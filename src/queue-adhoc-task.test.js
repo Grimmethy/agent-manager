@@ -290,3 +290,92 @@ test('queueAdhocTask records premium provenance only when premium is requested: 
   const labelOnly = mk({ premiumSetBy: 'chat-queue' });
   assert.equal('premiumSetBy' in labelOnly, false, 'a label without premiumPriority must not create provenance');
 });
+
+// --- ownership guard tests ---
+
+test('ownership guard: matching project allows the task', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-task-test-'));
+  // Create a projects.json array with an entry whose pipelineDir matches and repo matches
+  fs.writeFileSync(
+    path.join(dir, 'projects.json'),
+    JSON.stringify([{ pipelineDir: dir, repo: 'owner/test-repo' }])
+  );
+  fs.writeFileSync(path.join(dir, 'task-domains.json'), JSON.stringify({ default: {}, adhoc: {} }));
+  // Create a file that the task will reference, under this pipeline dir
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'main.py'), '# code');
+
+  const { record } = queueAdhocTask(
+    { title: 'Fix main.py', promptContext: { rawText: 'fix src/main.py in agent-manager' } },
+    { pipelineDir: dir, domainsPath: path.join(dir, 'task-domains.json') },
+  );
+  assert.equal(record.title, 'Fix main.py');
+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'adhoc')));
+});
+
+test('ownership guard: mismatching project refuses the task', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-task-test-'));
+  // Create two projects: one where the file actually is, one we're queueing for
+  const otherDir = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-task-other-'));
+  fs.writeFileSync(
+    path.join(dir, 'projects.json'),
+    JSON.stringify([
+      { pipelineDir: otherDir, repo: 'owner/other-repo' },
+      { pipelineDir: dir, repo: 'owner/wrong-repo' },
+    ])
+  );
+  fs.writeFileSync(path.join(dir, 'task-domains.json'), JSON.stringify({ default: {}, adhoc: {} }));
+  // Create the file under the OTHER project's pipeline dir (so it "belongs" to other-repo)
+  fs.mkdirSync(path.join(otherDir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(otherDir, 'src', 'main.py'), '# code');
+
+  assert.throws(
+    () => queueAdhocTask(
+      { title: 'Fix main.py', promptContext: { rawText: 'fix src/main.py in agent-manager' } },
+      { pipelineDir: dir, domainsPath: path.join(dir, 'task-domains.json') },
+    ),
+    /Refusing adhoc task.*does not own/
+  );
+  // Should NOT have written the task
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')), false);
+});
+
+test('ownership guard: no matching project falls back to AGENT_MANAGER_REPO_ROOT', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-task-test-'));
+  // Create a projects.json with no entry matching this pipelineDir
+  fs.writeFileSync(
+    path.join(dir, 'projects.json'),
+    JSON.stringify([{ pipelineDir: '/nonexistent/path', repo: 'owner/some-repo' }])
+  );
+  fs.writeFileSync(path.join(dir, 'task-domains.json'), JSON.stringify({ default: {}, adhoc: {} }));
+  // Create a file that the task will reference
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'main.py'), '# code');
+
+  const env = { ...process.env, AGENT_MANAGER_REPO_ROOT: 'owner/fallback-repo' };
+  const { record } = queueAdhocTask(
+    { title: 'Fix main.py', promptContext: { rawText: 'fix src/main.py' } },
+    { pipelineDir: dir, domainsPath: path.join(dir, 'task-domains.json') },
+  );
+  assert.equal(record.title, 'Fix main.py');
+  // The task should be written (no error thrown)
+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'adhoc')));
+});
+
+test('ownership guard: no files referenced skips the guard', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-task-test-'));
+  // Create a projects.json with a mismatching repo
+  fs.writeFileSync(
+    path.join(dir, 'projects.json'),
+    JSON.stringify([{ pipelineDir: dir, repo: 'owner/wrong-repo' }])
+  );
+  fs.writeFileSync(path.join(dir, 'task-domains.json'), JSON.stringify({ default: {}, adhoc: {} }));
+
+  // Task with no file references (just text)
+  const { record } = queueAdhocTask(
+    { title: 'Generic task', promptContext: { rawText: 'do something without referencing files' } },
+    { pipelineDir: dir, domainsPath: path.join(dir, 'task-domains.json') },
+  );
+  assert.equal(record.title, 'Generic task');
+  assert.ok(fs.existsSync(path.join(dir, 'queue', 'adhoc')));
+});

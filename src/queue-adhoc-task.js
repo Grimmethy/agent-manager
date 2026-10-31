@@ -38,6 +38,70 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriori
     throw new Error(`Invalid domain '${resolvedDomain}'. Valid domains: ${validDomains.join(', ')}`);
   }
 
+  // Ownership guard (2026-10-24): refuse adhoc tasks that reference files belonging to
+  // a different project than the one being queued for. This prevents tasks from being
+  // silently misrouted when a project's pipelineDir is registered with the wrong repo.
+  // The guard reads projects.json (an array of { pipelineDir, repo, ... }) and iterates
+  // it to find the entry matching the current pipelineDir. If no files are referenced in
+  // promptContext.rawText, the guard skips. If no matching project is found, falls back
+  // to AGENT_MANAGER_REPO_ROOT (no throw). If files are referenced but don't exist under
+  // any project's pipelineDir, the guard skips (can't determine ownership). If files exist
+  // under a different project, throws with a clear message.
+  const projectsPath = path.join(pipelineDir, 'projects.json');
+  let projects = [];
+  let expectedRepo;
+  if (fs.existsSync(projectsPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(projectsPath, 'utf8'));
+      if (Array.isArray(parsed)) {
+        projects = parsed;
+        const matchingProject = projects.find((p) => p.pipelineDir === pipelineDir);
+        if (matchingProject && matchingProject.repo) {
+          expectedRepo = matchingProject.repo;
+        } else {
+          // No matching project found; fall back to AGENT_MANAGER_REPO_ROOT
+          expectedRepo = process.env.AGENT_MANAGER_REPO_ROOT;
+        }
+      } else {
+        // projects.json is not an array; fall back to AGENT_MANAGER_REPO_ROOT
+        expectedRepo = process.env.AGENT_MANAGER_REPO_ROOT;
+      }
+    } catch {
+      // If projects.json is malformed, fall back to AGENT_MANAGER_REPO_ROOT
+      expectedRepo = process.env.AGENT_MANAGER_REPO_ROOT;
+    }
+  } else {
+    // No projects.json; fall back to AGENT_MANAGER_REPO_ROOT
+    expectedRepo = process.env.AGENT_MANAGER_REPO_ROOT;
+  }
+
+  // Extract file paths from promptContext.rawText
+  const rawText = promptContext && promptContext.rawText;
+  if (rawText && typeof rawText === 'string' && projects.length > 0 && expectedRepo) {
+    const fileReferences = rawText.match(/[a-zA-Z0-9_./-]+\.[a-zA-Z]{2,}/g) || [];
+    if (fileReferences.length > 0) {
+      // Determine which project owns the referenced files
+      let owningRepo;
+      for (const fileRef of fileReferences) {
+        // Check if the file exists under any project's pipelineDir
+        for (const project of projects) {
+          const projectPipelineDir = project.pipelineDir;
+          if (projectPipelineDir && fs.existsSync(path.join(projectPipelineDir, fileRef))) {
+            owningRepo = project.repo;
+            break;
+          }
+        }
+        if (owningRepo) break;
+      }
+      // If we found an owning repo and it doesn't match the expected repo, throw
+      if (owningRepo && owningRepo !== expectedRepo) {
+        throw new Error(
+          `Refusing adhoc task: the source repository '${owningRepo}' does not own the project '${expectedRepo}' registered at ${projectsPath}`
+        );
+      }
+    }
+  }
+
   const id = `adhoc-${slugify(title)}-${Date.now()}`;
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
   fs.mkdirSync(adhocDir, { recursive: true });
