@@ -1520,6 +1520,24 @@ test('stacked seq 2 on a dirty apply clone: fails ONCE up front with the stable 
   assert.equal(isInfraApplyFailure({ blockedStage: 'apply', blockedReason: result.reason }), true);
 });
 
+test('a normal (non-stacked) apply on a dirty clone fails with a stable error message before any mutating git ops', () => {
+  const { DIRTY_CLONE_ERROR_PREFIX } = require('./git-runner.js');
+  const gitRunner = createFakeGitRunner({ dirtyTree: 'foo.js' });
+  const result = applyTask(baseTask(), { repoRoot: '/tmp/dirty-clone-test', pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(result.succeeded, false);
+  assert.ok(result.reason.startsWith(DIRTY_CLONE_ERROR_PREFIX), `expected dirty-tree error, got: ${result.reason}`);
+  assert.ok(/foo\.js/.test(result.reason), `expected foo.js in error, got: ${result.reason}`);
+  assert.ok(result.reason.includes('-- simulated'), `expected -- simulated suffix, got: ${result.reason}`);
+  const names = gitRunner.calls.map((c) => c.name);
+  // assertCleanTree is itself a recorded call (not a no-op), so we only verify that
+  // mutating git operations (fetchMain, resetToMain, createBranch, add, commit, push)
+  // were NOT performed -- the pre-flight gate short-circuits before any of them.
+  const mutatingOps = ['fetchMain', 'resetToMain', 'createBranch', 'add', 'commit', 'push'];
+  for (const op of mutatingOps) {
+    assert.ok(!names.includes(op), `expected no ${op} call, got: ${JSON.stringify(names)}`);
+  }
+});
+
 test('a normal (non-stacked) apply is unchanged: resetToMain already clears stray content, so no extra pre-flight calls', () => {
   const gitRunner = createFakeGitRunner();
   applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
