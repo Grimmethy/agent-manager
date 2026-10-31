@@ -1312,6 +1312,22 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
     return { done: true, result: { succeeded: true, blocked: false } };
   }
 
+  // arch_import only: the model may wrap an empty response in HTML (e.g. "<p></p>", "<br>", etc.)
+  // instead of the literal "no real file to adapt" text. Strip HTML tags and treat a resulting
+  // empty string the same way -- concludeDraft with no task returned, not blocked. Other sources
+  // are NOT affected: an empty implementResponse from a non-arch_import source is left for the
+  // normal critique/implement-review path to handle.
+  if (resolveSourceName(task) === 'arch_import') {
+    const stripped = String(task.implementResponse || '').replace(/<[^>]+>/g, '').trim();
+    if (stripped === '') {
+      task.implementResponse = '';
+      recordImplement(attempt, { note: 'arch_import empty implementResponse after HTML strip -- terminal no-op' });
+      appendHistoryEvent(task, 'implement-done', 'arch_import empty implementResponse (no real file to adapt) -- terminal no-op, empty implementResponse, no critique or requeue');
+      concludeDraft(task);
+      return { done: true, result: { succeeded: true, blocked: false } };
+    }
+  }
+
   // A source can register a `postImplementCheck(task, implementResponse, {call,
   // maybeLockedOn})` -- generic, source-agnostic hook, same convention as premiseCheck
   // above but for the implement pass's OWN output rather than a candidate-fulfillment
