@@ -9,6 +9,7 @@ const { resolveGraphPath, getSecondBrainDir } = require('./config.js');
 const { writeAtomicSync, writeJsonAtomicSync } = require('./atomic-write.js');
 const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-dump-existing-work.js');
 const { checkEntryTargets, isEnabled: targetCheckEnabled } = require('./brain-dump-target-check.js');
+const { checkBrainDumpDuplicate, isEnabled: duplicateCheckEnabled } = require('./lib/brain-dump-duplicate-check.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { normalizeTokens, jaccardSimilarity } = require('./text-similarity.js');
 const {
@@ -634,6 +635,30 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
       linkedTo: existing.taskId,
       reason: `work for this brain-dump entry already exists: ${existing.taskId} (${existing.state}, matched by ${existing.how}) -- not queueing another task`,
     };
+  }
+
+  // Duplicate pre-queue check (2026-10-31, brain-dump-duplicate-check.js): an entry that duplicates another brain-dump entry
+  // (same cited file paths + first identifier) or an unmerged agent/* branch in the target repo is NOT turned into an adhoc
+  // task. It stays in Brain Dump with entry.duplicateOf set to the id/branch of the duplicate; sortAttempt is parked at the
+  // budget so brain_dump_sort does not pick it again. Kill switch: AGENT_MANAGER_BRAIN_DUMP_DUPLICATE_CHECK=false. Escape
+  // hatch: entry.duplicateOverride === true.
+  if (duplicateCheckEnabled()) {
+    // The target repo is known only when the sort named a registered project; without it the branch half is skipped (fails open), the entry half still runs.
+    const dupProject = result.belongsToProject ? readProjectRegistry().find((p) => p.label === result.belongsToProject) : null;
+    const dupCheck = checkBrainDumpDuplicate(entry, { brainDumpPath, repoRoot: dupProject ? dupProject.repoRoot : null });
+    if (dupCheck) {
+      entry.duplicateOf = dupCheck.duplicateOf;
+      entry.sortAttempt = Math.max(entry.sortAttempt || 0, 3);
+      fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+      writeJsonAtomicSync(brainDumpPath, data);
+      try { logPipelineEvent(pipelineDir, 'brain-dump-duplicate-check', { entryId: entry.id, serial: entry.serial ?? null, duplicateOf: dupCheck.duplicateOf, source: dupCheck.source, key: dupCheck.key }); } catch { /* best-effort log */ }
+      return {
+        skipped: true,
+        duplicateCheck: true,
+        linkedTo: dupCheck.duplicateOf,
+        reason: `brain-dump entry not queued: duplicates ${dupCheck.source} "${dupCheck.duplicateOf}" (entry.duplicateOf stamped; set duplicateOverride to force it)`,
+      };
+    }
   }
 
   // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code
