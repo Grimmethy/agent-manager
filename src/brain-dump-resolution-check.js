@@ -150,23 +150,51 @@ function next() {
   };
 }
 
-// Apply function: sets possiblyResolved on validated 'yes', records check otherwise
+// Stamp a verdict on ONE entry (HUB0274-05). Flag only: status, suppressed and rawText are never touched, and nothing is closed. Every verdict records
+// entry.resolutionCheck (so the changed-file recheck rule in selectEntryToCheck has its baseline); only a validated 'yes' also records possiblyResolved.
+function stampVerdict(entry, { verdict, evidence, masterSha, citedShas, now }) {
+  const at = now || new Date().toISOString();
+  entry[CHECKED_META_KEY] = { at, masterSha, verdict, citedShas: citedShas || {} };
+  if (verdict === 'yes') entry.possiblyResolved = { evidence, masterSha, checkedAt: at };
+  return entry;
+}
+
+// Apply function (kept for the registry): verdict is the validated { resolved } object.
 function apply(options) {
-  const { entry, verdict, evidence, masterSha } = options;
-  
-  if (verdict.resolved === 'yes') {
-    entry.possiblyResolved = {
-      evidence: evidence,
-      masterSha: masterSha,
-      checkedAt: new Date().toISOString(),
-    };
-  } else {
-    entry[CHECKED_META_KEY] = {
-      at: new Date().toISOString(),
-      masterSha: masterSha,
-      verdict: verdict.resolved,
-    };
+  const { entry, verdict, evidence, masterSha, citedShas, now } = options;
+  return stampVerdict(entry, { verdict: verdict.resolved, evidence, masterSha, citedShas, now });
+}
+
+// Pure: find the entry by id in `entries` and stamp the verdict on it. Returns the entry, or null when it is gone.
+function recordResolutionVerdict({ entries, entryId, verdict, evidence, masterSha, citedShas, now }) {
+  const entry = (Array.isArray(entries) ? entries : []).find((e) => e && e.id === entryId);
+  if (!entry) return null;
+  return stampVerdict(entry, { verdict, evidence, masterSha, citedShas, now });
+}
+
+// The model's answer is the first JSON object in its text. Anything unparsable is an 'unclear' verdict (recorded, so the entry is not retried in a loop).
+function parseVerdictResponse(text) {
+  const src = String(text || '');
+  for (let start = src.indexOf('{'); start !== -1; start = src.indexOf('{', start + 1)) {
+    let depth = 0;
+    let inString = false;
+    for (let k = start; k < src.length; k++) {
+      const ch = src[k];
+      if (inString) {
+        if (ch === '\\') k++;
+        else if (ch === '"') inString = false;
+      } else if (ch === '"') inString = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}' && --depth === 0) {
+        try {
+          const obj = JSON.parse(src.slice(start, k + 1));
+          if (obj && typeof obj === 'object') return { resolved: obj.resolved, evidence: typeof obj.evidence === 'string' ? obj.evidence : '' };
+        } catch { /* not JSON: try the next brace */ }
+        break;
+      }
+    }
   }
+  return { resolved: 'unclear', evidence: 'unparsable model output' };
 }
 
 // Validate verdict deterministically
@@ -196,4 +224,6 @@ module.exports = {
   selectEntryToCheck,
   repoRootFor,
   citedShasFor,
+  recordResolutionVerdict,
+  parseVerdictResponse,
 };
