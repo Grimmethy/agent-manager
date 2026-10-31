@@ -1,4 +1,23 @@
-const { prioritizeRefusal } = require('./brain-dump-chips.js');
+// POST /api/brain-dump/<id>/prioritize. The server answers 409 (JSON {description}) for an entry the target check holds back unless the body carries
+// {force: true}; on a 409 the owner is asked and a yes re-POSTs once with force. prioritizeRefusal comes from brain-dump-chips.js, which index.html
+// loads as a plain script before this one (a global function, not a require: this file runs in the browser).
+// -> { queued, declined, status }
+async function prioritizeEntry(id, force = false) {
+  const url = '/api/brain-dump/' + encodeURIComponent(id) + '/prioritize';
+  const res = await fetch(url, force
+    ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force: true }) }
+    : { method: 'POST' });
+  if (res.status === 409 && !force) {
+    let text = '';
+    try { const body = await res.json(); text = (body && body.description) || ''; } catch (e) { /* not JSON: ask without the reason */ }
+    const refusal = prioritizeRefusal(res.status, text);
+    if (refusal.refused) {
+      if (!window.confirm(refusal.message + '\n\nQueue it anyway?')) return { queued: false, declined: true, status: 409 };
+      return prioritizeEntry(id, true);
+    }
+  }
+  return { queued: res.ok, declined: false, status: res.status };
+}
 
 function renderBrainDumpShell() {
   document.getElementById('main').innerHTML = `
