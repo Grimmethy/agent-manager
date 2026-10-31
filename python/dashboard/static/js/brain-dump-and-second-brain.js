@@ -1,3 +1,5 @@
+const { prioritizeRefusal } = require('./brain-dump-chips.js');
+
 function renderBrainDumpShell() {
   document.getElementById('main').innerHTML = `
     <div class="capture-row">
