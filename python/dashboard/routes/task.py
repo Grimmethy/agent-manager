@@ -591,6 +591,35 @@ def api_task_requeue(state, task_id):
     else:
         dest_qdir = qdir
 
+    # Idempotency check: if a pipeline_history record already exists for this task_id,
+    # skip the requeue (no-op). Prevents duplicate pushes and history records when the
+    # same requeue is triggered multiple times rapidly.
+    history_file = instances_dir() / "pipeline-history.log"
+    if history_file.is_file():
+        try:
+            import re as _re
+            _task_id_re = _re.compile(rf'"taskId"\s*:\s*"{_re.escape(task_id)}"')
+            _recent_re = _re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+            _now = datetime.now(timezone.utc)
+            _dedup_window = timedelta(minutes=5)
+            for line in history_file.read_text(encoding="utf-8").splitlines():
+                if _task_id_re.search(line):
+                    ts_match = _recent_re.search(line)
+                    if ts_match:
+                        try:
+                            existing_ts = datetime.fromisoformat(ts_match.group(1).replace("Z", "+00:00"))
+                            if (_now - existing_ts) < _dedup_window:
+                                return jsonify({
+                                    "id": task_id,
+                                    "requeued": False,
+                                    "skipped": True,
+                                    "reason": "already requeued within dedup window",
+                                }), 200
+                        except (ValueError, TypeError):
+                            pass
+        except Exception:
+            pass  # Best-effort idempotency; don't fail the requeue if check fails
+
     pending_dir = dest_qdir / "pending"
     pending_dir.mkdir(parents=True, exist_ok=True)
     dest = pending_dir / f"{task_id}.json"
