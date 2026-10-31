@@ -232,6 +232,7 @@ function renderTaskDetailModal(task) {
   html += `<div style="margin:8px 0 4px">`
     + `<button type="button" class="secondary" id="task-send-to-chat">Send to Chat</button> `
     + `<button type="button" class="${premiumOn ? 'action' : 'secondary'}" id="task-premium-priority" title="${premiumOn ? 'Currently claimed ahead of everything else in the queue, every pass, until turned off or the task completes. Click to turn off.' : 'Always claim this task first, every pass, regardless of source or age -- stays on until you turn it off or the task completes.'}">${premiumOn ? '★ Premium Priority (on)' : '☆ Set Premium Priority'}</button>`
+    + (premiumProvenanceText(task, Date.now()) ? ` <span class="muted" id="task-premium-provenance">${escapeHtml(premiumProvenanceText(task, Date.now()))}</span>` : '')
     + `</div>`;
   if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
   html += `<div><strong>${escapeHtmlBright(task.title || '')}</strong></div>`;
@@ -429,6 +430,10 @@ function renderTaskDetailModal(task) {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         showToast(nextEnabled ? 'Premium priority set -- claimed first every pass until you turn it off' : 'Premium priority cleared', 'info');
         task.premiumPriority = nextEnabled;
+        // mirror what the route just stamped so the in-place re-render shows who/when instead of "origin unknown"
+        const nowIso = new Date().toISOString();
+        if (nextEnabled) { task.premiumSetBy = 'operator-ui'; task.premiumSetAt = nowIso; delete task.premiumClearedAt; delete task.premiumClearedBy; }
+        else { task.premiumClearedBy = 'operator-ui'; task.premiumClearedAt = nowIso; }
         renderTaskDetailModal(task); // re-render in place so the button flips state immediately, no full reopen
       } catch (e) {
         showToast('Could not update premium priority: ' + e.message);
