@@ -547,7 +547,35 @@ function capNumPredictToFit({ numPredict, promptTokens = 0, tokensPerSecond, cei
   return fit;
 }
 
+// HUB0280-02: stages whose callers already write their own model_calls row (src/local-draft.js, src/lib/implement-critique.js,
+// src/local-agentic-write-draft.js, src/research-agentic-draft.js); call() skips these so a model call is recorded exactly once.
+const CALLER_RECORDED_STAGES = ['plan', 'implement', 'implement-retry', 'critique', 'revise', 'agentic-write'];
+
+// Best-effort row in model_calls for a call whose caller does not record it (reviewer votes, needs-clarification triage votes). The model
+// label is the call's model or this module's default; latency covers the whole call including retries while the token counts are the final
+// attempt's, as on the plan/implement rows. Never throws.
+function recordUnrecordedCall(opts, startedAt, latencyMs, result) {
+  try {
+    if (!opts || typeof opts.taskId !== 'string' || !opts.taskId) return;
+    if (typeof opts.stage !== 'string' || !opts.stage || CALLER_RECORDED_STAGES.includes(opts.stage)) return;
+    if (!result || result.degenerate) return;
+    require('./model-stats-client.js').recordCall({
+      taskId: opts.taskId, stage: opts.stage, model: opts.model || MODEL, startedAt, latencyMs, result, source: opts.source || null,
+    });
+  } catch (e) {
+    console.warn(`[local-client] model_calls record failed for ${opts && opts.taskId} (non-fatal): ${e && e.message}`);
+  }
+}
+
 async function call(opts, maxRetries = 2) {
+  const startedAt = new Date().toISOString();
+  const startMs = Date.now();
+  const result = await callUnrecorded(opts, maxRetries);
+  recordUnrecordedCall(opts, startedAt, Date.now() - startMs, result);
+  return result;
+}
+
+async function callUnrecorded(opts, maxRetries = 2) {
   let lastDegenerate = null;
   let lastError = null;
   let gotAnyResponse = false;
@@ -760,7 +788,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, maxNumPredictThatFits, capNumPredictToFit, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
+module.exports = { call, callOnce, CALLER_RECORDED_STAGES, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, maxNumPredictThatFits, capNumPredictToFit, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,
