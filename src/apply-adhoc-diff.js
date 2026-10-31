@@ -436,4 +436,4 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
   }
 }
 
-module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask, BRAIN_DUMP_DISPOSITION_RE };
+module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask, slugify, BRAIN_DUMP_DISPOSITION_RE };
