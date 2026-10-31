@@ -334,6 +334,10 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
 
     // Non-secondbrain: git-branch-diff flow. Order matters -- fetch/reset/branch FIRST,
     // then write the artifact, so the change lands on the new branch, never on main.
+    // Pre-flight: reject any dirty working tree before touching git. Mirrors the
+    // defensive pattern at apply-branch-prep-route.js:37 -- fail closed if the
+    // gitRunner implementation hasn't wired assertCleanTree, fail open otherwise.
+    if (typeof gitRunner.assertCleanTree === 'function') gitRunner.assertCleanTree();
     gitRunner.fetchMain();
 
     // commitsDirectlyToMain sources skip the branch entirely (branchName stays null) and
