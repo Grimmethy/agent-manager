@@ -142,7 +142,8 @@ function wireBrainDumpCardHandlers(el) {
       btn.disabled = true;
       btn.textContent = 'Queuing...';
       try {
-        await fetch('/api/brain-dump/' + encodeURIComponent(btn.dataset.prioritize) + '/prioritize', { method: 'POST' });
+        const result = await prioritizeEntry(btn.dataset.prioritize);
+        if (result.declined) { btn.disabled = false; btn.textContent = 'Process now'; return; }
         await refreshBrainDumpEntries(true);
       } catch (e) {
         alert('Could not queue: ' + e.message);
@@ -1085,7 +1086,8 @@ function wireFiledFindingsHandlers(el) {
       btn.disabled = true;
       btn.textContent = 'Queuing...';
       try {
-        await fetch('/api/brain-dump/' + encodeURIComponent(btn.dataset.prioritize) + '/prioritize', { method: 'POST' });
+        const result = await prioritizeEntry(btn.dataset.prioritize);
+        if (result.declined) { btn.disabled = false; btn.textContent = 'Process now'; return; }
         await refreshFiledFindingsEntries();
       } catch (e) {
         alert('Could not queue: ' + e.message);
