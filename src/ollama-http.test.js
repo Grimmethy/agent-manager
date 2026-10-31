@@ -171,10 +171,10 @@ test('postJson tags a mid-body disconnect with a distinguishing code (STREAM_ERR
   );
 });
 
-test('postJson tags a socket timeout with OLLAMA_TIMEOUT and the real timeoutMs', async () => {
+test('postJson tags a deadline expiry with OLLAMA_TIMEOUT and the real deadlineMs', async () => {
   await withServer(
     (req, res) => {
-      // never respond -- forces the client-side socket timeout
+      // never respond -- forces the deadline timer to fire
     },
     async (base) => {
       try {
@@ -182,7 +182,7 @@ test('postJson tags a socket timeout with OLLAMA_TIMEOUT and the real timeoutMs'
         assert.fail('must reject');
       } catch (e) {
         assert.equal(e.code, OLLAMA_ERROR_CODES.TIMEOUT);
-        assert.equal(e.timeoutMs, 200);
+        assert.equal(e.deadlineMs, 200);
       }
     }
   );
@@ -241,12 +241,11 @@ test('premature close: server sends headers + partial chunked body then closes T
   );
 });
 
-test('silent server: server accepts TCP connection and sends nothing → rejects with OLLAMA_TIMEOUT via socket idle timeout', { timeout: 5000 }, async () => {
+test('silent server: server accepts TCP connection and sends nothing → rejects with OLLAMA_TIMEOUT via deadlineMs', { timeout: 5000 }, async () => {
   await withServer(
     (req, res) => {
-      // Accept the connection but never write anything -- the socket sits idle.
-      // Node's http.request `timeout` (socket idle timeout) will fire after timeoutMs
-      // of inactivity and destroy the request.
+      // Accept the connection but never write anything -- the deadline timer fires
+      // regardless of server activity (unlike socket idle timeout which resets).
       req.on('data', () => {}); // consume the body so the request completes
     },
     async (base) => {
@@ -256,37 +255,37 @@ test('silent server: server accepts TCP connection and sends nothing → rejects
       } catch (e) {
         assert.equal(e.code, OLLAMA_ERROR_CODES.TIMEOUT,
           `expected OLLAMA_TIMEOUT on silent server, got code=${e.code} msg=${e.message}`);
-        assert.equal(e.timeoutMs, 500, 'timeoutMs metadata should be preserved');
+        assert.equal(e.deadlineMs, 500, 'deadlineMs metadata should be preserved');
       }
     }
   );
 });
 
-// THIS IS THE KEY REPRODUCTION: Node's `http.request` `timeout` is a SOCKET IDLE
-// timeout, NOT a hard deadline. It resets on every byte received. A server sending
-// one byte every 10s keeps resetting the timer forever, so the request hangs
-// indefinitely -- this is exactly the live hang pattern observed in chat-and-lane.
-// The test-level 5s timeout causes node:test to report "exceeded timeout" rather
-// than the test passing, making the hang observable in CI.
-test('slow server (1 byte / 10s): socket idle timeout resets on activity → HANGS (test exceeds 5s timeout)', { timeout: 5000 }, async () => {
+// FIXED: With deadlineMs (hard deadline from call start), a slow server that sends
+// bytes periodically CANNOT prevent the timeout from firing. The deadline timer is
+// independent of socket activity.
+test('slow server (1 byte / 10s): deadlineMs fires regardless of activity → rejects with TIMEOUT', { timeout: 5000 }, async () => {
   await withServer(
     (req, res) => {
       req.on('data', () => {}); // consume the body so request "completes" on the wire
       // Send one byte every 10 seconds forever -- never enough to complete the response,
-      // but enough to reset Node's socket idle timer on every tick. This is the textbook
-      // hang pattern: the server is "alive" from the client's perspective but never
-      // produces a response.
+      // but enough to keep the socket "alive". With deadlineMs, this does NOT prevent
+      // the timeout from firing.
       const interval = setInterval(() => { res.write('x'); }, 10000);
       // We never clear the interval and never end -- the server is intentionally
-      // designed to hang the client.
+      // designed to test that deadlineMs is a hard deadline.
     },
     async (base) => {
-      // postJson's own timeoutMs (60000) is irrelevant here: the socket idle timer
-      // resets every 10s, so it will NEVER fire. The test-level 5s timeout is what
-      // catches this hang and reports it.
-      await postJson(`${base}/api/generate`, { a: 1 }, 60000);
-      // If we reach here, the test passed (unexpected -- the server should keep us hanging)
-      assert.fail('expected this test to hang -- the slow server keeps resetting the idle timeout');
+      // deadlineMs (200ms) is much shorter than the 10s interval, so the deadline
+      // will fire before the server can send another byte.
+      try {
+        await postJson(`${base}/api/generate`, { a: 1 }, 200);
+        assert.fail('expected reject on deadline expiry');
+      } catch (e) {
+        assert.equal(e.code, OLLAMA_ERROR_CODES.TIMEOUT,
+          `expected OLLAMA_TIMEOUT on slow server, got code=${e.code} msg=${e.message}`);
+        assert.equal(e.deadlineMs, 200, 'deadlineMs metadata should be preserved');
+      }
     }
   );
 });
@@ -306,6 +305,59 @@ test('postJson works with no extraHeaders (backward compatible)', async () => {
       const result = await postJson(`${base}/api/generate`, { a: 1 }, 5000);
       assert.deepEqual(result, { ok: true });
       assert.equal(receivedHeaders['x-tokenfold-session'], undefined);
+    }
+  );
+});
+
+// New test: deadlineMs omitted (undefined) produces no setTimeout and completes normally
+test('postJson with no deadlineMs completes normally on fast server', async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
+    },
+    async (base) => {
+      const result = await postJson(`${base}/api/generate`, { a: 1 });
+      assert.deepEqual(result, { ok: true });
+    }
+  );
+});
+
+// New test: deadlineMs with a server that responds in time does not reject
+test('postJson with deadlineMs that is not exceeded resolves normally', async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        // Respond quickly (well within the 5000ms deadline)
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
+    },
+    async (base) => {
+      const result = await postJson(`${base}/api/generate`, { a: 1 }, 5000);
+      assert.deepEqual(result, { ok: true });
+    }
+  );
+});
+
+// New test: deadlineMs expiry rejects with TIMEOUT
+test('postJson with deadlineMs that IS exceeded rejects with TIMEOUT', async () => {
+  await withServer(
+    (req, res) => {
+      // Never respond -- deadline will fire
+    },
+    async (base) => {
+      try {
+        await postJson(`${base}/api/generate`, { a: 1 }, 100);
+        assert.fail('expected reject on deadline expiry');
+      } catch (e) {
+        assert.equal(e.code, OLLAMA_ERROR_CODES.TIMEOUT);
+        assert.equal(e.deadlineMs, 100);
+      }
     }
   );
 });

@@ -74,10 +74,10 @@ function isAlreadyTagged(e) {
 /**
  * @param {string} urlString - Full URL to POST to.
  * @param {object} bodyObj - JSON body.
- * @param {number} timeoutMs - Socket timeout. Both current callers pass 240_000 (4 min,
- *   under the 5-min ceiling documented above) via their own REQUEST_TIMEOUT_MS constants --
- *   kept as separate named constants per caller rather than one shared value here, so each
- *   call site's reasoning stays visible next to it.
+ * @param {number} [deadlineMs] - Hard deadline from call start. If provided and the request
+ *   exceeds this duration, the promise rejects with OLLAMA_TIMEOUT. Unlike Node's socket
+ *   idle timeout (which resets on any received byte), this is a true deadline that fires
+ *   regardless of server activity. Undefined means no deadline timer.
  * @param {object} [extraHeaders] - Additional headers merged into the request. Used to pass
  *   X-TokenFold-Session (see local-client.js) -- without it, TokenFold's registry.py-adjacent
  *   proxy hashes each call's own prompt into a fresh, one-off session_id, so its dictionary
@@ -87,7 +87,7 @@ function isAlreadyTagged(e) {
  *   session header, 273 real requests netted 0.27% total savings and 198/273 fell back to
  *   "original".
  */
-function postJson(urlString, bodyObj, timeoutMs, extraHeaders, deadlineMs) {
+function postJson(urlString, bodyObj, deadlineMs, extraHeaders) {
   const url = new URL(urlString);
   const payload = JSON.stringify(bodyObj);
   let endFired = false;
@@ -108,7 +108,6 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders, deadlineMs) {
         { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
         extraHeaders || {}
       ),
-      timeout: timeoutMs,
       // agent: false -- confirmed live 2026-08-22: Node's http.globalAgent defaults to
       // keepAlive:true (as of this Node version), pooling TCP connections across calls
       // made from the SAME process. A single draftTask() call makes several SEQUENTIAL
@@ -170,7 +169,6 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders, deadlineMs) {
       // Clear timer on response arrival to prevent leaks
       req.on('response', clearDeadline);
     }
-    req.on('timeout', () => { req.destroy(taggedError(`Ollama request timed out after ${timeoutMs}ms`, OLLAMA_ERROR_CODES.TIMEOUT, { timeoutMs })); });
     req.on('error', (e) => reject(isAlreadyTagged(e) ? e : taggedError(e.message, OLLAMA_ERROR_CODES.CONNECTION_ERROR, { nodeCode: e.code })));
     req.write(payload);
     req.end();
@@ -189,7 +187,7 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders, deadlineMs) {
  * failure the proxy already turned into an {error, done_reason:"error"} NDJSON frame is
  * left for the caller to notice via onLine, same as any other line.
  */
-function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine, deadlineMs) {
+function postJsonStream(urlString, bodyObj, deadlineMs, extraHeaders, onLine) {
   const url = new URL(urlString);
   const payload = JSON.stringify(Object.assign({}, bodyObj, { stream: true }));
   let endFired = false;
@@ -210,7 +208,6 @@ function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine, dea
         { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
         extraHeaders || {}
       ),
-      timeout: timeoutMs,
       agent: false, // same stale-pooled-socket reasoning as postJson above
     }, (res) => {
       if (res.statusCode !== 200) {
@@ -261,7 +258,6 @@ function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine, dea
       // Clear timer on response arrival to prevent leaks
       req.on('response', clearDeadline);
     }
-    req.on('timeout', () => { req.destroy(taggedError(`Ollama request timed out after ${timeoutMs}ms`, OLLAMA_ERROR_CODES.TIMEOUT, { timeoutMs })); });
     req.on('error', (e) => { clearDeadline(); reject(isAlreadyTagged(e) ? e : taggedError(e.message, OLLAMA_ERROR_CODES.CONNECTION_ERROR, { nodeCode: e.code })); });
     req.write(payload);
     req.end();
