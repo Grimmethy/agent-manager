@@ -12,7 +12,7 @@
 
 const fs = require('fs');
 const { sharedInstancesDir } = require('./instances-dir.js');
-const { generationThrottled, makeSourceThrottle, liveLaneCount } = require('./generation-throttle.js');
+const { generationThrottled, makeGenerationBlocker, liveLaneCount } = require('./generation-throttle.js');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFileSync } = require('child_process');
@@ -3352,21 +3352,25 @@ if (require.main === module) {
   })();
 
   {
+    // An exemption lets through ONLY its own source (makeGenerationBlocker, generation-throttle.js); every other source stays under the
+    // priority-aware veto while a backlog exists. Before 2026-10-31 any exemption left `blocked` undefined, which opened the whole ladder and let
+    // project_search / deep_dive generate on every tick (1,196 identical project_search tasks piled up).
     const throttled = alreadyPending && !hasAdhocWaiting && !hasResearchWaiting && !hasBrainDumpWaiting && !hasHeldClarificationWaiting;
-    // Throttled no longer means "ask nobody": a source is vetoed only by in-flight work at least as important as
-    // itself (generation-throttle.js makeSourceThrottle), so a higher-priority source (arch_discovery 30) can still
-    // generate while lower-priority tasks (derived_task 41) already fill the slots.
     let blocked;
-    if (throttled) {
+    if (alreadyPending) {
       const { rankPriorityOfTask } = require('./next-claimable-task.js');
       const inFlightPriorities = inFlightFiles.map((f) => {
         try { return rankPriorityOfTask(JSON.parse(fs.readFileSync(f, 'utf8'))); } catch { return Infinity; }
       });
-      const veto = makeSourceThrottle({ inFlightPriorities, laneCount: liveLaneCount(instancesDir) });
-      blocked = (source) => veto(source.priority);
+      const exemptSourceNames = [];
+      if (hasAdhocWaiting) exemptSourceNames.push('adhoc');
+      if (hasResearchWaiting) exemptSourceNames.push('research_task');
+      if (hasBrainDumpWaiting) exemptSourceNames.push('brain_dump_sort');
+      if (hasHeldClarificationWaiting) exemptSourceNames.push('path_prefetch_resolve');
+      blocked = makeGenerationBlocker({ alreadyPending, exemptSourceNames, inFlightPriorities, laneCount: liveLaneCount(instancesDir) });
     }
     const task = getNextTask({ blocked });
-    if (!task && throttled) {
+    if (!task && alreadyPending) {
       console.log('pending/ already has work queued, not adding another task');
     } else if (!task) {
       console.log('no eligible task found (all registered sources exhausted or malformed)');
