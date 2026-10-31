@@ -25,6 +25,8 @@ const { KNOWN_FIXED } = require('./known-fixed-failures.js');
 
 const STATE_FILE = 'fix-signature-state.json';
 const COORDINATION_FIELDS = ['stacked', 'dependsOn', 'prerequisiteHubs', 'softDependsOn', 'atomic', 'noDecompose', 'parentHub', 'premiumPriority', 'hubPriority', 'humanQueued'];
+const VERDICTS_STORE = 'branch-verdicts.json';
+const VERDICT_SOURCE = 'deterministic';
 
 function enabled() { return process.env.AGENT_MANAGER_FIX_SIGNATURE_SWEEP !== 'false'; }
 
@@ -63,8 +65,127 @@ function freshShape(task, entry, from, nowIso) {
   return fresh;
 }
 
+// For any old branch card in done/ whose supersededBy task is now merged, write a deterministic
+// discard verdict (rule 2 of verify-unmerged-branches: "Superseded by a rival that already merged").
+// Gate is on the REPLACEMENT's merged status, not the old branch's status. The verdict names the
+// merged commit per rule 2's evidence requirement (function names, hub label, merge commit).
+// Idempotent: dedupes via fix-signature-state.json `mergedDiscardsSeen` keyed by oldId.
+function extractOldBranch(task) {
+  const history = Array.isArray(task.history) ? task.history : [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    const ev = history[i];
+    if (ev && ev.stage === 'applied' && ev.detail) {
+      const first = String(ev.detail).split(/\s/)[0];
+      if (first.startsWith('agent/')) return first;
+    }
+  }
+  return null;
+}
+
+function isBranchMerged(repoRoot, branch, mainBranch) {
+  try {
+    const { execFileSync } = require('child_process');
+    const main = mainBranch || 'main';
+    // Branch must exist on origin.
+    execFileSync('git', ['rev-parse', '--verify', `origin/${branch}`], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000 });
+    // And be an ancestor of origin/<main>.
+    execFileSync('git', ['merge-base', '--is-ancestor', `origin/${branch}`, `origin/${main}`], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000 });
+    return true;
+  } catch { return false; }
+}
+
+function branchHeadSha(repoRoot, branch) {
+  try {
+    const { execFileSync } = require('child_process');
+    const out = execFileSync('git', ['rev-parse', `origin/${branch}`], { cwd: repoRoot, stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8', timeout: 30000 });
+    return String(out).trim();
+  } catch { return null; }
+}
+
+function loadVerdictsStore(queueDir) {
+  try {
+    const data = JSON.parse(fs.readFileSync(path.join(queueDir, VERDICTS_STORE), 'utf8'));
+    return (data && typeof data === 'object' && !Array.isArray(data)) ? data : {};
+  } catch { return {}; }
+}
+
+function saveVerdictsStore(queueDir, store) {
+  fs.mkdirSync(queueDir, { recursive: true });
+  fs.writeFileSync(path.join(queueDir, VERDICTS_STORE), JSON.stringify(store, null, 2));
+}
+
+function emitDiscardVerdictForBranch(queueDir, repoRoot, branch, headSha, reasons, nowIso) {
+  if (!branch || !headSha) return false;
+  const store = loadVerdictsStore(queueDir);
+  const perBranch = store[branch] || {};
+  // Deterministic verdicts never overwrite a chat/manual one for the same SHA.
+  const existing = perBranch[headSha];
+  if (existing && existing.source !== VERDICT_SOURCE) return false;
+  store[branch] = { ...perBranch, [headSha]: { verdict: 'discard', reasons: reasons.slice(), source: VERDICT_SOURCE, verifiedAt: nowIso } };
+  // Keep the newest 5 SHAs per branch (same cap as the Python store).
+  const shas = Object.keys(store[branch]);
+  if (shas.length > 5) {
+    const toDrop = shas.slice(0, shas.length - 5);
+    for (const s of toDrop) delete store[branch][s];
+  }
+  saveVerdictsStore(queueDir, store);
+  return true;
+}
+
+async function emitDiscardVerdictsForMergedReplacements({ pipelineDir, now = new Date(), dryRun = false } = {}) {
+  const summary = { checked: 0, emitted: [], skipped: 0 };
+  if (!pipelineDir) return summary;
+  const queueDir = path.join(pipelineDir, 'queue');
+  const statePath = path.join(queueDir, STATE_FILE);
+  const state = readJson(statePath) || { mergedDiscardsSeen: {} };
+  state.mergedDiscardsSeen = state.mergedDiscardsSeen || {};
+  const nowIso = now.toISOString();
+  const doneDir = path.join(queueDir, 'done');
+  let doneNames;
+  try { doneNames = (await fs.promises.readdir(doneDir)).filter((f) => f.endsWith('.json')); } catch { return summary; }
+  for (const name of doneNames) {
+    const filePath = path.join(doneDir, name);
+    const task = readJson(filePath);
+    if (!task || typeof task !== 'object') continue;
+    if (!task.supersededBy || typeof task.supersededBy !== 'object') continue;
+    const oldId = task.id;
+    if (state.mergedDiscardsSeen[oldId]) { summary.skipped += 1; continue; }
+    summary.checked += 1;
+    const branch = extractOldBranch(task);
+    if (!branch) { summary.skipped += 1; continue; }
+    const headSha = branchHeadSha(pipelineDir, branch);
+    if (!headSha) { summary.skipped += 1; continue; }
+    // Gate: only emit when the replacement's branch is merged onto origin/main (or origin/master).
+    const mainBranch = process.env.AGENT_MANAGER_MAIN_BRANCH || 'main';
+    if (!isBranchMerged(pipelineDir, branch, mainBranch)) { summary.skipped += 1; continue; }
+    // Build the rule-2 evidence line: hub label (if any), function/symbol, merge commit.
+    const hubLabel = task.hubLabel || task.promptContext && task.promptContext.hubLabel || '';
+    const mergeCommit = headSha.slice(0, 10);
+    const functionOrSymbol = (task.promptContext && task.promptContext.rawText)
+      ? String(task.promptContext.rawText).slice(0, 80).replace(/\s+/g, ' ').trim()
+      : '';
+    const reasons = [
+      `superseded by merged rival: ${hubLabel || '(no hub)'} (merge commit ${mergeCommit})`,
+      functionOrSymbol ? `original scope: ${functionOrSymbol}` : '',
+    ].filter(Boolean);
+    if (dryRun) {
+      summary.emitted.push({ id: oldId, branch, headSha, reasons });
+      continue;
+    }
+    const written = emitDiscardVerdictForBranch(queueDir, pipelineDir, branch, headSha, reasons, nowIso);
+    if (written) {
+      state.mergedDiscardsSeen[oldId] = nowIso;
+      summary.emitted.push({ id: oldId, branch, headSha, reasons });
+    } else {
+      summary.skipped += 1;
+    }
+  }
+  if (!dryRun) writeJson(statePath, state);
+  return summary;
+}
+
 async function sweepKnownFixedFailures({ pipelineDir, entries = KNOWN_FIXED, now = new Date(), dryRun = false } = {}) {
-  const summary = { checked: 0, requeued: [], skipped: 0, newEntries: [] };
+  const summary = { checked: 0, requeued: [], skipped: 0, newEntries: [], mergedDiscards: await emitDiscardVerdictsForMergedReplacements({ pipelineDir, now, dryRun }) };
   if (!enabled() || !pipelineDir) return summary;
   const queueDir = path.join(pipelineDir, 'queue');
   const statePath = path.join(queueDir, STATE_FILE);
@@ -172,7 +293,7 @@ async function sweepKnownFixedFailures({ pipelineDir, entries = KNOWN_FIXED, now
   return summary;
 }
 
-module.exports = { sweepKnownFixedFailures, stuckSince, destinationDir, freshShape, STATE_FILE };
+module.exports = { sweepKnownFixedFailures, stuckSince, destinationDir, freshShape, emitDiscardVerdictsForMergedReplacements, STATE_FILE };
 
 if (require.main === module) {
   const { getConfig } = require('./config.js');
