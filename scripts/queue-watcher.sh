@@ -557,6 +557,25 @@ while :; do
       echo $! > "$GRAPH_BUILD_LOCK"
     fi
 
+    # Pool sweep (2026-10-30, HUB0295): runs branch-defect-readmit-sweep.js, branch-conflict-readmit-sweep.js, and redo-supersede-sweep.js for each pool project. Kill switch AGENT_MANAGER_SWEEP_POOL=false.
+    AGENT_MANAGER_SWEEP_POOL=${AGENT_MANAGER_SWEEP_POOL:=true}
+    if [[ "${AGENT_MANAGER_SWEEP_POOL}" == "true" ]]; then
+      while IFS= read -r _pipe; do
+        [[ -n "$_pipe" ]] || continue
+        _env_args="$(node "${PACKAGE_SRC_DIR}/pool-projects.js" --env-args "$_pipe" apply 2>/dev/null)" || true
+        if [[ -z "$_env_args" ]]; then
+          printf '[watchdog] skipping pool project %s -- no env args returned\n' "$_pipe" >&2
+          continue
+        fi
+        for _sweep in branch-defect-readmit-sweep.js branch-conflict-readmit-sweep.js redo-supersede-sweep.js; do
+          _sweep_output="$(env $_env_args node "${PACKAGE_SRC_DIR}/${_sweep}" 2>/dev/null)" || true
+          echo "$_sweep_output" | grep -E '^(checked|observed|requeued|superseded)' | while IFS= read -r _line; do
+            printf '[watchdog] %s %s %s\n' "$_pipe" "$_sweep" "$_line" >&2
+          done
+        done
+      done < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --all 2>/dev/null)
+    fi
+
     # Idle-pool borrowing (docs/idle-pool-borrowing.md, step 4): housekeeping for the pool projects lanes borrow work from -- retries, hub
     # reconciliation, triage -- which the sweeps above only do for the ACTIVE project. Runs in the BACKGROUND (a pool project's sweeps take
     # tens of seconds and must never delay this tick's daemon supervision), one run at a time (flock), and each project is due at most every
