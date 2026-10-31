@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { planTargetGuard, isDeclaredCreateTarget } = require('./plan-target-guard.js');
+const { PLAN_TARGET_REASON_RE } = require('./lib/gate-readmit.js');
 
 function tmpRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plan-target-guard-'));
@@ -30,6 +31,42 @@ test('blocked:true + missing list when a declared target does not exist and is n
   assert.equal(r.blocked, true);
   assert.deepEqual(r.missing, ['src/phantom.js']);
   assert.match(r.reason, /^plan cites missing-file target\(s\): src\/phantom\.js$/);
+});
+
+// 2026-10-30: after a human decision exists on the task the block message says how to correct the target.
+const HINT = ' -- a human decision exists on this task: answer it again with a "Files:" line naming the real paths to correct the target';
+
+test('a blocked task WITHOUT a decision block keeps exactly the old reason', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Edit src/phantom.js to add a guard', promptContext: { rawText: 'Edit src/phantom.js.' } };
+  const r = planTargetGuard(task, 'EDIT `src/phantom.js` to add the guard.', repo, ['src']);
+  assert.equal(r.blocked, true);
+  assert.equal(r.reason, 'plan cites missing-file target(s): src/phantom.js');
+});
+
+test('the same blocked task WITH a decision block gets the hint appended and the same missing list', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Edit src/phantom.js to add a guard', promptContext: { rawText: 'Edit src/phantom.js.\n\nHUMAN DESIGN DECISION (answered directly from Chat, 2026-10-30):\nthe file moved\n' } };
+  const r = planTargetGuard(task, 'EDIT `src/phantom.js` to add the guard.', repo, ['src']);
+  assert.equal(r.blocked, true);
+  assert.deepEqual(r.missing, ['src/phantom.js']);
+  assert.equal(r.reason, 'plan cites missing-file target(s): src/phantom.js' + HINT);
+});
+
+test('the reason still matches the gate-readmit prefix regex with and without the hint', () => {
+  const repo = tmpRepo();
+  const plain = planTargetGuard({ title: 'Edit src/phantom.js' }, 'EDIT `src/phantom.js`.', repo, ['src']);
+  const decided = planTargetGuard({ title: 'Edit src/phantom.js', promptContext: { rawText: 'HUMAN DESIGN DECISION (x):\ny' } }, 'EDIT `src/phantom.js`.', repo, ['src']);
+  assert.match(plain.reason, PLAN_TARGET_REASON_RE);
+  assert.match(decided.reason, PLAN_TARGET_REASON_RE);
+});
+
+test('a decision block mentioned only in the title does not trigger the hint', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Edit src/phantom.js (see HUMAN DESIGN DECISION notes)', promptContext: { rawText: 'Edit src/phantom.js.' } };
+  const r = planTargetGuard(task, 'EDIT `src/phantom.js` to add the guard.', repo, ['src']);
+  assert.equal(r.blocked, true);
+  assert.equal(r.reason, 'plan cites missing-file target(s): src/phantom.js');
 });
 
 test('a plan that explicitly proposes CREATING the target is not flagged', () => {

@@ -103,10 +103,16 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
   const paths = missing.map((entry) => entry.claimedPath);
   return {
     blocked: true,
-    reason: 'plan cites missing-file target(s): ' + paths.join(', '),
+    reason: 'plan cites missing-file target(s): ' + paths.join(', ') + (hasHumanDecision(task) ? HUMAN_DECISION_HINT : ''),
     missing: paths,
   };
 }
+
+// 2026-10-30 (HUB0088-02 sat through six identical blocks after a human had corrected the path in prose): once the task already carries a
+// 'HUMAN DESIGN DECISION' block the operator needs to know the way out is a `Files:` line in the answer, which replaces the stale one.
+// Appended AFTER the comma-joined path list so consumers that match only the prefix (src/lib/gate-readmit.js PLAN_TARGET_REASON_RE) are unaffected.
+const HUMAN_DECISION_HINT = ' -- a human decision exists on this task: answer it again with a "Files:" line naming the real paths to correct the target';
+const hasHumanDecision = (task) => /HUMAN DESIGN DECISION/.test((task && task.promptContext && task.promptContext.rawText) || '');
 
 const taskTextOf = (task) => `${(task && task.title) || ''}\n${(task && task.promptContext && task.promptContext.rawText) || ''}`;
 
