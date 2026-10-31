@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 import os
+import re
 import subprocess
 
 # The app.py helpers these views call (ENV_FILE_PATH, PACKAGE_ROOT, QUEUE_STATES, SRC_DIR, _archive_task_file, _call_discuss, _discuss_provider_args, _files_touched_for, _incoming_task_links, _outgoing_task_links, _record_manual_requeue, _repeated_blocker_match, _task_cost_summary, _task_input_summary, _work_log_for, get_active_grep_dirs, get_active_repo_root, get_pipeline_dir, instances_dir, logger, queue_dir, read_env_file, read_json_safe) are
@@ -652,6 +653,28 @@ def api_task_resolve_clarification(task_id):
     return jsonify({"id": task_id, "resolved": True, "prefetchedPaths": data.get("promptContext", {}).get("prefetchedPaths")})
 
 
+_FILES_LINE_RE = re.compile(r"^Files:[ \t]*(\S[^\r\n]*)$", re.IGNORECASE | re.MULTILINE)
+
+
+def replace_files_line(raw_text, answer):
+    """(new_raw_text, replaced) -- mirrors replaceFilesLine in src/chat-task-requeue.js (2026-10-30). The LAST `Files:` line of the answer
+    replaces the FIRST `Files:` line of the task text, because src/adhoc-diff-sanity.js extractDeclaredFiles reads only the first one and every
+    guard trusts it. replaced is None or {"old": str, "new": str}. Nothing changes when the answer has no such line, when the task text has no
+    earlier one, or when the value is unchanged."""
+    text = raw_text or ""
+    found = _FILES_LINE_RE.findall(answer or "")
+    if not found:
+        return text, None
+    new = found[-1].strip()
+    earlier = _FILES_LINE_RE.search(text)
+    if not earlier:
+        return text, None
+    old = earlier.group(1).strip()
+    if old == new:
+        return text, None
+    return text[:earlier.start()] + f"Files: {new}" + text[earlier.end():], {"old": old, "new": new}
+
+
 @task_bp.route("/api/task/needs-clarification/<task_id>/answer", methods=["POST"])
 def api_task_answer_clarification(task_id):
     """Multiple-choice / free-text answer for a 'design-decision' held task -- Grimmethy,
@@ -679,7 +702,8 @@ def api_task_answer_clarification(task_id):
         abort(400, description="answer is required")
 
     data.setdefault("promptContext", {})
-    prior = data["promptContext"].get("rawText", "")
+    # A `Files:` line in the answer REPLACES the task's stale first one (same rule as the chat answer), so the guards read the corrected paths.
+    prior, files_replaced = replace_files_line(data["promptContext"].get("rawText", ""), answer)
     data["promptContext"]["rawText"] = prior + (
         f"\n\nHUMAN DESIGN DECISION (answered directly from the Needs Clarification "
         f"picker, {datetime.now(timezone.utc).isoformat()}):\n{answer}\n"
@@ -687,6 +711,11 @@ def api_task_answer_clarification(task_id):
         f"directly rather than re-asking for clarification."
     )
     _clean_slate_for_fresh_adhoc_attempt(data)
+    if files_replaced:
+        data.setdefault("history", []).append({
+            "stage": "files-line-replaced", "at": datetime.now(timezone.utc).isoformat(),
+            "detail": f'Files line replaced by the answer: "{files_replaced["old"]}" -> "{files_replaced["new"]}"',
+        })
     data.setdefault("history", []).append({
         "stage": "needs-clarification-resolved", "at": datetime.now(timezone.utc).isoformat(),
         "detail": "Answered directly from the dashboard's multiple-choice/Other picker -- requeued to adhoc/ for a fresh draft pass.",
