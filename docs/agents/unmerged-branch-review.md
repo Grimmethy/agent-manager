@@ -33,3 +33,11 @@ hub.** A hub's sub-tasks are frequently designed as a matched set, not independe
 See also: "Hub tasks: every sub-task must merge to `main` independently" in `AGENTS.md` for
 the separate mergeability rule this applies alongside (each sub-task still needs its own
 clean merge to `main` — this doc is about how to *review* them, not how they should land).
+
+## Which hub branches the tab lists (2026-10-31)
+
+The tab does not list a built piece of an unfinished hub: its branch is pushed, but held (`GET /api/git/held-hub-branches`, `?projects=all` for every project)
+until the hub is `readyToMerge`. Held: hubs whose source is `manual`, `derived_task` or `change_review_fix`, in any domain. Listed as before: function-length,
+performance and arch-review hubs (their pieces merge alone) and any hub that owns a branch. A hub with an **abandoned** piece is not ready (the piece is not
+shipped code, e.g. a wiring step): set `abandonedPiecesWaived: true` on the hub record to say "merge it anyway", or use merge-early on a held branch.
+Verify a held piece only when its hub is ready; before that it can only be a "hold".
