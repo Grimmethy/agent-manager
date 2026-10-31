@@ -2358,8 +2358,10 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
         })
 
     branches, held = partition_held_hub_branches(branches)
-    if not other:
-        with _branch_cache_lock:
+    with _branch_cache_lock:
+        if other:
+            _branch_cache.setdefault("held_other", {})[str(repo_root)] = held
+        else:
             _branch_cache["held"] = held
     _annotate_hub_sibling_conflicts(repo_root, branches)
     import branch_verdicts  # lazy: keeps app.py's import block untouched
@@ -2431,11 +2433,19 @@ def list_unmerged_branches(force=False):
     return branches
 
 
-def list_held_hub_groups():
-    """Hubs whose built children are pushed but not listed yet (see partition_held_hub_branches)."""
+def list_held_hub_groups(include_other_projects=False):
+    """Hubs whose built children are pushed but not listed yet (see partition_held_hub_branches). include_other_projects adds the groups the background
+    refresh found in every other registered project, each tagged with its `project` ({label, repoRoot}); a project not scanned yet contributes nothing."""
     list_unmerged_branches(force=False)
     with _branch_cache_lock:
-        return list(_branch_cache.get("held") or [])
+        groups = list(_branch_cache.get("held") or [])
+        others = dict(_branch_cache.get("held_other") or {})
+    if include_other_projects and others:
+        import branch_projects  # lazy, same as the listing route
+        for p in branch_projects.registered_projects(get_active_repo_root()):
+            if not p["active"]:
+                groups.extend({**g, "project": branch_projects.project_tag(p)} for g in others.get(str(p["repoRoot"]), []))
+    return groups
 
 
 def _invalidate_branch_cache(refetch=True):
