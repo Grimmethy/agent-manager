@@ -151,6 +151,43 @@ escalation with no re-admission mechanism matching. The concept card's telemetry
 its timeline are the live scoreboard — a debt entry stops recurring once you build the
 missing deterministic recovery.
 
+## Fourth principle: triggers, not polls — announce the change, don't re-check on a timer
+
+Grimmethy's standing design rule, learned developing games (Grimmethy/Elementals: `GameEvents`,
+`TileSignalComponent`, `GameClockComponent`) and now written down as ADR-0024 with its language-neutral
+home in the private repo `Grimmethy/triggers` (`docs/PRINCIPLE.md`, `docs/PRIMITIVES.md`, `spec/`).
+Polling re-asks "did anything change?" on a timer, once per consumer per tick. Measured here on
+2026-10-31: 31 distinct `node` scripts per watchdog tick, a shared spinning disk at 100% busy on ~7 MB/s
+of tiny reads, and `liveSiblingsOnBranch` parsing every queue file once per candidate. The rules:
+
+- **The writer announces.** Whatever changes state emits a named, past-tense event (a verdict recorded,
+  a branch merged, a task blocked). Consumers do not scan for it.
+- **One authority per concern, and everyone routes through it.** Queue transitions and time are not
+  re-implemented per sweep.
+- **Register, catch up once, then react.** A new consumer evaluates current state once, then acts on events.
+- **Edge by default.** Fire on transitions; repeating while a condition holds is opt-in.
+- **One clock.** Periodic work registers an interval; do not add a new sleep loop or per-script timer.
+- **Keep a slow reconcile and count what it finds.** A correction means a producer forgot to emit — fix
+  the producer. Zero corrections for weeks is the evidence the events are complete.
+- **Handles and teardown.** Every registration can be released.
+
+Existing precedents to extend, not duplicate: `queue/side-findings-inbox` + `src/side-finding-sweep.js`,
+`queue/context-log-inbox` + `src/context-log-sweep.js`, and `src/queue-cache.js`.
+
+```
+# WRONG: every pool project, every tick, 1 + 3 node launches each (32 projects ~ 128 launches)
+for pipe in $(node src/pool-projects.js --all); do run the three sweeps; done
+
+# RIGHT (src/pool-sweep-gate.js arrives with HUB0295 piece 5): ask once which projects changed, sweep only those
+for pipe in $(node src/pool-sweep-gate.js --due); do run the three sweeps; done
+```
+
+**Before adding any sweep, tick, poll or timer** answer in the change description: which event would
+make it unnecessary and why it cannot be emitted; what one pass costs when nothing changed (measure it);
+whether it registers with the shared clock instead of owning a timer; what its reconcile is and what the
+reconcile counter says; and whether it is edge-triggered on purpose. An unmeasured idle cost is not an
+answer. Stage plan and open questions: `docs/adr/0024-triggers-not-polls.md`.
+
 ## Hub tasks: every sub-task must merge to `main` independently
 
 Tracked as its own concept row (`concepts.json`, `concept-hub-task-integration-549f09` —
