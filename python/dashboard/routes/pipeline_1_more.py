@@ -406,9 +406,12 @@ def api_git_unmerged_branches():
         import branch_projects
         from app import get_active_repo_root
         branches, pending = branch_projects.combined_branches(branches, get_active_repo_root())
-    # Group branches by hub for the Unmerged Branches tab
-    grouped = groupBranchesByHub(branches)
-    resp = jsonify(grouped)
+    # Group branches by hub only when requested (opt-in); default is flat list for backward compatibility
+    if request.args.get("group") == "hub":
+        grouped = groupBranchesByHub(branches)
+        resp = jsonify(grouped)
+    else:
+        resp = jsonify(branches)
     resp.headers["X-Branch-Cache-Age"] = str(max(0, int(time.time() - filled))) if filled else "0"
     resp.headers["X-Branch-Projects-Pending"] = ",".join(pending)
     # The tab polls this every 15 s and the ~140 KB list is almost always unchanged: tag it so an unchanged list is answered with a body-less 304 (the browser revalidates by itself
