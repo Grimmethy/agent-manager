@@ -11,6 +11,8 @@ const { writeTaskLogFile, taskLogRelPath, taskComputeForLog } = require('../task
 require('../task-sources.js');
 const { TRIAGE_BRANCH, ungatedMainPushAllowed } = require('./main-push-policy.js');
 const { coAuthorTrailer, usesGroupB, applyCandidateSplit, writeArtifact, closeOriginatingBrainDumpEntry, assertStageableFiles } = require('./apply-core.js');
+const { dedupe } = require('./candidate-dedupe.js');
+const { recordBranchRemoval } = require('../branch-removal-ledger.js');
 
 // The shared checkout must never be left on the triage branch. That branch is based on whatever main was when it was first created and is only brought up to date by merging main in on the next apply tick (never rebased: a rewritten branch was never pushed and looped, see git-runner.js prepareStackedBranch), so a
 // checkout parked on it (2026-09-20, PF: 4 h, 40 commits behind main) makes every read of "the repo" (plan grounding, review's live content, the staleness
@@ -30,7 +32,7 @@ function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, 
 
 function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBrainDir, brainDumpPath, gitRunner, state }) {
   const results = {};
-  const eligible = [];
+  let eligible = [];
   for (const task of tasks) {
     const reg = getRegisteredSource(resolveSourceName(task));
     if (reg && reg.directToMain === true) {
@@ -40,6 +42,29 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
     }
   }
   if (eligible.length === 0) return { results, committed: false };
+
+  // Within-batch dedupe: drop candidates whose file+identifier matches another in this batch.
+  // Writes each removal to queue/branch-removals.jsonl with the required fields.
+  const deduped = dedupe(eligible, null, { mode: 'within-batch' });
+  if (deduped.removals && deduped.removals.length > 0) {
+    for (const r of deduped.removals) {
+      console.error(`[apply-main-batch] within-batch dedupe: removing ${r.duplicateCandidate.id} (duplicate of ${r.originalCandidate.id}): ${r.reason}`);
+      const dupTask = r.duplicateCandidate;
+      const keptTask = r.originalCandidate;
+      // Ledger entry: cause=superseded-by-requeue, detail=dedupe reason, actor=apply-main-batch, branch=kept candidate's branch.
+      const branch = keptTask.branch || keptTask.id;
+      recordBranchRemoval(pipelineDir, {
+        branch,
+        taskId: dupTask.id,
+        cause: 'superseded-by-requeue',
+        detail: r.reason,
+        actor: 'apply-main-batch',
+        now: new Date(r.timestamp),
+      });
+    }
+    eligible = deduped.candidates;
+    if (eligible.length === 0) return { results, committed: false };
+  }
 
   // Gated (default): append onto the rolling TRIAGE_BRANCH, never main -- see main-push-policy.js.
   // prepareStackedBranch syncs it from origin if it exists (earlier unmerged batches stay on it),
