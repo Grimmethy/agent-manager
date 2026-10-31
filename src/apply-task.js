@@ -190,6 +190,29 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       return { succeeded: true, doneMarker: `closed brain-dump entry ${entryId}` };
     }
 
+    // brain_dump_resolution_check records a verdict on ONE brain-dump entry (HUB0274-05). Same non-git shape as brain_dump_disposition: its target is
+    // brain-dump.json under brainDumpPath, not a repo file. FLAG ONLY: it stamps entry.resolutionCheck (and entry.possiblyResolved for a validated yes)
+    // and never changes status, suppressed or rawText. An entry that is gone or whose text changed since the task was drafted is a safe skip.
+    if (task.domain === 'brain_dump_resolution_check') {
+      const { parseVerdictResponse, recordResolutionVerdict } = require('./brain-dump-resolution-check.js');
+      const { validateResolutionVerdict } = require('./validate-resolution.js');
+      const { loadBrainDump } = require('./apply-group-a-brain-dump.js');
+      const { writeJsonAtomicSync } = require('./atomic-write.js');
+      const ctx = task.promptContext || {};
+      const data = loadBrainDump(brainDumpPath);
+      const entry = data.entries.find((e) => e && e.id === ctx.brainDumpEntryId);
+      if (!entry) return { skipped: true, reason: `brain_dump_resolution_check: entry ${ctx.brainDumpEntryId} is gone -- nothing recorded` };
+      if (entry.rawText !== ctx.rawText) return { skipped: true, reason: `brain_dump_resolution_check: entry ${entry.id} changed since this check was drafted -- nothing recorded` };
+      const parsed = parseVerdictResponse(task.implementResponse);
+      const checked = validateResolutionVerdict(parsed, parsed.evidence, ctx.evidencePack);
+      recordResolutionVerdict({
+        entries: data.entries, entryId: entry.id, verdict: checked.resolved, evidence: checked.evidence,
+        masterSha: ctx.masterSha, citedShas: ctx.citedShas,
+      });
+      writeJsonAtomicSync(brainDumpPath, data);
+      return { succeeded: true, doneMarker: `resolution check ${entry.id}: ${checked.resolved}` };
+    }
+
     // project_search's target (UsefulProjectIndex/INDEX.md) lives OUTSIDE any project's
     // repo root by design (see ADR-0018) -- a non-git write, same shape as the secondbrain
     // path above, not the git-branch-diff flow below.

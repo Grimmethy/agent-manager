@@ -24,6 +24,7 @@ const { statedAcceptanceBlock, fixedLiteralsBlock, priorRejectionBlock, priorVer
 const { assemblePrompt } = require('./lib/prompt-assembly.js');
 const { troubleLogPlanPrompt, secondbrainPlanPrompt, brainDumpSortPlanPrompt, pathPrefetchResolvePlanPrompt, researchPlanPrompt, pipelineSelfAuditPlanPrompt, pipelineHealthAuditPlanPrompt, uiVisibilityAuditPlanPrompt, stalenessAuditPlanPrompt, productSpecPlanPrompt, backlogDecompositionPlanPrompt } = require('./lib/prompt-planning.js');
 const { pathPrefetchResolveImplementPrompt, deepDiveImplementPrompt, backlogDecompositionImplementPrompt, brainDumpSortImplementPrompt } = require('./lib/prompt-implementation.js');
+const { resolutionCheckPlanPrompt, resolutionCheckImplementPrompt } = require('./lib/prompt-resolution-check.js');
 
 function truncate(str, max) {
   if (!str) return '';
@@ -1589,6 +1590,7 @@ updateTaskSource('trouble_log', { buildPlanPrompt: troubleLogPlanPrompt, buildIm
 // plan/implement prompt pair now instead of reaching for archReviewPlanPrompt here.
 updateTaskSource('secondbrain', { buildPlanPrompt: secondbrainPlanPrompt });
 updateTaskSource('brain_dump_sort', { buildPlanPrompt: brainDumpSortPlanPrompt, buildImplementPrompt: brainDumpSortImplementPrompt });
+updateTaskSource('brain_dump_resolution_check', { buildPlanPrompt: resolutionCheckPlanPrompt, buildImplementPrompt: resolutionCheckImplementPrompt });
 updateTaskSource('path_prefetch_resolve', { buildPlanPrompt: pathPrefetchResolvePlanPrompt, buildImplementPrompt: pathPrefetchResolveImplementPrompt });
 // apply is NOT set here (unlike most of this file's other updateTaskSource calls) --
 // 'adhoc' already got apply: applyAdhocDiff at its own registerTaskSource() call in
