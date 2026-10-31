@@ -20,6 +20,32 @@ const fs = require('fs');
 const path = require('path');
 const { findExistingWorkForEntry } = require('./brain-dump-existing-work.js');
 const { checkEntryTargets } = require('./brain-dump-target-check.js');
+const { writeJsonAtomicSync } = require('./atomic-write.js');
+
+// Tolerant reader for the brain-dump JSON file. The real shape is
+//   { "entries": [...], <other-top-level-keys> }
+// but older fixtures / unit tests may still ship a bare array. Accept both:
+//   - object with an `entries` array  -> use result
+//   - bare array                      -> wrap in { entries: <array> }
+//   - anything else                   -> throw
+function readBrainDumpRaw(filePath) {
+  const raw = fs.readFileSync(filePath, 'utf8');
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`brain-dump JSON parse error at ${filePath}: ${err.message}`);
+  }
+  if (Array.isArray(parsed)) {
+    // Legacy bare-array shape: keep entries, remember we should write back as bare array.
+    return { entries: parsed, _shape: 'bare-array' };
+  }
+  if (parsed && typeof parsed === 'object' && Array.isArray(parsed.entries)) {
+    // Real wrapper shape: keep the full object so extra top-level keys survive a write.
+    return { entries: parsed.entries, _shape: 'wrapped', _full: parsed };
+  }
+  throw new Error(`brain-dump JSON at ${filePath} does not contain an array`);
+}
 
 // Mirror python/dashboard/app.py's brain_dump_path() logic (line 689):
 //   1. AGENT_MANAGER_BRAIN_DUMP_PATH env var (highest priority)
@@ -60,24 +86,9 @@ function reconcileBrainDumpEntries(options) {
     throw new Error('Cannot determine brain-dump path: no active project configured');
   }
 
-  // 1. Read and parse JSON -- throw on parse error with path
-  let entries;
-  try {
-    const raw = fs.readFileSync(brainDumpPath, 'utf8');
-    entries = JSON.parse(raw);
-  } catch (err) {
-    if (err.code === 'ENOENT') {
-      throw new Error(`brain-dump JSON not found at ${brainDumpPath}`);
-    }
-    if (err instanceof SyntaxError) {
-      throw new Error(`brain-dump JSON parse error at ${brainDumpPath}: ${err.message}`);
-    }
-    throw err;
-  }
-
-  if (!Array.isArray(entries)) {
-    throw new Error(`brain-dump JSON at ${brainDumpPath} does not contain an array`);
-  }
+  // 1. Read and parse JSON -- tolerant of { "entries": [...] } or bare array
+  const store = readBrainDumpRaw(brainDumpPath);
+  const entries = store.entries;
 
   const counts = { actioned: 0, possiblyResolved: 0, checked: 0 };
   const changes = [];
@@ -159,11 +170,12 @@ function reconcileBrainDumpEntries(options) {
   }
 
   // 7. Write back atomically when not dryRun (only if there were changes)
+  //    Preserve the original top-level shape: wrapped objects keep all keys,
+  //    legacy bare arrays stay as bare arrays (existing tests expect this).
   if (!dryRun && changes.length > 0) {
     try {
-      const tmpPath = brainDumpPath + '.tmp.' + process.pid;
-      fs.writeFileSync(tmpPath, JSON.stringify(entries, null, 2), 'utf8');
-      fs.renameSync(tmpPath, brainDumpPath);
+      const payload = store._shape === 'wrapped' ? store._full : entries;
+      writeJsonAtomicSync(brainDumpPath, payload);
     } catch (err) {
       logger.warn(`Failed to write brain-dump JSON to ${brainDumpPath}: ${err.message}`);
       throw new Error(`brain-dump write failure at ${brainDumpPath}: ${err.message}`);
