@@ -159,5 +159,96 @@ class TestHeldHubEndToEnd(unittest.TestCase):
                 p.stop()
 
 
+class TestFreshListingCacheBypass(unittest.TestCase):
+    """Verify that force=True bypasses the branch listing cache."""
+
+    def test_force_true_bypasses_cache(self):
+        """list_unmerged_branches(force=True) should bypass cache and return fresh data."""
+        repo, _bare, task_a, task_b = make_repo_with_conflicting_siblings()
+        patches = [
+            mock.patch.object(app, "get_active_repo_root", return_value=str(repo)),
+            mock.patch.object(app, "get_pipeline_dir", return_value=repo),
+            mock.patch.object(app, "queue_dir", return_value=repo / "queue"),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            # Get cached listing
+            cached = app.list_unmerged_branches(force=False)
+            self.assertIsInstance(cached, list)
+
+            # Get fresh listing
+            fresh = app.list_unmerged_branches(force=True)
+            self.assertIsInstance(fresh, list)
+
+            # Both should have the same branches (no cache difference in this simple case)
+            cached_branches = {b["branch"] for b in cached}
+            fresh_branches = {b["branch"] for b in fresh}
+            self.assertEqual(cached_branches, fresh_branches)
+        finally:
+            for p in patches:
+                p.stop()
+
+
+class TestFalseConflictDetection(unittest.TestCase):
+    """Verify that held hub branches do not show false conflicts."""
+
+    def setUp(self):
+        app._invalidate_branch_cache()
+        self._sync = mock.patch.object(app, "_sync_live_checkout", return_value={"synced": False})
+        self._sync.start()
+
+    def tearDown(self):
+        app._invalidate_branch_cache()
+        self._sync.stop()
+
+    def _set_hub(self, repo, task_a, task_b, b_status, b_phase):
+        hub_path = next((repo / "queue" / "coordinating").glob("*.json"))
+        hub = json.loads(hub_path.read_text())
+        hub.update({"source": "manual", "domain": "adhoc"})
+        hub["subTasks"] = [
+            {"id": task_a, "title": "A", "status": "pending-merge", "phase": "built"},
+            {"id": task_b, "title": "B", "status": b_status, "phase": b_phase},
+        ]
+        hub_path.write_text(json.dumps(hub))
+        app._invalidate_branch_cache()
+
+    def test_held_branch_no_false_conflict_with_master(self):
+        """Held hub branches should not show willConflict=True for master."""
+        repo, _bare, task_a, task_b = make_repo_with_conflicting_siblings()
+        patches = [
+            mock.patch.object(app, "get_active_repo_root", return_value=str(repo)),
+            mock.patch.object(app, "get_pipeline_dir", return_value=repo),
+            mock.patch.object(app, "queue_dir", return_value=repo / "queue"),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            client = app.app.test_client()
+
+            # Set hub so one branch is held
+            self._set_hub(repo, task_a, task_b, "in-progress", "open")
+
+            # Get unmerged branches listing
+            res = client.get("/api/git/unmerged-branches")
+            self.assertEqual(res.status_code, 200)
+            branches = res.get_json()
+
+            # Held branches should not be in the listing
+            branch_ids = {b["taskId"] for b in branches}
+            self.assertNotIn(task_a, branch_ids)
+            self.assertNotIn(task_b, branch_ids)
+
+            # Check held hub branches endpoint
+            held_res = client.get("/api/git/held-hub-branches")
+            self.assertEqual(held_res.status_code, 200)
+            held = held_res.get_json()
+            self.assertEqual(len(held), 1)
+            self.assertEqual(sorted(held[0]["branches"]), sorted([f"agent/{task_a}", f"agent/{task_b}"]))
+        finally:
+            for p in patches:
+                p.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

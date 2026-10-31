@@ -6,6 +6,8 @@ Tests that:
 - After listing refresh with matching SHA, verdict is applied and pending file removed
 - After listing refresh with different SHA, pending verdict is dropped
 - A branch unknown to origin still returns 404
+- No /fake/repo-* directories are created in the working tree
+- PermissionError is handled gracefully for non-root users
 
 Run: /media/model-cache/github/agent-manager/.venv/bin/python -m unittest python.dashboard.tests.test_branch_verdicts_pending
 """
@@ -391,6 +393,76 @@ class TestPendingVerdictRoute(unittest.TestCase):
         # Verify no pending file was written
         pending = bvp.get_pending_verdict(str(self.q), "agent/feature-x")
         self.assertIsNone(pending)
+
+
+class TestNoFakeDirectories(unittest.TestCase):
+    """Verify that test execution does not create /fake/repo-* directories."""
+
+    def test_no_fake_repo_directories_created(self):
+        """After running pending verdict tests, verify no /fake/repo-* directories exist in working tree."""
+        # Run the pending verdict tests
+        suite = unittest.TestLoader().loadTestsFromTestCase(TestPendingVerdicts)
+        runner = unittest.TextTestRunner(verbosity=0)
+        result = runner.run(suite)
+        self.assertTrue(result.wasSuccessful(), f"Tests failed: {result.failures}")
+
+        # Check working tree for /fake/repo-* directories
+        working_tree = Path(".").resolve()
+        fake_dirs = list(working_tree.glob("**/fake/repo-*"))
+        self.assertEqual(
+            fake_dirs, [],
+            f"Found unexpected /fake/repo-* directories: {[str(d) for d in fake_dirs]}"
+        )
+
+
+class TestPermissionErrorHandling(unittest.TestCase):
+    """Verify PermissionError is handled gracefully."""
+
+    def test_pending_verdict_with_unwritable_dir(self):
+        """When queue dir is unwritable, store_pending_verdict should handle gracefully."""
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_dir = Path(tmp) / "unwritable"
+            queue_dir.mkdir()
+            # Make directory read-only
+            queue_dir.chmod(0o555)
+
+            try:
+                # This should raise or handle the error, not crash
+                with self.assertRaises((PermissionError, OSError)):
+                    bvp.store_pending_verdict(str(queue_dir), "test-branch", "sha123", "merge", [], "manual")
+            finally:
+                # Restore permissions for cleanup
+                queue_dir.chmod(0o755)
+
+    def test_apply_pending_verdicts_with_unreadable_pending_dir(self):
+        """When pending dir exists but is unreadable, apply_pending_verdicts should handle gracefully."""
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_dir = Path(tmp)
+            pending_dir = queue_dir / "pending_verdicts"
+            pending_dir.mkdir()
+
+            # Create a pending file
+            (pending_dir / "test_branch.json").write_text('{"branch": "test", "headSha": "abc123"}')
+
+            # Make pending dir unreadable
+            pending_dir.chmod(0o000)
+
+            try:
+                # This should handle the error gracefully
+                def mock_list_unmerged_branches(force=False):
+                    return []
+
+                # Should not raise, just skip unreadable files
+                bvp.apply_pending_verdicts(
+                    str(queue_dir),
+                    "/fake/repo",
+                    mock_list_unmerged_branches,
+                    run_git,
+                    bv,
+                )
+            finally:
+                # Restore permissions for cleanup
+                pending_dir.chmod(0o755)
 
 
 if __name__ == "__main__":
