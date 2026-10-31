@@ -59,12 +59,12 @@ test('a seeded day gets exactly one row that passes the real validator, with the
   assert.deepEqual(row.items, { released: [], held: [], filed: [] });
 });
 
-test('the real schema rejects null for the fields that are not measured, so they are written as 0 and listed as unknown', () => {
+test('the real schema accepts null on the four allowNull fields, and the backfill still writes 0 for unknown fields', () => {
   const { dir, dbPath } = seeded();
   backfill({ pipelineDir: dir, dbPath, from: DAY, to: DAY, now: NOW, log: quiet });
   const row = readRows(dir)[0];
-  assert.equal(validateRow({ ...row, metric: { name: 'backfill', before: null, after: null } }).ok, false, 'a null metric is invalid in the real schema');
-  assert.equal(validateRow({ ...row, cost: { ...row.cost, gpu_minutes: null } }).ok, false);
+  assert.equal(validateRow({ ...row, metric: { name: 'backfill', before: null, after: null } }).ok, true, 'a null metric is valid in the real schema');
+  assert.equal(validateRow({ ...row, cost: { ...row.cost, gpu_minutes: null } }).ok, true);
   assert.deepEqual(row.verdict.inputs.unknown_fields, ['metric.before', 'metric.after', 'cost.gpu_minutes', 'cost.peak_ram_mb']);
   assert.equal(row.metric.before, 0);
   assert.match(row.note, /not measured and are written as 0/);

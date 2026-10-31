@@ -100,16 +100,16 @@ const HEALTH_LEDGER_ROW_SCHEMA = {
       required: ['name', 'before', 'after'],
       fields: {
         name: { type: 'string' },
-        before: { type: 'number' },
-        after: { type: 'number' },
+        before: { type: 'number', allowNull: true },
+        after: { type: 'number', allowNull: true },
       },
     },
     cost: {
       type: 'object',
       required: ['gpu_minutes', 'peak_ram_mb', 'model_calls'],
       fields: {
-        gpu_minutes: { type: 'number' },
-        peak_ram_mb: { type: 'number' },
+        gpu_minutes: { type: 'number', allowNull: true },
+        peak_ram_mb: { type: 'number', allowNull: true },
         model_calls: { type: 'number' },
       },
     },
@@ -209,10 +209,10 @@ function validateRow(obj) {
       if (typeof obj.metric.name !== 'string') {
         errors.push('metric.name must be a string');
       }
-      if (typeof obj.metric.before !== 'number') {
+      if (obj.metric.before !== null && typeof obj.metric.before !== 'number') {
         errors.push('metric.before must be a number');
       }
-      if (typeof obj.metric.after !== 'number') {
+      if (obj.metric.after !== null && typeof obj.metric.after !== 'number') {
         errors.push('metric.after must be a number');
       }
     }
@@ -223,10 +223,10 @@ function validateRow(obj) {
     if (typeof obj.cost !== 'object' || obj.cost === null || Array.isArray(obj.cost)) {
       errors.push('cost must be an object');
     } else {
-      if (typeof obj.cost.gpu_minutes !== 'number') {
+      if (obj.cost.gpu_minutes !== null && typeof obj.cost.gpu_minutes !== 'number') {
         errors.push('cost.gpu_minutes must be a number');
       }
-      if (typeof obj.cost.peak_ram_mb !== 'number') {
+      if (obj.cost.peak_ram_mb !== null && typeof obj.cost.peak_ram_mb !== 'number') {
         errors.push('cost.peak_ram_mb must be a number');
       }
       if (typeof obj.cost.model_calls !== 'number') {
