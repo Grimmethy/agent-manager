@@ -223,6 +223,11 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   loadSourceRegistry();
   const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
   const { DEFAULT_HUB_ORDER } = require('./hub-priority.js');
+  // Per-scan cache: lanes.json and dashboard-settings.json are read exactly once
+  // via scanContext (opts.scanContext or createScanContext() default), not per
+  // candidate task. The scanContext carries { lanes, dashboardSettings, loaded }.
+  const { createScanContext } = require('./scan-config-cache.js');
+  const scanContext = opts.scanContext || createScanContext();
 
   // <queue>/pending -> pipelineDir (hub-priority.js re-joins queue/coordinating itself).
   const pipelineDir = path.join(pendingDir, '..', '..');
@@ -238,7 +243,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   // The whole lane list, kept for the lane-avoidance check below (is there anywhere ELSE this task can go?). [] on any error = never avoid.
   let claimLanes = [];
   try {
-    const allLanes = opts.lanes || require('./lanes.js').getLanes();
+    const allLanes = scanContext.lanes || opts.lanes || require('./lanes.js').getLanes();
     claimLanes = allLanes;
     laneCount = allLanes.length;
     thisLane = allLanes.find((l) => l.id === instanceId) || null;
@@ -293,7 +298,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
         let probe = false;
         if (routing.cfg.mode !== 'off') {
           try {
-            probe = capRouting.probeSelected({ task, source: sourceName, registered: getRegisteredSource(sourceName), lane: thisLane, lanes: opts.lanes || require('./lanes.js').getLanes(), rows: routing.rows(), cfg: routing.cfg, degraded: opts.laneDegraded ? opts.laneDegraded(thisLane.id) : require('./lane-health.js').laneDegraded(routing.instancesDir, thisLane.id) });
+            probe = capRouting.probeSelected({ task, source: sourceName, registered: getRegisteredSource(sourceName), lane: thisLane, lanes: scanContext.lanes || opts.lanes || require('./lanes.js').getLanes(), rows: routing.rows(), cfg: routing.cfg, degraded: opts.laneDegraded ? opts.laneDegraded(thisLane.id) : require('./lane-health.js').laneDegraded(routing.instancesDir, thisLane.id) });
           } catch (_) { probe = false; }
         }
         if (!probe) continue;
@@ -311,7 +316,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     if (task && thisLane && routing.cfg.mode !== 'off' && !task.humanQueued && !task.premiumPriority) {
       let srcName = null;
       try { srcName = resolveSourceName(task); } catch (_) { srcName = null; }
-      const allLanes = opts.lanes || (() => { try { return require('./lanes.js').getLanes(); } catch (_) { return []; } })();
+      const allLanes = scanContext.lanes || opts.lanes || (() => { try { return require('./lanes.js').getLanes(); } catch (_) { return []; } })();
       const decision = require('./capability-routing.js').decideReservation({
         source: srcName, thisLane, lanes: allLanes, rows: routing.rows(), ageMs: (opts.now !== undefined ? opts.now : Date.now()) - mtimeMs, cfg: routing.cfg,
         isAlive: (id) => (opts.laneAlive ? opts.laneAlive(id) : require('./capability-routing.js').laneAliveFromHeartbeat(routing.instancesDir, id)),
