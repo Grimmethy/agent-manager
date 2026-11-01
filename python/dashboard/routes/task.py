@@ -8,6 +8,8 @@ import re
 import subprocess
 import tempfile
 
+from project_scope import resolve_task_across_projects, TaskNotFoundError
+
 # The app.py helpers these views call (ENV_FILE_PATH, PACKAGE_ROOT, QUEUE_STATES, SRC_DIR, _archive_task_file, _call_discuss, _discuss_provider_args, _files_touched_for, _incoming_task_links, _outgoing_task_links, _record_manual_requeue, _repeated_blocker_match, _task_cost_summary, _task_input_summary, _work_log_for, get_active_grep_dirs, get_active_repo_root, get_pipeline_dir, instances_dir, logger, queue_dir, read_env_file, read_json_safe) are
 # imported lazily inside each view: app.py imports THIS module to register the
 # blueprint, so a top-level `from app import ...` is a circular import that only
@@ -79,26 +81,25 @@ def _clean_slate_for_fresh_adhoc_attempt(data):
 
 @task_bp.route("/api/task/<state>/<task_id>")
 def api_task_detail(state, task_id):
-    from app import QUEUE_STATES, _files_touched_for, _incoming_task_links, _outgoing_task_links, _task_cost_summary, _task_input_summary, _work_log_for, queue_dir, read_json_safe
-    qdir = queue_dir()
-    if not qdir:
+    from app import QUEUE_STATES, _files_touched_for, _incoming_task_links, _outgoing_task_links, _task_cost_summary, _task_input_summary, _work_log_for, get_active_repo_root, queue_dir, read_json_safe
+    import branch_projects
+
+    # Parse ?project= query param and pass as project_hint to resolve_task_across_projects
+    project = request.args.get("project")
+    active_root = get_active_repo_root()
+    projects_list = branch_projects.registered_projects(active_root)
+    projects = {}
+    for p in projects_list:
+        label = p.get("label")
+        qdir_path = p.get("pipelineDir")
+        if label and qdir_path:
+            projects[label] = {"qdir": Path(qdir_path) / "queue", "repoRoot": p.get("repoRoot", "")}
+
+    try:
+        data = resolve_task_across_projects(task_id=task_id, project_hint=project, projects=projects)
+    except TaskNotFoundError:
         abort(404)
 
-    if state == "drafting":
-        drafting_root = qdir / "drafting"
-        if drafting_root.is_dir():
-            for candidate in drafting_root.rglob(f"{task_id}.json"):
-                data = read_json_safe(candidate)
-                if data:
-                    return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id), "_incomingLinks": _incoming_task_links(task_id), "_outgoingLinks": _outgoing_task_links(task_id)})
-        abort(404)
-
-    if state not in QUEUE_STATES:
-        abort(404)
-    f = qdir / state / f"{task_id}.json"
-    data = read_json_safe(f)
-    if not data:
-        abort(404)
     return jsonify({**data, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id), "_incomingLinks": _incoming_task_links(task_id), "_outgoingLinks": _outgoing_task_links(task_id)})
 
 
