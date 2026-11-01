@@ -306,11 +306,33 @@ function findSymbolCoveringTests(repoRoot, changedFiles, symbols) {
   return res;
 }
 
-// The primary (file-name based) finder first; only when it finds NOTHING, fall back to tests that mention the changed symbols.
+// 2026-11-01: the UNION of the file-name/importer finder and the tests that merely mention the changed symbols. It used to be primary-or-fallback: a good diff
+// adds or edits the test of its own file, so the primary finder always found something and the symbol finder never ran, which hid regressions in other
+// files' tests (src/context-trim-sweep.test.js 14/14 -> 14/17 and test_chat_turn_timings, both missed, both approved by the voters). The extras land in the
+// DEPENDENTS tier (splitCoveringTiers: they are not the changed file's own tests), so a slow one is only unverified, never a reason to discard the primary
+// result, and a failing one still counts. Capped by AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX (default 6, 0 turns the extras off).
+function extraCoveringMax(env = process.env) {
+  const v = parseInt(env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX, 10);
+  return Number.isInteger(v) && v >= 0 ? v : 6;
+}
+
 function findTestsWithSymbolFallback(repoRoot, changedFiles, diff) {
   const primary = findAffectedTestFiles(repoRoot, changedFiles);
-  if (primary.js.length || primary.py.length) return primary;
-  return findSymbolCoveringTests(repoRoot, changedFiles, extractChangedSymbols(diff));
+  const max = extraCoveringMax();
+  if (max === 0) return primary.js.length || primary.py.length ? primary : findSymbolCoveringTests(repoRoot, changedFiles, extractChangedSymbols(diff));
+  const symbol = findSymbolCoveringTests(repoRoot, changedFiles, extractChangedSymbols(diff));
+  const merge = (have, extra) => {
+    const out = [...have];
+    let added = 0;
+    for (const f of extra) {
+      if (out.includes(f)) continue;
+      if (have.length && added >= max) break;          // with no primary tests at all the symbol finder keeps its own cap, as before
+      out.push(f);
+      added += 1;
+    }
+    return out;
+  };
+  return { js: merge(primary.js, symbol.js), py: merge(primary.py, symbol.py) };
 }
 
 // The repo files a classified command targets (node --test/--check paths, python -m py_compile paths, python -m unittest module names), so the
@@ -754,13 +776,20 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 
     // 2a. Dependent tier: tests that only import a changed module. Run with whatever budget is left; a timeout or exhausted budget is
     // reported (result.tests.dependentsUnverified), never a reason for inconclusive. A real failure goes through the same base attribution.
+    // 2026-11-01: ONE process per dependent file (cheapest first), like the primary tier. They used to run as one `node --test a b c` call, so a single
+    // file that also fails on the base in this sandbox made the whole group unattributable and a REAL regression in a sibling file (src/context-trim-sweep.test.js,
+    // 14/14 -> 14/17 on the red-test branch) was reported only as 'unverified'.
     if (result.tests && depSuites.length) {
+      const depSizeOf = (f) => { try { return fs.statSync(path.join(worktreeDir, f)).size; } catch { return 0; } };
       for (const s of depSuites) {
-        const r = runOne(s.bin, s.buildArgs(s.files), TEST_TIMEOUT_MS, { tolerateTimeout: true, cwd: s.cwd });
-        if (!r.ran) continue;
-        result.tests.dependents = [...(result.tests.dependents || []), ...s.files];
-        if (r.timedOut) { result.tests.dependentsUnverified = [...(result.tests.dependentsUnverified || []), ...s.files]; continue; }
-        if (r.exitCode !== 0) failedSuites.push({ s, dependent: true, names: s.parse(r.output), raw: r.output, missing: r.missingModules || [] });   // result.tests.passed is only touched once the failure is attributed to the diff
+        for (const file of [...s.files].sort((a, b) => depSizeOf(a) - depSizeOf(b))) {
+          const one = { ...s, files: [file] };
+          const r = runOne(s.bin, one.buildArgs(one.files), TEST_TIMEOUT_MS, { tolerateTimeout: true, cwd: s.cwd });
+          if (!r.ran) continue;
+          result.tests.dependents = [...(result.tests.dependents || []), file];
+          if (r.timedOut) { result.tests.dependentsUnverified = [...(result.tests.dependentsUnverified || []), file]; continue; }
+          if (r.exitCode !== 0) failedSuites.push({ s: one, dependent: true, names: s.parse(r.output), raw: r.output, missing: r.missingModules || [] });   // result.tests.passed is only touched once the failure is attributed to the diff
+        }
       }
     }
 
@@ -883,6 +912,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 }
 
 module.exports = {
+  extraCoveringMax,
   pythonTestArgs, checkChangedFilesSyntax, splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
   verifyDiff, addedTestNames, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS,
