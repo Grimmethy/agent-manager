@@ -405,6 +405,20 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     }
 
     if (artifact && artifact.skipped) {
+      // HUB0306 2/2: a stacked hub child whose diff came back empty must NOT be
+      // silently marked done -- it needs a human to decide whether to drop the piece,
+      // reschedule, or merge it away. Block it via recordApplyOutcome's existing
+      // { succeeded:false, reason, status:'needs-clarification' } path so it lands in
+      // queue/awaiting-confirm/ with a clear reason, same as any other human-gated
+      // hold. Plain (non-stacked) empty-diff tasks keep the old "succeeded:true"
+      // behavior: they are standalone no-ops, not hub pieces that freeze the chain.
+      if (artifact.emptyDiff === true && task && task.stacked) {
+        abandonBranch();
+        closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
+        const outcome = { succeeded: false, reason: artifact.reason, status: 'needs-clarification' };
+        recordApplyOutcome(task, outcome);
+        return outcome;
+      }
       abandonBranch();
       closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
       return { succeeded: true, doneMarker: artifact.reason };
