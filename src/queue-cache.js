@@ -26,6 +26,8 @@ const crypto = require('crypto');
 const REVALIDATE_MS = 60000;
 const RACY_MS = 2000;
 const CACHE_VERSION = 1;
+const SNAPSHOT_TTL_MS = 30000;
+const SCAN_DIRS = ['done', 'review', 'approved', 'pending', 'adhoc', 'blocked', 'needs-clarification', 'awaiting-confirm', 'drafting'];
 
 function cacheDisabled() {
   return /^false$/i.test(String(process.env.AGENT_MANAGER_QUEUE_CACHE || '').trim());
@@ -166,4 +168,68 @@ function readTaskCached(cache, fullPath) {
   return { task: read.task, mtimeMs: read.mtimeMs };
 }
 
-module.exports = { openQueueCache, readTaskCached, cacheFileFor, REVALIDATE_MS, RACY_MS };
+// Build a snapshot of all queue stages by reading every .json file in SCAN_DIRS once.
+// Returns { <state>: { files: { <filename>: { content, mtimeMs, size } }, mtime: <dirMtimeMs> } }
+// for each state in SCAN_DIRS.
+function buildQueueSnapshot(pipelineDir) {
+  if (!pipelineDir) return {};
+  const snapshot = {};
+  const now = Date.now();
+  for (const state of SCAN_DIRS) {
+    const dir = state === 'drafting'
+      ? path.join(pipelineDir, 'queue', 'drafting')
+      : path.join(pipelineDir, 'queue', state);
+    try {
+      const dirStat = fs.statSync(dir);
+      const files = {};
+      const listed = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+      for (const name of listed) {
+        const full = path.join(dir, name);
+        const read = readFileTask(full);
+        let content = null;
+        try { content = fs.readFileSync(full, 'utf8'); } catch (_) { /* ignore */ }
+        files[name] = { content, mtimeMs: read.mtimeMs, size: read.size };
+      }
+      snapshot[state] = { files, mtime: dirStat.mtimeMs };
+    } catch (_) { /* directory missing or unreadable: skip */ }
+  }
+  return snapshot;
+}
+
+// Write the snapshot to /dev/shm/agent-manager-queue-tick-<instanceId>.json with TTL.
+function writeQueueSnapshot(pipelineDir) {
+  const instanceId = process.env.AGENT_MANAGER_INSTANCE_ID || 'unknown';
+  const snapshotDir = '/dev/shm';
+  const snapshotFile = path.join(snapshotDir, `agent-manager-queue-tick-${instanceId}.json`);
+  try {
+    const snapshot = buildQueueSnapshot(pipelineDir);
+    const payload = { snapshot, writtenAt: Date.now(), ttl: SNAPSHOT_TTL_MS };
+    fs.mkdirSync(snapshotDir, { recursive: true });
+    const tmp = `${snapshotFile}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(payload));
+    fs.renameSync(tmp, snapshotFile);
+    return snapshotFile;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Read the snapshot from the shared file, validating TTL.
+function readQueueSnapshot(snapshotFile) {
+  const file = snapshotFile || process.env.QUEUE_SNAPSHOT_FILE;
+  if (!file) return null;
+  try {
+    const stat = fs.statSync(file);
+    const age = Date.now() - stat.mtimeMs;
+    if (age > SNAPSHOT_TTL_MS) return null;
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (data && data.snapshot && data.writtenAt && (Date.now() - data.writtenAt) <= data.ttl) {
+      return data.snapshot;
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+module.exports = { openQueueCache, readTaskCached, cacheFileFor, REVALIDATE_MS, RACY_MS, buildQueueSnapshot, writeQueueSnapshot, readQueueSnapshot, SCAN_DIRS, SNAPSHOT_TTL_MS };
