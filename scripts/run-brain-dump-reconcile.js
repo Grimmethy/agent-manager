@@ -81,6 +81,7 @@ function printSummary(result) {
   console.log(`  checked: ${counts.checked}`);
   console.log(`  actioned: ${counts.actioned}`);
   console.log(`  possiblyResolved: ${counts.possiblyResolved}`);
+  console.log(`  skipped (not captured or sorted): ${counts.skipped}`);
   console.log('');
   console.log('Changes:');
   for (const change of changes) {

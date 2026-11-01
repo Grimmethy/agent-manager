@@ -72,6 +72,9 @@ function getBrainDumpPath() {
   return path.join(process.cwd(), 'brain-dump.json');
 }
 
+// Entries in these statuses have not been decided yet; everything else is left alone.
+const CANDIDATE_STATUSES = new Set(['captured', 'sorted']);
+
 function reconcileBrainDumpEntries(options) {
   const opts = options || {};
   const dryRun = opts.dryRun === true;
@@ -90,23 +93,35 @@ function reconcileBrainDumpEntries(options) {
   const store = readBrainDumpRaw(brainDumpPath);
   const entries = store.entries;
 
-  const counts = { actioned: 0, possiblyResolved: 0, checked: 0 };
+  const counts = { actioned: 0, possiblyResolved: 0, checked: 0, skipped: 0 };
   const changes = [];
 
-  // Collect pipeline dirs for findExistingWorkForEntry
+  // Collect pipeline dirs for findExistingWorkForEntry, and the project's REPO root for the target check (git runs there, never in the
+  // pipeline dir and never in the cwd: both were "not a git repository").
   let pipelineDirs = [];
+  let repoRoot = opts.repoRoot || null;
   try {
     const config = require('./config.js');
     const cfg = config.getConfig ? config.getConfig() : config;
     if (cfg && cfg.pipelineDir) {
       pipelineDirs = [cfg.pipelineDir];
     }
+    if (!repoRoot && cfg && cfg.repoRoot) repoRoot = cfg.repoRoot;
   } catch {
     // config not available
+  }
+  if (!repoRoot) {
+    logger.warn('No repo root known (pass repoRoot or set AGENT_MANAGER_REPO_ROOT): cited-path existence is not checked this run');
   }
 
   // 2. Iterate entries
   for (const entry of entries) {
+    // Only entries still waiting for a decision are candidates. An entry that is already actioned (or possibly-resolved, suppressed, ...) is left
+    // untouched: re-stamping it would rewrite queuedAt on every run.
+    if (!entry || !CANDIDATE_STATUSES.has(entry.status)) {
+      counts.skipped++;
+      continue;
+    }
     counts.checked++;
     const entryId = entry.id;
     if (!entryId) {
@@ -147,7 +162,6 @@ function reconcileBrainDumpEntries(options) {
     let isSuspect = false;
     let targetCheck = null;
     try {
-      const repoRoot = pipelineDirs.length > 0 ? pipelineDirs[0] : process.cwd();
       targetCheck = checkEntryTargets(entryText, { repoRoot });
       if (targetCheck && targetCheck.verdict === 'suspect') {
         isSuspect = true;
@@ -185,4 +199,4 @@ function reconcileBrainDumpEntries(options) {
   return { counts, changes };
 }
 
-module.exports = { reconcileBrainDumpEntries };
+module.exports = { reconcileBrainDumpEntries, CANDIDATE_STATUSES };

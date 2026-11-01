@@ -236,7 +236,7 @@ test('every cited path missing -> possibly-resolved, does not close', () => {
   injectFakeConfig(temp.pipelineDir);
   process.env.AGENT_MANAGER_BRAIN_DUMP_PATH = temp.brainDumpPath;
 
-  const result = reconcileBrainDumpEntries({ dryRun: false });
+  const result = reconcileBrainDumpEntries({ dryRun: false, repoRoot: temp.pipelineDir });
 
   assert.equal(result.counts.checked, 1);
   assert.equal(result.counts.actioned, 0);
@@ -289,19 +289,14 @@ test('second run on same data is a no-op (same counts, no new changes)', () => {
   assert.equal(first.counts.checked, 1);
   assert.equal(first.changes.length, 1);
 
-  // Second run: entry is now status='actioned' with queuedTaskId set.
-  // findExistingWorkForEntry will still find the same task (it matches by raisedFrom),
-  // so the entry gets actioned again -- but since it's already actioned, the mutation
-  // is a no-op on the entry state. The counts and changes are identical.
+  // Second run: the entry is now status='actioned', so it is no longer a candidate: skipped, no change, and the file is left byte-for-byte alone.
+  const before = fs.readFileSync(temp.brainDumpPath, 'utf8');
   const second = reconcileBrainDumpEntries({ dryRun: false });
-  assert.equal(second.counts.actioned, 1);
-  assert.equal(second.counts.checked, 1);
-  assert.equal(second.changes.length, 1);
-  assert.equal(second.changes[0].entryId, first.changes[0].entryId);
-  assert.equal(second.changes[0].action, first.changes[0].action);
-  assert.equal(second.changes[0].taskId, first.changes[0].taskId);
-
-  // The file content is stable: queuedAt may differ (new Date()), but status and queuedTaskId are the same
+  assert.equal(second.counts.actioned, 0);
+  assert.equal(second.counts.checked, 0);
+  assert.equal(second.counts.skipped, 1);
+  assert.equal(second.changes.length, 0);
+  assert.equal(fs.readFileSync(temp.brainDumpPath, 'utf8'), before, 'nothing is rewritten');
   const reRead = JSON.parse(fs.readFileSync(temp.brainDumpPath, 'utf8'));
   assert.equal(reRead[0].status, 'actioned');
   assert.equal(reRead[0].queuedTaskId, 'HUB0066');
@@ -361,8 +356,9 @@ test('real-shape { entries, _meta } is processed, _meta preserved on write, seco
 
   // Second run: idempotent
   const second = reconcileBrainDumpEntries({ dryRun: false });
-  assert.equal(second.counts.actioned, 1);
-  assert.equal(second.counts.checked, 1);
+  assert.equal(second.counts.actioned, 0);
+  assert.equal(second.counts.checked, 0);
+  assert.equal(second.counts.skipped, 1);
   const reRead2 = JSON.parse(fs.readFileSync(temp.brainDumpPath, 'utf8'));
   assert.equal(reRead2.entries[0].status, 'actioned');
   assert.equal(reRead2._meta.version, 1);
@@ -461,3 +457,113 @@ test('if parse were array-only, real-shape file throws "does not contain an arra
 });
 });
 
+
+// ---------------------------------------------------------------------------
+// HUB0226 corrective: only captured/sorted entries are candidates; git runs in the repo root
+// ---------------------------------------------------------------------------
+const { execFileSync, spawnSync } = require('child_process');
+
+function makeGitRepo(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  for (const args of [['init', '-q'], ['config', 'user.email', 't@t.t'], ['config', 'user.name', 'T']]) execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
+  fs.writeFileSync(path.join(dir, 'README.md'), '# repo\n');
+  execFileSync('git', ['add', '.'], { cwd: dir, stdio: 'ignore' });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir, stdio: 'ignore' });
+}
+
+// A file shaped like the real one: wrapped, other top-level keys, a status mix.
+function realisticStore(temp) {
+  const actioned = Array.from({ length: 6 }, (_, i) => ({
+    id: `bd-1790000000${i}00-done-${i}`, serial: 100 + i, status: 'actioned', rawText: `old finding ${i}`, capturedAt: '2026-09-01T00:00:00.000Z',
+    queuedTaskId: `task-${i}`, queuedAt: `2026-09-0${i + 1}T10:00:00.000Z`,
+  }));
+  const entries = [
+    ...actioned,
+    { id: 'bd-1793000000001-sorted-gone', serial: 200, status: 'sorted', rawText: 'bug in `src/long-gone-module.js`', capturedAt: '2026-10-20T00:00:00.000Z' },
+    { id: 'bd-1793000000002-sorted-plain', serial: 201, status: 'sorted', rawText: 'a plain note with no paths', capturedAt: '2026-10-20T00:00:00.000Z' },
+    { id: 'bd-1793000000003-captured-covered', serial: 202, status: 'captured', rawText: 'covered by a merged task', capturedAt: '2026-10-21T00:00:00.000Z' },
+    { id: 'bd-1793000000004-captured-plain', serial: 203, status: 'captured', rawText: 'another plain note', capturedAt: '2026-10-21T00:00:00.000Z' },
+    { id: 'bd-1793000000005-pr', serial: 204, status: 'possibly-resolved', rawText: 'already flagged', capturedAt: '2026-10-21T00:00:00.000Z' },
+    { id: 'bd-1793000000006-nostatus', serial: 205, rawText: 'no status at all', capturedAt: '2026-10-21T00:00:00.000Z' },
+  ];
+  fs.writeFileSync(temp.brainDumpPath, JSON.stringify({ entries, _meta: { version: 3 }, nextSerial: 206 }, null, 2));
+  writeTask(temp.pipelineDir, 'done', { id: 'task-covering', status: 'done', mergedAt: '2026-10-22T00:00:00.000Z', raisedFrom: 'brain-dump-bd-1793000000003-captured-covered', promptContext: { brainDumpEntryId: 'bd-1793000000003-captured-covered' } });
+  return entries;
+}
+
+function runCli(temp, repoRoot, extraEnv = {}) {
+  return spawnSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'run-brain-dump-reconcile.js'), '--json'], {
+    encoding: 'utf8',
+    env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: temp.pipelineDir, AGENT_MANAGER_BRAIN_DUMP_PATH: temp.brainDumpPath, ...extraEnv },
+  });
+}
+
+test('realistic file: already-actioned entries are byte-for-byte untouched and only the two intended entries change', () => {
+  const temp = makeIsolatedTempDir();
+  const repo = path.join(temp.root, 'repo');
+  makeGitRepo(repo);
+  const original = realisticStore(temp);
+  const res = runCli(temp, repo);
+  assert.equal(res.status, 0, res.stderr);
+  const out = JSON.parse(res.stdout);
+  assert.equal(out.counts.checked, 4, 'two sorted + two captured are candidates');
+  assert.equal(out.counts.skipped, 8, '6 actioned + possibly-resolved + no status are skipped');
+  assert.equal(out.counts.actioned, 1);
+  assert.equal(out.counts.possiblyResolved, 1);
+  assert.deepEqual(out.changes.map((c) => `${c.entryId}:${c.action}`).sort(), ['bd-1793000000001-sorted-gone:possibly-resolved', 'bd-1793000000003-captured-covered:actioned']);
+  const after = JSON.parse(fs.readFileSync(temp.brainDumpPath, 'utf8'));
+  for (let i = 0; i < 6; i++) assert.deepEqual(after.entries[i], original[i], `actioned entry ${i} is identical, queuedAt included`);
+  assert.equal(after.entries[9].status, 'captured', 'a plain captured note is left alone');
+  assert.deepEqual(after.entries[10], original[10], 'an entry already flagged possibly-resolved is untouched');
+  assert.deepEqual(after.entries[11], original[11], 'an entry with no status is untouched');
+  assert.equal(after.entries[6].status, 'possibly-resolved');
+  assert.equal(after.entries[8].status, 'actioned');
+  assert.equal(after.entries[8].queuedTaskId, 'task-covering');
+  assert.equal(after.entries[7].status, 'sorted', 'a plain sorted note is left alone');
+  assert.deepEqual(after._meta, { version: 3 });
+  assert.equal(after.nextSerial, 206);
+  fs.rmSync(temp.root, { recursive: true, force: true });
+});
+
+test('a second CLI run on the realistic file changes nothing and rewrites nothing', () => {
+  const temp = makeIsolatedTempDir();
+  const repo = path.join(temp.root, 'repo');
+  makeGitRepo(repo);
+  realisticStore(temp);
+  assert.equal(runCli(temp, repo).status, 0);
+  const first = fs.readFileSync(temp.brainDumpPath, 'utf8');
+  const out = JSON.parse(runCli(temp, repo).stdout);
+  assert.equal(out.counts.actioned, 0);
+  assert.equal(out.counts.possiblyResolved, 0);
+  assert.equal(out.changes.length, 0);
+  assert.equal(fs.readFileSync(temp.brainDumpPath, 'utf8'), first);
+  fs.rmSync(temp.root, { recursive: true, force: true });
+});
+
+test('git runs in the repo root: no "not a git repository" text, even though the pipeline dir is not a repo', () => {
+  const temp = makeIsolatedTempDir();
+  const repo = path.join(temp.root, 'repo');
+  makeGitRepo(repo);
+  realisticStore(temp);
+  const res = runCli(temp, repo);
+  assert.doesNotMatch(res.stderr, /fatal|not a git repository/i);
+  fs.rmSync(temp.root, { recursive: true, force: true });
+});
+
+test('no repo root known: one warning, no git call in the cwd or the pipeline dir, cited paths are not judged missing', () => {
+  const temp = makeIsolatedTempDir();
+  const warnings = [];
+  const logger = { info() {}, warn: (m) => warnings.push(m) };
+  fs.writeFileSync(temp.brainDumpPath, JSON.stringify({ entries: [{ id: 'bd-1793000000009-x', status: 'sorted', rawText: 'bug in `src/long-gone-module.js`', capturedAt: '2026-10-20T00:00:00.000Z' }] }));
+  injectFakeConfig(temp.pipelineDir);
+  process.env.AGENT_MANAGER_BRAIN_DUMP_PATH = temp.brainDumpPath;
+  try {
+    const result = reconcileBrainDumpEntries({ dryRun: true, logger });
+    assert.equal(warnings.filter((m) => /No repo root known/.test(m)).length, 1);
+    assert.equal(result.counts.possiblyResolved, 0, 'without a repo root a missing path is not asserted');
+  } finally {
+    restoreConfigCache();
+    delete process.env.AGENT_MANAGER_BRAIN_DUMP_PATH;
+    fs.rmSync(temp.root, { recursive: true, force: true });
+  }
+});
