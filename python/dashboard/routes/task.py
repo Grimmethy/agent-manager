@@ -560,67 +560,7 @@ def api_task_requeue(state, task_id):
             # scope: it marks the queue/ record, it does not retroactively rescue a
             # never-merged branch's task-log onto main.
 
-    # Determine destination project via resolve_task_project (HUB0278): the task may
-    # belong to a different project than the active one, and the requeue should land it
-    # in that project's queue, not the active project's. Falls back to the active
-    # project's queue if resolution fails (e.g., test environment with no registry).
-    from app import instances_dir, _queue_dir_for_project_label
-    dest_project = None
-    source_project = None
-    try:
-        from project_scope import resolve_task_project
-        dest_project = resolve_task_project(task_id)
-        # Source project is the active project's label (derived from registry)
-        active_root = get_active_repo_root()
-        if active_root:
-            from branch_projects import registered_projects
-            projects = registered_projects(active_root)
-            active_proj = next((p for p in projects if p.get("active")), None)
-            if active_proj:
-                source_project = active_proj.get("label")
-    except (ValueError, Exception):
-        # Resolution failed (e.g., no registry in test env) -- fall back to active project
-        pass
-
-    # Determine destination queue directory
-    if dest_project:
-        dest_qdir = _queue_dir_for_project_label(dest_project)
-        if not dest_qdir:
-            # Project label invalid -- fall back to active
-            dest_qdir = qdir
-    else:
-        dest_qdir = qdir
-
-    # Idempotency check: if a pipeline_history record already exists for this task_id,
-    # skip the requeue (no-op). Prevents duplicate pushes and history records when the
-    # same requeue is triggered multiple times rapidly.
-    history_file = instances_dir() / "pipeline-history.log"
-    if history_file.is_file():
-        try:
-            import re as _re
-            _task_id_re = _re.compile(rf'"taskId"\s*:\s*"{_re.escape(task_id)}"')
-            _recent_re = _re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
-            _now = datetime.now(timezone.utc)
-            _dedup_window = timedelta(minutes=5)
-            for line in history_file.read_text(encoding="utf-8").splitlines():
-                if _task_id_re.search(line):
-                    ts_match = _recent_re.search(line)
-                    if ts_match:
-                        try:
-                            existing_ts = datetime.fromisoformat(ts_match.group(1).replace("Z", "+00:00"))
-                            if (_now - existing_ts) < _dedup_window:
-                                return jsonify({
-                                    "id": task_id,
-                                    "requeued": False,
-                                    "skipped": True,
-                                    "reason": "already requeued within dedup window",
-                                }), 200
-                        except (ValueError, TypeError):
-                            pass
-        except Exception:
-            pass  # Best-effort idempotency; don't fail the requeue if check fails
-
-    pending_dir = dest_qdir / "pending"
+    pending_dir = qdir / "pending"
     pending_dir.mkdir(parents=True, exist_ok=True)
     dest = pending_dir / f"{task_id}.json"
     if dest.exists():
@@ -674,20 +614,6 @@ def api_task_requeue(state, task_id):
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual")
-    
-    # Write pipeline_history record (best-effort, observability-only)
-    if dest_project:
-        try:
-            _write_pipeline_history(instances_dir(), {
-                "type": "requeue",
-                "taskId": task_id,
-                "sourceProject": source_project,
-                "destProject": dest_project,
-                "timestamp": now_iso,
-            })
-        except Exception:
-            pass
-    
     return jsonify({"id": task_id, "requeued": True})
 
 
