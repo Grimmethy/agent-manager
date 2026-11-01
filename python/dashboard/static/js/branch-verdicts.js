@@ -4,13 +4,14 @@
 // Kept out of branches-joblist-hardware-tabs.js on purpose (hot file) -- that file only calls the helpers
 // below. Pure string/array functions, no DOM, so they are testable from Node.
 //
-// Border color per card: green = merge, yellow = needs-work, red = discard, grey = unverified or stale.
+// Border color per card: green = merge, yellow = needs-work, blue = hold (sound, waiting on its hub or a sibling), red = discard, grey = unverified or stale.
 
 const BRANCH_VERDICT_FILTERS = [
   { key: 'all', label: 'All' },
   { key: 'unverified', label: 'Unverified' },
   { key: 'merge', label: 'Ready to merge' },
   { key: 'needs-work', label: 'Needs work' },
+  { key: 'hold', label: 'Hold' },
   { key: 'discard', label: 'Discard' },
 ];
 
@@ -19,11 +20,11 @@ let branchVerdictFilter = 'all';
 // The bucket a branch falls in. A stale verdict is "unverified" -- it vouches for an older commit.
 function branchVerdictKey(b) {
   if (!b || b.stale || !b.verdict) return 'unverified';
-  return ['merge', 'needs-work', 'discard'].includes(b.verdict) ? b.verdict : 'unverified';
+  return ['merge', 'needs-work', 'hold', 'discard'].includes(b.verdict) ? b.verdict : 'unverified';
 }
 
 function branchVerdictColorVar(key) {
-  return { merge: 'var(--ok)', 'needs-work': 'var(--warn)', discard: 'var(--bad)' }[key] || 'var(--muted)';
+  return { merge: 'var(--ok)', 'needs-work': 'var(--warn)', hold: 'var(--accent)', discard: 'var(--bad)' }[key] || 'var(--muted)';
 }
 
 // Inline style for the card: a colored left border plus a thin outline in the same color.
@@ -36,8 +37,8 @@ function _bvEscape(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 }
 
-const _BV_BADGE_CLASS = { merge: 'ok', 'needs-work': 'warn', discard: 'bad' };
-const _BV_WORD = { merge: 'merge', 'needs-work': 'needs work', discard: 'discard' };
+const _BV_BADGE_CLASS = { merge: 'ok', 'needs-work': 'warn', hold: 'hold', discard: 'bad' };
+const _BV_WORD = { merge: 'merge', 'needs-work': 'needs work', hold: 'hold', discard: 'discard' };
 
 // Badge with the verdict word plus a one-line reason under the title.
 function branchVerdictBadgeHtml(b) {
@@ -71,11 +72,96 @@ function filterBranchesByVerdict(branches, filterKey) {
 function branchVerdictFilterBarHtml(branches, activeKey) {
   const counts = {};
   for (const b of branches) counts[branchVerdictKey(b)] = (counts[branchVerdictKey(b)] || 0) + 1;
-  return '<div class="row" data-verdict-filter-bar style="gap:8px;margin-bottom:10px">' + BRANCH_VERDICT_FILTERS.map((f) => {
+  // .row is only a flex container inside a card (templates/index.html), so the bar sets its own flex: that is what lets the Discard-all button's margin-left:auto push it right.
+  return '<div class="row" data-verdict-filter-bar style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:10px">' + BRANCH_VERDICT_FILTERS.map((f) => {
     const n = f.key === 'all' ? branches.length : (counts[f.key] || 0);
     const cls = f.key === activeKey ? 'action' : 'secondary';
     return `<button class="${cls}" data-verdict-filter="${f.key}">${_bvEscape(f.label)} (${n})</button>`;
-  }).join('') + '</div>';
+  }).join('') + discardAllButtonHtml(branches, activeKey) + '</div>';
+}
+
+// ---- Discard all (owner request 2026-10-31) -- pure helpers; the browser wiring is wireDiscardAll below. Server: POST /api/git/branches/discard-batch.
+// The rolling candidate-doc branch is regenerated and handled separately: left out unless the owner opts in.
+const DISCARD_TRIAGE_BRANCH = 'agent/triage-queue';
+const DISCARD_ALL_LIST_LIMIT = 15;
+let discardAllRunning = false;
+// A card's content ends 18px inside the card (2px border + 16px padding, .worker-card in templates/index.html): the Discard-all button keeps the same inset so its
+// right edge lines up with the Discard buttons on the cards below it.
+const DISCARD_ALL_INSET_PX = 18;
+
+// Cards whose CURRENT verdict is discard. A stale verdict reads as unverified (branchVerdictKey), so it can never be in here.
+function discardAllCandidates(branches, includeTriage) {
+  return (Array.isArray(branches) ? branches : []).filter((b) => branchVerdictKey(b) === 'discard' && (includeTriage || b.branch !== DISCARD_TRIAGE_BRANCH));
+}
+
+function discardAllButtonHtml(branches, activeKey) {
+  if (activeKey !== 'discard') return '';
+  const n = discardAllCandidates(branches, false).length;
+  if (!n) return '';
+  return `<button class="secondary" data-discard-all style="margin-left:auto;margin-right:${DISCARD_ALL_INSET_PX}px"${discardAllRunning ? ' disabled' : ''} title="Permanently delete every remote branch with a current discard verdict (one confirmation).">`
+    + `${discardAllRunning ? 'Discarding...' : `Discard all (${n})`}</button>`;
+}
+
+function _discardProjectLabel(b) {
+  return (b && b.project && !b.project.active && b.project.label) ? ` [${b.project.label}]` : '';
+}
+
+// A branch that is a piece of a hub that is not finished: discarding it alone may unblock or orphan its siblings.
+function discardOpenHubBranches(candidates) {
+  return candidates.filter((b) => b.hub && b.hub.state && !['done', 'retired'].includes(b.hub.state));
+}
+
+function discardAllDialogText(candidates) {
+  const n = candidates.length;
+  const shown = candidates.slice(0, DISCARD_ALL_LIST_LIMIT).map((b) => `  - ${b.branch}${_discardProjectLabel(b)}`);
+  const more = n > shown.length ? [`  ... and ${n - shown.length} more`] : [];
+  const hubs = discardOpenHubBranches(candidates);
+  const hubLines = hubs.length
+    ? ['', `WARNING: ${hubs.length} of these ${hubs.length === 1 ? 'is a piece' : 'are pieces'} of a hub that is still open (discarding a piece alone may unblock or orphan its siblings):`]
+      .concat(hubs.slice(0, DISCARD_ALL_LIST_LIMIT).map((b) => `  - ${b.branch} (hub ${b.hub.id || '?'}, ${b.hub.state})`))
+    : [];
+  return [`Discard ${n} branch${n === 1 ? '' : 'es'}?`, '', ...shown, ...more, ...hubLines, '',
+    'This PERMANENTLY DELETES the remote branches and archives their tasks as dismissed. The commits stay recoverable under refs/discarded/* in the repo.',
+    '', `Type ${n} to confirm:`].join('\n');
+}
+
+function discardAllConfirmOk(typed, n) {
+  return typeof typed === 'string' && typed.trim() === String(n);
+}
+
+function discardAllPayload(candidates, includeTriage) {
+  return { branches: candidates.map((b) => ({ branch: b.branch, project: branchProjectRequestRoot(b), sha: b.headSha })), includeTriage: !!includeTriage };
+}
+
+// "Discarded X of N" plus one line per failure.
+function discardAllResultText(result) {
+  const results = Array.isArray(result && result.results) ? result.results : [];
+  const ok = results.filter((r) => r.succeeded).length;
+  const failed = results.filter((r) => !r.succeeded);
+  return [`Discarded ${ok} of ${results.length}`].concat(failed.map((r) => `  - ${r.branch}: ${r.reason || 'failed'}`)).join('\n');
+}
+
+async function runDiscardAll(main) {
+  const triage = discardAllCandidates(currentBranches, true).filter((b) => b.branch === DISCARD_TRIAGE_BRANCH);
+  let includeTriage = false;
+  if (triage.length && confirm(`Also include ${DISCARD_TRIAGE_BRANCH}${_discardProjectLabel(triage[0])}? It is the rolling candidate-doc branch and normally left out. OK = include it, Cancel = leave it out.`)) includeTriage = true;
+  const candidates = discardAllCandidates(currentBranches, includeTriage);
+  if (!candidates.length) return;
+  const typed = prompt(discardAllDialogText(candidates));
+  if (!discardAllConfirmOk(typed, candidates.length)) return;
+  discardAllRunning = true;
+  refreshBranchVerdictFilterBar(main, currentBranches);
+  let text;
+  try {
+    const resp = await fetch('/api/git/branches/discard-batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(discardAllPayload(candidates, includeTriage)) });
+    const result = await resp.json();
+    text = resp.ok ? discardAllResultText(result) : `Nothing was discarded: ${result.reason || 'HTTP ' + resp.status}`;
+  } catch (e) {
+    text = 'Discard all failed: ' + e.message;
+  }
+  discardAllRunning = false;
+  await renderBranchesTab();
+  alert(text);
 }
 
 // Browser-only: (re)build the filter bar + filtered card list into `main`. Uses the globals
@@ -105,6 +191,8 @@ function renderBranchListInto(main, branches) {
 }
 
 function wireBranchVerdictFilterBar(main) {
+  const all = main.querySelector('[data-discard-all]');
+  if (all) all.onclick = () => runDiscardAll(main);
   main.querySelectorAll('[data-verdict-filter]').forEach((btn) => {
     btn.onclick = () => { branchVerdictFilter = btn.dataset.verdictFilter; renderBranchListInto(main, currentBranches); };
   });
@@ -118,4 +206,4 @@ function refreshBranchVerdictFilterBar(main, branches) {
   wireBranchVerdictFilterBar(main);
 }
 
-if (typeof module !== 'undefined') module.exports = { branchVerdictKey, branchVerdictBorderStyle, branchVerdictBadgeHtml, branchVerdictDetailHtml, filterBranchesByVerdict, branchVerdictFilterBarHtml, BRANCH_VERDICT_FILTERS, heldHubsHtml };
+if (typeof module !== 'undefined') module.exports = { branchVerdictKey, branchVerdictBorderStyle, branchVerdictBadgeHtml, branchVerdictDetailHtml, filterBranchesByVerdict, branchVerdictFilterBarHtml, BRANCH_VERDICT_FILTERS, heldHubsHtml, discardAllCandidates, discardAllButtonHtml, DISCARD_ALL_INSET_PX, discardAllDialogText, discardAllConfirmOk, discardAllPayload, discardAllResultText, discardOpenHubBranches };

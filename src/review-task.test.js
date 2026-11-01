@@ -3088,3 +3088,82 @@ test('hit-count gate: reviewTask counts the draft post-image (a correct draft re
     }
   }
 });
+
+// ---- comment-only diffs close as a no-op instead of an applied branch (2026-10-31, discard analysis) ----------------------------------------------------
+// src/review-comment-only.js decides; review-task.js acts before any vote. Real reviewTask and real applyAdhocDiff, only the vote is faked.
+
+const COMMENT_ONLY_DIFF = [
+  'diff --git a/test/schedule.test.js b/test/schedule.test.js', '--- a/test/schedule.test.js', '+++ b/test/schedule.test.js', '@@ -10,3 +10,4 @@',
+  '   const defs = makeDefs()', '+  // intentional: deep clone for immutability check -- not a hot path', '   const original = JSON.parse(JSON.stringify(defs))', '   dueDefs(defs, day)', '',
+].join('\n');
+const CODE_AND_COMMENT_DIFF = COMMENT_ONLY_DIFF.replace('   dueDefs(defs, day)', '-  dueDefs(defs, day)\n+  dueDefs(defs, day + 1)');
+
+function brainDumpFix(overrides = {}) {
+  return adhocImplementedTask({ id: 'co-fix', promptContext: { brainDumpEntryId: 'bd-1793403711417-schedule', rawText: 'a brain-dump finding' }, rawDiff: COMMENT_ONLY_DIFF, ...overrides });
+}
+async function reviewWithVote(task) {
+  const { repoRoot, domainsPath } = makeFixture();
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  return { result, captured, repoRoot };
+}
+
+test('a comment-only brain-dump fix is approved with NO vote, its diff is kept, and it becomes a no-change task', async () => {
+  const task = brainDumpFix();
+  const original = task.rawDiff;
+  const { result, captured } = await reviewWithVote(task);
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 0, 'no model vote');
+  assert.equal(task.reviewProvider, 'deterministic-comment-only');
+  assert.equal(task.rawDiff, '', 'nothing left to apply as a branch');
+  assert.equal(task.adhocResolution, 'no-changes-needed');
+  assert.equal(task.commentOnlyDiff, original, 'the original diff stays on the record');
+  assert.deepEqual(task.commentOnly.files, [{ path: 'test/schedule.test.js', removed: 0, added: 1 }]);
+  assert.match(task.implementResponse, /^Comment-only change, no behavior: test\/schedule\.test\.js/);
+  assert.match(task.history.at(-1).detail, /deterministic-comment-only: 1 file\(s\) with only comment or docstring changes; closed as a no-op, no branch will be applied/);
+});
+
+test('apply then records it as a skipped no-op (terminalDisposition noop), never a branch', async () => {
+  const task = brainDumpFix({ id: 'co-apply' });
+  const { repoRoot } = await reviewWithVote(task);
+  const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
+  const applied = applyAdhocDiff({ task, repoRoot, pipelineDir: repoRoot, exec: () => { throw new Error('apply must not run git for a no-op'); } });
+  assert.equal(applied.skipped, true);
+  assert.match(applied.reason, /^no code change needed: Comment-only change, no behavior/);
+  assert.equal(require('./task-disposition.js').isNoopApplyDetail(applied.reason), true, 'the disposition logic reads it as a no-op');
+});
+
+test('a diff that changes code as well as comments still goes to the vote', async () => {
+  const task = brainDumpFix({ id: 'co-mixed', rawDiff: CODE_AND_COMMENT_DIFF });
+  const { result, captured } = await reviewWithVote(task);
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 1, 'the vote happened');
+  assert.notEqual(task.reviewProvider, 'deterministic-comment-only');
+  assert.equal(task.adhocResolution, 'implemented');
+  assert.equal(task.rawDiff, CODE_AND_COMMENT_DIFF);
+});
+
+test('only brain-dump-derived, non-hub adhoc fixes are short-circuited', async () => {
+  for (const [label, overrides] of [
+    ['no brainDumpEntryId', { promptContext: { rawText: 'a task someone filed' } }],
+    ['a hub slice (stacked)', { stacked: { branch: 'agent/decompose-hub-x', seq: 2, total: 3 } }],
+    ['a hub slice (dependsOn)', { dependsOn: ['HUB0001-01-a'] }],
+    ['not an implemented draft', { adhocResolution: 'no-changes-needed' }],
+  ]) {
+    const task = brainDumpFix({ id: `co-skip-${label.replace(/\W+/g, '-')}`, ...overrides });
+    await reviewWithVote(task);
+    assert.notEqual(task.reviewProvider, 'deterministic-comment-only', label);
+    assert.equal(task.commentOnlyDiff, undefined, label);
+  }
+});
+
+test('the kill switch AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK=false sends a comment-only diff to the vote', async () => {
+  process.env.AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK = 'false';
+  try {
+    const task = brainDumpFix({ id: 'co-off' });
+    const { captured } = await reviewWithVote(task);
+    assert.equal(captured.length, 1);
+    assert.notEqual(task.reviewProvider, 'deterministic-comment-only');
+    assert.equal(task.rawDiff, COMMENT_ONLY_DIFF);
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK; }
+});

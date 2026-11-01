@@ -1027,6 +1027,37 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     return { succeeded: true, verdict: 'approved', factCheckVerdict: 'skipped' };
   }
 
+  // Comment-only change (2026-10-31, discard analysis; src/review-comment-only.js): 10 brain-dump branches since 2026-10-24 were discarded because their whole
+  // change was comments or docstrings -- nothing behaves differently, and the voters approved them anyway. A brain-dump-derived adhoc fix (not a hub slice)
+  // whose diff is provably comment-only is closed here as a no-op: no vote, no executed verification, and NO branch -- the diff is kept on the record
+  // (commentOnlyDiff) and the task becomes 'no-changes-needed', which apply records as a skipped 'no code change needed' (terminalDisposition noop).
+  // Conservative: anything the analyzer cannot prove falls through to the normal vote. Kill switch AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK=false.
+  if (String(process.env.AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK || '').trim().toLowerCase() !== 'false'
+      && resolveSourceName(task) === 'adhoc'
+      && task.adhocResolution === 'implemented'
+      && task.promptContext && typeof task.promptContext === 'object' && task.promptContext.brainDumpEntryId
+      && !isHubChildTask(task)
+      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
+    let commentOnly = null;
+    try { commentOnly = require('./review-comment-only.js').analyzeCommentOnly(task.rawDiff); } catch (e) {
+      console.error(`[review] comment-only check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+    }
+    if (commentOnly && commentOnly.commentOnly) {
+      const paths = commentOnly.files.map((f) => f.path);
+      task.commentOnlyDiff = task.rawDiff;
+      task.commentOnly = { at: new Date().toISOString(), files: commentOnly.files };
+      task.rawDiff = '';
+      task.adhocResolution = 'no-changes-needed';
+      task.implementResponse = `Comment-only change, no behavior: ${paths.slice(0, 6).join(', ')}${paths.length > 6 ? `, +${paths.length - 6} more` : ''} change only comments or docstrings, so no code change is needed. The original diff is kept on the task as commentOnlyDiff.`;
+      task.reviewedAt = new Date().toISOString();
+      task.reviewProvider = 'deterministic-comment-only';
+      task.localVerdict = 'Auto-approved as a no-op: the diff changes only comments or docstrings (deterministic, no vote).';
+      recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
+      appendHistoryEvent(task, 'approved', `deterministic-comment-only: ${commentOnly.reason}; closed as a no-op, no branch will be applied`);
+      return { succeeded: true, verdict: 'approved', factCheckVerdict: 'skipped' };
+    }
+  }
+
   const domainCfg = getDomainConfig(domainsPath, task.domain);
   const workDir = getWorkDir(domainCfg, { repoRoot, secondBrainDir });
 

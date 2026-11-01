@@ -152,6 +152,36 @@ def after_action(scope):
                 entry["at"] = 0.0
 
 
+def patch_verdict_cache(scope, branch, verdict, reasons, head_sha, record=None):
+    """Update the cached row for a branch in a non-active project with a new verdict without recomputing the whole list.
+
+    A verdict does not change which branches exist, only their label. So we patch the cached row in place and mark the entry stale (at=0.0) so the next
+    background refresh redoes it. Merge/discard still call after_action() because a card can disappear.
+
+    Returns None on success, an error string on failure (the verdict was still recorded; only the cache patch failed).
+    """
+    with _lock:
+        cache = dict(_state["cache"])
+    entry = cache.get(scope["repoRoot"])
+    if not entry:
+        return "no cached list for project"
+    row = next((b for b in entry["branches"] if b["branch"] == branch), None)
+    if not row:
+        return f"branch '{branch}' not in cached list"
+    row["verdict"] = verdict
+    row["reasons"] = list(reasons) if reasons else []
+    row["stale"] = False
+    # source / verifiedAt are what a card shows next to the badge (tooltip, detail view); a patched row must carry them like a recomputed one does.
+    if isinstance(record, dict):
+        row["source"] = record.get("source")
+        row["verifiedAt"] = record.get("verifiedAt")
+    with _lock:
+        current = _state["cache"].get(scope["repoRoot"])
+        if current:
+            current["at"] = 0.0
+    return None
+
+
 def find_other_project_branch(project_root, branch):
     """(project, branch row) for a cached branch of a NON-active project, else (None, None). The commits endpoint's "only act on what we offered" gate."""
     with _lock:

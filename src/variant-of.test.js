@@ -52,7 +52,7 @@ test('node src/lanes.js --json prints the documented lane surface without launch
   fs.writeFileSync(reg, JSON.stringify([{ gpu: 'rx580', ollamaUrl: 'http://g:11434', model: 'qwen3-vl:8b-instruct', numCtx: 16384, numBatch: 1024, taskClasses: ['brain_dump_sort'] }]));
   const out = JSON.parse(execFileSync(process.execPath, [path.join(__dirname, 'lanes.js'), '--json'], { env: { ...process.env, AGENT_MANAGER_LANES_PATH: reg, AGENT_MANAGER_LOCAL_GPU: '3090' }, encoding: 'utf8' }));
   const small = out.find((l) => l.id === 'worker-rx580');
-  assert.deepEqual(small, { id: 'worker-rx580', gpu: 'rx580', model: 'qwen3-vl:8b-instruct', tier: 8, numCtx: 16384, numBatch: 1024, slow: false, local: false, preempt: 'never', taskClasses: ['brain_dump_sort'], reserve: 'auto', endpoint: 'http://g:11434' });
+  assert.deepEqual(small, { id: 'worker-rx580', gpu: 'rx580', model: 'qwen3-vl:8b-instruct', tier: 8, numCtx: 16384, numBatch: 1024, slow: false, local: false, reviewer: false, reviewerId: 'reviewer-rx580', preempt: 'never', taskClasses: ['brain_dump_sort'], reserve: 'auto', endpoint: 'http://g:11434' });
   assert.equal(out[0].id, 'worker-3090');
   assert.ok(!('env' in small));
 });

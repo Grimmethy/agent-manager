@@ -2,7 +2,7 @@
 
 Why this exists: in the 2026-09-25 review, of 37 unmerged branches 4 were already on master under a
 different SHA, 30+ were redundant agent/triage-queue-rescued-* snapshots, and only ~7 needed a real
-decision -- and none of that was visible in the app. A verdict (merge / needs-work / discard) is recorded
+decision -- and none of that was visible in the app. A verdict (merge / needs-work / hold / discard) is recorded
 per branch AND head SHA, so a verdict for an older commit reads back as stale instead of vouching for code
 nobody looked at.
 
@@ -23,7 +23,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-VERDICTS = ("merge", "needs-work", "discard")
+# "hold" (2026-10-31): a sound piece that cannot merge yet (its hub is unfinished, or a sibling must merge first). It is NOT needs-work: nothing in it is
+# defective, so it is never fed to a redraft (apply_prior_verdict) and never counted as a defect. It is also never merge-ready.
+VERDICTS = ("merge", "needs-work", "hold", "discard")
 SOURCES = ("deterministic", "chat", "manual")
 STORE_NAME = "branch-verdicts.json"
 ROLLING_BRANCH = "agent/triage-queue"
@@ -296,7 +298,7 @@ def apply_prior_verdict(rec, branch, verdict, reasons, source, sha=None):
 
     chat/manual + needs-work sets it (latest wins); chat/manual + merge clears it (the redraft was accepted);
     every other combination -- deterministic checks, discard (its reasons are about redundancy, not a defect in
-    the change) -- leaves it alone. Never called for a hub record. A record whose promptContext is not a dict
+    the change), hold (nothing to redraft: the piece is waiting, not defective) -- leaves it alone. Never called for a hub record. A record whose promptContext is not a dict
     is skipped rather than overwritten."""
     if source not in ("chat", "manual"):
         return False

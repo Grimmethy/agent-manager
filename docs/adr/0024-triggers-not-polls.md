@@ -1,0 +1,112 @@
+# ADR-0024 — Triggers, not polls
+
+**Status:** Accepted (principle; implementation staged — S0 is this ADR and the AGENTS.md block, nothing else is built yet)
+
+## Context
+
+Much of agent-manager decides what to do by **re-checking state on a timer**. Every watchdog tick
+(`scripts/queue-watcher.sh`, `ORC_TICK_SECS`, default 30–60 s) starts **31 distinct `node` scripts**
+(the hub-tasks plugin's coordinator sweep comes on top), most of them re-reading queue directories to
+see whether anything changed. Every lane claim lists and ranks `queue/pending`.
+
+Measured on 2026-10-31, on this machine:
+
+- The shared spinning disk (`sdb`, which holds the repos, the queues, the models and `/tmp`) sat at
+  **100% busy while moving only about 7 MB/s** and at 89% I/O pressure: tiny random reads, not throughput.
+- `queue/done` holds 1,830 task records (74 MB); agent-manager's `queue/pending` held 2,512 files (1,799
+  of them deep-dive research chunks).
+- A claim scan of `pending/` took 5.7 s of CPU with the queue cache in use, because `lanes.json` and
+  `dashboard-settings.json` were each re-read **2,446 times** (once per task).
+- The defect-readmit sweep needed more than eight minutes for a handful of candidates under that I/O
+  load: `liveSiblingsOnBranch` (`src/lib/shared-branch.js`) lists and parses every task file in each
+  scanned queue state, once per candidate, without the queue cache.
+- Hub HUB0295 piece 1 (run the readmit and supersede sweeps for every pool project) polled **all 32
+  pool projects on every tick**: 1 + 3 `node` launches each, about 128 launches per tick.
+
+The owner's standing observation, learned developing games: *create triggers rather than rely on
+polls.* The reference system is Grimmethy/Elementals: `Core/GameEvents.gd` (one global event bus),
+`Components/Arena/TileSignalComponent.gd` ("the authority on distance": consumers register a trigger,
+get a handle, and are called on enter / exit; registration checks current state once), and
+`Components/Arena/GameClockComponent.gd` ("the single source of truth for timing": 200+ per-actor
+timers became one clock with registered intervals). The language-neutral principle, the four
+primitives and conformance scenarios live in the private repo `Grimmethy/triggers`
+(`docs/PRINCIPLE.md`, `docs/PRIMITIVES.md`, `spec/`).
+
+agent-manager already has partial answers, which is why this is a direction and not a rewrite:
+
+- **Inbox hand-offs:** `queue/side-findings-inbox` and `queue/context-log-inbox`. The writer drops a
+  small file; `src/side-finding-sweep.js` and `src/context-log-sweep.js` drain only the inbox.
+- **`src/queue-cache.js` (HUB0247):** a tmpfs cache of parsed task files, validated by directory mtime,
+  so an unchanged directory costs one stat.
+- Marker-file switches (worker on/off) and the dashboard summary cache.
+
+## Decision
+
+Adopt **triggers, not polls** as a standing principle (AGENTS.md, Fourth principle):
+
+1. **The writer announces.** Whatever changes state (a verdict recorded, a branch pushed or merged, a task
+   blocked, a hub piece built) emits a named, past-tense event. Consumers do not ask "did anything
+   change?" on a timer.
+2. **One authority per concern.** Queue transitions and time each get exactly one owner; sweeps register
+   with it instead of each scanning on their own.
+3. **Register, catch up once, then react.** Registration evaluates current state once (so a late consumer
+   is not blind), then acts on events only.
+4. **Edge by default.** Fire on transitions; level-style repetition is opt-in.
+5. **One clock.** Genuinely periodic work registers an interval with the single watchdog clock; no new
+   per-script sleep loops or timers.
+6. **A slow, counted reconcile.** A low-frequency pass re-derives state from the source of truth and heals
+   missed events. Each correction increments a counter, because a correction means a producer forgot to
+   emit. The counter is the health metric of the whole design.
+7. **Handles and teardown.** Registrations return handles and are released with their owner.
+
+**Rule for new work, effective now:** any new sweep, tick, poll or timer states in its change description
+which event would make it unnecessary and why that event cannot be emitted, and its measured cost per
+pass when nothing changed (the checklist in `Grimmethy/triggers` `docs/PRINCIPLE.md`).
+
+**Proposed authorities** (names are proposals, to be settled in S1): a *queue-events journal* (durable,
+cross-process: node, python and bash writers append; consumers drain from their own position; a
+`snapshot` serves late subscribers) and the existing watchdog as the *single clock*.
+
+## Staging
+
+- **S0 — this ADR, the AGENTS.md block, the CLAUDE.md pointer.** Docs only.
+- **S1 — pilot.** Emit `verdict_recorded` (python verdict route) and `branch_merged` (merge route); drive
+  `branch-defect-readmit-sweep.js` and `redo-supersede-sweep.js` from the journal instead of scanning
+  `done/`. Interim: HUB0295 piece 5 gates the pool sweep on a cheap change signature with a counted
+  reconcile (the same shape, built from stats). The event code takes the clock and filesystem as
+  arguments and imports nothing from agent-manager, so it can move into the triggers repo unchanged.
+- **S2 — measure, then migrate by cost.** Time each of the 31 watchdog scripts for one idle tick; convert
+  the most expensive ones first.
+- **S3 — lane wake-up.** Replace the idle `sleep` loops with a wake on change (node `fs.watch`, which
+  works on the queue directories here, or a sequence counter in `/dev/shm`).
+- **S4 — extract.** Move the proven Node implementation into the triggers repo once a second consumer
+  exists (Elementals' own components passing the conformance scenarios counts).
+
+## Alternatives considered
+
+- **Persisted queue index.** Rejected as redundant: `queue-cache.js` already exists and the measured
+  claim-scan cost is CPU spent on repeated config reads, not scanning. Memoising the two files per scan
+  is a separate small fix.
+- **Move the queue to the SSD.** Rejected on measurement: the same claim scan took 6.0 s warm on an SSD
+  copy against 10.2 s on the HDD at the same moment, and the SSD is reserved for measured wins.
+- **`ionice` the heavy readers.** Not available: both disks use `mq-deadline`, and BFQ is not loaded.
+- **Only add more caches.** Caches shorten a poll; they do not remove the 31 launches or the re-listing.
+
+## Consequences
+
+- Idle cost should trend to near zero; the measure is scans and bytes read per idle minute, plus the
+  reconcile counter.
+- Producers must emit. That is the real cost: every writer of queue state (node, python dashboard
+  routes, bash `mv`) needs to go through the authority, or the reconcile finds the gap.
+- Pool-wide features (HUB0295) can be built without multiplying scans by the number of projects.
+- A hub's piece list is fixed at decomposition, so a corrective piece cannot yet be gated on (tracked as
+  its own task); until then a follow-up piece needs a hold on the hub's branch card.
+
+## Open questions
+
+- Where the journal lives: tmpfs (`/dev/shm`, lost on reboot, healed by reconcile) or a file under
+  `queue/` (durable, on the HDD).
+- Wake primitive for bash lanes: a small node waiter on `fs.watch` or a sequence counter; `inotifywait`
+  is not installed here.
+- How python and bash writers emit (one shared helper, or a thin CLI).
+- Whether the dashboard should push (server-sent events) instead of polling `/api/summary` every 5 s.
