@@ -40,6 +40,12 @@ const CREATE_FILE_VERBS_RE = /\b(?:create|creates|creating|add(?:s|ing)?\s+a\s+n
 // an ordinary edit, not a create signal.
 // The phrase must sit directly against the path (only punctuation/quotes between): "write ONE file, Docs/x.md" yes; "write the file list ... then edit src/x.js" no.
 const WRITE_FILE_PHRASE_RE = /\bwrite\s+(?:(?:the|a|an|one|single|new)\s+)+file[\s,:;(`'"*_-]*$/i;
+// 2026-11-01 (questforge hub HUB0029-08, docs piece, blocked 'plan cites missing-file target(s): Docs/SERVICE.md' with a thin plan): the task title mentioned the
+// path first, inside parentheses ("... the service (Docs/SERVICE.md) and the backlog line"), and the broad create-verb window below only looks at the FIRST mention of
+// a path in the task text, so the later, explicit "WHAT: create Docs/SERVICE.md, edit Docs/BACKLOG.md ..." was never examined. Like WRITE_FILE_PHRASE_RE this
+// phrase is strict enough to check at EVERY mention: the create verb must sit DIRECTLY against the path (only articles, "file" and punctuation or quotes between),
+// so "Create a summary of the problem, then edit src/x.js" and "create X, edit Y" (Y) stay ordinary edit targets.
+const DIRECT_CREATE_RE = /\b(?:create|creates|creating)\s+(?:(?:the|a|an|one|single|new)\s+)*(?:file\s+)?[\s`'"*_(]*$/i;
 const isCreateVerbBefore = (before) => CREATE_FILE_VERBS_RE.test(before) || WRITE_FILE_PHRASE_RE.test(before);
 
 // every occurrence of needle in text, as start indexes (the guard used to look at the first only: 2026-10-15, a plan that quoted the task's "write ONE file" first and said
@@ -81,7 +87,7 @@ function isDeclaredCreateTarget(planText, targetPath, taskText = '') {
   const task = String(taskText || '');
   const tIdxs = mentionIndexes(task, targetPath);
   const win = (i) => task.slice(Math.max(0, i - 80), i);
-  return tIdxs.length > 0 && (CREATE_FILE_VERBS_RE.test(win(tIdxs[0])) || tIdxs.some((i) => WRITE_FILE_PHRASE_RE.test(win(i))));
+  return tIdxs.length > 0 && (CREATE_FILE_VERBS_RE.test(win(tIdxs[0])) || tIdxs.some((i) => WRITE_FILE_PHRASE_RE.test(win(i)) || DIRECT_CREATE_RE.test(win(i))));
 }
 
 // (task, planText, repoRoot, extraRoots, existsAtRef) -> { blocked, reason?, missing? }
