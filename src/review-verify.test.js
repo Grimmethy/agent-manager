@@ -9,7 +9,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { splitCoveringTiers, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS, TEST_TIMEOUT_MS } = require('./review-verify.js');
-const { addedTestNames, verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback, relinkExternalDependencies, sandboxUnresolvedDependency } = require('./review-verify.js');
+const { addedTestNames, verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback, extraCoveringMax, relinkExternalDependencies, sandboxUnresolvedDependency } = require('./review-verify.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 
 const DIFF = 'diff --git a/src/a.js b/src/a.js\n--- a/src/a.js\n+++ b/src/a.js\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/src/a.test.js b/src/a.test.js\nnew file mode 100644\n--- /dev/null\n+++ b/src/a.test.js\n@@ -0,0 +1 @@\n+z\n';
@@ -304,14 +304,44 @@ test('findSymbolCoveringTests matches whole identifiers only, ranks by distinct 
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('findTestsWithSymbolFallback prefers the file-name based finder and only falls back when it finds nothing', () => {
+test('findTestsWithSymbolFallback returns the file-name tests PLUS the symbol-covering ones (capped), and only the symbol ones when there is no co-located test', () => {
   const root = makeDashTree();
   try {
     const diff = '@@ -1,2 +1,2 @@ def _build_pipeline_env():\n-    return 1\n+    return 2\n';
+    // no co-located test: the symbol finder keeps its own result, as before
     assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py'], diff).py, ['python/dashboard/test_alpha.py', 'python/dashboard/test_delta.py', 'python/dashboard/test_zeta.py']);
-    fs.writeFileSync(path.join(root, 'python/dashboard/test_app.py'), 'pass\n');     // now a co-located test exists
-    assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py'], diff).py, ['python/dashboard/test_app.py']);
+    fs.writeFileSync(path.join(root, 'python/dashboard/test_app.py'), 'pass\n');     // now a co-located test exists: it stays first, the symbol tests follow (they used to be dropped)
+    assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py'], diff).py, ['python/dashboard/test_app.py', 'python/dashboard/test_alpha.py', 'python/dashboard/test_delta.py', 'python/dashboard/test_zeta.py']);
+    // a test file the diff itself changes is never listed twice
+    assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py', 'python/dashboard/test_app.py'], diff).py.filter((f) => f === 'python/dashboard/test_app.py').length, 1);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('findTestsWithSymbolFallback caps the extra symbol tests at AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX and 0 restores the old primary-or-fallback behaviour', () => {
+  const root = makeDashTree();
+  const saved = process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX;
+  try {
+    const diff = '@@ -1,2 +1,2 @@ def _build_pipeline_env():\n-    return 1\n+    return 2\n';
+    fs.writeFileSync(path.join(root, 'python/dashboard/test_app.py'), 'pass\n');
+    // test_alpha.py does `from app import ...`, so the primary finder already returns it as an importer; delta and zeta are the symbol-only extras
+    process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX = '1';
+    assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py'], diff).py, ['python/dashboard/test_app.py', 'python/dashboard/test_alpha.py', 'python/dashboard/test_delta.py']);
+    process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX = '0';
+    assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py'], diff).py, ['python/dashboard/test_app.py', 'python/dashboard/test_alpha.py']);
+    assert.equal(extraCoveringMax({}), 6);
+    assert.equal(extraCoveringMax({ AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX: 'x' }), 6);
+    assert.equal(extraCoveringMax({ AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX: '3' }), 3);
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX; else process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX = saved;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the extras land in the DEPENDENTS tier, so a slow extra never turns the primary result inconclusive', () => {
+  const found = { js: ['src/sdk/a.test.js', 'src/other.test.js'], py: [] };
+  const tiers = splitCoveringTiers(['src/sdk/a.js'], found);
+  assert.deepEqual(tiers.primary.js, ['src/sdk/a.test.js']);
+  assert.deepEqual(tiers.dependents.js, ['src/other.test.js']);
 });
 
 const PY3 = ['/usr/bin/python3', '/usr/local/bin/python3'].find((p) => fs.existsSync(p));
@@ -885,6 +915,20 @@ test('a dependent file that also fails on the base in the sandbox is unverified,
   assert.equal(r.status, 'passed');
   assert.equal(r.tests.passed, true);
   assert.deepEqual(r.tests.dependentsUnverified, ['src/dep.test.js']);
+});
+
+test('dependent files run one process each: one that only fails in the sandbox no longer hides a sibling that really regressed (context-trim-sweep.test.js on the red-test branch)', () => {
+  const files = ['src/a.js', 'src/a.test.js', 'src/dep1.test.js', 'src/dep2.test.js'];
+  // primary ok; dep1 fails with the diff AND on the base (sandbox only); dep2 fails with the diff but passes on the base (a real regression)
+  const run = scriptedRun([passing, failing('env only'), failing('real regression'), failing('env only'), passing]);
+  const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js', 'src/dep1.test.js', 'src/dep2.test.js'], py: [] }), prepare: baseTree(files), run });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.deepEqual(run.calls.slice(0, 3).map((c) => c.args.filter((a) => a.endsWith('.test.js'))), [['src/a.test.js'], ['src/dep1.test.js'], ['src/dep2.test.js']], 'one process per dependent file');
+  assert.equal(r.status, 'failed');
+  assert.equal(r.tests.passed, false);
+  assert.deepEqual(r.tests.failures, ['real regression']);
+  assert.deepEqual(r.tests.dependentsUnverified, ['src/dep1.test.js']);
+  assert.deepEqual(r.tests.dependents, ['src/dep1.test.js', 'src/dep2.test.js']);
 });
 
 test('a primary file that also fails on the base in the sandbox still makes the result inconclusive', () => {
