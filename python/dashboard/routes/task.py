@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 
 # The app.py helpers these views call (ENV_FILE_PATH, PACKAGE_ROOT, QUEUE_STATES, SRC_DIR, _archive_task_file, _call_discuss, _discuss_provider_args, _files_touched_for, _incoming_task_links, _outgoing_task_links, _record_manual_requeue, _repeated_blocker_match, _task_cost_summary, _task_input_summary, _work_log_for, get_active_grep_dirs, get_active_repo_root, get_pipeline_dir, instances_dir, logger, queue_dir, read_env_file, read_json_safe) are
 # imported lazily inside each view: app.py imports THIS module to register the
@@ -242,6 +243,71 @@ def api_hub_retire(hub_id):
     _stamp_and_archive(hub_file, "coordinating", "hub retired by a human via the dashboard" + (f" -- {reason}" if reason else "")
                        + (f"; retired {len(archived)} unfinished sub-task(s)" if archived else ""))
     return jsonify({"hub": hub_id, "archived": archived, "left": left})
+
+
+@task_bp.route("/api/hub/<hub_id>/pieces", methods=["POST"])
+def api_hub_add_piece(hub_id):
+    """Add a follow-up piece to a hub that is already coordinating (2026-10-31, HUB0295-05).
+
+    A hub's piece list is fixed when it is decomposed, and `_summarize_hub` computes readyToMerge from it, so a corrective piece filed by hand
+    never held the hub back: the hub read "ready to merge" without it. This appends the piece to the hub's `subTasks` (and writes its child
+    record on the hub's stacked chain); the coordinator sweep then renumbers the not-yet-started pieces. Single implementation: src/hub-add-piece.js,
+    run here as a subprocess exactly like /rereview, so the route and the CLI can never diverge.
+
+    `hub_id` is the hub RECORD id (the file name in queue/coordinating/, like /retire), not the HUBnnnn label. Body, a NEW piece:
+    {"title": "...", "rawText": "<self-contained piece text>", "files": ["path", ...]?, "dependsOn": ["id"]?, "reason": "why"?};
+    or ADOPT a child that already exists: {"adopt": "<child id>", "reason": "why"?}. `?project=<repoRoot>` selects another registered project.
+    Returns the CLI's JSON {ok, id, total, seq?, adopted?, ownerGate?}: 404 no such coordinating hub, 400 bad body, 409 refused (duplicate id, child in
+    another hub, file-decompose hub, several chains, switched off)."""
+    from app import ENV_FILE_PATH, PACKAGE_ROOT, read_env_file
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        abort(400, description="body must be a JSON object")
+    qdir, _scope = _qdir_for_request(body)
+    if not qdir:
+        abort(404)
+    adopt = body.get("adopt")
+    title = body.get("title")
+    raw_text = body.get("rawText")
+    if adopt is not None and not (isinstance(adopt, str) and adopt.strip()):
+        abort(400, description="adopt must be a non-empty child task id")
+    if not adopt and not (isinstance(title, str) and title.strip() and isinstance(raw_text, str) and raw_text.strip()):
+        abort(400, description="give a title and a rawText for a new piece, or adopt: <child id>")
+    script = PACKAGE_ROOT / "src" / "hub-add-piece.js"
+    args = ["node", str(script), hub_id, "--pipeline-dir", str(qdir.parent), "--who", "dashboard"]
+    reason = body.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        args += ["--reason", reason.strip()]
+    tmp_path = None
+    try:
+        if adopt:
+            args += ["--adopt", adopt.strip()]
+        else:
+            payload = {"rawText": raw_text}
+            if isinstance(body.get("files"), list):
+                payload["files"] = body["files"]
+            if isinstance(body.get("prerequisiteHubs"), list):
+                payload["prerequisiteHubs"] = body["prerequisiteHubs"]
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
+                json.dump(payload, fh)
+                tmp_path = fh.name
+            args += ["--title", title.strip(), "--prompt-context-file", tmp_path]
+            if isinstance(body.get("dependsOn"), list) and body["dependsOn"]:
+                args += ["--depends-on", ",".join(str(d) for d in body["dependsOn"])]
+        cp = subprocess.run(args, capture_output=True, text=True, timeout=60, env={**os.environ, **read_env_file(ENV_FILE_PATH)})
+        result = json.loads((cp.stdout or "{}").strip().splitlines()[-1])
+    except Exception as e:  # noqa: BLE001 -- surface a clean error, never a stack trace
+        abort(500, description=f"add-piece failed: {e}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    if not result.get("ok"):
+        status = 404 if str(result.get("error", "")).startswith("no coordinating hub") else 409
+        return jsonify(result), status
+    return jsonify(result)
 
 
 @task_bp.route("/api/task/<state>/<task_id>/rereview", methods=["POST"])
