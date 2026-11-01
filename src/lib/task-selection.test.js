@@ -144,3 +144,22 @@ test('hub-tier: a hub child with an unmet dependsOn or softDependsOn does not pr
     clearRegistry();
   }
 });
+
+// 2026-10-31: the blocker built for a tick with a backlog and an adhoc exemption lets the adhoc source through and keeps vetoing a low-priority filler
+// source (the project_search flood: an exemption used to leave `blocked` undefined, so every source generated).
+test('getNextTask with makeGenerationBlocker: adhoc exemption returns the adhoc task and skips a vetoed project_search source', () => {
+  withRepo(os.tmpdir(), (pipelineDir) => {
+    clearRegistry();
+    let searchAsked = 0;
+    let adhocHasWork = true;
+    registerTaskSource('adhoc', { priority: 10, next: () => (adhocHasWork ? { id: 'adhoc-1', source: 'adhoc' } : null) });
+    registerTaskSource('project_search', { priority: 85, next: () => { searchAsked += 1; return { id: 'ps-1', source: 'project_search' }; } });
+    const { makeGenerationBlocker } = require('../generation-throttle.js');
+    const blocked = makeGenerationBlocker({ alreadyPending: true, exemptSourceNames: ['adhoc'], inFlightPriorities: [10, 10], laneCount: 2 });
+    assert.equal(getNextTask({ blocked }).id, 'adhoc-1');
+    adhocHasWork = false;
+    assert.equal(getNextTask({ blocked }), null, 'with adhoc empty the vetoed filler source must not be asked, or it would generate on every tick');
+    assert.equal(searchAsked, 0, 'project_search.next() is never called while vetoed');
+  });
+});
+
