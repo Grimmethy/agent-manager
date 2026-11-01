@@ -195,7 +195,8 @@ function laneFromEntry(raw, index) {
 
 // -> [{ id, gpu, env, local, slow, numCtx, preempt, taskClasses, model, tier, reserve }]. `env` is the per-lane environment launch.sh / the watchdog must apply
 // when spawning the lane ({} = inherit, i.e. the host's own Ollama). `taskClasses` null = claims any task.
-function getLanes(env = process.env, overrides = undefined) {
+function getLanes(env = process.env, overrides = undefined, cachedLanes = undefined) {
+  if (cachedLanes != null) return cachedLanes;
   const local = slug(env.AGENT_MANAGER_LOCAL_GPU) || detectLocalGpu() || 'local';
   // The host lane's model is the base LOCAL_MODEL, which launch.sh also exports as AGENT_MANAGER_HOST_LOCAL_MODEL because a remote lane's
   // worker overrides LOCAL_MODEL in its own process. Without either signal the tier is unknown (null) and capability routing leaves it alone.
