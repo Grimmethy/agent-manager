@@ -186,6 +186,49 @@ comfyui_lease_held() {
   [[ "$verdict" == "held" ]]
 }
 
+# A lane yielding to a GPU session (a Forge job, a tuning session) says so in its heartbeat instead of looking idle or stuck, and warms the model
+# up again when the session ends. The lease being held is the pause (comfyui_lease_held above, one tick at a time); these two helpers add the
+# visible state and the resume. The session evicted the pipeline's model from the card, so the first call after it would pay a full cold load
+# (ornith:35b measured 350-490 s from the HDD) against a 240-300 s call timeout and be counted as a failure. Warming first, with a long timeout
+# and a heartbeat every few seconds, takes that cost where it cannot fail a task. `warming` and `paused` are not `idle`, so lane-health.js (which
+# probes only idle lanes) leaves the lane alone during both.
+#   lane_note_gpu_pause <instance_id> <model> <started_at>   call in the yield branch
+#   lane_warm_after_pause <instance_id> <model> <started_at> call once the lease is clear; a no-op unless this process was paused
+lane_note_gpu_pause() {
+  LANE_WAS_PAUSED=true
+  write_heartbeat_file "$1" "paused" "${2:-}" "" "gpu-session" "${3:-}"
+}
+
+lane_warm_after_pause() {
+  [[ "${LANE_WAS_PAUSED:-false}" == "true" ]] || return 0
+  LANE_WAS_PAUSED=false
+  local id="$1" model="${2:-}" started_at="${3:-}"
+  [[ -n "$model" ]] || return 0
+  local timeout_s="${AGENT_MANAGER_WARMUP_TIMEOUT_S:-900}" beat_s="${AGENT_MANAGER_WARMUP_BEAT_S:-20}"
+  local url="${OLLAMA_URL:-http://localhost:11434}"
+  local capacity_js
+  capacity_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/gpu-capacity.js"
+  local payload
+  payload="$(node -e '
+    const { PINNED_NUM_CTX } = require(process.argv[2]);
+    const ctx = Number(process.env.AGENT_MANAGER_LANE_NUM_CTX) || PINNED_NUM_CTX;
+    console.log(JSON.stringify({ model: process.argv[1], prompt: "hi", stream: false, keep_alive: -1, options: { num_ctx: ctx } }));
+  ' "$model" "$capacity_js" 2>/dev/null)" || payload=""
+  [[ -n "$payload" ]] || return 0
+  printf '[%s] GPU session over -- warming %s before claiming anything (up to %ss)\n' "$id" "$model" "$timeout_s" >&2
+  write_heartbeat_file "$id" "warming" "$model" "" "model-warmup" "$started_at"
+  curl -s -m "$timeout_s" "${url}/api/generate" -d "$payload" -o /dev/null &
+  local curl_pid=$! waited=0
+  while kill -0 "$curl_pid" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+    if (( waited % beat_s == 0 )); then write_heartbeat_file "$id" "warming" "$model" "" "model-warmup" "$started_at"; fi
+  done
+  wait "$curl_pid" 2>/dev/null || true
+  printf '[%s] warm-up finished after %ss\n' "$id" "$waited" >&2
+  return 0
+}
+
 
 # Host-RAM headroom (2026-10-12 freeze: RAM + all swap exhausted by ComfyUI + the P40 VM +
 # Ollama's runner, kernel thrashed until power-cycled). mem-guard.js measures MemAvailable /
