@@ -31,6 +31,14 @@ const DIRTY_CLONE_ERROR_PREFIX = 'apply clone is dirty';
 // is scanned -- see clearStaleLocks().
 const STALE_LOCK_DEFAULT_MINUTES = 30;
 
+// Retry configuration for fetch operations. A single retry (count=1) with 5-10 second backoff
+// absorbs transient ETIMEDOUT (network/git timeout) and lock contention (stale .lock files) without
+// blocking the task permanently -- the original error is preserved as the blocked reason if the
+// retry also fails.
+const FETCH_RETRY_COUNT = 1;
+const FETCH_RETRY_BACKOFF_MS = 5_000;
+const FETCH_RETRY_MAX_BACKOFF_MS = 10_000;
+
 /**
  * Detects the repo's real default branch instead of assuming "main" -- reproduced live
  * 2026-07-20: this package's own repo (agent-manager) defaults to "master", and every
@@ -146,6 +154,46 @@ function createRealGitRunner(repoRoot) {
       throw annotateGitTimeout(e, args, GIT_TIMEOUT_MS);
     }
   }
+  // True when an error is retryable for fetch operations: ETIMEDOUT (git timed out) or
+  // a lock contention error (another git process holds a .lock file). clearStaleLocks() is
+  // called before retrying lock errors to remove stale locks in the dedicated apply clone.
+  function isRetryableFetchError(err) {
+    if (!err) return false;
+    const msg = String(err.message || '');
+    // Timeout: ETIMEDOUT code or "timed out" in message (annotateGitTimeout prefixes the msg)
+    if (err.code === 'ETIMEDOUT' || /timed out/.test(msg)) return true;
+    // Lock: "File exists" for .lock creation or explicit ".lock" in message
+    if (/\.lock: File exists/.test(msg) || /Unable to create.*\.lock/.test(msg)) return true;
+    return false;
+  }
+  // Wraps a fetch-like git operation with single-retry logic: on timeout or lock error,
+  // waits 5-10s (linear backoff), optionally clears stale locks (for lock errors), and
+  // retries once. Returns the original error if the retry also fails.
+  function runWithRetry(args, extra = {}) {
+    let firstErr = null;
+    for (let attempt = 0; attempt <= FETCH_RETRY_COUNT; attempt++) {
+      try {
+        return run(args, extra);
+      } catch (e) {
+        if (attempt === 0) firstErr = e;
+        if (!isRetryableFetchError(e) || attempt === FETCH_RETRY_COUNT) {
+          throw firstErr; // Exhausted retries or non-retryable: surface the first error
+        }
+        // Backoff: linear from FETCH_RETRY_BACKOFF_MS toward FETCH_RETRY_MAX_BACKOFF_MS
+        const backoff = FETCH_RETRY_BACKOFF_MS + (attempt * (FETCH_RETRY_MAX_BACKOFF_MS - FETCH_RETRY_BACKOFF_MS));
+        // clearStaleLocks for lock errors (no-op elsewhere)
+        if (/\.lock/.test(String(e.message))) {
+          try { clearStaleLocks(repoRoot); } catch { /* best-effort */ }
+        }
+        // Sleep via sync wait (simple, no async complexity needed here)
+        const start = Date.now();
+        while (Date.now() - start < backoff) {
+          // Spin-wait; acceptable for a one-time 5-10s backoff in a synchronous pipeline
+        }
+      }
+    }
+    throw firstErr;
+  }
   function isAncestor(a, b) {
     try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
   }
@@ -219,7 +267,7 @@ function createRealGitRunner(repoRoot) {
       throw new Error(`auto-stash before resetToMain failed, reset aborted to avoid destroying work: ${e.message}`);
     }
     run(['checkout', mainBranch]);
-    run(['fetch', 'origin', mainBranch]);
+    runWithRetry(['fetch', 'origin', mainBranch]);
     const remote = `origin/${mainBranch}`;
     const originInLocal = isAncestor(remote, mainBranch);
     const localInOrigin = isAncestor(mainBranch, remote);
@@ -274,7 +322,7 @@ function createRealGitRunner(repoRoot) {
   }
   return {
     mainBranch,
-    fetchMain: () => run(['fetch', 'origin', mainBranch]),
+    fetchMain: () => runWithRetry(['fetch', 'origin', mainBranch]),
     // Auto-stash before the hard reset instead of silently destroying uncommitted work --
     // this exact `git reset --hard` wiped real, unrecoverable work TWICE in one session
     // (see docs/pipeline-incident-2026-07-19.md and its 2026-07-21 repeat) because this
@@ -336,7 +384,7 @@ function createRealGitRunner(repoRoot) {
     // Best-effort fetch of one non-main branch (stacked decompose: pick up a prior step's
     // commit if this host's local ref is behind or missing). A failure is non-fatal.
     fetchBranch: (name) => {
-      try { return run(['fetch', 'origin', name]); } catch { return ''; }
+      try { return runWithRetry(['fetch', 'origin', name]); } catch { return ''; }
     },
     // Reset-or-create a local branch to track origin/<name> exactly (stacked decompose,
     // when the local ref is missing or stale but origin has the prior step's commit).
@@ -370,7 +418,7 @@ function createRealGitRunner(repoRoot) {
     //     by trusting whatever name happens to exist locally.
     prepareStackedBranch: (name) => {
       try {
-        run(['fetch', 'origin', name]);
+        runWithRetry(['fetch', 'origin', name]);
       } catch {
         // Best-effort, matches fetchBranch. But a fetch of a branch that was DELETED on the
         // remote fails without pruning this clone's own refs/remotes/origin/<name>, and the
@@ -437,7 +485,7 @@ function createRealGitRunner(repoRoot) {
         // lineage, silently re-including commits that had already separately landed on
         // main (identical SHAs -- confirmed live), one of which was a finding a human had
         // explicitly retracted as a false positive after the fact.
-        try { run(['fetch', 'origin', mainBranch]); } catch { /* best-effort, matches fetchMain elsewhere */ }
+        try { runWithRetry(['fetch', 'origin', mainBranch]); } catch { /* best-effort, matches fetchMain elsewhere */ }
         if (!isAncestor(`origin/${mainBranch}`, remote)) {
           // MERGE main in first; the rebase is only the fallback (brain dump bd-1791228522460, 2026-10-05). The rebase this used to do EVERY time rewrote only the LOCAL branch and nothing pushed the
           // rewrite, so origin never contained main and this block re-fired on EVERY tick: a tick with a batch had its plain push rejected (non-fast-forward) and
@@ -485,7 +533,7 @@ function createRealGitRunner(repoRoot) {
     // branch off main would throw away (the next push is then rejected non-fast-forward, identically on every retry). A branch that
     // is merged into main (or gone from origin) is not "work to keep": the caller may start fresh off main.
     remoteHasUnmergedWork: (name) => {
-      try { run(['fetch', 'origin', name]); } catch { /* best-effort, matches fetchBranch */ }
+      try { runWithRetry(['fetch', 'origin', name]); } catch { /* best-effort, matches fetchBranch */ }
       const remote = `origin/${name}`;
       try { run(['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}`]); } catch { return false; }
       return !isAncestor(remote, `origin/${mainBranch}`);
