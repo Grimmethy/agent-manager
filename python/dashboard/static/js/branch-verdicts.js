@@ -72,7 +72,8 @@ function filterBranchesByVerdict(branches, filterKey) {
 function branchVerdictFilterBarHtml(branches, activeKey) {
   const counts = {};
   for (const b of branches) counts[branchVerdictKey(b)] = (counts[branchVerdictKey(b)] || 0) + 1;
-  return '<div class="row" data-verdict-filter-bar style="gap:8px;margin-bottom:10px">' + BRANCH_VERDICT_FILTERS.map((f) => {
+  // .row is only a flex container inside a card (templates/index.html), so the bar sets its own flex: that is what lets the Discard-all button's margin-left:auto push it right.
+  return '<div class="row" data-verdict-filter-bar style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:10px">' + BRANCH_VERDICT_FILTERS.map((f) => {
     const n = f.key === 'all' ? branches.length : (counts[f.key] || 0);
     const cls = f.key === activeKey ? 'action' : 'secondary';
     return `<button class="${cls}" data-verdict-filter="${f.key}">${_bvEscape(f.label)} (${n})</button>`;
@@ -84,6 +85,9 @@ function branchVerdictFilterBarHtml(branches, activeKey) {
 const DISCARD_TRIAGE_BRANCH = 'agent/triage-queue';
 const DISCARD_ALL_LIST_LIMIT = 15;
 let discardAllRunning = false;
+// A card's content ends 18px inside the card (2px border + 16px padding, .worker-card in templates/index.html): the Discard-all button keeps the same inset so its
+// right edge lines up with the Discard buttons on the cards below it.
+const DISCARD_ALL_INSET_PX = 18;
 
 // Cards whose CURRENT verdict is discard. A stale verdict reads as unverified (branchVerdictKey), so it can never be in here.
 function discardAllCandidates(branches, includeTriage) {
@@ -94,7 +98,7 @@ function discardAllButtonHtml(branches, activeKey) {
   if (activeKey !== 'discard') return '';
   const n = discardAllCandidates(branches, false).length;
   if (!n) return '';
-  return `<button class="secondary" data-discard-all style="margin-left:auto"${discardAllRunning ? ' disabled' : ''} title="Permanently delete every remote branch with a current discard verdict (one confirmation).">`
+  return `<button class="secondary" data-discard-all style="margin-left:auto;margin-right:${DISCARD_ALL_INSET_PX}px"${discardAllRunning ? ' disabled' : ''} title="Permanently delete every remote branch with a current discard verdict (one confirmation).">`
     + `${discardAllRunning ? 'Discarding...' : `Discard all (${n})`}</button>`;
 }
 
@@ -202,4 +206,4 @@ function refreshBranchVerdictFilterBar(main, branches) {
   wireBranchVerdictFilterBar(main);
 }
 
-if (typeof module !== 'undefined') module.exports = { branchVerdictKey, branchVerdictBorderStyle, branchVerdictBadgeHtml, branchVerdictDetailHtml, filterBranchesByVerdict, branchVerdictFilterBarHtml, BRANCH_VERDICT_FILTERS, heldHubsHtml, discardAllCandidates, discardAllButtonHtml, discardAllDialogText, discardAllConfirmOk, discardAllPayload, discardAllResultText, discardOpenHubBranches };
+if (typeof module !== 'undefined') module.exports = { branchVerdictKey, branchVerdictBorderStyle, branchVerdictBadgeHtml, branchVerdictDetailHtml, filterBranchesByVerdict, branchVerdictFilterBarHtml, BRANCH_VERDICT_FILTERS, heldHubsHtml, discardAllCandidates, discardAllButtonHtml, DISCARD_ALL_INSET_PX, discardAllDialogText, discardAllConfirmOk, discardAllPayload, discardAllResultText, discardOpenHubBranches };
