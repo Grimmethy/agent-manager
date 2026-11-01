@@ -419,7 +419,7 @@ def api_git_unmerged_branches():
 def api_git_held_hub_branches():
     """Hubs with built-but-unlisted children, so the tab can say what each is waiting on."""
     from app import list_held_hub_groups
-    return jsonify(list_held_hub_groups())
+    return jsonify(list_held_hub_groups(include_other_projects=request.args.get("projects") == "all"))
 
 
 @pipeline_1_more_bp.route("/api/git/branches/<path:branch>/commits")

@@ -4,6 +4,7 @@ with the git-backed lookups stubbed. Store/check behavior is covered in test_bra
 Run: python -m unittest python.dashboard.test_branch_verdict_endpoint -v   (from the repo root)
 """
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 import branch_verdicts as bv  # noqa: E402
+import branch_verdicts_pending as bvp  # noqa: E402
 
 
 class Endpoint(unittest.TestCase):
@@ -115,6 +117,84 @@ class Endpoint(unittest.TestCase):
         self.assertEqual(pv["sha"], "sha-D")
         self.assertEqual(pv["branch"], "agent/decompose-hub-x")
         self.assertNotIn("priorVerdict", json.loads((self.q / "coordinating" / "hub-x.json").read_text())["promptContext"])
+
+
+class TestVerdictOnHeldHubBranch(unittest.TestCase):
+    """POST /api/git/branches/<branch>/verdict for a held hub branch (not in listing)."""
+
+    def setUp(self):
+        import app  # noqa: WPS433
+        self.app = app
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.q = Path(self.tmp.name)
+        self.client = app.app.test_client()
+
+        # Create a real bare repo so git commands work
+        self.bare = Path(self.tmp.name) / "origin.git"
+        self.work = Path(self.tmp.name) / "work"
+        subprocess.run(
+            ["git", "init", "--bare", "-b", "master", str(self.bare)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "clone", str(self.bare), str(self.work)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "init"],
+            cwd=str(self.work), check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "push", "origin", "master"],
+            cwd=str(self.work), check=True, capture_output=True,
+        )
+
+    def test_post_verdict_on_held_branch_returns_pending(self):
+        """When branch exists on origin but not in listing, verdict is stored as pending."""
+        # Create a branch on origin
+        subprocess.run(
+            ["git", "checkout", "-b", "agent/held-branch"],
+            cwd=str(self.work), check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "held"],
+            cwd=str(self.work), check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "push", "origin", "agent/held-branch"],
+            cwd=str(self.work), check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "master"],
+            cwd=str(self.work), check=True, capture_output=True,
+        )
+
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "origin/agent/held-branch"],
+            cwd=str(self.work), check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        with mock.patch.object(self.app, "list_unmerged_branches", return_value=[]), \
+             mock.patch.object(self.app, "get_active_repo_root", return_value=str(self.work)), \
+             mock.patch.object(self.app, "queue_dir", return_value=self.q), \
+             mock.patch.object(self.app, "_invalidate_branch_cache"):
+            r = self.client.post(
+                "/api/git/branches/agent%2Fheld-branch/verdict",
+                json={"verdict": "merge", "reasons": ["looks good"], "source": "manual"},
+            )
+        self.assertEqual(r.status_code, 200, r.get_json())
+        body = r.get_json()
+        self.assertTrue(body["succeeded"])
+        self.assertTrue(body["pending"])
+        self.assertEqual(body["headSha"], head_sha)
+
+        # Verify pending file was created
+        pending = bvp.get_pending_verdict(self.q, "agent/held-branch")
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["branch"], "agent/held-branch")
+        self.assertEqual(pending["headSha"], head_sha)
+        self.assertEqual(pending["verdict"], "merge")
 
 
 if __name__ == "__main__":
