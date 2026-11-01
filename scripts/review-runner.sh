@@ -174,10 +174,12 @@ while :; do                                                                     
   # the GPU for an image generation this tick.
   if comfyui_lease_held "${OLLAMA_URL:-http://localhost:11434}"; then
     printf '[review-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+    lane_note_gpu_pause "$INSTANCE_ID" "${LOCAL_MODEL:-}" "$STARTED_AT"   # heartbeat says "paused" (Workers tab) and remembers to warm the model up afterwards
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
     continue
   fi
+  lane_warm_after_pause "$INSTANCE_ID" "${LOCAL_MODEL:-}" "$STARTED_AT"   # no-op unless the lease was just released: reload the model before reviewing
 
   # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
   if mem_pressure_high; then
