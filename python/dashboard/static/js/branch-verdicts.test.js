@@ -149,3 +149,13 @@ test('discard all: the result reads "Discarded X of N" and lists each failure wi
   assert.equal(dv.discardAllResultText(r), 'Discarded 2 of 3\n  - agent/b: head moved');
   assert.equal(dv.discardAllResultText({ results: [] }), 'Discarded 0 of 0');
 });
+
+test('discard all: the bar is a flex container and only the Discard-all button is pushed right, inset like the card buttons', () => {
+  const list = [D('agent/a'), D('agent/b')];
+  const html = branchVerdictFilterBarHtml(list, 'discard');
+  assert.match(html, /data-verdict-filter-bar style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;/);
+  assert.equal(dv.DISCARD_ALL_INSET_PX, 18, 'card border 2px + padding 16px');
+  assert.match(html, /<button class="secondary" data-discard-all style="margin-left:auto;margin-right:18px"/);
+  assert.equal((html.match(/margin-left:auto/g) || []).length, 1, 'no filter chip is pushed right');
+  assert.doesNotMatch(branchVerdictFilterBarHtml(list, 'all'), /margin-left:auto/);
+});
