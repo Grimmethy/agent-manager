@@ -539,7 +539,12 @@ if (require.main === module) {
     const withPremium = process.argv.includes('--with-premium');
     const [pendingDir, instanceId] = process.argv.slice(2).filter((a) => a !== '--with-premium');
     try {
-      const items = pickClaimableTasks(pendingDir, instanceId, { withPremium });
+      // Create a fresh scanContext (lanes + dashboard settings, read once) and pass it
+      // explicitly to pickClaimableTasks so the perf win is realized regardless of any
+      // future changes to the function's fallback behavior.
+      const { createScanContext } = require('./scan-config-cache.js');
+      const scanContext = createScanContext();
+      const items = pickClaimableTasks(pendingDir, instanceId, { withPremium, scanContext });
       for (const item of items) console.log(withPremium ? `${item.name}\t${item.premium ? 1 : 0}` : item);
     } catch (e) {
       // Best-effort, matching the removed inline script's own catch-and-fall-through --
