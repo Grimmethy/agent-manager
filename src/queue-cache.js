@@ -166,4 +166,24 @@ function readTaskCached(cache, fullPath) {
   return { task: read.task, mtimeMs: read.mtimeMs };
 }
 
-module.exports = { openQueueCache, readTaskCached, cacheFileFor, REVALIDATE_MS, RACY_MS };
+// Classify every entry in `dir` as either a "deep_dive" file (name starts with 'deep_dive')
+// or "other". Pure function: only a readdirSync with withFileTypes (stat-only directory
+// listing, no file content parsing). Returns two Sets of entry names.
+function classifyDeepDiveFiles(dir) {
+  const deepDiveNames = new Set();
+  const otherNames = new Set();
+
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (entry.name.startsWith('deep_dive')) {
+      deepDiveNames.add(entry.name);
+    } else {
+      otherNames.add(entry.name);
+    }
+  }
+
+  return { deepDiveNames, otherNames };
+}
+
+module.exports = { openQueueCache, readTaskCached, cacheFileFor, classifyDeepDiveFiles, REVALIDATE_MS, RACY_MS };
