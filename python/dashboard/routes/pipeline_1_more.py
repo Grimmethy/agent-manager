@@ -868,7 +868,7 @@ def api_git_discard_branch(branch):
     Mirrors api_git_merge_branch for the parts that overlap (the same-list re-validation
     gate, the apply-lock, the two-location task lookup) minus the merge/checkout/push-to-
     main steps this doesn't need."""
-    from app import _acquire_apply_lock, _archive_task_file, _delete_local_branch, _invalidate_branch_cache, _release_apply_lock, _run_git, get_active_repo_root, list_unmerged_branches, logger, queue_dir, read_json_safe
+    from app import _acquire_apply_lock, _release_apply_lock, get_active_repo_root, list_unmerged_branches
     repo_root = get_active_repo_root()
     if not repo_root:
         abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
@@ -884,7 +884,6 @@ def api_git_discard_branch(branch):
         abort(404, description=str(e))
     if scope:
         repo_root = scope["repoPath"]
-    qdir_for = (lambda: scope["qdir"]) if scope else queue_dir
 
     # Same "only act on what we ourselves already offered" gate api_git_merge_branch/
     # api_task_archive/api_task_requeue all already use (another project: ITS list, recomputed now).
@@ -898,87 +897,26 @@ def api_git_discard_branch(branch):
     except RuntimeError:
         abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
 
-    local_branch = {"deleted": False, "reason": "not attempted"}
-
-    # Brain-dump #1740: capture WHAT this branch holds (commits, the candidate headings it added, the verdict recorded on its card) and
-    # pin its head under refs/discarded/ BEFORE the remote delete below, so a discarded batch is no longer just "discarded via the
-    # dashboard" and stays recoverable once both the remote and local branch are gone. Best-effort: nothing in this block may stop the discard.
-    snapshot, reason = {}, ""
+    # The effect itself lives in branch_discard.discard_branch, shared with the Discard-all batch route below.
+    from branch_discard import discard_branch
     try:
-        from branch_removals import snapshot_branch
-        snapshot = snapshot_branch(_run_git, repo_root, match.get("mainBranch") or "main", branch, match.get("headSha"), qdir_for(), keep_ref=True)
-        body = request.get_json(silent=True)
-        reason = str(body.get("reason") or "").strip() if isinstance(body, dict) else ""
-        if not reason:
-            default_reasons = (snapshot.get("verdict") or {}).get("reasons") or []
-            reason = str(default_reasons[0]) if default_reasons else ""
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Non-fatal: could not snapshot %r before discarding it: %s", branch, exc)
-
-    try:
-        try:
-            _run_git(["push", "origin", "--delete", branch], repo_root)
-        except RuntimeError as e:
-            # A delete failing because the ref is already gone (deleted by hand, or a
-            # duplicate click) means the actual goal -- this branch not existing on origin
-            # -- is already achieved; only a REAL git failure (auth, network, etc.) should
-            # surface as an error. Same "remote ref does not exist" shape git itself uses
-            # for this case.
-            if "remote ref does not exist" not in str(e) and "unable to delete" not in str(e).lower():
-                raise
-        from branch_removals import record_branch_removal
-        record_branch_removal(qdir_for(), branch, "discarded", task_id=branch.removeprefix("agent/"),
-                              detail="discarded via the dashboard Unmerged Branches tab", actor="dashboard-discard",
-                              reason=reason or None, snapshot=snapshot or None)
-        # Also drop the LOCAL copy (only reached when the remote delete succeeded or the ref was
-        # already gone) -- see _delete_local_branch for why leaving it is a real hazard.
-        local_branch = _delete_local_branch(repo_root, branch)
+        payload = discard_branch(branch, match, repo_root, scope, reason=body_in.get("reason"))
     except RuntimeError as e:
         return jsonify({"succeeded": False, "reason": str(e)}), 500
     finally:
         _release_apply_lock(lock_fd)
+    return jsonify(payload)
 
-    # Archive the matching task record, same 2-location lookup api_git_merge_branch's own
-    # mergedAt-stamping step already does. Best-effort: no task record found (a branch
-    # pushed with nothing matching in done/) is not an error, just nothing to reconcile;
-    # already-archived (a human archived it by hand first, or a duplicate click) is a
-    # silent no-op, not a 409 -- the branch delete above is the part that mattered.
-    task_archived = False
-    qdir = qdir_for()
-    if qdir:
-        task_id = branch.removeprefix("agent/")
-        done_path = qdir / "done" / f"{task_id}.json"
-        archived_path = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
-        if done_path.is_file():
-            data = read_json_safe(done_path)
-            if data is not None:
-                now_iso = datetime.now(timezone.utc).isoformat()
-                if data.get("terminalDisposition") != "dismissed":
-                    hist = data.get("history")
-                    if not isinstance(hist, list):
-                        hist = data["history"] = []
-                    hist.append({
-                        "stage": "dismissed",
-                        "at": now_iso,
-                        "detail": f"branch {branch} discarded via the dashboard Unmerged Branches tab -- not merging this",
-                    })
-                    data["terminalDisposition"] = "dismissed"
-                try:
-                    done_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-                except OSError as exc:
-                    logger.error("Failed to persist dismissed-state for branch %r to %s: %s", branch, done_path, exc)
-                    raise
-            try:
-                _archive_task_file(qdir, done_path)
-                task_archived = True
-            except FileExistsError:
-                pass
-        elif archived_path.is_file():
-            task_archived = True  # already archived (e.g. by hand) -- nothing more to do
 
-    if scope:
-        branch_projects.after_action(scope)
-    else:
-        _invalidate_branch_cache()
-    return jsonify({"succeeded": True, "branch": branch, "taskArchived": task_archived, "localBranch": local_branch,
-                    "snapshotRef": (snapshot or {}).get("snapshotRef")})
+@pipeline_1_more_bp.route("/api/git/branches/discard-batch", methods=["POST"])
+def api_git_discard_batch():
+    """Discard every listed branch whose CURRENT verdict is discard (the Unmerged Branches tab's "Discard all" button, owner request 2026-10-31).
+
+    Body: {"branches": [{"branch", "project", "sha"}], "includeTriage": false}. Each item repeats the single route's effects by calling the same helper
+    (branch_discard.discard_branch) and is refused unless the verdict the owner saw still stands (see branch_discard.refusal). One apply lock for the whole
+    batch: busy -> 409 and nothing deleted. Per-item results; one failure does not stop the rest."""
+    from branch_discard import discard_batch
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    status, payload = discard_batch(body.get("branches"), include_triage=bool(body.get("includeTriage")))
+    return jsonify(payload), status
