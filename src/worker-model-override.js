@@ -18,9 +18,18 @@ function settingsPath() {
 
 // -> { <instanceId>: <bare model name> }. A "claude:" override is a Claude lane choice, not a local model, so it is not an override of the local model; a
 // legacy "ollama:" prefix is stripped (the bash side tolerates it too). Any read or parse problem is an empty map (never blocks anything).
-function readWorkerModelOverrides(file = settingsPath()) {
+// `cachedDashboardSettings` is an optional pre-loaded dashboard-settings.json value (object or JSON string). When provided, it is used instead of reading from disk.
+function readWorkerModelOverrides(file, cachedDashboardSettings) {
   let raw;
-  try { raw = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) { return {}; }
+  if (cachedDashboardSettings !== undefined && cachedDashboardSettings !== null) {
+    try {
+      raw = typeof cachedDashboardSettings === 'string' ? JSON.parse(cachedDashboardSettings) : cachedDashboardSettings;
+    } catch (_) {
+      return {};
+    }
+  } else {
+    try { raw = JSON.parse(fs.readFileSync(file || settingsPath(), 'utf8')); } catch (_) { return {}; }
+  }
   const map = raw && raw.workerModelOverrides;
   const out = {};
   if (!map || typeof map !== 'object') return out;

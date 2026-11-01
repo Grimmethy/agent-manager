@@ -19,6 +19,30 @@
 // convention emptyApproval/advisoryProse/candidateFulfillment already use.
 
 const registry = {};
+const fs = require('fs');
+const path = require('path');
+
+// Reads dashboard-settings.json from the package root (or AGENT_MANAGER_SETTINGS_PATH env var).
+// `cachedDashboardSettings` is an optional pre-loaded value (object or JSON string). When provided,
+// it is used instead of reading from disk. Any read or parse problem returns an empty object.
+function readDashboardSettings(settingsPath, cachedDashboardSettings) {
+  let parsed;
+  if (cachedDashboardSettings !== undefined && cachedDashboardSettings !== null) {
+    try {
+      parsed = typeof cachedDashboardSettings === 'string' ? JSON.parse(cachedDashboardSettings) : cachedDashboardSettings;
+    } catch (_) {
+      return {};
+    }
+  } else {
+    const settingsPathValue = settingsPath || process.env.AGENT_MANAGER_SETTINGS_PATH || path.join(__dirname, '..', 'dashboard-settings.json');
+    try {
+      parsed = JSON.parse(fs.readFileSync(settingsPathValue, 'utf8'));
+    } catch (_) {
+      return {};
+    }
+  }
+  return (parsed && typeof parsed === 'object') ? parsed : {};
+}
 
 function registerModelProfile(name, config) {
   if (registry[name] !== undefined) {
@@ -35,4 +59,4 @@ function clearModelProfileRegistry() {
   Object.keys(registry).forEach((key) => delete registry[key]);
 }
 
-module.exports = { registerModelProfile, getModelProfile, clearModelProfileRegistry };
+module.exports = { registerModelProfile, getModelProfile, clearModelProfileRegistry, readDashboardSettings };

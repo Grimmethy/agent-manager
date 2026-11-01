@@ -45,16 +45,28 @@ function settingsPathFor() {
 // must never silently block real work" rule this codebase applies to every other
 // best-effort environment read (getConfig()'s own try/catches, check_budget_healthy's
 // node error handler). A missing/corrupt settings file must never look like "paused."
+// `cachedDashboardSettings` is an optional pre-loaded dashboard-settings.json value (object
+// or JSON string). When provided, it is used instead of reading from disk.
 // `settingsPath` is a test seam only -- production callers pass nothing and get the
 // package-root path above.
-function isClaudePaused(settingsPath = settingsPathFor()) {
-  try {
-    const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-    return settings.claudePaused === true;
-  } catch (e) {
-    console.error(`claude-pause: ${e.message}`, e);
-    return false;
+function isClaudePaused(settingsPath, cachedDashboardSettings) {
+  let settings;
+  if (cachedDashboardSettings !== undefined && cachedDashboardSettings !== null) {
+    try {
+      settings = typeof cachedDashboardSettings === 'string' ? JSON.parse(cachedDashboardSettings) : cachedDashboardSettings;
+    } catch (e) {
+      console.error(`claude-pause: ${e.message}`, e);
+      return false;
+    }
+  } else {
+    try {
+      settings = JSON.parse(fs.readFileSync(settingsPath || settingsPathFor(), 'utf8'));
+    } catch (e) {
+      console.error(`claude-pause: ${e.message}`, e);
+      return false;
+    }
   }
+  return settings && settings.claudePaused === true;
 }
 
 module.exports = { isClaudePaused, settingsPathFor };
