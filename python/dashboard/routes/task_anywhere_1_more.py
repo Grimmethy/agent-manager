@@ -12,52 +12,160 @@ import json
 
 task_anywhere_1_more_bp = Blueprint("task-anywhere-1-more-bp", __name__)
 
+
+def _projects_for_anywhere():
+    """Build the {label: {qdir, repoRoot}} mapping used by resolve_task_across_projects.
+
+    Imported lazily to avoid a top-level circular import with app.py / branch_projects.
+    """
+    from app import get_active_repo_root, get_pipeline_dir
+    import branch_projects
+    active_root = get_active_repo_root()
+    active_pipeline = get_pipeline_dir()
+    active_real = os.path.realpath(active_root) if active_root else None
+    projects = {}
+    for label, info in branch_projects.registered_projects(active_root):
+        repo_root = info.get("repoRoot", "")
+        pipeline_dir = info.get("pipelineDir", "")
+        qdir = Path(pipeline_dir) / "queue" if pipeline_dir else None
+        projects[label] = {"qdir": qdir, "repoRoot": repo_root}
+    # Ensure the active project is in the mapping even if not registered.
+    if active_root and active_root not in {v.get("repoRoot") for v in projects.values()}:
+        projects.setdefault("__active__", {"qdir": Path(active_pipeline) / "queue" if active_pipeline else None, "repoRoot": active_root})
+    return projects
+
+
 @task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>")
 def api_task_anywhere(task_id):
     """Workers tab click-through: an instance's currentTaskId doesn't say which queue
     state to look in (a worker's is in drafting/, review-runner's is in review/,
     apply-runner's is in approved/) -- rather than hardcode that mapping (fragile if a
     new instance type is added later), just search drafting first (the common case for
-    an actively 'working' instance), then every other state in order."""
-    from app import QUEUE_STATES, _files_touched_for, _incoming_task_links, _outgoing_task_links, _task_cost_summary, _task_input_summary, _work_log_for, queue_dir, read_json_safe
-    qdir = queue_dir()
-    if not qdir:
-        abort(404)
+    an actively 'working' instance), then every other state in order.
 
-    drafting_root = qdir / "drafting"
-    if drafting_root.is_dir():
-        for candidate in drafting_root.rglob(f"{task_id}.json"):
-            data = read_json_safe(candidate)
-            if data:
-                return jsonify({**data, "_foundState": "drafting", "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id), "_incomingLinks": _incoming_task_links(task_id), "_outgoingLinks": _outgoing_task_links(task_id)})
+    Accepts ?project=<label> to hint which registered project to search first; falls
+    back to the active project, then every other project. Crosses project boundaries
+    so a worker in project A can click through to a task owned by project B.
+    """
+    from app import QUEUE_STATES, _files_touched_for, _incoming_task_links, _outgoing_task_links, _task_cost_summary, _task_input_summary, _work_log_for, read_json_safe
+    from routes.project_scope import resolve_task_across_projects, TaskNotFoundError
+    import os
+    from pathlib import Path
 
-    def _payload(data, found_state):
-        return jsonify({**data, "_foundState": found_state, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id), "_incomingLinks": _incoming_task_links(task_id), "_outgoingLinks": _outgoing_task_links(task_id)})
+    project_hint = request.args.get("project")
+    projects = _projects_for_anywhere()
+    try:
+        data = resolve_task_across_projects(task_id, project_hint, projects)
+    except TaskNotFoundError:
+        abort(404, description=f"task {task_id} not found in any project")
 
-    for state in QUEUE_STATES:
-        data = read_json_safe(qdir / state / f"{task_id}.json")
-        if data:
-            return _payload(data, state)
+    # Determine which state the task was found in (for _foundState).
+    search_order = list(projects.keys())
+    if project_hint and project_hint in projects:
+        search_order = [project_hint] + [n for n in search_order if n != project_hint]
+    else:
+        from app import get_active_repo_root
+        active_root = get_active_repo_root()
+        active_real = os.path.realpath(active_root) if active_root else None
+        ordered = []
+        for name in projects:
+            rr = projects[name].get("repoRoot", "")
+            if os.path.realpath(rr) == active_real:
+                ordered.insert(0, name)
+            else:
+                ordered.append(name)
+        search_order = ordered
 
-    # A job-log / recent-tasks row can point at a task that has since been archived (by the
-    # daily done-archive pass or by hand) or that lives in adhoc/ -- none of which are in
-    # QUEUE_STATES. Check those too so the row still opens.
-    data = read_json_safe(qdir / "adhoc" / f"{task_id}.json")
-    if data:
-        return _payload(data, "adhoc")
-    data = read_json_safe(qdir / "done" / "_archived_no_action" / f"{task_id}.json")
-    if data:
-        return _payload(data, "archived")
-    dated_archive_root = qdir / "done" / "_archived"
-    if dated_archive_root.is_dir():
-        for month_dir in sorted(dated_archive_root.iterdir(), reverse=True):
-            if not month_dir.is_dir():
+    found_state = "unknown"
+    for proj_name in search_order:
+        qdir = projects[proj_name].get("qdir")
+        if not qdir:
+            continue
+        drafting_root = qdir / "drafting"
+        if drafting_root.is_dir():
+            for candidate in drafting_root.rglob(f"{task_id}.json"):
+                if read_json_safe(candidate) is not None:
+                    found_state = "drafting"
+                    break
+            if found_state == "drafting":
+                break
+        if found_state != "unknown":
+            continue
+        for state in QUEUE_STATES:
+            if read_json_safe(qdir / state / f"{task_id}.json") is not None:
+                found_state = state
+                break
+        if found_state != "unknown":
+            break
+    if found_state == "unknown":
+        for proj_name in search_order:
+            qdir = projects[proj_name].get("qdir")
+            if not qdir:
                 continue
-            data = read_json_safe(month_dir / f"{task_id}.json")
-            if data:
-                return _payload(data, "archived")
+            if (qdir / "adhoc" / f"{task_id}.json").exists():
+                found_state = "adhoc"
+                break
+            if (qdir / "done" / "_archived_no_action" / f"{task_id}.json").exists():
+                found_state = "archived"
+                break
+            dated_archive_root = qdir / "done" / "_archived"
+            if dated_archive_root.is_dir():
+                for month_dir in sorted(dated_archive_root.iterdir(), reverse=True):
+                    if month_dir.is_dir() and (month_dir / f"{task_id}.json").exists():
+                        found_state = "archived"
+                        break
+                if found_state == "archived":
+                    break
+            if found_state != "unknown":
+                break
 
-    abort(404, description=f"task {task_id} not found in any queue state")
+    def _payload(d, state):
+        return jsonify({**d, "_foundState": state, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(d), "_requestInput": _task_input_summary(d), "_workLog": _work_log_for(task_id), "_incomingLinks": _incoming_task_links(task_id), "_outgoingLinks": _outgoing_task_links(task_id)})
+
+    return _payload(data, found_state)
+
+
+@task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>/work-log")
+def api_work_log(task_id):
+    """Return the per-task tool-call transcript (queue/worklogs/<id>.json).
+
+    Accepts ?project=<label> to look in another registered project's worklogs/; falls
+    back to the active project, then every other project. Returns 404 if not found in
+    any project.
+    """
+    from app import read_json_safe
+    import os
+    from pathlib import Path
+
+    project_hint = request.args.get("project")
+    projects = _projects_for_anywhere()
+    search_order = list(projects.keys())
+    if project_hint and project_hint in projects:
+        search_order = [project_hint] + [n for n in search_order if n != project_hint]
+    else:
+        from app import get_active_repo_root
+        active_root = get_active_repo_root()
+        active_real = os.path.realpath(active_root) if active_root else None
+        ordered = []
+        for name in projects:
+            rr = projects[name].get("repoRoot", "")
+            if os.path.realpath(rr) == active_real:
+                ordered.insert(0, name)
+            else:
+                ordered.append(name)
+        search_order = ordered
+
+    for proj_name in search_order:
+        repo_root = projects[proj_name].get("repoRoot")
+        if not repo_root:
+            continue
+        worklog_path = Path(repo_root) / "queue" / "worklogs" / f"{task_id}.json"
+        if worklog_path.is_file():
+            data = read_json_safe(worklog_path)
+            if data is not None:
+                return jsonify({"task_id": task_id, "workLog": data})
+
+    abort(404, description=f"work-log for {task_id} not found in any project")
 
 
 @task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>/premium-priority", methods=["POST"])
