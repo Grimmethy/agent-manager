@@ -333,6 +333,20 @@ const KNOWN_FIXED = [
     dirs: ['blocked', 'needs-clarification'],
     applies: siblingNowReachableOnStackedBranch,
   },
+  {
+    id: 'stale-git-lock-file-exists',
+    fixedIn: 'agent-manager (git-runner: clearStaleLocks removes locks older than AGENT_MANAGER_APPLY_STALE_LOCK_MINUTES, 2026-10-28)',
+    description: 'git operations failed with "Unable to create <path>.lock: File exists" because a previous run left a stale lock file; clearStaleLocks() now removes locks older than AGENT_MANAGER_APPLY_STALE_LOCK_MINUTES (default 30) before running git commands',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => /Unable to create .+\\.lock: File exists/.test(failureText(task)),
+  },
+  {
+    id: 'git-fetch-timeout-etimedout',
+    fixedIn: 'agent-manager (git-runner: retry git fetch once on ETIMEDOUT, 2026-10-28)',
+    description: 'git fetch failed with "git fetch <remote> timed out after <N>ms (ETIMEDOUT)" on a slow network; the implement pass now retries fetch once on ETIMEDOUT instead of blocking the task',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => /git fetch .+ timed out after \\d+ms \\(ETIMEDOUT\\)/.test(failureText(task)),
+  },
 ];
 
 module.exports = { KNOWN_FIXED, failureText, siblingRepoWasUnreachable, SIBLING_NOT_IN_TREE_RE, _setEndpointProbe };
