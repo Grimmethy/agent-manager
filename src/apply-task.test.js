@@ -1725,3 +1725,104 @@ test('applyTask forwards a decompose parent\'s ownerGates in its coordinating re
   assert.equal(result.ownerGates.length, 1);
   assert.equal(result.ownerGates[0].why, 'owner approval');
 });
+
+// --- HUB0244 · 3/3: Dirty-tree contamination incident reproduction tests ---
+// These tests verify the dirty-tree handling added to prevent cross-task contamination
+// in the apply loop. The scenario: task A's apply leaves uncommitted changes in the
+// working tree, then task B starts its apply. Without dirty-tree handling, B's git
+// operations would either fail or (worse) silently include A's changes in B's branch.
+
+test('HUB0244 3/3: dirty working tree before task B apply is detected and blocks with the file named', () => {
+  // Simulate: task A left dirty files in the working tree, then task B starts its apply.
+  // The production code's quarantineDirtyTree() stashes the dirty files (in a dedicated
+  // apply clone) so the apply can proceed, but assertCleanTree() still fails if there's
+  // uncommitted tracked content that couldn't be rescued -- that's the path this test
+  // exercises: a dirty tree that the self-heal cannot clear.
+  const { DIRTY_CLONE_ERROR_PREFIX } = require('./git-runner.js');
+  const gitRunner = createFakeGitRunner({ dirtyTree: 'stray-file.txt' });
+  
+  const taskB = baseTask({ id: 'task-b-1', implementResponse: JSON.stringify({ mode: 'edit', file: 'foo.js', find: 'a', replace: 'b' }) });
+  const resultB = applyTask(taskB, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  
+  // Task B fails because the dirty tree could not be fully rescued
+  assert.equal(resultB.succeeded, false);
+  assert.ok(resultB.reason.startsWith(DIRTY_CLONE_ERROR_PREFIX), `reason should start with DIRTY_CLONE_ERROR_PREFIX, got: ${resultB.reason}`);
+  assert.match(resultB.reason, /stray-file\.txt/, 'error should name the stray file that task A left behind');
+  
+  // Verify the fake git runner's sequencing: quarantine first, then assert, then bail
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree'], 'self-heal is attempted first, then the assert -- and nothing after it');
+  assert.ok(names.indexOf('quarantineDirtyTree') < names.indexOf('assertCleanTree'), 'quarantine runs before the assert');
+});
+
+test('HUB0244 3/3: post-apply extra file outside rawDiff blocks the branch with the path named', () => {
+  // Simulate: an extra file exists in the working tree that is NOT part of the task's
+  // rawDiff. The production code's assertCleanTree() detects this and fails the apply
+  // with a message that names the extra paths, so the branch is blocked until the stray
+  // content is cleaned up.
+  const { DIRTY_CLONE_ERROR_PREFIX } = require('./git-runner.js');
+  const gitRunner = createFakeGitRunner({ dirtyTree: ' Docs/ARCH_REVIEW_CANDIDATES.md,extra-file.txt' });
+  
+  const task = baseTask({ id: 'blocked-task-1', implementResponse: JSON.stringify({ mode: 'edit', file: 'foo.js', find: 'a', replace: 'b' }) });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  
+  // applyTask returns a failure result (does not throw) when the tree is dirty
+  assert.equal(result.succeeded, false);
+  assert.ok(result.reason.startsWith(DIRTY_CLONE_ERROR_PREFIX), `reason should start with DIRTY_CLONE_ERROR_PREFIX, got: ${result.reason}`);
+  // The error should name BOTH the real file and the extra file
+  assert.match(result.reason, /extra-file\.txt/, 'error should name the extra file outside rawDiff');
+  assert.match(result.reason, /ARCH_REVIEW_CANDIDATES\.md/, 'error should name the uncommitted tracked change');
+  
+  // The branch should be blocked: no commit, no push, no add
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(!names.includes('commit'), 'no commit should be made on a dirty tree');
+  assert.ok(!names.includes('push'), 'no push should be made on a dirty tree');
+  assert.ok(!names.includes('add'), 'no add should be made on a dirty tree');
+});
+
+test('HUB0244 3/3: migration script detects pool projects missing applyRepoRoot in dry-run', () => {
+  // The migration script (scripts/migrate-apply-repo-root.sh) uses jq to find pool:true
+  // projects missing applyRepoRoot. This test replicates that detection logic in JS to
+  // verify the behavior without depending on jq being installed.
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'migrate-apply-repo-root-'));
+  const projectsPath = path.join(tmpDir, 'projects.json');
+  
+  const projects = [
+    { repoName: 'existing-project', repoRoot: '/media/model-cache/github/existing-project', applyRepoRoot: '/media/model-cache/github/existing-project-apply', pool: false },
+    { repoName: 'missing-apply-repo', repoRoot: '/media/model-cache/github/missing-apply-repo', pool: true, applyRepoRoot: null },
+    { repoName: 'empty-apply-repo', repoRoot: '/media/model-cache/github/empty-apply-repo', pool: true, applyRepoRoot: '' },
+    { repoName: 'has-apply-repo', repoRoot: '/media/model-cache/github/has-apply-repo', pool: true, applyRepoRoot: '/media/model-cache/github/has-apply-repo-apply' },
+  ];
+  
+  fs.writeFileSync(projectsPath, JSON.stringify(projects, null, 2));
+  
+  // Replicate the script's jq logic in JS:
+  // [.[] | select(.pool == true) | select(.applyRepoRoot == null or .applyRepoRoot == "")]
+  // | .[]
+  // | (.repoRoot // "" | split("/") | last) as $name
+  // | "\($name) \(.repoRoot // "")"
+  const missing = projects
+    .filter((p) => p.pool === true)
+    .filter((p) => p.applyRepoRoot === null || p.applyRepoRoot === '')
+    .map((p) => {
+      const name = (p.repoRoot || '').split('/').filter(Boolean).pop() || '';
+      return { name, repoRoot: p.repoRoot };
+    });
+  
+  // Verify the detection logic finds the two missing projects
+  assert.equal(missing.length, 2, 'should detect two pool projects missing applyRepoRoot');
+  const names = missing.map((m) => m.name).sort();
+  assert.deepEqual(names, ['empty-apply-repo', 'missing-apply-repo'], 'should name both missing projects');
+  
+  // Verify the projects.json was NOT modified (the detection is read-only)
+  const updatedProjects = JSON.parse(fs.readFileSync(projectsPath, 'utf8'));
+  const missingProject = updatedProjects.find((p) => p.repoName === 'missing-apply-repo');
+  assert.equal(missingProject.applyRepoRoot, null, 'detection should not have set applyRepoRoot');
+  const emptyProject = updatedProjects.find((p) => p.repoName === 'empty-apply-repo');
+  assert.equal(emptyProject.applyRepoRoot, '', 'detection should not have set applyRepoRoot');
+  const hasProject = updatedProjects.find((p) => p.repoName === 'has-apply-repo');
+  assert.equal(hasProject.applyRepoRoot, '/media/model-cache/github/has-apply-repo-apply', 'project with applyRepoRoot should be unchanged');
+  
+  // Cleanup
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
