@@ -21,7 +21,7 @@ const section = (p) => call('renderStalledWorkerSection', p);
 const buildOpen = (p) => { const ctx = load(); vm.runInContext('stalledWorkerExpanded = true', ctx); return vm.runInContext(`buildStalledWorkerHtml(${JSON.stringify(p)})`, ctx); };
 
 const live = (over = {}) => ({
-  configured: true, mode: 'dry-run', timerActive: true, lastTickAgeS: 125, decisions: 7,
+  configured: true, mode: 'dry-run', trigger: { state: 'idle', checkedAgeS: 12, endedAgeS: 90, stopped: 'idle' }, lastTickAgeS: 125, decisions: 7,
   stalled: { total: 580, projects: 33, topBuckets: [{ state: 'blocked', signature: 'plan cites missing-file target(s): <path>', count: 18 }] },
   today: { 'ESCALATE-MECHANISM': 5, 'ARCHIVE-DUPLICATE': 2 },
   holds: [{ taskId: 'adhoc-x-1', project: 'alpha', question: 'Which API?', ageHours: 5.5, ageS: 19800, dryRun: true }],
@@ -34,17 +34,21 @@ test('nothing is drawn unless the worker has left a trace', () => {
   assert.match(section(live()), /id="stalled-worker-panel"/);
 });
 
-test('the title carries the mode badge and the timer badge', () => {
+test('the title carries the mode badge and the trigger badge', () => {
   const dry = build(live());
   assert.match(dry, /class="worker-card clickable"/);
   assert.match(dry, /<span class="id">[^<]*stalled-worker<\/span><div class="badge-col">/);
   assert.match(dry, /class="badge hold"[^>]*>dry-run</);
-  assert.match(dry, /class="badge ok"[^>]*>timer on</);
+  assert.match(dry, /class="badge ok"[^>]*>trigger on</);
   assert.match(build(live({ mode: 'on' })), /class="badge ok"[^>]*>live</);
   assert.match(build(live({ mode: 'off' })), /class="badge idle"[^>]*>off</);
   assert.match(build(live({ mode: null })), />no runs yet</);
-  assert.match(build(live({ timerActive: false })), /class="badge warn"[^>]*>timer stopped</);
-  assert.match(build(live({ timerActive: null })), />timer unknown</);
+  assert.match(build(live({ trigger: { state: 'draining' } })), /class="badge ok"[^>]*>draining</);
+  assert.match(build(live({ trigger: { state: 'backlog', endedAgeS: 30, stopped: 'cap' } })), /class="badge warn"[^>]*The last drain ended 30s ago \(cap\)[^>]*>backlog</);
+  assert.match(build(live({ trigger: null })), /class="badge warn"[^>]*watchdogScripts[^>]*>no trigger yet</);
+  assert.match(build(live({})), /The last drain ended 1m ago \(idle\)/);
+  assert.doesNotMatch(build(live({ trigger: { state: 'idle' } })), /last drain ended/);
+  assert.doesNotMatch(build(live({ trigger: { state: 'idle', endedAgeS: 5, stopped: '<b>' } })), /<b>/);
 });
 
 test('the age helper: seconds, minutes, hours with minutes, days with hours, and nothing for unknown values', () => {
@@ -187,7 +191,7 @@ test('a switched-off worker offers Turn on (next-enabled=true), shows the switch
   assert.match(html, /Switched off since 2026-11-02T12:00:00\.000Z/);
   assert.doesNotMatch(html, /class="badge hold"[^>]*>dry-run</);
   assert.match(html, /class="worker-card clickable worker-off"/);
-  assert.match(html, /timer on/);                                            // the timer badge stays: the timer keeps running
+  assert.match(html, /trigger on/);                                          // the trigger badge stays when the worker is switched off: the watchdog keeps running
   assert.match(build(live({ switch: { disabled: true } })), /class="badge idle"[^>]*>switched off</);
   assert.doesNotMatch(build(live({ switch: { disabled: true } })), /since/);
 });
@@ -324,4 +328,18 @@ test('exactly three outcomes show no "more"; a long gateway error is cut in the 
   const err = build(live({ budget: null, gateway: { available: false, error: 'E'.repeat(100) } }));
   assert.match(err, /\(E{39}…\)/);
   assert.doesNotMatch(err, /E{41}/);
+});
+
+test('the trigger heartbeat: "checked Ns ago" on the meta line and in the badge title, "trigger silent" past five minutes, never for a running drain', () => {
+  assert.match(build(live()), /<div class="meta">[^<]*trigger checked 12s ago/);
+  assert.match(build(live()), /class="badge ok"[^>]*Checked 12s ago\.[^>]*>trigger on</);
+  assert.doesNotMatch(build(live({ trigger: { state: 'idle', endedAgeS: 90 } })), /trigger checked/);
+  assert.doesNotMatch(build(live({ trigger: null })), /trigger checked/);
+  const silent = build(live({ trigger: { state: 'idle', checkedAgeS: 301 } }));
+  assert.match(silent, /class="badge warn"[^>]*has not called the trigger for 5m[^>]*>trigger silent</);
+  assert.doesNotMatch(silent, />trigger on</);
+  assert.match(build(live({ trigger: { state: 'idle', checkedAgeS: 300 } })), />trigger on</);                       // exactly five minutes is still fine
+  assert.match(build(live({ trigger: { state: 'backlog', checkedAgeS: 9999 } })), />trigger silent</);
+  assert.match(build(live({ trigger: { state: 'draining', checkedAgeS: 9999 } })), />draining</);
+  assert.match(build(live({ trigger: { state: 'backlog', checkedAgeS: 20, endedAgeS: 30, stopped: 'cap' } })), /class="badge warn"[^>]*Checked 20s ago[^>]*>backlog</);
 });

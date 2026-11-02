@@ -5,7 +5,6 @@ Run: .venv/bin/python -m unittest python.dashboard.test_verifier_worker -v   (fr
 """
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -43,21 +42,24 @@ def row(phase, branch, verdict, ago, mode="on", result=None, sha="s1", **extra):
     return {**r, **extra}
 
 
-def build(rows=(), index=None, timer=True, env=None, switch=None):
-    return vw.build_verifier_worker(env=env or {}, now=NOW, read_rows=lambda p: list(rows), read_index=lambda p: index, timer=lambda: timer,
+TRIG = {"state": "idle", "endedAt": "2027-01-15T07:59:00Z", "endedAgeS": 60, "stopped": "idle", "iterations": 1}
+
+
+def build(rows=(), index=None, trigger=TRIG, env=None, switch=None):
+    return vw.build_verifier_worker(env=env or {}, now=NOW, read_rows=lambda p: list(rows), read_index=lambda p: index, trigger=lambda: trigger,
                                     read_sw=(lambda e: switch) if switch is not None else (lambda e: {"disabled": False, "disabledAt": None}))
 
 
 class Payload(unittest.TestCase):
     def test_nothing_at_all_is_not_configured(self):
-        self.assertEqual(build(timer=False), {"configured": False})
-        self.assertEqual(build(timer=None), {"configured": False})
+        self.assertEqual(build(trigger=None), {"configured": False})
+        self.assertEqual(build(trigger=None), {"configured": False})
 
     def test_any_single_trace_is_enough(self):
-        self.assertTrue(build(timer=True)["configured"])
-        self.assertTrue(build(timer=False, index={"branches": 3, "builtAt": None})["configured"])
-        self.assertTrue(build(timer=False, rows=[row("intent", "a", "merge", 5, mode="dry-run")])["configured"])
-        self.assertTrue(build(timer=False, switch={"disabled": True, "disabledAt": "x"})["configured"])
+        self.assertTrue(build()["configured"])
+        self.assertTrue(build(trigger=None, index={"branches": 3, "builtAt": None})["configured"])
+        self.assertTrue(build(trigger=None, rows=[row("intent", "a", "merge", 5, mode="dry-run")])["configured"])
+        self.assertTrue(build(trigger=None, switch={"disabled": True, "disabledAt": "x"})["configured"])
 
     def test_result_replaces_its_intent_and_only_live_results_count_today(self):
         rows = [row("intent", "a", "merge", 100, result="planned"), row("result", "a", "merge", 99, result="recorded"),
@@ -113,14 +115,15 @@ class Payload(unittest.TestCase):
     def test_dry_run_is_reported_as_the_mode(self):
         self.assertEqual(build([row("intent", "a", "merge", 5, mode="dry-run", result="dry-run: not executed")])["mode"], "dry-run")
 
-    def test_index_and_timer_flow_through(self):
-        p = build(index={"branches": 7, "builtAt": ISO(5)}, timer=False)
-        self.assertEqual((p["indexed"]["branches"], p["timerActive"]), (7, False))
+    def test_index_and_trigger_flow_through(self):
+        p = build(index={"branches": 7, "builtAt": ISO(5)}, trigger={"state": "backlog", "endedAgeS": 5})
+        self.assertEqual((p["indexed"]["branches"], p["trigger"]), (7, {"state": "backlog", "endedAgeS": 5}))
+        self.assertIsNone(build(index={"branches": 7, "builtAt": None}, trigger=None)["trigger"])
 
     def test_a_failing_reader_never_raises(self):
         def boom(*a, **k):
             raise RuntimeError("x")
-        p = vw.build_verifier_worker(env={}, now=NOW, read_rows=boom, read_index=boom, timer=boom, read_sw=boom)
+        p = vw.build_verifier_worker(env={}, now=NOW, read_rows=boom, read_index=boom, trigger=boom, read_sw=boom)
         self.assertEqual(p, {"configured": False})
 
 
@@ -179,19 +182,6 @@ class Files(unittest.TestCase):
         with mock.patch.object(vw.json, "load", side_effect=AssertionError("re-read")):
             self.assertEqual(vw.read_index_count(str(p))["branches"], 1)
 
-    def test_timer_state(self):
-        def run(out=None, exc=None):
-            def f(*a, **k):
-                if exc:
-                    raise exc
-                return subprocess.CompletedProcess(a, 0, stdout=out)
-            return f
-        self.assertIs(vw.timer_state(run("active\n")), True)
-        self.assertIs(vw.timer_state(run("inactive\n")), False)
-        self.assertIs(vw.timer_state(run("weird\n")), None)
-        self.assertIs(vw.timer_state(run(exc=OSError())), None)
-        self.assertIs(vw.timer_state(run(exc=subprocess.TimeoutExpired("x", 1))), None)
-
 
 class Routes(unittest.TestCase):
     def setUp(self):
@@ -200,14 +190,17 @@ class Routes(unittest.TestCase):
         self.addCleanup(lambda: self.marker.exists() and self.marker.unlink())
 
     def test_get_is_json_and_hidden_without_a_trace(self):
-        with mock.patch.object(vw.subprocess, "run", return_value=subprocess.CompletedProcess([], 3, stdout="inactive\n")):
-            r = self.client.get("/api/branch-verifier")
+        r = self.client.get("/api/branch-verifier")
         self.assertEqual((r.status_code, r.get_json()), (200, {"configured": False}))
 
-    def test_get_reports_a_running_timer_through_the_real_subprocess_hook(self):
-        with mock.patch.object(vw.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout="active\n")):
-            p = self.client.get("/api/branch-verifier").get_json()
-        self.assertEqual((p["configured"], p["timerActive"]), (True, True))
+    def test_get_reports_the_real_trigger_files_of_the_verifier(self):
+        d = Path(os.environ["HOME"]) / ".local" / "state" / "pipeline-ops"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "verifier-trigger.json").write_text(json.dumps({"sig": "s", "endedAt": ISO(5), "backlog": False, "stopped": "idle", "iterations": 2}))
+        self.addCleanup(lambda: (d / "verifier-trigger.json").unlink())
+        p = self.client.get("/api/branch-verifier").get_json()
+        self.assertEqual((p["configured"], p["trigger"]["state"], p["trigger"]["stopped"], p["trigger"]["iterations"]), (True, "idle", "idle", 2))
+        self.assertNotIn("timerActive", p)
 
     def test_post_off_then_on(self):
         r = self.client.post("/api/branch-verifier/enabled", json={"enabled": False})
