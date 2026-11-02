@@ -864,6 +864,97 @@ test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error, zero
   });
 });
 
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error but report shows missing target -> reclassified to needs-clarification, NOT requeued', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'misdirected-target-1' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nThe requested branch "feature-x" does not exist in this repository. The task appears to be misdirected to the wrong repository -- the target code is absent from this checkout.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'read_file' }, { tool: 'grep_codebase' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.retryableDraftBlock, false, 'must NOT be requeued as infra retry');
+    assert.equal(task.infraErrorRetry, undefined, 'must NOT set infraErrorRetry');
+    assert.match(out.blockedReason, /target is missing or misdirected/);
+    assert.match(out.blockedReason, /feature-x/);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error with missing target signal "does not exist in any repo" -> reclassified', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'misdirected-target-2' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nI searched every repo I can access and the target code does not exist in any repo I can access. This task is misdirected to the wrong repository.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'read_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, true);
+    assert.match(out.blockedReason, /target is missing or misdirected/);
+    assert.match(out.blockedReason, /does not exist/);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error with genuine tool failure -> still requeued (existing behavior preserved)', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'infra-real-failure-1' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nThe worktree git index is locked -- every edit_file call fails with "unable to create .git/index.lock". Not a design question.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'read_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, undefined, 'must NOT be routed to needs-clarification');
+    assert.equal(task.retryableDraftBlock, true);
+    assert.equal(task.infraErrorBefore, true);
+    assert.equal(task.infraErrorRetry, true);
+    assert.match(out.blockedReason, /BLOCKER-TYPE: infra-error/);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error with missing target AND partial work -> still reclassified (missing target takes priority)', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'partial work landed\n');
+    const task = { id: 'misdirected-target-3' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nGot the first file done, then realized the requested branch does not exist in this repository. The task is misdirected to the wrong repository.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'read_file' }, { tool: 'edit_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.isAgenticContinuation, undefined, 'must NOT be treated as continuation');
+    assert.match(out.blockedReason, /target is missing or misdirected/);
+  });
+});
+
+test('detectMissingTargetReport: detects missing target signals', () => {
+  const { detectMissingTargetReport } = require('./agentic-draft-common.js');
+  assert.ok(detectMissingTargetReport('The requested branch "feature-x" does not exist in this repository'));
+  assert.ok(detectMissingTargetReport('The target code does not exist in any repo I can access'));
+  assert.ok(detectMissingTargetReport('This task is misdirected to the wrong repository'));
+  assert.ok(detectMissingTargetReport('The file absent from checkout was not found'));
+  assert.ok(detectMissingTargetReport('The repository does not contain the requested path'));
+  assert.ok(detectMissingTargetReport('No matching file in this repo for the target'));
+  assert.equal(detectMissingTargetReport('The worktree git index is locked'), null);
+  assert.equal(detectMissingTargetReport('Got ETIMEDOUT on every call'), null);
+  assert.equal(detectMissingTargetReport(''), null);
+  assert.equal(detectMissingTargetReport(null), null);
+});
+
 test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error WITH partial work landed -> continuation', () => {
   withRealRepo((wt) => {
     fs.writeFileSync(path.join(wt, 'a.txt'), 'partial work landed\n');
