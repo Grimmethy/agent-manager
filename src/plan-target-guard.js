@@ -45,7 +45,10 @@ const WRITE_FILE_PHRASE_RE = /\bwrite\s+(?:(?:the|a|an|one|single|new)\s+)+file[
 // a path in the task text, so the later, explicit "WHAT: create Docs/SERVICE.md, edit Docs/BACKLOG.md ..." was never examined. Like WRITE_FILE_PHRASE_RE this
 // phrase is strict enough to check at EVERY mention: the create verb must sit DIRECTLY against the path (only articles, "file" and punctuation or quotes between),
 // so "Create a summary of the problem, then edit src/x.js" and "create X, edit Y" (Y) stay ordinary edit targets.
-const DIRECT_CREATE_RE = /\b(?:create|creates|creating)\s+(?:(?:the|a|an|one|single|new)\s+)*(?:file\s+)?[\s`'"*_(]*$/i;
+// 2026-11-02 (HUB0259-01, "Add src/tool-loop-guard.test.js with tests" parked as a missing-file target): "add" directly against a path is a create signal in the same strict form;
+// it only matters for a path that does not exist, so "Add a summary of the problem, then edit src/x.js" still leaves src/x.js an ordinary target.
+const DIRECT_CREATE_RE = /\b(?:create|creates|creating|add|adds|adding)\s+(?:(?:the|a|an|one|single|new)\s+)*(?:file\s+)?[\s`'"*_(]*$/i;
+const ONCE_IT_EXISTS_AFTER_RE = /^[\s`'"*_)(,.;:-]{0,6}once[\s*_]+it[\s*_]+(?:exists|is[\s*_]+(?:created|written))\b/i;
 const isCreateVerbBefore = (before) => CREATE_FILE_VERBS_RE.test(before) || WRITE_FILE_PHRASE_RE.test(before);
 
 // every occurrence of needle in text, as start indexes (the guard used to look at the first only: 2026-10-15, a plan that quoted the task's "write ONE file" first and said
@@ -70,7 +73,7 @@ function mentionIndexes(text, needle) {
 // ("does **not** exist yet") -- confirmed live, this is the EXACT real phrasing that
 // caused the incident above, and a literal whitespace-only gap would miss it.
 // 2026-10-08: also "is absent" / "not present" / "not found" / "no such file" (HUB0011-02: the plan said `<path>` "is absent" for a task titled "Create <file>" and was blocked).
-const EXISTENCE_ACK_RE = /\b(?:does|do)[\s*_]+not[\s*_]+(?:yet[\s*_]+)?exist\b|\bdoesn'?t[\s*_]+(?:yet[\s*_]+)?exist\b|\bnot[\s*_]+yet[\s*_]+(?:present|created)\b|\b(?:is|are|was)[\s*_]+(?:currently[\s*_]+)?absent\b|\b(?:is|are)[\s*_]+not[\s*_]+(?:present|found)\b|\bno[\s*_]+such[\s*_]+file\b/i;
+const EXISTENCE_ACK_RE = /\b(?:does|do)[\s*_]+not[\s*_]+(?:yet[\s*_]+)?exist\b|\bdoesn'?t[\s*_]+(?:yet[\s*_]+)?exist\b|\bnot[\s*_]+yet[\s*_]+(?:present|created)\b|\b(?:is|are|was)[\s*_]+(?:currently[\s*_]+)?absent\b|\b(?:is|are)[\s*_]+not[\s*_]+(?:present|found)\b|\bno[\s*_]+such[\s*_]+file\b|\bonce[\s*_]+it[\s*_]+(?:exists|is[\s*_]+(?:created|written))\b/i;
 
 // taskText (optional, 2026-10-08): the TASK's own title + body. A task that itself says "Create <file>" has declared the file a create target no matter how the
 // plan words it; the plan-only signals above missed that when the plan named the file by its full path and called it "absent".
@@ -87,7 +90,10 @@ function isDeclaredCreateTarget(planText, targetPath, taskText = '') {
   const task = String(taskText || '');
   const tIdxs = mentionIndexes(task, targetPath);
   const win = (i) => task.slice(Math.max(0, i - 80), i);
-  return tIdxs.length > 0 && (CREATE_FILE_VERBS_RE.test(win(tIdxs[0])) || tIdxs.some((i) => WRITE_FILE_PHRASE_RE.test(win(i)) || DIRECT_CREATE_RE.test(win(i))));
+  // 2026-11-02 (HUB0273-01: "... and src/chat-tool-gate.test.js once it exists"): the task text itself says the file is not there yet. Strict like the write-file phrase: the
+  // words must follow the path directly (a few characters of punctuation at most), so an unrelated "once it exists" elsewhere exempts nothing.
+  const afterWin = (i) => task.slice(i + targetPath.length, i + targetPath.length + 24);
+  return tIdxs.length > 0 && (CREATE_FILE_VERBS_RE.test(win(tIdxs[0])) || tIdxs.some((i) => WRITE_FILE_PHRASE_RE.test(win(i)) || DIRECT_CREATE_RE.test(win(i)) || ONCE_IT_EXISTS_AFTER_RE.test(afterWin(i))));
 }
 
 // (task, planText, repoRoot, extraRoots, existsAtRef) -> { blocked, reason?, missing? }
