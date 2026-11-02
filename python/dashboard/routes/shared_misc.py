@@ -519,6 +519,22 @@ def _compute_summary_counts(qdir):
     return counts
 
 
+def _with_memory(counts):
+    """The cached queue counts plus the host-memory state for the header chip. Computed per call, NOT cached with the counts: it is one tiny file read
+    (see memory_status.py) and the chip must show a pressure change on the very next refresh."""
+    import memory_status
+    return {**dict(counts), "memory": memory_status.memory_status()}
+
+
+@shared_misc_bp.route("/api/memory/unload-ollama", methods=["POST"])
+def api_memory_unload_ollama():
+    """The header chip's owner-only button: ask the gpu-broker to unload its Ollama models. The broker refuses (403) unless it was started with
+    AGENT_MANAGER_MEM_RELIEF_OLLAMA=owner, and a broker without the route answers 404; both are passed through so the page can hide the button."""
+    import memory_status
+    status, body = memory_status.unload_ollama(who="dashboard")
+    return jsonify(body), status
+
+
 @shared_misc_bp.route("/api/summary")
 def api_summary():
     from app import queue_dir
@@ -538,7 +554,7 @@ def api_summary():
 
     value = fresh_value()
     if value is not None:
-        return jsonify(dict(value))
+        return jsonify(_with_memory(value))
     if _summary_lock.acquire(blocking=False):
         try:
             value = fresh_value()
@@ -546,16 +562,16 @@ def api_summary():
                 value = recompute()
         finally:
             _summary_lock.release()
-        return jsonify(dict(value))
+        return jsonify(_with_memory(value))
     # Another poll is already recomputing: serve the last good payload for this project
     # (flagged stale) rather than stacking behind it; only a caller with nothing to serve waits.
     entry = _summary_state["entry"]
     if entry and entry[0] == key:
-        return jsonify({**entry[2], "stale": True})
+        return jsonify(_with_memory({**entry[2], "stale": True}))
     with _summary_lock:
         entry = _summary_state["entry"]
         value = entry[2] if entry and entry[0] == key else recompute()
-    return jsonify(dict(value))
+    return jsonify(_with_memory(value))
 
 
 @shared_misc_bp.route("/api/browse")

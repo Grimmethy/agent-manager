@@ -158,7 +158,7 @@ class Routes(CacheCase):
         with mock.patch.object(app, "list_unmerged_branches", wraps=app.list_unmerged_branches) as spy, \
                 mock.patch.object(app, "_list_unmerged_branches_uncached") as rec:
             resp = self.client.get("/api/git/unmerged-branches")
-        spy.assert_called_once_with(force=False)
+        spy.assert_called_once_with(force=False, stale_ok=True)   # the listing endpoint never recomputes inside the request
         rec.assert_not_called()
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json(), OLD)

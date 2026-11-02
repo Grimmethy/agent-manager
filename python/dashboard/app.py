@@ -2374,6 +2374,7 @@ def _store_branch_list(branches):
     with _branch_cache_lock:
         _branch_cache["at"] = time.time()
         _branch_cache["branches"] = branches
+        _branch_cache["filled"] = True   # a list was computed at least once: an invalidated cache still has a last good list to serve
     # Apply any pending verdicts for branches that are now in the listing
     try:
         import branch_verdicts_pending as bvp
@@ -2398,15 +2399,21 @@ def _refresh_branch_list_in_background():
             _branch_fetch_state["refreshing"] = False
 
 
-def list_unmerged_branches(force=False):
+def list_unmerged_branches(force=False, stale_ok=False):
     """Fresh cache -> it. force=True or no cache yet (including right after _invalidate_branch_cache) -> synchronous recompute. A STALE non-empty cache is returned
-    immediately while ONE background thread refreshes it (stale-while-revalidate): the full recompute costs ~37 s under load, longer than the tab's 30 s timeout."""
+    immediately while ONE background thread refreshes it (stale-while-revalidate): the full recompute costs ~37 s under load, longer than the tab's 30 s timeout.
+
+    stale_ok=True (the read-only listing endpoint, 2026-11-02): the request NEVER recomputes. An invalidated cache (a merge, discard or verdict just reset its
+    timestamp) still holds its last good list, which is served at once while the one background refresh runs. Before the very first list exists there is nothing to
+    serve, so that one request computes it (as before). Callers that must see their own change in the list (the verdict, merge and discard routes) keep stale_ok=False
+    and recompute."""
     with _branch_cache_lock:
         age = time.time() - _branch_cache["at"]
         have_cache = _branch_cache["at"] > 0
+        filled = bool(_branch_cache.get("filled")) or have_cache
         if not force and age < _BRANCH_CACHE_TTL_SECONDS:
             return _branch_cache["branches"]
-        if not force and have_cache:
+        if not force and (have_cache or (stale_ok and filled)):
             stale = _branch_cache["branches"]
             start_refresh = not _branch_fetch_state["refreshing"]
             if start_refresh:
@@ -2433,6 +2440,12 @@ def list_unmerged_branches(force=False):
     return branches
 
 
+def branch_list_refreshing():
+    """True while the served list is not a fresh one: a background refresh is running, the cache was invalidated, or it is older than its TTL."""
+    with _branch_cache_lock:
+        return bool(_branch_fetch_state["refreshing"]) or (time.time() - _branch_cache["at"]) >= _BRANCH_CACHE_TTL_SECONDS     # an invalidated cache (at = 0) is older than any TTL
+
+
 def list_held_hub_groups(include_other_projects=False):
     """Hubs whose built children are pushed but not listed yet (see partition_held_hub_branches). include_other_projects adds the groups the background
     refresh found in every other registered project, each tagged with its `project` ({label, repoRoot}); a project not scanned yet contributes nothing."""
@@ -2448,13 +2461,16 @@ def list_held_hub_groups(include_other_projects=False):
     return groups
 
 
-def _invalidate_branch_cache(refetch=True):
+def _invalidate_branch_cache(refetch=True, drop_branch=None):
     """Drop the cached list so the next one is recomputed synchronously. refetch=True (default: a merge/discard moved a remote ref) also forces the next recompute to
     fetch; refetch=False (a verdict was recorded, no remote ref moved) keeps the fetch timer so the recompute does not pay for another fetch."""
     with _branch_cache_lock:
         _branch_cache["at"] = 0.0
         if refetch:
             _branch_fetch_state["at"] = 0.0
+        if drop_branch:
+            # The branch that was just merged or discarded must leave the list at once, even though the full recompute now runs in the background.
+            _branch_cache["branches"] = [b for b in _branch_cache["branches"] if b.get("branch") != drop_branch]
 
 
 def _sync_live_checkout(main_branch):
