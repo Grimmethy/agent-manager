@@ -15,6 +15,12 @@ source "${SCRIPT_DIR}/lib/start-singleton-bg.sh"
 
 readonly INSTANCE_ID="${1:-watchdog}"    # same naming as PowerShell's $env:InstanceID per-daemon.
 
+# Snapshot file path: parsed from --snapshot-file CLI flag or QUEUE_SNAPSHOT_FILE env var.
+# Default pattern: /dev/shm/agent-manager-queue-tick-<instanceId>.json where <instanceId>
+# comes from AGENT_MANAGER_INSTANCE_ID. Each script independently parses the flag/env and
+# forwards the path to its Node.js entry point.
+SNAPSHOT_FILE="${QUEUE_SNAPSHOT_FILE:-}"
+
 # Refuse to start if a live process already holds this instanceId -- see local-worker.sh's
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
 # Applies to the watchdog's OWN identity here -- distinct from (and unrelated to) the
@@ -499,6 +505,15 @@ while :; do
     # ever, not every tick) -- cheap to run on every watchdog tick like the sweep above.
     merged_work_result="$(node "${PACKAGE_SRC_DIR}/merged-work-sweep.js" 2>>"${HOME_LOGS}/merged-work-sweep.log")"
     printf '[watchdog] merged-work-sweep: %s\n' "$merged_work_result" >&2
+
+    # Queue snapshot tick: rebuild the shared /dev/shm snapshot so other daemons can read
+    # it via readQueueSnapshot() (which honors QUEUE_SNAPSHOT_FILE). Skipped when no
+    # snapshot file path was configured (--snapshot-file CLI flag or QUEUE_SNAPSHOT_FILE
+    # env var), since the default tmpfs path is only useful when a consumer expects it.
+    if [[ -n "$SNAPSHOT_FILE" ]]; then
+      snapshot_result="$(QUEUE_SNAPSHOT_FILE="$SNAPSHOT_FILE" node "${PACKAGE_SRC_DIR}/queue-cache.js" buildQueueSnapshot "${AGENT_MANAGER_REPO_ROOT}" 2>>"${HOME_LOGS}/queue-snapshot.log")"
+      printf '[watchdog] queue-snapshot: %s\n' "$snapshot_result" >&2
+    fi
 
     # Drift-scan (Brain Dump #83: "Reasoning tasks aren't represented in the job list...
     # make sure task visibility is a consistent part of the pipeline"). drift-scan.js
