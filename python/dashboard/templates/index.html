@@ -33,6 +33,13 @@
   ::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
   ::-webkit-scrollbar-corner { background: transparent; }
   @supports not selector(::-webkit-scrollbar) { * { scrollbar-width: thin; scrollbar-color: var(--border-strong) rgba(91, 157, 255, .06); } }
+  /* Form controls (owner request 2026-11-02, "continue with the restyle"): bare inputs, selects and textareas showed the browser's white and light-grey boxes on the dark theme.
+     One base style at zero specificity (:where), so every control that already has its own rule or inline style keeps it. 13px text, 4px grid, --border-strong outline, blue focus ring. */
+  :root { color-scheme: dark; accent-color: var(--accent); }
+  :where(input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="hidden"], [type="color"]), select, textarea) { background: var(--panel); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 4px 8px; font-size: 13px; font-family: inherit; }
+  :where(input, select, textarea):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  :where(input, select, textarea):disabled { opacity: .5; cursor: not-allowed; }
+  :where(input, textarea)::placeholder { color: var(--muted); }
   body { margin: 0; font-family: -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; }
   a { color: var(--link); }
   a:hover { text-decoration: underline; }
