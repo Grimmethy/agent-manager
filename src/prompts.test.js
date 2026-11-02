@@ -794,3 +794,27 @@ test('the guidance sits alongside the brain-dump directive without displacing it
   assert.match(prompt, /wrongly drop/);
   assert.ok(prompt.indexOf('captured research finding') < prompt.indexOf('adds or changes a path that skips'));
 });
+
+// 2026-11-02 stalled-task loop: the deep_dive / arch_import prompts named agent-manager as the target project in every pipeline ---------------------------------------------
+const { consumerLabel, deepDivePlanPrompt, archImportPlanPrompt, archImportImplementPrompt } = require('./prompts.js');
+const ddTask = (consumerProject) => ({ promptContext: { projectName: 'ext', communityName: 'c', communityId: 1, files: [{ path: 'a.js', degree: 2, content: 'x' }], consumerProject } });
+const aiTask = (consumerProject) => ({ promptContext: { sourceProject: 'ext', rating: 'Use', itemTitle: 't', itemFiles: 'a.js', itemRationale: 'r', harnessHits: [], harnessFiles: [], consumerProject } });
+
+test('consumerLabel: the stamped consumerProject wins, and the default is agent-manager when nothing says otherwise', () => {
+  assert.equal(consumerLabel({ promptContext: { consumerProject: 'questforge' } }), 'questforge');
+  assert.equal(consumerLabel({ promptContext: { consumerProject: '  ' } }).length > 0, true);
+});
+
+test('deep_dive and arch_import prompts for another consumer project never name agent-manager, and name the consumer', () => {
+  for (const text of [deepDivePlanPrompt(ddTask('questforge')), archImportPlanPrompt(aiTask('questforge')), archImportImplementPrompt(aiTask('questforge'), 'PLAN')]) {
+    assert.doesNotMatch(text, /agent-manager/);
+    assert.match(text, /questforge/);
+  }
+  assert.doesNotMatch(deepDivePlanPrompt(ddTask('questforge')), /local-LLM-driven task pipeline/, "agent-manager's description is not attached to another project");
+});
+
+test('deep_dive and arch_import prompts for agent-manager keep the agent-manager text, including the project description', () => {
+  assert.match(deepDivePlanPrompt(ddTask('agent-manager')), /"agent-manager" \(a local-LLM-driven task pipeline/);
+  assert.match(archImportPlanPrompt(aiTask('agent-manager')), /agent-manager's own codebase/);
+  assert.match(archImportImplementPrompt(aiTask('agent-manager'), 'PLAN'), /agent-manager's OWN repo/);
+});
