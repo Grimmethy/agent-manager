@@ -64,10 +64,10 @@ function groupBranchesByProject(branches) {
 function branchProjectHeaderHtml(group) {
   const p = group.project;
   const n = group.branches.length;
-  return `<div data-project-header="${_bpEscape(p.label)}" style="margin:18px 0 8px;padding:6px 10px;border-radius:6px;background:${branchProjectColorCss(p.label)};color:#fff;display:flex;gap:10px;align-items:baseline">`
+  return `<div data-project-header="${_bpEscape(p.label)}" style="margin:16px 0 8px;padding:8px 12px;border-radius:6px;background:${branchProjectColorCss(p.label)};color:#fff;display:flex;gap:10px;align-items:baseline">`
     + `<strong>${_bpEscape(p.label)}</strong>${p.active ? '<span>● active project</span>' : ''}`
     + `<span style="opacity:.8">${n} branch${n === 1 ? '' : 'es'}</span>`
-    + `<span style="opacity:.6;font-family:monospace;font-size:11px;margin-left:auto">${_bpEscape(p.repoRoot)}</span></div>`;
+    + `<span style="opacity:.6;font-family:monospace;font-size:12px;margin-left:auto">${_bpEscape(p.repoRoot)}</span></div>`;
 }
 
 // Headers only earn their space when more than one project is on screen.
