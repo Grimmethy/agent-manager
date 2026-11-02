@@ -17,6 +17,8 @@ function load() {
 const call = (fn, arg) => vm.runInContext(`${fn}(${JSON.stringify(arg)})`, load());
 const build = (p) => call('buildStalledWorkerHtml', p);
 const section = (p) => call('renderStalledWorkerSection', p);
+// The card opened by a click: the same builder after stalledWorkerExpanded was flipped.
+const buildOpen = (p) => { const ctx = load(); vm.runInContext('stalledWorkerExpanded = true', ctx); return vm.runInContext(`buildStalledWorkerHtml(${JSON.stringify(p)})`, ctx); };
 
 const live = (over = {}) => ({
   configured: true, mode: 'dry-run', timerActive: true, lastTickAgeS: 125, decisions: 7,
@@ -34,7 +36,8 @@ test('nothing is drawn unless the worker has left a trace', () => {
 
 test('the title carries the mode badge and the timer badge', () => {
   const dry = build(live());
-  assert.match(dry, /Stalled-task worker/);
+  assert.match(dry, /class="worker-card clickable"/);
+  assert.match(dry, /<span class="id">[^<]*stalled-worker<\/span><div class="badge-col">/);
   assert.match(dry, /class="badge hold"[^>]*>dry-run</);
   assert.match(dry, /class="badge ok"[^>]*>timer on</);
   assert.match(build(live({ mode: 'on' })), /class="badge ok"[^>]*>live</);
@@ -48,13 +51,14 @@ test('the age helper: seconds, minutes, hours with minutes, days with hours, and
   const age = (s) => call('stalledWorkerAge', s);
   assert.deepEqual([age(45), age(125), age(7300), age(3600 * 47 + 59 * 60), age(3600 * 48), age(200000)], ['45s', '2m', '2h 1m', '47h 59m', '2d 0h', '2d 7h']);
   for (const bad of [null, -1, NaN, 'x']) assert.equal(age(bad), '', String(bad));
-  assert.match(build(live({ lastTickAgeS: 125 })), /Last tick 2m ago/);
-  assert.match(build(live({ lastTickAgeS: null })), /No tick recorded yet/);
+  assert.match(build(live({ lastTickAgeS: 125 })), /last tick 2m ago/);
+  assert.match(build(live({ lastTickAgeS: null })), /no tick recorded yet/);
 });
 
 test('the token budget line shows used of per-hour with a percentage, and flags a spent budget', () => {
   assert.match(build(live()), /1,350,000 of 5,400,000 tokens this hour \(25%\)/);
   assert.match(build(live()), /claude-subscription · claude-sonnet-5-5/);
+  assert.match(build(live()), /<div class="meta">[^\n]*tokens this hour/);
   assert.doesNotMatch(build(live()), /budget spent/);
   assert.match(build(live({ budget: { perHour: 100, used: 100 } })), /budget spent/);
   assert.match(build(live({ budget: { perHour: 0, used: 5 } })), /\(0%\)/);
@@ -62,26 +66,27 @@ test('the token budget line shows used of per-hour with a percentage, and flags 
 
 test('a gateway that is down says so, with the reason escaped', () => {
   const html = build(live({ budget: null, gateway: { available: false, error: '<boom> refused' } }));
-  assert.match(html, /Model gateway not reachable \(&lt;boom&gt; refused\)\./);
+  assert.match(html, /gateway not reachable \(&lt;boom&gt; refused\)/);
   assert.doesNotMatch(html, /tokens this hour/);
-  assert.match(build(live({ budget: null, gateway: { available: false } })), /Model gateway not reachable\./);
+  assert.match(build(live({ budget: null, gateway: { available: false } })), /gateway not reachable(?! \()/);
 });
 
 test('the stalled count and the top buckets are listed, long reasons cut, empty reasons named', () => {
-  const html = build(live());
-  assert.match(html, /<strong>580<\/strong> stalled across 33 projects/);
+  const html = buildOpen(live());
+  assert.match(build(live()), /580 stalled across 33 projects/);
+  assert.doesNotMatch(build(live()), /plan cites missing-file/);   // the buckets are behind the click
   assert.match(html, /18 · blocked · plan cites missing-file target\(s\): &lt;path&gt;/);
-  assert.match(build(live({ stalled: { total: 1, projects: 1, topBuckets: [{ state: 'blocked', signature: 'x'.repeat(300), count: 1 }] } })), /x{110}</);
-  assert.doesNotMatch(build(live({ stalled: { total: 1, projects: 1, topBuckets: [{ state: 'blocked', signature: 'x'.repeat(300), count: 1 }] } })), /x{111}/);
-  assert.match(build(live({ stalled: { total: 1, projects: 1, topBuckets: [{ state: 'blocked', signature: '', count: 1 }] } })), /\(no reason recorded\)/);
-  assert.match(build(live({ stalled: null })), /No stalled-task index yet\./);
+  assert.match(buildOpen(live({ stalled: { total: 1, projects: 1, topBuckets: [{ state: 'blocked', signature: 'x'.repeat(300), count: 1 }] } })), /x{109}\u2026</);
+  assert.doesNotMatch(buildOpen(live({ stalled: { total: 1, projects: 1, topBuckets: [{ state: 'blocked', signature: 'x'.repeat(300), count: 1 }] } })).replace(/title="[^"]*"/g, ''), /x{110}/);   // the tooltip keeps the full text
+  assert.match(buildOpen(live({ stalled: { total: 1, projects: 1, topBuckets: [{ state: 'blocked', signature: '', count: 1 }] } })), /\(no reason recorded\)/);
+  assert.match(build(live({ stalled: null })), /no stalled-task index yet/);
 });
 
 test('today lists outcomes biggest first, or says there were none', () => {
   const html = build(live());
   assert.ok(html.indexOf('ESCALATE-MECHANISM 5') > -1 && html.indexOf('ESCALATE-MECHANISM 5') < html.indexOf('ARCHIVE-DUPLICATE 2'));
-  assert.match(build(live({ today: {} })), /No decisions today\./);
-  assert.match(build(live({ today: undefined })), /No decisions today\./);
+  assert.match(build(live({ today: {} })), /no decisions today/);
+  assert.match(build(live({ today: undefined })), /no decisions today/);
 });
 
 test('questions waiting for the owner show the question, project, task, age and a dry-run marker; none means no section', () => {
@@ -98,15 +103,17 @@ test('questions waiting for the owner show the question, project, task, age and 
 
 test('recent decisions show time, outcome, project, task and a dry-run marker', () => {
   const html = build(live());
-  assert.match(html, /<strong>Recent<\/strong>/);
-  assert.match(html, /11:16 · ESCALATE-MECHANISM · alpha · adhoc-x-1 · dry-run/);
-  assert.doesNotMatch(build(live({ recent: [{ at: '2026-11-02T11:16:31Z', project: 'p', taskId: 't', outcome: 'O', mode: 'on' }] })), /· dry-run<\/div>/);
-  assert.doesNotMatch(build(live({ recent: [] })), /Recent/);
+  assert.doesNotMatch(html, /Worker history/);   // closed by default
+  const open = buildOpen(live());
+  assert.match(open, /<strong>Worker history<\/strong>/);
+  assert.match(open, /11:16 · ESCALATE-MECHANISM · alpha · adhoc-x-1 · dry-run/);
+  assert.doesNotMatch(buildOpen(live({ recent: [{ at: '2026-11-02T11:16:31Z', project: 'p', taskId: 't', outcome: 'O', mode: 'on' }] })), /· dry-run<\/div>/);
+  assert.match(buildOpen(live({ recent: [] })), /No decisions recorded yet/);
 });
 
 test('every dynamic value is escaped', () => {
   const evil = '<img src=x onerror=alert(1)>';
-  const html = build(live({
+  const html = buildOpen(live({
     provider: evil, holds: [{ taskId: evil, project: evil, question: evil, ageHours: 1, ageS: 3600, dryRun: true }],
     recent: [{ at: '2026-11-02T11:16:31Z', project: evil, taskId: evil, outcome: evil, mode: 'on' }], today: { [evil]: 1 },
     stalled: { total: 1, projects: 1, topBuckets: [{ state: evil, signature: evil, count: 1 }] },
@@ -137,8 +144,8 @@ test('age thresholds sit exactly on the minute and the hour', () => {
 });
 
 test('a budget without a per-hour figure counts as no meter, and the percentage rounds to the nearest whole number', () => {
-  assert.match(build(live({ budget: {}, gateway: { available: true } })), /Model gateway not reachable/);
-  assert.match(build(live({ budget: { used: 5 }, gateway: { available: true } })), /Model gateway not reachable/);
+  assert.match(build(live({ budget: {}, gateway: { available: true } })), /gateway not reachable/);
+  assert.match(build(live({ budget: { used: 5 }, gateway: { available: true } })), /gateway not reachable/);
   assert.match(build(live({ budget: { perHour: 540000, used: 138240 } })), /\(26%\)/);
   assert.match(build(live({ budget: { perHour: 1000, used: 254 } })), /\(25%\)/);
 });
@@ -149,10 +156,10 @@ test('today lists the biggest outcome first whatever the order it arrived in', (
 });
 
 test('the ledger decision count is only mentioned when the payload carries one', () => {
-  assert.match(build(live({ decisions: 7 })), /7 decisions in the ledger tail/);
-  assert.match(build(live({ decisions: 0 })), /0 decisions in the ledger tail/);
+  assert.match(build(live({ decisions: 7 })), /Show history \(7 decisions\)/);
+  assert.match(build(live({ decisions: 0 })), /Show history \(0 decisions\)/);
   const { decisions, ...without } = live();
-  assert.doesNotMatch(build(without), /decisions in the ledger tail/);
+  assert.doesNotMatch(build(without), /decisions\)/);
 });
 
 test('a hold only minutes old shows its exact age, not zero hours', () => {
@@ -179,7 +186,7 @@ test('a switched-off worker offers Turn on (next-enabled=true), shows the switch
   assert.match(html, /class="badge idle"[^>]*>switched off</);
   assert.match(html, /Switched off since 2026-11-02T12:00:00\.000Z/);
   assert.doesNotMatch(html, /class="badge hold"[^>]*>dry-run</);
-  assert.match(html, /margin:12px 0; opacity:\.65;/);
+  assert.match(html, /class="worker-card clickable worker-off"/);
   assert.match(html, /timer on/);                                            // the timer badge stays: the timer keeps running
   assert.match(build(live({ switch: { disabled: true } })), /class="badge idle"[^>]*>switched off</);
   assert.doesNotMatch(build(live({ switch: { disabled: true } })), /since/);
@@ -251,4 +258,70 @@ test('only a strict true counts as switched off: other truthy values and a false
     assert.strictEqual(badge(sw), '', JSON.stringify(sw));
   }
   assert.match(button({ disabled: true }), /data-next-enabled="true"[^>]*>\u23FB Turn on</);
+});
+
+// ---- lane-card layout, truncation and click-to-expand (2026-11-02) ----
+test('collapsed: no history, one meta line, a Show history toggle, aria-expanded false; opened: history, Hide toggle, aria-expanded true', () => {
+  const closed = build(live());
+  assert.match(closed, /aria-expanded="false"/);
+  assert.match(closed, /\u25b8 Show history/);
+  assert.doesNotMatch(closed, /Worker history|Biggest buckets/);
+  const open = buildOpen(live());
+  assert.match(open, /aria-expanded="true"/);
+  assert.match(open, /\u25be Hide history/);
+  assert.match(open, /Worker history/);
+  assert.match(open, /Biggest buckets/);
+});
+
+test('the Turn on/off button sits in the right-hand badge column under the status badges, not in a title line', () => {
+  const html = build(live());
+  const col = html.slice(html.indexOf('badge-col'), html.indexOf('</div></div>', html.indexOf('badge-col')));
+  assert.match(col, /badge hold/);
+  assert.match(col, /state-timer[^>]*>last tick 2m ago/);
+  assert.match(col, /stalled-switch-btn/);
+  assert.ok(col.indexOf('badge hold') < col.indexOf('stalled-switch-btn'));
+});
+
+test('collapsed card shows only the biggest three outcomes with a +n more, and the full list when opened', () => {
+  const today = { A: 9, B: 8, C: 7, D: 6, E: 5 };
+  const closed = build(live({ today }));
+  assert.match(closed, /A 9 · B 8 · C 7 \+2 more/);
+  assert.doesNotMatch(closed, /D 6/);
+  assert.match(buildOpen(live({ today })), /A 9 · B 8 · C 7 · D 6 · E 5/);
+});
+
+test('long questions and task ids are cut with an ellipsis and keep the full text in the tooltip; only two holds show when collapsed', () => {
+  const q = 'Q'.repeat(200);
+  const holds = [1, 2, 3].map((n) => ({ taskId: 't' + n, project: 'p', question: q, ageHours: 1, ageS: 3600, dryRun: false }));
+  const closed = build(live({ holds }));
+  assert.match(closed, /Q{89}\u2026/);
+  assert.doesNotMatch(closed, /Q{91}</);
+  assert.match(closed, new RegExp('title="' + 'Q'.repeat(200)));
+  assert.match(closed, /\+1 more \(click the card\)/);
+  assert.equal((closed.match(/p · t\d/g) || []).length, 2);
+  const open = buildOpen(live({ holds }));
+  assert.equal((open.match(/p · t\d/g) || []).length, 3);
+  assert.doesNotMatch(open, /click the card/);
+});
+
+test('wiring: clicking the card flips the open state and redraws; a click on the switch button does not reach the card', async () => {
+  const ctx = load();
+  const calls = [];
+  const card = { onclick: null };
+  const root = { querySelectorAll: (sel) => (sel === '[data-stalled-expand]' ? [card] : []) };
+  ctx.redraw = () => calls.push(vm.runInContext('stalledWorkerExpanded', ctx));
+  vm.runInContext('wireStalledWorkerExpand', ctx)(root, ctx.redraw);
+  card.onclick(); card.onclick();
+  assert.deepEqual(calls, [true, false]);
+  assert.match(fs.readFileSync(path.join(__dirname, 'workers-tab.js'), 'utf8'), /wireStalledWorkerExpand\(main, renderWorkers\)/);
+  assert.match(fs.readFileSync(path.join(__dirname, 'stalled-worker-panel.js'), 'utf8'), /e\.stopPropagation\(\)/);
+});
+
+test('exactly three outcomes show no "more"; a long gateway error is cut in the card line', () => {
+  const three = build(live({ today: { A: 3, B: 2, C: 1 } }));
+  assert.match(three, /A 3 · B 2 · C 1</);
+  assert.doesNotMatch(three, /more/);
+  const err = build(live({ budget: null, gateway: { available: false, error: 'E'.repeat(100) } }));
+  assert.match(err, /\(E{39}…\)/);
+  assert.doesNotMatch(err, /E{41}/);
 });
