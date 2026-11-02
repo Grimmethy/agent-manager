@@ -136,12 +136,12 @@ async function renderQueueTab(state) {
     .concat(sourceNames.map((n) => `<option value="${escapeAttr(n)}" ${n === sourceFilter ? 'selected' : ''}>${escapeHtml(n)}</option>`))
     .join('');
   const hubSortHtml = state === 'coordinating'
-    ? `<label class="meta" style="margin-left:14px">Sort hubs: <select id="hub-sort-select">
+    ? `<label class="meta" style="margin-left:16px">Sort hubs: <select id="hub-sort-select">
          <option value="priority" ${hubSort === 'priority' ? 'selected' : ''}>Priority (then oldest first)</option>
          <option value="name" ${hubSort === 'name' ? 'selected' : ''}>Name (A–Z)</option>
        </select></label>`
     : '';
-  const filterHtml = `<div class="row" style="margin-bottom:10px"><label class="meta">Task type: <select id="queue-source-filter">${filterOptionsHtml}</select></label>${hubSortHtml}</div>`;
+  const filterHtml = `<div class="row" style="margin-bottom:8px"><label class="meta">Task type: <select id="queue-source-filter">${filterOptionsHtml}</select></label>${hubSortHtml}</div>`;
 
   if (isStale()) return;
   if (tasks.length === 0) {
@@ -233,8 +233,8 @@ async function renderQueueTab(state) {
         'retries-exhausted': '🧗 capability ceiling', 'fabrication-repeat': '🧗 capability ceiling',
         'recheck-verdict-archive': '🪦 recheck: retire' }[sf.reason] || `⚑ ${sf.reason}`;
       const tip = escapeAttr(((sf.evidence || []).join(' • ')).slice(0, 400) + `  [${sf.confidence}${sf.voteResult ? ', ' + sf.voteResult : ''}]`);
-      const col = sf.confidence === 'high' ? 'var(--bad)' : 'var(--warn)';
-      return `<span title="${tip}" style="display:inline-block;margin-bottom:3px;padding:1px 5px;border:1px solid ${col};border-radius:3px;color:${col};font-size:11px">${label}</span><br>`;
+      const col = sf.confidence === 'high' ? 'chip-bad' : 'chip-warn';
+      return `<span title="${tip}" class="chip chip-block ${col}">${label}</span><br>`;
     })() : '';
     const rereviewBtn = t.rereviewable ? `<button type="button" class="secondary task-rereview-btn" data-id="${escapeAttr(t.id)}" title="Send this SAME draft back to review (no redraft) -- for when the draft was fine and the review side was wrong">Re-review</button>` : '';
     const keepBtn = sf ? `<button type="button" class="secondary task-staleness-keep-btn" data-id="${escapeAttr(t.id)}" title="Dismiss this flag -- the task stays and is not re-flagged for a while">Keep</button>` : '';
@@ -245,8 +245,8 @@ async function renderQueueTab(state) {
     const ctf = t.contextTrimFlag;
     const trimChip = ctf ? (() => {
       const tip = escapeAttr(((ctf.evidence || []).join(' • ')).slice(0, 400) + `  [${ctf.confidence}]`);
-      const col = ctf.confidence === 'strong' ? 'var(--bad)' : 'var(--warn)';
-      return `<span title="${tip}" style="display:inline-block;margin-bottom:3px;padding:1px 5px;border:1px solid ${col};border-radius:3px;color:${col};font-size:11px">🔍 stale grounding — needs re-anchoring</span><br>`;
+      const col = ctf.confidence === 'strong' ? 'chip-bad' : 'chip-warn';
+      return `<span title="${tip}" class="chip chip-block ${col}">🔍 stale grounding — needs re-anchoring</span><br>`;
     })() : '';
     const trimKeepBtn = ctf ? `<button type="button" class="secondary task-context-trim-keep-btn" data-id="${escapeAttr(t.id)}" title="Dismiss this flag -- the task stays as-is and won't be re-anchored for a while">Keep grounding as-is</button>` : '';
     // Hub Tasks family indent (2026-09-08): hubDepth comes pre-computed from api_queue_state's
@@ -256,11 +256,11 @@ async function renderQueueTab(state) {
     // children. Shown on every coordinating row; the button prompts and POSTs to
     // /api/task-anywhere/<id>/hub-priority.
     const hubPriorityControl = state === 'coordinating'
-      ? `<div style="margin-top:3px">`
+      ? `<div style="margin-top:4px">`
         + (t.hubPriority !== null && t.hubPriority !== undefined
-          ? `<span title="Hub priority — lower is worked first" style="display:inline-block;padding:1px 5px;border:1px solid var(--link);border-radius:3px;color:var(--link);font-size:11px">P${escapeHtml(String(t.hubPriority))}</span> `
-          : `<span class="meta" style="font-size:11px">unranked</span> `)
-        + `<button type="button" class="secondary hub-priority-btn" data-id="${escapeAttr(t.id)}" data-priority="${t.hubPriority === null || t.hubPriority === undefined ? '' : escapeAttr(String(t.hubPriority))}" style="padding:0 6px;font-size:11px" title="Set or clear this hub's priority">Set priority</button>`
+          ? `<span title="Hub priority — lower is worked first" class="chip chip-link chip-solo">P${escapeHtml(String(t.hubPriority))}</span> `
+          : `<span class="meta" style="font-size:12px">unranked</span> `)
+        + `<button type="button" class="secondary hub-priority-btn" data-id="${escapeAttr(t.id)}" data-priority="${t.hubPriority === null || t.hubPriority === undefined ? '' : escapeAttr(String(t.hubPriority))}" style="padding:0 8px;font-size:12px" title="Set or clear this hub's priority">Set priority</button>`
         + `</div>`
       : '';
     const hubIdCell = state === 'coordinating'

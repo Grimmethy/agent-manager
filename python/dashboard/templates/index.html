@@ -154,7 +154,7 @@
   .recent-tasks-list { list-style: none; padding: 0; margin: 8px 0 0; }
   .recent-tasks-list li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-top: 1px solid var(--border); }
   .recent-tasks-list li:first-child { border-top: none; }
-  .empty { color: var(--muted); padding: 30px; text-align: center; }
+  .empty { color: var(--muted); padding: 32px; text-align: center; }
   /* Skeleton shimmer (skeleton.js): shown while a tab loads. A soft light band sweeps left to right every 1.4 s; reduced motion keeps the shapes still. */
   .skeleton { padding: 8px 0; position: relative; }
   .skeleton-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
@@ -260,7 +260,7 @@
   .browser-entry .git-badge { font-size: 10px; color: var(--ok); border: 1px solid var(--ok); padding: 1px 6px; border-radius: 8px; }
   .browser-entry .entry-count { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
   .browser-entry .set-active-project, .browser-entry .create-github-project { font-size: 11px; padding: 3px 9px; }
-  .stat-row { display: flex; gap: 24px; margin: 14px 0; }
+  .stat-row { display: flex; gap: 24px; margin: 16px 0; }
   .stat { color: var(--muted); font-size: 12px; }
   .stat strong { color: var(--text); font-size: 16px; display: block; }
   .build-log { background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 10px 12px; font-family: monospace; font-size: 12px; max-height: 180px; overflow-y: auto; margin-top: 10px; }
@@ -278,6 +278,11 @@
   .chip { display: inline-block; margin-left: 8px; padding: 4px 8px; border: 1px solid var(--muted); border-radius: 4px; color: var(--muted); font-size: 12px; }
   .chip.chip-warn { border-color: var(--warn); color: var(--warn); }
   .chip.clickable { cursor: pointer; }
+  .chip.chip-bad { border-color: var(--bad); color: var(--bad); }
+  .chip.chip-accent { border-color: var(--accent); color: var(--accent); }
+  .chip.chip-link { border-color: var(--link); color: var(--link); }
+  .chip.chip-solo { margin-left: 0; }
+  .chip.chip-block { margin-left: 0; margin-bottom: 4px; }
   .chip-gap { margin-left: 8px; }
   .chip-note { margin-left: 4px; font-size: 12px; }
   .bd-entry a.jump { color: var(--link); font-size: 12px; text-decoration: none; }
@@ -331,7 +336,7 @@
     .plugin-sidebar-toggle.sidebar-open { bottom: calc(65vh + 10px); }
     .worker-card .row { flex-wrap: wrap; row-gap: 6px; }
     .worker-model-select { margin-left: 0; margin-right: 0; max-width: none; width: 100%; }
-    .stat-row { flex-wrap: wrap; row-gap: 10px; }
+    .stat-row { flex-wrap: wrap; row-gap: 12px; }
     .split-pane { flex-direction: column; }
     .path-row, .capture-row { flex-wrap: wrap; }
     .modal-backdrop { padding: 12px; }

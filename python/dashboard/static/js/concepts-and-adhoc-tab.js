@@ -44,12 +44,12 @@ function renderConceptCard(concept) {
   const isStable = CONCEPT_STABLE_STATUSES.has(concept.status);
   const statusBadge = `<span class="badge ${isStable ? 'ok' : 'idle'}">${escapeHtml(concept.status || 'open')}</span>`;
   const researchChip = concept.researchForkCount > 0
-    ? `<span title="Last researched ${concept.lastResearchedAt ? escapeAttr(new Date(concept.lastResearchedAt).toLocaleString()) : 'unknown'}" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--muted);border-radius:3px;color:var(--muted);font-size:11px">🔬 researched ${concept.researchForkCount}×</span>`
+    ? `<span title="Last researched ${concept.lastResearchedAt ? escapeAttr(new Date(concept.lastResearchedAt).toLocaleString()) : 'unknown'}" class="chip">🔬 researched ${concept.researchForkCount}×</span>`
     : '';
   const scratch = concept.builtFromScratchCount || 0;
   const adapted = concept.adaptedFromResourceCount || 0;
   const buildChip = (scratch + adapted) > 0
-    ? `<span title="Self-reported by the implementing model when it finishes concept-tagged work -- NOT verified against real diffs, treat as a rough signal only" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--warn);border-radius:3px;color:var(--warn);font-size:11px">🔨 ${scratch} scratch / 🔗 ${adapted} adapted (unverified)</span>`
+    ? `<span title="Self-reported by the implementing model when it finishes concept-tagged work -- NOT verified against real diffs, treat as a rough signal only" class="chip chip-warn">🔨 ${scratch} scratch / 🔗 ${adapted} adapted (unverified)</span>`
     : '';
   // linkedTaskCount (2026-09-06): a deterministic backfill match (a done task's own
   // title/rawText literally named this concept) -- see src/concept-tally-backfill.js.
@@ -57,7 +57,7 @@ function renderConceptCard(concept) {
   // exact phrase match), not a self-report, so it earns a plain accent tone instead of
   // the warn-colored "unverified" styling.
   const linkedChip = concept.linkedTaskCount > 0
-    ? `<span title="Done tasks whose own title or text named this concept by name -- a deterministic match, not self-reported" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--accent);border-radius:3px;color:var(--accent);font-size:11px">📎 ${concept.linkedTaskCount} linked task${concept.linkedTaskCount === 1 ? '' : 's'}</span>`
+    ? `<span title="Done tasks whose own title or text named this concept by name -- a deterministic match, not self-reported" class="chip chip-accent">📎 ${concept.linkedTaskCount} linked task${concept.linkedTaskCount === 1 ? '' : 's'}</span>`
     : '';
   const shelveNote = concept.status === 'shelved'
     ? `<div class="row meta" style="margin-top:4px"><span>⏸ Shelved: ${escapeHtml(concept.shelvedReason || '')}${concept.revisitCondition ? ` — revisit when: ${escapeHtml(concept.revisitCondition)}` : ''}</span></div>`
@@ -100,9 +100,9 @@ function renderConceptCard(concept) {
     { label: 'done / blocked', detail: 'status: done (mergedAt set) or blocked (blockedReason set)' },
   ];
   const lifecyclePanel = concept.id === 'concept-adhoc-task-lifecycle-64935e'
-    ? `<div class="meta" style="margin-top:6px;display:flex;flex-wrap:wrap;align-items:center;gap:4px">
+    ? `<div class="meta" style="margin-top:8px;display:flex;flex-wrap:wrap;align-items:center;gap:4px">
         ${LIFECYCLE_STAGES.map((s, i) => `
-          <span style="display:inline-block;border:1px solid var(--muted);border-radius:4px;padding:4px 8px;font-size:11px;line-height:1.3">
+          <span style="display:inline-block;border:1px solid var(--muted);border-radius:4px;padding:4px 8px;font-size:12px;line-height:1.3">
             <strong>${escapeHtml(s.label)}</strong><br>${escapeHtml(s.detail)}
           </span>
           ${i < LIFECYCLE_STAGES.length - 1 ? '<span style="color:var(--muted)">→</span>' : ''}
