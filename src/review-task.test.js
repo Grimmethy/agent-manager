@@ -3167,3 +3167,27 @@ test('the kill switch AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK=false sends a comm
     assert.equal(task.rawDiff, COMMENT_ONLY_DIFF);
   } finally { delete process.env.AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK; }
 });
+
+// 2026-11-02 stalled-task loop: a function_length_review Solution that NAMES the extracted pieces is concrete without a code fence -----------------------------------------
+test('namesExtractedPieces: two or more named new identifiers in the Solution count, prose-only does not', () => {
+  const { namesExtractedPieces } = require('./review-task.js');
+  assert.equal(namesExtractedPieces('### AC-1\nProblem: long.\nSolution: Extract `buildPlanContext(params)` and `postProcessResponse(response, opts)` from the loop.\n\nBenefits:\nTestable.'), true);
+  assert.equal(namesExtractedPieces('Solution: Extract five subfunctions: `_validate_input`, `_map_timestamps`, `_wrap_text`.\n\nBenefits: x'), true);
+  assert.equal(namesExtractedPieces('Solution: split it into three smaller helper functions, one per responsibility, and call each in turn.\n\nBenefits: x'), false);
+  assert.equal(namesExtractedPieces('Solution: Extract `buildContext` only, keep the rest.\n\nBenefits: x'), false, 'one name is not a decomposition');
+  assert.equal(namesExtractedPieces('Problem: the old buildPlanContext and postProcessResponse are long.\nSolution: split it up.\n\nBenefits: x'), false, 'names outside the Solution section do not count');
+  assert.equal(namesExtractedPieces('Solution: call `do_it` then `go_on` and use it_is here.\n\nBenefits: x'), false, 'short snake_case words are not named pieces');
+  assert.equal(namesExtractedPieces(''), false);
+});
+
+test('reviewTask lets a function_length_review draft that names its extracted pieces through to the vote instead of the missing-code-diff block', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({
+    domain: 'default', source: 'function_length_review',
+    implementResponse: '### AC-9\nProblem: runPlanWithTools is 492 lines and stacks four concerns.\nSolution: Extract `buildPlanContext(params)` for the setup block and `postProcessResponse(response, opts)` for the marker dispatch; the tool-calling loop stays.\n\nBenefits:\nEach piece is testable.',
+  });
+  const captured = [];
+  await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  assert.notEqual(task.reviewProvider, 'deterministic-missing-code-diff');
+  assert.equal(captured.length, 1, 'reaches a real vote');
+});

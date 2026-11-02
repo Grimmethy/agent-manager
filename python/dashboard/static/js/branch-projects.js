@@ -8,6 +8,7 @@
 const BRANCHES_URL = '/api/git/unmerged-branches?projects=all';
 // Labels of registered projects the server has not finished scanning yet (response header); the tab's own poll picks them up.
 let branchProjectsPending = [];
+let branchListRefreshing = false;     // X-Branch-Refreshing: the served list is the last good one while the server recomputes it in the background
 
 function _bpEscape(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -64,10 +65,10 @@ function groupBranchesByProject(branches) {
 function branchProjectHeaderHtml(group) {
   const p = group.project;
   const n = group.branches.length;
-  return `<div data-project-header="${_bpEscape(p.label)}" style="margin:18px 0 8px;padding:6px 10px;border-radius:6px;background:${branchProjectColorCss(p.label)};color:#fff;display:flex;gap:10px;align-items:baseline">`
+  return `<div data-project-header="${_bpEscape(p.label)}" style="margin:16px 0 8px;padding:8px 12px;border-radius:6px;background:${branchProjectColorCss(p.label)};color:#fff;display:flex;gap:10px;align-items:baseline">`
     + `<strong>${_bpEscape(p.label)}</strong>${p.active ? '<span>● active project</span>' : ''}`
     + `<span style="opacity:.8">${n} branch${n === 1 ? '' : 'es'}</span>`
-    + `<span style="opacity:.6;font-family:monospace;font-size:11px;margin-left:auto">${_bpEscape(p.repoRoot)}</span></div>`;
+    + `<span style="opacity:.6;font-family:monospace;font-size:12px;margin-left:auto">${_bpEscape(p.repoRoot)}</span></div>`;
 }
 
 // Headers only earn their space when more than one project is on screen.
@@ -80,7 +81,13 @@ function branchListWithProjectHeadersHtml(branches, cardHtml) {
 function branchProjectsPendingHtml(pending) {
   const list = Array.isArray(pending) ? pending.filter(Boolean) : [];
   if (!list.length) return '';
-  return `<div class="meta" data-projects-pending style="margin:0 0 10px">Still scanning ${list.length} other project${list.length === 1 ? '' : 's'} for branches: ${list.map(_bpEscape).join(', ')} -- they appear here as each finishes.</div>`;
+  return `<div class="meta" data-projects-pending style="margin:0 0 8px">Still scanning ${list.length} other project${list.length === 1 ? '' : 's'} for branches: ${list.map(_bpEscape).join(', ')} -- they appear here as each finishes.</div>`;
+}
+
+// The list is served at once from the cache; while it is being recomputed (after a merge, discard or verdict, or on a cold start) say so instead of looking stuck.
+function branchListRefreshingHtml(refreshing) {
+  if (!refreshing) return '';
+  return '<div class="meta" data-list-refreshing style="margin:0 0 8px">Refreshing the branch list -- showing the last result; it updates by itself.</div>';
 }
 
 // Merge/discard/verdict act on the card's OWN project: the buttons carry the project's repoRoot (empty for the active project) and the request appends
@@ -118,7 +125,8 @@ async function fetchBranchList() {
   }
   if (!r.ok) throw new Error(BRANCHES_URL + ' -> ' + r.status);
   branchProjectsPending = (r.headers.get('X-Branch-Projects-Pending') || '').split(',').filter(Boolean);
+  branchListRefreshing = r.headers.get('X-Branch-Refreshing') === '1';
   return r.json();
 }
 
-if (typeof module !== 'undefined') module.exports = { branchIsActiveProject, branchRowKey, BRANCH_PROJECT_PINS, branchProjectHue, branchProjectColorCss, branchProjectChipHtml, groupBranchesByProject, branchProjectHeaderHtml, branchListWithProjectHeadersHtml, branchProjectsPendingHtml, branchProjectRequestRoot, branchActionUrl, branchConfirmWithProject };
+if (typeof module !== 'undefined') module.exports = { branchListRefreshingHtml, branchIsActiveProject, branchRowKey, BRANCH_PROJECT_PINS, branchProjectHue, branchProjectColorCss, branchProjectChipHtml, groupBranchesByProject, branchProjectHeaderHtml, branchListWithProjectHeadersHtml, branchProjectsPendingHtml, branchProjectRequestRoot, branchActionUrl, branchConfirmWithProject };

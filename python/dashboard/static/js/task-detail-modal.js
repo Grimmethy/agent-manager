@@ -488,7 +488,7 @@ function renderDesignDecisionPicker(task) {
     html += `<div style="margin-top:10px"><strong>Pick one:</strong></div>`;
     html += `<div style="margin-top:6px;display:flex;flex-direction:column;gap:6px">`;
     html += nc.options.map((o, i) => `
-      <button type="button" class="secondary clarify-answer-option-btn" data-answer="${escapeAttr(`${o.label}: ${o.description}`)}" style="text-align:left;padding:8px 10px">
+      <button type="button" class="secondary clarify-answer-option-btn" data-answer="${escapeAttr(`${o.label}: ${o.description}`)}" style="text-align:left;padding:8px 12px">
         <strong>${escapeHtml(o.label)}</strong><br><span class="meta">${escapeHtmlBright(o.description)}</span>
       </button>`).join('');
     html += `</div>`;

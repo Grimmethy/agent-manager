@@ -274,7 +274,8 @@ test('live state: with the old docs-only entry already first-seen in September, 
 
 test('once only: a task stuck after the new entry was first seen is left alone, and a requeued task is not requeued again for the same entry', async () => {
   const dir = pipeline();
-  seedState(dir, { 'docs-only-gate-negated-paths': OLD_DOCS_ENTRY_FIRST_SEEN, [NEW_ENTRY]: SWEEP_NOW.toISOString() });
+  // 2026-11-02: the later docs-only entry is already live too (since before both tasks got stuck), otherwise it is seen for the first time here and requeues these documentation tasks.
+  seedState(dir, { 'docs-only-gate-negated-paths': OLD_DOCS_ENTRY_FIRST_SEEN, [NEW_ENTRY]: SWEEP_NOW.toISOString(), 'docs-only-gate-created-document-deliverable': '2026-10-15T00:00:00.000Z' });
   put(dir, 'needs-clarification', verifyTask('late', READONLY_PF_TEXT, '2026-10-16T02:00:00Z'));
   const again = verifyTask('again', READONLY_CORE_TEXT, '2026-10-16T00:30:00Z');
   again.requeuedForFixes = [NEW_ENTRY];
@@ -557,4 +558,25 @@ test('the CLI awaits the async sweep and prints its summary line', () => {
   });
   assert.match(out, /^checked=\d+ requeued=1 \[cli-t<-wrong-block-whole-function-snippet\] skipped=0/);
   assert.match(out, /\(dry run\)\s*$/);
+});
+
+// 2026-11-02: an entry that says the 'design-decision' label itself was wrong must not be skipped by the genuine-design-question guard ----------------------------
+test('mislabeledAsDesign entry drains a design-decision task that was never exhausted; a normal entry still skips it', async () => {
+  const task = (id) => stuck(id, { source: 'manual', needsClarification: { reason: 'design-decision', openQuestions: 'PLACEHOLDER' }, history: [at('2026-09-20T05:00:00Z')] });
+  const mk = (extra) => [{ id: 'e-test', dirs: ['needs-clarification'], applies: (t) => t.needsClarification && t.needsClarification.openQuestions === 'PLACEHOLDER', ...extra }];
+  const dirA = pipeline();
+  put(dirA, 'needs-clarification', task('mislabeled-1'));
+  await sweepKnownFixedFailures({ pipelineDir: dirA, now: new Date('2026-09-20T06:00:00Z'), entries: mk({}) }); // first sight: stamps firstSeen
+  const sA = await sweepKnownFixedFailures({ pipelineDir: dirA, now: NOW, entries: mk({}) });
+  assert.deepEqual(sA.requeued, [], 'a normal entry skips a design-decision task that was not exhausted');
+  assert.equal(has(dirA, 'needs-clarification', 'mislabeled-1'), true);
+  const dirB = pipeline();
+  put(dirB, 'needs-clarification', task('mislabeled-2'));
+  const sB = await sweepKnownFixedFailures({ pipelineDir: dirB, now: NOW, entries: mk({ mislabeledAsDesign: true }) });
+  assert.deepEqual(sB.requeued.map((r) => r.id), ['mislabeled-2']);
+  assert.equal(has(dirB, 'needs-clarification', 'mislabeled-2'), false);
+});
+
+test('the out-of-turns known-fixed entry opts out of the design-question guard', () => {
+  assert.equal(byId['agentic-empty-forced-summary-parked-as-design-question'].mislabeledAsDesign, true);
 });

@@ -17,7 +17,7 @@ test('neither field gives an empty string', () => {
 
 test('possiblyResolved gives the chip and the evidence', () => {
   const html = brainDumpChipsHtml({ possiblyResolved: { evidence: 'commit 4e8054e added the hold subcommand', masterSha: 'abc', checkedAt: 'x' } }, escapeHtml);
-  assert.match(html, /class="badge warn"[^>]*>possibly resolved<\/span>/);
+  assert.match(html, /class="badge warn chip-gap"[^>]*>possibly resolved<\/span>/);
   assert.match(html, />commit 4e8054e added the hold subcommand<\/span>/);
   assert.match(html, /title="Possibly already fixed on master \(not closed, check it\): commit 4e8054e/);
   assert.doesNotMatch(html, /target check/);

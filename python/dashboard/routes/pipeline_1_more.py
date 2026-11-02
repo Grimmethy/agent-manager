@@ -394,8 +394,8 @@ def api_pipeline_stop():
 @pipeline_1_more_bp.route("/api/git/unmerged-branches")
 def api_git_unmerged_branches():
     # Served from the cache (stale-while-revalidate, see app.list_unmerged_branches): the forced full recompute took ~37 s under load, past the tab's 30 s timeout.
-    from app import _branch_cache, _branch_cache_lock, list_unmerged_branches
-    branches = list_unmerged_branches(force=False)
+    from app import _branch_cache, _branch_cache_lock, branch_list_refreshing, list_unmerged_branches
+    branches = list_unmerged_branches(force=False, stale_ok=True)   # never recomputes inside the request: last good list now, refresh in the background
     with _branch_cache_lock:
         filled = _branch_cache["at"]
     pending = []
@@ -408,10 +408,11 @@ def api_git_unmerged_branches():
     resp = jsonify(branches)
     resp.headers["X-Branch-Cache-Age"] = str(max(0, int(time.time() - filled))) if filled else "0"
     resp.headers["X-Branch-Projects-Pending"] = ",".join(pending)
+    resp.headers["X-Branch-Refreshing"] = "1" if branch_list_refreshing() else "0"
     # The tab polls this every 15 s and the ~140 KB list is almost always unchanged: tag it so an unchanged list is answered with a body-less 304 (the browser revalidates by itself
     # under no-cache). The pending header is part of the tag because the tab reads it (branchProjectsPending); the cache-age header changes every call and is left out.
     resp.headers["Cache-Control"] = "no-cache"
-    resp.set_etag(hashlib.sha256(resp.get_data() + b"\0" + resp.headers["X-Branch-Projects-Pending"].encode()).hexdigest())
+    resp.set_etag(hashlib.sha256(resp.get_data() + b"\0" + resp.headers["X-Branch-Projects-Pending"].encode() + b"\0" + resp.headers["X-Branch-Refreshing"].encode()).hexdigest())
     return resp.make_conditional(request)
 
 
@@ -698,7 +699,7 @@ def _apply_post_merge_side_effects(context):
         if os.path.realpath(str(scope["repoPath"])) != os.path.realpath(str(PACKAGE_ROOT)):
             return {"skipped": "not the dashboard's own repo"}
         return _sync_live_checkout(context["main_branch"])
-    _invalidate_branch_cache()
+    _invalidate_branch_cache(drop_branch=(context.get("match") or {}).get("branch"))
     return _sync_live_checkout(context["main_branch"])
 
 

@@ -128,7 +128,7 @@ test('summary: no badge when the sum is zero or the section has no badge keys; s
 });
 
 // --- the real renderNav on a wide screen, against a small fake DOM ---
-function makeEnv({ stored = {}, active = 'project', narrow = false } = {}) {
+function makeEnv({ stored = {}, active = 'project', narrow = false, icons = false, tabs = null } = {}) {
   const store = { ...stored };
   const appended = [];
   const notchCalls = [];
@@ -143,9 +143,10 @@ function makeEnv({ stored = {}, active = 'project', narrow = false } = {}) {
     counts: { pending: 4, blocked: 7 }, activeTab: active, TAB_COUNT_SEVERITY_THRESHOLDS: { blocked: { bad: 1 } }, switchToTab() {},
     escapeHtml: (s) => String(s),
   });
+  if (icons) vm.runInContext(fs.readFileSync(path.join(__dirname, 'nav-icons.js'), 'utf8'), ctx);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'nav-sections.js'), 'utf8'), ctx);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'core-ui.js'), 'utf8'), ctx);
-  vm.runInContext('TABS = ' + JSON.stringify(LIVE()), ctx);
+  vm.runInContext('TABS = ' + JSON.stringify(tabs || LIVE()), ctx);
   const text = (b) => b.innerHTML.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
   return { ctx, store, appended, nav, text, notchCalls, sections: () => ctx.buildNavSections(JSON.parse(JSON.stringify(LIVE()))) };
 }
@@ -353,6 +354,54 @@ test('page wiring: index.html styles the collapse button, pill and the 72px rail
   assert.match(html, /nav\.nav-rail \.nav-notch \{ display: none; \}/);
   assert.match(html, /nav\.nav-rail button\.rail-btn\.active \{ background: var\(--accent\); color: var\(--accent-text\);/);
   assert.match(html, /@media \(prefers-reduced-motion: reduce\) \{ nav \{ transition: none; \} \}/);
+});
+
+// --- line icons in the nav ---
+const EMOJI_TABS = () => LIVE().map((x) => (x.children ? x : { ...x, label: ({ branches: '🌿 Unmerged Branches', workers: '👷 Workers', adhoc: '📌 Adhoc Tasks', project: '📁 Project' })[x.key] || x.label }));
+
+test('with the icon module, a tab button is the line icon plus the name without its emoji', () => {
+  const env = makeEnv({ icons: true, tabs: EMOJI_TABS() });
+  env.ctx.renderNav();
+  const tabs = env.appended.filter((e) => !/^nav-/.test(e.className));
+  const branches = tabs[0];
+  assert.match(branches.innerHTML, /^<span class="nav-tab-label"><svg class="nav-ic"/);
+  assert.match(branches.innerHTML, /<\/svg><span>Unmerged Branches<\/span><\/span>/);
+  assert.doesNotMatch(branches.innerHTML, /🌿/);
+  assert.match(tabs[1].innerHTML, /<span>Workers<\/span>/);
+  assert.equal(tabs.filter((b) => /nav-ic/.test(b.innerHTML)).length, 4);
+});
+
+test('the adhoc tab keeps its two counts next to the icon label', () => {
+  const env = makeEnv({ icons: true, tabs: EMOJI_TABS() });
+  env.ctx.renderNav();
+  const adhoc = env.appended.filter((e) => !/^nav-/.test(e.className))[2];
+  assert.match(adhoc.innerHTML, /^<span class="nav-tab-label"><svg class="nav-ic"[\s\S]*<span>Adhoc Tasks<\/span><\/span><span class="count">/);
+});
+
+test('a tab with no icon keeps its label exactly as it was, and so does everything when the icon module is absent', () => {
+  const unknown = [{ key: 'workers', label: 'Workers' }, { key: 'my-plugin-tab', label: '🧪 My Tab' }];
+  const env = makeEnv({ icons: true, tabs: unknown, stored: { agentManagerNavSection_more: 'expanded' } });
+  env.ctx.renderNav();
+  const labelled = env.appended.filter((e) => !/^nav-/.test(e.className));
+  assert.match(labelled[1].innerHTML, /^<span>🧪 My Tab<\/span>/);
+  const plain = makeEnv({ tabs: EMOJI_TABS() });
+  plain.ctx.renderNav();
+  assert.match(plain.appended.filter((e) => !/^nav-/.test(e.className))[0].innerHTML, /^<span>🌿 Unmerged Branches<\/span>/);
+});
+
+test('the rail draws 20px line icons for tabs and for folded sections, and falls back to glyphs and letters without them', () => {
+  const env = makeEnv({ icons: true, tabs: EMOJI_TABS(), stored: { agentManagerNavRail: 'collapsed' } });
+  env.ctx.renderNav();
+  const rail = env.appended.filter((e) => /rail-btn/.test(e.className) && !/rail-section/.test(e.className));
+  assert.equal(rail.length, 4);
+  for (const b of rail) assert.match(b.innerHTML, /<span class="rail-glyph"><svg class="nav-ic"[^>]*width="20" height="20"/);
+  const sections = env.appended.filter((e) => /rail-section/.test(e.className));
+  assert.equal(sections.length, 6);
+  for (const b of sections) assert.match(b.innerHTML, /<span class="rail-glyph"><svg class="nav-ic"[^>]*width="20" height="20"/);
+  const bare = makeEnv({ tabs: EMOJI_TABS(), stored: { agentManagerNavRail: 'collapsed' } });
+  bare.ctx.renderNav();
+  assert.match(bare.appended.filter((e) => /rail-btn/.test(e.className) && !/rail-section/.test(e.className))[0].innerHTML, /<span class="rail-glyph">🌿<\/span>/);
+  assert.match(bare.appended.find((e) => /rail-section/.test(e.className)).innerHTML, /<span class="rail-glyph">Q<\/span>/);
 });
 
 test('page wiring: index.html loads nav-sections.js, styles headers and the fading divider, nav is 232px wide', () => {

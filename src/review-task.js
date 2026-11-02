@@ -1423,7 +1423,8 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       && /^#{2,4}\s*AC-\S+/m.test(trimmedImplResponse)
       && !/```/.test(trimmedImplResponse)
       && !/^(?:---|\+\+\+|@@)/m.test(trimmedImplResponse)
-      && !/^(?:\+|-)(?!\s*$)\S/m.test(trimmedImplResponse)) {
+      && !/^(?:\+|-)(?!\s*$)\S/m.test(trimmedImplResponse)
+      && !namesExtractedPieces(trimmedImplResponse)) {
     const reason = 'Deterministic gate: missing-code-diff -- candidate drafts from this source must show the concrete change as a fenced code block or diff hunk, not prose-only commentary describing what should change. No local-model review call spent on a draft with no code shape at all.';
     task.reviewProvider = 'deterministic-missing-code-diff';
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
@@ -1779,6 +1780,18 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
 // kept that stale value and the dashboard list view -- which reads task.status straight
 // through task_summary() -- showed the whole approved/ backlog as "needs-review". The
 // verdict strings ('approved' / 'blocked') are already exactly the status values we want.
+// 2026-11-02 (stalled-task loop: 53 function_length_review candidates parked on missing-code-diff after ~4.4 drafts each): the deliverable for extracting pieces of a long function is the
+// NAMED pieces, and the local model will not write a code block for a 500-line extraction. A Solution that names at least two distinct new identifiers (camelCase or snake_case, optionally
+// with a leading underscore, longer than five characters) states the concrete change; a Solution that only says "split it into smaller helper functions" does not. Replay over the 53 parked
+// drafts: 45 name pieces, 8 are prose-only and stay blocked.
+const NAMED_PIECE_RE = /\b_?(?:[a-z]+(?:[A-Z][a-z0-9]+)+|[a-z]+(?:_[a-z0-9]+)+)\b/g;
+function namesExtractedPieces(text) {
+  const m = /Solution:\s*([\s\S]*?)(?:\n\s*\n(?:Benefits|Strength)|$)/.exec(String(text || ''));
+  const solution = m ? m[1] : '';
+  const names = new Set((solution.match(NAMED_PIECE_RE) || []).filter((w) => w.replace(/^_/, '').length > 5));
+  return names.size >= 2;
+}
+
 async function reviewTask(task, opts = {}) {
   const result = await runReview(task, opts);
   if (result && result.succeeded && (result.verdict === 'approved' || result.verdict === 'blocked')) {
@@ -1842,7 +1855,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { getDomainConfig, EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { namesExtractedPieces, getDomainConfig, EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();
