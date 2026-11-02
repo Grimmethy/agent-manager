@@ -40,6 +40,7 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { decideFindingResolved } = require('./premise-recheck-decision.js');
 const { alreadyEscalatedSinceLastReadmission } = require('./reject-retry-check.js');
+const { classifyPatchFailure } = require('./patch-failure-classifier.js');
 
 const MAX_APPLY_RETRIES = 2;
 
@@ -132,16 +133,23 @@ function defaultIsApplyCloneClean() {
 }
 
 function buildExhaustedApplyQuestion(task) {
+  const classification = task.applyRetryClassification;
+  const classificationNote = classification
+    ? `Classification: ${classification.classification} -- ${classification.detail}`
+    : '';
+
   return [
     `An apply failure survived ${MAX_APPLY_RETRIES} automatic redraft attempts: ${String(task.blockedReason || '(no reason recorded)')}`,
-    '',
+    classificationNote,
     isFindStringMiss(task)
       ? 'The draft\'s edit could not be matched against the real file. Common cause: the '
         + 'candidate\'s citation is stale -- something else may have already changed or fixed '
         + 'that code, and a deterministic re-scan could not confirm it either way. Check the '
         + 'real file: if the issue is already fixed, Archive this task; if the citation is '
         + 'merely stale, correct it and requeue.'
-      : 'A fresh draft against current code kept failing to apply. Check whether another task '
+      : classification?.classification === 'conflicting_edit'
+        ? `Another task changed the lines this patch was editing. Check which task made the conflicting change (look at recent commits to ${classification.detail.split(' ')[3] || 'the file'}), then either requeue after reconciling or Archive if the conflict is already resolved.`
+        : 'A fresh draft against current code kept failing to apply. Check whether another task '
         + 'changed the same lines, and either requeue after reconciling or Archive it.',
   ].join('\n');
 }
@@ -283,6 +291,57 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approv
           landAsResolvedFalsePositive(task, name, filePath, approvedDirResolved);
           summary.resolved++;
           continue;
+        }
+      }
+
+      // Patch-failure classification: distinguish stale context (redraft will fix) from
+      // conflicting edit (escalate with the conflict named) from malformed hunk (regenerate).
+      // This prevents the "same kind of failure every retry" loop the stalled-task worker
+      // was complaining about. The classifier reads current file state, so it can tell
+      // "the code moved" (stale) from "the code was replaced" (conflict) -- git apply's
+      // own error messages are ambiguous between the two.
+      if (!isInfraApplyFailure(task) && !isGitTimeoutFailure(task) && !isDivergedHistoryFailure(task)) {
+        try {
+          const classification = classifyPatchFailure({
+            rawDiff: task.rawDiff || '',
+            blockedReason: task.blockedReason || '',
+            repoRoot: repoRoot || getConfig().repoRoot,
+          });
+
+          // Conflicting edit: escalate immediately, don't burn a retry on something
+          // that structurally cannot apply (another task changed the same lines).
+          if (classification.classification === 'conflicting_edit') {
+            if (needsClarificationDir && !alreadyEscalatedSinceLastReadmission(task)) {
+              step = 'record';
+              task.needsClarification = {
+                reason: 'conflicting-edit',
+                openQuestions: [
+                  `Apply failed because another task changed the lines this patch was editing: ${classification.detail}`,
+                  `The patch's context lines no longer exist at the expected location. Check which task made the conflicting change (look at recent commits to ${classification.detail.split(' ')[3] || 'the file'}), then either requeue after reconciling or Archive if the conflict is already resolved.`,
+                ],
+              };
+              appendHistoryEvent(task, 'needs-clarification', `escalated: conflicting edit (${classification.detail})`);
+              if (pipelineDir) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'apply-retry-check:conflicting-edit', pipelineDir });
+              step = 'write';
+              fs.mkdirSync(needsClarificationDir, { recursive: true });
+              fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
+              step = 'unlink';
+              fs.unlinkSync(filePath);
+              summary.exhausted++;
+              continue;
+            }
+          }
+
+          // Stale context or malformed hunk: add a note to the task so the redraft
+          // knows what to look for. The retry mechanism will pick this up.
+          if (classification.classification === 'stale_context') {
+            task.applyRetryNote = `stale context: ${classification.detail} -- redraft against current code`;
+          } else if (classification.classification === 'malformed_hunk') {
+            task.applyRetryNote = `malformed hunk: ${classification.detail} -- regenerate the edit`;
+          }
+        } catch (classifyErr) {
+          // Classification is best-effort; a failure here should not block the retry.
+          console.warn('[apply-retry-check] patch classification failed:', classifyErr.message);
         }
       }
 
