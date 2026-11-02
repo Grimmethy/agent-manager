@@ -130,6 +130,20 @@ def resolve_scope(project_root, active_root):
     raise LookupError(f"'{project_root}' is not a registered project")
 
 
+def find_or_refresh_other_project_branch(scope, branch):
+    """find_other_project_branch, but when that project has no cached list that names the branch (the cache is only filled once the tab has asked for `?projects=all`,
+    and a list can be up to TTL old), compute the project's list now, exactly like merge and discard do, and look again. Without this a verdict for a pushed branch of a
+    registered project was parked in pending_verdicts, which nothing drains for a non-active project. A failed refresh counts as 'not listed'."""
+    real, row = find_other_project_branch(scope["repoRoot"], branch)
+    if row:
+        return real, row
+    try:
+        refresh_branches(scope)
+    except Exception as e:  # noqa: BLE001 -- the caller falls back to its pending/404 path
+        print(f"[branches] refresh for verdict on {scope.get('label')} failed (non-fatal): {type(e).__name__}: {e}", file=sys.stderr)
+    return find_other_project_branch(scope["repoRoot"], branch)
+
+
 def refresh_branches(scope):
     """Recompute that project's list NOW (git fetch included) and cache it: an action must gate on the branch as it is, not on a list up to 5 minutes old."""
     import app
