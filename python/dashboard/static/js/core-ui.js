@@ -446,6 +446,7 @@ function renderNav() {
       nav.appendChild(renderTabButton(tab, false));
     }
   }
+  if (typeof navNotchUpdate === 'function') navNotchUpdate(nav);
 }
 
 function fmtPct(x) { return x == null ? '-' : Math.round(x * 100) + '%'; }

@@ -60,6 +60,11 @@
   nav button { display: flex; justify-content: space-between; width: 100%; padding: 10px 20px; background: none; border: none; color: var(--text); text-align: left; cursor: pointer; font-size: 13px; }
   nav button:hover { background: var(--panel); }
   nav button.active { background: var(--panel); border-left: 3px solid var(--accent); color: var(--accent); }
+  /* Floating notch (nav-notch.js): a ball in a ring at the right edge of the active tab; it hops to the newly chosen tab. */
+  nav button { padding-right: 32px; }
+  .nav-notch { position: absolute; top: 0; left: calc(100% - 16px); width: 12px; height: 12px; pointer-events: none; will-change: transform; }
+  .nav-notch::before { content: ''; position: absolute; inset: -4px; border: 2px solid var(--border); border-radius: 50%; background: var(--bg); }
+  .nav-notch-ball { position: absolute; inset: 0; border-radius: 50%; background: var(--accent); }
   nav .count { color: var(--muted); font-variant-numeric: tabular-nums; }
   /* min-width:0 lets main shrink below its content (a flex item's default min-width:auto kept it at its widest child, so nav + main + the 380px
      sidebar summed past the window and the whole page scrolled sideways, clipping the sidebar's right edge); overflow-x:auto scrolls wide content
@@ -245,6 +250,7 @@
     nav { width: 100%; height: auto; position: static; overflow-y: visible; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); display: flex; overflow-x: auto; padding: 6px 8px; -webkit-overflow-scrolling: touch; }
     nav button { width: auto; white-space: nowrap; padding: 8px 12px; }
     nav button.active { border-left: none; border-bottom: 3px solid var(--accent); }
+    .nav-notch { display: none; }
     main { padding: 12px; overflow-x: auto; }
     table { min-width: 560px; }
     .plugin-sidebar { position: fixed; left: 0; right: 0; bottom: 0; top: auto; width: 100%; height: 65vh; border-left: none; border-top: 2px solid var(--border); z-index: 15; }
@@ -287,6 +293,7 @@
 </div>
 
 <script src="{{ url_for('static', filename='js/core-ui.js') }}"></script>
+<script src="/static/js/nav-notch.js"></script>
 <script src="/static/js/queue-tab.js"></script>
 <script src="/static/js/plugins-tab.js"></script>
 <script src="/static/js/workers-tab.js"></script>
