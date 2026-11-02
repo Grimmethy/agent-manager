@@ -2366,6 +2366,18 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
     _annotate_hub_sibling_conflicts(repo_root, branches)
     import branch_verdicts  # lazy: keeps app.py's import block untouched
     branch_verdicts.enrich_branches_with_verdicts(qdir, repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
+    if other and qdir:
+        # A verdict posted for a branch this project's list did not (yet) show waits in ITS queue/pending_verdicts. The active project's list applies its own after every
+        # refresh (_store_branch_list); no one drained the others', so those verdicts never reached a card. Apply them here, after the cards carry headSha (the apply drops a
+        # verdict whose listing row has none), then enrich again so THIS refresh already returns the verdict. A held hub branch is not in `branches`: its verdict keeps waiting.
+        try:
+            import branch_verdicts_pending as bvp
+            parked = len(bvp.list_pending_verdicts(qdir))
+            bvp.apply_pending_verdicts(qdir, repo_root, lambda force=False: branches, _run_git, branch_verdicts)      # returns at once when nothing is parked
+            if len(bvp.list_pending_verdicts(qdir)) != parked:
+                branch_verdicts.enrich_branches_with_verdicts(qdir, repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
+        except Exception as exc:  # noqa: BLE001 -- listing must never fail because of a parked verdict
+            print(f"[branches] pending verdict apply for {repo_root} failed (non-fatal): {exc}", file=sys.stderr)
     branches.sort(key=lambda b: b["pushedAt"])
     return branches
 
