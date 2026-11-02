@@ -85,3 +85,22 @@ test('missing numbers never print NaN or undefined', () => {
   assert.doesNotMatch(html, /NaN|undefined|null/);
   assert.match(html, /0 calls · 0 in \/ 0 out tokens · \$0\.00/);
 });
+
+test('switched off with the gateway stopped: a plain note, no error wording, and the reason is not shown', () => {
+  const html = build({ cloudLane: true, available: false, switchedOff: true, laneId: 'worker-cloud', error: '[Errno 111] Connection refused' });
+  assert.match(html, /id="cloud-spend-panel"/);
+  assert.match(html, /Cloud spend/);
+  assert.match(html, /Cloud lane switched off -- no spend is being recorded\. Turn the cloud worker back on and start the cloud-providers plugin to see spend\./);
+  assert.doesNotMatch(html, /not reachable/);
+  assert.doesNotMatch(html, /Errno/);
+  assert.equal(section({ cloudLane: true, available: false, switchedOff: true }), build({ cloudLane: true, available: false, switchedOff: true }));
+});
+
+test('not switched off with the gateway down keeps the old not-reachable note, and an available meter wins over switchedOff', () => {
+  assert.match(build({ cloudLane: true, available: false, error: 'refused' }), /Cloud gateway not reachable \(refused\)\./);
+  assert.match(build({ cloudLane: true, available: false, switchedOff: false, error: 'refused' }), /not reachable/);
+  const live = { cloudLane: true, available: true, switchedOff: true, provider: 'p', model: 'm', monthToDate: { calls: 1 }, today: {}, cap: {} };
+  assert.doesNotMatch(build(live), /switched off/);
+  assert.match(build(live), /Month to date/);
+  assert.equal(build({ cloudLane: false, available: false, switchedOff: true }), '');
+});
