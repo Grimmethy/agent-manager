@@ -68,6 +68,7 @@ const { checkDraft, checkCitationsAgainstHarnessFiles } = require('./fact-checke
 const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
+const { getScriptHandler } = require('./script-handler-registry.js');
 const { getPreDispatchGate } = require('./deterministic-recheck-registry.js');
 const { buildGateFalsePositiveDraft } = require('./lib/gate-verdict.js');
 const { selectAbModel } = require('./ab-model-select.js');
@@ -1601,6 +1602,26 @@ async function draftTask(task, deps = {}) {
     appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic verdict, nothing for a critique pass to add)');
     concludeDraft(task);
     return { succeeded: true, blocked: false, gateVerdict: 'false-positive', ruleId: gateHit.ruleId, reason: gateHit.reason };
+  }
+  // Script-handled source (src/script-handler-registry.js): the work is a script, not a diff. Run it, record its result on the task and finish as
+  // 'recorded' (no model call, no draft attempt). A throw falls into the worker's normal draft-failure accounting.
+  const scriptHandler = getScriptHandler(resolveSourceName(task));
+  if (scriptHandler) {
+    try {
+      const res = (await scriptHandler(task, {})) || {};
+      const outcome = String(res.outcome || 'done');
+      const summary = String(res.summary || '');
+      task.scriptResult = { outcome, summary, detail: res.detail === undefined ? null : res.detail, at: new Date().toISOString() };
+      task.terminalDisposition = 'recorded';
+      task.status = 'recorded';
+      appendHistoryEvent(task, 'script-handler-done', `${outcome}: ${summary}`.slice(0, 200));
+      appendHistoryEvent(task, 'recorded', 'script handler finished; no review needed');
+      return { succeeded: true, recorded: true };
+    } catch (err) {
+      const message = err && err.message ? err.message : String(err);
+      appendHistoryEvent(task, 'script-handler-failed', message.slice(0, 200));
+      return { succeeded: false, reason: `script handler failed: ${message}` };
+    }
   }
   // One append-only record per draftTask() run (draft-attempt-record.js). runDraftPasses
   // threads `attempt` through every pass and records into it as output is produced;
