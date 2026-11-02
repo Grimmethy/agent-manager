@@ -80,7 +80,7 @@ function branchListWithProjectHeadersHtml(branches, cardHtml) {
 function branchProjectsPendingHtml(pending) {
   const list = Array.isArray(pending) ? pending.filter(Boolean) : [];
   if (!list.length) return '';
-  return `<div class="meta" data-projects-pending style="margin:0 0 10px">Still scanning ${list.length} other project${list.length === 1 ? '' : 's'} for branches: ${list.map(_bpEscape).join(', ')} -- they appear here as each finishes.</div>`;
+  return `<div class="meta" data-projects-pending style="margin:0 0 8px">Still scanning ${list.length} other project${list.length === 1 ? '' : 's'} for branches: ${list.map(_bpEscape).join(', ')} -- they appear here as each finishes.</div>`;
 }
 
 // Merge/discard/verdict act on the card's OWN project: the buttons carry the project's repoRoot (empty for the active project) and the request appends

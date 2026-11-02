@@ -9,7 +9,7 @@ function buildUnslottedRows(plugins) {
   return plugins.filter((p) => !p.slot).map((p) => {
     const enabled = p.enabled !== false;
     return `
-      <div style="display:flex; align-items:flex-start; gap:12px; padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
+      <div style="display:flex; align-items:flex-start; gap:12px; padding:12px 16px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
         <label style="display:flex; align-items:center; gap:8px; margin-top:2px; cursor:pointer;">
           <input type="checkbox" class="plugin-toggle" data-name="${escapeAttr(p.name)}" ${enabled ? 'checked' : ''}>
         </label>
@@ -46,7 +46,7 @@ function buildSlotSections(slottedPlugins) {
       </label>`;
     })];
     return `
-      <div style="padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
+      <div style="padding:12px 16px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
         <div class="field-label" style="margin-bottom:6px;">${escapeHtml(slot)} source</div>
         <div style="display:flex; flex-direction:column; gap:2px;" id="slot-group-${escapeAttr(slot)}">${options.join('')}</div>
         <div class="meta slot-status" style="margin-top:6px;"></div>
@@ -195,7 +195,7 @@ async function renderMarketplace(main) {
       const versionLine = p.installedVersion
         ? '<div class="meta" style="margin-top:2px; font-size:11px;">Installed: ' + escapeHtml(p.installedVersion) + (updateAvail ? ' <span class="badge idle" style="margin-left:4px;">update available</span>' : '') + '</div>'
         : '';
-      return '<div style="display:flex; align-items:flex-start; gap:12px; padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">'
+      return '<div style="display:flex; align-items:flex-start; gap:12px; padding:12px 16px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">'
         + '<div style="flex:1; min-width:0;">'
         + '<div style="font-weight:600;">' + escapeHtml(p.name) + (priceText ? ' <span class="meta" style="margin-left:8px;">' + priceText + '</span>' : '') + '</div>'
         + '<div class="meta" style="margin-top:2px;">' + escapeHtml(p.summary || '') + '</div>'
