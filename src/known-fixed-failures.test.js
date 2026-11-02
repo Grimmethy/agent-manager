@@ -49,6 +49,22 @@ test('ungrounded-field-test-fixture: re-admits only when every flagged name is o
   assert.equal(fx.applies({}), false);
 });
 
+// --- ungrounded-field-own-declarations-and-platform-constants (2026-11-02) --------------------------------------------------------------------
+test('ungrounded-field-own-declarations-and-platform-constants: re-admits only when none of the flagged names is still flagged', () => {
+  const e = KNOWN_FIXED.find((x) => x.id === 'ungrounded-field-own-declarations-and-platform-constants');
+  assert.ok(e, 'entry registered');
+  assert.deepEqual(e.dirs, ['blocked', 'needs-clarification']);
+  const draft = DIFF(['+RULE_TABLE: dict[str, bool] = {', '+ExecStart=@BACKUP_TARGET@/run --family=AF_INET', '+DIR="$(dirname "${BASH_SOURCE[0]}")"']);
+  const blocked = (...names) => ({ title: 'T', promptContext: { rawText: 'unrelated' }, implementResponse: draft, blockedReason: names.map(BLOCK).join('\n') });
+  assert.equal(e.applies(blocked('RULE_TABLE', 'BACKUP_TARGET', 'AF_INET', 'BASH_SOURCE')), true);
+  assert.equal(e.applies(blocked('RULE_TABLE', 'MADE_UP_KEY')), false, 'a flagged name that is not in the stored draft cannot be re-checked, so it stays parked');
+  const invented = { ...blocked('RULE_TABLE', 'INVENTED_KEY'), implementResponse: `${draft}\n+if (INVENTED_KEY) {}` };
+  assert.equal(e.applies(invented), false, 'one invented name keeps it parked');
+  assert.equal(e.applies({ ...blocked('RULE_TABLE'), blockedReason: 'something else' }), false, 'no ungrounded-field name');
+  assert.equal(e.applies({ blockedReason: BLOCK('RULE_TABLE') }), false, 'no draft');
+  assert.equal(e.applies({}), false);
+});
+
 // --- lane-endpoint-outage-parked (2026-10-23) -----------------------------------------------------------------------------------------------
 
 test('lane-endpoint-outage-parked: re-admits a task parked on an unreachable or silent lane endpoint only while that endpoint answers', () => {

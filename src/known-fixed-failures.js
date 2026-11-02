@@ -294,6 +294,27 @@ const KNOWN_FIXED = [
     },
   },
   {
+    // 2026-11-02 (stalled-task loop): the gate now accepts a name the draft itself declares (Python annotation, shell export/readonly/local), an @NAME@ template placeholder it writes,
+    // and language/OS constants (BASH_*, AF_*, SOCK_*, NODE_ENV). This re-runs the real check on the parked task's own draft against the task text only (a poorer source than the real
+    // grounding, so it can only under-match) and re-admits it when none of the names it was blocked on is flagged any more; one genuinely invented name keeps it parked.
+    id: 'ungrounded-field-own-declarations-and-platform-constants',
+    fixedIn: 'agent-manager (fact-checker: own declarations, @NAME@ placeholders and language/OS constants are not ungrounded, 2026-11-02)',
+    description: 'an ungrounded-field block on names the draft declares itself or that the language or OS defines',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => {
+      const names = [...failureText(task).matchAll(/ungrounded-field: ([A-Z][A-Z0-9]*_[A-Z0-9_]+)/g)].map((m) => m[1]);
+      if (!names.length) return false;
+      try {
+        const { checkGroundedValues } = require('./fact-checker.js');
+        const draft = (task && (task.implementResponse || task.rawDiff)) || '';
+        if (!draft) return false;
+        const source = `${(task && task.title) || ''}\n${(task && task.promptContext && task.promptContext.rawText) || ''}`;
+        const still = new Set(checkGroundedValues(draft, source).filter((f) => f.type === 'ungrounded-field').map((f) => f.detail));
+        return names.every((n) => draft.includes(n) && !still.has(n));
+      } catch { return false; }
+    },
+  },
+  {
     // 2026-10-23 (Grimmethy: the rx580 lane sat idle 12 h after grimm hard-reset; "this is a recurring event"): with the lane's Ollama endpoint down, every draft failed
     // identically, burned the infra requeue rounds and parked the task in blocked/. scripts/local-worker.sh now claims nothing while its endpoint is down (the circuit
     // breaker), so this cannot happen again; this requeues, once, the tasks parked before it existed, and only when the endpoint they name answers now.
