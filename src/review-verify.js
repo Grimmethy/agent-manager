@@ -962,6 +962,17 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     if (!confirmed) return inconclusive('no covering tests and no runnable acceptance commands were found');
     result.status = 'passed';
     // Advisory, after the verdict is settled: never changes the status.
+    // Test pinning check runs before unpinned hunk check -- it reverts production changes
+    // and verifies tests fail on base, providing evidence the diff is needed.
+    if (result.tests && result.tests.passed === true && suites.length) {
+      try {
+        const pinningResult = checkTestPinning({ worktreeDir, rawDiff, suites, run: d.run, d, deadline, py, repoRoot, isRefactor: false });
+        if (pinningResult && pinningResult.ran) {
+          if (pinningResult.blockedTests && pinningResult.blockedTests.length) result.blockedTests = pinningResult.blockedTests;
+          if (pinningResult.advisoryTests && pinningResult.advisoryTests.length) result.advisoryTests = pinningResult.advisoryTests;
+        }
+      } catch { /* advisory: a failure here must never disturb the settled verdict */ }
+    }
     if (checkUnpinned && result.tests && result.tests.passed === true && suites.length) {
       try {
         const unpinned = checkUnpinnedHunks({ worktreeDir, rawDiff, suites, run: d.run, d, deadline, py, repoRoot });
@@ -981,42 +992,6 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
   } finally {
     if (prepared) { try { d.cleanup(repoRoot, worktreeDir, branchName); } catch { /* best-effort */ } }
   }
-}
-
-// Check whether a diff's test coverage is "pinned" (i.e. the tests exist on the base branch)
-// so the reviewer can trust the executed-verification result. Returns a reason string or null.
-//
-// Branches:
-//   - Diff with 'refactor' in header → 'header-with-keyword' (advisory escape)
-//   - Test-only diff, tests pass on base → 'tests-passing-on-base' (blocked)
-//   - Test-only diff, tests fail on base → 'tests-failing-on-base' (advisory)
-//   - Diff with production changes, tests pass on base → 'tests-passing-on-base' (blocked)
-//   - Fallback → null
-function checkTestPinning({ srcFiles, testFiles, testsPassedOnBase, testsFailedOnBase, rawDiff }) {
-  // Check for advisory escape keyword in diff header
-  if (rawDiff && typeof rawDiff === 'string' && rawDiff.includes('refactor')) {
-    return 'header-with-keyword';
-  }
-
-  const hasSrcFiles = Array.isArray(srcFiles) && srcFiles.length > 0;
-  const hasTestFiles = Array.isArray(testFiles) && testFiles.length > 0;
-
-  // Test-only diff (no production files changed)
-  if (!hasSrcFiles && hasTestFiles) {
-    if (testsPassedOnBase) {
-      return 'tests-passing-on-base';
-    }
-    if (testsFailedOnBase) {
-      return 'tests-failing-on-base';
-    }
-  }
-
-  // Diff with production changes and tests pass on base
-  if (hasSrcFiles && testsPassedOnBase) {
-    return 'tests-passing-on-base';
-  }
-
-  return null;
 }
 
 module.exports = {

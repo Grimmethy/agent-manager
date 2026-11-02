@@ -699,6 +699,8 @@ function summariseExecutedVerification(ev) {
     })),
     ...(ev.unpinned && typeof ev.unpinned === 'object' ? { unpinned: summariseUnpinned(ev.unpinned) } : {}),
     ...(ev.syntax && typeof ev.syntax === 'object' ? { syntax: summariseSyntax(ev.syntax) } : {}),
+    ...(ev.blockedTests && Array.isArray(ev.blockedTests) && ev.blockedTests.length ? { blockedTests: ev.blockedTests.slice(0, 10).map((t) => String(t).slice(0, 200)) } : {}),
+    ...(ev.advisoryTests && Array.isArray(ev.advisoryTests) && ev.advisoryTests.length ? { advisoryTests: ev.advisoryTests.slice(0, 10).map((t) => String(t).slice(0, 200)) } : {}),
   };
 }
 
