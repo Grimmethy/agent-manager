@@ -270,10 +270,16 @@
   .split-pane > div { flex: 1; min-width: 0; }
   .capture-row { display: flex; gap: 8px; margin-bottom: 14px; }
   .capture-row input { flex: 1; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; }
-  .bd-entry { background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .bd-entry { background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 8px; }
   .bd-entry .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
   .bd-entry .text { font-size: 13px; }
-  .bd-entry .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .bd-entry .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  /* Small outlined tag next to an entry's text; colour comes from the modifier, size and spacing sit on the 4px grid. */
+  .chip { display: inline-block; margin-left: 8px; padding: 4px 8px; border: 1px solid var(--muted); border-radius: 4px; color: var(--muted); font-size: 12px; }
+  .chip.chip-warn { border-color: var(--warn); color: var(--warn); }
+  .chip.clickable { cursor: pointer; }
+  .chip-gap { margin-left: 8px; }
+  .chip-note { margin-left: 4px; font-size: 12px; }
   .bd-entry a.jump { color: var(--link); font-size: 12px; text-decoration: none; }
   .note-content { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 12px; font-size: 13px; max-height: 500px; overflow-y: auto; font-family: monospace; }
   .grill-transcript { max-height: 360px; overflow-y: auto; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 10px; }
