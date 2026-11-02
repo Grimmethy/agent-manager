@@ -260,7 +260,7 @@ async function renderWorkers(isPoll) {
   // call-level data (review-task.js's majorityVote never calls recordCall, see that
   // route's own docstring) so it keeps the existing terminal-state recent-tasks view.
   const expandedIsWorker = !!(expandedWorkerId && expandedWorkerId.startsWith('worker'));
-  const [instances, workerModels, costSummary, recentTasks, cloudMeter] = await Promise.all([
+  const [instances, workerModels, costSummary, recentTasks, cloudMeter, stalledWorker] = await Promise.all([
     fetchJson('/api/instances'),
     fetchJson('/api/worker-models'),
     fetchJson('/api/models/cost-summary'),
@@ -271,6 +271,8 @@ async function renderWorkers(isPoll) {
       : Promise.resolve(null),
     // Cloud spend panel (cloud-spend-panel.js): fail soft -- a missing or erroring meter just hides the panel.
     fetchJson('/api/cloud-meter').catch(() => null),
+    // Stalled-task worker panel (stalled-worker-panel.js): fail soft the same way.
+    fetchJson('/api/stalled-worker').catch(() => null),
   ]);
   // Candidate list for each worker's own "assign task" override dropdown (2026-09-07
   // follow-up, Grimmethy after live-testing the override: "the only tasks I have
@@ -315,10 +317,10 @@ async function renderWorkers(isPoll) {
     }
   });
   const filterBar = `
-    <div class="worker-filter-bar" style="margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
+    <div class="worker-filter-bar" style="margin-bottom:12px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px">
       <div></div>
-      <label style="display:flex; align-items:center; gap:6px; font-size:0.9em; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
-        <input type="checkbox" id="claude-pause-toggle" ${workerModels.claudePaused ? 'checked' : ''}>
+      <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
+        <input type="checkbox" id="claude-pause-toggle" style="margin:0" ${workerModels.claudePaused ? 'checked' : ''}>
         Pause Claude (preserve subscription tokens)
       </label>
     </div>
@@ -442,7 +444,7 @@ async function renderWorkers(isPoll) {
         ${recentTasks ? (recentTasks.runs ? renderRunLogList(recentTasks.runs) : renderRecentTasksList(recentTasks.tasks || [])) : '<div class="meta">Loading…</div>'}
       </div>` : ''}
     </div>
-  `).join('')) + (typeof renderCloudSpendSection === 'function' ? renderCloudSpendSection(cloudMeter) : '') + renderCompletedTasksSection();
+  `).join('')) + (typeof renderCloudSpendSection === 'function' ? renderCloudSpendSection(cloudMeter) : '') + (typeof renderStalledWorkerSection === 'function' ? renderStalledWorkerSection(stalledWorker) : '') + renderCompletedTasksSection();
   window.scrollTo(0, scrollY);
   setupCompletedTasksObserver();
   if (!completedTasksLog.length && !completedTasksLoading && !completedTasksExhausted) {
@@ -452,6 +454,8 @@ async function renderWorkers(isPoll) {
     card.onclick = () => toggleWorkerExpand(card.dataset.instanceId);
   });
   if (typeof wireWorkerSwitchButtons === 'function') wireWorkerSwitchButtons(main);
+  if (typeof wireStalledWorkerSwitch === 'function') wireStalledWorkerSwitch(main);
+  if (typeof wireStalledWorkerExpand === 'function') wireStalledWorkerExpand(main, renderWorkers);
   const claudePauseToggle = main.querySelector('#claude-pause-toggle');
   if (claudePauseToggle) {
     claudePauseToggle.onchange = (e) => setClaudePaused(e.target.checked);

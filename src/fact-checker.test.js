@@ -1230,3 +1230,34 @@ test('once prose ends the diff block, later lines are prose too: an indented URL
   const draft = ['diff --git a/src/a.js b/src/a.js', '@@ -1 +1,2 @@', ' const a = 1;', '+const b = 2;', 'That is the change.', `  details at ${FABRICATED_URL}`].join('\n');
   assert.deepEqual(checkGroundedValues(draft, SOURCE_WITHOUT_URLS).map((f) => f.detail), [FABRICATED_URL]);
 });
+
+// 2026-11-02 stalled-task loop: ungrounded-field false positives on names the draft defines itself or the platform defines ---------------
+const ufgDiff = (...added) => ['Summary.', '', '=== DIFF ===', 'diff --git a/deploy/x.sh b/deploy/x.sh', '@@ -0,0 +1,3 @@', ...added.map((l) => '+' + l)].join('\n');
+const UFG_UNRELATED = 'grounding that mentions none of these names';
+
+test('ungrounded-field: a Python annotated module constant the draft declares is not flagged', () => {
+  const flags = checkGroundedValues(ufgDiff('RULE_TABLE: dict[str, bool] = {', 'NAME_LIST: Tuple[str, ...] = ("a", "b")'), UFG_UNRELATED);
+  assert.deepEqual(flags, []);
+});
+
+test('ungrounded-field: shell export/readonly/local declarations the draft adds are not flagged', () => {
+  const flags = checkGroundedValues(ufgDiff('export BACKUP_TARGET=/srv/b', 'readonly RETRY_LIMIT=3', 'local WORK_DIR_NAME=x'), UFG_UNRELATED);
+  assert.deepEqual(flags, []);
+});
+
+test('ungrounded-field: an annotated-looking dict entry, a kwarg and a comparison are still not declarations', () => {
+  assert.deepEqual(checkGroundedValues(ufgDiff('  "MADE_UP_KEY": value,'), UFG_UNRELATED).map((f) => f.detail), ['MADE_UP_KEY']);
+  assert.deepEqual(checkGroundedValues(ufgDiff('call(MADE_UP_ARG=3)'), UFG_UNRELATED).map((f) => f.detail), ['MADE_UP_ARG']);
+  assert.deepEqual(checkGroundedValues(ufgDiff('MADE_UP_CMP: x == y'), UFG_UNRELATED).map((f) => f.detail), ['MADE_UP_CMP']);
+});
+
+test('ungrounded-field: @NAME@ template placeholders on added lines are exempt, the same token in prose is not', () => {
+  assert.deepEqual(checkGroundedValues(ufgDiff('ExecStart=@APP_DIR@/backup.sh --to=@BACKUP_TO@'), UFG_UNRELATED), []);
+  const prose = ['The unit reads BACKUP_TO from the environment.', '', '=== DIFF ===', 'diff --git a/a b/a', '@@ -1 +1 @@', '+x'].join('\n');
+  assert.deepEqual(checkGroundedValues(prose, UFG_UNRELATED).map((f) => f.detail), ['BACKUP_TO']);
+});
+
+test('ungrounded-field: language and OS constants are exempt, a made-up config key is still flagged', () => {
+  const flags = checkGroundedValues(ufgDiff('DIR="$(dirname "${BASH_SOURCE[0]}")"', 'RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX', 'Environment=NODE_ENV=production', 'if (MADE_UP_LIMIT) {}'), UFG_UNRELATED);
+  assert.deepEqual(flags.map((f) => f.detail), ['MADE_UP_LIMIT']);
+});

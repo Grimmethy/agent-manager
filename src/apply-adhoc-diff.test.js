@@ -89,6 +89,47 @@ test('applyAdhocDiff returns {skipped} when task.rawDiff is empty, without touch
   assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v1\n');
 });
 
+test('applyAdhocDiff returns emptyDiff:true for an empty diff that is NOT no-changes-needed', () => {
+  const repoDir = makeRepo();
+  // rawDiff is empty, but adhocResolution is NOT 'no-changes-needed' -- this is the
+  // "agentic draft produced nothing" case HUB0306 targets. Must carry emptyDiff:true
+  // so applyTask can block a stacked hub child instead of silently marking it done.
+  const task = { id: 'apply-test-empty-diff', rawDiff: '', implementResponse: 'summary', adhocResolution: 'implemented' };
+
+  const result = applyAdhocDiff({ task, repoRoot: repoDir });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.emptyDiff, true, 'empty-diff flag must be present when the model did not claim no-changes-needed');
+  assert.match(result.reason, /adhoc agentic draft produced no diff/);
+  assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v1\n');
+});
+
+test('applyAdhocDiff does NOT set emptyDiff for adhocResolution === no-changes-needed', () => {
+  const repoDir = makeRepo();
+  const task = { id: 'apply-test-3', rawDiff: '', implementResponse: 'Already resolved, no change needed.', adhocResolution: 'no-changes-needed' };
+
+  const result = applyAdhocDiff({ task, repoRoot: repoDir });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.emptyDiff, undefined, 'emptyDiff must be absent for an explicit no-changes-needed model call');
+});
+
+test('applyAdhocDiff does NOT set emptyDiff for a decompose parent', () => {
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const task = {
+    id: 'apply-test-decompose-empty',
+    rawDiff: '',
+    adhocResolution: 'decompose',
+    subTaskProposals: [{ title: 'Piece one', rawText: 'First.' }],
+  };
+
+  const result = applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+
+  assert.equal(result.coordinating, true);
+  assert.equal(result.emptyDiff, undefined, 'emptyDiff must be absent for a decompose parent');
+});
+
 test('applyAdhocDiff applies a real diff whose hunk header line-count is wrong (regression: 2026-08-18 "corrupt patch" incident)', () => {
   // A plain `git apply` (no --recount) rejects a hunk whose "@@ -a,b +c,d @@" counts
   // don't match the actual hunk body as corrupt, even when the body itself is completely

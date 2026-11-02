@@ -815,3 +815,26 @@ test('extractDeclaredTargets: a file named as the deliverable or created in the 
   assert.ok(extractDeclaredTargets(t, plan).includes('scratch/extra.txt'));
   assert.ok(!extractDeclaredTargets(adhoc('Read src/a.js for context. Do not create src/b.js.'), '').some((p) => /src\/[ab]\.js/.test(p)), 'cited or prohibited files are not targets');
 });
+
+// 2026-11-02 stalled-task loop: a document-writing task whose descriptive sentences cite code (HUB0125 1/2, HUB0002 2/2) --------------------------------------
+const AUDIT_TASK = 'Create docs/audit-batch-write-bypass-2026-10-02.md. It must contain a markdown table with the exact columns file, function, write target, verdict, with a row for src/product-spec-to-hub.js / fileHub() (verdict CONFIRMED bypass). Include an explicit sentence stating the single-task throttle in task-sources.js does not cover batch fan-out.';
+
+test('docs-only: a task that creates one document and only CITES code in descriptive sentences is not blocked for a docs-only diff', () => {
+  const t = adhoc(AUDIT_TASK);
+  assert.equal(adhocDiffSubstanceProblem(t, createDiff('docs/audit-batch-write-bypass-2026-10-02.md')), null);
+});
+
+test('docs-only: the same task still blocks when the diff creates a different document than the one declared', () => {
+  const t = adhoc(AUDIT_TASK);
+  assert.equal(adhocDiffSubstanceProblem(t, createDiff('docs/something-else.md')).code, 'docs-only');
+});
+
+test('docs-only: a created-document task that also asks, in an imperative sentence, to change code in src/a.js still blocks a docs-only diff', () => {
+  const t = adhoc(`${AUDIT_TASK} Rename the helper in src/a.js.`);
+  assert.equal(adhocDiffSubstanceProblem(t, createDiff('docs/audit-batch-write-bypass-2026-10-02.md')).code, 'docs-only');
+});
+
+test('docs-only: a created-document task whose declared targets include a code file is not exempted', () => {
+  const t = adhoc(`${AUDIT_TASK}\nFiles: docs/audit-batch-write-bypass-2026-10-02.md, src/product-spec-to-hub.js`);
+  assert.equal(adhocDiffSubstanceProblem(t, createDiff('docs/audit-batch-write-bypass-2026-10-02.md')).code, 'docs-only');
+});
