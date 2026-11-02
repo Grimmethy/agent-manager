@@ -139,7 +139,8 @@ async function runDueProbes({ lanes, instancesDir, pipelineDir, env = process.en
   const modelOverrides = overrides !== undefined ? overrides : (env === process.env ? readWorkerModelOverrides() : {});
   for (const lane of lanes || []) {
     // A cloud lane has no tokens/s to judge (the gateway reports no eval_duration, so every probe would read as a failure) and each probe would be a billed call.
-    if (lane.cloud) continue;
+    // A script lane has no model at all (its work is a script handler): nothing to probe.
+    if (lane.cloud || lane.script) continue;
     const url = (lane.env && lane.env.OLLAMA_URL) || hostUrl;
     const model = effectiveLaneModel(lane, modelOverrides);
     if (!model || !laneIdleNow(instancesDir, lane.id, now)) continue;

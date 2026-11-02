@@ -489,6 +489,11 @@ while :; do
       start_singleton_bg "$PROACTIVE_LOCK" "${HOME_LOGS}/proactive-file-decompose-sweep.log" node "${_hygiene_src}/proactive-file-decompose-sweep.js"
     fi
 
+    # Plugin watchdog scripts (2026-11-02, ADR-0024 interim clock hook): every enabled plugins.json entry that declares "watchdogScripts" gets those scripts run
+    # once per tick, with a timeout and failure isolation, so a new plugin trigger needs no hardcoded block here. See scripts/run-plugin-watchdog-scripts.sh.
+    # AGENT_MANAGER_PLUGIN_WATCHDOG_SCRIPTS=off disables.
+    HOME_LOGS="$HOME_LOGS" PACKAGE_SRC_DIR="$PACKAGE_SRC_DIR" bash "${SCRIPT_DIR}/run-plugin-watchdog-scripts.sh"
+
     # merged-work-sweep (2026-09-18): wires verify-merged-work.js -- built 2026-09-16,
     # never previously called from anywhere -- into a periodic pass. Cheaply pre-filters
     # queue/done/ tasks claiming terminalDisposition:'merged' down to the ones whose
