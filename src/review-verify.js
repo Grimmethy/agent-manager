@@ -73,7 +73,7 @@ const escapeRegex = (t) => String(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 function extractChangedFiles(diff) {
   const files = [];
-  const re = /^diff --git a\/(\S+) b\/(\S+)$/gm;
+  const re = /^diff --git a\/(\S+) b\/(\S+)/gm;
   let m;
   while ((m = re.exec(String(diff || '')))) if (!files.includes(m[2])) files.push(m[2]);
   return files;
@@ -535,6 +535,78 @@ function checkFailsOnBase({ worktreeDir, rawDiff, suites, run, d, deadline, py, 
   return result;
 }
 
+// Tests pass on base: the diff's production change is not required for the tests to green. This is the inverse of checkFailsOnBase --
+// instead of "do the tests FAIL on the base?" it asks "do the tests PASS on the base?". If they do, the tests are not pinned to the
+// production change and could pass on the original code (or a refactor) without verifying the fix.
+// Returns { blockedTests: [...], ran: true } when the diff is not a refactor and tests pass on base, { advisoryTests: [...], ran: true }
+// when it is a refactor (informational only, never changes status), or { ran: false, reason } when the check cannot run.
+// Uses parseModifiedHunks to extract hunks, unapplyDiff to revert production changes, and runs the suites on the reverted tree.
+const TEST_PINNING_MIN_REMAINING_MS = 20000;
+
+function checkTestPinning({ worktreeDir, rawDiff, suites, run, d, deadline, py, repoRoot, isRefactor }) {
+  const skip = (reason) => ({ ran: false, reason });
+  const parts = splitDiffFiles(rawDiff);
+  const testParts = parts.filter((p) => isTestFile(p.file));
+  const prodParts = parts.filter((p) => !isTestFile(p.file));
+  if (!testParts.length) return skip('the diff adds no test');
+  if (!prodParts.length) return skip('the diff has no production change to revert');
+  if (deadline - Date.now() < TEST_PINNING_MIN_REMAINING_MS) return skip('not enough review budget left');
+  
+  // Build patch of production changes to revert
+  const prodPatch = prodParts.map((p) => p.text).join('');
+  const reverted = d.unapplyDiff(worktreeDir, prodPatch);
+  if (!reverted || !reverted.applied) return skip(`could not revert production changes (${String((reverted && reverted.reason) || 'unknown').slice(0, 120)})`);
+  
+  let result;
+  try {
+    const exec = (bin, args, timeoutMs, cwd) => run({ worktreeDir, bin, args, timeoutMs: Math.min(timeoutMs, deadline - Date.now()), pythonBin: py, mainRepoRoot: repoRoot, ...(cwd ? { cwd } : {}) });
+    
+    // Check that reverted code still parses
+    for (const p of prodParts) {
+      if (p.isDeleted || !/\.py|[cm]?js$/i.test(p.file)) continue;
+      const syn = p.file.endsWith('.py') ? exec('python', ['-m', 'py_compile', p.file], COMMAND_TIMEOUT_MS) : exec('node', ['--check', p.file], COMMAND_TIMEOUT_MS);
+      if (!syn || !syn.ran || syn.timedOut || syn.exitCode !== 0) { result = skip(`${p.file} does not parse with production changes reverted`); break; }
+    }
+    
+    if (!result) {
+      // Run test suites on reverted code
+      const touched = new Set(testParts.map((p) => p.file));
+      const runnable = (suites || []).map((s) => ({ s, files: s.files.filter((f) => touched.has(f)) })).filter((x) => x.files.length);
+      
+      if (!runnable.length) {
+        result = skip('no runner for the tests the diff touches');
+      } else {
+        let allPass = true;
+        const passedFiles = [];
+        for (const { s, files } of runnable) {
+          for (const file of files) {
+            const r = exec(s.bin, s.buildArgs([file]), TEST_TIMEOUT_MS, s.cwd);
+            if (!r || !r.ran || r.timedOut) { result = skip(`test ${file} could not run on reverted tree`); allPass = false; break; }
+            if (r.exitCode !== 0) { allPass = false; break; }
+            passedFiles.push(file);
+          }
+          if (!allPass) break;
+        }
+        
+        if (!result && allPass) {
+          // Tests pass on base - they're not pinned to the production change
+          result = {
+            ran: true,
+            blockedTests: isRefactor ? undefined : passedFiles,
+            advisoryTests: isRefactor ? passedFiles : undefined,
+          };
+        } else if (!result) {
+          result = { ran: true, blockedTests: [], advisoryTests: [] };
+        }
+      }
+    }
+  } finally {
+    const back = d.applyDiff(worktreeDir, prodPatch);
+    if (!back || !back.applied) return null;
+  }
+  return result;
+}
+
 // Two evidence tiers for the covering tests. PRIMARY = the test files the diff itself changes plus the co-located test of each changed
 // source file (foo.js -> foo.test.js, foo.py -> test_foo.py): they gate the verdict. DEPENDENTS = every other test that merely imports a
 // changed module (scoped-test-runner's reverse dependents): a module many tests import has a large, legitimate covering set, and one slow
@@ -916,5 +988,5 @@ module.exports = {
   pythonTestArgs, checkChangedFilesSyntax, splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
   verifyDiff, addedTestNames, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS,
-  checkFailsOnBase, splitDiffFiles,
+  checkFailsOnBase, splitDiffFiles, checkTestPinning,
 };
