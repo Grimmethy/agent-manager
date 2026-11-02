@@ -724,9 +724,15 @@ function executedVerificationBlockReason(ev) {
   for (const c of (ev.commands || []).filter((x) => x.outcome === 'contradicted')) {
     bits.push(`the draft claimed PASS for \`${c.command}\` but it exits ${c.exitCode}`);
   }
+  // Test pinning failures: the covering tests pass with the diff but also pass on the base,
+  // meaning the diff is unnecessary (or a refactor that does not change behavior).
+  if (ev.blockedTests && Array.isArray(ev.blockedTests) && ev.blockedTests.length) {
+    bits.push(`test pinning failed: the covering tests pass on the base without the diff (${ev.blockedTests.length} test(s) unverified)`);
+  }
   const tail = (ev.tests && ev.tests.passed === false && ev.tests.raw)
-    || ((ev.commands || []).find((c) => c.outcome === 'contradicted') || {}).detail || '';
-  return `Deterministic gate: executed verification failed -- the diff was applied in a scratch worktree and ${bits.join('; ') || (ev.reasons || []).join('; ')}.${tail ? ` Output tail: ${String(tail).trim().slice(-700)}` : ''} No local-model review call spent on a draft whose own tests or claimed checks demonstrably fail.`;
+    || ((ev.commands || []).find((c) => c.outcome === 'contradicted') || {}).detail
+    || (ev.blockedTests && ev.blockedTests[0] ? String(ev.blockedTests[0]).slice(-700) : '');
+  return `Deterministic gate: executed verification failed -- the diff was applied in a scratch worktree and ${bits.join('; ') || (ev.reasons || []).join('; ')}.${tail ? ` Output tail: ${tail}` : ''} No local-model review call spent on a draft whose own tests or claimed checks demonstrably fail.`;
 }
 
 // --- inert additions, as the voters see them (brain dump #1665) -------------------------------------------------------------------------------------
@@ -1514,6 +1520,22 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
         recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reproBlock });
         appendHistoryEvent(task, 'blocked', reproBlock);
         return { succeeded: true, verdict: 'blocked', blockedReason: reproBlock, blockedStage: 'review', factCheckVerdict };
+      }
+      // Test pinning check: if the covering tests pass on the base without the diff, the diff is unnecessary.
+      // Mode 'block' blocks; any other mode (default: advisory) downgrades to evidence for the voters.
+      if (ev.blockedTests && Array.isArray(ev.blockedTests) && ev.blockedTests.length) {
+        const pinningMode = process.env.AGENT_MANAGER_REVIEW_TEST_PINNING_MODE || 'advisory';
+        if (pinningMode === 'block') {
+          const reason = `Deterministic gate: test pinning failed -- the covering tests pass on the base (${ev.blockedTests.length} test(s) unverified), so the diff is unnecessary. Either the diff does not change behavior, or it is a refactor that should not be merged until the tests are pinned to the new behavior.`;
+          task.reviewProvider = 'deterministic-test-pinning';
+          recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+          appendHistoryEvent(task, 'blocked', reason);
+          return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+        } else {
+          // Advisory: add to the evidence set for the voters
+          task.testPinningAdvisory = ev.blockedTests;
+          appendHistoryEvent(task, 'advisory', `test pinning: ${ev.blockedTests.length} test(s) unverified (advisory, not blocking)`);
+        }
       }
       if (ev.status === 'failed') {
         const reason = executedVerificationBlockReason(ev);
