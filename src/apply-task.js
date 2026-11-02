@@ -485,6 +485,22 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       fs.unlinkSync(msgPath);
     }
 
+    // 2026-10-08 (HUB0245-3/4): post-apply validation -- confirm the committed tree
+    // matches rawDiff.files from the task definition. This catches accidental inclusion
+    // of unrelated changes (e.g. a stray editor scratch file, a leaked test fixture,
+    // or a Group-B function writing to the wrong path) before the branch is pushed.
+    // `git diff-tree --no-commit-id --name-only -r HEAD` lists every file the commit
+    // touched. Anything in that list that isn't in rawDiff.files is a violation -- the
+    // diff was supposed to be scoped, and the commit should reflect exactly that scope.
+    if (task.rawDiff && task.rawDiff.files) {
+      const expectedFiles = new Set(task.rawDiff.files);
+      const committedFiles = gitRunner.getCommittedFiles();
+      const unexpected = committedFiles.filter((f) => !expectedFiles.has(f));
+      if (unexpected.length) {
+        throw new Error(`Post-apply validation failed: unexpected files in committed tree: ${unexpected.join(', ')}`);
+      }
+    }
+
     if (commitsDirectlyToMain) {
       // Always pushes here, deliberately ignoring the global skipPush flag: unlike the
       // branch path below (where "commit locally, stop there" just leaves a harmless

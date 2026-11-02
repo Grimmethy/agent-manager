@@ -425,6 +425,20 @@ function createRealGitRunner(repoRoot) {
     pruneRetractedCandidates: () => require('./lib/prune-retracted-candidates.js').pruneRetractedCandidates({ repoRoot, git: run, mainRef: `origin/${mainBranch}` }),
     add: (files) => run(['add', ...files]),
     commit: (messageFilePath) => run(['commit', '-F', messageFilePath]),
+    // 2026-10-08 (HUB0245-3/4): return the set of files the HEAD commit touched, for
+    // post-apply validation (apply-task.js) to confirm the committed tree matches
+    // rawDiff.files and no unrelated changes leaked in. Uses `--no-commit-id` to suppress
+    // the SHA, `--name-only` for just paths, `-r` to list every file (not just root diffs),
+    // and `HEAD` to read the most recent commit. Empty string means no files (e.g. an
+    // empty commit, which shouldn't happen here but is handled gracefully).
+    getCommittedFiles: () => {
+      try {
+        const out = run(['diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD']).trim();
+        return out ? out.split('\n').filter(Boolean) : [];
+      } catch {
+        return [];
+      }
+    },
     push: (branchName) => run(['push', '-u', 'origin', branchName]),
     // 2026-09-24: closes the specific gap that produced two real incidents (a human
     // manually rescuing agent/triage-queue by hand on 2026-09-23, then four more identical
@@ -559,6 +573,13 @@ function createFakeGitRunner(opts = {}) {
     pruneRetractedCandidates: () => { record('pruneRetractedCandidates'); return { pruned: [], committed: false }; },
     add: (files) => record('add', files),
     commit: (messageFilePath) => record('commit', messageFilePath),
+    // 2026-10-08 (HUB0245-3/4): fake counterpart of real adapter's getCommittedFiles.
+    // Driven by opts.committedFiles (default empty) so a test can simulate a clean or
+    // dirty post-commit tree without a real git repo.
+    getCommittedFiles: () => {
+      record('getCommittedFiles');
+      return opts.committedFiles || [];
+    },
     push: (branchName) => record('push', branchName),
     // Mirrors the real adapter's retryPushAfterRebase (2026-09-24). Defaults to "the retry
     // doesn't help" so every existing push-failure test keeps its old behavior unchanged;
