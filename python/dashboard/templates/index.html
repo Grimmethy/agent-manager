@@ -33,7 +33,7 @@
      does, so a long tab list and a long #main page no longer share one page scroll. 53px is the
      header height both rules already assume. align-self:flex-start stops the flex row from
      stretching nav to #main's height (which would defeat the fixed height). */
-  nav { width: 200px; flex-shrink: 0; padding: 16px 0; border-right: 2px solid var(--border); height: calc(100vh - 53px); position: sticky; top: 53px; align-self: flex-start; overflow-y: auto; overscroll-behavior: contain; }
+  nav { width: 232px; flex-shrink: 0; padding: 16px 0; border-right: 2px solid var(--border); height: calc(100vh - 53px); position: sticky; top: 53px; align-self: flex-start; overflow-y: auto; overscroll-behavior: contain; }
   /* Chat panel (Brain Dump #153): a third flex sibling of nav/main, not a modal -- see
      app.py/chat_sessions.py for the backend. Collapsed state is a plain width/visibility
      toggle (localStorage-persisted, same convention nav-group expand/collapse already
@@ -60,6 +60,41 @@
   nav button { display: flex; justify-content: space-between; width: 100%; padding: 10px 20px; background: none; border: none; color: var(--text); text-align: left; cursor: pointer; font-size: 13px; }
   nav button:hover { background: var(--panel); }
   nav button.active { background: var(--panel); border-left: 3px solid var(--accent); color: var(--accent); }
+  /* Floating notch (nav-notch.js): a ball in a ring at the right edge of the active tab; it hops to the newly chosen tab. */
+  nav button { padding-right: 32px; }
+  /* Sidebar sections (nav-sections.js, renderNavSections in core-ui.js): a small label per section with a fold chevron, and a hairline that fades out at both ends between sections. */
+  :root { --border-strong: #5668a0; }
+  .nav-div { height: 1px; margin: 12px 8px; background: linear-gradient(90deg, transparent, var(--border-strong), transparent); }
+  nav button.nav-sh { display: flex; align-items: center; justify-content: flex-start; gap: 8px; padding: 6px 20px; font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  nav button.nav-sh:hover { background: none; color: var(--text); }
+  nav button.nav-sub-sh { padding-left: 32px; text-transform: none; letter-spacing: 0; font-weight: 500; }
+  .nav-sh .nav-sh-label { flex: 1; text-align: left; }
+  .nav-sh em { font-style: normal; font-variant-numeric: tabular-nums; letter-spacing: 0; color: var(--muted); }
+  .nav-chev { display: inline-flex; transition: transform .1s ease; }
+  .nav-chev.closed { transform: rotate(-90deg); }
+  /* Collapse button + icon rail (core-ui.js renderNavTop / renderNavRail): a round chevron button beside a "Collapse" pill; collapsed, the sidebar is a 72px strip of icons. */
+  :root { --accent-text: #0b0d12; }
+  .nav-top { display: flex; align-items: center; gap: 8px; padding: 0 12px 8px; }
+  nav button.nav-collapse-btn { width: 28px; height: 28px; padding: 0; flex: none; border: 2px solid var(--border-strong); border-radius: 50%; background: var(--bg); color: var(--text); display: grid; place-items: center; }
+  nav button.nav-collapse-btn:hover { background: var(--bg); border-color: var(--accent); color: var(--accent); }
+  nav button.nav-collapse-btn:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+  .nav-collapse-pill { font-size: 12px; font-weight: 600; line-height: 20px; padding: 2px 12px; border-radius: 999px; background: var(--accent); color: var(--accent-text); }
+  nav.nav-rail { width: 72px; }
+  nav.nav-rail .nav-top { justify-content: center; padding: 0 0 8px; }
+  nav.nav-rail .nav-div { margin: 8px 12px; }
+  nav.nav-rail button.rail-btn { position: relative; justify-content: center; width: 100%; padding: 8px 0; border-left: 3px solid transparent; }
+  nav.nav-rail button.rail-btn.active { background: var(--accent); color: var(--accent-text); border-left-color: transparent; }
+  .rail-glyph { font-size: 18px; line-height: 24px; }
+  nav.nav-rail button.rail-section .rail-glyph { font-size: 12px; font-weight: 600; letter-spacing: .06em; color: var(--muted); }
+  nav.nav-rail .status-dot { position: absolute; top: 6px; right: 14px; }
+  nav.nav-rail .nav-notch { display: none; }
+  nav { transition: width .15s ease; }
+  @media (prefers-reduced-motion: reduce) { nav { transition: none; } }
+  .nav-here { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
+  @media (prefers-reduced-motion: reduce) { .nav-chev { transition: none; } }
+  .nav-notch { position: absolute; top: 0; left: calc(100% - 16px); width: 12px; height: 12px; pointer-events: none; will-change: transform; }
+  .nav-notch::before { content: ''; position: absolute; inset: -4px; border: 2px solid var(--border); border-radius: 50%; background: var(--bg); }
+  .nav-notch-ball { position: absolute; inset: 0; border-radius: 50%; background: var(--accent); }
   nav .count { color: var(--muted); font-variant-numeric: tabular-nums; }
   /* min-width:0 lets main shrink below its content (a flex item's default min-width:auto kept it at its widest child, so nav + main + the 380px
      sidebar summed past the window and the whole page scrolled sideways, clipping the sidebar's right edge); overflow-x:auto scrolls wide content
@@ -101,6 +136,19 @@
   .recent-tasks-list li { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-top: 1px solid var(--border); }
   .recent-tasks-list li:first-child { border-top: none; }
   .empty { color: var(--muted); padding: 30px; text-align: center; }
+  /* Skeleton shimmer (skeleton.js): shown while a tab loads. A soft light band sweeps left to right every 1.4 s; reduced motion keeps the shapes still. */
+  .skeleton { padding: 8px 0; position: relative; }
+  .skeleton-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .skeleton-caption { color: var(--muted); margin: 0 0 16px; }
+  .skeleton-title, .skeleton-block, .skeleton-line { position: relative; overflow: hidden; background: var(--panel); border-radius: 6px; display: block; }
+  .skeleton-title { height: 24px; width: 28%; margin-bottom: 20px; }
+  .skeleton-row { display: flex; gap: 16px; padding: 16px; margin-bottom: 12px; border: 2px solid var(--border); border-radius: 10px; }
+  .skeleton-block { width: 48px; height: 48px; flex: none; }
+  .skeleton-lines { flex: 1; display: flex; flex-direction: column; gap: 12px; justify-content: center; }
+  .skeleton-line { height: 12px; }
+  .skeleton-title::after, .skeleton-block::after, .skeleton-line::after { content: ''; position: absolute; inset: 0; transform: translateX(-100%); background: linear-gradient(90deg, transparent, rgba(255,255,255,.09), transparent); animation: skeleton-sweep 1.4s linear infinite; }
+  @keyframes skeleton-sweep { to { transform: translateX(100%); } }
+  @media (prefers-reduced-motion: reduce) { .skeleton-title::after, .skeleton-block::after, .skeleton-line::after { animation: none; } }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   tr.top-row td:first-child { border-left: 2px solid var(--ok); }
@@ -245,6 +293,7 @@
     nav { width: 100%; height: auto; position: static; overflow-y: visible; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); display: flex; overflow-x: auto; padding: 6px 8px; -webkit-overflow-scrolling: touch; }
     nav button { width: auto; white-space: nowrap; padding: 8px 12px; }
     nav button.active { border-left: none; border-bottom: 3px solid var(--accent); }
+    .nav-notch { display: none; }
     main { padding: 12px; overflow-x: auto; }
     table { min-width: 560px; }
     .plugin-sidebar { position: fixed; left: 0; right: 0; bottom: 0; top: auto; width: 100%; height: 65vh; border-left: none; border-top: 2px solid var(--border); z-index: 15; }
@@ -287,6 +336,8 @@
 </div>
 
 <script src="{{ url_for('static', filename='js/core-ui.js') }}"></script>
+<script src="/static/js/nav-notch.js"></script>
+<script src="/static/js/nav-sections.js"></script>
 <script src="/static/js/queue-tab.js"></script>
 <script src="/static/js/plugins-tab.js"></script>
 <script src="/static/js/workers-tab.js"></script>
@@ -300,6 +351,7 @@
 <script src="/static/js/task-detail-modal.js"></script>
 <script src="/static/js/branch-verdicts.js"></script>
 <script src="/static/js/branch-projects.js"></script>
+<script src="/static/js/skeleton.js"></script>
 <script src="/static/js/branches-joblist-hardware-tabs.js"></script>
 <script src="/static/js/project-tab.js"></script>
 <script src="/static/js/brain-dump-chips.js"></script>

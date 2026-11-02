@@ -319,7 +319,15 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
     const reason = task && task.adhocResolution === 'no-changes-needed'
       ? `no code change needed: ${(task.implementResponse || '').slice(0, 300)}`
       : 'adhoc agentic draft produced no diff';
-    return { skipped: true, reason };
+    // HUB0306 1/2: flag the caller (applyTask) so a stacked hub child with no diff
+    // can be blocked from succeeding instead of silently marked done. NOT set for
+    // `no-changes-needed` (that is an explicit model call, not a no-diff artifact) and
+    // NOT set for decompose parents (handled earlier, returns a coordinator plan).
+    const artifact = { skipped: true, reason };
+    if (task && task.adhocResolution !== 'no-changes-needed') {
+      artifact.emptyDiff = true;
+    }
+    return artifact;
   }
 
   const patchPath = path.join(os.tmpdir(), `adhoc-apply-${task.id}-${process.pid}.patch`);

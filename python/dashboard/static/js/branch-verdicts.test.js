@@ -9,10 +9,8 @@ const { branchVerdictKey, branchVerdictBorderStyle, branchVerdictBadgeHtml, bran
 
 const B = (verdict, extra = {}) => ({ branch: 'agent/x', verdict, reasons: ['r1', 'r2'], source: 'manual', stale: false, ...extra });
 
-test('hold: its own blue border, badge and filter bucket, distinct from needs-work', () => {
+test('hold: its own badge and filter bucket, distinct from needs-work', () => {
   assert.equal(branchVerdictKey(B('hold')), 'hold');
-  assert.match(branchVerdictBorderStyle(B('hold')), /var\(--accent\)/);
-  assert.doesNotMatch(branchVerdictBorderStyle(B('hold')), /var\(--warn\)/);
   assert.match(branchVerdictBadgeHtml(B('hold')), /class="badge hold" data-verdict="hold"/);
   assert.equal(branchVerdictKey(B('hold', { stale: true })), 'unverified');
   const list = [B('needs-work'), B('hold'), B('hold'), B('merge')];
@@ -21,17 +19,19 @@ test('hold: its own blue border, badge and filter bucket, distinct from needs-wo
   assert.match(branchVerdictFilterBarHtml(list, 'all'), /Hold \(2\)/);
 });
 
-test('border color: green merge, yellow needs-work, red discard, grey unverified', () => {
-  assert.match(branchVerdictBorderStyle(B('merge')), /var\(--ok\)/);
-  assert.match(branchVerdictBorderStyle(B('needs-work')), /var\(--warn\)/);
-  assert.match(branchVerdictBorderStyle(B('discard')), /var\(--bad\)/);
-  assert.match(branchVerdictBorderStyle(B(null)), /var\(--muted\)/);
+test('the card border is the shared blue for every verdict: the verdict shows in the badge, not the border', () => {
+  for (const v of ['merge', 'needs-work', 'hold', 'discard', null]) assert.equal(branchVerdictBorderStyle(B(v)), '', String(v));
+  assert.equal(branchVerdictBorderStyle(B('merge', { stale: true })), '');
+  assert.equal(branchVerdictBorderStyle(), '');
+  assert.match(branchVerdictBadgeHtml(B('merge')), /class="badge ok" data-verdict="merge"/);
+  assert.match(branchVerdictBadgeHtml(B('needs-work')), /class="badge warn" data-verdict="needs-work"/);
+  assert.match(branchVerdictBadgeHtml(B('discard')), /class="badge bad" data-verdict="discard"/);
+  assert.match(branchVerdictBadgeHtml(B(null)), /class="badge idle" data-verdict="unverified"/);
 });
 
 test('a stale verdict is grey/unverified and shows the older-commit note', () => {
   const b = B(null, { stale: true, reasons: ['verdict is for an older commit'] });
   assert.equal(branchVerdictKey(b), 'unverified');
-  assert.match(branchVerdictBorderStyle(b), /var\(--muted\)/);
   assert.match(branchVerdictBadgeHtml(b), /verdict is for an older commit/);
 });
 
