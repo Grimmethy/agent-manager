@@ -65,6 +65,18 @@ test('ungrounded-field-own-declarations-and-platform-constants: re-admits only w
   assert.equal(e.applies({}), false);
 });
 
+// --- agentic-empty-forced-summary-parked-as-design-question (2026-11-02) ----------------------------------------------------------------------
+test('agentic-empty-forced-summary-parked-as-design-question: re-admits only a task whose sole question is the ran-out-of-turns placeholder', () => {
+  const e = KNOWN_FIXED.find((x) => x.id === 'agentic-empty-forced-summary-parked-as-design-question');
+  assert.ok(e, 'entry registered');
+  assert.deepEqual(e.dirs, ['needs-clarification']);
+  const placeholder = '(the agentic implement pass ran out of turns before reaching a conclusion; see its recorded tool activity for what it had investigated)';
+  assert.equal(e.applies({ needsClarification: { reason: 'design-decision', openQuestions: placeholder } }), true);
+  assert.equal(e.applies({ needsClarification: { reason: 'design-decision', openQuestions: 'Should the gate call Stripe live, or stub it?' } }), false, 'a real question stays with the human');
+  assert.equal(e.applies({ needsClarification: { openQuestions: `Which DB?\n${placeholder}` } }), false, 'the placeholder must be the whole question');
+  assert.equal(e.applies({}), false);
+});
+
 // --- lane-endpoint-outage-parked (2026-10-23) -----------------------------------------------------------------------------------------------
 
 test('lane-endpoint-outage-parked: re-admits a task parked on an unreachable or silent lane endpoint only while that endpoint answers', () => {

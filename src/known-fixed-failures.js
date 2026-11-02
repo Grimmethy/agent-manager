@@ -315,6 +315,20 @@ const KNOWN_FIXED = [
     },
   },
   {
+    // 2026-11-02 (stalled-task loop): an agentic implement pass that ran out of turns with an EMPTY forced final turn was parked as a 'design-decision' whose only question is the
+    // placeholder below (40 tasks, 31 premium). agentic-draft-common.js now routes that to a continuation / budget-exhaustion block (decompose-eligible) instead. Re-admits a task
+    // parked on exactly that placeholder, once; a task with a real question keeps waiting for a human.
+    id: 'agentic-empty-forced-summary-parked-as-design-question',
+    fixedIn: 'agent-manager (agentic-draft-common: an empty forced summary after edits is budget exhaustion, not a design question, 2026-11-02)',
+    description: 'a task parked in needs-clarification with only the "ran out of turns before reaching a conclusion" placeholder as its question',
+    dirs: ['needs-clarification'],
+    applies: (task) => {
+      const nc = (task && task.needsClarification) || {};
+      const q = String(nc.openQuestions || '').trim();
+      return /^\(the agentic implement pass ran out of turns before reaching a conclusion; see its recorded tool activity/.test(q);
+    },
+  },
+  {
     // 2026-10-23 (Grimmethy: the rx580 lane sat idle 12 h after grimm hard-reset; "this is a recurring event"): with the lane's Ollama endpoint down, every draft failed
     // identically, burned the infra requeue rounds and parked the task in blocked/. scripts/local-worker.sh now claims nothing while its endpoint is down (the circuit
     // breaker), so this cannot happen again; this requeues, once, the tasks parked before it existed, and only when the endpoint they name answers now.
