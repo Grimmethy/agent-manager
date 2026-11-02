@@ -10,13 +10,13 @@ function buildUnslottedRows(plugins) {
     const enabled = p.enabled !== false;
     return `
       <div style="display:flex; align-items:flex-start; gap:12px; padding:12px 16px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
-        <label style="display:flex; align-items:center; gap:8px; margin-top:2px; cursor:pointer;">
+        <label style="display:flex; align-items:center; gap:8px; margin-top:4px; cursor:pointer;">
           <input type="checkbox" class="plugin-toggle" data-name="${escapeAttr(p.name)}" ${enabled ? 'checked' : ''}>
         </label>
         <div style="flex:1; min-width:0;">
-          <div style="font-weight:600;">${escapeHtml(p.name)} ${enabled ? '' : '<span class="badge idle" style="margin-left:6px;">disabled</span>'}</div>
-          ${p.description ? `<div class="meta" style="margin-top:2px;">${escapeHtml(p.description)}</div>` : ''}
-          <div class="meta" style="margin-top:4px; word-break:break-all; font-family:monospace; font-size:11px; color:var(--muted);">${escapeHtml(p.registerPath || '(no path)')}</div>
+          <div style="font-weight:600;">${escapeHtml(p.name)} ${enabled ? '' : '<span class="badge idle" style="margin-left:8px;">disabled</span>'}</div>
+          ${p.description ? `<div class="meta" style="margin-top:4px;">${escapeHtml(p.description)}</div>` : ''}
+          <div class="meta" style="margin-top:4px; word-break:break-all; font-family:monospace; font-size:12px; color:var(--muted);">${escapeHtml(p.registerPath || '(no path)')}</div>
         </div>
       </div>`;
   }).join('');
@@ -34,28 +34,28 @@ function buildSlotSections(slottedPlugins) {
         <span>None (stop monitoring)</span>
       </label>`, ...members.map((m) => {
       const badge = m.running
-        ? '<span class="badge ok" style="margin-left:6px;">running</span>'
-        : '<span class="badge idle" style="margin-left:6px;">stopped</span>';
+        ? '<span class="badge ok" style="margin-left:8px;">running</span>'
+        : '<span class="badge idle" style="margin-left:8px;">stopped</span>';
       return `
       <label style="display:flex; align-items:flex-start; gap:8px; padding:8px 12px; cursor:pointer;">
-        <input type="radio" name="${escapeAttr(radioName)}" class="slot-radio" data-slot="${escapeAttr(slot)}" value="${escapeAttr(m.name)}" ${m.active ? 'checked' : ''} style="margin-top:2px;">
+        <input type="radio" name="${escapeAttr(radioName)}" class="slot-radio" data-slot="${escapeAttr(slot)}" value="${escapeAttr(m.name)}" ${m.active ? 'checked' : ''} style="margin-top:4px;">
         <span>
           <div style="font-weight:600;">${escapeHtml(m.name)}${badge}</div>
-          ${m.description ? `<div class="meta" style="margin-top:2px;">${escapeHtml(m.description)}</div>` : ''}
+          ${m.description ? `<div class="meta" style="margin-top:4px;">${escapeHtml(m.description)}</div>` : ''}
         </span>
       </label>`;
     })];
     return `
       <div style="padding:12px 16px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
-        <div class="field-label" style="margin-bottom:6px;">${escapeHtml(slot)} source</div>
-        <div style="display:flex; flex-direction:column; gap:2px;" id="slot-group-${escapeAttr(slot)}">${options.join('')}</div>
+        <div class="field-label" style="margin-bottom:8px;">${escapeHtml(slot)} source</div>
+        <div style="display:flex; flex-direction:column; gap:4px;" id="slot-group-${escapeAttr(slot)}">${options.join('')}</div>
         <div class="meta slot-status" style="margin-top:6px;"></div>
       </div>`;
   }).join('');
 }
 
 function buildAddPluginForm() {
-  return `<h3 style="margin-top:22px;">Add a plugin</h3>
+  return `<h3 style="margin-top:24px;">Add a plugin</h3>
     <div style="display:flex; flex-direction:column; gap:8px; max-width:640px;">
       <input type="text" id="plugin-add-path" placeholder="Absolute path to the plugin's register.js (e.g. /media/model-cache/github/agent-manager-imagegen/register.js)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
       <input type="text" id="plugin-add-name" placeholder="Name (optional -- defaults to the plugin folder name)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
@@ -186,19 +186,19 @@ async function renderMarketplace(main) {
       if (installed && updateAvail) {
         controlHtml = '<button class="action" data-mkt-action="update" data-id="' + escapeAttr(p.id) + '">Update</button>';
       } else if (installed) {
-        controlHtml = '<span class="badge ok" style="margin-top:2px;">Installed</span>';
+        controlHtml = '<span class="badge ok" style="margin-top:4px;">Installed</span>';
       } else {
         const isPaid = p.pricing && p.pricing.model && p.pricing.model !== 'free';
         const paidStyle = isPaid ? ' style="opacity:0.7; border-style:dashed;" title="Paid plugin -- requires a license"' : '';
         controlHtml = '<button class="action" data-mkt-action="install" data-id="' + escapeAttr(p.id) + '"' + paidStyle + '>Install</button>';
       }
       const versionLine = p.installedVersion
-        ? '<div class="meta" style="margin-top:2px; font-size:11px;">Installed: ' + escapeHtml(p.installedVersion) + (updateAvail ? ' <span class="badge idle" style="margin-left:4px;">update available</span>' : '') + '</div>'
+        ? '<div class="meta" style="margin-top:4px; font-size:12px;">Installed: ' + escapeHtml(p.installedVersion) + (updateAvail ? ' <span class="badge idle" style="margin-left:4px;">update available</span>' : '') + '</div>'
         : '';
       return '<div style="display:flex; align-items:flex-start; gap:12px; padding:12px 16px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">'
         + '<div style="flex:1; min-width:0;">'
         + '<div style="font-weight:600;">' + escapeHtml(p.name) + (priceText ? ' <span class="meta" style="margin-left:8px;">' + priceText + '</span>' : '') + '</div>'
-        + '<div class="meta" style="margin-top:2px;">' + escapeHtml(p.summary || '') + '</div>'
+        + '<div class="meta" style="margin-top:4px;">' + escapeHtml(p.summary || '') + '</div>'
         + versionLine
         + '</div>'
         + '<div style="white-space:nowrap;">' + controlHtml + '</div>'
@@ -257,7 +257,7 @@ async function renderPluginsTab() {
   main.innerHTML = `
     <h2 style="margin-top:0;">Plugins</h2>
     ${slotSections}
-    <div class="meta" style="margin-bottom:14px;">
+    <div class="meta" style="margin-bottom:16px;">
       Only enabled plugins register their task sources. A change here restarts the pipeline if it is running so an
       in-flight draft for a now-disabled source can't stall. Manifest: <span style="font-family:monospace;">${escapeHtml(data.manifestPath || 'plugins.json')}</span>
     </div>
@@ -265,7 +265,7 @@ async function renderPluginsTab() {
 
     ${buildAddPluginForm()}
 
-    <h3 style="margin-top:22px;">Available plugins</h3>
+    <h3 style="margin-top:24px;">Available plugins</h3>
     <div id="marketplace-note" class="meta" style="margin-bottom:10px;"></div>
     <div id="marketplace-list"><div class="meta">Loading...</div></div>`;
 

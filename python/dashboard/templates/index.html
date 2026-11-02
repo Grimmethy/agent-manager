@@ -189,7 +189,7 @@
      too much text for the models list's nowrap chip layout, so each case gets its own
      wrapping block row instead. */
   .bench-category-group .benchmark-check { display: block; white-space: normal; margin-top: 3px; }
-  .bench-case-stats { color: var(--muted); font-size: 11px; margin-left: 6px; }
+  .bench-case-stats { color: var(--muted); font-size: 12px; margin-left: 8px; }
   .ok-text { color: var(--ok); }
   .bad-text { color: var(--bad); }
   /* Reasoning benchmark radar chart: the Responses table (the run's test prompts) sits on
@@ -222,19 +222,19 @@
   .da-outcome-succeeded { color: var(--good, #4caf50); }
   .da-tier { font-size: 12px; padding: 4px 0; border-top: 1px dashed var(--border); margin-top: 6px; }
   .da-tier-name { font-family: monospace; font-weight: 600; }
-  .da-tools { font-size: 11px; color: var(--muted); font-family: monospace; }
+  .da-tools { font-size: 12px; color: var(--muted); font-family: monospace; }
   .draft-attempt pre { max-height: 260px; }
   /* Work Log: full per-tier tool transcript (task._workLog, src/work-log.js) for auditing. */
   .work-log { border: 2px solid var(--border); border-radius: 6px; margin-top: 6px; padding: 0 10px; }
   .work-log > summary { cursor: pointer; padding: 8px 0; font-weight: 600; list-style-position: inside; }
   .work-log[open] > summary { border-bottom: 1px solid var(--border); margin-bottom: 6px; }
   .wl-tier { border-top: 1px dashed var(--border); margin-top: 6px; padding-top: 4px; }
-  .wl-call { font-family: monospace; font-size: 11px; padding: 2px 0; line-height: 1.5; }
+  .wl-call { font-family: monospace; font-size: 12px; padding: 4px 0; line-height: 1.5; }
   .wl-call > summary { cursor: pointer; }
   .wl-call.wl-err { color: var(--bad); }
   .wl-n { color: var(--muted); }
   .wl-tool { font-weight: 600; }
-  .work-log pre { max-height: 220px; font-size: 11px; }
+  .work-log pre { max-height: 220px; font-size: 12px; }
   /* Base state (Ornith) also gets its own look, not just the Claude state -- previously
      only .provider-toggle-claude had a distinct color, so the default Ornith state was
      visually identical to a plain .secondary button (Discuss/Edit/Delete), which is how
@@ -262,11 +262,11 @@
   .browser-crumb { color: var(--muted); font-size: 12px; margin-bottom: 8px; word-break: break-all; }
   .browser-crumb .crumb-link { color: var(--link); cursor: pointer; }
   .browser-crumb .crumb-link:hover { text-decoration: underline; }
-  .browser-entry { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-radius: 4px; cursor: pointer; }
+  .browser-entry { display: flex; justify-content: space-between; align-items: center; padding: 8px; border-radius: 4px; cursor: pointer; }
   .browser-entry:hover { background: var(--bg); }
-  .browser-entry .git-badge { font-size: 10px; color: var(--ok); border: 1px solid var(--ok); padding: 1px 6px; border-radius: 8px; }
-  .browser-entry .entry-count { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-  .browser-entry .set-active-project, .browser-entry .create-github-project { font-size: 11px; padding: 3px 9px; }
+  .browser-entry .git-badge { font-size: 12px; color: var(--ok); border: 1px solid var(--ok); padding: 0 8px; line-height: 16px; border-radius: 8px; }
+  .browser-entry .entry-count { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .browser-entry .set-active-project, .browser-entry .create-github-project { font-size: 12px; padding: 4px 8px; }
   .stat-row { display: flex; gap: 24px; margin: 16px 0; }
   .stat { color: var(--muted); font-size: 12px; }
   .stat strong { color: var(--text); font-size: 16px; display: block; }
@@ -300,7 +300,7 @@
   .bd-entry a.jump { color: var(--link); font-size: 12px; text-decoration: none; }
   .note-content { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 12px; font-size: 13px; max-height: 500px; overflow-y: auto; font-family: monospace; }
   .grill-transcript { max-height: 360px; overflow-y: auto; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 10px; }
-  .grill-msg-role { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .grill-msg-role { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
   .grill-msg-assistant .grill-msg-role { color: var(--accent); }
   .grill-msg-text { font-size: 13px; white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
   /* 2026-09-01 (Grimmethy: "each thinking segment to include a full blank line space
@@ -310,7 +310,7 @@
      blank-line gap between it and the next segment. */
   .grill-msg-text p { margin: 0 0 1em 0; }
   .grill-msg-text p:last-child { margin-bottom: 0; }
-  .grill-seg-ts { display: inline-block; font-size: 10px; font-variant-numeric: tabular-nums; color: var(--muted); margin-right: 0.5em; }
+  .grill-seg-ts { display: inline-block; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); margin-right: 0.5em; }
   .grill-msg-user { align-self: flex-end; max-width: 85%; }
   .grill-msg-user .grill-msg-role { text-align: right; }
   .grill-msg-user .grill-msg-text { background: var(--panel); border-radius: 6px; padding: 6px 10px; }

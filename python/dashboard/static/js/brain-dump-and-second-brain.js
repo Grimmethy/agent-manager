@@ -40,7 +40,7 @@ function renderBrainDumpShell() {
       <div>
         <div class="field-label" style="display:flex; justify-content:space-between; align-items:center;">
           <span>Second Brain</span>
-          <button class="secondary" id="bd-sync-github-btn" style="text-transform:none; letter-spacing:normal; font-size:12px; padding:4px 10px;" title="Scan GitHub for your repos and create Second Brain notes for any that aren't linked yet">Sync GitHub Projects</button>
+          <button class="secondary" id="bd-sync-github-btn" style="text-transform:none; letter-spacing:normal; font-size:12px; padding:4px 12px;" title="Scan GitHub for your repos and create Second Brain notes for any that aren't linked yet">Sync GitHub Projects</button>
         </div>
         <div class="browser-panel" id="bd-browser" style="max-height:220px"><div class="empty">Loading...</div></div>
         <div id="bd-file-panel"></div>

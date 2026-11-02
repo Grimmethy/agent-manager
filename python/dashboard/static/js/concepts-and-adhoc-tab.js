@@ -33,7 +33,7 @@ async function renderAdhocTasksTab() {
       <td>${escapeHtml(when)}</td>
     </tr>`;
   }).join('');
-  const footer = `<div class="meta" style="padding:10px 4px">Showing ${tasks.length} adhoc task${tasks.length === 1 ? '' : 's'}.</div>`;
+  const footer = `<div class="meta" style="padding:12px 4px">Showing ${tasks.length} adhoc task${tasks.length === 1 ? '' : 's'}.</div>`;
   main.innerHTML = `<table><thead><tr><th>Title</th><th>State</th><th>Created</th></tr></thead><tbody>${rows}</tbody></table>${footer}`;
   main.querySelectorAll('tr.clickable').forEach(row => {
     row.onclick = () => openTaskAnywhere(row.dataset.id);
