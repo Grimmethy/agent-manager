@@ -290,3 +290,32 @@ test('a path that exists is never blocked and the stacked-branch rescue still wo
   assert.equal(isDeclaredCreateTarget('x', 'Docs/SERVICE.md', `${task.title}\n${task.promptContext.rawText}`), true);
 });
 
+
+// 2026-11-02 (stalled-task loop: HUB0259-01 "Add src/tool-loop-guard.test.js with tests", HUB0273-01 "src/chat-tool-gate.test.js once it exists").
+test('"Add <path> with tests" in the task text makes a missing test file a create target, end to end through planTargetGuard', () => {
+  const repo = tmpRepo();
+  const task = {
+    title: 'HUB0259 · 1/2 · Create src/tool-loop-guard.js module with tests',
+    promptContext: { rawText: 'Add src/tool-loop-guard.test.js with tests for every layer, polling detection, escalation, and option overrides.' },
+  };
+  const plan = '1. Write the module.\n2. Edit `src/tool-loop-guard.test.js` with the cases.';
+  assert.equal(planTargetGuard(task, plan, repo, ['src']).blocked, false);
+  assert.equal(isDeclaredCreateTarget(plan, 'src/tool-loop-guard.test.js', task.promptContext.rawText), true);
+});
+
+test('"Add a summary ..., then edit <path>" does not exempt a fabricated edit target', () => {
+  const body = 'Add a summary of the problem first, then edit src/invented.js.';
+  assert.equal(isDeclaredCreateTarget(THIN_PLAN, 'src/invented.js', body), false);
+});
+
+test('"<path> once it exists" after the path in the task text declares a create target; the phrase elsewhere does not', () => {
+  const body = 'Run this piece\'s test file and then src/local-tool-client.test.js (and src/chat-tool-gate.test.js once it exists), report the pass counts.';
+  assert.equal(isDeclaredCreateTarget('x', 'src/chat-tool-gate.test.js', body), true);
+  assert.equal(isDeclaredCreateTarget('x', 'src/local-tool-client.test.js', body), false, 'a different path in the same sentence is not exempted');
+  assert.equal(isDeclaredCreateTarget('x', 'src/invented.js', 'Edit src/invented.js now. Much later the helper is added once it exists elsewhere.'), false);
+});
+
+test('plan text "<path> ... once it exists" counts as the existence acknowledgement', () => {
+  assert.equal(isDeclaredCreateTarget('Also run `src/new.test.js` once it exists.', 'src/new.test.js'), true);
+  assert.equal(isDeclaredCreateTarget('Run it once it is created: `src/new.test.js`.', 'src/new.test.js'), true);
+});
