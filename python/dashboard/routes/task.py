@@ -117,10 +117,11 @@ def api_task_archive(state, task_id):
     down an anchor for. 'awaiting-confirm' included the same day, same reasoning -- DENYING
     a delete-containing batch (the awaiting-confirm gate's own opposite of /confirm below)
     is exactly this action too: give up on it rather than let it apply."""
-    from app import _archive_task_file, _stamp_manual_archive, queue_dir
+    from app import _archive_task_file, _stamp_manual_archive
     if state not in ("blocked", "done", "needs-clarification", "awaiting-confirm"):
         abort(400, description="only a blocked, done, needs-clarification, or awaiting-confirm task can be archived")
-    qdir = queue_dir()
+    body = request.get_json(silent=True) or {}
+    qdir, _scope = _qdir_for_request(body)   # ?project=<repoRoot> archives in that registered project's queue (2026-11-02, cross-project workers)
     if not qdir:
         abort(404)
     src = qdir / state / f"{task_id}.json"
@@ -129,7 +130,6 @@ def api_task_archive(state, task_id):
     dest = qdir / "done" / "_archived_no_action" / src.name
     if dest.exists():
         abort(409, description=f"an archived copy of '{src.stem}' already exists")
-    body = request.get_json(silent=True) or {}
     # Record what this archive MEANS before moving it (see _stamp_manual_archive): without a disposition the task is
     # "unclassified" forever and silently blocks anything that dependsOn it.
     stamped = _stamp_manual_archive(src, state, body.get("reason"))
@@ -519,10 +519,10 @@ def api_task_requeue(state, task_id):
     archive pass moved there is just as "archived" and must be just as requeueable as one a
     human moved to _archived_no_action/ by hand; see done-archive.js's own header on the
     same "always reversible" promise this endpoint already exists to uphold."""
-    from app import _record_manual_requeue, _repeated_blocker_match, get_active_repo_root, logger, queue_dir, read_json_safe
+    from app import _record_manual_requeue, _repeated_blocker_match, get_active_repo_root, logger, read_json_safe
     if state not in ("blocked", "needs-clarification", "done", "archived"):
         abort(400, description="only a blocked, needs-clarification, done, or archived task can be requeued")
-    qdir = queue_dir()
+    qdir, scope = _qdir_for_request(request.get_json(silent=True) or {})   # ?project=<repoRoot>: that registered project's queue, repo and pipeline
     if not qdir:
         abort(404)
     if state == "archived":
@@ -595,7 +595,7 @@ def api_task_requeue(state, task_id):
             })
         elif applied_branch:
             from app import _invalidate_branch_cache, _run_git
-            repo_root = get_active_repo_root()
+            repo_root = scope["repoPath"] if scope else get_active_repo_root()
             repo_root = Path(repo_root) if repo_root else None
             if repo_root:
                 try:
@@ -611,7 +611,11 @@ def api_task_requeue(state, task_id):
                         "Non-fatal: could not delete superseded branch %r for requeued task %r: %s",
                         applied_branch, task_id, e,
                     )
-                _invalidate_branch_cache()
+                if scope:
+                    import branch_projects
+                    branch_projects.after_action(scope)
+                else:
+                    _invalidate_branch_cache()
             abandon_iso = datetime.now(timezone.utc).isoformat()
             abandon_detail = f"superseded by a manual requeue from {state}/; prior branch {applied_branch} deleted"
             data.setdefault("history", []).append({
@@ -679,7 +683,8 @@ def api_task_requeue(state, task_id):
         fresh["noDecompose"] = data["noDecompose"]
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
-    _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual")
+    _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual",
+                           pipeline_dir=scope["pipelineDir"] if scope else None)
     return jsonify({"id": task_id, "requeued": True})
 
 
