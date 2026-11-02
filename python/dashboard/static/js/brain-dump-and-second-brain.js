@@ -465,7 +465,7 @@ function renderBrainDumpCard(entry) {
   // common case and needs no extra UI); raisedByBadge marks a machine-raised entry so it
   // reads differently from a human-typed note at a glance.
   const countChip = entry.count > 1
-    ? `<span title="${escapeAttr(`Seen ${entry.count} times${(entry.seenIn || []).length ? ' -- tasks: ' + entry.seenIn.join(', ') : ''}`)}" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--warn);border-radius:3px;color:var(--warn);font-size:11px">🔁 seen ${entry.count}&times;</span>`
+    ? `<span title="${escapeAttr(`Seen ${entry.count} times${(entry.seenIn || []).length ? ' -- tasks: ' + entry.seenIn.join(', ') : ''}`)}" class="chip chip-warn">🔁 seen ${entry.count}&times;</span>`
     : '';
   // 2026-09-05, Grimmethy (reading the first real finding, #208, which had no taskId at
   // all): "Make sure the brain dumps provide enough context. A link to the task that
@@ -476,8 +476,8 @@ function renderBrainDumpCard(entry) {
   // that predates this or genuinely has no task to link (taskId stays null for Chat).
   const raisedByBadge = entry.raisedBy
     ? (entry.raisedBy.taskId
-      ? `<span class="clickable" data-open-task="${escapeAttr(entry.raisedBy.taskId)}" style="cursor:pointer;display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--muted);border-radius:3px;color:var(--muted);font-size:11px" title="Flagged automatically while working on ${escapeAttr(entry.raisedBy.taskId)} -- click to open that task">🤖 ${escapeHtml(entry.raisedBy.source || 'pipeline')}</span>`
-      : `<span style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--muted);border-radius:3px;color:var(--muted);font-size:11px" title="Flagged automatically while working on a ${escapeAttr(entry.raisedBy.source || 'pipeline')} task (no task link available)">🤖 ${escapeHtml(entry.raisedBy.source || 'pipeline')}</span>`)
+      ? `<span class="chip clickable" data-open-task="${escapeAttr(entry.raisedBy.taskId)}" title="Flagged automatically while working on ${escapeAttr(entry.raisedBy.taskId)} -- click to open that task">🤖 ${escapeHtml(entry.raisedBy.source || 'pipeline')}</span>`
+      : `<span class="chip" title="Flagged automatically while working on a ${escapeAttr(entry.raisedBy.source || 'pipeline')} task (no task link available)">🤖 ${escapeHtml(entry.raisedBy.source || 'pipeline')}</span>`)
     : '';
   // Suppress only makes sense for a machine-raised entry (retire a stale/obsolete
   // finding a sweep keeps re-flagging) -- a human's own Brain Dump note is deleted, not
