@@ -319,6 +319,7 @@ const KNOWN_FIXED = [
     // placeholder below (40 tasks, 31 premium). agentic-draft-common.js now routes that to a continuation / budget-exhaustion block (decompose-eligible) instead. Re-admits a task
     // parked on exactly that placeholder, once; a task with a real question keeps waiting for a human.
     id: 'agentic-empty-forced-summary-parked-as-design-question',
+    mislabeledAsDesign: true, // the 'design-decision' reason on these tasks is the bug; fix-signature-sweep must not skip them as genuine design questions
     fixedIn: 'agent-manager (agentic-draft-common: an empty forced summary after edits is budget exhaustion, not a design question, 2026-11-02)',
     description: 'a task parked in needs-clarification with only the "ran out of turns before reaching a conclusion" placeholder as its question',
     dirs: ['needs-clarification'],
