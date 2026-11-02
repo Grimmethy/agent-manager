@@ -159,3 +159,96 @@ test('a hold only minutes old shows its exact age, not zero hours', () => {
   assert.match(build(live({ holds: [{ taskId: 't', project: 'p', question: 'Q', ageHours: 0, ageS: 100, dryRun: false }] })), /p · t · 1m/);
   assert.match(build(live({ holds: [{ taskId: 't', project: 'p', question: 'Q', ageHours: 0, ageS: 45, dryRun: false }] })), /p · t · 45s/);
 });
+
+// ---- the on/off switch (2026-11-02) ----
+const off = { disabled: true, disabledAt: '2026-11-02T12:00:00.000Z' };
+const on = { disabled: false, disabledAt: null };
+
+test('an enabled worker offers Turn off (next-enabled=false) and shows its mode badge; a payload without a switch field behaves as enabled', () => {
+  for (const html of [build(live({ switch: on })), build(live())]) {
+    assert.match(html, /<button type="button" class="secondary stalled-switch-btn" data-next-enabled="false"[^>]*>⏻ Turn off<\/button>/);
+    assert.match(html, /class="badge hold"[^>]*>dry-run</);
+    assert.doesNotMatch(html, /switched off/);
+    assert.doesNotMatch(html, /opacity:\.65/);
+  }
+});
+
+test('a switched-off worker offers Turn on (next-enabled=true), shows the switched-off badge with its time instead of the mode, and dims the panel', () => {
+  const html = build(live({ switch: off }));
+  assert.match(html, /data-next-enabled="true"[^>]*>⏻ Turn on<\/button>/);
+  assert.match(html, /class="badge idle"[^>]*>switched off</);
+  assert.match(html, /Switched off since 2026-11-02T12:00:00\.000Z/);
+  assert.doesNotMatch(html, /class="badge hold"[^>]*>dry-run</);
+  assert.match(html, /margin:12px 0; opacity:\.65;/);
+  assert.match(html, /timer on/);                                            // the timer badge stays: the timer keeps running
+  assert.match(build(live({ switch: { disabled: true } })), /class="badge idle"[^>]*>switched off</);
+  assert.doesNotMatch(build(live({ switch: { disabled: true } })), /since/);
+});
+
+test('the switch time is escaped', () => {
+  assert.doesNotMatch(build(live({ switch: { disabled: true, disabledAt: '<img src=x onerror=1>' } })), /<img/);
+});
+
+// A bare vm context with the three globals the click handler uses: fetch, showToast, renderWorkers.
+function loadSwitch({ fetchImpl, rendered = [], toasts = [] }) {
+  const ctx = vm.createContext({ fetch: fetchImpl, showToast: (m) => toasts.push(m), renderWorkers: async () => { rendered.push(1); }, JSON, Error });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'stalled-worker-panel.js'), 'utf8'), ctx, { filename: 'stalled-worker-panel.js' });
+  return ctx;
+}
+
+test('switching posts {enabled} as JSON to the dashboard route and redraws the Workers tab on success', async () => {
+  const calls = []; const rendered = []; const toasts = [];
+  const ctx = loadSwitch({ rendered, toasts, fetchImpl: async (url, init) => { calls.push([url, init.method, init.headers['Content-Type'], init.body]); return { ok: true, status: 200 }; } });
+  assert.strictEqual(await ctx.setStalledWorkerEnabled(false), true);
+  assert.strictEqual(await ctx.setStalledWorkerEnabled(true), true);
+  assert.deepStrictEqual(calls, [['/api/stalled-worker/enabled', 'POST', 'application/json', '{"enabled":false}'], ['/api/stalled-worker/enabled', 'POST', 'application/json', '{"enabled":true}']]);
+  assert.strictEqual(rendered.length, 2);
+  assert.deepStrictEqual(toasts, []);
+});
+
+test('a refused or failed switch shows a toast naming the direction and the reason, and does not redraw', async () => {
+  const mk = (fetchImpl) => { const rendered = []; const toasts = []; return { rendered, toasts, ctx: loadSwitch({ rendered, toasts, fetchImpl }) }; };
+  const a = mk(async () => ({ ok: false, status: 500, json: async () => ({ error: 'could not change the switch: disk full' }) }));
+  assert.strictEqual(await a.ctx.setStalledWorkerEnabled(false), false);
+  assert.deepStrictEqual(a.toasts, ['Could not switch the stalled-task worker off: could not change the switch: disk full']);
+  assert.strictEqual(a.rendered.length, 0);
+  const b = mk(async () => ({ ok: false, status: 502, json: async () => { throw new Error('not json'); } }));
+  assert.strictEqual(await b.ctx.setStalledWorkerEnabled(true), false);
+  assert.deepStrictEqual(b.toasts, ['Could not switch the stalled-task worker on: HTTP 502']);
+  const c = mk(async () => { throw new Error('network down'); });
+  assert.strictEqual(await c.ctx.setStalledWorkerEnabled(true), false);
+  assert.deepStrictEqual(c.toasts, ['Could not switch the stalled-task worker on: network down']);
+  assert.strictEqual(c.rendered.length + b.rendered.length, 0);
+});
+
+test('clicking the button disables it, switches in the direction it names, and re-enables it only when the switch failed', async () => {
+  for (const [ok, nextEnabled, expectDisabledAfter] of [[true, 'false', true], [false, 'true', false]]) {
+    const calls = [];
+    const ctx = loadSwitch({ fetchImpl: async (url, init) => { calls.push(init.body); return ok ? { ok: true, status: 200 } : { ok: false, status: 500, json: async () => ({}) }; } });
+    let stopped = false;
+    const btn = { dataset: { nextEnabled }, disabled: false, onclick: null };
+    ctx.wireStalledWorkerSwitch({ querySelectorAll: (sel) => { assert.strictEqual(sel, '.stalled-switch-btn'); return [btn]; } });
+    await btn.onclick({ stopPropagation: () => { stopped = true; } });
+    assert.strictEqual(stopped, true);
+    assert.deepStrictEqual(calls, [JSON.stringify({ enabled: nextEnabled === 'true' })]);
+    assert.strictEqual(btn.disabled, expectDisabledAfter);
+  }
+});
+
+test('wiring: the Workers tab wires the stalled-task switch next to the lane switches', () => {
+  assert.match(fs.readFileSync(path.join(__dirname, 'workers-tab.js'), 'utf8'), /if \(typeof wireStalledWorkerSwitch === 'function'\) wireStalledWorkerSwitch\(main\);/);
+});
+
+test('only a strict true counts as switched off: other truthy values and a false switch show the on state', () => {
+  const badge = (sw) => call('stalledWorkerSwitchBadge', sw);
+  const button = (sw) => call('stalledWorkerSwitchButton', sw);
+  assert.strictEqual(badge({ disabled: false }), '');
+  assert.strictEqual(badge(null), '');
+  assert.strictEqual(badge(undefined), '');
+  assert.match(badge({ disabled: true }), /switched off/);
+  for (const sw of [{ disabled: 1 }, { disabled: 'yes' }, { disabled: false }, {}, null]) {
+    assert.match(button(sw), /data-next-enabled="false"[^>]*>\u23FB Turn off</, JSON.stringify(sw));
+    assert.strictEqual(badge(sw), '', JSON.stringify(sw));
+  }
+  assert.match(button({ disabled: true }), /data-next-enabled="true"[^>]*>\u23FB Turn on</);
+});

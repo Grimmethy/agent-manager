@@ -454,6 +454,7 @@ async function renderWorkers(isPoll) {
     card.onclick = () => toggleWorkerExpand(card.dataset.instanceId);
   });
   if (typeof wireWorkerSwitchButtons === 'function') wireWorkerSwitchButtons(main);
+  if (typeof wireStalledWorkerSwitch === 'function') wireStalledWorkerSwitch(main);
   const claudePauseToggle = main.querySelector('#claude-pause-toggle');
   if (claudePauseToggle) {
     claudePauseToggle.onchange = (e) => setClaudePaused(e.target.checked);
