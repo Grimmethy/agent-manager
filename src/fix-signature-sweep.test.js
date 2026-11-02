@@ -274,7 +274,8 @@ test('live state: with the old docs-only entry already first-seen in September, 
 
 test('once only: a task stuck after the new entry was first seen is left alone, and a requeued task is not requeued again for the same entry', async () => {
   const dir = pipeline();
-  seedState(dir, { 'docs-only-gate-negated-paths': OLD_DOCS_ENTRY_FIRST_SEEN, [NEW_ENTRY]: SWEEP_NOW.toISOString() });
+  // 2026-11-02: the later docs-only entry is already live too (since before both tasks got stuck), otherwise it is seen for the first time here and requeues these documentation tasks.
+  seedState(dir, { 'docs-only-gate-negated-paths': OLD_DOCS_ENTRY_FIRST_SEEN, [NEW_ENTRY]: SWEEP_NOW.toISOString(), 'docs-only-gate-created-document-deliverable': '2026-10-15T00:00:00.000Z' });
   put(dir, 'needs-clarification', verifyTask('late', READONLY_PF_TEXT, '2026-10-16T02:00:00Z'));
   const again = verifyTask('again', READONLY_CORE_TEXT, '2026-10-16T00:30:00Z');
   again.requeuedForFixes = [NEW_ENTRY];

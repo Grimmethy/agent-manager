@@ -211,6 +211,24 @@ const KNOWN_FIXED = [
     applies: docsOnlyGateNoLongerBlocks,
   },
   {
+    // A NEW id (the sweep stamps firstSeen once per id): 2026-11-02 fix for a task that CREATES one document and only cites code in descriptive sentences (HUB0125 1/2 audit doc, HUB0002 2/2 research
+    // note). Re-runs the real gate on a synthetic diff that creates exactly the documents the recorded failure names; re-admits only when the gate now lets that diff through.
+    id: 'docs-only-gate-created-document-deliverable',
+    fixedIn: 'agent-manager (docs-only gate: a task whose declared targets are all documents and whose diff creates exactly them is a document deliverable, 2026-11-02)',
+    description: 'adhoc-diff-sanity blocked a CORRECT docs-only diff ("the task asks for a code change") for a task whose deliverable is a document it creates',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => {
+      const m = /only (?:touches|created\/edited) documentation \(([^)]+)\)/.exec(failureText(task));
+      if (!m || !/code change/.test(failureText(task))) return false;
+      try {
+        const paths = m[1].split(',').map((p) => p.trim()).filter(Boolean);
+        if (!paths.length) return false;
+        const diff = paths.map((p) => `diff --git a/${p} b/${p}\nnew file mode 100644\n--- /dev/null\n+++ b/${p}\n@@ -0,0 +1 @@\n+x\n`).join('');
+        return require('./adhoc-diff-sanity.js').adhocDiffSubstanceProblem(task, diff, 'RESOLUTION: implemented') === null;
+      } catch { return false; }
+    },
+  },
+  {
     id: 'implement-pass-sibling-repos-readable',
     fixedIn: 'agent-manager (implement pass reads registered plugin/project repos read-only, merged 028e586f, 2026-10-16)',
     description: 'The agentic implement pass could see only its own worktree, so a read-only cross-repo verification task (GPU broker verify videoforge/promptforge) found "/media/model-cache/github/<repo> does not exist" or "path is not inside any accessible repo" and concluded the repo was not on this machine. It now gets every registered plugin repo as a read-only root.',
