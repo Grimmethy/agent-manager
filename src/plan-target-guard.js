@@ -100,23 +100,74 @@ function isDeclaredCreateTarget(planText, targetPath, taskText = '') {
 // existsAtRef (optional, injected so this stays a pure wrapper): (claimedPath) => boolean, "does it exist on the branch this task really builds
 // on". A STACKED task's files live on its shared branch tip, which the working tree at repoRoot does not show, so a target only that branch has
 // is real, not fabricated. It can only RESCUE a path the working-tree check called missing; a throw or a false leaves the verdict unchanged.
+
+// 2026-11-08: explicit type field support. Plans can now declare targets as `{type: 'create', path: '...'}` or `{type: 'modify', path: '...'}`.
+// Create targets skip the existence check; modify targets must exist. This is cleaner than the heuristic isDeclaredCreateTarget for plans that
+// explicitly state their intent. The regex captures both JSON-like and prose forms: {type: 'create', path: 'x'}, {type: "modify", path: "y"}, etc.
+const EXPLICIT_TYPE_RE = /\{[^}]*type\s*:\s*['"]?(create|modify)['"]?[^}]*path\s*:\s*['"]?([^'"}\s]+)['"]?[^}]*\}/gi;
+
+function extractExplicitTypes(planText) {
+  const types = new Map();
+  if (!planText) return types;
+  let m;
+  while ((m = EXPLICIT_TYPE_RE.exec(planText)) !== null) {
+    const type = m[1].toLowerCase();
+    const path = m[2];
+    types.set(path, type);
+  }
+  return types;
+}
+
 function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef = null) {
   let targets = [];
   try { targets = extractDeclaredTargets(task, planText); } catch { targets = []; }
+  
+  // 2026-11-08: also extract paths from explicit type declarations
+  const explicitTypes = extractExplicitTypes(planText);
+  for (const [path, type] of explicitTypes) {
+    if (!targets.includes(path)) {
+      targets.push(path);
+    }
+  }
+  
   if (!targets.length || !repoRoot) return { blocked: false };
 
   const checked = checkFilePaths(targets.join(', '), repoRoot, extraRoots);
-  const missing = checked.filter(
-    (entry) => entry.exists === false && !existsOnBranch(existsAtRef, entry.claimedPath) && !isDeclaredCreateTarget(planText, entry.claimedPath, taskTextOf(task)),
-  );
+  
+  // 2026-11-08: categorize targets by type
+  const createPaths = [];
+  const modifyPaths = [];
+  for (const entry of checked) {
+    if (explicitTypes.get(entry.claimedPath) === 'create') {
+      createPaths.push(entry.claimedPath);
+    } else {
+      modifyPaths.push(entry.claimedPath);
+    }
+  }
+  
+  // 2026-11-08: filter out create targets from missing check; they don't need to exist
+  const missing = checked.filter((entry) => {
+    if (entry.exists !== false) return false;
+    if (existsOnBranch(existsAtRef, entry.claimedPath)) return false;
+    // Explicit type 'create' exempts the target
+    if (explicitTypes.get(entry.claimedPath) === 'create') return false;
+    // Heuristic fallback: isDeclaredCreateTarget for backward compatibility
+    if (isDeclaredCreateTarget(planText, entry.claimedPath, taskTextOf(task))) return false;
+    return true;
+  });
 
-  if (missing.length === 0) return { blocked: false };
+  if (missing.length === 0) return { blocked: false, targetSummary: { create: createPaths, modify: modifyPaths } };
 
   const paths = missing.map((entry) => entry.claimedPath);
+  
+  // 2026-11-08: include actionable feedback suggesting to mark as create target
+  const feedback = ' -- mark as a create target (e.g. "create `' + paths[0] + '`)") or correct the path';
+  
   return {
     blocked: true,
-    reason: 'plan cites missing-file target(s): ' + paths.join(', ') + (hasHumanDecision(task) ? HUMAN_DECISION_HINT : ''),
+    reason: 'plan cites missing-file target(s): ' + paths.join(', ') + feedback + (hasHumanDecision(task) ? HUMAN_DECISION_HINT : ''),
     missing: paths,
+    targetSummary: { create: createPaths, modify: modifyPaths },
   };
 }
 
