@@ -90,6 +90,15 @@
   nav.nav-rail .nav-notch { display: none; }
   nav { transition: width .15s ease; }
   @media (prefers-reduced-motion: reduce) { nav { transition: none; } }
+  /* Line icons (nav-icons.js): the tab label is an icon plus the name; the icon follows the text colour, accent when active. */
+  .nav-tab-label { display: inline-flex; align-items: center; gap: 10px; min-width: 0; }
+  .nav-ic { flex: none; color: var(--muted); }
+  nav button:hover .nav-ic { color: var(--text); }
+  nav button.active .nav-ic { color: var(--accent); }
+  nav.nav-rail button.rail-btn .nav-ic { color: inherit; }
+  nav.nav-rail button.rail-btn:not(.active) { color: var(--muted); }
+  nav.nav-rail button.rail-btn:hover { color: var(--text); }
+  nav.nav-rail button.rail-btn.active .nav-ic { color: var(--accent-text); }
   .nav-here { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
   @media (prefers-reduced-motion: reduce) { .nav-chev { transition: none; } }
   .nav-notch { position: absolute; top: 0; left: calc(100% - 16px); width: 12px; height: 12px; pointer-events: none; will-change: transform; }
@@ -337,6 +346,7 @@
 
 <script src="{{ url_for('static', filename='js/core-ui.js') }}"></script>
 <script src="/static/js/nav-notch.js"></script>
+<script src="/static/js/nav-icons.js"></script>
 <script src="/static/js/nav-sections.js"></script>
 <script src="/static/js/queue-tab.js"></script>
 <script src="/static/js/plugins-tab.js"></script>
