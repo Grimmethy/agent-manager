@@ -15,6 +15,12 @@ source "${SCRIPT_DIR}/lib/start-singleton-bg.sh"
 
 readonly INSTANCE_ID="${1:-watchdog}"    # same naming as PowerShell's $env:InstanceID per-daemon.
 
+# Snapshot file path: parsed from --snapshot-file CLI flag or QUEUE_SNAPSHOT_FILE env var.
+# Default pattern: /dev/shm/agent-manager-queue-tick-<instanceId>.json where <instanceId>
+# comes from AGENT_MANAGER_INSTANCE_ID. Each script independently parses the flag/env and
+# forwards the path to its Node.js entry point.
+SNAPSHOT_FILE="${QUEUE_SNAPSHOT_FILE:-}"
+
 # Refuse to start if a live process already holds this instanceId -- see local-worker.sh's
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
 # Applies to the watchdog's OWN identity here -- distinct from (and unrelated to) the
@@ -505,6 +511,15 @@ while :; do
     merged_work_result="$(node "${PACKAGE_SRC_DIR}/merged-work-sweep.js" 2>>"${HOME_LOGS}/merged-work-sweep.log")"
     printf '[watchdog] merged-work-sweep: %s\n' "$merged_work_result" >&2
 
+    # Queue snapshot tick: rebuild the shared /dev/shm snapshot so other daemons can read
+    # it via readQueueSnapshot() (which honors QUEUE_SNAPSHOT_FILE). Skipped when no
+    # snapshot file path was configured (--snapshot-file CLI flag or QUEUE_SNAPSHOT_FILE
+    # env var), since the default tmpfs path is only useful when a consumer expects it.
+    if [[ -n "$SNAPSHOT_FILE" ]]; then
+      snapshot_result="$(QUEUE_SNAPSHOT_FILE="$SNAPSHOT_FILE" node "${PACKAGE_SRC_DIR}/queue-cache.js" buildQueueSnapshot "${AGENT_MANAGER_REPO_ROOT}" 2>>"${HOME_LOGS}/queue-snapshot.log")"
+      printf '[watchdog] queue-snapshot: %s\n' "$snapshot_result" >&2
+    fi
+
     # Drift-scan (Brain Dump #83: "Reasoning tasks aren't represented in the job list...
     # make sure task visibility is a consistent part of the pipeline"). drift-scan.js
     # already existed to catch exactly this class of bug (a static list, e.g. the
@@ -567,6 +582,25 @@ while :; do
         rm -f "$GRAPH_BUILD_LOCK"
       ) &
       echo $! > "$GRAPH_BUILD_LOCK"
+    fi
+
+    # Pool sweep (2026-10-30, HUB0295): runs branch-defect-readmit-sweep.js, branch-conflict-readmit-sweep.js, and redo-supersede-sweep.js for each pool project. Kill switch AGENT_MANAGER_SWEEP_POOL=false.
+    AGENT_MANAGER_SWEEP_POOL=${AGENT_MANAGER_SWEEP_POOL:=true}
+    if [[ "${AGENT_MANAGER_SWEEP_POOL}" == "true" ]]; then
+      while IFS= read -r _pipe; do
+        [[ -n "$_pipe" ]] || continue
+        _env_args="$(node "${PACKAGE_SRC_DIR}/pool-projects.js" --env-args "$_pipe" apply 2>/dev/null)" || true
+        if [[ -z "$_env_args" ]]; then
+          printf '[watchdog] skipping pool project %s -- no env args returned\n' "$_pipe" >&2
+          continue
+        fi
+        for _sweep in branch-defect-readmit-sweep.js branch-conflict-readmit-sweep.js redo-supersede-sweep.js; do
+          _sweep_output="$(env $_env_args node "${PACKAGE_SRC_DIR}/${_sweep}" 2>/dev/null)" || true
+          echo "$_sweep_output" | grep -E '^(checked|observed|requeued|superseded)' | while IFS= read -r _line; do
+            printf '[watchdog] %s %s %s\n' "$_pipe" "$_sweep" "$_line" >&2
+          done
+        done
+      done < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --all 2>/dev/null)
     fi
 
     # Idle-pool borrowing (docs/idle-pool-borrowing.md, step 4): housekeeping for the pool projects lanes borrow work from -- retries, hub
