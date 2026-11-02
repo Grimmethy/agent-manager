@@ -48,64 +48,92 @@ function stalledWorkerSwitchBadge(sw) {
 function stalledWorkerSwitchButton(sw) {
   const off = !!(sw && sw.disabled === true);
   const title = off
-    ? 'Switch the worker back on: it starts working again at its next tick (within 10 minutes).'
+    ? 'Switch the worker back on: it starts working again at its next tick (within a minute).'
     : 'Switch the worker off: new ticks do nothing (a tick already running finishes). The timer keeps running; nothing is deleted.';
   return '<button type="button" class="secondary stalled-switch-btn" data-next-enabled="' + (off ? 'true' : 'false') + '" title="' + stalledWorkerEsc(title)
-    + '" style="margin-left:8px">' + (off ? '\u23FB Turn on' : '\u23FB Turn off') + '</button>';
+    + '" style="margin-top:4px">' + (off ? '\u23FB Turn on' : '\u23FB Turn off') + '</button>';
 }
 
-function stalledWorkerBudgetLine(p) {
+// Open/closed state of the history section. Lives here (not in workers-tab.js) because the panel is not a lane: a click on the card flips it and redraws.
+let stalledWorkerExpanded = false;
+
+function stalledWorkerCut(text, max) {
+  const t = String(text === undefined || text === null ? '' : text);
+  return t.length > max ? t.slice(0, max - 1) + '…' : t;
+}
+
+// One short line for the card body: tokens used this hour, or why there is no meter.
+function stalledWorkerBudgetText(p) {
   const b = p.budget;
-  const source = [p.provider, p.model].filter(Boolean).map(stalledWorkerEsc).join(' · ');
-  if (!b || !Number.isFinite(Number(b.perHour))) {
-    const why = p.gateway && p.gateway.error ? ' (' + stalledWorkerEsc(p.gateway.error) + ')' : '';
-    return '<div class="meta" style="margin-top:4px">Model gateway not reachable' + why + '.</div>';
-  }
+  if (!b || !Number.isFinite(Number(b.perHour))) return 'gateway not reachable' + (p.gateway && p.gateway.error ? ' (' + stalledWorkerEsc(stalledWorkerCut(p.gateway.error, 40)) + ')' : '');
   const pct = Number(b.perHour) > 0 ? Math.round((Number(b.used) / Number(b.perHour)) * 100) : 0;
-  return '<div style="margin-top:4px">' + (source ? '<span class="meta">' + source + '</span> · ' : '')
-    + stalledWorkerInt(b.used) + ' of ' + stalledWorkerInt(b.perHour) + ' tokens this hour (' + pct + '%)'
-    + (Number(b.used) >= Number(b.perHour) ? ' <span class="badge warn" title="The gateway answers 429 until older calls leave the 60-minute window">budget spent</span>' : '') + '</div>';
+  return stalledWorkerInt(b.used) + ' of ' + stalledWorkerInt(b.perHour) + ' tokens this hour (' + pct + '%)'
+    + (Number(b.used) >= Number(b.perHour) ? ' <span class="badge warn" title="The gateway answers 429 until older calls leave the 60-minute window">budget spent</span>' : '');
 }
 
-function stalledWorkerStalledLine(stalled) {
-  if (!stalled) return '<div class="meta" style="margin-top:4px">No stalled-task index yet.</div>';
-  const top = (stalled.topBuckets || []).map((b) => '<div class="meta" style="margin-left:12px">'
-    + stalledWorkerInt(b.count) + ' · ' + stalledWorkerEsc(b.state) + ' · ' + stalledWorkerEsc(String(b.signature || '(no reason recorded)').slice(0, 110)) + '</div>').join('');
-  return '<div style="margin-top:8px"><strong>' + stalledWorkerInt(stalled.total) + '</strong> stalled across ' + stalledWorkerInt(stalled.projects) + ' projects</div>' + top;
+function stalledWorkerSourceText(p) {
+  return [p.provider, p.model].filter(Boolean).map((v) => stalledWorkerEsc(v)).join(' · ');
 }
 
-function stalledWorkerTodayLine(p) {
+function stalledWorkerStalledText(stalled) {
+  if (!stalled) return 'no stalled-task index yet';
+  return stalledWorkerInt(stalled.total) + ' stalled across ' + stalledWorkerInt(stalled.projects) + ' projects';
+}
+
+function stalledWorkerBucketsHtml(stalled) {
+  const rows = ((stalled && stalled.topBuckets) || []).map((b) => '<div class="meta" style="margin-top:2px" title="' + stalledWorkerEsc(b.signature) + '">'
+    + stalledWorkerInt(b.count) + ' · ' + stalledWorkerEsc(b.state) + ' · ' + stalledWorkerEsc(stalledWorkerCut(b.signature || '(no reason recorded)', 110)) + '</div>').join('');
+  return rows ? '<div style="margin-top:8px"><strong>Biggest buckets</strong>' + rows + '</div>' : '';
+}
+
+// Compact "ESCALATE-MECHANISM 5 · ARCHIVE-DUPLICATE 2"; the collapsed card shows the biggest three and a "+n more".
+function stalledWorkerTodayText(p, limit) {
   const entries = Object.entries(p.today || {}).sort((a, b) => b[1] - a[1]);
-  if (!entries.length) return '<div class="meta" style="margin-top:8px">No decisions today.</div>';
-  return '<div style="margin-top:8px"><strong>Today</strong> ' + entries.map(([k, n]) => stalledWorkerEsc(k) + ' ' + stalledWorkerInt(n)).join(' · ') + '</div>';
+  if (!entries.length) return 'no decisions today';
+  const shown = entries.slice(0, limit || entries.length).map(([k, n]) => stalledWorkerEsc(k) + ' ' + stalledWorkerInt(n)).join(' · ');
+  return shown + (limit && entries.length > limit ? ' +' + (entries.length - limit) + ' more' : '');
 }
 
-function stalledWorkerHoldsHtml(holds) {
+function stalledWorkerHoldRow(h) {
+  return '<div style="margin-top:2px" title="' + stalledWorkerEsc(h.question) + '">' + stalledWorkerEsc(stalledWorkerCut(h.question || '(no question recorded)', 90))
+    + ' <span class="meta">' + stalledWorkerEsc(h.project) + ' · ' + stalledWorkerEsc(stalledWorkerCut(h.taskId, 40))
+    + (Number.isFinite(h.ageS) ? ' · ' + stalledWorkerEsc(stalledWorkerAge(h.ageS)) : '') + (h.dryRun ? ' · dry-run' : '') + '</span></div>';
+}
+
+// Questions waiting for the owner stay visible when collapsed (they need a person) but only the first two, cut; the rest are behind the click.
+function stalledWorkerHoldsHtml(holds, all) {
   if (!holds || !holds.length) return '';
-  const rows = holds.map((h) => '<div style="margin-left:12px">' + stalledWorkerEsc(h.question || '(no question recorded)')
-    + ' <span class="meta">' + stalledWorkerEsc(h.project) + ' · ' + stalledWorkerEsc(String(h.taskId || '').slice(0, 60))
-    + (Number.isFinite(h.ageS) ? ' · ' + stalledWorkerEsc(stalledWorkerAge(h.ageS)) : '') + (h.dryRun ? ' · dry-run' : '') + '</span></div>').join('');
-  return '<div style="margin-top:8px"><strong>Waiting for you</strong>' + rows + '</div>';
+  const shown = all ? holds : holds.slice(0, 2);
+  const more = holds.length - shown.length;
+  return '<div style="margin-top:8px"><strong>Waiting for you</strong>' + shown.map(stalledWorkerHoldRow).join('')
+    + (more > 0 ? '<div class="meta">+' + more + ' more (click the card)</div>' : '') + '</div>';
 }
 
 function stalledWorkerRecentHtml(recent) {
-  if (!recent || !recent.length) return '';
-  const rows = recent.map((r) => '<div class="meta" style="margin-left:12px">' + stalledWorkerEsc(String(r.at || '').slice(11, 16)) + ' · ' + stalledWorkerEsc(r.outcome)
-    + ' · ' + stalledWorkerEsc(r.project) + ' · ' + stalledWorkerEsc(String(r.taskId || '').slice(0, 48)) + (r.mode === 'dry-run' ? ' · dry-run' : '') + '</div>').join('');
-  return '<div style="margin-top:8px"><strong>Recent</strong>' + rows + '</div>';
+  if (!recent || !recent.length) return '<div class="meta" style="margin-top:8px">No decisions recorded yet.</div>';
+  const rows = recent.map((r) => '<div class="meta" style="margin-top:2px" title="' + stalledWorkerEsc(r.taskId) + '">' + stalledWorkerEsc(String(r.at || '').slice(11, 16)) + ' · ' + stalledWorkerEsc(r.outcome)
+    + ' · ' + stalledWorkerEsc(r.project) + ' · ' + stalledWorkerEsc(stalledWorkerCut(r.taskId, 48)) + (r.mode === 'dry-run' ? ' · dry-run' : '') + '</div>').join('');
+  return '<div style="margin-top:8px"><strong>Worker history</strong>' + rows + '</div>';
 }
 
+// Same card as the lane workers: id on the left, badges + timer + Turn on/off stacked on the right, one meta line, click the card to open the history.
 function buildStalledWorkerHtml(p) {
   if (!p || !p.configured) return '';
   const off = !!(p.switch && p.switch.disabled === true);
-  const box = 'padding:12px 16px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin:12px 0;' + (off ? ' opacity:.65;' : '');
+  const open = stalledWorkerExpanded === true;
   const age = stalledWorkerAge(p.lastTickAgeS);
-  const title = '<div style="font-weight:600">\u{1F9F9} Stalled-task worker ' + (off ? stalledWorkerSwitchBadge(p.switch) : stalledWorkerModeBadge(p.mode)) + ' ' + stalledWorkerTimerBadge(p.timerActive)
-    + stalledWorkerSwitchButton(p.switch) + '</div>';
-  const last = '<div class="meta" style="margin-top:4px">' + (age ? 'Last tick ' + stalledWorkerEsc(age) + ' ago' : 'No tick recorded yet')
-    + (p.decisions !== undefined ? ' · ' + stalledWorkerInt(p.decisions) + ' decisions in the ledger tail' : '') + '</div>';
-  return '<div id="stalled-worker-panel" style="' + box + '">' + title + last + stalledWorkerBudgetLine(p) + stalledWorkerStalledLine(p.stalled)
-    + stalledWorkerTodayLine(p) + stalledWorkerHoldsHtml(p.holds) + stalledWorkerRecentHtml(p.recent) + '</div>';
+  const head = '<div class="row"><span class="id">\u{1F9F9} stalled-worker</span><div class="badge-col">'
+    + (off ? stalledWorkerSwitchBadge(p.switch) : stalledWorkerModeBadge(p.mode)) + ' ' + stalledWorkerTimerBadge(p.timerActive)
+    + '<span class="state-timer">' + (age ? 'last tick ' + stalledWorkerEsc(age) + ' ago' : 'no tick recorded yet') + '</span>'
+    + stalledWorkerSwitchButton(p.switch) + '</div></div>';
+  const source = stalledWorkerSourceText(p);
+  const meta = '<div class="meta">' + (source ? source + ' · ' : '') + stalledWorkerBudgetText(p) + ' · ' + stalledWorkerStalledText(p.stalled)
+    + ' · today: ' + stalledWorkerTodayText(p, 3) + '</div>';
+  const toggle = '<div class="meta" style="margin-top:4px">' + (open ? '▾ Hide history' : '▸ Show history') + (p.decisions !== undefined ? ' (' + stalledWorkerInt(p.decisions) + ' decisions)' : '') + '</div>';
+  const detail = open ? '<div class="worker-recent-tasks">' + stalledWorkerBucketsHtml(p.stalled)
+    + '<div class="meta" style="margin-top:8px"><strong>Today</strong> ' + stalledWorkerTodayText(p) + '</div>' + stalledWorkerRecentHtml(p.recent) + '</div>' : '';
+  return '<div id="stalled-worker-panel" class="worker-card clickable' + (off ? ' worker-off' : '') + '" data-stalled-expand="1" aria-expanded="' + open + '">'
+    + head + meta + stalledWorkerHoldsHtml(p.holds, open) + toggle + detail + '</div>';
 }
 
 // What renderWorkers() appends: nothing at all unless the worker has left any trace (ledger, index, running timer or a reachable gateway).
@@ -141,5 +169,12 @@ function wireStalledWorkerSwitch(root) {
       const ok = await setStalledWorkerEnabled(btn.dataset.nextEnabled === 'true');
       if (!ok) btn.disabled = false;       // a failed switch leaves the panel as it was, and the button usable
     };
+  });
+}
+
+// Click anywhere on the card (but the Turn on/off button, which stops propagation) opens or closes the history.
+function wireStalledWorkerExpand(root, redraw) {
+  root.querySelectorAll('[data-stalled-expand]').forEach((card) => {
+    card.onclick = () => { stalledWorkerExpanded = !stalledWorkerExpanded; if (typeof redraw === 'function') redraw(); };
   });
 }

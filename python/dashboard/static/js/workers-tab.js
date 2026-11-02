@@ -455,6 +455,7 @@ async function renderWorkers(isPoll) {
   });
   if (typeof wireWorkerSwitchButtons === 'function') wireWorkerSwitchButtons(main);
   if (typeof wireStalledWorkerSwitch === 'function') wireStalledWorkerSwitch(main);
+  if (typeof wireStalledWorkerExpand === 'function') wireStalledWorkerExpand(main, renderWorkers);
   const claudePauseToggle = main.querySelector('#claude-pause-toggle');
   if (claudePauseToggle) {
     claudePauseToggle.onchange = (e) => setClaudePaused(e.target.checked);
