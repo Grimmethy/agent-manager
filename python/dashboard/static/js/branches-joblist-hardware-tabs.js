@@ -249,7 +249,8 @@ async function refreshBranchesTab() {
   const wanted = new Set(shown.map(branchRowKey));
   const membershipChanged = onScreen.size !== wanted.size || [...wanted].some((k) => !onScreen.has(k));
   const pendingNow = main.querySelector('[data-projects-pending]') !== null;
-  if (membershipChanged || pendingNow !== (branchProjectsPending.length > 0)) {
+  const refreshingNow = main.querySelector('[data-list-refreshing]') !== null;
+  if (membershipChanged || pendingNow !== (branchProjectsPending.length > 0) || refreshingNow !== !!branchListRefreshing) {
     // A card appeared or went away (or the "still scanning" note changed): rebuild, keeping the scroll position. Project headers sit between the cards, so
     // appending a lone card (the old behaviour) would land it under the wrong project.
     const y = window.scrollY;
@@ -1072,10 +1073,48 @@ async function renderMain() {
 // tab whose render takes longer than 5s would be superseded every time and never paint.
 function refresh() { return runRefreshGuarded(refreshCycle); }
 
+// Header chip for host-memory pressure (model in core-ui.js memoryChipModel). Shown only while the broker reports tight/critical; the owner-only "Unload Ollama"
+// button appears only when the broker says the action is enabled, and disappears for the session if the broker answers 403/404.
+let memoryUnloadHidden = false;
+function renderMemoryChip(memory) {
+  const el = document.getElementById('memory-chip');
+  if (!el) return;
+  const model = memoryChipModel(memory);
+  if (!model.visible) { el.hidden = true; el.className = ''; el.textContent = ''; el.title = ''; return; }
+  el.hidden = false;
+  el.className = model.className;
+  el.title = model.title;
+  el.textContent = model.text;
+  if (model.canUnload && !memoryUnloadHidden) {
+    const btn = document.createElement('button');
+    btn.className = 'action';
+    btn.style.marginLeft = '8px';
+    btn.textContent = 'Unload Ollama';
+    btn.title = 'Owner action: unload the Ollama models held on the GPU (nothing does this automatically)';
+    btn.onclick = unloadOllamaFromChip;
+    el.appendChild(btn);
+  }
+}
+
+async function unloadOllamaFromChip() {
+  if (!window.confirm('Unload the Ollama models? Running generations that use them will have to reload.')) return;
+  try {
+    const r = await fetch('/api/memory/unload-ollama', { method: 'POST' });
+    if (r.status === 403 || r.status === 404) { memoryUnloadHidden = true; renderMemoryChip(counts && counts.memory); return; }
+    const body = await r.json().catch(() => ({}));
+    const el = document.getElementById('memory-chip');
+    if (el) el.title = r.ok ? `Unloaded: ${(body.unloaded || []).join(', ') || 'nothing was loaded'}` : `Unload failed: ${body.error || r.status}`;
+  } catch (e) {
+    const el = document.getElementById('memory-chip');
+    if (el) el.title = `Unload failed: ${e.message}`;
+  }
+}
+
 async function refreshCycle() {
   try {
     counts = await fetchJson('/api/summary');
     document.getElementById('pipeline-status').textContent = 'connected';
+    renderMemoryChip(counts.memory);
   } catch (e) {
     document.getElementById('pipeline-status').textContent = 'disconnected';
   }

@@ -671,6 +671,33 @@ async function safeSourceNames(sourceNamesFn = allSourceNames) {
   }
 }
 
+// ---- Host-memory chip (2026-11-02, phase 5 of the memory-pressure plan) -------------------------------------------------------------------------------------
+// /api/summary carries `memory` (python/dashboard/memory_status.py): {state:'ok'|'unknown'} or, under pressure, {state:'tight'|'critical', reason, numbers, paused,
+// wouldPause, pauseS, canUnload}. The header chip shows only under pressure; it never adds a request of its own (it rides the existing summary refresh).
+function formatPauseLength(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '';
+  const s = Math.floor(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+function memoryChipModel(memory) {
+  if (!memory || (memory.state !== 'tight' && memory.state !== 'critical')) return { visible: false };
+  let text = `Memory ${memory.state}`;
+  if (memory.paused) text += ` \u00b7 new work paused${Number.isFinite(memory.pauseS) ? ` ${formatPauseLength(memory.pauseS)}` : ''}`;
+  else if (memory.wouldPause) text += ' \u00b7 would pause (dry-run)';
+  const n = memory.numbers || {};
+  const bits = [];
+  if (Number.isFinite(n.available_mb)) bits.push(`${n.available_mb} MB available`);
+  if (Number.isFinite(n.swap_free_mb)) bits.push(`swap ${n.swap_free_mb} MB free`);
+  if (Number.isFinite(n.io_full)) bits.push(`io stall ${n.io_full}%`);
+  if (Number.isFinite(n.mem_full)) bits.push(`memory stall ${n.mem_full}%`);
+  const title = [memory.reason, bits.join(', ')].filter(Boolean).join(' \u2014 ');
+  return { visible: true, text, title, className: memory.state === 'critical' ? 'chip chip-solo chip-bad' : 'chip chip-solo chip-warn', canUnload: !!memory.canUnload };
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -720,4 +747,4 @@ function adhocStateLabel(state) {
 // (`module` is undefined there, so this is a no-op in production) -- the guard exists
 // solely so safeSourceNames is requireable from a Node test, the first test coverage
 // this file has ever had.
-if (typeof module !== 'undefined') module.exports = { navOrder, safeSourceNames, bumpRenderGeneration, renderStaleCheck, runRefreshGuarded, _resetRenderStateForTest };
+if (typeof module !== 'undefined') module.exports = { formatPauseLength, memoryChipModel, navOrder, safeSourceNames, bumpRenderGeneration, renderStaleCheck, runRefreshGuarded, _resetRenderStateForTest };

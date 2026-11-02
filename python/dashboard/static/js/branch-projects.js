@@ -8,6 +8,7 @@
 const BRANCHES_URL = '/api/git/unmerged-branches?projects=all';
 // Labels of registered projects the server has not finished scanning yet (response header); the tab's own poll picks them up.
 let branchProjectsPending = [];
+let branchListRefreshing = false;     // X-Branch-Refreshing: the served list is the last good one while the server recomputes it in the background
 
 function _bpEscape(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -83,6 +84,12 @@ function branchProjectsPendingHtml(pending) {
   return `<div class="meta" data-projects-pending style="margin:0 0 8px">Still scanning ${list.length} other project${list.length === 1 ? '' : 's'} for branches: ${list.map(_bpEscape).join(', ')} -- they appear here as each finishes.</div>`;
 }
 
+// The list is served at once from the cache; while it is being recomputed (after a merge, discard or verdict, or on a cold start) say so instead of looking stuck.
+function branchListRefreshingHtml(refreshing) {
+  if (!refreshing) return '';
+  return '<div class="meta" data-list-refreshing style="margin:0 0 8px">Refreshing the branch list -- showing the last result; it updates by itself.</div>';
+}
+
 // Merge/discard/verdict act on the card's OWN project: the buttons carry the project's repoRoot (empty for the active project) and the request appends
 // ?project=<repoRoot>, which the server resolves against the registry (an unknown project is a 404, never a fallback to the active one).
 function branchProjectRequestRoot(b) {
@@ -118,7 +125,8 @@ async function fetchBranchList() {
   }
   if (!r.ok) throw new Error(BRANCHES_URL + ' -> ' + r.status);
   branchProjectsPending = (r.headers.get('X-Branch-Projects-Pending') || '').split(',').filter(Boolean);
+  branchListRefreshing = r.headers.get('X-Branch-Refreshing') === '1';
   return r.json();
 }
 
-if (typeof module !== 'undefined') module.exports = { branchIsActiveProject, branchRowKey, BRANCH_PROJECT_PINS, branchProjectHue, branchProjectColorCss, branchProjectChipHtml, groupBranchesByProject, branchProjectHeaderHtml, branchListWithProjectHeadersHtml, branchProjectsPendingHtml, branchProjectRequestRoot, branchActionUrl, branchConfirmWithProject };
+if (typeof module !== 'undefined') module.exports = { branchListRefreshingHtml, branchIsActiveProject, branchRowKey, BRANCH_PROJECT_PINS, branchProjectHue, branchProjectColorCss, branchProjectChipHtml, groupBranchesByProject, branchProjectHeaderHtml, branchListWithProjectHeadersHtml, branchProjectsPendingHtml, branchProjectRequestRoot, branchActionUrl, branchConfirmWithProject };

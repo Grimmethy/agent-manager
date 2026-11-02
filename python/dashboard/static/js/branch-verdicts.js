@@ -181,6 +181,7 @@ function renderBranchListInto(main, branches) {
   const shown = filterBranchesByVerdict(branches, branchVerdictFilter);
   main.innerHTML = branchVerdictFilterBarHtml(branches, branchVerdictFilter)
     + (typeof branchProjectsPendingHtml === 'function' ? branchProjectsPendingHtml(branchProjectsPending) : '')
+    + (typeof branchListRefreshingHtml === 'function' ? branchListRefreshingHtml(branchListRefreshing) : '')
     + (shown.length ? (typeof branchListWithProjectHeadersHtml === 'function' ? branchListWithProjectHeadersHtml(shown, branchCardHtml) : shown.map(branchCardHtml).join('')) : `<div class="empty">${branches.length ? 'No branches match this filter.' : 'Nothing is ready to verify yet.'}</div>`)
     + heldHubsHtml(typeof currentHeldHubs === 'undefined' ? [] : currentHeldHubs);
   main.querySelectorAll('[data-branch-row]').forEach(wireBranchCard);
