@@ -42,12 +42,15 @@ METER = {"tokenBudget": {"perHour": 5400000, "used": 1000, "remaining": 5399000,
 INDEX = {"total": 5, "projects": 2, "builtAt": ISO(30), "topBuckets": [{"state": "blocked", "signature": "s", "count": 3}]}
 
 
-def build(rows=(), index=INDEX, meter=METER, timer=True, env=None, switch=None):
+TRIG = {"state": "idle", "endedAt": "2027-01-15T07:59:00Z", "endedAgeS": 60, "stopped": "idle", "iterations": 1}
+
+
+def build(rows=(), index=INDEX, meter=METER, trigger=TRIG, env=None, switch=None):
     def fetch(url, timeout):
         if isinstance(meter, Exception):
             raise meter
         return meter
-    return sw.build_stalled_worker(env=env or {}, now=NOW, read_rows=lambda p: list(rows), read_index=lambda p: index, fetch=fetch, timer=lambda: timer,
+    return sw.build_stalled_worker(env=env or {}, now=NOW, read_rows=lambda p: list(rows), read_index=lambda p: index, fetch=fetch, trigger=lambda: trigger,
                                    read_sw=lambda e: switch or {"disabled": False, "disabledAt": None})
 
 
@@ -139,41 +142,21 @@ class IndexSummary(unittest.TestCase):
         self.assertEqual((s["total"], s["topBuckets"][0]["count"]), (3, 1))
 
 
-class TimerState(unittest.TestCase):
-    def run_with(self, out=None, raises=None):
-        def fake(cmd, **kw):
-            self.assertEqual(cmd, ["systemctl", "--user", "is-active", "stalled-tick.timer"])
-            self.assertEqual(kw["timeout"], 2)
-            if raises:
-                raise raises
-            return mock.Mock(stdout=out)
-        return sw.timer_state(run=fake)
-
-    def test_active_inactive_and_unknown(self):
-        self.assertIs(self.run_with("active\n"), True)
-        for out in ("inactive\n", "failed\n", "activating\n", "dead\n"):
-            self.assertIs(self.run_with(out), False, out)
-        self.assertIsNone(self.run_with("weird\n"))
-        self.assertIsNone(self.run_with("", raises=FileNotFoundError()))
-        import subprocess
-        self.assertIsNone(self.run_with("", raises=subprocess.TimeoutExpired("x", 2)))
-
-
 class Build(unittest.TestCase):
     def test_nothing_at_all_is_not_configured(self):
-        self.assertEqual(build(rows=[], index=None, meter=OSError("refused"), timer=False), {"configured": False})
-        self.assertEqual(build(rows=[], index=None, meter=OSError("refused"), timer=None), {"configured": False})
+        self.assertEqual(build(rows=[], index=None, meter=OSError("refused"), trigger=None), {"configured": False})
+        self.assertEqual(build(rows=[], index=None, meter=OSError("refused"), trigger=None), {"configured": False})
 
     def test_any_single_trace_makes_it_configured(self):
-        self.assertTrue(build(rows=[row("intent", "t1", "X", 5)], index=None, meter=OSError("x"), timer=False)["configured"])
-        self.assertTrue(build(rows=[], index=INDEX, meter=OSError("x"), timer=False)["configured"])
-        self.assertTrue(build(rows=[], index=None, meter=OSError("x"), timer=True)["configured"])
-        self.assertTrue(build(rows=[], index=None, meter=METER, timer=False)["configured"])
+        self.assertTrue(build(rows=[row("intent", "t1", "X", 5)], index=None, meter=OSError("x"), trigger=None)["configured"])
+        self.assertTrue(build(rows=[], index=INDEX, meter=OSError("x"), trigger=None)["configured"])
+        self.assertTrue(build(rows=[], index=None, meter=OSError("x"), trigger=TRIG)["configured"])
+        self.assertTrue(build(rows=[], index=None, meter=METER, trigger=None)["configured"])
 
     def test_the_full_payload(self):
         rows = [row("intent", "t1", "ARCHIVE-DUPLICATE", 3000), row("result", "t1", "ARCHIVE-DUPLICATE", 2999, mode="on", result="done"), row("intent", "t2", "ESCALATE-MECHANISM", 60)]
         p = build(rows=rows)
-        self.assertEqual((p["configured"], p["mode"], p["timerActive"], p["lastTickAgeS"], p["decisions"]), (True, "dry-run", True, 60, 2))
+        self.assertEqual((p["configured"], p["mode"], p["trigger"]["state"], p["lastTickAgeS"], p["decisions"]), (True, "dry-run", "idle", 60, 2))
         self.assertEqual(p["lastTickAt"], ISO(60))
         self.assertEqual(p["today"], {"ARCHIVE-DUPLICATE": 1, "ESCALATE-MECHANISM": 1})
         self.assertEqual(p["stalled"], INDEX)
@@ -246,15 +229,16 @@ class Build(unittest.TestCase):
         self.assertIsNone(build(rows=[row("intent", "t1", "X", 5)], meter={"provider": "p"})["budget"])
         self.assertIsNone(build(rows=[row("intent", "t1", "X", 5)], meter={"tokenBudget": "x"})["budget"])
 
-    def test_an_unknowable_timer_is_none_not_false(self):
-        self.assertIsNone(build(rows=[row("intent", "t1", "X", 5)], timer=None)["timerActive"])
-        self.assertIs(build(rows=[row("intent", "t1", "X", 5)], timer=False)["timerActive"], False)
+    def test_a_worker_that_was_never_triggered_has_trigger_none_and_the_trigger_flows_through(self):
+        self.assertIsNone(build(rows=[row("intent", "t1", "X", 5)], trigger=None)["trigger"])
+        self.assertEqual(build(rows=[row("intent", "t1", "X", 5)], trigger={"state": "draining"})["trigger"], {"state": "draining"})
+        self.assertNotIn("timerActive", build(rows=[row("intent", "t1", "X", 5)]))
 
     def test_it_never_raises_whatever_a_reader_does(self):
         def boom(*a, **k):
             raise RuntimeError("x")
-        self.assertEqual(sw.build_stalled_worker(env={}, now=NOW, read_rows=boom, read_index=boom, fetch=boom, timer=boom, read_sw=boom), {"configured": False})
-        p = sw.build_stalled_worker(env={}, now=NOW, read_rows=lambda p: [row("intent", "t", "X", 5)], read_index=boom, fetch=boom, timer=boom, read_sw=boom)
+        self.assertEqual(sw.build_stalled_worker(env={}, now=NOW, read_rows=boom, read_index=boom, fetch=boom, trigger=boom, read_sw=boom), {"configured": False})
+        p = sw.build_stalled_worker(env={}, now=NOW, read_rows=lambda p: [row("intent", "t", "X", 5)], read_index=boom, fetch=boom, trigger=boom, read_sw=boom)
         self.assertEqual(p["switch"], {"disabled": False, "disabledAt": None})
         self.assertTrue(p["configured"])
         self.assertIsNone(p["stalled"])
@@ -273,7 +257,7 @@ class Build(unittest.TestCase):
         def fetch(url, timeout):
             seen["url"], seen["timeout"] = url, timeout
             raise OSError("x")
-        sw.build_stalled_worker(env={"STALLED_LEDGER_PATH": "/l", "STALLED_INDEX_PATH": "/i", "STALLED_MODEL_URL": "http://gw:9/"}, now=NOW, read_rows=rows, read_index=idx, fetch=fetch, timer=lambda: None)
+        sw.build_stalled_worker(env={"STALLED_LEDGER_PATH": "/l", "STALLED_INDEX_PATH": "/i", "STALLED_MODEL_URL": "http://gw:9/"}, now=NOW, read_rows=rows, read_index=idx, fetch=fetch, trigger=lambda: None)
         self.assertEqual(seen, {"ledger": "/l", "index": "/i", "url": "http://gw:9/meter", "timeout": 3})
         self.assertEqual(sw.ledger_path({}), os.path.join(os.path.expanduser("~"), ".local", "state", "pipeline-ops", "stalled-ledger.jsonl"))
         self.assertEqual(sw.index_path({}), os.path.join(os.path.expanduser("~"), ".local", "state", "pipeline-ops", "stalled-index.json"))
@@ -333,8 +317,8 @@ class SwitchRule(unittest.TestCase):
         off = {"disabled": True, "disabledAt": "2026-11-02T12:00:00.000Z"}
         self.assertEqual(build(rows=[row("intent", "t", "X", 5)], switch=off)["switch"], off)
         self.assertEqual(build(rows=[row("intent", "t", "X", 5)])["switch"], {"disabled": False, "disabledAt": None})
-        self.assertEqual(build(rows=[], index=None, meter=OSError("x"), timer=False, switch=off)["switch"], off)
-        self.assertEqual(build(rows=[], index=None, meter=OSError("x"), timer=False), {"configured": False})
+        self.assertEqual(build(rows=[], index=None, meter=OSError("x"), trigger=None, switch=off)["switch"], off)
+        self.assertEqual(build(rows=[], index=None, meter=OSError("x"), trigger=None), {"configured": False})
 
 
 class Route(unittest.TestCase):

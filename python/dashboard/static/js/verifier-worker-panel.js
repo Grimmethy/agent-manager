@@ -1,5 +1,5 @@
-// Branch-verifier card for the Workers tab (agent-manager-pipeline-ops). The verifier is a CLI run by a user systemd timer, not a lane, so this card is how it shows up:
-// same layout as the lane workers and the stalled-task card (id left; mode badge, timer badge, "last tick" and the Turn on/off button stacked right; one meta line; click the
+// Branch-verifier card for the Workers tab (agent-manager-pipeline-ops). The verifier is a CLI started by the watchdog trigger (no timer), not a lane, so this card is how it shows up:
+// same layout as the lane workers and the stalled-task card (id left; mode badge, trigger badge, "last tick" and the Turn on/off button stacked right; one meta line; click the
 // card to open the history). A plain global <script> of pure string builders (no DOM, no fetch, no require), loaded by index.html after stalled-worker-panel.js;
 // workers-tab.js appends renderVerifierWorkerSection(payload). `payload` is the GET /api/branch-verifier body (routes/verifier_worker.py).
 
@@ -36,10 +36,23 @@ function verifierWorkerModeBadge(mode) {
   return '<span class="badge idle" title="No decision has been recorded yet">no runs yet</span>';
 }
 
-function verifierWorkerTimerBadge(active) {
-  if (active === true) return '<span class="badge ok" title="The user systemd timer verify-tick.timer is running">timer on</span>';
-  if (active === false) return '<span class="badge warn" title="verify-tick.timer is not running, so no new ticks happen">timer stopped</span>';
-  return '<span class="badge idle" title="The timer state could not be read">timer unknown</span>';
+// The watchdog trigger (no timer): `t` is payload.trigger {state: 'draining' | 'backlog' | 'idle', endedAgeS, stopped} or null when it has never run.
+// The watchdog calls the trigger about once a minute and it rewrites its heartbeat every time, so a heartbeat older than this means the watchdog or the plugin entry is broken.
+const verifierWorkerTriggerSilentS = 300;
+
+function verifierWorkerTriggerBadge(t) {
+  const ended = t && Number.isFinite(t.endedAgeS) ? ' The last drain ended ' + verifierWorkerAge(t.endedAgeS) + ' ago' + (t.stopped ? ' (' + verifierWorkerEsc(t.stopped) + ')' : '') + '.' : '';
+  const checked = t && Number.isFinite(t.checkedAgeS) ? ' Checked ' + verifierWorkerAge(t.checkedAgeS) + ' ago.' : '';
+  if (t && t.state === 'draining') return '<span class="badge ok" title="A drain is running: the watchdog saw new input and the worker is ticking through it.">draining</span>';
+  if (t && Number.isFinite(t.checkedAgeS) && t.checkedAgeS > verifierWorkerTriggerSilentS) return '<span class="badge warn" title="The watchdog has not called the trigger for ' + verifierWorkerAge(t.checkedAgeS) + '. It normally does about once a minute: check the watchdog and watchdogScripts on the plugins.json entry.">trigger silent</span>';
+  if (t && t.state === 'backlog') return '<span class="badge warn" title="The last drain stopped at its cap with work left; the next watchdog tick continues it.' + ended + checked + '">backlog</span>';
+  if (t && t.state === 'idle') return '<span class="badge ok" title="The watchdog trigger is armed: it starts a drain when the input changes.' + ended + checked + '">trigger on</span>';
+  return '<span class="badge warn" title="The watchdog trigger has not run yet. Check that watchdogScripts for this worker is set on its plugins.json entry.">no trigger yet</span>';
+}
+
+// "trigger checked 12s ago" for the meta line; empty when there is no heartbeat to show.
+function verifierWorkerTriggerCheckedText(t) {
+  return t && Number.isFinite(t.checkedAgeS) ? 'trigger checked ' + verifierWorkerAge(t.checkedAgeS) + ' ago' : '';
 }
 
 function verifierWorkerSwitchBadge(sw) {
@@ -52,7 +65,7 @@ function verifierWorkerSwitchButton(sw) {
   const off = !!(sw && sw.disabled === true);
   const title = off
     ? 'Switch the verifier back on: it starts verifying again at its next tick (within a minute).'
-    : 'Switch the verifier off: new ticks do nothing (a tick already running finishes). The timer keeps running; nothing is deleted.';
+    : 'Switch the verifier off: new ticks do nothing (a tick already running finishes). The watchdog trigger keeps running; nothing is deleted.';
   return '<button type="button" class="secondary verifier-switch-btn" data-next-enabled="' + (off ? 'true' : 'false') + '" title="' + verifierWorkerEsc(title)
     + '" style="margin-top:4px">' + (off ? '⏻ Turn on' : '⏻ Turn off') + '</button>';
 }
@@ -91,10 +104,10 @@ function buildVerifierWorkerHtml(p) {
   const open = verifierWorkerExpanded === true;
   const age = verifierWorkerAge(p.lastTickAgeS);
   const head = '<div class="row"><span class="id">✅ branch-verifier</span><div class="badge-col">'
-    + (off ? verifierWorkerSwitchBadge(p.switch) : verifierWorkerModeBadge(p.mode)) + ' ' + verifierWorkerTimerBadge(p.timerActive)
+    + (off ? verifierWorkerSwitchBadge(p.switch) : verifierWorkerModeBadge(p.mode)) + ' ' + verifierWorkerTriggerBadge(p.trigger)
     + '<span class="state-timer">' + (age ? 'last tick ' + verifierWorkerEsc(age) + ' ago' : 'no tick recorded yet') + '</span>'
     + verifierWorkerSwitchButton(p.switch) + '</div></div>';
-  const meta = '<div class="meta">' + verifierWorkerCountsText(p) + ' · ' + verifierWorkerIndexText(p.indexed) + ' · today: ' + verifierWorkerTodayText(p, 3) + '</div>';
+  const meta = '<div class="meta">' + verifierWorkerCountsText(p) + ' · ' + verifierWorkerIndexText(p.indexed) + (verifierWorkerTriggerCheckedText(p.trigger) ? ' · ' + verifierWorkerTriggerCheckedText(p.trigger) : '') + ' · today: ' + verifierWorkerTodayText(p, 3) + '</div>';
   const toggle = '<div class="meta" style="margin-top:4px">' + (open ? '▾ Hide history' : '▸ Show history') + (p.decisions !== undefined ? ' (' + verifierWorkerInt(p.decisions) + ' decisions)' : '') + '</div>';
   const detail = open ? '<div class="worker-recent-tasks"><div class="meta" style="margin-top:8px"><strong>Today</strong> ' + verifierWorkerTodayText(p) + '</div>'
     + verifierWorkerRecentHtml(p.recent) + '</div>' : '';
@@ -102,7 +115,7 @@ function buildVerifierWorkerHtml(p) {
     + head + meta + toggle + detail + '</div>';
 }
 
-// What renderWorkers() appends: nothing at all unless the verifier has left any trace (ledger, index, running timer or a switched-off marker).
+// What renderWorkers() appends: nothing at all unless the verifier has left any trace (ledger, index, trigger state or a switched-off marker).
 function renderVerifierWorkerSection(payload) {
   return buildVerifierWorkerHtml(payload);   // returns '' itself unless payload.configured
 }

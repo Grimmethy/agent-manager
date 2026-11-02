@@ -1,6 +1,6 @@
 """The Workers tab's Branch-verifier panel payload (agent-manager-pipeline-ops, 2026-11-02).
 
-The verifier is NOT a lane (it produces a verdict, not a code diff): it is a CLI run by a user systemd timer (verify-tick.timer) that records `source: "worker"`
+The verifier is NOT a lane (it produces a verdict, not a code diff): it is a CLI that the agent-manager watchdog triggers (a `watchdogScripts` entry in plugins.json starts a detached drain when its input changed) and that records `source: "worker"`
 verdicts through this dashboard's own verdict route. This route only READS what it leaves behind:
 
   ledger  JSONL, append-only: an 'intent' line per verdict it is about to post and a 'result' line when it ran (dry-run writes only the intent)
@@ -8,22 +8,21 @@ verdicts through this dashboard's own verdict route. This route only READS what 
   marker  the on/off file its tick checks first (the panel's Turn off/on button writes it)
 
 Event, not poll (ADR-0024): no timer of its own; it reads files the verifier rewrites on each tick, once per Workers-tab refresh. Fails soft everywhere: a missing file, a
-torn ledger line or an unknowable timer each just leave that part out, and with nothing at all the payload is {configured: False} and the card stays hidden.
+torn ledger line or an unreadable trigger state each just leave that part out, and with nothing at all the payload is {configured: False} and the card stays hidden.
 """
 import json
 import os
-import subprocess
 import time
 from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, request
 
+from routes.worker_trigger import read_trigger
+
 verifier_worker_bp = Blueprint("verifier-worker-bp", __name__)
 
 LEDGER_TAIL_BYTES = 256 * 1024
-TIMER_TIMEOUT_S = 2
 RECENT_COUNT = 8
-TIMER_UNIT = "verify-tick.timer"
 
 _index_cache = {"key": None, "value": None}
 
@@ -141,21 +140,6 @@ def read_index_count(path):
     return value
 
 
-def timer_state(run=None):
-    """True / False for the verifier's user systemd timer, None when it cannot be known (no systemd user session, a timeout)."""
-    run = run or subprocess.run     # looked up per call so a test can patch subprocess.run
-    try:
-        r = run(["systemctl", "--user", "is-active", TIMER_UNIT], capture_output=True, text=True, timeout=TIMER_TIMEOUT_S)
-        out = (r.stdout or "").strip()
-        if out == "active":
-            return True
-        if out in ("inactive", "failed", "activating", "deactivating", "dead"):
-            return False
-        return None
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
 def _parse_ts(s):
     try:
         return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
@@ -163,7 +147,7 @@ def _parse_ts(s):
         return None
 
 
-def build_verifier_worker(env=None, now=None, read_rows=read_ledger_tail, read_index=read_index_count, timer=timer_state, read_sw=read_switch):
+def build_verifier_worker(env=None, now=None, read_rows=read_ledger_tail, read_index=read_index_count, trigger=None, read_sw=read_switch):
     """The panel payload. See the module docstring. Never raises."""
     env = os.environ if env is None else env
     now = time.time() if now is None else now
@@ -176,9 +160,9 @@ def build_verifier_worker(env=None, now=None, read_rows=read_ledger_tail, read_i
 
     rows = safe(lambda: read_rows(ledger_path(env)), [])
     index = safe(lambda: read_index(index_path(env)), None)
-    timer_active = safe(timer, None)
+    trigger_state = safe(trigger or (lambda: read_trigger('verifier', env, now)), None)
     switch = safe(lambda: read_sw(env), {"disabled": False, "disabledAt": None})
-    if not rows and not index and timer_active is not True and not switch.get("disabled"):
+    if not rows and not index and trigger_state is None and not switch.get("disabled"):
         return {"configured": False}
 
     ds = safe(lambda: decisions(rows), [])
@@ -200,7 +184,7 @@ def build_verifier_worker(env=None, now=None, read_rows=read_ledger_tail, read_i
         "configured": True,
         "mode": last_mode,
         "switch": switch,
-        "timerActive": timer_active,
+        "trigger": trigger_state,
         "lastTickAt": datetime.fromtimestamp(last_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if last_ts is not None else None,
         "lastTickAgeS": max(0, int(now - last_ts)) if last_ts is not None else None,
         "indexed": index,
