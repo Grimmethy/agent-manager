@@ -442,7 +442,7 @@ async function renderJobListTab() {
   const backboneHtml = mapAvailable ? `
     <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px;">
       ${PIPELINE_STAGE_ORDER.map((stage) => `
-        <div style="flex:1; min-width:110px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px; text-align:center;">
+        <div style="flex:1; min-width:110px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px; text-align:center;">
           <div style="font-size:22px; font-weight:700; color:${stageTotals[stage] > 0 ? 'var(--accent)' : 'var(--muted)'};">${stageTotals[stage]}</div>
           <div class="meta">${PIPELINE_STAGE_LABELS[stage]}</div>
         </div>
@@ -595,7 +595,7 @@ async function renderJobListTab() {
       <td>${headerPriorityCell}</td>
       <td colspan="10">
         <button type="button" class="fam-toggle" data-family="${escapeAttr(item.key)}"
-          style="background:none;border:none;color:inherit;cursor:pointer;font:inherit;padding:0 6px 0 0">${collapsed ? '▶' : '▼'}</button>
+          style="background:none;border:none;color:inherit;cursor:pointer;font:inherit;padding:0 8px 0 0">${collapsed ? '▶' : '▼'}</button>
         <b>${escapeHtml(item.label)}</b>
         <span class="meta"> — ${item.members.length} sources · ${spread}</span>
       </td>
@@ -617,14 +617,14 @@ async function renderJobListTab() {
   // rather than auto-generated.
   const detailInsetsHtml = mapAvailable ? `
     <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:24px;">
-      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px;">
+      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:16px;">
         <div style="font-weight:600; margin-bottom:8px;">Adhoc draft (domain:'adhoc', source:'manual')</div>
         <div class="meta" style="line-height:1.7;">
           A single local multi-turn agentic pass, <b>local-agentic-write</b> (local-agentic-write-draft.js) — real read/grep/glob/edit/write/run_bash tool access against an isolated worktree. No Claude tier, and no cheaper escalation tiers ahead of it: those existed 2026-09-01 through 2026-09-06, removed after real production history showed the cheap tiers won only ~11% of the time combined while costing the other ~89% their full time for nothing, and a safety audit found no incident of this pass's write access producing a bad edit a cheaper read-only tier would have caught. Declines (blocks for a human) if it can't confidently make the change.<br>
           Can resolve to <b>decompose</b> (task judged too large — queues 2+ fresh adhoc sub-tasks to <code>queue/adhoc/</code> instead of a diff) or <b>needs-human-decision</b> (routes to <code>queue/needs-clarification/</code>, never judged by an automatic reviewer).
         </div>
       </div>
-      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px;">
+      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:16px;">
         <div style="font-weight:600; margin-bottom:8px;">Split escape hatch (candidate-fulfillment sources — see "split-capable" badge)</div>
         <div class="meta" style="line-height:1.7;">
           Implement can output <code>{"mode":"split","candidates":[...]}</code> instead of a diff when the real candidate genuinely doesn't fit one atomic JSON edit (prompts.js's candidateSplitInstructions). Skips critique (no diff to critique) and goes straight to review, judged on scope-coverage rather than "does it contain code." At apply time, the sub-candidates are written back into the <i>same</i> candidates doc the original came from (the exact appender arch_discovery's own apply already uses) — each one then flows through the normal pickup loop on a later tick, small enough to land as its own single edit.
@@ -634,9 +634,9 @@ async function renderJobListTab() {
   ` : '';
 
   if (isStale()) return;
-  main.innerHTML = `<div style="margin-bottom:10px"><button id="reset-job-type-counts" class="secondary">Reset counts</button></div>`
+  main.innerHTML = `<div style="margin-bottom:8px"><button id="reset-job-type-counts" class="secondary">Reset counts</button></div>`
     + backboneHtml
-    + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Behavior</th><th>Live (in-flight)</th><th title="Min / Avg / Max turnsUsed across every recorded runPlanWithTools() call for this source">Turns (min/avg/max)</th><th>Times Performed</th><th>Available</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`
+    + `<div class="table-scroll"><table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Behavior</th><th>Live (in-flight)</th><th title="Min / Avg / Max turnsUsed across every recorded runPlanWithTools() call for this source">Turns (min/avg/max)</th><th>Times Performed</th><th>Available</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table></div>`
     + unregisteredHtml
     + detailInsetsHtml;
 
@@ -880,7 +880,7 @@ function renderWatchConfigChecklist(watchConfig) {
     </label>`).join('');
   return `
     <div class="field-label">Watching</div>
-    <div style="margin-bottom:10px;">${items}</div>
+    <div style="margin-bottom:8px;">${items}</div>
     <div class="meta" style="margin-bottom:14px;">Unchecked categories stop being measured
       each tick (not just hidden here) -- on a CPU-constrained box, checking only CPU
       skips the plugin's own expensive probe call entirely.</div>`;

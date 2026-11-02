@@ -268,7 +268,10 @@
   iframe.viz { width: 100%; flex: 1; min-height: 0; border: 2px solid var(--border); border-radius: 8px; margin-top: 16px; }
   .split-pane { display: flex; gap: 16px; align-items: flex-start; }
   .split-pane > div { flex: 1; min-width: 0; }
-  .capture-row { display: flex; gap: 8px; margin-bottom: 14px; }
+  .capture-row { display: flex; gap: 8px; margin-bottom: 16px; }
+  /* A wide data table scrolls inside its own box instead of pushing the whole tab sideways (Job List was 1669px wide in a 754px tab). */
+  .table-scroll { overflow-x: auto; border: 2px solid var(--border); border-radius: 8px; margin-bottom: 16px; }
+  .table-scroll > table { margin: 0; }
   .capture-row input { flex: 1; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; }
   .bd-entry { background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 8px; }
   .bd-entry .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
@@ -305,7 +308,7 @@
   .grill-session .grill-answer { display: block; width: 100%; box-sizing: border-box; resize: vertical; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; margin-top: 10px; font-family: inherit; }
   .grill-enriched-badge { color: var(--ok); font-size: 12px; margin-top: 10px; }
   .browser-entry.active { background: var(--bg); color: var(--accent); }
-  .priority-input { width: 60px; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 6px; font-size: 13px; }
+  .priority-input { width: 60px; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px; border-radius: 6px; font-size: 13px; }
   .priority-input:focus { outline: 1px solid var(--accent); }
 
   /* Mobile layout: below this width there isn't room for the fixed 200px nav rail plus a
