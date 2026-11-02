@@ -259,6 +259,19 @@ existing hardcoded tab (Hub Tasks, or the PromptForge/AdForge/ScriptForge iframe
 companions) onto this mechanism is separate follow-up work, tracked in
 `Docs/hub-tasks-extraction-plan.md`.
 
+## Watchdog scripts (optional)
+
+A plugin that needs "check something cheap every tick, act only on a change" declares it in its `plugins.json` entry instead of starting a timer of its own (ADR-0024: the watchdog is the single clock):
+
+```json
+{ "name": "uiforge", "registerPath": "/path/uiforge/register.js", "enabled": true, "watchdogScripts": ["harness/watchdog-trigger.js"] }
+```
+
+- `src/plugin-watchdog-scripts.js` lists the scripts of every ENABLED entry. Each path must be relative to the plugin root (the directory of `registerPath`), contain no `..`, and end in `.js`; anything else is skipped with a reason on stderr, never thrown. Extra manifest fields survive both the JS reader and the dashboard's plugin toggle, which rewrites whole entries.
+- `scripts/run-plugin-watchdog-scripts.sh`, called from `scripts/queue-watcher.sh` once per tick, runs each script with `timeout` (`AGENT_MANAGER_PLUGIN_WATCHDOG_TIMEOUT_SECS`, default 20), sends its stderr to `<HOME_LOGS>/watchdog-plugin-<plugin>.log`, logs its FIRST stdout line as `[watchdog] <plugin>:<script>: <line>`, and logs a failure or timeout once without stopping the tick or the scripts after it. `AGENT_MANAGER_PLUGIN_WATCHDOG_SCRIPTS=off` disables it. With no plugin declaring scripts a tick pays one extra node start (about 40 ms measured).
+- A script must do ONE cheap edge check (compare a stored sha or file stats) and return fast. Anything slow starts a detached, lock-protected singleton (`scripts/lib/start-singleton-bg.sh`), the way the proactive decompose sweep does.
+- This is an interim hook. The event that would make a script unnecessary is the queue-events journal (ADR-0024 S1, not built yet); a script should count every change it finds without an event so that gap stays measurable.
+
 ## Reserving a GPU and showing the job (optional)
 
 For a plugin that runs its own GPU work beside the pipeline (first one: KaggleForge's eval runner, a Python process). Both
