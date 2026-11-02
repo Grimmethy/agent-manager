@@ -29,7 +29,7 @@ function buildSlotSections(slottedPlugins) {
     const radioName = `slot-${slot}`;
     const noneChecked = !members.some((m) => m.active) ? 'checked' : '';
     const options = [`
-      <label style="display:flex; align-items:center; gap:8px; padding:8px 10px; cursor:pointer;">
+      <label style="display:flex; align-items:center; gap:8px; padding:8px 12px; cursor:pointer;">
         <input type="radio" name="${escapeAttr(radioName)}" class="slot-radio" data-slot="${escapeAttr(slot)}" value="" ${noneChecked}>
         <span>None (stop monitoring)</span>
       </label>`, ...members.map((m) => {
@@ -37,7 +37,7 @@ function buildSlotSections(slottedPlugins) {
         ? '<span class="badge ok" style="margin-left:6px;">running</span>'
         : '<span class="badge idle" style="margin-left:6px;">stopped</span>';
       return `
-      <label style="display:flex; align-items:flex-start; gap:8px; padding:8px 10px; cursor:pointer;">
+      <label style="display:flex; align-items:flex-start; gap:8px; padding:8px 12px; cursor:pointer;">
         <input type="radio" name="${escapeAttr(radioName)}" class="slot-radio" data-slot="${escapeAttr(slot)}" value="${escapeAttr(m.name)}" ${m.active ? 'checked' : ''} style="margin-top:2px;">
         <span>
           <div style="font-weight:600;">${escapeHtml(m.name)}${badge}</div>

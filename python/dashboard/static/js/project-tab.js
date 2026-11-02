@@ -51,15 +51,15 @@ async function enterProjectTab() {
         <input id="project-grepdirs-input" type="text" placeholder="src, frontend/src, backend/src (optional -- comma-separated, leave blank to scan the whole path)" value="${escapeAttr(grepDirs)}">
       </div>
       <div class="path-row" id="pipeline-toggles-row" style="gap:16px;align-items:center;">
-        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;">
+        <label style="display:flex;align-items:center;gap:4px;font-size:13px;cursor:pointer;">
           <input type="checkbox" id="include-apply-toggle" ${includeApply ? 'checked' : ''}>
           Enable Apply Runner (writes/commits changes)
         </label>
-        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;${includeApply ? '' : 'opacity:.5;'}" title="Applied work is always pushed now (2026-08-17) -- an unpushed branch was silently losing real work over time. This only controls whether the local checkout returns to main after each apply, or stays on the applied branch for inspection.">
+        <label style="display:flex;align-items:center;gap:4px;font-size:13px;cursor:pointer;${includeApply ? '' : 'opacity:.5;'}" title="Applied work is always pushed now (2026-08-17) -- an unpushed branch was silently losing real work over time. This only controls whether the local checkout returns to main after each apply, or stays on the applied branch for inspection.">
           <input type="checkbox" id="skip-push-toggle" ${!includeApply ? 'disabled' : ''} ${!skipPush ? 'checked' : ''}>
           Return to main after each apply (unchecked: stay on the applied branch)
         </label>
-        <span class="meta" style="font-size:0.85em;">Which job types run is now controlled from the Job List tab. Applied work is always pushed to the remote for durability, regardless of this toggle.</span>
+        <span class="meta" style="font-size:12px;">Which job types run is now controlled from the Job List tab. Applied work is always pushed to the remote for durability, regardless of this toggle.</span>
       </div>
       <div id="browser-panel" class="browser-panel" style="display:none"></div>
       <div id="pipeline-panel" class="worker-card"></div>
