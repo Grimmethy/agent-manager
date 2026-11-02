@@ -315,10 +315,10 @@ async function renderWorkers(isPoll) {
     }
   });
   const filterBar = `
-    <div class="worker-filter-bar" style="margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
+    <div class="worker-filter-bar" style="margin-bottom:12px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px">
       <div></div>
-      <label style="display:flex; align-items:center; gap:6px; font-size:0.9em; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
-        <input type="checkbox" id="claude-pause-toggle" ${workerModels.claudePaused ? 'checked' : ''}>
+      <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
+        <input type="checkbox" id="claude-pause-toggle" style="margin:0" ${workerModels.claudePaused ? 'checked' : ''}>
         Pause Claude (preserve subscription tokens)
       </label>
     </div>
