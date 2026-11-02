@@ -22,12 +22,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { SCAN_DIRS } = require('./lib/shared-branch');
 
 const REVALIDATE_MS = 60000;
 const RACY_MS = 2000;
 const CACHE_VERSION = 1;
 const SNAPSHOT_TTL_MS = 30000;
-const SCAN_DIRS = ['done', 'review', 'approved', 'pending', 'adhoc', 'blocked', 'needs-clarification', 'awaiting-confirm', 'drafting'];
 
 function cacheDisabled() {
   return /^false$/i.test(String(process.env.AGENT_MANAGER_QUEUE_CACHE || '').trim());
@@ -168,13 +168,16 @@ function readTaskCached(cache, fullPath) {
   return { task: read.task, mtimeMs: read.mtimeMs };
 }
 
-// Build a snapshot of all queue stages by reading every .json file in SCAN_DIRS once.
-// Returns { <state>: { files: { <filename>: { content, mtimeMs, size } }, mtime: <dirMtimeMs> } }
-// for each state in SCAN_DIRS.
+// Build a snapshot of all queue stages by reading every .json file in SCAN_DIRS once,
+// then write it atomically to /dev/shm/agent-manager-queue-tick-<instanceId>.json.
+// Returns the snapshot file path on success, null on failure.
 function buildQueueSnapshot(pipelineDir) {
-  if (!pipelineDir) return {};
+  if (!pipelineDir) return null;
+  const instanceId = process.env.AGENT_MANAGER_INSTANCE_ID || 'unknown';
+  const snapshotDir = '/dev/shm';
+  const snapshotFile = path.join(snapshotDir, `agent-manager-queue-tick-${instanceId}.json`);
+  
   const snapshot = {};
-  const now = Date.now();
   for (const state of SCAN_DIRS) {
     const dir = state === 'drafting'
       ? path.join(pipelineDir, 'queue', 'drafting')
@@ -193,19 +196,11 @@ function buildQueueSnapshot(pipelineDir) {
       snapshot[state] = { files, mtime: dirStat.mtimeMs };
     } catch (_) { /* directory missing or unreadable: skip */ }
   }
-  return snapshot;
-}
-
-// Write the snapshot to /dev/shm/agent-manager-queue-tick-<instanceId>.json with TTL.
-function writeQueueSnapshot(pipelineDir) {
-  const instanceId = process.env.AGENT_MANAGER_INSTANCE_ID || 'unknown';
-  const snapshotDir = '/dev/shm';
-  const snapshotFile = path.join(snapshotDir, `agent-manager-queue-tick-${instanceId}.json`);
+  
   try {
-    const snapshot = buildQueueSnapshot(pipelineDir);
-    const payload = { snapshot, writtenAt: Date.now(), ttl: SNAPSHOT_TTL_MS };
     fs.mkdirSync(snapshotDir, { recursive: true });
     const tmp = `${snapshotFile}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+    const payload = { snapshot, writtenAt: Date.now(), ttl: SNAPSHOT_TTL_MS };
     fs.writeFileSync(tmp, JSON.stringify(payload));
     fs.renameSync(tmp, snapshotFile);
     return snapshotFile;
@@ -232,4 +227,4 @@ function readQueueSnapshot(snapshotFile) {
   }
 }
 
-module.exports = { openQueueCache, readTaskCached, cacheFileFor, REVALIDATE_MS, RACY_MS, buildQueueSnapshot, writeQueueSnapshot, readQueueSnapshot, SCAN_DIRS, SNAPSHOT_TTL_MS };
+module.exports = { openQueueCache, readTaskCached, cacheFileFor, REVALIDATE_MS, RACY_MS, buildQueueSnapshot, readQueueSnapshot, SCAN_DIRS, SNAPSHOT_TTL_MS };
