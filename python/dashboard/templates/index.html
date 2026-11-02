@@ -33,7 +33,7 @@
      does, so a long tab list and a long #main page no longer share one page scroll. 53px is the
      header height both rules already assume. align-self:flex-start stops the flex row from
      stretching nav to #main's height (which would defeat the fixed height). */
-  nav { width: 200px; flex-shrink: 0; padding: 16px 0; border-right: 2px solid var(--border); height: calc(100vh - 53px); position: sticky; top: 53px; align-self: flex-start; overflow-y: auto; overscroll-behavior: contain; }
+  nav { width: 232px; flex-shrink: 0; padding: 16px 0; border-right: 2px solid var(--border); height: calc(100vh - 53px); position: sticky; top: 53px; align-self: flex-start; overflow-y: auto; overscroll-behavior: contain; }
   /* Chat panel (Brain Dump #153): a third flex sibling of nav/main, not a modal -- see
      app.py/chat_sessions.py for the backend. Collapsed state is a plain width/visibility
      toggle (localStorage-persisted, same convention nav-group expand/collapse already
@@ -62,6 +62,18 @@
   nav button.active { background: var(--panel); border-left: 3px solid var(--accent); color: var(--accent); }
   /* Floating notch (nav-notch.js): a ball in a ring at the right edge of the active tab; it hops to the newly chosen tab. */
   nav button { padding-right: 32px; }
+  /* Sidebar sections (nav-sections.js, renderNavSections in core-ui.js): a small label per section with a fold chevron, and a hairline that fades out at both ends between sections. */
+  :root { --border-strong: #5668a0; }
+  .nav-div { height: 1px; margin: 12px 8px; background: linear-gradient(90deg, transparent, var(--border-strong), transparent); }
+  nav button.nav-sh { display: flex; align-items: center; justify-content: flex-start; gap: 8px; padding: 6px 20px; font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  nav button.nav-sh:hover { background: none; color: var(--text); }
+  nav button.nav-sub-sh { padding-left: 32px; text-transform: none; letter-spacing: 0; font-weight: 500; }
+  .nav-sh .nav-sh-label { flex: 1; text-align: left; }
+  .nav-sh em { font-style: normal; font-variant-numeric: tabular-nums; letter-spacing: 0; color: var(--muted); }
+  .nav-chev { display: inline-flex; transition: transform .1s ease; }
+  .nav-chev.closed { transform: rotate(-90deg); }
+  .nav-here { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
+  @media (prefers-reduced-motion: reduce) { .nav-chev { transition: none; } }
   .nav-notch { position: absolute; top: 0; left: calc(100% - 16px); width: 12px; height: 12px; pointer-events: none; will-change: transform; }
   .nav-notch::before { content: ''; position: absolute; inset: -4px; border: 2px solid var(--border); border-radius: 50%; background: var(--bg); }
   .nav-notch-ball { position: absolute; inset: 0; border-radius: 50%; background: var(--accent); }
@@ -307,6 +319,7 @@
 
 <script src="{{ url_for('static', filename='js/core-ui.js') }}"></script>
 <script src="/static/js/nav-notch.js"></script>
+<script src="/static/js/nav-sections.js"></script>
 <script src="/static/js/queue-tab.js"></script>
 <script src="/static/js/plugins-tab.js"></script>
 <script src="/static/js/workers-tab.js"></script>

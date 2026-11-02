@@ -427,24 +427,77 @@ if (typeof window !== 'undefined' && window.matchMedia) {
   if (mq.addEventListener) mq.addEventListener('change', () => { if (typeof renderNav === 'function' && document.getElementById('nav')) renderNav(); });
 }
 
+const NAV_CHEVRON_SVG = '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 6l3 3 3-3"/></svg>';
+
+function navFoldKey(path) { return 'agentManagerNavSection_' + path; }
+
+// One fold header: a chevron, the label, a dot when something inside needs attention (shown even while folded), a count, and a marker when the
+// folded section holds the tab on screen. sub is true for the Forges sub-groups.
+function renderNavFoldHeader(label, { open, sub, severity, badge, here, path }) {
+  const header = document.createElement('button');
+  header.className = sub ? 'nav-sh nav-sub-sh' : 'nav-sh';
+  if (typeof header.setAttribute === 'function') header.setAttribute('aria-expanded', open ? 'true' : 'false');
+  header.innerHTML = `<span class="nav-chev${open ? '' : ' closed'}">${NAV_CHEVRON_SVG}</span><span class="nav-sh-label">${escapeHtml(label)}</span>`
+    + (here && !open ? '<span class="nav-here" title="The tab you are on is in here"></span>' : '')
+    + (severity ? `<span class="status-dot ${severity}"></span>` : '')
+    + (badge ? `<em>${badge}</em>` : '');
+  header.onclick = () => {
+    localStorage.setItem(navFoldKey(path), open ? 'collapsed' : 'expanded');
+    renderNav();
+  };
+  return header;
+}
+
+// The wide layout: sections (nav-sections.js) with a hairline divider between them. Fold choices persist per section / sub-group in localStorage.
+function renderNavSections(nav) {
+  const countOf = (key) => counts[key];
+  const severityOf = (key) => severityForTab(key, counts[key]);
+  buildNavSections(TABS).forEach((section, i) => {
+    if (i > 0) {
+      const divider = document.createElement('div');
+      divider.className = 'nav-div';
+      nav.appendChild(divider);
+    }
+    const containsActive = navSectionContains(section, activeTab);
+    const open = navSectionOpen({ stored: localStorage.getItem(navFoldKey(section.key)), defaultOpen: section.defaultOpen, containsActive });
+    const { badge, severity } = navSectionSummary(section, { countOf, severityOf });
+    nav.appendChild(renderNavFoldHeader(section.label, { open, sub: false, severity, badge, here: containsActive, path: section.key }));
+    if (!open) return;
+    for (const tab of section.items) nav.appendChild(renderTabButton(tab, false));
+    for (const sub of section.subgroups || []) {
+      const path = `${section.key}.${sub.key}`;
+      const subActive = sub.items.some((t) => t.key === activeTab);
+      const subOpen = navSectionOpen({ stored: localStorage.getItem(navFoldKey(path)), defaultOpen: false, containsActive: subActive });
+      const subSeverity = sub.items.map((t) => severityOf(t.key)).includes('bad') ? 'bad' : (sub.items.map((t) => severityOf(t.key)).includes('warn') ? 'warn' : null);
+      nav.appendChild(renderNavFoldHeader(sub.label, { open: subOpen, sub: true, severity: subSeverity, badge: null, here: subActive, path }));
+      if (subOpen) for (const tab of sub.items) nav.appendChild(renderTabButton(tab, true));
+    }
+  });
+}
+
 function renderNav() {
   const nav = document.getElementById('nav');
   nav.innerHTML = '';
-  for (const tab of navOrder(TABS, isNarrowScreen())) {
-    if (tab.group) {
-      const expanded = isGroupExpanded(tab.group);
-      const header = document.createElement('button');
-      header.innerHTML = `<span>${expanded ? '▾' : '▸'} ${tab.group}</span><span class="count"></span>`;
-      header.onclick = () => {
-        localStorage.setItem('agentManagerNavGroup_' + tab.group, expanded ? 'collapsed' : 'expanded');
-        renderNav();
-      };
-      nav.appendChild(header);
-      if (expanded) {
-        for (const child of tab.children) nav.appendChild(renderTabButton(child, true));
+  if (!isNarrowScreen() && typeof buildNavSections === 'function') {
+    renderNavSections(nav);
+  } else {
+    // Phone layout (or nav-sections.js missing): the flat strip with the old Forges / Job Status groups.
+    for (const tab of navOrder(TABS, isNarrowScreen())) {
+      if (tab.group) {
+        const expanded = isGroupExpanded(tab.group);
+        const header = document.createElement('button');
+        header.innerHTML = `<span>${expanded ? '▾' : '▸'} ${tab.group}</span><span class="count"></span>`;
+        header.onclick = () => {
+          localStorage.setItem('agentManagerNavGroup_' + tab.group, expanded ? 'collapsed' : 'expanded');
+          renderNav();
+        };
+        nav.appendChild(header);
+        if (expanded) {
+          for (const child of tab.children) nav.appendChild(renderTabButton(child, true));
+        }
+      } else {
+        nav.appendChild(renderTabButton(tab, false));
       }
-    } else {
-      nav.appendChild(renderTabButton(tab, false));
     }
   }
   if (typeof navNotchUpdate === 'function') navNotchUpdate(nav);
