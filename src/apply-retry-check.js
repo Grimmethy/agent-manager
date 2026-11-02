@@ -97,12 +97,21 @@ const INFRA_APPLY_RE = /apply clone is dirty|local changes to the following file
 // after <n>ms") is also infrastructure -- the apply clone sits on the same rotational disk as the model files (IO pressure avg300 ~13%),
 // and 23 such timeouts across 3 days hit already-approved drafts (arch_discovery community-12 burned all 2 apply retries on it and was
 // escalated as a 'design-decision'). Same treatment as a dirty clone: re-apply the approved result, no redraft. Unlike a dirty clone this
-// can recur every time, so it is bounded: after APPLY_TIMEOUT_MAX_RELEASES releases it falls through to the normal retry/escalation path.
+// can recur every time, so it is bounded: after APPLY_TIMEOUT_MAX_RELEASES releases it is left in a retryable state (NOT needs-clarification)
+// with the fetch timeout recorded as its reason, so the watchdog picks it up again automatically once git connectivity returns. The redraft
+// counter is never touched for this failure class -- redrafting cannot fix a network timeout, and burning retries on it masks the real cause.
 const GIT_TIMEOUT_RE = /spawnSync git ETIMEDOUT|\bgit [\w-]+[^\n]{0,80} timed out after \d+ms/i;
 const APPLY_TIMEOUT_MAX_RELEASES = 4;
 function isGitTimeoutApplyFailure(task) {
   return isApplyFailure(task) && GIT_TIMEOUT_RE.test(String(task.blockedReason || ''))
     && (Number(task.applyTimeoutReleases) || 0) < APPLY_TIMEOUT_MAX_RELEASES;
+}
+// Same classification but WITHOUT the release-count gate -- used after the infra short-circuit to
+// catch timeouts that have exceeded max releases and must be left in a retryable state (not
+// escalated to needs-clarification, not redrafted). A timeout is a timeout regardless of how many
+// times we've tried to re-apply; the underlying cause (network/git) is unchanged.
+function isGitTimeoutFailure(task) {
+  return isApplyFailure(task) && GIT_TIMEOUT_RE.test(String(task.blockedReason || ''));
 }
 function isInfraApplyFailure(task) {
   return isApplyFailure(task) && (INFRA_APPLY_RE.test(String(task.blockedReason || '')) || isGitTimeoutApplyFailure(task));
@@ -210,6 +219,30 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approv
           }
           summary.held++;
         }
+        continue;
+      }
+
+      // Exhausted git-timeout short-circuit -- see isGitTimeoutFailure's own header.
+      // After APPLY_TIMEOUT_MAX_RELEASES releases back to approved/, the fetch is still
+      // failing. This is a TRANSIENT INFRASTRUCTURE ERROR, not a draft/content problem:
+      // redrafting cannot fix a network timeout, and escalating to a human for "clarification"
+      // on a fetch timeout is exactly what the stalled-task worker was complaining about
+      // (4 deadcode tasks parked in needs-clarification for a cause they cannot usefully
+      // resolve). Leave the task in blocked/ (the watchdog picks it up again on the next
+      // tick) with a recorded reason that names the fetch timeout, so it resumes
+      // automatically once git connectivity returns. The redraft counter is untouched.
+      if (isGitTimeoutFailure(task)) {
+        const alreadyMarked = Array.isArray(task.history) && task.history.some((h) => h && h.stage === 'git-timeout-exhausted');
+        if (!alreadyMarked) {
+          step = 'record';
+          appendHistoryEvent(task, 'git-timeout-exhausted',
+            `Git fetch timed out after ${APPLY_TIMEOUT_MAX_RELEASES} automatic re-apply attempts (no redraft burned -- a timeout cannot be fixed by redrafting): ${String(task.blockedReason || '')}`);
+          step = 'write';
+          fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
+        }
+        // Do NOT escalate to needs-clarification, do NOT burn a redraft, do NOT move
+        // the task -- the watchdog will re-pick it up and the next tick may succeed.
+        summary.held++;
         continue;
       }
 
@@ -344,7 +377,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { applyRetryCheck, isDivergedHistoryFailure, isInfraApplyFailure, defaultIsApplyCloneClean };
+module.exports = { applyRetryCheck, isDivergedHistoryFailure, isInfraApplyFailure, isGitTimeoutFailure, defaultIsApplyCloneClean };
 
 if (require.main === module) {
   main();
