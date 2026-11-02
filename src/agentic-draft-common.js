@@ -472,6 +472,37 @@ function resolveNoResolutionForced(ctx) {
       capturedDiff: undefined,
     };
   }
+  // 2026-11-02 (stalled-task loop: 40 needs-clarification tasks, 31 premium, all parked as 'design-decision' with the placeholder below as their only question):
+  // the pass spent its turns, the forced final turn produced NO text, and either edits landed that no diff captured or a partial diff exists. That is the same
+  // budget exhaustion the explicit BLOCKER-TYPE: budget-exhausted path handles, not a question for a human. Same ladder: a partial diff continues (bounded by
+  // MAX_AGENTIC_CONTINUATIONS), otherwise flag the exhaustion (sticky, which also unlocks RESOLUTION: decompose for a leaf) and requeue as a retryable block.
+  if (!String(summary || '').trim()) {
+    const continuations = Number(task.agenticContinuationCount) || 0;
+    if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
+      task.agenticContinuationCount = continuations + 1;
+      task.agenticContinuationNote = 'the pass ran out of turns and its forced final turn produced no text; finish from the partial diff';
+      task.priorPartialDiff = capturedDiff;
+      task.retryableDraftBlock = true;
+      task.isAgenticContinuation = true;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: `Agentic implement pass ran out of turns with partial work and no final text -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS}`,
+        ...meta,
+        capturedDiff,
+      };
+    }
+    task.turnBudgetExhausted = true;
+    task.retryableDraftBlock = true;
+    task.turnBudgetExhaustedBefore = true;
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: 'Agentic implement pass ran out of turns and its forced final turn produced no text -- budget exhaustion, not a design question; requeued for a smaller scope',
+      ...meta,
+      capturedDiff: undefined,
+    };
+  }
   // Otherwise the model got somewhere (partial work in the worktree, or the forced
   // summary produced real content) -- keep the existing human-clarification path.
   task.adhocResolution = 'needs-human-decision';
