@@ -72,6 +72,24 @@
   .nav-sh em { font-style: normal; font-variant-numeric: tabular-nums; letter-spacing: 0; color: var(--muted); }
   .nav-chev { display: inline-flex; transition: transform .1s ease; }
   .nav-chev.closed { transform: rotate(-90deg); }
+  /* Collapse button + icon rail (core-ui.js renderNavTop / renderNavRail): a round chevron button beside a "Collapse" pill; collapsed, the sidebar is a 72px strip of icons. */
+  :root { --accent-text: #0b0d12; }
+  .nav-top { display: flex; align-items: center; gap: 8px; padding: 0 12px 8px; }
+  nav button.nav-collapse-btn { width: 28px; height: 28px; padding: 0; flex: none; border: 2px solid var(--border-strong); border-radius: 50%; background: var(--bg); color: var(--text); display: grid; place-items: center; }
+  nav button.nav-collapse-btn:hover { background: var(--bg); border-color: var(--accent); color: var(--accent); }
+  nav button.nav-collapse-btn:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+  .nav-collapse-pill { font-size: 12px; font-weight: 600; line-height: 20px; padding: 2px 12px; border-radius: 999px; background: var(--accent); color: var(--accent-text); }
+  nav.nav-rail { width: 72px; }
+  nav.nav-rail .nav-top { justify-content: center; padding: 0 0 8px; }
+  nav.nav-rail .nav-div { margin: 8px 12px; }
+  nav.nav-rail button.rail-btn { position: relative; justify-content: center; width: 100%; padding: 8px 0; border-left: 3px solid transparent; }
+  nav.nav-rail button.rail-btn.active { background: var(--accent); color: var(--accent-text); border-left-color: transparent; }
+  .rail-glyph { font-size: 18px; line-height: 24px; }
+  nav.nav-rail button.rail-section .rail-glyph { font-size: 12px; font-weight: 600; letter-spacing: .06em; color: var(--muted); }
+  nav.nav-rail .status-dot { position: absolute; top: 6px; right: 14px; }
+  nav.nav-rail .nav-notch { display: none; }
+  nav { transition: width .15s ease; }
+  @media (prefers-reduced-motion: reduce) { nav { transition: none; } }
   .nav-here { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
   @media (prefers-reduced-motion: reduce) { .nav-chev { transition: none; } }
   .nav-notch { position: absolute; top: 0; left: calc(100% - 16px); width: 12px; height: 12px; pointer-events: none; will-change: transform; }

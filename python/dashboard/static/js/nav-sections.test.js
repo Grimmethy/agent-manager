@@ -132,11 +132,11 @@ function makeEnv({ stored = {}, active = 'project', narrow = false } = {}) {
   const store = { ...stored };
   const appended = [];
   const notchCalls = [];
-  const mk = (tag) => ({ tag, className: '', style: {}, innerHTML: '', title: '', onclick: null, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } });
-  const nav = { innerHTML: 'old', appendChild(el) { appended.push(el); } };
+  const mk = (tag) => ({ tag, className: '', style: {}, innerHTML: '', title: '', onclick: null, attrs: {}, children: [], setAttribute(k, v) { this.attrs[k] = v; }, appendChild(c) { this.children.push(c); } });
+  const nav = { innerHTML: 'old', className: '', appendChild(el) { appended.push(el); } };
   const ctx = vm.createContext({
     console,
-    localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = v; } },
+    localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = v; }, removeItem: (k) => { delete store[k]; } },
     document: { getElementById: (id) => (id === 'nav' ? nav : null), createElement: mk },
     window: { matchMedia: (q) => ({ matches: narrow && /max-width:\s*860px/.test(q), addEventListener() {} }) },
     navNotchUpdate(n) { notchCalls.push(n); },
@@ -147,7 +147,7 @@ function makeEnv({ stored = {}, active = 'project', narrow = false } = {}) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'core-ui.js'), 'utf8'), ctx);
   vm.runInContext('TABS = ' + JSON.stringify(LIVE()), ctx);
   const text = (b) => b.innerHTML.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-  return { ctx, store, appended, nav, text, notchCalls };
+  return { ctx, store, appended, nav, text, notchCalls, sections: () => ctx.buildNavSections(JSON.parse(JSON.stringify(LIVE()))) };
 }
 
 test('wide renderNav draws section headers with dividers; only Work is open by default', () => {
@@ -226,6 +226,133 @@ test('the phone layout keeps the flat strip: no section headers, the old groups'
   env.ctx.renderNav();
   assert.equal(env.appended.filter((e) => /nav-sh|nav-div/.test(e.className)).length, 0);
   assert.match(env.text(env.appended[0]), /Forges/);
+});
+
+// --- collapse button and icon rail ---
+const topOf = (env) => env.appended.find((e) => e.className === 'nav-top');
+
+test('glyphs: an explicit icon wins, then the leading emoji (including ones with a variation selector or joiners), then the first letter', () => {
+  assert.equal(ns.navTabGlyph({ label: '📁 Project', icon: 'P' }), 'P');
+  assert.equal(ns.navTabGlyph({ label: '📁 Project' }), '📁');
+  assert.equal(ns.navTabGlyph({ label: '🖥️ Hardware' }), '🖥️');
+  assert.equal(ns.navTabGlyph({ label: '👨‍👩‍👧 Family' }), '👨‍👩‍👧');
+  assert.equal(ns.navTabGlyph({ label: 'FSBO Calls' }), 'F');
+  assert.equal(ns.navTabGlyph({ key: 'books' }), 'B');
+  assert.equal(ns.navTabGlyph({ label: '' }), '?');
+  assert.equal(ns.navTabGlyph(null), '?');
+});
+
+test('plain labels drop the leading emoji', () => {
+  assert.equal(ns.navTabPlainLabel({ label: '🖥️ Hardware' }), 'Hardware');
+  assert.equal(ns.navTabPlainLabel({ label: 'FSBO Calls' }), 'FSBO Calls');
+  assert.equal(ns.navTabPlainLabel({ label: '📁' }), '📁');
+  assert.equal(ns.navTabPlainLabel(null), '');
+});
+
+test('rail entries: a divider between sections, icons for open ones, one button for folded ones', () => {
+  const sections = ns.buildNavSections(LIVE());
+  const entries = ns.navRailEntries(sections, (s) => s.key === 'work');
+  assert.deepEqual(entries.map((e) => e.type), ['tab', 'tab', 'tab', 'tab', 'divider', 'section', 'divider', 'section', 'divider', 'section', 'divider', 'section', 'divider', 'section', 'divider', 'section']);
+  assert.deepEqual(entries.filter((e) => e.type === 'tab').map((e) => e.tab.key), ['branches', 'workers', 'adhoc', 'project']);
+  assert.deepEqual(entries.filter((e) => e.type === 'section').map((e) => e.section.key), ['queue', 'ideas', 'system', 'forges', 'knowledge', 'business']);
+  const allOpen = ns.navRailEntries(sections, () => true);
+  assert.equal(allOpen.filter((e) => e.type === 'tab').length, 53);
+  assert.equal(allOpen.filter((e) => e.type === 'section').length, 0);
+  assert.deepEqual(ns.navRailEntries([], () => true), []);
+});
+
+test('the rail key is the stored collapsed marker', () => {
+  assert.equal(ns.NAV_RAIL_KEY, 'agentManagerNavRail');
+});
+
+test('expanded sidebar: a top row with the round collapse button and the Collapse pill, nav has no rail class', () => {
+  const env = makeEnv();
+  env.ctx.renderNav();
+  const top = topOf(env);
+  assert.equal(env.appended[0], top, 'the top row comes first');
+  assert.equal(env.nav.className, '');
+  const [btn, pill] = top.children;
+  assert.equal(btn.className, 'nav-collapse-btn');
+  assert.equal(btn.attrs['aria-label'], 'Collapse sidebar');
+  assert.equal(btn.attrs['aria-expanded'], 'true');
+  assert.match(btn.innerHTML, /M10 3L5 8l5 5/);
+  assert.equal(pill.className, 'nav-collapse-pill');
+  assert.equal(pill.innerHTML, 'Collapse');
+});
+
+test('clicking collapse stores the choice and re-renders as the rail; clicking expand removes it', () => {
+  const env = makeEnv();
+  env.ctx.renderNav();
+  topOf(env).children[0].onclick();
+  assert.equal(env.store.agentManagerNavRail, 'collapsed');
+  const rail = makeEnv({ stored: { agentManagerNavRail: 'collapsed' } });
+  rail.ctx.renderNav();
+  rail.appended.find((e) => e.className === 'nav-top').children[0].onclick();
+  assert.equal('agentManagerNavRail' in rail.store, false);
+});
+
+test('the rail: nav-rail class, a single expand button without the pill, icon buttons for Work and one letter button per folded section', () => {
+  const env = makeEnv({ stored: { agentManagerNavRail: 'collapsed' } });
+  env.ctx.renderNav();
+  assert.equal(env.nav.className, 'nav-rail');
+  const top = topOf(env);
+  assert.equal(top.children.length, 1);
+  assert.equal(top.children[0].attrs['aria-label'], 'Expand sidebar');
+  assert.equal(top.children[0].attrs['aria-expanded'], 'false');
+  assert.match(top.children[0].innerHTML, /M6 3l5 5-5 5/);
+  const tabs = env.appended.filter((e) => /rail-btn/.test(e.className) && !/rail-section/.test(e.className));
+  assert.deepEqual(tabs.map((b) => b.title), ['branches', 'workers', 'adhoc', 'project']);
+  assert.deepEqual(tabs.map((b) => b.attrs['aria-label']), ['branches', 'workers', 'adhoc', 'project']);
+  const folded = env.appended.filter((e) => /rail-section/.test(e.className));
+  assert.deepEqual(folded.map((b) => b.attrs['aria-label']), ['Open Queue', 'Open Ideas', 'Open System', 'Open Forges', 'Open Knowledge', 'Open Business']);
+  assert.deepEqual(folded.map((b) => env.text(b).replace(/\s+/g, '')), ['Q', 'I', 'S', 'F', 'K', 'B']);
+  assert.equal(env.appended.filter((e) => e.className === 'nav-div').length, 6);
+  assert.equal(env.appended.filter((e) => /nav-sh/.test(e.className)).length, 0, 'no section headers in the rail');
+});
+
+test('rail: the active tab button is marked active, attention dots show on buttons and folded sections', () => {
+  const env = makeEnv({ stored: { agentManagerNavRail: 'collapsed', agentManagerNavSection_queue: 'expanded' }, active: 'blocked' });
+  env.ctx.renderNav();
+  const tabs = env.appended.filter((e) => /rail-btn/.test(e.className) && !/rail-section/.test(e.className));
+  const blocked = tabs.find((b) => b.title === 'blocked');
+  assert.match(blocked.className, /active/);
+  assert.match(blocked.innerHTML, /status-dot bad/);
+  assert.equal(tabs.filter((b) => /active/.test(b.className)).length, 1);
+  const folded = makeEnv({ stored: { agentManagerNavRail: 'collapsed' } });
+  folded.ctx.renderNav();
+  const queue = folded.appended.find((e) => e.attrs['aria-label'] === 'Open Queue');
+  assert.match(queue.innerHTML, /status-dot bad/);
+});
+
+test('clicking a folded section in the rail opens it and widens the sidebar again; clicking a tab switches to it', () => {
+  const env = makeEnv({ stored: { agentManagerNavRail: 'collapsed' } });
+  const switched = [];
+  env.ctx.switchToTab = (k) => switched.push(k);
+  env.ctx.renderNav();
+  env.appended.find((e) => e.attrs['aria-label'] === 'Open Queue').onclick();
+  assert.equal(env.store.agentManagerNavSection_queue, 'expanded');
+  assert.equal('agentManagerNavRail' in env.store, false);
+  env.appended.find((e) => e.title === 'workers').onclick();
+  assert.deepEqual(switched, ['workers']);
+});
+
+test('the phone layout has no collapse button and no rail class even when the rail was chosen', () => {
+  const env = makeEnv({ narrow: true, stored: { agentManagerNavRail: 'collapsed' } });
+  env.ctx.renderNav();
+  assert.equal(topOf(env), undefined);
+  assert.equal(env.nav.className, '');
+  assert.equal(env.appended.filter((e) => /rail-btn/.test(e.className)).length, 0);
+});
+
+test('page wiring: index.html styles the collapse button, pill and the 72px rail, the notch hides in the rail', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', '..', 'templates', 'index.html'), 'utf8');
+  assert.match(html, /nav button\.nav-collapse-btn \{ width: 28px; height: 28px;[^}]*border-radius: 50%;/);
+  assert.match(html, /\.nav-collapse-pill \{[^}]*border-radius: 999px; background: var\(--accent\); color: var\(--accent-text\);/);
+  assert.match(html, /--accent-text: #0b0d12;/);
+  assert.match(html, /nav\.nav-rail \{ width: 72px; \}/);
+  assert.match(html, /nav\.nav-rail \.nav-notch \{ display: none; \}/);
+  assert.match(html, /nav\.nav-rail button\.rail-btn\.active \{ background: var\(--accent\); color: var\(--accent-text\);/);
+  assert.match(html, /@media \(prefers-reduced-motion: reduce\) \{ nav \{ transition: none; \} \}/);
 });
 
 test('page wiring: index.html loads nav-sections.js, styles headers and the fading divider, nav is 232px wide', () => {

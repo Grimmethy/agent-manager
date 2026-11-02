@@ -475,11 +475,91 @@ function renderNavSections(nav) {
   });
 }
 
+const NAV_COLLAPSE_SVG = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3L5 8l5 5"/></svg>';
+const NAV_EXPAND_SVG = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3l5 5-5 5"/></svg>';
+
+function navRailCollapsed() {
+  return localStorage.getItem(NAV_RAIL_KEY) === 'collapsed';
+}
+
+// The row at the top of the wide sidebar: a round chevron button (the "Sidebar UI" reel) plus a "Collapse" pill; in the rail just the button, pointing the other way.
+function renderNavTop(collapsed) {
+  const top = document.createElement('div');
+  top.className = 'nav-top';
+  const btn = document.createElement('button');
+  btn.className = 'nav-collapse-btn';
+  btn.title = collapsed ? 'Expand the sidebar' : 'Collapse the sidebar to icons';
+  if (typeof btn.setAttribute === 'function') {
+    btn.setAttribute('aria-label', collapsed ? 'Expand sidebar' : 'Collapse sidebar');
+    btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  }
+  btn.innerHTML = collapsed ? NAV_EXPAND_SVG : NAV_COLLAPSE_SVG;
+  btn.onclick = () => {
+    if (collapsed) localStorage.removeItem(NAV_RAIL_KEY); else localStorage.setItem(NAV_RAIL_KEY, 'collapsed');
+    renderNav();
+  };
+  top.appendChild(btn);
+  if (!collapsed) {
+    const pill = document.createElement('span');
+    pill.className = 'nav-collapse-pill';
+    pill.innerHTML = 'Collapse';
+    top.appendChild(pill);
+  }
+  return top;
+}
+
+// An icon-only tab button: the glyph, a dot when the tab needs attention, the full name as the tooltip and accessible name.
+function renderNavRailButton(tab) {
+  const btn = document.createElement('button');
+  btn.className = 'rail-btn' + (tab.key === activeTab ? ' active' : '');
+  const name = navTabPlainLabel(tab);
+  btn.title = name;
+  if (typeof btn.setAttribute === 'function') btn.setAttribute('aria-label', name);
+  const severity = severityForTab(tab.key, counts[tab.key]);
+  btn.innerHTML = `<span class="rail-glyph">${escapeHtml(navTabGlyph(tab))}</span>` + (severity ? `<span class="status-dot ${severity}"></span>` : '');
+  btn.onclick = () => switchToTab(tab.key);
+  return btn;
+}
+
+// The collapsed sidebar: an icon per tab for the sections that are open, one letter button per folded section (clicking it opens the section and widens
+// the sidebar again), and the same hairline dividers.
+function renderNavRail(nav) {
+  const sections = buildNavSections(TABS);
+  const openOf = (section) => navSectionOpen({ stored: localStorage.getItem(navFoldKey(section.key)), defaultOpen: section.defaultOpen, containsActive: navSectionContains(section, activeTab) });
+  for (const entry of navRailEntries(sections, openOf)) {
+    if (entry.type === 'divider') {
+      const divider = document.createElement('div');
+      divider.className = 'nav-div';
+      nav.appendChild(divider);
+    } else if (entry.type === 'tab') {
+      nav.appendChild(renderNavRailButton(entry.tab));
+    } else {
+      const section = entry.section;
+      const btn = document.createElement('button');
+      btn.className = 'rail-btn rail-section';
+      btn.title = `${section.label} (click to open)`;
+      if (typeof btn.setAttribute === 'function') btn.setAttribute('aria-label', `Open ${section.label}`);
+      const { severity } = navSectionSummary(section, { countOf: (k) => counts[k], severityOf: (k) => severityForTab(k, counts[k]) });
+      btn.innerHTML = `<span class="rail-glyph">${escapeHtml(section.label.charAt(0))}</span>` + (severity ? `<span class="status-dot ${severity}"></span>` : '');
+      btn.onclick = () => {
+        localStorage.setItem(navFoldKey(section.key), 'expanded');
+        localStorage.removeItem(NAV_RAIL_KEY);
+        renderNav();
+      };
+      nav.appendChild(btn);
+    }
+  }
+}
+
 function renderNav() {
   const nav = document.getElementById('nav');
   nav.innerHTML = '';
-  if (!isNarrowScreen() && typeof buildNavSections === 'function') {
-    renderNavSections(nav);
+  const wide = !isNarrowScreen() && typeof buildNavSections === 'function';
+  const rail = wide && navRailCollapsed();
+  nav.className = rail ? 'nav-rail' : '';
+  if (wide) {
+    nav.appendChild(renderNavTop(rail));
+    if (rail) renderNavRail(nav); else renderNavSections(nav);
   } else {
     // Phone layout (or nav-sections.js missing): the flat strip with the old Forges / Job Status groups.
     for (const tab of navOrder(TABS, isNarrowScreen())) {

@@ -107,4 +107,35 @@ function navSectionSummary(section, { countOf = () => undefined, severityOf = ()
   return { badge, severity };
 }
 
-if (typeof module !== 'undefined') module.exports = { NAV_SECTIONS, NAV_MORE_SECTION, navFlattenTabs, buildNavSections, navSectionTabs, navSectionContains, navSectionOpen, navSectionSummary };
+// --- Icon rail (the collapsed sidebar) ---
+const NAV_RAIL_KEY = 'agentManagerNavRail';   // localStorage: 'collapsed' or nothing
+
+// The one-character stand-in for a tab in the rail: an explicit tab.icon when a tab has one (the line-icon set will provide it), else the emoji its
+// label starts with, else the first letter of the label.
+function navTabGlyph(tab) {
+  if (tab && tab.icon) return String(tab.icon);
+  const label = String((tab && tab.label) || (tab && tab.key) || '').trim();
+  const m = /^(\p{Extended_Pictographic}(?:\uFE0F|\u200D\p{Extended_Pictographic})*)/u.exec(label);
+  if (m) return m[1];
+  return label ? Array.from(label)[0].toUpperCase() : '?';
+}
+
+// The label without a leading emoji, for tooltips and screen readers.
+function navTabPlainLabel(tab) {
+  const label = String((tab && tab.label) || (tab && tab.key) || '').trim();
+  return label.replace(/^(\p{Extended_Pictographic}(?:\uFE0F|\u200D\p{Extended_Pictographic})*)\s*/u, '') || label;
+}
+
+// What the rail draws, in order: for every section a divider (except before the first), then its tabs as icons when the section is open,
+// or one section button when it is folded (clicking that opens the section and widens the sidebar). openOf(section) -> boolean.
+function navRailEntries(sections, openOf) {
+  const out = [];
+  sections.forEach((section, i) => {
+    if (i > 0) out.push({ type: 'divider' });
+    if (openOf(section)) for (const tab of navSectionTabs(section)) out.push({ type: 'tab', tab, section });
+    else out.push({ type: 'section', section });
+  });
+  return out;
+}
+
+if (typeof module !== 'undefined') module.exports = { NAV_RAIL_KEY, navTabGlyph, navTabPlainLabel, navRailEntries, NAV_SECTIONS, NAV_MORE_SECTION, navFlattenTabs, buildNavSections, navSectionTabs, navSectionContains, navSectionOpen, navSectionSummary };
