@@ -983,6 +983,42 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
   }
 }
 
+// Check whether a diff's test coverage is "pinned" (i.e. the tests exist on the base branch)
+// so the reviewer can trust the executed-verification result. Returns a reason string or null.
+//
+// Branches:
+//   - Diff with 'refactor' in header → 'header-with-keyword' (advisory escape)
+//   - Test-only diff, tests pass on base → 'tests-passing-on-base' (blocked)
+//   - Test-only diff, tests fail on base → 'tests-failing-on-base' (advisory)
+//   - Diff with production changes, tests pass on base → 'tests-passing-on-base' (blocked)
+//   - Fallback → null
+function checkTestPinning({ srcFiles, testFiles, testsPassedOnBase, testsFailedOnBase, rawDiff }) {
+  // Check for advisory escape keyword in diff header
+  if (rawDiff && typeof rawDiff === 'string' && rawDiff.includes('refactor')) {
+    return 'header-with-keyword';
+  }
+
+  const hasSrcFiles = Array.isArray(srcFiles) && srcFiles.length > 0;
+  const hasTestFiles = Array.isArray(testFiles) && testFiles.length > 0;
+
+  // Test-only diff (no production files changed)
+  if (!hasSrcFiles && hasTestFiles) {
+    if (testsPassedOnBase) {
+      return 'tests-passing-on-base';
+    }
+    if (testsFailedOnBase) {
+      return 'tests-failing-on-base';
+    }
+  }
+
+  // Diff with production changes and tests pass on base
+  if (hasSrcFiles && testsPassedOnBase) {
+    return 'tests-passing-on-base';
+  }
+
+  return null;
+}
+
 module.exports = {
   extraCoveringMax,
   pythonTestArgs, checkChangedFilesSyntax, splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
