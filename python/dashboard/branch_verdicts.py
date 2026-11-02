@@ -26,7 +26,10 @@ logger = logging.getLogger(__name__)
 # "hold" (2026-10-31): a sound piece that cannot merge yet (its hub is unfinished, or a sibling must merge first). It is NOT needs-work: nothing in it is
 # defective, so it is never fed to a redraft (apply_prior_verdict) and never counted as a defect. It is also never merge-ready.
 VERDICTS = ("merge", "needs-work", "hold", "discard")
-SOURCES = ("deterministic", "chat", "manual")
+# "worker" (2026-11-02): the branch-verifier worker (agent-manager-pipeline-ops). Automated like "deterministic", but it ran the touched tests, so it ranks between the two:
+# it replaces a deterministic verdict, never a chat/manual one (a human verdict wins), and a deterministic check never replaces it.
+SOURCES = ("deterministic", "chat", "manual", "worker")
+HUMAN_SOURCES = ("chat", "manual")
 STORE_NAME = "branch-verdicts.json"
 ROLLING_BRANCH = "agent/triage-queue"
 STALE_NOTE = "verdict is for an older commit"
@@ -104,6 +107,8 @@ def record_verdict(queue_dir, branch, sha, verdict, reasons, source):
     per_branch = verdicts.setdefault(branch, {})
     existing = per_branch.get(sha)
     if existing and source == "deterministic" and existing.get("source") != "deterministic":
+        return existing, False
+    if existing and source == "worker" and existing.get("source") in HUMAN_SOURCES:
         return existing, False
     record = {"verdict": verdict, "reasons": list(reasons), "source": source, "verifiedAt": _now_iso()}
     per_branch[sha] = record
@@ -296,11 +301,11 @@ _PRIOR_VERDICT_REASON_CHARS = 1500
 def apply_prior_verdict(rec, branch, verdict, reasons, source, sha=None):
     """Mutates a TASK record's promptContext.priorVerdict from a recorded verdict; returns True if it changed.
 
-    chat/manual + needs-work sets it (latest wins); chat/manual + merge clears it (the redraft was accepted);
+    chat/manual/worker + needs-work sets it (latest wins); chat/manual/worker + merge clears it (the redraft was accepted);
     every other combination -- deterministic checks, discard (its reasons are about redundancy, not a defect in
     the change), hold (nothing to redraft: the piece is waiting, not defective) -- leaves it alone. Never called for a hub record. A record whose promptContext is not a dict
     is skipped rather than overwritten."""
-    if source not in ("chat", "manual"):
+    if source not in HUMAN_SOURCES + ("worker",):
         return False
     ctx = rec.get("promptContext")
     if not isinstance(ctx, dict):
