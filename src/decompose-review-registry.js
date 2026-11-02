@@ -78,6 +78,29 @@ function clearDeterministicReviewRegistry() {
   registry.clear();
 }
 
+// HUB0321 · 2/3: register the mock-seam check as a deterministic review kind.
+// The verify function runs analyzeMockSeams and returns {ok: true/false, reason: ...}.
+// The actual gating (advisory vs block) is handled by review-task.js based on the
+// AGENT_MANAGER_REVIEW_MOCK_SEAM_CHECK config, defaulting to 'advisory'.
+function verifyMockSeamDraft(task, repoRoot) {
+  if (!task || typeof task.rawDiff !== 'string' || !task.rawDiff.trim()) {
+    return { ok: true }; // No diff to check -- no seam possible.
+  }
+  const { analyzeMockSeams } = require('./review-mock-seam.js');
+  const { seams, advisory } = analyzeMockSeams({ diff: task.rawDiff, config: {} });
+  if (seams.length === 0) {
+    return { ok: true };
+  }
+  const affectedFns = seams.map((s) => s.changedFn).join(', ');
+  return {
+    ok: false,
+    reason: `Mock seam detected: ${seams.length} function(s) changed in production but mocked in tests (${affectedFns}). ${advisory || 'Review requires a real (non-mocked) test or manual review note.'}`,
+  };
+}
+
+// Register with kind 'mock-seam-check', default mode 'advisory' (gating handled by caller).
+registerDeterministicReview('mock-seam-check', { verify: verifyMockSeamDraft });
+
 module.exports = {
   registerDeterministicReview, verifyDeterministicDraft, verifyOnePassStyleRederivation, clearDeterministicReviewRegistry,
 };

@@ -63,6 +63,7 @@ const { classifyNullOutcome } = require('./advisory-null-outcome.js');
 const { getDecomposeProposalDetection } = require('./hub-review-detection.js');
 const { getSplitCoverageJudging } = require('./split-coverage-judging-route.js');
 const { verifyDeterministicDraft } = require('./decompose-review-registry.js');
+const { analyzeMockSeams } = require('./review-mock-seam.js');
 // script-extract.js stays in core (also required directly by scripts/extract-core-ui.js,
 // a standalone dev CLI that can't depend on an optional plugin) -- this require reaches
 // its registerDeterministicReview('script-extract', ...) side effect normally, same as any
@@ -1543,6 +1544,32 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       }
     } catch (e) {
       console.error(`[review] inert-addition check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+    }
+  }
+
+  // Mock-seam check (HUB0321 · 2/3): detect when production code changes but tests mock
+  // the very function being modified, indicating a double rather than real behaviour.
+  // Honors AGENT_MANAGER_REVIEW_MOCK_SEAM_CHECK (false | advisory | block, default advisory).
+  const mockSeamMode = getConfig().reviewMockSeamCheck;
+  if (mockSeamMode !== 'false'
+      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
+    try {
+      const { seams, advisory } = analyzeMockSeams({ diff: task.rawDiff, config: { AGENT_MANAGER_REVIEW_MOCK_SEAM_CHECK: mockSeamMode } });
+      if (seams.length > 0) {
+        task.mockSeams = { count: seams.length, seams };
+        const affectedFns = seams.map((s) => s.changedFn);
+        appendHistoryEvent(task, mockSeamMode === 'block' ? 'blocked' : 'advisory',
+          `mock-seam check: ${seams.length} seam(s) detected (${affectedFns.join(', ')}${seams.length > 3 ? ', ...' : ''}) -- ${advisory}`);
+        if (mockSeamMode === 'block') {
+          const reason = `Mock seam detected: ${seams.length} function(s) changed in production but mocked in tests (${affectedFns.join(', ')}). Review requires a real (non-mocked) test or manual review note.`;
+          task.reviewProvider = 'deterministic-mock-seam';
+          recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+          appendHistoryEvent(task, 'blocked', reason);
+          return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+        }
+      }
+    } catch (e) {
+      console.error(`[review] mock-seam check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
     }
   }
 
