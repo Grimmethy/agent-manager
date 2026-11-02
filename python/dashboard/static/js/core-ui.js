@@ -140,6 +140,7 @@ function switchToTab(key) {
   bumpRenderGeneration(); // any in-flight render for the tab being left is now stale
   activeTab = key;
   renderNav();
+  if (typeof showTabSkeleton === 'function') showTabSkeleton();   // clear the previous tab's content at once; the tab's own render replaces this
   if (key === 'project') enterProjectTab();
   else if (key === 'brain-dump') enterBrainDumpTab();
   else if (key === 'branches') enterBranchesTab();
@@ -371,7 +372,7 @@ async function ensurePluginTabStarted(tab, main) {
   if (!tab.startCommand || pluginTabStarted[tab.pluginName]) return 'ready';
   if (pluginTabStarting[tab.pluginName]) return 'pending';
   const hasContent = main.querySelector && (main.querySelector('iframe') || main.querySelector('[data-plugin-start-error]'));
-  if (!hasContent) main.innerHTML = `<div class="empty">Starting ${escapeHtml(tab.label)}...</div>`;
+  if (!hasContent) main.innerHTML = typeof skeletonHtml === 'function' ? skeletonHtml({ caption: `Starting ${tab.label}...` }) : `<div class="empty">Starting ${escapeHtml(tab.label)}...</div>`;
   pluginTabStarting[tab.pluginName] = true;
   let why = '';
   try {
@@ -395,7 +396,7 @@ async function renderPluginTab(tab) {
       if ((await ensurePluginTabStarted(tab, main)) !== 'ready') return;
     }
     if (!pluginTabRenderers[tab.key]) {
-      main.innerHTML = `<div class="empty">Loading ${escapeHtml(tab.label)}...</div>`;
+      main.innerHTML = typeof skeletonHtml === 'function' ? skeletonHtml({ caption: `Loading ${tab.label}...` }) : `<div class="empty">Loading ${escapeHtml(tab.label)}...</div>`;
       await loadPluginTabScript(tab);
     }
     const renderFn = pluginTabRenderers[tab.key];
