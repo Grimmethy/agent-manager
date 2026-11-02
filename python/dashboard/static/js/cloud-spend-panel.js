@@ -32,7 +32,7 @@ function cloudSpendPeriodLine(label, totals) {
 
 function buildCloudSpendHtml(meter) {
   if (!meter || !meter.cloudLane) return '';
-  const box = 'padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin:12px 0;';
+  const box = 'padding:12px 16px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin:12px 0;';
   const title = '<div style="font-weight:600">☁ Cloud spend</div>';
   if (!meter.available) {
     const why = meter.error ? ' (' + cloudSpendEsc(meter.error) + ')' : '';
@@ -46,7 +46,7 @@ function buildCloudSpendHtml(meter) {
     : 'No monthly cap';
   const source = [meter.provider, meter.model].filter(Boolean).map(cloudSpendEsc).join(' · ');
   return '<div id="cloud-spend-panel" style="' + box + '">' + title
-    + (source ? '<div class="meta" style="margin-top:2px">' + source + '</div>' : '')
+    + (source ? '<div class="meta" style="margin-top:4px">' + source + '</div>' : '')
     + cloudSpendPeriodLine('Month to date', meter.monthToDate)
     + cloudSpendPeriodLine('Today', meter.today)
     + '<div style="margin-top:4px">' + capLine + '</div></div>';
