@@ -38,6 +38,22 @@ function stalledWorkerTimerBadge(active) {
   return '<span class="badge idle" title="The timer state could not be read">timer unknown</span>';
 }
 
+// The operator's on/off switch (the marker file the worker's tick checks first). `sw` is payload.switch: {disabled, disabledAt}.
+function stalledWorkerSwitchBadge(sw) {
+  if (!sw || sw.disabled !== true) return '';
+  const since = sw.disabledAt ? ' since ' + stalledWorkerEsc(sw.disabledAt) : '';
+  return '<span class="badge idle" title="Switched off' + since + ': the worker\'s ticks do nothing until you turn it back on">switched off</span>';
+}
+
+function stalledWorkerSwitchButton(sw) {
+  const off = !!(sw && sw.disabled === true);
+  const title = off
+    ? 'Switch the worker back on: it starts working again at its next tick (within 10 minutes).'
+    : 'Switch the worker off: new ticks do nothing (a tick already running finishes). The timer keeps running; nothing is deleted.';
+  return '<button type="button" class="secondary stalled-switch-btn" data-next-enabled="' + (off ? 'true' : 'false') + '" title="' + stalledWorkerEsc(title)
+    + '" style="margin-left:8px">' + (off ? '\u23FB Turn on' : '\u23FB Turn off') + '</button>';
+}
+
 function stalledWorkerBudgetLine(p) {
   const b = p.budget;
   const source = [p.provider, p.model].filter(Boolean).map(stalledWorkerEsc).join(' · ');
@@ -81,9 +97,11 @@ function stalledWorkerRecentHtml(recent) {
 
 function buildStalledWorkerHtml(p) {
   if (!p || !p.configured) return '';
-  const box = 'padding:12px 16px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin:12px 0;';
+  const off = !!(p.switch && p.switch.disabled === true);
+  const box = 'padding:12px 16px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin:12px 0;' + (off ? ' opacity:.65;' : '');
   const age = stalledWorkerAge(p.lastTickAgeS);
-  const title = '<div style="font-weight:600">\u{1F9F9} Stalled-task worker ' + stalledWorkerModeBadge(p.mode) + ' ' + stalledWorkerTimerBadge(p.timerActive) + '</div>';
+  const title = '<div style="font-weight:600">\u{1F9F9} Stalled-task worker ' + (off ? stalledWorkerSwitchBadge(p.switch) : stalledWorkerModeBadge(p.mode)) + ' ' + stalledWorkerTimerBadge(p.timerActive)
+    + stalledWorkerSwitchButton(p.switch) + '</div>';
   const last = '<div class="meta" style="margin-top:4px">' + (age ? 'Last tick ' + stalledWorkerEsc(age) + ' ago' : 'No tick recorded yet')
     + (p.decisions !== undefined ? ' · ' + stalledWorkerInt(p.decisions) + ' decisions in the ledger tail' : '') + '</div>';
   return '<div id="stalled-worker-panel" style="' + box + '">' + title + last + stalledWorkerBudgetLine(p) + stalledWorkerStalledLine(p.stalled)
@@ -93,4 +111,35 @@ function buildStalledWorkerHtml(p) {
 // What renderWorkers() appends: nothing at all unless the worker has left any trace (ledger, index, running timer or a reachable gateway).
 function renderStalledWorkerSection(payload) {
   return buildStalledWorkerHtml(payload);   // returns '' itself unless payload.configured
+}
+
+// POST the switch, then redraw the Workers tab (same flow as worker-switch-ui.js setWorkerEnabled). Returns true on success.
+async function setStalledWorkerEnabled(enabled) {
+  const verb = enabled ? 'on' : 'off';
+  let res;
+  try {
+    res = await fetch('/api/stalled-worker/enabled', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) });
+  } catch (e) {
+    showToast('Could not switch the stalled-task worker ' + verb + ': ' + e.message);
+    return false;
+  }
+  if (!res.ok) {
+    let why = 'HTTP ' + res.status;
+    try { const body = await res.json(); why = body.error || why; } catch (e) { /* keep the HTTP status */ }
+    showToast('Could not switch the stalled-task worker ' + verb + ': ' + why);
+    return false;
+  }
+  await renderWorkers();
+  return true;
+}
+
+function wireStalledWorkerSwitch(root) {
+  root.querySelectorAll('.stalled-switch-btn').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      btn.disabled = true;
+      const ok = await setStalledWorkerEnabled(btn.dataset.nextEnabled === 'true');
+      if (!ok) btn.disabled = false;       // a failed switch leaves the panel as it was, and the button usable
+    };
+  });
 }

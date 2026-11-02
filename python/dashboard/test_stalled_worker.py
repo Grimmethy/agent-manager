@@ -16,6 +16,20 @@ sys.path.insert(0, str(Path(__file__).parent))
 import app  # noqa: E402
 from routes import stalled_worker as sw  # noqa: E402
 
+_ISO_DIR = tempfile.mkdtemp(prefix="stalled-worker-tests-")
+_ISO_ENV = mock.patch.dict(os.environ, {"HOME": _ISO_DIR, "STALLED_DISABLED_PATH": os.path.join(_ISO_DIR, "marker"), "STALLED_LEDGER_PATH": os.path.join(_ISO_DIR, "ledger.jsonl"),
+                                        "STALLED_INDEX_PATH": os.path.join(_ISO_DIR, "index.json")})
+
+
+def setUpModule():
+    # Every test runs with HOME and every state path in a temp dir: even a broken rule can only ever write here, never the real ~/.local/state/pipeline-ops (a mutation run once did).
+    _ISO_ENV.start()
+
+
+def tearDownModule():
+    _ISO_ENV.stop()
+
+
 NOW = 1_800_000_000.0                       # 2027-01-15T08:00:00Z
 ISO = lambda secs_ago: __import__("datetime").datetime.fromtimestamp(NOW - secs_ago, __import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
 
@@ -28,12 +42,13 @@ METER = {"tokenBudget": {"perHour": 5400000, "used": 1000, "remaining": 5399000,
 INDEX = {"total": 5, "projects": 2, "builtAt": ISO(30), "topBuckets": [{"state": "blocked", "signature": "s", "count": 3}]}
 
 
-def build(rows=(), index=INDEX, meter=METER, timer=True, env=None):
+def build(rows=(), index=INDEX, meter=METER, timer=True, env=None, switch=None):
     def fetch(url, timeout):
         if isinstance(meter, Exception):
             raise meter
         return meter
-    return sw.build_stalled_worker(env=env or {}, now=NOW, read_rows=lambda p: list(rows), read_index=lambda p: index, fetch=fetch, timer=lambda: timer)
+    return sw.build_stalled_worker(env=env or {}, now=NOW, read_rows=lambda p: list(rows), read_index=lambda p: index, fetch=fetch, timer=lambda: timer,
+                                   read_sw=lambda e: switch or {"disabled": False, "disabledAt": None})
 
 
 class Decisions(unittest.TestCase):
@@ -238,8 +253,9 @@ class Build(unittest.TestCase):
     def test_it_never_raises_whatever_a_reader_does(self):
         def boom(*a, **k):
             raise RuntimeError("x")
-        self.assertEqual(sw.build_stalled_worker(env={}, now=NOW, read_rows=boom, read_index=boom, fetch=boom, timer=boom), {"configured": False})
-        p = sw.build_stalled_worker(env={}, now=NOW, read_rows=lambda p: [row("intent", "t", "X", 5)], read_index=boom, fetch=boom, timer=boom)
+        self.assertEqual(sw.build_stalled_worker(env={}, now=NOW, read_rows=boom, read_index=boom, fetch=boom, timer=boom, read_sw=boom), {"configured": False})
+        p = sw.build_stalled_worker(env={}, now=NOW, read_rows=lambda p: [row("intent", "t", "X", 5)], read_index=boom, fetch=boom, timer=boom, read_sw=boom)
+        self.assertEqual(p["switch"], {"disabled": False, "disabledAt": None})
         self.assertTrue(p["configured"])
         self.assertIsNone(p["stalled"])
 
@@ -264,6 +280,63 @@ class Build(unittest.TestCase):
         self.assertEqual(sw.model_url({}), "http://127.0.0.1:7475")
 
 
+class SwitchRule(unittest.TestCase):
+    def env(self, d):
+        return {"STALLED_DISABLED_PATH": os.path.join(d, "marker")}
+
+    def test_the_default_marker_is_the_one_the_workers_tick_checks(self):
+        self.assertEqual(sw.switch_path({"STALLED_DISABLED_PATH": ""}), os.path.join(os.path.expanduser("~"), ".local", "state", "pipeline-ops", "stalled-disabled"))
+        self.assertTrue(sw.switch_path({}).endswith(os.path.join(".local", "state", "pipeline-ops", "stalled-disabled")))
+        self.assertEqual(sw.switch_path({"STALLED_DISABLED_PATH": " /x/m "}), "/x/m")
+        self.assertEqual(sw.switch_path({"STALLED_DISABLED_PATH": "   "}), os.path.join(os.path.expanduser("~"), ".local", "state", "pipeline-ops", "stalled-disabled"))
+
+    def test_no_marker_means_on_and_a_marker_means_off_with_its_time(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self.env(d)
+            self.assertEqual(sw.read_switch(env), {"disabled": False, "disabledAt": None})
+            sw.set_enabled(False, env, now=NOW)
+            self.assertEqual(sw.read_switch(env), {"disabled": True, "disabledAt": ISO(0).replace("Z", ".000Z")})
+
+    def test_an_empty_or_garbage_marker_still_means_off_with_an_unknown_time(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self.env(d)
+            for content in ("", "{bad", "[]", '{"disabledAt": 5}'):
+                Path(env["STALLED_DISABLED_PATH"]).write_text(content)
+                self.assertEqual(sw.read_switch(env), {"disabled": True, "disabledAt": None}, content)
+
+    def test_it_fails_open_a_directory_or_a_path_below_a_file_is_on(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, "adir"))
+            self.assertFalse(sw.read_switch({"STALLED_DISABLED_PATH": os.path.join(d, "adir")})["disabled"])
+            Path(d, "afile").write_text("x")
+            self.assertFalse(sw.read_switch({"STALLED_DISABLED_PATH": os.path.join(d, "afile", "m")})["disabled"])
+
+    def test_turning_off_and_on_is_idempotent_creates_the_directory_and_leaves_no_temp_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {"STALLED_DISABLED_PATH": os.path.join(d, "deep", "er", "marker")}
+            self.assertEqual(sw.set_enabled(True, env), {"disabled": False, "disabledAt": None})
+            self.assertTrue(sw.set_enabled(False, env, now=NOW)["disabled"])
+            self.assertTrue(sw.set_enabled(False, env, now=NOW)["disabled"])
+            self.assertEqual(os.listdir(os.path.dirname(env["STALLED_DISABLED_PATH"])), ["marker"])
+            self.assertEqual(json.loads(Path(env["STALLED_DISABLED_PATH"]).read_text()), {"disabledAt": ISO(0).replace("Z", ".000Z")})
+            self.assertFalse(sw.set_enabled(True, env)["disabled"])
+            self.assertFalse(sw.set_enabled(True, env)["disabled"])
+            self.assertEqual(os.listdir(os.path.dirname(env["STALLED_DISABLED_PATH"])), [])
+
+    def test_a_filesystem_error_is_raised_to_the_caller(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "afile").write_text("x")
+            with self.assertRaises(OSError):
+                sw.set_enabled(False, {"STALLED_DISABLED_PATH": os.path.join(d, "afile", "m")})
+
+    def test_the_payload_carries_the_switch_and_a_marker_alone_makes_it_configured(self):
+        off = {"disabled": True, "disabledAt": "2026-11-02T12:00:00.000Z"}
+        self.assertEqual(build(rows=[row("intent", "t", "X", 5)], switch=off)["switch"], off)
+        self.assertEqual(build(rows=[row("intent", "t", "X", 5)])["switch"], {"disabled": False, "disabledAt": None})
+        self.assertEqual(build(rows=[], index=None, meter=OSError("x"), timer=False, switch=off)["switch"], off)
+        self.assertEqual(build(rows=[], index=None, meter=OSError("x"), timer=False), {"configured": False})
+
+
 class Route(unittest.TestCase):
     def test_the_route_returns_the_payload(self):
         with mock.patch.object(sw, "build_stalled_worker", return_value={"configured": False}):
@@ -272,6 +345,60 @@ class Route(unittest.TestCase):
 
     def test_the_route_is_get_only(self):
         self.assertEqual(app.app.test_client().post("/api/stalled-worker").status_code, 405)
+
+
+class EnabledRoute(unittest.TestCase):
+    def setUp(self):
+        self.client = app.app.test_client()
+        self.marker = os.environ["STALLED_DISABLED_PATH"]
+        if os.path.exists(self.marker):
+            os.unlink(self.marker)
+        self.addCleanup(lambda: os.path.exists(self.marker) and os.unlink(self.marker))
+
+    def post(self, body):
+        return self.client.post("/api/stalled-worker/enabled", json=body)
+
+    def test_off_writes_the_marker_and_on_removes_it_and_both_are_idempotent(self):
+        r = self.post({"enabled": False})
+        self.assertEqual((r.status_code, r.get_json()["enabled"], r.get_json()["switch"]["disabled"]), (200, False, True))
+        self.assertTrue(os.path.isfile(self.marker))
+        self.assertEqual(self.post({"enabled": False}).status_code, 200)
+        r2 = self.post({"enabled": True})
+        self.assertEqual((r2.status_code, r2.get_json()["enabled"], r2.get_json()["switch"]), (200, True, {"disabled": False, "disabledAt": None}))
+        self.assertFalse(os.path.exists(self.marker))
+        self.assertEqual(self.post({"enabled": True}).status_code, 200)
+
+    def test_a_bad_body_is_a_400_and_writes_nothing(self):
+        for body in ({}, {"enabled": "yes"}, {"enabled": 1}, {"enabled": None}, {"enable": False}, [True], "off"):
+            r = self.post(body)
+            self.assertEqual(r.status_code, 400, body)
+            self.assertIn("enabled", r.get_json()["error"])
+        self.assertEqual(self.client.post("/api/stalled-worker/enabled").status_code, 400)
+        self.assertEqual(self.client.post("/api/stalled-worker/enabled", data="not json", content_type="application/json").status_code, 400)
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_an_unwritable_marker_is_a_500_with_a_plain_error_not_a_crash(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "afile").write_text("x")
+            with mock.patch.dict(os.environ, {"STALLED_DISABLED_PATH": os.path.join(d, "afile", "m")}):
+                r = self.post({"enabled": False})
+        self.assertEqual(r.status_code, 500)
+        self.assertIn("could not change the switch", r.get_json()["error"])
+
+    def test_the_marker_carries_the_time_of_the_switch_off(self):
+        with mock.patch("routes.stalled_worker.time.time", return_value=NOW):
+            r = self.post({"enabled": False})
+        self.assertEqual(r.get_json()["switch"]["disabledAt"], ISO(0).replace("Z", ".000Z"))
+        self.assertEqual(json.loads(Path(self.marker).read_text()), {"disabledAt": ISO(0).replace("Z", ".000Z")})
+
+    def test_the_payload_reflects_the_switch_after_a_post(self):
+        self.post({"enabled": False})
+        self.assertTrue(sw.read_switch()["disabled"])
+        self.post({"enabled": True})
+        self.assertFalse(sw.read_switch()["disabled"])
+
+    def test_the_route_is_post_only(self):
+        self.assertEqual(self.client.get("/api/stalled-worker/enabled").status_code, 405)
 
 
 if __name__ == "__main__":

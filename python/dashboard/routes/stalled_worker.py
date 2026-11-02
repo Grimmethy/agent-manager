@@ -17,7 +17,7 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 
 stalled_worker_bp = Blueprint("stalled-worker-bp", __name__)
 
@@ -46,6 +46,47 @@ def index_path(env=None):
 def model_url(env=None):
     env = os.environ if env is None else env
     return str(env.get("STALLED_MODEL_URL") or DEFAULT_MODEL_URL).rstrip("/")
+
+
+def switch_path(env=None):
+    """The worker's on/off marker. The SAME file agent-manager-pipeline-ops src/switch.js reads first thing each tick (pinned by a test in both repos)."""
+    env = os.environ if env is None else env
+    return str(env.get("STALLED_DISABLED_PATH") or "").strip() or os.path.join(os.path.expanduser("~"), ".local", "state", "pipeline-ops", "stalled-disabled")
+
+
+def read_switch(env=None):
+    """{disabled, disabledAt}: the marker file is present = switched off. Any error reading it means ON (a broken switch must never look like a stopped worker)."""
+    path = switch_path(env)
+    if not os.path.isfile(path):          # False for a missing path, a directory, a path below a file or an unreadable parent: all mean ON (isfile never raises)
+        return {"disabled": False, "disabledAt": None}
+    disabled_at = None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("disabledAt"), str):
+            disabled_at = data["disabledAt"]
+    except (OSError, ValueError):
+        pass
+    return {"disabled": True, "disabledAt": disabled_at}
+
+
+def set_enabled(enabled, env=None, now=None):
+    """Switch the worker on (remove the marker, idempotent) or off (write it atomically). Raises OSError on a filesystem failure; returns the new switch state."""
+    path = switch_path(env)
+    if enabled:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return {"disabled": False, "disabledAt": None}
+    stamp = datetime.fromtimestamp(time.time() if now is None else now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump({"disabledAt": stamp}, f)
+        f.write("\n")
+    os.replace(tmp, path)
+    return {"disabled": True, "disabledAt": stamp}
 
 
 def read_ledger_tail(path, max_bytes=LEDGER_TAIL_BYTES):
@@ -145,7 +186,7 @@ def _parse_ts(s):
         return None
 
 
-def build_stalled_worker(env=None, now=None, read_rows=read_ledger_tail, read_index=read_index_summary, fetch=_http_get_json, timer=timer_state):
+def build_stalled_worker(env=None, now=None, read_rows=read_ledger_tail, read_index=read_index_summary, fetch=_http_get_json, timer=timer_state, read_sw=read_switch):
     """The panel payload. See the module docstring. Never raises."""
     env = os.environ if env is None else env
     now = time.time() if now is None else now
@@ -170,7 +211,8 @@ def build_stalled_worker(env=None, now=None, read_rows=read_ledger_tail, read_in
     except Exception as exc:   # noqa: BLE001 -- down, timed out, refused or not JSON
         gateway = {"available": False, "error": str(exc)[:200]}
 
-    if not rows and not index and timer_active is not True and not gateway["available"]:
+    switch = safe(lambda: read_sw(env), {"disabled": False, "disabledAt": None})
+    if not rows and not index and timer_active is not True and not gateway["available"] and not switch.get("disabled"):
         return {"configured": False}
 
     ds = safe(lambda: decisions(rows), [])
@@ -194,6 +236,7 @@ def build_stalled_worker(env=None, now=None, read_rows=read_ledger_tail, read_in
     return {
         "configured": True,
         "mode": last_mode,
+        "switch": switch,
         "timerActive": timer_active,
         "lastTickAt": datetime.fromtimestamp(last_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if last_ts is not None else None,
         "lastTickAgeS": max(0, int(now - last_ts)) if last_ts is not None else None,
@@ -214,3 +257,16 @@ def build_stalled_worker(env=None, now=None, read_rows=read_ledger_tail, read_in
 def api_stalled_worker():
     """Status of the stalled-task worker for the Workers tab. See build_stalled_worker."""
     return jsonify(build_stalled_worker())
+
+
+@stalled_worker_bp.route("/api/stalled-worker/enabled", methods=["POST"])
+def api_stalled_worker_enabled():
+    """The panel's Turn on / Turn off button: body {enabled: bool}. Off writes the marker the worker's tick checks first; on removes it. A bad body is a 400 and writes nothing."""
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        return jsonify({"error": "body must be {\"enabled\": true|false}"}), 400
+    try:
+        switch = set_enabled(body["enabled"])
+    except OSError as exc:
+        return jsonify({"error": f"could not change the switch: {exc}"[:240]}), 500
+    return jsonify({"enabled": body["enabled"], "switch": switch})
