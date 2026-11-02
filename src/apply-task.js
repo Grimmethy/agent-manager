@@ -775,6 +775,15 @@ function main() {
   // can't be auto-stashed by this apply's own resetToMain() call.
   const { applyRepoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath } = getConfig();
 
+  // 2026-10-08 (HUB0245-4/4): provisioning warning for pool projects -- when a project
+  // is marked pool:true but AGENT_MANAGER_APPLY_REPO_ROOT is not explicitly set (meaning
+  // applyRepoRoot falls back to repoRoot), apply operations may not work correctly
+  // because pool projects expect a dedicated worktree to avoid interfering with the
+  // shared interactive checkout. Warn but do not block the apply.
+  if (task.project && task.project.pool === true && !process.env.AGENT_MANAGER_APPLY_REPO_ROOT) {
+    console.warn('Project is pool:true but missing applyRepoRoot. Apply operations may not work correctly.');
+  }
+
   let task;
   try {
     task = JSON.parse(fs.readFileSync(taskPath, 'utf8'));
