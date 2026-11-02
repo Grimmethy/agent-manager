@@ -101,6 +101,19 @@
   .recent-tasks-list li { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-top: 1px solid var(--border); }
   .recent-tasks-list li:first-child { border-top: none; }
   .empty { color: var(--muted); padding: 30px; text-align: center; }
+  /* Skeleton shimmer (skeleton.js): shown while a tab loads. A soft light band sweeps left to right every 1.4 s; reduced motion keeps the shapes still. */
+  .skeleton { padding: 8px 0; position: relative; }
+  .skeleton-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .skeleton-caption { color: var(--muted); margin: 0 0 16px; }
+  .skeleton-title, .skeleton-block, .skeleton-line { position: relative; overflow: hidden; background: var(--panel); border-radius: 6px; display: block; }
+  .skeleton-title { height: 24px; width: 28%; margin-bottom: 20px; }
+  .skeleton-row { display: flex; gap: 16px; padding: 16px; margin-bottom: 12px; border: 2px solid var(--border); border-radius: 10px; }
+  .skeleton-block { width: 48px; height: 48px; flex: none; }
+  .skeleton-lines { flex: 1; display: flex; flex-direction: column; gap: 12px; justify-content: center; }
+  .skeleton-line { height: 12px; }
+  .skeleton-title::after, .skeleton-block::after, .skeleton-line::after { content: ''; position: absolute; inset: 0; transform: translateX(-100%); background: linear-gradient(90deg, transparent, rgba(255,255,255,.09), transparent); animation: skeleton-sweep 1.4s linear infinite; }
+  @keyframes skeleton-sweep { to { transform: translateX(100%); } }
+  @media (prefers-reduced-motion: reduce) { .skeleton-title::after, .skeleton-block::after, .skeleton-line::after { animation: none; } }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   tr.top-row td:first-child { border-left: 2px solid var(--ok); }
@@ -300,6 +313,7 @@
 <script src="/static/js/task-detail-modal.js"></script>
 <script src="/static/js/branch-verdicts.js"></script>
 <script src="/static/js/branch-projects.js"></script>
+<script src="/static/js/skeleton.js"></script>
 <script src="/static/js/branches-joblist-hardware-tabs.js"></script>
 <script src="/static/js/project-tab.js"></script>
 <script src="/static/js/brain-dump-chips.js"></script>
