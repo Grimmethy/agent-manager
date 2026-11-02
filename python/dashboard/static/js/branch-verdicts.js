@@ -4,7 +4,8 @@
 // Kept out of branches-joblist-hardware-tabs.js on purpose (hot file) -- that file only calls the helpers
 // below. Pure string/array functions, no DOM, so they are testable from Node.
 //
-// Border color per card: green = merge, yellow = needs-work, blue = hold (sound, waiting on its hub or a sibling), red = discard, grey = unverified or stale.
+// The verdict is shown by the badge (green = merge, yellow = needs-work, blue = hold (sound, waiting on its hub or a sibling), red = discard, grey = unverified or stale),
+// not by the card border: every card keeps the standard 2px --border blue the other tabs use (owner, 2026-11-02).
 
 const BRANCH_VERDICT_FILTERS = [
   { key: 'all', label: 'All' },
@@ -23,14 +24,10 @@ function branchVerdictKey(b) {
   return ['merge', 'needs-work', 'hold', 'discard'].includes(b.verdict) ? b.verdict : 'unverified';
 }
 
-function branchVerdictColorVar(key) {
-  return { merge: 'var(--ok)', 'needs-work': 'var(--warn)', hold: 'var(--accent)', discard: 'var(--bad)' }[key] || 'var(--muted)';
-}
-
-// Inline style for the card: a colored left border plus a thin outline in the same color.
-function branchVerdictBorderStyle(b) {
-  const c = branchVerdictColorVar(branchVerdictKey(b));
-  return `border-left:5px solid ${c};border-color:${c};`;
+// Inline style for the card border: none. The card falls back to the shared .worker-card border (2px solid var(--border)). Kept as a function so the
+// one caller in branches-joblist-hardware-tabs.js does not change.
+function branchVerdictBorderStyle() {
+  return '';
 }
 
 function _bvEscape(s) {
