@@ -1299,3 +1299,51 @@ test('parseSubTaskProposals keeps a valid files array and drops an unusable one;
   assert.equal(out[1].files, undefined);
   assert.match(formatSubTaskProposalsForReview(out), /1\. a\n   x\n   Files: README\.md, src\/a\.js\n2\. b\n   y$/);
 });
+
+// 2026-11-02 stalled-task loop: the forced final turn produced NO text after edits landed (40 parked 'design-decision' tasks whose only question was the placeholder) ------
+test('resolveAgenticDraft: forcedSummary with EMPTY text + edits but no captured diff -> budget exhaustion block (decompose-eligible), not a human hold', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'oot-1' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: '', forcedSummary: true, turnsUsed: 35, toolCallLog: [{ tool: 'read_file' }, { tool: 'edit_file' }, { tool: 'edit_file' }] },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, undefined);
+    assert.equal(task.turnBudgetExhausted, true);
+    assert.equal(task.turnBudgetExhaustedBefore, true);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.notEqual(task.adhocResolution, 'needs-human-decision');
+    assert.match(out.blockedReason, /ran out of turns/);
+  });
+});
+
+test('resolveAgenticDraft: forcedSummary with EMPTY text + a partial diff -> continuation, then exhaustion once the cap is hit', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'partial work landed\n');
+    const res = { response: '', forcedSummary: true, turnsUsed: 35, toolCallLog: [{ tool: 'edit_file' }] };
+    const first = { id: 'oot-2' };
+    const out = resolveAgenticDraft(first, { result: res, worktreeDir: wt });
+    assert.match(out.blockedReason, /continuation 1\/2/);
+    assert.equal(first.isAgenticContinuation, true);
+    assert.match(first.priorPartialDiff, /a\.txt/);
+    const capped = { id: 'oot-3', agenticContinuationCount: 2 };
+    const out2 = resolveAgenticDraft(capped, { result: res, worktreeDir: wt });
+    assert.equal(out2.blocked, true);
+    assert.equal(capped.turnBudgetExhaustedBefore, true);
+    assert.equal(out2.needsClarification, undefined);
+  });
+});
+
+test('resolveAgenticDraft: forcedSummary with REAL text but no RESOLUTION line still goes to a human (only the empty-text case changed)', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'oot-4' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'I found two incompatible readings of the spec and cannot pick one.', forcedSummary: true, turnsUsed: 35, toolCallLog: [{ tool: 'edit_file' }] },
+      worktreeDir: wt,
+    });
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.adhocResolution, 'needs-human-decision');
+    assert.ok(!task.turnBudgetExhausted);
+  });
+});

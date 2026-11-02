@@ -19,7 +19,16 @@ function statusBadgeClass(status, stale) {
   // deliberate third state (green=actively running, amber=waiting its turn, gray=idle)
   // rather than falling through by accident.
   if (status === 'queued') return 'warn';
+  // 'paused' / 'warming' (B3): the lane is yielding to a GPU session, or reloading its model after one. Amber like 'queued': deliberate, not broken.
+  if (status === 'paused' || status === 'warming') return 'warn';
   return 'warn';
+}
+
+// What the badge says. Most statuses are shown as they are; the two GPU-session states say why in words.
+function statusLabel(status) {
+  if (status === 'paused') return 'paused: GPU session';
+  if (status === 'warming') return 'resuming: model warming';
+  return status;
 }
 
 function modelKindForInstance(inst) {
@@ -306,10 +315,10 @@ async function renderWorkers(isPoll) {
     }
   });
   const filterBar = `
-    <div class="worker-filter-bar" style="margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
+    <div class="worker-filter-bar" style="margin-bottom:12px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px">
       <div></div>
-      <label style="display:flex; align-items:center; gap:6px; font-size:0.9em; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
-        <input type="checkbox" id="claude-pause-toggle" ${workerModels.claudePaused ? 'checked' : ''}>
+      <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
+        <input type="checkbox" id="claude-pause-toggle" style="margin:0" ${workerModels.claudePaused ? 'checked' : ''}>
         Pause Claude (preserve subscription tokens)
       </label>
     </div>
@@ -413,7 +422,7 @@ async function renderWorkers(isPoll) {
           return typeSelect + taskSelect;
         })() : ''}
         <div class="badge-col">
-          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
+          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : statusLabel(inst.status)}</span>
           ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
           <span class="state-timer" id="state-timer-${inst.instanceId}">${inst.stateAgeSeconds != null ? 'in this state ' + fmtDuration(inst.stateAgeSeconds) : ''}</span>
           ${typeof buildWorkerSwitchHtml === 'function' ? buildWorkerSwitchHtml(inst) : ''}

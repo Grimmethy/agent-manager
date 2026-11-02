@@ -1254,14 +1254,14 @@ def _delete_local_branch(repo_root, branch):
     return {"deleted": True, "sha": sha}
 
 
-def _record_manual_requeue(task: dict, *, reason_hint: str, requeue_writer: str, actor: str = "operator-manual"):
+def _record_manual_requeue(task: dict, *, reason_hint: str, requeue_writer: str, actor: str = "operator-manual", pipeline_dir=None):
     """Best-effort: record an operator-initiated requeue into requeue-attribution.db with
     actor='operator-manual', so the Ghost-in-the-Machine concept card can trend hand-fixes
     against pipeline-mechanism recoveries. Never raises -- a telemetry write must not turn
     a working requeue into a 500. See requeue_attribution_client.py."""
     try:
         import requeue_attribution_client
-        d = get_pipeline_dir()
+        d = Path(pipeline_dir) if pipeline_dir else get_pipeline_dir()
         requeue_attribution_client.classify_requeue(
             task,
             reason_hint=reason_hint,
@@ -2358,8 +2358,10 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
         })
 
     branches, held = partition_held_hub_branches(branches)
-    if not other:
-        with _branch_cache_lock:
+    with _branch_cache_lock:
+        if other:
+            _branch_cache.setdefault("held_other", {})[str(repo_root)] = held
+        else:
             _branch_cache["held"] = held
     _annotate_hub_sibling_conflicts(repo_root, branches)
     import branch_verdicts  # lazy: keeps app.py's import block untouched
@@ -2431,11 +2433,19 @@ def list_unmerged_branches(force=False):
     return branches
 
 
-def list_held_hub_groups():
-    """Hubs whose built children are pushed but not listed yet (see partition_held_hub_branches)."""
+def list_held_hub_groups(include_other_projects=False):
+    """Hubs whose built children are pushed but not listed yet (see partition_held_hub_branches). include_other_projects adds the groups the background
+    refresh found in every other registered project, each tagged with its `project` ({label, repoRoot}); a project not scanned yet contributes nothing."""
     list_unmerged_branches(force=False)
     with _branch_cache_lock:
-        return list(_branch_cache.get("held") or [])
+        groups = list(_branch_cache.get("held") or [])
+        others = dict(_branch_cache.get("held_other") or {})
+    if include_other_projects and others:
+        import branch_projects  # lazy, same as the listing route
+        for p in branch_projects.registered_projects(get_active_repo_root()):
+            if not p["active"]:
+                groups.extend({**g, "project": branch_projects.project_tag(p)} for g in others.get(str(p["repoRoot"]), []))
+    return groups
 
 
 def _invalidate_branch_cache(refetch=True):

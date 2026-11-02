@@ -87,6 +87,14 @@ test('a file that is not valid JSON is left untouched and the script fails', () 
   assert.deepStrictEqual(backups(d), []);
 });
 
+test('script runs successfully on a fully-populated file (regression guard against node -e syntax error)', () => {
+  const d = tmpDir();
+  fs.writeFileSync(path.join(d, 'task-domains.json'), JSON.stringify(TEMPLATE));
+  const r = run(d);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.match(r.stdout, /already lists all/);
+});
+
 test('provision, adopt and register scripts all call ensure-task-domains.sh', () => {
   for (const name of ['provision-plugin-repo.sh', 'adopt-existing-project.sh', 'register-project.sh']) {
     const text = fs.readFileSync(path.join(ROOT, 'scripts', name), 'utf8');

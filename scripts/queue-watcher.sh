@@ -257,6 +257,19 @@ while :; do
     defect_readmit_result="$(node "${PACKAGE_SRC_DIR}/branch-defect-readmit-sweep.js" 2>>"${HOME_LOGS}/branch-defect-readmit-sweep.log")"
     printf '[watchdog] branch-defect-readmit-sweep: %s\n' "$defect_readmit_result" >&2
 
+    # Redo supersession (2026-10-30): when a redo task (promptContext.redoOf) has merged, record a discard verdict on the Unmerged Branches card of the task it replaced,
+    # so the old needs-work branch does not sit in the pool until a human notices. Records only; the owner's Discard click deletes the branch.
+    # AGENT_MANAGER_REDO_SUPERSEDE=off|dry-run|on (default on). See redo-supersede-sweep.js.
+    redo_supersede_result="$(node "${PACKAGE_SRC_DIR}/redo-supersede-sweep.js" 2>>"${HOME_LOGS}/redo-supersede-sweep.log")"
+    printf '[watchdog] redo-supersede-sweep: %s\n' "$redo_supersede_result" >&2
+
+    # Brain-dump reconcile (HUB0226): closes a brain-dump entry when a task that names it has merged or been superseded. Why a poll and not an event: tasks reach
+    # done/ from the dashboard merge route (python), apply-task (node) and sweeps, so there is no single writer to announce; the one signal all of them leave is the
+    # mtime of queue/done (plus the brain dump file's own mtime). Idle cost: two stat calls and this node start; reconcile only runs when one moved, and a 6 hour
+    # full run counts what the mtimes missed. AGENT_MANAGER_BRAIN_DUMP_RECONCILE=off|dry-run|on (default dry-run). See brain-dump-reconcile-sweep.js.
+    brain_dump_reconcile_result="$(node "${PACKAGE_SRC_DIR}/brain-dump-reconcile-sweep.js" 2>>"${HOME_LOGS}/brain-dump-reconcile-sweep.log")"
+    printf '[watchdog] brain-dump-reconcile-sweep: %s\n' "$brain_dump_reconcile_result" >&2
+
     # Expiry sweep (2026-09-24, change_review flood): retires a QUEUED task whose subject went stale while it waited, for any source that
     # declares an `expiry` hook on its registration (change_review: a review of a commit older than its recency window). Source-agnostic --
     # core names no plugin source. archive -> done/_archived_no_action/ stamped terminalDisposition 'aged-out'; a task already holding an

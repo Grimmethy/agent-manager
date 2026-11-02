@@ -45,7 +45,7 @@ function branchCardHtml(b) {
   const foreign = !branchIsActiveProject(b);
   return `
     <div class="worker-card" data-branch-row="${escapeAttr(branchRowKey(b))}" data-open-branch="${escapeAttr(branchRowKey(b))}" data-verdict-key="${branchVerdictKey(b)}" style="cursor:pointer;${branchVerdictBorderStyle(b)}">
-      ${b.project ? `<div style="margin-bottom:6px">${branchProjectChipHtml(b)}</div>` : ''}
+      ${b.project ? `<div style="margin-bottom:8px">${branchProjectChipHtml(b)}</div>` : ''}
       <div class="row">
         <span class="id">${escapeHtmlBright(b.title)}</span>
         <div class="badge-col">
@@ -62,8 +62,8 @@ function branchCardHtml(b) {
         ${!b.matchedTaskState ? ' · <span title="No matching queue/ task file found -- label is the branch\'s own last commit subject.">no task record found</span>' : ''}
         ${b.matchedTaskState === 'task-log' ? ' · <span title="No live queue/ record exists for this task anymore -- this came from the git-tracked task-logs/ file apply-task.js committed alongside the change, so it survives archival.">from committed task log</span>' : ''}
       </div>
-      ${b.description ? `<div style="margin-top:6px;font-size:13px;color:var(--text)">${escapeHtml(b.description)}</div>` : ''}
-      <div class="meta" style="font-family:monospace;font-size:11px;margin-top:4px">${escapeHtml(b.branch)}</div>
+      ${b.description ? `<div style="margin-top:8px;font-size:14px;color:var(--text)">${escapeHtml(b.description)}</div>` : ''}
+      <div class="meta" style="font-family:monospace;font-size:12px;margin-top:4px">${escapeHtml(b.branch)}</div>
       <div class="row" style="margin-top:8px">
         <button class="action" data-project="${escapeAttr(branchProjectRequestRoot(b))}" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}" data-hub-midflight="${hubMidFlight === true}" data-hub-status="${escapeAttr(b.hub ? b.hub.progress.done + '/' + b.hub.progress.total + ' done' + (b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : '') : '')}">Merge to ${escapeHtml(b.mainBranch)}</button>
         <button class="secondary" data-project="${escapeAttr(branchProjectRequestRoot(b))}" data-discard-branch="${escapeAttr(b.branch)}" title="Permanently delete this remote branch and archive its task -- for a branch you've decided NOT to merge.">Discard</button>
@@ -295,7 +295,7 @@ async function renderBranchDetailModal(b) {
   }
   let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtmlBright(b.title)}</h2>`;
   if (b.project) html += `<div style="margin:4px 0">${branchProjectChipHtml(b)}</div>`;
-  html += `<div class="meta" style="font-family:monospace;font-size:11px">${escapeHtml(b.branch)} → ${escapeHtml(b.mainBranch)}</div>`;
+  html += `<div class="meta" style="font-family:monospace;font-size:12px">${escapeHtml(b.branch)} → ${escapeHtml(b.mainBranch)}</div>`;
   if (b.domain) html += `<div class="field-label">Domain / Source</div><div>${escapeHtml(b.domain)} / ${escapeHtml(b.source || '')}</div>`;
   if (b.description) html += `<div class="field-label">What this changes</div><div>${escapeHtml(b.description)}</div>`;
   html += branchVerdictDetailHtml(b);
@@ -310,16 +310,16 @@ async function renderBranchDetailModal(b) {
     html += `<div class="worker-card" style="margin:4px 0">`;
     const hubBuilt = p.built != null ? Math.max(p.built, p.done || 0) : (p.done || 0);
     if (!hub.readyToMerge) {
-      html += `<div class="badge bad" style="margin-bottom:6px">⚠ mid-flight — not ready to merge</div>`;
+      html += `<div class="badge bad" style="margin-bottom:8px">⚠ mid-flight — not ready to merge</div>`;
     } else if (hub.state === 'done') {
-      html += `<div class="badge ok" style="margin-bottom:6px">✓ hub complete</div>`;
+      html += `<div class="badge ok" style="margin-bottom:8px">✓ hub complete</div>`;
     } else {
-      html += `<div class="badge ok" style="margin-bottom:6px">✓ ready to merge — every piece is built</div>`;
+      html += `<div class="badge ok" style="margin-bottom:8px">✓ ready to merge — every piece is built</div>`;
     }
     html += `<div class="meta"><a href="javascript:void(0)" data-open-hub="${escapeAttr(hub.id)}" style="cursor:pointer">${escapeHtmlBright(hub.title || hub.id)}</a> · ${hubBuilt}/${p.total} built${hubBuilt > (p.done || 0) ? ` · ${p.done || 0} merged` : ''}`
       + (gate ? ` · integration gate <strong>${escapeHtml(gate)}</strong>` : '') + `</div>`;
     if (hub.blockedReason) html += `<div class="meta" style="color:var(--bad);margin-top:4px">${escapeHtmlBright(hub.blockedReason)}</div>`;
-    html += `<div class="task-history" style="margin-top:6px">` + (hub.subTasks || []).map((st) =>
+    html += `<div class="task-history" style="margin-top:8px">` + (hub.subTasks || []).map((st) =>
       `<div class="task-history-row"><span class="task-history-stage">${escapeHtmlBright(st.title || st.id)}</span> `
       + `<span class="badge ${st.status === 'done' || st.status === 'merged' ? 'ok' : st.status === 'blocked' || st.status === 'needs-clarification' ? 'bad' : ''}">${escapeHtml(st.status || '?')}</span>`
       + (st.heldFor ? ` <span class="meta" title="Held until this earlier piece of the hub lands on main">held: waiting for an earlier piece (${escapeHtml(st.heldFor.status || '?')})</span>` : '') + `</div>`
@@ -348,18 +348,18 @@ async function renderBranchDetailModal(b) {
       // task's REAL pipeline log (plan → implement tiers → review votes → disposition).
       if (c.task) {
         const t = c.task;
-        row += `<div class="meta" style="margin-top:2px">task <code>${escapeHtml(t.id)}</code> · ${escapeHtml(t.state || '?')}`
+        row += `<div class="meta" style="margin-top:4px">task <code>${escapeHtml(t.id)}</code> · ${escapeHtml(t.state || '?')}`
           + (t.terminalDisposition ? ` · ${escapeHtml(t.terminalDisposition)}` : '')
           + (t.reviewVotes ? ` · review ${escapeHtml(t.reviewVotes)}` : '') + `</div>`;
         if (t.description) row += `<div style="font-size:12px;margin-top:4px">${escapeHtml(t.description)}</div>`;
-        row += `<div class="task-history" style="margin-top:6px">` + (t.history || []).map((e) => {
+        row += `<div class="task-history" style="margin-top:8px">` + (t.history || []).map((e) => {
           const eWhen = e.at ? new Date(e.at).toLocaleTimeString() : '';
           return `<div class="task-history-row"><span class="task-history-stage">${escapeHtml(e.stage || '?')}</span> `
             + `<span class="meta">${escapeHtml(eWhen)}</span>`
             + (e.detail ? ` <span style="font-size:12px">${escapeHtml(e.detail)}</span>` : '') + `</div>`;
         }).join('') + `</div>`;
       } else {
-        if (c.taskId) row += `<div class="meta" style="margin-top:2px">task <code>${escapeHtml(c.taskId)}</code> — no queue record found</div>`;
+        if (c.taskId) row += `<div class="meta" style="margin-top:4px">task <code>${escapeHtml(c.taskId)}</code> — no queue record found</div>`;
         if (c.body) row += `<pre>${escapeHtml(c.body)}</pre>`;
       }
       return row + `</div>`;
@@ -442,7 +442,7 @@ async function renderJobListTab() {
   const backboneHtml = mapAvailable ? `
     <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px;">
       ${PIPELINE_STAGE_ORDER.map((stage) => `
-        <div style="flex:1; min-width:110px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px; text-align:center;">
+        <div style="flex:1; min-width:110px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px; text-align:center;">
           <div style="font-size:22px; font-weight:700; color:${stageTotals[stage] > 0 ? 'var(--accent)' : 'var(--muted)'};">${stageTotals[stage]}</div>
           <div class="meta">${PIPELINE_STAGE_LABELS[stage]}</div>
         </div>
@@ -595,7 +595,7 @@ async function renderJobListTab() {
       <td>${headerPriorityCell}</td>
       <td colspan="10">
         <button type="button" class="fam-toggle" data-family="${escapeAttr(item.key)}"
-          style="background:none;border:none;color:inherit;cursor:pointer;font:inherit;padding:0 6px 0 0">${collapsed ? '▶' : '▼'}</button>
+          style="background:none;border:none;color:inherit;cursor:pointer;font:inherit;padding:0 8px 0 0">${collapsed ? '▶' : '▼'}</button>
         <b>${escapeHtml(item.label)}</b>
         <span class="meta"> — ${item.members.length} sources · ${spread}</span>
       </td>
@@ -617,14 +617,14 @@ async function renderJobListTab() {
   // rather than auto-generated.
   const detailInsetsHtml = mapAvailable ? `
     <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:24px;">
-      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px;">
+      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:16px;">
         <div style="font-weight:600; margin-bottom:8px;">Adhoc draft (domain:'adhoc', source:'manual')</div>
         <div class="meta" style="line-height:1.7;">
           A single local multi-turn agentic pass, <b>local-agentic-write</b> (local-agentic-write-draft.js) — real read/grep/glob/edit/write/run_bash tool access against an isolated worktree. No Claude tier, and no cheaper escalation tiers ahead of it: those existed 2026-09-01 through 2026-09-06, removed after real production history showed the cheap tiers won only ~11% of the time combined while costing the other ~89% their full time for nothing, and a safety audit found no incident of this pass's write access producing a bad edit a cheaper read-only tier would have caught. Declines (blocks for a human) if it can't confidently make the change.<br>
           Can resolve to <b>decompose</b> (task judged too large — queues 2+ fresh adhoc sub-tasks to <code>queue/adhoc/</code> instead of a diff) or <b>needs-human-decision</b> (routes to <code>queue/needs-clarification/</code>, never judged by an automatic reviewer).
         </div>
       </div>
-      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px;">
+      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:16px;">
         <div style="font-weight:600; margin-bottom:8px;">Split escape hatch (candidate-fulfillment sources — see "split-capable" badge)</div>
         <div class="meta" style="line-height:1.7;">
           Implement can output <code>{"mode":"split","candidates":[...]}</code> instead of a diff when the real candidate genuinely doesn't fit one atomic JSON edit (prompts.js's candidateSplitInstructions). Skips critique (no diff to critique) and goes straight to review, judged on scope-coverage rather than "does it contain code." At apply time, the sub-candidates are written back into the <i>same</i> candidates doc the original came from (the exact appender arch_discovery's own apply already uses) — each one then flows through the normal pickup loop on a later tick, small enough to land as its own single edit.
@@ -634,9 +634,9 @@ async function renderJobListTab() {
   ` : '';
 
   if (isStale()) return;
-  main.innerHTML = `<div style="margin-bottom:10px"><button id="reset-job-type-counts" class="secondary">Reset counts</button></div>`
+  main.innerHTML = `<div style="margin-bottom:8px"><button id="reset-job-type-counts" class="secondary">Reset counts</button></div>`
     + backboneHtml
-    + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Behavior</th><th>Live (in-flight)</th><th title="Min / Avg / Max turnsUsed across every recorded runPlanWithTools() call for this source">Turns (min/avg/max)</th><th>Times Performed</th><th>Available</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`
+    + `<div class="table-scroll"><table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Behavior</th><th>Live (in-flight)</th><th title="Min / Avg / Max turnsUsed across every recorded runPlanWithTools() call for this source">Turns (min/avg/max)</th><th>Times Performed</th><th>Available</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table></div>`
     + unregisteredHtml
     + detailInsetsHtml;
 
@@ -880,7 +880,7 @@ function renderWatchConfigChecklist(watchConfig) {
     </label>`).join('');
   return `
     <div class="field-label">Watching</div>
-    <div style="margin-bottom:10px;">${items}</div>
+    <div style="margin-bottom:8px;">${items}</div>
     <div class="meta" style="margin-bottom:14px;">Unchecked categories stop being measured
       each tick (not just hidden here) -- on a CPU-constrained box, checking only CPU
       skips the plugin's own expensive probe call entirely.</div>`;

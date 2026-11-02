@@ -73,7 +73,7 @@ test('first sighting only records state; a requeue needs a second run after the 
   const s3 = await run(w, t0 + SETTLE_MS + 1000, { requeue });
   assert.equal(s3.requeued.length, 1); assert.equal(calls.length, 1);
   assert.deepEqual(readState(w.pipelineDir), {}, 'a successful requeue leaves no state behind');
-  assert.equal(calls[0][2], 't1'); assert.deepEqual(calls[0][3], { state: 'done', force: true });
+  assert.equal(calls[0][2], 't1'); assert.deepEqual(calls[0][3], { state: 'done', force: true, keepPriority: true });
 });
 
 test('the history event is written before the requeue call, and the verdict stays on the task', async () => {
@@ -114,14 +114,46 @@ test('only a chat or manual needs-work verdict that is not main-moved counts', a
   assert.equal(defectVerdict({ promptContext: { priorVerdict: verdict('') } }), null);
 });
 
-test('hub children, stacked, human-queued, premium, pinned and not-pending-merge tasks are never touched', async () => {
-  for (const extra of [{ parentHub: 'H' }, { stacked: { branch: 'agent/t1', seq: 1, total: 2 } }, { humanQueued: true }, { premiumPriority: true }, { pinnedWorker: 'w' }, { terminalDisposition: 'merged' }]) {
+test('hub children, stacked, pinned and not-pending-merge tasks are never touched', async () => {
+  for (const extra of [{ parentHub: 'H' }, { stacked: { branch: 'agent/t1', seq: 1, total: 2 } }, { pinnedWorker: 'w' }, { terminalDisposition: 'merged' }]) {
     const w = defectWorld(extra);
     const { calls, requeue } = recorder();
     const t0 = Date.now();
     await run(w, t0, { requeue }); await run(w, t0 + SETTLE_MS + 1000, { requeue });
     assert.equal(calls.length, 0, JSON.stringify(extra));
   }
+});
+
+test('a human-queued or premium task with a chat needs-work verdict IS requeued once, with keepPriority (owner decision 2026-10-30)', async () => {
+  for (const extra of [{ humanQueued: true }, { premiumPriority: true }, { humanQueued: true, premiumPriority: true }]) {
+    const w = defectWorld(extra);
+    const { calls, requeue } = recorder();
+    const t0 = Date.now();
+    await run(w, t0, { requeue });
+    assert.equal(calls.length, 0, 'first sighting only records state');
+    const s = await run(w, t0 + SETTLE_MS + 1000, { requeue });
+    assert.equal(calls.length, 1, JSON.stringify(extra));
+    assert.equal(s.requeued.length, 1);
+    assert.equal(calls[0][2], 't1');
+    assert.equal(calls[0][3].keepPriority, true, 'the sweep must ask requeueBlockedTask to keep the priority');
+  }
+});
+
+test('with the REAL requeueBlockedTask the re-admitted premium task lands in pending/ still premium and human-queued', async () => {
+  const w = defectWorld({ humanQueued: true, premiumPriority: true, premiumSetBy: 'chat', premiumSetAt: '2026-10-30T00:00:00Z' });
+  fs.mkdirSync(path.join(w.pipelineDir, 'queue', 'pending'), { recursive: true });
+  const t0 = Date.now();
+  await run(w, t0);
+  const s = await run(w, t0 + SETTLE_MS + 1000);
+  assert.equal(s.errors, 0);
+  assert.equal(s.requeued.length, 1);
+  const moved = JSON.parse(fs.readFileSync(path.join(w.pipelineDir, 'queue', 'pending', 't1.json'), 'utf8'));
+  assert.equal(moved.humanQueued, true);
+  assert.equal(moved.premiumPriority, true);
+  assert.equal(moved.premiumSetBy, 'chat');
+  assert.equal(moved.premiumSetAt, '2026-10-30T00:00:00Z');
+  assert.equal(moved.promptContext.priorVerdict.verdict, 'needs-work', 'the reviewer reasons still ride along');
+  assert.equal(moved.history.filter((e) => e.stage === READMIT_STAGE).length, 1);
 });
 
 test('a branch another live task sits on is never touched', async () => {

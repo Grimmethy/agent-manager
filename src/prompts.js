@@ -24,6 +24,7 @@ const { statedAcceptanceBlock, fixedLiteralsBlock, priorRejectionBlock, priorVer
 const { assemblePrompt } = require('./lib/prompt-assembly.js');
 const { troubleLogPlanPrompt, secondbrainPlanPrompt, brainDumpSortPlanPrompt, pathPrefetchResolvePlanPrompt, researchPlanPrompt, pipelineSelfAuditPlanPrompt, pipelineHealthAuditPlanPrompt, uiVisibilityAuditPlanPrompt, stalenessAuditPlanPrompt, productSpecPlanPrompt, backlogDecompositionPlanPrompt } = require('./lib/prompt-planning.js');
 const { pathPrefetchResolveImplementPrompt, deepDiveImplementPrompt, backlogDecompositionImplementPrompt, brainDumpSortImplementPrompt } = require('./lib/prompt-implementation.js');
+const { resolutionCheckPlanPrompt, resolutionCheckImplementPrompt } = require('./lib/prompt-resolution-check.js');
 
 function truncate(str, max) {
   if (!str) return '';
@@ -532,13 +533,30 @@ function archDiscoveryImplementPrompt(task, planText) {
 // architecturally sound" but "what here is worth taking for agent-manager itself." Modeled
 // directly on archDiscoveryPlanPrompt/archDiscoveryImplementPrompt above -- same pre-fetch
 // constraint (no live exploration), different judgment and output contract.
+// 2026-11-02 (stalled-task loop: 50 arch_import tasks in the storyforge/sceneforge/questforge pipelines whose rationale was written about agent-manager, 11 fresh questforge arch_import tasks blocked
+// with zero harness hits, 19 storyforge/sceneforge deep_dive tasks blocked empty): the deep_dive and arch_import prompts named "agent-manager" as the target project whatever pipeline they ran in.
+// The label is the consumer project this pipeline serves: promptContext.consumerProject when a source stamped it, else the basename of the pipeline's repoRoot, else agent-manager. In
+// agent-manager's own pipeline the text is byte-identical to before (the description clause is kept only for the default).
+const DEFAULT_CONSUMER = 'agent-manager';
+function consumerLabel(task) {
+  const pc = (task && task.promptContext) || {};
+  if (typeof pc.consumerProject === 'string' && pc.consumerProject.trim()) return pc.consumerProject.trim();
+  try {
+    const root = require('./config.js').getConfig().repoRoot;
+    const base = root ? require('path').basename(String(root)) : '';
+    if (base) return base;
+  } catch { /* no config in this context (a unit test, a CLI): the default */ }
+  return DEFAULT_CONSUMER;
+}
+
 function deepDivePlanPrompt(task) {
   const ctx = task.promptContext;
+  const P = consumerLabel(task);
   const fileList = ctx.files.map((f) => `- ${f.path} (link-degree ${f.degree})`).join('\n');
   const fileContents = formatFileContents(ctx.files);
   const fileCount = ctx.files.length;
   return [
-    `You are reading ONE community of files from an external open-source project ("${ctx.projectName}"), looking for anything concretely useful to a DIFFERENT project called "agent-manager" (a local-LLM-driven task pipeline: drafting/review/apply queue, local-model-based workers, majority-vote review gates).`,
+    `You are reading ONE community of files from an external open-source project ("${ctx.projectName}"), looking for anything concretely useful to a DIFFERENT project called "${P}"${P === DEFAULT_CONSUMER ? ' (a local-LLM-driven task pipeline: drafting/review/apply queue, local-model-based workers, majority-vote review gates)' : ''}.`,
     '',
     `COMMUNITY: ${ctx.communityName} (id ${ctx.communityId}, from ${ctx.projectName})`,
     '',
@@ -547,7 +565,7 @@ function deepDivePlanPrompt(task) {
     '',
     fileContents || '(no file content available)',
     '',
-    `Write a numbered PLAN (no code) identifying 0 to ${fileCount} specific things in the files above that are worth a verdict for agent-manager: a pattern to use close to as-is, an idea worth adapting to agent-manager's own context, or something plausible-looking that turns out not to apply and should be explicitly marked to ignore (with why). Pick the ${fileCount} MOST worth flagging if more genuinely qualify -- do not pad the count. It is fine and expected to find NOTHING worth flagging if this community genuinely has nothing relevant -- a fabricated or generic-sounding item is worse than an honest "nothing useful here." Do not comment on files outside the ones given above, and do not describe what the code does in general -- describe specifically what agent-manager could take from it, or why it does not apply.`,
+    `Write a numbered PLAN (no code) identifying 0 to ${fileCount} specific things in the files above that are worth a verdict for ${P}: a pattern to use close to as-is, an idea worth adapting to ${P}'s own context, or something plausible-looking that turns out not to apply and should be explicitly marked to ignore (with why). Pick the ${fileCount} MOST worth flagging if more genuinely qualify -- do not pad the count. It is fine and expected to find NOTHING worth flagging if this community genuinely has nothing relevant -- a fabricated or generic-sounding item is worse than an honest "nothing useful here." Do not comment on files outside the ones given above, and do not describe what the code does in general -- describe specifically what ${P} could take from it, or why it does not apply.`,
     '',
     'When you cite a file, copy its path EXACTLY as it appears in the "Files in this community" list above (e.g. if the list shows "python/packages/autogen-ext/src/foo/_bar.py", cite that whole string, not a shortened guess like "src/foo/_bar.py") -- a downstream fact-check resolves your citation against the real repo, and a shortened or paraphrased path resolves to nothing and reads as fabrication even when the underlying claim is accurate.',
   ].join('\n');
@@ -563,14 +581,15 @@ function deepDivePlanPrompt(task) {
 // local-worker.ps1's arch_import branch and arch-import-fetch.js.
 function archImportPlanPrompt(task) {
   const ctx = task.promptContext;
+  const P = consumerLabel(task);
   return [
-    `You are looking at ONE finding a previous deep-dive pass already made about an external project ("${ctx.sourceProject}"), rated ${ctx.rating} for agent-manager:`,
+    `You are looking at ONE finding a previous deep-dive pass already made about an external project ("${ctx.sourceProject}"), rated ${ctx.rating} for ${P}:`,
     '',
     `TITLE: ${ctx.itemTitle}`,
     `SOURCE FILES (in ${ctx.sourceProject}): ${ctx.itemFiles || '(none given)'}`,
     `RATIONALE: ${ctx.itemRationale}`,
     '',
-    'Propose 1 to 3 SHORT search terms (function/variable/file names, or a few-word phrase) likely to find WHERE in agent-manager\'s own codebase this idea would actually apply -- e.g. an existing config module it could extend, or a pattern it would replace or sit alongside. Think about what agent-manager concept this maps to, not just keywords from the finding above.',
+    `Propose 1 to 3 SHORT search terms (function/variable/file names, or a few-word phrase) likely to find WHERE in ${P}'s own codebase this idea would actually apply -- e.g. an existing config module it could extend, or a pattern it would replace or sit alongside. Think about what ${P} concept this maps to, not just keywords from the finding above.`,
     '',
     'Output EXACTLY this format, one query per line, nothing else:',
     'QUERY: <search terms>',
@@ -580,22 +599,23 @@ function archImportPlanPrompt(task) {
 
 function archImportImplementPrompt(task, planText) {
   const ctx = task.promptContext;
+  const P = consumerLabel(task);
   const hits = ctx.harnessHits || [];
   const files = ctx.harnessFiles || [];
   const hitsText = hits.length > 0
     ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
-    : '(no matches -- the searches found nothing in agent-manager\'s own code)';
+    : `(no matches -- the searches found nothing in ${P}'s own code)`;
   const filesText = files.length > 0
     ? formatFileContents(files)
     : '(no file content fetched)';
   return [
-    `Earlier you proposed search terms to find where this deep-dive finding applies in agent-manager's own code:`,
+    `Earlier you proposed search terms to find where this deep-dive finding applies in ${P}'s own code:`,
     '',
     planText,
     '',
     `ORIGINAL FINDING (from ${ctx.sourceProject}, rated ${ctx.rating}): ${ctx.itemTitle} -- ${ctx.itemRationale}`,
     '',
-    'The harness ran those searches against agent-manager\'s OWN repo. Real matches:',
+    `The harness ran those searches against ${P}'s OWN repo. Real matches:`,
     '',
     hitsText,
     '',
@@ -603,7 +623,7 @@ function archImportImplementPrompt(task, planText) {
     '',
     filesText,
     '',
-    'Now write ONE architecture-import candidate grounded in the REAL agent-manager files above. HARD RULE: you MUST NOT name, reference, create, or import any file path that does not appear verbatim in the Real matches file list above -- the files listed there are the ONLY files you may reference, and naming a file outside that list is a hard violation that will be rejected outright. If no file in that list is a valid adaptation target for this finding, respond with exactly the single line:',
+    `Now write ONE architecture-import candidate grounded in the REAL ${P} files above. HARD RULE: you MUST NOT name, reference, create, or import any file path that does not appear verbatim in the Real matches file list above -- the files listed there are the ONLY files you may reference, and naming a file outside that list is a hard violation that will be rejected outright. If no file in that list is a valid adaptation target for this finding, respond with exactly the single line:`,
     'no real file to adapt',
     'and nothing else -- no other text, no partial implementation, no placeholder path, no fabricated filename. That line is a terminal, successful no-op: do not force a candidate onto files that do not actually fit.',
     '',
@@ -612,13 +632,13 @@ function archImportImplementPrompt(task, planText) {
     '### AC-NNN · Title',
     'Strength: Strong',
     `Source: ${ctx.sourceProject} — "${ctx.itemTitle}"`,
-    'Files: comma, separated, agent-manager, file, paths (from the real matches above)',
+    `Files: comma, separated, ${P}, file, paths (from the real matches above)`,
     '',
     'Problem:',
-    'A paragraph describing the friction in agent-manager\'s own code, grounded in the real files above.',
+    `A paragraph describing the friction in ${P}'s own code, grounded in the real files above.`,
     '',
     'Solution:',
-    'A paragraph describing the fix, informed by (but adapted for agent-manager, not copied verbatim from) the original finding.',
+    `A paragraph describing the fix, informed by (but adapted for ${P}, not copied verbatim from) the original finding.`,
     '',
     'Benefits:',
     'A paragraph describing what improves.',
@@ -1589,6 +1609,7 @@ updateTaskSource('trouble_log', { buildPlanPrompt: troubleLogPlanPrompt, buildIm
 // plan/implement prompt pair now instead of reaching for archReviewPlanPrompt here.
 updateTaskSource('secondbrain', { buildPlanPrompt: secondbrainPlanPrompt });
 updateTaskSource('brain_dump_sort', { buildPlanPrompt: brainDumpSortPlanPrompt, buildImplementPrompt: brainDumpSortImplementPrompt });
+updateTaskSource('brain_dump_resolution_check', { buildPlanPrompt: resolutionCheckPlanPrompt, buildImplementPrompt: resolutionCheckImplementPrompt });
 updateTaskSource('path_prefetch_resolve', { buildPlanPrompt: pathPrefetchResolvePlanPrompt, buildImplementPrompt: pathPrefetchResolveImplementPrompt });
 // apply is NOT set here (unlike most of this file's other updateTaskSource calls) --
 // 'adhoc' already got apply: applyAdhocDiff at its own registerTaskSource() call in
@@ -1727,6 +1748,7 @@ function buildRevisionPrompt(task, planText, implementText, critiqueText) {
 }
 
 module.exports = {
+  consumerLabel, deepDivePlanPrompt,
   buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents, priorRejectionBlock, priorVerdictBlock,
   adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, skipPathDirective, seedPlanBlock, planGroundingBlock, hubStatusGroundingBlock, planCritiqueFeedbackBlock,
   pipelineForensicsPlanPrompt, pipelineForensicsImplementPrompt,

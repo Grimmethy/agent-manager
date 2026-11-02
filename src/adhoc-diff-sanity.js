@@ -527,6 +527,17 @@ function declaredEditTargetsAllDocs(task, planText = '') {
   return editTargets.length > 0 && editTargets.every((t) => isDocPath(t));
 }
 
+// 2026-11-02 (stalled-task loop: HUB0125 1/2 "Create docs/audit-....md", HUB0002 2/2 "Write the research note", both parked 'diff only touches documentation -- the task asks for a code
+// change'): a task whose every declared target (edit OR create) is a document, whose diff creates exactly those documents, and in which no sentence OPENS WITH AN IMPERATIVE aimed at a code
+// path, is asking for the document. The keyword scan trips on the descriptive sentences ("mapping ... to getConceptTimeline at src/concepts.js:185", "a row for src/x.js / fileHub()") that a
+// document-writing task is full of. A sentence like "Also rename foo in src/a.js" still opens with an imperative, so a task that really wants code stays blocked.
+function isCreatedDocDeliverable(task, planText, rawText, files) {
+  const targets = extractDeclaredTargets(task, planText, { includeCreated: true });
+  if (!targets.length || !targets.every((t) => isDocPath(t))) return false;
+  if (!files.length || !files.every((f) => targets.some((t) => pathsRefEqual(f.path, t)))) return false;
+  return !scanForCodeSignals(rawText).tripping.some(opensWithImperative);
+}
+
 function taskWantsCodeChange(task) {
   const rawText = (task && task.promptContext && task.promptContext.rawText) || (task && task.title) || '';
   const planText = (task && (task.planResponse || task.lastGoodPlan)) || '';
@@ -582,7 +593,7 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   // (Files this task says to CREATE are left out here: "Create docs/x.md ... Then update src/y.js" must still read as asking for code.)
   const docOnlyTargets = declaredEditTargetsAllDocs(task, planText);
   if (nonDoc.length === 0 && !docOnlyTargets) {
-    if (taskWantsCodeFromText(rawText, combined)) {
+    if (taskWantsCodeFromText(rawText, combined) && !isCreatedDocDeliverable(task, planText, rawText, files)) {
       return {
         code: 'docs-only',
         reason: `diff only touches documentation (${files.map((f) => f.path).join(', ')}) -- the task asks for a code change`,

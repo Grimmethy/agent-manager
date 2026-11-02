@@ -140,11 +140,21 @@ function switchToTab(key) {
   bumpRenderGeneration(); // any in-flight render for the tab being left is now stale
   activeTab = key;
   renderNav();
+  if (typeof showTabSkeleton === 'function') showTabSkeleton();   // clear the previous tab's content at once; the tab's own render replaces this
   if (key === 'project') enterProjectTab();
   else if (key === 'brain-dump') enterBrainDumpTab();
   else if (key === 'branches') enterBranchesTab();
   else if (key === 'hygiene') enterHygieneTab();
   else renderMain();
+}
+
+// The tab's label as drawn in the nav: its line icon (nav-icons.js) followed by the label without its old leading emoji. A tab without a known icon
+// (a plugin tab, say) keeps its label exactly as it was.
+function navTabLabelHtml(tab) {
+  const icon = typeof navTabIcon === 'function' ? navTabIcon(tab) : '';
+  if (!icon) return `<span>${tab.label}</span>`;
+  const plain = typeof navTabPlainLabel === 'function' ? navTabPlainLabel(tab) : tab.label;
+  return `<span class="nav-tab-label">${icon}<span>${plain}</span></span>`;
 }
 
 function renderTabButton(tab, indent) {
@@ -160,7 +170,7 @@ function renderTabButton(tab, indent) {
     // 'awaiting-confirm' already get elsewhere in this nav).
     const inProgress = counts.adhocInProgress ?? 0;
     const blocked = counts.adhocBlocked ?? 0;
-    btn.innerHTML = `<span>${tab.label}</span><span class="count">`
+    btn.innerHTML = `${navTabLabelHtml(tab)}<span class="count">`
       + `<span style="color:var(--muted)">${inProgress}</span>`
       + ` <span style="color:var(--bad); font-weight:600">${blocked}</span>`
       + `</span>`;
@@ -170,7 +180,7 @@ function renderTabButton(tab, indent) {
   const count = (tab.key === 'workers' || tab.key === 'models' || tab.key === 'joblist' || tab.key === 'plugins' || tab.key === 'deepdive') ? '' : (counts[tab.key] ?? '');
   const severity = severityForTab(tab.key, count);
   const dot = severity ? `<span class="status-dot ${severity}"></span>` : '';
-  btn.innerHTML = `<span>${tab.label}</span><span class="count">${dot}${count}</span>`;
+  btn.innerHTML = `${navTabLabelHtml(tab)}<span class="count">${dot}${count}</span>`;
   btn.onclick = () => switchToTab(tab.key);
   return btn;
 }
@@ -371,7 +381,7 @@ async function ensurePluginTabStarted(tab, main) {
   if (!tab.startCommand || pluginTabStarted[tab.pluginName]) return 'ready';
   if (pluginTabStarting[tab.pluginName]) return 'pending';
   const hasContent = main.querySelector && (main.querySelector('iframe') || main.querySelector('[data-plugin-start-error]'));
-  if (!hasContent) main.innerHTML = `<div class="empty">Starting ${escapeHtml(tab.label)}...</div>`;
+  if (!hasContent) main.innerHTML = typeof skeletonHtml === 'function' ? skeletonHtml({ caption: `Starting ${tab.label}...` }) : `<div class="empty">Starting ${escapeHtml(tab.label)}...</div>`;
   pluginTabStarting[tab.pluginName] = true;
   let why = '';
   try {
@@ -395,7 +405,7 @@ async function renderPluginTab(tab) {
       if ((await ensurePluginTabStarted(tab, main)) !== 'ready') return;
     }
     if (!pluginTabRenderers[tab.key]) {
-      main.innerHTML = `<div class="empty">Loading ${escapeHtml(tab.label)}...</div>`;
+      main.innerHTML = typeof skeletonHtml === 'function' ? skeletonHtml({ caption: `Loading ${tab.label}...` }) : `<div class="empty">Loading ${escapeHtml(tab.label)}...</div>`;
       await loadPluginTabScript(tab);
     }
     const renderFn = pluginTabRenderers[tab.key];
@@ -426,26 +436,162 @@ if (typeof window !== 'undefined' && window.matchMedia) {
   if (mq.addEventListener) mq.addEventListener('change', () => { if (typeof renderNav === 'function' && document.getElementById('nav')) renderNav(); });
 }
 
+const NAV_CHEVRON_SVG = '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 6l3 3 3-3"/></svg>';
+
+function navFoldKey(path) { return 'agentManagerNavSection_' + path; }
+
+// One fold header: a chevron, the label, a dot when something inside needs attention (shown even while folded), a count, and a marker when the
+// folded section holds the tab on screen. sub is true for the Forges sub-groups.
+function renderNavFoldHeader(label, { open, sub, severity, badge, here, path }) {
+  const header = document.createElement('button');
+  header.className = sub ? 'nav-sh nav-sub-sh' : 'nav-sh';
+  if (typeof header.setAttribute === 'function') header.setAttribute('aria-expanded', open ? 'true' : 'false');
+  header.innerHTML = `<span class="nav-chev${open ? '' : ' closed'}">${NAV_CHEVRON_SVG}</span><span class="nav-sh-label">${escapeHtml(label)}</span>`
+    + (here && !open ? '<span class="nav-here" title="The tab you are on is in here"></span>' : '')
+    + (severity ? `<span class="status-dot ${severity}"></span>` : '')
+    + (badge ? `<em>${badge}</em>` : '');
+  header.onclick = () => {
+    localStorage.setItem(navFoldKey(path), open ? 'collapsed' : 'expanded');
+    renderNav();
+  };
+  return header;
+}
+
+// The wide layout: sections (nav-sections.js) with a hairline divider between them. Fold choices persist per section / sub-group in localStorage.
+function renderNavSections(nav) {
+  const countOf = (key) => counts[key];
+  const severityOf = (key) => severityForTab(key, counts[key]);
+  buildNavSections(TABS).forEach((section, i) => {
+    if (i > 0) {
+      const divider = document.createElement('div');
+      divider.className = 'nav-div';
+      nav.appendChild(divider);
+    }
+    const containsActive = navSectionContains(section, activeTab);
+    const open = navSectionOpen({ stored: localStorage.getItem(navFoldKey(section.key)), defaultOpen: section.defaultOpen, containsActive });
+    const { badge, severity } = navSectionSummary(section, { countOf, severityOf });
+    nav.appendChild(renderNavFoldHeader(section.label, { open, sub: false, severity, badge, here: containsActive, path: section.key }));
+    if (!open) return;
+    for (const tab of section.items) nav.appendChild(renderTabButton(tab, false));
+    for (const sub of section.subgroups || []) {
+      const path = `${section.key}.${sub.key}`;
+      const subActive = sub.items.some((t) => t.key === activeTab);
+      const subOpen = navSectionOpen({ stored: localStorage.getItem(navFoldKey(path)), defaultOpen: false, containsActive: subActive });
+      const subSeverity = sub.items.map((t) => severityOf(t.key)).includes('bad') ? 'bad' : (sub.items.map((t) => severityOf(t.key)).includes('warn') ? 'warn' : null);
+      nav.appendChild(renderNavFoldHeader(sub.label, { open: subOpen, sub: true, severity: subSeverity, badge: null, here: subActive, path }));
+      if (subOpen) for (const tab of sub.items) nav.appendChild(renderTabButton(tab, true));
+    }
+  });
+}
+
+const NAV_COLLAPSE_SVG = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3L5 8l5 5"/></svg>';
+const NAV_EXPAND_SVG = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3l5 5-5 5"/></svg>';
+
+function navRailCollapsed() {
+  return localStorage.getItem(NAV_RAIL_KEY) === 'collapsed';
+}
+
+// The row at the top of the wide sidebar: a round chevron button (the "Sidebar UI" reel) plus a "Collapse" pill; in the rail just the button, pointing the other way.
+function renderNavTop(collapsed) {
+  const top = document.createElement('div');
+  top.className = 'nav-top';
+  const btn = document.createElement('button');
+  btn.className = 'nav-collapse-btn';
+  btn.title = collapsed ? 'Expand the sidebar' : 'Collapse the sidebar to icons';
+  if (typeof btn.setAttribute === 'function') {
+    btn.setAttribute('aria-label', collapsed ? 'Expand sidebar' : 'Collapse sidebar');
+    btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  }
+  btn.innerHTML = collapsed ? NAV_EXPAND_SVG : NAV_COLLAPSE_SVG;
+  btn.onclick = () => {
+    if (collapsed) localStorage.removeItem(NAV_RAIL_KEY); else localStorage.setItem(NAV_RAIL_KEY, 'collapsed');
+    renderNav();
+  };
+  top.appendChild(btn);
+  if (!collapsed) {
+    const pill = document.createElement('span');
+    pill.className = 'nav-collapse-pill';
+    pill.innerHTML = 'Collapse';
+    top.appendChild(pill);
+  }
+  return top;
+}
+
+// An icon-only tab button: the glyph, a dot when the tab needs attention, the full name as the tooltip and accessible name.
+function renderNavRailButton(tab) {
+  const btn = document.createElement('button');
+  btn.className = 'rail-btn' + (tab.key === activeTab ? ' active' : '');
+  const name = navTabPlainLabel(tab);
+  btn.title = name;
+  if (typeof btn.setAttribute === 'function') btn.setAttribute('aria-label', name);
+  const severity = severityForTab(tab.key, counts[tab.key]);
+  const icon = typeof navTabIcon === 'function' ? navTabIcon(tab, 20) : '';
+  btn.innerHTML = (icon ? `<span class="rail-glyph">${icon}</span>` : `<span class="rail-glyph">${escapeHtml(navTabGlyph(tab))}</span>`) + (severity ? `<span class="status-dot ${severity}"></span>` : '');
+  btn.onclick = () => switchToTab(tab.key);
+  return btn;
+}
+
+// The collapsed sidebar: an icon per tab for the sections that are open, one letter button per folded section (clicking it opens the section and widens
+// the sidebar again), and the same hairline dividers.
+function renderNavRail(nav) {
+  const sections = buildNavSections(TABS);
+  const openOf = (section) => navSectionOpen({ stored: localStorage.getItem(navFoldKey(section.key)), defaultOpen: section.defaultOpen, containsActive: navSectionContains(section, activeTab) });
+  for (const entry of navRailEntries(sections, openOf)) {
+    if (entry.type === 'divider') {
+      const divider = document.createElement('div');
+      divider.className = 'nav-div';
+      nav.appendChild(divider);
+    } else if (entry.type === 'tab') {
+      nav.appendChild(renderNavRailButton(entry.tab));
+    } else {
+      const section = entry.section;
+      const btn = document.createElement('button');
+      btn.className = 'rail-btn rail-section';
+      btn.title = `${section.label} (click to open)`;
+      if (typeof btn.setAttribute === 'function') btn.setAttribute('aria-label', `Open ${section.label}`);
+      const { severity } = navSectionSummary(section, { countOf: (k) => counts[k], severityOf: (k) => severityForTab(k, counts[k]) });
+      const sectionIcon = typeof navSectionIcon === 'function' ? navSectionIcon(section, 20) : '';
+      btn.innerHTML = (sectionIcon ? `<span class="rail-glyph">${sectionIcon}</span>` : `<span class="rail-glyph">${escapeHtml(section.label.charAt(0))}</span>`) + (severity ? `<span class="status-dot ${severity}"></span>` : '');
+      btn.onclick = () => {
+        localStorage.setItem(navFoldKey(section.key), 'expanded');
+        localStorage.removeItem(NAV_RAIL_KEY);
+        renderNav();
+      };
+      nav.appendChild(btn);
+    }
+  }
+}
+
 function renderNav() {
   const nav = document.getElementById('nav');
   nav.innerHTML = '';
-  for (const tab of navOrder(TABS, isNarrowScreen())) {
-    if (tab.group) {
-      const expanded = isGroupExpanded(tab.group);
-      const header = document.createElement('button');
-      header.innerHTML = `<span>${expanded ? '▾' : '▸'} ${tab.group}</span><span class="count"></span>`;
-      header.onclick = () => {
-        localStorage.setItem('agentManagerNavGroup_' + tab.group, expanded ? 'collapsed' : 'expanded');
-        renderNav();
-      };
-      nav.appendChild(header);
-      if (expanded) {
-        for (const child of tab.children) nav.appendChild(renderTabButton(child, true));
+  const wide = !isNarrowScreen() && typeof buildNavSections === 'function';
+  const rail = wide && navRailCollapsed();
+  nav.className = rail ? 'nav-rail' : '';
+  if (wide) {
+    nav.appendChild(renderNavTop(rail));
+    if (rail) renderNavRail(nav); else renderNavSections(nav);
+  } else {
+    // Phone layout (or nav-sections.js missing): the flat strip with the old Forges / Job Status groups.
+    for (const tab of navOrder(TABS, isNarrowScreen())) {
+      if (tab.group) {
+        const expanded = isGroupExpanded(tab.group);
+        const header = document.createElement('button');
+        header.innerHTML = `<span>${expanded ? '▾' : '▸'} ${tab.group}</span><span class="count"></span>`;
+        header.onclick = () => {
+          localStorage.setItem('agentManagerNavGroup_' + tab.group, expanded ? 'collapsed' : 'expanded');
+          renderNav();
+        };
+        nav.appendChild(header);
+        if (expanded) {
+          for (const child of tab.children) nav.appendChild(renderTabButton(child, true));
+        }
+      } else {
+        nav.appendChild(renderTabButton(tab, false));
       }
-    } else {
-      nav.appendChild(renderTabButton(tab, false));
     }
   }
+  if (typeof navNotchUpdate === 'function') navNotchUpdate(nav);
 }
 
 function fmtPct(x) { return x == null ? '-' : Math.round(x * 100) + '%'; }

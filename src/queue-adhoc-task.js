@@ -28,7 +28,7 @@ function defaultTaskDomain(validDomains) {
 // instead of executing it directly -- can queue a real adhoc task without shelling out
 // to this script. Throws on an invalid domain rather than the CLI's own
 // print-and-exit(1), since a library call has no business calling process.exit.
-function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority, project, generatedForRepoRoot }, { pipelineDir, domainsPath }) {
+function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority, premiumSetBy, project, generatedForRepoRoot }, { pipelineDir, domainsPath }) {
   if (!title) throw new Error('queueAdhocTask: title is required');
   if (!promptContext) throw new Error('queueAdhocTask: promptContext is required');
 
@@ -64,6 +64,10 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriori
     // This was previously a manual step an operator had to remember to do after every
     // Chat-queued task; automating it here closes that gap.
     ...(premiumPriority ? { premiumPriority: true } : {}),
+    // Provenance of the premium flag (premiumSetBy: operator-ui | operator-bulk | chat-queue | cli | source; premiumSetAt: ISO),
+    // shown in the task modal next to the Premium Priority button. Chat's queue_reviewed_task passes 'chat-queue'; any other
+    // caller that asks for premium without a label is recorded as 'cli'. Display only: claim order reads premiumPriority alone.
+    ...(premiumPriority ? { premiumSetBy: premiumSetBy || 'cli', premiumSetAt: new Date().toISOString() } : {}),
     ...(cleanDependsOn && cleanDependsOn.length ? { dependsOn: cleanDependsOn } : {}),
     // The registered project this task was filed for (Chat's queue_reviewed_task passes it); informational.
     ...(project ? { project } : {}),

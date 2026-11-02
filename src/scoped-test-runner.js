@@ -79,13 +79,45 @@ function reverseDependents(repoRoot, file, alreadyIncluded) {
   // quote char on both ends, base immediately followed by either the closing quote or a
   // JS/TS extension then the closing quote, never a longer name that merely starts with
   // base (e.g. "./utility" must NOT match a search for "util").
-  const re = new RegExp(`(['"])\\.\\.?/${escapeRegExp(base)}(?:\\.[jt]sx?)?\\1`);
+  // 2026-11-01: directory segments between the leading ./ or ../ and the base are allowed (require('./sdk/candidate-fulfillment.js') from a test one
+  // directory above src/sdk). The old pattern needed the base right after ./, so a test that reached the module through a sub-directory was never
+  // found: src/context-trim-sweep.test.js broke on a branch changing src/sdk/candidate-fulfillment.js and nothing ran it.
+  const re = new RegExp(`(['"])\\.\\.?/(?:[^'"/\\n]+/)*${escapeRegExp(base)}(?:\\.[jt]sx?)?\\1`);
   const hits = [];
   for (const d of searchDirs) {
     let entries;
     try { entries = fs.readdirSync(path.join(repoRoot, d)); } catch { continue; }
     for (const name of entries) {
       if (!/\.test\.[jt]sx?$/i.test(name)) continue;
+      const rel = path.join(d, name).replace(/\\/g, '/');
+      if (alreadyIncluded.has(rel)) continue;
+      let content;
+      try { content = fs.readFileSync(path.join(repoRoot, rel), 'utf8'); } catch { continue; }
+      if (re.test(content)) {
+        hits.push(rel);
+        if (hits.length >= MAX_REVERSE_DEP_FILES) return hits;
+      }
+    }
+  }
+  return hits;
+}
+
+// Python twin of reverseDependents: test files in the changed module's directory or its parent that `import <module>` or `from <module> import ...`
+// (also a dotted prefix such as `from dashboard.chat_sessions import`). Same two-directory bound and cap as the JS finder; 2026-11-01: before this a changed
+// .py file only ever got its test_<name>.py, so test_chat_turn_timings.py (it imports chat_sessions) broke on a chat_sessions.py change and was never run.
+function reverseDependentsPy(repoRoot, file, alreadyIncluded) {
+  if (!/\.py$/i.test(file) || isTestFile(file)) return [];
+  const dir = path.dirname(file);
+  const base = path.basename(file, '.py');
+  if (!/^[A-Za-z_][\w]*$/.test(base)) return [];
+  const searchDirs = [...new Set([dir, path.dirname(dir)])];
+  const re = new RegExp(`^\\s*(?:from\\s+(?:[\\w.]+\\.)?${escapeRegExp(base)}\\s+import\\b|import\\s+(?:[\\w.]+\\.)?${escapeRegExp(base)}\\b)`, 'm');
+  const hits = [];
+  for (const d of searchDirs) {
+    let entries;
+    try { entries = fs.readdirSync(path.join(repoRoot, d)); } catch { continue; }
+    for (const name of entries) {
+      if (!/^test_[^/]+\.py$/i.test(name)) continue;
       const rel = path.join(d, name).replace(/\\/g, '/');
       if (alreadyIncluded.has(rel)) continue;
       let content;
@@ -119,6 +151,12 @@ function findAffectedTestFiles(repoRoot, changedFiles) {
     for (const dep of reverseDependents(repoRoot, file, js)) {
       js.add(dep);
       if (js.size >= MAX_TEST_FILES) break;
+    }
+  }
+  for (const file of changedFiles || []) {
+    for (const dep of reverseDependentsPy(repoRoot, file, py)) {
+      py.add(dep);
+      if (py.size >= MAX_TEST_FILES) break;
     }
   }
   return { js: [...js].slice(0, MAX_TEST_FILES), py: [...py].slice(0, MAX_TEST_FILES) };
@@ -320,6 +358,7 @@ function runScopedTests(repoRoot, changedFiles, opts = {}) {
 module.exports = {
   childEnv,
   findAffectedTestFiles,
+  reverseDependentsPy,
   runScopedTests,
   runJsTests,
   runPyTests,

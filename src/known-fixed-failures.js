@@ -211,6 +211,24 @@ const KNOWN_FIXED = [
     applies: docsOnlyGateNoLongerBlocks,
   },
   {
+    // A NEW id (the sweep stamps firstSeen once per id): 2026-11-02 fix for a task that CREATES one document and only cites code in descriptive sentences (HUB0125 1/2 audit doc, HUB0002 2/2 research
+    // note). Re-runs the real gate on a synthetic diff that creates exactly the documents the recorded failure names; re-admits only when the gate now lets that diff through.
+    id: 'docs-only-gate-created-document-deliverable',
+    fixedIn: 'agent-manager (docs-only gate: a task whose declared targets are all documents and whose diff creates exactly them is a document deliverable, 2026-11-02)',
+    description: 'adhoc-diff-sanity blocked a CORRECT docs-only diff ("the task asks for a code change") for a task whose deliverable is a document it creates',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => {
+      const m = /only (?:touches|created\/edited) documentation \(([^)]+)\)/.exec(failureText(task));
+      if (!m || !/code change/.test(failureText(task))) return false;
+      try {
+        const paths = m[1].split(',').map((p) => p.trim()).filter(Boolean);
+        if (!paths.length) return false;
+        const diff = paths.map((p) => `diff --git a/${p} b/${p}\nnew file mode 100644\n--- /dev/null\n+++ b/${p}\n@@ -0,0 +1 @@\n+x\n`).join('');
+        return require('./adhoc-diff-sanity.js').adhocDiffSubstanceProblem(task, diff, 'RESOLUTION: implemented') === null;
+      } catch { return false; }
+    },
+  },
+  {
     id: 'implement-pass-sibling-repos-readable',
     fixedIn: 'agent-manager (implement pass reads registered plugin/project repos read-only, merged 028e586f, 2026-10-16)',
     description: 'The agentic implement pass could see only its own worktree, so a read-only cross-repo verification task (GPU broker verify videoforge/promptforge) found "/media/model-cache/github/<repo> does not exist" or "path is not inside any accessible repo" and concluded the repo was not on this machine. It now gets every registered plugin repo as a read-only root.',
@@ -332,6 +350,42 @@ const KNOWN_FIXED = [
       const { fieldsOnlyInAddedTestFiles } = require('./fact-checker.js');
       const fixtures = fieldsOnlyInAddedTestFiles((task && (task.implementResponse || task.rawDiff)) || '');
       return names.every((n) => fixtures.has(n));
+    },
+  },
+  {
+    // 2026-11-02 (stalled-task loop): the gate now accepts a name the draft itself declares (Python annotation, shell export/readonly/local), an @NAME@ template placeholder it writes,
+    // and language/OS constants (BASH_*, AF_*, SOCK_*, NODE_ENV). This re-runs the real check on the parked task's own draft against the task text only (a poorer source than the real
+    // grounding, so it can only under-match) and re-admits it when none of the names it was blocked on is flagged any more; one genuinely invented name keeps it parked.
+    id: 'ungrounded-field-own-declarations-and-platform-constants',
+    fixedIn: 'agent-manager (fact-checker: own declarations, @NAME@ placeholders and language/OS constants are not ungrounded, 2026-11-02)',
+    description: 'an ungrounded-field block on names the draft declares itself or that the language or OS defines',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => {
+      const names = [...failureText(task).matchAll(/ungrounded-field: ([A-Z][A-Z0-9]*_[A-Z0-9_]+)/g)].map((m) => m[1]);
+      if (!names.length) return false;
+      try {
+        const { checkGroundedValues } = require('./fact-checker.js');
+        const draft = (task && (task.implementResponse || task.rawDiff)) || '';
+        if (!draft) return false;
+        const source = `${(task && task.title) || ''}\n${(task && task.promptContext && task.promptContext.rawText) || ''}`;
+        const still = new Set(checkGroundedValues(draft, source).filter((f) => f.type === 'ungrounded-field').map((f) => f.detail));
+        return names.every((n) => draft.includes(n) && !still.has(n));
+      } catch { return false; }
+    },
+  },
+  {
+    // 2026-11-02 (stalled-task loop): an agentic implement pass that ran out of turns with an EMPTY forced final turn was parked as a 'design-decision' whose only question is the
+    // placeholder below (40 tasks, 31 premium). agentic-draft-common.js now routes that to a continuation / budget-exhaustion block (decompose-eligible) instead. Re-admits a task
+    // parked on exactly that placeholder, once; a task with a real question keeps waiting for a human.
+    id: 'agentic-empty-forced-summary-parked-as-design-question',
+    mislabeledAsDesign: true, // the 'design-decision' reason on these tasks is the bug; fix-signature-sweep must not skip them as genuine design questions
+    fixedIn: 'agent-manager (agentic-draft-common: an empty forced summary after edits is budget exhaustion, not a design question, 2026-11-02)',
+    description: 'a task parked in needs-clarification with only the "ran out of turns before reaching a conclusion" placeholder as its question',
+    dirs: ['needs-clarification'],
+    applies: (task) => {
+      const nc = (task && task.needsClarification) || {};
+      const q = String(nc.openQuestions || '').trim();
+      return /^\(the agentic implement pass ran out of turns before reaching a conclusion; see its recorded tool activity/.test(q);
     },
   },
   {

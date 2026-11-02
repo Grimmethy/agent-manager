@@ -203,6 +203,19 @@ test('helpers: appliedBranch reads the latest agent/* applied event; eligibleTas
   assert.equal(eligibleTask({ terminalDisposition: 'pending-merge' }), true);
 });
 
+test('eligibleTask: human-queued and premium tasks are skipped by default and allowed only with allowHumanPrioritised; hub, stacked and pinned tasks never are', () => {
+  const base = { terminalDisposition: 'pending-merge' };
+  for (const extra of [{ humanQueued: true }, { premiumPriority: true }, { humanQueued: true, premiumPriority: true }]) {
+    assert.equal(eligibleTask({ ...base, ...extra }), false, `default ${JSON.stringify(extra)}`);
+    assert.equal(eligibleTask({ ...base, ...extra }, { allowHumanPrioritised: true }), true, `allowed ${JSON.stringify(extra)}`);
+  }
+  for (const extra of [{ hubId: 'H' }, { parentHub: 'H' }, { stacked: { branch: 'agent/x', seq: 1, total: 2 } }, { pinnedWorker: 'w' }, { humanQueued: true, pinnedWorker: 'w' }]) {
+    assert.equal(eligibleTask({ ...base, ...extra }), false, `default ${JSON.stringify(extra)}`);
+    assert.equal(eligibleTask({ ...base, ...extra }, { allowHumanPrioritised: true }), false, `allowed ${JSON.stringify(extra)}`);
+  }
+  assert.equal(eligibleTask({ terminalDisposition: 'merged', humanQueued: true }, { allowHumanPrioritised: true }), false);
+});
+
 test('priorVerdictBlock: a main-moved verdict is framed as "not rejected", a plain verdict keeps the reviewer framing', () => {
   const mk = (pv) => ({ promptContext: { priorVerdict: pv } });
   const moved = priorVerdictBlock(mk({ verdict: 'needs-work', kind: 'main-moved', reasons: ['main moved'] }));

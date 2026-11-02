@@ -1027,6 +1027,37 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     return { succeeded: true, verdict: 'approved', factCheckVerdict: 'skipped' };
   }
 
+  // Comment-only change (2026-10-31, discard analysis; src/review-comment-only.js): 10 brain-dump branches since 2026-10-24 were discarded because their whole
+  // change was comments or docstrings -- nothing behaves differently, and the voters approved them anyway. A brain-dump-derived adhoc fix (not a hub slice)
+  // whose diff is provably comment-only is closed here as a no-op: no vote, no executed verification, and NO branch -- the diff is kept on the record
+  // (commentOnlyDiff) and the task becomes 'no-changes-needed', which apply records as a skipped 'no code change needed' (terminalDisposition noop).
+  // Conservative: anything the analyzer cannot prove falls through to the normal vote. Kill switch AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK=false.
+  if (String(process.env.AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK || '').trim().toLowerCase() !== 'false'
+      && resolveSourceName(task) === 'adhoc'
+      && task.adhocResolution === 'implemented'
+      && task.promptContext && typeof task.promptContext === 'object' && task.promptContext.brainDumpEntryId
+      && !isHubChildTask(task)
+      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
+    let commentOnly = null;
+    try { commentOnly = require('./review-comment-only.js').analyzeCommentOnly(task.rawDiff); } catch (e) {
+      console.error(`[review] comment-only check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+    }
+    if (commentOnly && commentOnly.commentOnly) {
+      const paths = commentOnly.files.map((f) => f.path);
+      task.commentOnlyDiff = task.rawDiff;
+      task.commentOnly = { at: new Date().toISOString(), files: commentOnly.files };
+      task.rawDiff = '';
+      task.adhocResolution = 'no-changes-needed';
+      task.implementResponse = `Comment-only change, no behavior: ${paths.slice(0, 6).join(', ')}${paths.length > 6 ? `, +${paths.length - 6} more` : ''} change only comments or docstrings, so no code change is needed. The original diff is kept on the task as commentOnlyDiff.`;
+      task.reviewedAt = new Date().toISOString();
+      task.reviewProvider = 'deterministic-comment-only';
+      task.localVerdict = 'Auto-approved as a no-op: the diff changes only comments or docstrings (deterministic, no vote).';
+      recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
+      appendHistoryEvent(task, 'approved', `deterministic-comment-only: ${commentOnly.reason}; closed as a no-op, no branch will be applied`);
+      return { succeeded: true, verdict: 'approved', factCheckVerdict: 'skipped' };
+    }
+  }
+
   const domainCfg = getDomainConfig(domainsPath, task.domain);
   const workDir = getWorkDir(domainCfg, { repoRoot, secondBrainDir });
 
@@ -1392,7 +1423,8 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       && /^#{2,4}\s*AC-\S+/m.test(trimmedImplResponse)
       && !/```/.test(trimmedImplResponse)
       && !/^(?:---|\+\+\+|@@)/m.test(trimmedImplResponse)
-      && !/^(?:\+|-)(?!\s*$)\S/m.test(trimmedImplResponse)) {
+      && !/^(?:\+|-)(?!\s*$)\S/m.test(trimmedImplResponse)
+      && !namesExtractedPieces(trimmedImplResponse)) {
     const reason = 'Deterministic gate: missing-code-diff -- candidate drafts from this source must show the concrete change as a fenced code block or diff hunk, not prose-only commentary describing what should change. No local-model review call spent on a draft with no code shape at all.';
     task.reviewProvider = 'deterministic-missing-code-diff';
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
@@ -1677,6 +1709,8 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     minAgreeing: 2,
     temperature: 0.2,
     source: task.source,
+    taskId: task.id,
+    stage: 'review-vote', // HUB0280-02: local-client.js call() records these votes in model_calls
   });
 
   // 2026-08-24, Grimmethy: "are there any efficiency buffs you can think of" -- voteErrors
@@ -1746,6 +1780,18 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
 // kept that stale value and the dashboard list view -- which reads task.status straight
 // through task_summary() -- showed the whole approved/ backlog as "needs-review". The
 // verdict strings ('approved' / 'blocked') are already exactly the status values we want.
+// 2026-11-02 (stalled-task loop: 53 function_length_review candidates parked on missing-code-diff after ~4.4 drafts each): the deliverable for extracting pieces of a long function is the
+// NAMED pieces, and the local model will not write a code block for a 500-line extraction. A Solution that names at least two distinct new identifiers (camelCase or snake_case, optionally
+// with a leading underscore, longer than five characters) states the concrete change; a Solution that only says "split it into smaller helper functions" does not. Replay over the 53 parked
+// drafts: 45 name pieces, 8 are prose-only and stay blocked.
+const NAMED_PIECE_RE = /\b_?(?:[a-z]+(?:[A-Z][a-z0-9]+)+|[a-z]+(?:_[a-z0-9]+)+)\b/g;
+function namesExtractedPieces(text) {
+  const m = /Solution:\s*([\s\S]*?)(?:\n\s*\n(?:Benefits|Strength)|$)/.exec(String(text || ''));
+  const solution = m ? m[1] : '';
+  const names = new Set((solution.match(NAMED_PIECE_RE) || []).filter((w) => w.replace(/^_/, '').length > 5));
+  return names.size >= 2;
+}
+
 async function reviewTask(task, opts = {}) {
   const result = await runReview(task, opts);
   if (result && result.succeeded && (result.verdict === 'approved' || result.verdict === 'blocked')) {
@@ -1809,7 +1855,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { getDomainConfig, EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { namesExtractedPieces, getDomainConfig, EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();

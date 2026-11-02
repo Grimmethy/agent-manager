@@ -25,6 +25,7 @@ const { execFileSync } = require('child_process');
 const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
 const { ownerGateFor } = require('./owner-gates.js');
 const { validProposalFiles } = require('./proposal-files.js');
+const { targetHintForFailure } = require('./apply-target-hint.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
@@ -318,7 +319,15 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
     const reason = task && task.adhocResolution === 'no-changes-needed'
       ? `no code change needed: ${(task.implementResponse || '').slice(0, 300)}`
       : 'adhoc agentic draft produced no diff';
-    return { skipped: true, reason };
+    // HUB0306 1/2: flag the caller (applyTask) so a stacked hub child with no diff
+    // can be blocked from succeeding instead of silently marked done. NOT set for
+    // `no-changes-needed` (that is an explicit model call, not a no-diff artifact) and
+    // NOT set for decompose parents (handled earlier, returns a coordinator plan).
+    const artifact = { skipped: true, reason };
+    if (task && task.adhocResolution !== 'no-changes-needed') {
+      artifact.emptyDiff = true;
+    }
+    return artifact;
   }
 
   const patchPath = path.join(os.tmpdir(), `adhoc-apply-${task.id}-${process.pid}.patch`);
@@ -427,10 +436,12 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
   } catch (e) {
     if (/^acceptance command failed/.test(e.message || '')) throw e;
     const detail = (e.stdout || e.stderr || e.message || '').toString().slice(0, 2000);
-    throw new Error(`git apply failed: ${detail}`);
+    // Only on this failure path: if the diff was written for another registered project, name it and where the record belongs (apply-target-hint.js).
+    const hint = targetHintForFailure(rawDiff, repoRoot);
+    throw new Error(`git apply failed: ${detail}${hint ? `\n${hint}` : ''}`);
   } finally {
     try { fs.unlinkSync(patchPath); } catch (_) { /* best-effort cleanup */ }
   }
 }
 
-module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask, BRAIN_DUMP_DISPOSITION_RE };
+module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask, slugify, BRAIN_DUMP_DISPOSITION_RE };

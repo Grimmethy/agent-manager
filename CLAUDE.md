@@ -37,6 +37,12 @@ Single-context — one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/
 `act-as-local-agent` and `verify-unmerged-branches` ship in `docs/agents/skills/` (`.claude/` is
 gitignored). Run `scripts/install-skills.sh` once to link them into `~/.claude/skills`.
 
+### Triggers, not polls
+
+Before adding a sweep, tick, poll or timer, read the Fourth principle in `AGENTS.md` and
+`docs/adr/0024-triggers-not-polls.md`: announce the change at the writer, register interest once, keep a
+counted slow reconcile, and measure the idle cost. Language-neutral spec: the private repo `Grimmethy/triggers`.
+
 ### Codebase map
 
 **Check `docs/agents/codebase-map.md` first** — before grepping, guessing, or

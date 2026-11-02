@@ -84,7 +84,9 @@ async function sweepKnownFixedFailures({ pipelineDir, entries = KNOWN_FIXED, now
         const already = Array.isArray(task.requeuedForFixes) && task.requeuedForFixes.includes(entry.id);
         const failedAfterFix = stuckSince(task, filePath) > liveAt;
         // A genuine design question is not a drafting failure -- only retry-exhaustion escalations are (same rule as blocked-drain.js).
-        const design = task.needsClarification && task.needsClarification.reason === 'design-decision';
+        // An entry whose whole point is that the 'design-decision' label was WRONG (the pass ran out of turns and the placeholder was stamped as a question) opts out of this guard with
+        // mislabeledAsDesign: true; otherwise the guard skipped all 12 tasks the 'agentic-empty-forced-summary-parked-as-design-question' entry was written for (they were never 'exhausted').
+        const design = !entry.mislabeledAsDesign && task.needsClarification && task.needsClarification.reason === 'design-decision';
         const exhausted = Array.isArray(task.history) && task.history.some((h) => (h.stage || h.status) === 'exhausted');
         const hasBranch = Array.isArray(task.history) && task.history.some((h) => h && h.stage === 'applied');
         if (already || failedAfterFix || (design && !exhausted) || hasBranch || task.reviewInconclusive) { summary.skipped += 1; continue; }

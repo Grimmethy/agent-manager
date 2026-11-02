@@ -271,3 +271,22 @@ test('queueAdhocTask omits generatedForRepoRoot when not provided', () => {
   );
   assert.equal('generatedForRepoRoot' in record, false);
 });
+
+test('queueAdhocTask records premium provenance only when premium is requested: the given label, "cli" when none is given', () => {
+  const dir = tmpPipeline();
+  const domainsPath = path.join(dir, 'task-domains.json');
+  const mk = (extra) => queueAdhocTask({ title: 'Prov ' + Math.random().toString(36).slice(2, 6), promptContext: { rawText: 'x', raisedFrom: 'chat' }, ...extra }, { pipelineDir: dir, domainsPath }).record;
+
+  const labelled = mk({ premiumPriority: true, premiumSetBy: 'chat-queue' });
+  assert.equal(labelled.premiumSetBy, 'chat-queue');
+  assert.ok(Number.isFinite(Date.parse(labelled.premiumSetAt)));
+
+  const unlabelled = mk({ premiumPriority: true });
+  assert.equal(unlabelled.premiumSetBy, 'cli');
+
+  const plain = mk({});
+  assert.equal('premiumSetBy' in plain, false);
+  assert.equal('premiumSetAt' in plain, false);
+  const labelOnly = mk({ premiumSetBy: 'chat-queue' });
+  assert.equal('premiumSetBy' in labelOnly, false, 'a label without premiumPriority must not create provenance');
+});
