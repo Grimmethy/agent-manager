@@ -15703,3 +15703,149 @@ for (const name of names) {
 
 Benefits:
 Each filter stage becomes independently unit-testable (e.g. "given avoidLanes ['lane-2'] and laneCount 3, does it skip?"). The orchestrator drops to ~80 lines. Reviewers evaluate one 5-line guard at a time instead of scanning 171 lines of interleaved logic.
+
+### AC-216 · Forced Summary Turn Decomposition
+Strength: Strong
+Files: src/local-tool-client.js
+Symbol: runForcedSummaryTurn
+Snippet:
+```
+  // still calling tools; stopped early with no RESOLUTION line). See the header on the
+  // forceSummaryOnCap param and the call sites for why each path needs it.
+  const runForcedSummaryTurn = async (reason = 'turns') => {
+    turnStartLengths.push(messages.length);
+    turnStartLogLengths.push(toolCallLog.length);
+    // Three genuinely distinct causes land here, each needing its own model-facing
+    // framing -- 'turns' is the only one where "you are out of turns and can no longer
+    // call tools" is actually true. 'voluntary-stop' (2026-09-15, Grimmethy: "different
+    // stop reasons should absolutely be distinguishable -- it keeps the system
+    // understandable") used to share 'turns'' default reason and its wrong leadIn even
+    // though the model stopped ON ITS OWN, often on turn 2 of a 100-turn budget --
+    // telling it "you are out of turns" then was simply false, and the caller-facing
+    // explainer built from this same reason string (chat_sessions.py's _stream_local)
+    // told a human the same false thing ("ran out of its 100-turn tool budget") on
+    // ordinary short conversational replies that never called a tool. See this file's
+    // own voluntary-stop call site for what actually triggers it.
+    const leadIn = reason === 'context'
+      ? 'This conversation has grown too large to safely continue -- you are nearly out of context room and can no longer call tools.'
+      : reason === 'voluntary-stop'
+      ? 'Your last message ended without a RESOLUTION: line.'
+      : reason === 'degenerate'
+      ? 'Your last message was too short to be a real answer.'
+      : 'You are out of turns and can no longer call tools.';
+    // budgetWarning (2026-09-08, root-caused live): a real forced-summary turn with
+    // reason:'context' answered RESOLUTION: decompose and got cut off mid-string writing
+    // its second sub-task's rawText -- exactly the moment remaining room is tightest is
+    // also the moment this prompt used to ask for the MOST verbose possible answer. Only
+    // added for reason:'context' (not 'turns', where context room is unaffected) --
+    // running out of TURNS with plenty of context left doesn't need this constraint.
+    const budgetWarning = reason === 'context'
+      ? ' You have very little context room left, so be CONCISE: if you use RESOLUTION: decompose, keep each sub-task rawText to 2-3 sentences -- a short answer that finishes beats a long one that gets cut off.'
+      : '';
+    // isChatCaller: never ask for a RESOLUTION: line -- that sentinel is the PIPELINE's
+    // own agentic-draft convention (resolveAgenticDraft et al.), meaningless for a chat
+    // conversation. Root-caused live 2026-09-22 (Grimmethy: "It's not responding how I'd
+    // expect"): this instruction used to be unconditional, so 'voluntary-stop' (which
+    // fires below on almost every ordinary chat reply, since a normal conversational
+    // answer never naturally contains "RESOLUTION:") forced EVERY chat turn through this
+    // demand -- one real session showed the model complying with "RESOLUTION:
+    // no-changes-needed" as its entire answer to "What's the goal of this project?", and
+    // another showed this turn's own compliance-retry (below) overwriting a real answer
+    // with a near-empty one. See the voluntary-stop call site's own comment for why that
+    // trigger no longer fires for chat at all now.
+    const content = isChatCaller
+      ? `${leadIn} Using only what you have already learned, give your best complete answer now -- a real, substantive reply, not a placeholder or a single word.${budgetWarning}`
+      : `${leadIn} Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires.${budgetWarning} If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).`;
+    messages.push({ role: 'user', content });
+    turnsUsed += 1;
+    const { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
+      messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
+      toolCallLog, turnStartLengths, turnStartLogLengths,
+      onEmptyAttempt: (info) => logEmptyAttempt(turnsUsed, 'forced-summary', info),
+    });
+    addUsage(summaryUsage);
+    logTurnEnd(turnsUsed, 'forced-summary', { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake });
+    // The forced-summary turn itself can, in principle, also get clipped -- worth its own
+    // audit entry (see logContextAudit's own header) since RESERVED_RESPONSE_TOKENS is
+    // exactly the margin betting this never happens.
+    if (summaryDoneReason === 'length') {
+      logContextAudit({
+        event: 'summary-truncated', source, taskId, stage, reason,
+        promptEvalCount: summaryUsage && summaryUsage.prompt_eval_count,
+        evalCount: summaryUsage && summaryUsage.eval_count, ceiling: PINNED_NUM_CTX,
+      });
+    }
+    let summaryContent = (!summaryFlake && summaryMsg && summaryMsg.content) ? summaryMsg.content : '';
+
+    // 2026-09-16, pipeline hardening: this turn explicitly demands a RESOLUTION: line, but
+    // nothing ever checked whether the model actually complied -- a non-compliant reply
+    // (narration, a truncated thought, anything without the sentinel) was returned as-is
+    // and silently misread downstream as a genuine "needs-human-decision" design question,
+    // permanently stranding a task whose real diff was often already sitting in this same
+    // run's history. Confirmed live, twice in a row on the identical task: the model
+    // replied with narration ("Let me verify the edited code in the file:") on the FIRST
+    // forced-summary turn, ignoring the RESOLUTION: instruction entirely. One bounded
+    // retry with a short, unambiguous instruction gives the model a real second chance
+    // before this gets flagged as non-compliant for whoever reads the result downstream.
+    // isChatCaller never asked for RESOLUTION above, so there is nothing to check
+    // compliance against -- skip this whole retry block, which otherwise applied
+    // unconditionally and could overwrite a real chat answer with a shorter, worse one
+    // whenever the "longer of the two" comparison below picked the retry (see this
+    // function's own header on isChatCaller for the live incident this caused).
+    if (!isChatCaller && !HAS_RESOLUTION_RE.test(summaryContent)) {
+      turnStartLengths.push(messages.length);
+      turnStartLogLengths.push(toolCallLog.length);
+      messages.push({
+        role: 'user',
+        content: 'Your last message still did not end with a RESOLUTION: line. Reply with '
+          + 'NOTHING but that line (plus its required follow-up) now -- '
+          + 'RESOLUTION: implemented / no-changes-needed / decompose / needs-human-decision.',
+      });
+      turnsUsed += 1;
+      const retryResult = await chatTurnWithFlakeRecovery({
+        messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
+        toolCallLog, turnStartLengths, turnStartLogLengths,
+        onEmptyAttempt: (info) => logEmptyAttempt(turnsUsed, 'forced-summary-retry', info),
+      });
+      addUsage(retryResult.usage);
+      logTurnEnd(turnsUsed, 'forced-summary-retry', retryResult);
+      const retryContent = (!retryResult.flakeErr && retryResult.message && retryResult.message.content) ? retryResult.message.content : '';
+      if (HAS_RESOLUTION_RE.test(retryContent)) {
+        summaryContent = retryContent;
+      } else if (retryContent) {
+        // Neither attempt produced the sentinel -- keep whichever reply carries more real
+        // content (a fuller non-compliant answer is more useful to a human than a shorter
+        // one), and mark the result so a downstream reader (needs-clarification-triage,
+        // resolveAgenticDraft) can tell "the model never complied even under a direct,
+        // repeated instruction" apart from a genuine RESOLUTION: needs-human-decision.
+        if (retryContent.length > summaryContent.length) summaryContent = retryContent;
+      }
+    }
+    // isChatCaller has no sentinel to comply with -- "compliant" is a pipeline-only
+    // concept (resolveAgenticDraft etc.), so leave it trivially true rather than false
+    // (HAS_RESOLUTION_RE never matches chat prose), which would mislabel every chat
+    // forced-summary as forcedSummaryNonCompliant for no reason.
+    const compliant = isChatCaller || HAS_RESOLUTION_RE.test(summaryContent);
+    return withUsage({
+      response: summaryContent || (lastMessage && lastMessage.content) || '',
+      toolCallLog, turnsUsed, toolsDisabled: false, forcedSummary: true, forcedSummaryReason: reason,
+      ...(compliant ? {} : { forcedSummaryNonCompliant: true }),
+    });
+  };
+```
+
+Problem:
+This function orchestrates a forced summary turn with five distinct responsibilities: constructing lead-in messages, injecting budget warnings, formatting content for chat vs. non-chat callers, executing the summary turn with flake recovery, and handling compliance retries. The current monolithic structure forces readers to track state transitions across 120 lines, making it brittle to change — modifying one behavior risks breaking unrelated logic. The hazard is that the retry logic doesn’t record the reason for non-compliance, potentially causing downstream systems to misfire on useful but non-compliant replies.
+
+Solution:
+Extract five logical pieces into named functions: buildLeadIn, buildBudgetWarning, buildContent, executeSummaryTurn, and handleComplianceRetry. Each handles one responsibility with clear inputs and outputs. The final wrapper, runForcedSummaryTurn, orchestrates them in sequence, passing state cleanly between functions. This isolates logic, enables unit testing, and makes the function’s intent explicit: it manages a multi-phase forced summary with compliance safeguards.
+
+Benefits:
+Readability improves because each function has a single responsibility. Testability increases because each piece can be tested independently. Review-ability improves because changes to one phase (e.g., budget warning phrasing) won’t affect others. The hazard of unrecorded non-compliance can be addressed by returning a granular status object from handleComplianceRetry, which downstream systems can then handle appropriately.
+
+VERDICT CONSTRAINT (mandatory for this task):
+- The function snippet IS provided above in this prompt; you do not need to request it or assume it is missing.
+- You MUST render exactly one verdict: GENUINE or FALSE POSITIVE.
+- Refusals, hedging, or a third outcome (including "Uncertain", "I cannot determine", or any other qualifier) are NOT acceptable. Pick the one verdict that best fits the evidence in the snippet and commit to it.
+
+VERDICT: GENUINE
