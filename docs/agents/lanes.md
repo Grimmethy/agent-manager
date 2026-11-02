@@ -194,6 +194,19 @@ The Workers tab (and `POST /api/worker-models/<instance>`) can override the mode
 - **Two big models cannot share the 3090.** A trial of another model needs the worker AND the host `reviewer` on it (they share one Ollama), the chat and Forge
   sessions off the card (both evict it), and the old model unloaded explicitly (`keep_alive: 0`): `OLLAMA_KEEP_ALIVE=-1` pins it.
 
+## Script-handled sources (2026-11-02)
+
+A task source whose work is a script rather than a model-drafted diff (a tuning experiment, an archive, a ledger line) registers a handler with
+`registerScriptHandler(sourceName, fn)` (`src/script-handler-registry.js`; `fn(task, ctx)` returns `{outcome, summary, detail?}`, throwing is allowed).
+`draftTask()` in `src/local-draft.js` looks the handler up right after the pre-dispatch gate and BEFORE any draft attempt or model call. On success the
+result is stored on the task (`task.scriptResult`), the task gets `terminalDisposition: 'recorded'` and returns `{succeeded: true, recorded: true}`;
+`scripts/local-worker.sh` then moves it to `queue/done/` (blocked and needs-clarification keep priority). On a throw the draft fails with
+`script handler failed: <message>` and the worker's normal draft-failure accounting applies. A source with no handler is untouched.
+
+`recorded` is a terminal, stable disposition and releases `dependsOn` edges like `noop`. The lane that claims such tasks (provider `script`, no model,
+no reviewer) is piece A2 and does not exist yet; until then a script-handled source runs on an ordinary lane's tick. Tests:
+`src/script-handler-registry.test.js`, `src/local-draft-script-handler.test.js`, `scripts/local-worker-recorded.test.js`.
+
 ## Tests
 
 `src/worker-model-override.test.js`, `scripts/model-override-reset.test.js` (override read, effective model, restore on clear), `src/lanes.test.js` (registry parsing, validation, fail-closed, id/endpoint collisions, CLI), `src/next-claimable-task.test.js` (allowlist),

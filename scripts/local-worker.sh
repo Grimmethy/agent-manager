@@ -204,6 +204,8 @@ process_drafting_file() {
   # queue/needs-clarification/ instead of review/, same "nothing here for an automatic
   # reviewer to verify" reasoning local-draft.js's own comment documents.
   draft_needs_clarification="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.needsClarification?"true":"false")}catch(e){console.log("false")}')"
+  # recorded (2026-11-02): a script-handled source (src/script-handler-registry.js) finished its work and left the result on the task; nothing for a reviewer to verify.
+  draft_recorded="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.recorded?"true":"false")}catch(e){console.log("false")}')"
 
   if [[ "$draft_succeeded" == "true" && "$draft_blocked" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/blocked" >/dev/null 2>&1
@@ -213,6 +215,10 @@ process_drafting_file() {
     mkdir -p "${QUEUE_DIR}/needs-clarification" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/needs-clarification/${name}"
     printf '[worker-%s] %s needs a human decision -- moved to needs-clarification/\n' "$INSTANCE_ID" "$task_id" >&2
+  elif [[ "$draft_succeeded" == "true" && "$draft_recorded" == "true" ]]; then
+    mkdir -p "${QUEUE_DIR}/done" >/dev/null 2>&1
+    mv -n "$wpath" "${QUEUE_DIR}/done/${name}"
+    printf '[worker-%s] recorded %s -- script handler finished, no review needed: moved to done/\n' "$INSTANCE_ID" "$task_id" >&2
   elif [[ "$draft_succeeded" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/review" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/review/${name}"
