@@ -8,6 +8,8 @@
   :root {
     --bg: #0f1115; --panel: #171a21; --border: #2a3358; --text: #e6e8eb; --muted: #8a90a0;
     --accent: #5b9dff; --ok: #4caf7d; --warn: #e0a940; --bad: #e0575c;
+    /* Hairlines and the scrollbar thumb: 3:1 against --bg and --panel, a step brighter than the decorative --border. */
+    --border-strong: #5668a0;
     /* Lighter than --accent specifically for link text -- #5b9dff reads fine for borders/
        badges/fills but is too close to --bg (#0f1115) for thin anchor text to stay
        legible at a glance (Grimmethy, 2026-08-19: "links... blend in too much with the
@@ -22,6 +24,15 @@
      given element already uses -- no per-color math needed here. */
   .hl-bright { filter: brightness(1.3); }
   * { box-sizing: border-box; }
+  /* Scrollbars (owner request 2026-11-02: they no longer matched the app): slim, fully rounded, blue. The thumb is --border-strong (3:1 against the page and the cards)
+     and --accent on hover over a faint blue track; the transparent border inset makes the thumb a floating pill. Chrome, Edge and Safari take the ::-webkit-scrollbar
+     rules; browsers without them (Firefox) get the standard thin scrollbar in the same colours. The Chat panel is a separate page and carries its own copy. */
+  ::-webkit-scrollbar { width: 12px; height: 12px; }
+  ::-webkit-scrollbar-track { background: rgba(91, 157, 255, .06); border-radius: 999px; }
+  ::-webkit-scrollbar-thumb { background: var(--border-strong); background-clip: padding-box; border: 3px solid transparent; border-radius: 999px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
+  ::-webkit-scrollbar-corner { background: transparent; }
+  @supports not selector(::-webkit-scrollbar) { * { scrollbar-width: thin; scrollbar-color: var(--border-strong) rgba(91, 157, 255, .06); } }
   body { margin: 0; font-family: -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; }
   a { color: var(--link); }
   a:hover { text-decoration: underline; }
@@ -63,7 +74,6 @@
   /* Floating notch (nav-notch.js): a ball in a ring at the right edge of the active tab; it hops to the newly chosen tab. */
   nav button { padding-right: 32px; }
   /* Sidebar sections (nav-sections.js, renderNavSections in core-ui.js): a small label per section with a fold chevron, and a hairline that fades out at both ends between sections. */
-  :root { --border-strong: #5668a0; }
   .nav-div { height: 1px; margin: 12px 8px; background: linear-gradient(90deg, transparent, var(--border-strong), transparent); }
   nav button.nav-sh { display: flex; align-items: center; justify-content: flex-start; gap: 8px; padding: 8px 20px; font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
   nav button.nav-sh:hover { background: none; color: var(--text); }
