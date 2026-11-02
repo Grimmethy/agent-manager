@@ -90,6 +90,7 @@ async function sweepBranchDefects({
 
   const doneDir = path.join(queueDir, 'done');
   let names = [];
+  let superseded = 0;
   try { names = fs.readdirSync(doneDir).filter((f) => f.endsWith('.json')); } catch { names = []; }
 
   for (const name of names) {
@@ -135,6 +136,7 @@ async function sweepBranchDefects({
       }
       delete nextState[branch];
       summary.requeued.push(entry);
+      superseded++;
     } catch (e) {
       summary.errors += 1;
       console.error(`[branch-defect-readmit] ${task && task.id || name}: ${e.message}`);
@@ -154,6 +156,6 @@ if (require.main === module) {
   const dryRun = process.argv.includes('--dry-run');
   sweepBranchDefects({ pipelineDir: cfg.pipelineDir, repoRoot: cfg.repoRoot, mainBranch: detectDefaultBranch(cfg.repoRoot), dryRun }).then((s) => {
     const ids = (a) => (a.length ? ` [${a.map((x) => x.id).join(', ')}]` : '');
-    process.stdout.write(`mode=${s.mode} checked=${s.checked} observed=${s.observed.length} settling=${s.settling.length} stale=${s.stale.length} requeued=${s.requeued.length}${ids(s.requeued)} exhausted=${s.exhausted.length}${ids(s.exhausted)} errors=${s.errors}${dryRun ? ' (dry run)' : ''}\n`);
+    process.stdout.write(`mode=${s.mode} checked=${s.checked} observed=${s.observed.length} settling=${s.settling.length} stale=${s.stale.length} requeued=${s.requeued.length} superseded=${s.superseded}${ids(s.requeued)} exhausted=${s.exhausted.length}${ids(s.exhausted)} errors=${s.errors}${dryRun ? ' (dry run)' : ''}\n`);
   }).catch((e) => { console.error('[branch-defect-readmit]', (e && e.stack) || e); process.exit(1); });
 }

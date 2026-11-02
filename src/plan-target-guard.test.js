@@ -30,27 +30,31 @@ test('blocked:true + missing list when a declared target does not exist and is n
   const r = planTargetGuard(task, planText, repo, ['src']);
   assert.equal(r.blocked, true);
   assert.deepEqual(r.missing, ['src/phantom.js']);
-  assert.match(r.reason, /^plan cites missing-file target\(s\): src\/phantom\.js$/);
+  assert.match(r.reason, /^plan cites missing-file target\(s\): src\/phantom\.js/);
+  assert.match(r.reason, /mark as a create target/);
 });
 
 // 2026-10-30: after a human decision exists on the task the block message says how to correct the target.
 const HINT = ' -- a human decision exists on this task: answer it again with a "Files:" line naming the real paths to correct the target';
 
-test('a blocked task WITHOUT a decision block keeps exactly the old reason', () => {
+test('a blocked task WITHOUT a decision block gets the create-target hint', () => {
   const repo = tmpRepo();
   const task = { title: 'Edit src/phantom.js to add a guard', promptContext: { rawText: 'Edit src/phantom.js.' } };
   const r = planTargetGuard(task, 'EDIT `src/phantom.js` to add the guard.', repo, ['src']);
   assert.equal(r.blocked, true);
-  assert.equal(r.reason, 'plan cites missing-file target(s): src/phantom.js');
+  assert.match(r.reason, /^plan cites missing-file target\(s\): src\/phantom\.js/);
+  assert.match(r.reason, /mark as a create target/);
 });
 
-test('the same blocked task WITH a decision block gets the hint appended and the same missing list', () => {
+test('the same blocked task WITH a decision block gets both hints appended', () => {
   const repo = tmpRepo();
   const task = { title: 'Edit src/phantom.js to add a guard', promptContext: { rawText: 'Edit src/phantom.js.\n\nHUMAN DESIGN DECISION (answered directly from Chat, 2026-10-30):\nthe file moved\n' } };
   const r = planTargetGuard(task, 'EDIT `src/phantom.js` to add the guard.', repo, ['src']);
   assert.equal(r.blocked, true);
   assert.deepEqual(r.missing, ['src/phantom.js']);
-  assert.equal(r.reason, 'plan cites missing-file target(s): src/phantom.js' + HINT);
+  assert.match(r.reason, /^plan cites missing-file target\(s\): src\/phantom\.js/);
+  assert.match(r.reason, /mark as a create target/);
+  assert.match(r.reason, /-- a human decision exists on this task/);
 });
 
 test('the reason still matches the gate-readmit prefix regex with and without the hint', () => {
@@ -66,7 +70,9 @@ test('a decision block mentioned only in the title does not trigger the hint', (
   const task = { title: 'Edit src/phantom.js (see HUMAN DESIGN DECISION notes)', promptContext: { rawText: 'Edit src/phantom.js.' } };
   const r = planTargetGuard(task, 'EDIT `src/phantom.js` to add the guard.', repo, ['src']);
   assert.equal(r.blocked, true);
-  assert.equal(r.reason, 'plan cites missing-file target(s): src/phantom.js');
+  assert.match(r.reason, /^plan cites missing-file target\(s\): src\/phantom\.js/);
+  assert.match(r.reason, /mark as a create target/);
+  assert.doesNotMatch(r.reason, /-- a human decision exists on this task/);
 });
 
 test('a plan that explicitly proposes CREATING the target is not flagged', () => {
@@ -318,4 +324,74 @@ test('"<path> once it exists" after the path in the task text declares a create 
 test('plan text "<path> ... once it exists" counts as the existence acknowledgement', () => {
   assert.equal(isDeclaredCreateTarget('Also run `src/new.test.js` once it exists.', 'src/new.test.js'), true);
   assert.equal(isDeclaredCreateTarget('Run it once it is created: `src/new.test.js`.', 'src/new.test.js'), true);
+});
+
+// --- 2026-11-08: explicit type field support (create vs modify targets) ----------------------------------------
+
+test('plan with explicit type: create for nonexistent file passes validation', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Create src/new-module.js' };
+  const planText = 'Create the new module: {type: "create", path: "src/new-module.js"} with the helper function.';
+  const r = planTargetGuard(task, planText, repo, ['src']);
+  assert.equal(r.blocked, false, 'create target should not be blocked');
+});
+
+test('plan with explicit type: modify for nonexistent file fails with path in message', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Modify src/nonexistent.js' };
+  const planText = 'Edit the file: {type: "modify", path: "src/nonexistent.js"} to add the guard.';
+  const r = planTargetGuard(task, planText, repo, ['src']);
+  assert.equal(r.blocked, true, 'modify target for nonexistent file should be blocked');
+  assert.ok(r.reason.includes('src/nonexistent.js'), 'reason should include the path');
+  assert.ok(r.reason.includes('mark as a create target'), 'reason should suggest create target');
+});
+
+test('mixed plan with existing modify and nonexistent create targets passes', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Edit existing and create new file' };
+  const planText = 'Edit `src/real.js` and create: {type: "create", path: "src/new-module.js"} with the helper.';
+  const r = planTargetGuard(task, planText, repo, ['src']);
+  assert.equal(r.blocked, false, 'mixed plan should not be blocked');
+});
+
+test('planTargetGuard returns targetSummary with create and modify arrays', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Edit existing and create new file' };
+  const planText = 'Edit `src/real.js` and create: {type: "create", path: "src/new-module.js"} with the helper.';
+  const r = planTargetGuard(task, planText, repo, ['src']);
+  assert.equal(r.blocked, false);
+  assert.ok(r.targetSummary, 'should have targetSummary');
+  assert.ok(Array.isArray(r.targetSummary.create), 'create should be an array');
+  assert.ok(Array.isArray(r.targetSummary.modify), 'modify should be an array');
+  assert.ok(r.targetSummary.create.includes('src/new-module.js'), 'create should include the new file');
+  assert.ok(r.targetSummary.modify.includes('src/real.js'), 'modify should include the existing file');
+});
+
+test('blocked plan gives actionable feedback with retry hint', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Modify src/nonexistent.js' };
+  const planText = 'Edit `src/nonexistent.js` to add the guard.';
+  const r = planTargetGuard(task, planText, repo, ['src']);
+  assert.equal(r.blocked, true);
+  assert.ok(r.reason.includes('mark as a create target'), 'should suggest create target');
+  assert.ok(r.reason.includes('src/nonexistent.js'), 'should include the path');
+  assert.ok(r.reason.includes('or correct the path'), 'should suggest correcting the path');
+});
+
+test('explicit type field overrides heuristic create detection', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Edit src/existing.js' };
+  // Even though "create" verb is present, explicit type: modify should be respected
+  const planText = 'Create the file {type: "modify", path: "src/existing.js"} with the new guard.';
+  const r = planTargetGuard(task, planText, repo, ['src']);
+  // src/existing.js exists in tmpRepo, so this should pass
+  assert.equal(r.blocked, false);
+});
+
+test('prose form with type: create also works', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Create src/prose-module.js' };
+  const planText = 'Create the new file with type: create for src/prose-module.js and add the helper.';
+  const r = planTargetGuard(task, planText, repo, ['src']);
+  assert.equal(r.blocked, false, 'prose form should also work');
 });
