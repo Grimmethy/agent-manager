@@ -207,6 +207,42 @@ class CrossProjectActions(unittest.TestCase):
         cached = branch_projects._state["cache"][self.other_root]["branches"]
         self.assertEqual(next(b for b in cached if b["branch"] == "agent/oth-1").get("verdict"), "merge", "the card carries the verdict")
 
+    def test_a_verdict_for_a_branch_the_tab_never_listed_is_recorded_not_parked_as_pending(self):
+        """The cache of another project is empty until the tab asks for ?projects=all; the verdict must not wait for that."""
+        self.assertEqual(branch_projects._state["cache"], {})
+        sha = git(["rev-parse", "agent/oth-1"], self.other["repo"]).strip()
+        body = {"verdict": "merge", "reasons": ["sandbox check"], "source": "chat", "sha": sha}
+        res = self.post("agent/oth-1", "verdict", project=True, body=body)
+        self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+        self.assertNotIn("pending", res.get_json())
+        self.assertEqual(res.get_json()["verdict"], "merge")
+        self.assertFalse((self.other["pipe"] / "queue" / "pending_verdicts").exists())
+        self.assertIn("agent/oth-1", (self.other["pipe"] / "queue" / "branch-verdicts.json").read_text())
+
+    def test_the_batch_route_also_records_for_a_branch_the_tab_never_listed(self):
+        sha = git(["rev-parse", "agent/oth-1"], self.other["repo"]).strip()
+        res = self.client.post("/api/git/branches/verdicts", json={"verdicts": [
+            {"branch": "agent/oth-1", "project": self.other_root, "sha": sha, "verdict": "merge", "reasons": ["sandbox check"], "source": "chat"}]})
+        item = res.get_json()["results"][0]
+        self.assertTrue(item["succeeded"], item)
+        self.assertNotIn("pending", item)
+        self.assertIn("agent/oth-1", (self.other["pipe"] / "queue" / "branch-verdicts.json").read_text())
+
+    def test_a_branch_already_in_the_cache_is_not_refreshed_again(self):
+        scope = branch_projects.resolve_scope(self.other_root, str(self.active["repo"]))
+        branch_projects.refresh_branches(scope)
+        with mock.patch.object(branch_projects, "refresh_branches") as refresh:
+            real, row = branch_projects.find_or_refresh_other_project_branch(scope, "agent/oth-1")
+        self.assertEqual(row["branch"], "agent/oth-1")
+        refresh.assert_not_called()
+
+    def test_a_failing_refresh_falls_back_to_the_old_pending_path(self):
+        sha = git(["rev-parse", "agent/oth-1"], self.other["repo"]).strip()
+        with mock.patch.object(branch_projects, "refresh_branches", side_effect=RuntimeError("boom")):
+            res = self.post("agent/oth-1", "verdict", project=True, body={"verdict": "merge", "reasons": ["x"], "source": "chat", "sha": sha})
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.get_json()["pending"])
+
     def test_a_verdict_for_an_unknown_project_or_unlisted_branch_is_a_404(self):
         body = {"verdict": "merge", "reasons": ["x"], "source": "chat"}
         self.assertEqual(self.post("agent/oth-1", "verdict", project="/no/such/project", body=body).status_code, 404)
