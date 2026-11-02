@@ -953,6 +953,32 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     // Checked BEFORE the "already reviewed" skip -- see header. Only acts (and counts
     // toward `checked`) when decompLoop is set; otherwise falls through unchanged.
     if (decompLoop) {
+      // 2026-09-22: if the task cites a Files: path that doesn't exist in the repo,
+      // the decompose-loop premise is invalid (the file to decompose doesn't exist).
+      // Stamp it and leave in place instead of requeuing.
+      const citedFiles = Array.isArray(task.files) ? task.files : [];
+      if (citedFiles.length > 0) {
+        const allMissing = citedFiles.every((f) => !fs.existsSync(path.join(repoRoot, f)));
+        if (allMissing) {
+          summary.checked += 1;
+          const id0 = task.id || name.replace(/\\.json$/, '');
+          log(`${id0}: bucket E but Files: path nonexistent -> decompose-loop-premise-invalid`);
+          delete task.stalenessFlag;
+          delete task.decomposeBlockCount;
+          delete task.autoDecomposeCount;
+          task.ncTriageDecision = 'decompose-loop-premise-invalid';
+          task.ncTriageReviewedAt = new Date().toISOString();
+          appendHistoryEvent(task, 'nc-triage-reviewed',
+            `needs-clarification-triage: decompose-loop flag with nonexistent Files: path -- ncTriageDecision: decompose-loop-premise-invalid, left in place`);
+          try {
+            fs.writeFileSync(file, JSON.stringify(task, null, 2));
+          } catch (e) {
+            log(`${id0}: writeback failed: ${e.message}`);
+            summary.errors += 1;
+          }
+          continue;
+        }
+      }
       const id0 = task.id || name.replace(/\.json$/, '');
       // Surface the decompose design question to a human BEFORE the terminal action
       // below (requeue, or the cap-spent leave-for-human fall-through), so the original
