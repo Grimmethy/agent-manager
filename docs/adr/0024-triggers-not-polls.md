@@ -75,6 +75,7 @@ cross-process: node, python and bash writers append; consumers drain from their 
   `done/`. Interim: HUB0295 piece 5 gates the pool sweep on a cheap change signature with a counted
   reconcile (the same shape, built from stats). The event code takes the clock and filesystem as
   arguments and imports nothing from agent-manager, so it can move into the triggers repo unchanged.
+- **Interim hook (2026-11-02).** Plugins declare `watchdogScripts` in `plugins.json` and the watchdog runs them once per tick (`docs/PLUGIN_API.md`, "Watchdog scripts"), so a new plugin trigger registers with the one clock instead of adding a timer or a hardcoded block. Each such script is a cheap edge check that the journal's events will replace.
 - **S2 — measure, then migrate by cost.** Time each of the 31 watchdog scripts for one idle tick; convert
   the most expensive ones first.
 - **S3 — lane wake-up.** Replace the idle `sleep` loops with a wake on change (node `fs.watch`, which
