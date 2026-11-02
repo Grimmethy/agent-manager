@@ -45,7 +45,7 @@ function branchCardHtml(b) {
   const foreign = !branchIsActiveProject(b);
   return `
     <div class="worker-card" data-branch-row="${escapeAttr(branchRowKey(b))}" data-open-branch="${escapeAttr(branchRowKey(b))}" data-verdict-key="${branchVerdictKey(b)}" style="cursor:pointer;${branchVerdictBorderStyle(b)}">
-      ${b.project ? `<div style="margin-bottom:6px">${branchProjectChipHtml(b)}</div>` : ''}
+      ${b.project ? `<div style="margin-bottom:8px">${branchProjectChipHtml(b)}</div>` : ''}
       <div class="row">
         <span class="id">${escapeHtmlBright(b.title)}</span>
         <div class="badge-col">
@@ -62,8 +62,8 @@ function branchCardHtml(b) {
         ${!b.matchedTaskState ? ' · <span title="No matching queue/ task file found -- label is the branch\'s own last commit subject.">no task record found</span>' : ''}
         ${b.matchedTaskState === 'task-log' ? ' · <span title="No live queue/ record exists for this task anymore -- this came from the git-tracked task-logs/ file apply-task.js committed alongside the change, so it survives archival.">from committed task log</span>' : ''}
       </div>
-      ${b.description ? `<div style="margin-top:6px;font-size:13px;color:var(--text)">${escapeHtml(b.description)}</div>` : ''}
-      <div class="meta" style="font-family:monospace;font-size:11px;margin-top:4px">${escapeHtml(b.branch)}</div>
+      ${b.description ? `<div style="margin-top:8px;font-size:14px;color:var(--text)">${escapeHtml(b.description)}</div>` : ''}
+      <div class="meta" style="font-family:monospace;font-size:12px;margin-top:4px">${escapeHtml(b.branch)}</div>
       <div class="row" style="margin-top:8px">
         <button class="action" data-project="${escapeAttr(branchProjectRequestRoot(b))}" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}" data-hub-midflight="${hubMidFlight === true}" data-hub-status="${escapeAttr(b.hub ? b.hub.progress.done + '/' + b.hub.progress.total + ' done' + (b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : '') : '')}">Merge to ${escapeHtml(b.mainBranch)}</button>
         <button class="secondary" data-project="${escapeAttr(branchProjectRequestRoot(b))}" data-discard-branch="${escapeAttr(b.branch)}" title="Permanently delete this remote branch and archive its task -- for a branch you've decided NOT to merge.">Discard</button>
@@ -295,7 +295,7 @@ async function renderBranchDetailModal(b) {
   }
   let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtmlBright(b.title)}</h2>`;
   if (b.project) html += `<div style="margin:4px 0">${branchProjectChipHtml(b)}</div>`;
-  html += `<div class="meta" style="font-family:monospace;font-size:11px">${escapeHtml(b.branch)} → ${escapeHtml(b.mainBranch)}</div>`;
+  html += `<div class="meta" style="font-family:monospace;font-size:12px">${escapeHtml(b.branch)} → ${escapeHtml(b.mainBranch)}</div>`;
   if (b.domain) html += `<div class="field-label">Domain / Source</div><div>${escapeHtml(b.domain)} / ${escapeHtml(b.source || '')}</div>`;
   if (b.description) html += `<div class="field-label">What this changes</div><div>${escapeHtml(b.description)}</div>`;
   html += branchVerdictDetailHtml(b);
@@ -310,16 +310,16 @@ async function renderBranchDetailModal(b) {
     html += `<div class="worker-card" style="margin:4px 0">`;
     const hubBuilt = p.built != null ? Math.max(p.built, p.done || 0) : (p.done || 0);
     if (!hub.readyToMerge) {
-      html += `<div class="badge bad" style="margin-bottom:6px">⚠ mid-flight — not ready to merge</div>`;
+      html += `<div class="badge bad" style="margin-bottom:8px">⚠ mid-flight — not ready to merge</div>`;
     } else if (hub.state === 'done') {
-      html += `<div class="badge ok" style="margin-bottom:6px">✓ hub complete</div>`;
+      html += `<div class="badge ok" style="margin-bottom:8px">✓ hub complete</div>`;
     } else {
-      html += `<div class="badge ok" style="margin-bottom:6px">✓ ready to merge — every piece is built</div>`;
+      html += `<div class="badge ok" style="margin-bottom:8px">✓ ready to merge — every piece is built</div>`;
     }
     html += `<div class="meta"><a href="javascript:void(0)" data-open-hub="${escapeAttr(hub.id)}" style="cursor:pointer">${escapeHtmlBright(hub.title || hub.id)}</a> · ${hubBuilt}/${p.total} built${hubBuilt > (p.done || 0) ? ` · ${p.done || 0} merged` : ''}`
       + (gate ? ` · integration gate <strong>${escapeHtml(gate)}</strong>` : '') + `</div>`;
     if (hub.blockedReason) html += `<div class="meta" style="color:var(--bad);margin-top:4px">${escapeHtmlBright(hub.blockedReason)}</div>`;
-    html += `<div class="task-history" style="margin-top:6px">` + (hub.subTasks || []).map((st) =>
+    html += `<div class="task-history" style="margin-top:8px">` + (hub.subTasks || []).map((st) =>
       `<div class="task-history-row"><span class="task-history-stage">${escapeHtmlBright(st.title || st.id)}</span> `
       + `<span class="badge ${st.status === 'done' || st.status === 'merged' ? 'ok' : st.status === 'blocked' || st.status === 'needs-clarification' ? 'bad' : ''}">${escapeHtml(st.status || '?')}</span>`
       + (st.heldFor ? ` <span class="meta" title="Held until this earlier piece of the hub lands on main">held: waiting for an earlier piece (${escapeHtml(st.heldFor.status || '?')})</span>` : '') + `</div>`
@@ -348,18 +348,18 @@ async function renderBranchDetailModal(b) {
       // task's REAL pipeline log (plan → implement tiers → review votes → disposition).
       if (c.task) {
         const t = c.task;
-        row += `<div class="meta" style="margin-top:2px">task <code>${escapeHtml(t.id)}</code> · ${escapeHtml(t.state || '?')}`
+        row += `<div class="meta" style="margin-top:4px">task <code>${escapeHtml(t.id)}</code> · ${escapeHtml(t.state || '?')}`
           + (t.terminalDisposition ? ` · ${escapeHtml(t.terminalDisposition)}` : '')
           + (t.reviewVotes ? ` · review ${escapeHtml(t.reviewVotes)}` : '') + `</div>`;
         if (t.description) row += `<div style="font-size:12px;margin-top:4px">${escapeHtml(t.description)}</div>`;
-        row += `<div class="task-history" style="margin-top:6px">` + (t.history || []).map((e) => {
+        row += `<div class="task-history" style="margin-top:8px">` + (t.history || []).map((e) => {
           const eWhen = e.at ? new Date(e.at).toLocaleTimeString() : '';
           return `<div class="task-history-row"><span class="task-history-stage">${escapeHtml(e.stage || '?')}</span> `
             + `<span class="meta">${escapeHtml(eWhen)}</span>`
             + (e.detail ? ` <span style="font-size:12px">${escapeHtml(e.detail)}</span>` : '') + `</div>`;
         }).join('') + `</div>`;
       } else {
-        if (c.taskId) row += `<div class="meta" style="margin-top:2px">task <code>${escapeHtml(c.taskId)}</code> — no queue record found</div>`;
+        if (c.taskId) row += `<div class="meta" style="margin-top:4px">task <code>${escapeHtml(c.taskId)}</code> — no queue record found</div>`;
         if (c.body) row += `<pre>${escapeHtml(c.body)}</pre>`;
       }
       return row + `</div>`;

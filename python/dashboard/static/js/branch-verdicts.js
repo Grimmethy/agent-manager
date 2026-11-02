@@ -57,7 +57,7 @@ function branchVerdictDetailHtml(b) {
   let html = `<div class="field-label">Verdict</div><div>${branchVerdictBadgeHtml({ ...b, reasons: [] })}`;
   if (b && b.source) html += ` <span class="meta">${_bvEscape(b.source)}${b.verifiedAt ? ' · ' + _bvEscape(b.verifiedAt) : ''}</span>`;
   html += '</div>';
-  if (reasons.length) html += '<ul style="margin:4px 0 0 18px">' + reasons.map((r) => `<li>${_bvEscape(r)}</li>`).join('') + '</ul>';
+  if (reasons.length) html += '<ul style="margin:4px 0 0 16px">' + reasons.map((r) => `<li>${_bvEscape(r)}</li>`).join('') + '</ul>';
   return key === 'unverified' && !reasons.length && !(b && b.stale) ? '' : html;
 }
 
@@ -70,7 +70,7 @@ function branchVerdictFilterBarHtml(branches, activeKey) {
   const counts = {};
   for (const b of branches) counts[branchVerdictKey(b)] = (counts[branchVerdictKey(b)] || 0) + 1;
   // .row is only a flex container inside a card (templates/index.html), so the bar sets its own flex: that is what lets the Discard-all button's margin-left:auto push it right.
-  return '<div class="row" data-verdict-filter-bar style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:10px">' + BRANCH_VERDICT_FILTERS.map((f) => {
+  return '<div class="row" data-verdict-filter-bar style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:12px">' + BRANCH_VERDICT_FILTERS.map((f) => {
     const n = f.key === 'all' ? branches.length : (counts[f.key] || 0);
     const cls = f.key === activeKey ? 'action' : 'secondary';
     return `<button class="${cls}" data-verdict-filter="${f.key}">${_bvEscape(f.label)} (${n})</button>`;
@@ -170,10 +170,10 @@ function heldHubsHtml(groups) {
   const rows = list.map((g) => {
     const p = g.progress || {};
     const waiting = (g.waitingOn || []).map(_bvEscape).join(', ');
-    return `<div class="meta" style="margin:2px 0">${_bvEscape(String(g.title || g.hubId).slice(0, 70))}: ${p.built || 0} of ${p.total || 0} built, `
+    return `<div class="meta" style="margin:4px 0">${_bvEscape(String(g.title || g.hubId).slice(0, 70))}: ${p.built || 0} of ${p.total || 0} built, `
       + `${(g.branches || []).length} held${waiting ? ', waiting on ' + waiting : ''}</div>`;
   }).join('');
-  return '<div data-held-hubs style="margin-top:14px;padding:8px 10px;border:1px dashed #888;border-radius:6px">'
+  return '<div data-held-hubs style="margin-top:16px;padding:8px 12px;border:1px dashed #888;border-radius:6px">'
     + `<div class="meta"><b>Waiting on siblings (${list.length})</b> -- pushed, but not listed until every piece of the hub is built</div>${rows}</div>`;
 }
 
