@@ -77,6 +77,19 @@ test('agentic-empty-forced-summary-parked-as-design-question: re-admits only a t
   assert.equal(e.applies({}), false);
 });
 
+// --- docs-only-gate-created-document-deliverable (2026-11-02) ----------------------------------------------------------------------------
+test('docs-only-gate-created-document-deliverable: re-admits a document-creating task, not one that also declares a code file', () => {
+  const e = KNOWN_FIXED.find((x) => x.id === 'docs-only-gate-created-document-deliverable');
+  assert.ok(e, 'entry registered');
+  assert.deepEqual(e.dirs, ['blocked', 'needs-clarification']);
+  const raw = 'Create docs/audit-x.md. It must contain a table with a row for src/product-spec-to-hub.js / fileHub(). Include a sentence stating the throttle in task-sources.js does not cover batch fan-out.';
+  const block = 'Agentic implement pass produced a diff that is not a real implementation -- diff only touches documentation (docs/audit-x.md) -- the task asks for a code change';
+  assert.equal(e.applies({ source: 'manual', promptContext: { rawText: raw }, blockedReason: block }), true);
+  assert.equal(e.applies({ source: 'manual', promptContext: { rawText: `${raw}\nFiles: docs/audit-x.md, src/product-spec-to-hub.js` }, blockedReason: block }), false, 'a declared code file keeps it parked');
+  assert.equal(e.applies({ promptContext: { rawText: raw }, blockedReason: 'something else' }), false);
+  assert.equal(e.applies({}), false);
+});
+
 // --- lane-endpoint-outage-parked (2026-10-23) -----------------------------------------------------------------------------------------------
 
 test('lane-endpoint-outage-parked: re-admits a task parked on an unreachable or silent lane endpoint only while that endpoint answers', () => {
