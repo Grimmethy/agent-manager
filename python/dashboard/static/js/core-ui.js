@@ -148,6 +148,15 @@ function switchToTab(key) {
   else renderMain();
 }
 
+// The tab's label as drawn in the nav: its line icon (nav-icons.js) followed by the label without its old leading emoji. A tab without a known icon
+// (a plugin tab, say) keeps its label exactly as it was.
+function navTabLabelHtml(tab) {
+  const icon = typeof navTabIcon === 'function' ? navTabIcon(tab) : '';
+  if (!icon) return `<span>${tab.label}</span>`;
+  const plain = typeof navTabPlainLabel === 'function' ? navTabPlainLabel(tab) : tab.label;
+  return `<span class="nav-tab-label">${icon}<span>${plain}</span></span>`;
+}
+
 function renderTabButton(tab, indent) {
   const btn = document.createElement('button');
   btn.className = tab.key === activeTab ? 'active' : '';
@@ -161,7 +170,7 @@ function renderTabButton(tab, indent) {
     // 'awaiting-confirm' already get elsewhere in this nav).
     const inProgress = counts.adhocInProgress ?? 0;
     const blocked = counts.adhocBlocked ?? 0;
-    btn.innerHTML = `<span>${tab.label}</span><span class="count">`
+    btn.innerHTML = `${navTabLabelHtml(tab)}<span class="count">`
       + `<span style="color:var(--muted)">${inProgress}</span>`
       + ` <span style="color:var(--bad); font-weight:600">${blocked}</span>`
       + `</span>`;
@@ -171,7 +180,7 @@ function renderTabButton(tab, indent) {
   const count = (tab.key === 'workers' || tab.key === 'models' || tab.key === 'joblist' || tab.key === 'plugins' || tab.key === 'deepdive') ? '' : (counts[tab.key] ?? '');
   const severity = severityForTab(tab.key, count);
   const dot = severity ? `<span class="status-dot ${severity}"></span>` : '';
-  btn.innerHTML = `<span>${tab.label}</span><span class="count">${dot}${count}</span>`;
+  btn.innerHTML = `${navTabLabelHtml(tab)}<span class="count">${dot}${count}</span>`;
   btn.onclick = () => switchToTab(tab.key);
   return btn;
 }
@@ -516,7 +525,8 @@ function renderNavRailButton(tab) {
   btn.title = name;
   if (typeof btn.setAttribute === 'function') btn.setAttribute('aria-label', name);
   const severity = severityForTab(tab.key, counts[tab.key]);
-  btn.innerHTML = `<span class="rail-glyph">${escapeHtml(navTabGlyph(tab))}</span>` + (severity ? `<span class="status-dot ${severity}"></span>` : '');
+  const icon = typeof navTabIcon === 'function' ? navTabIcon(tab, 20) : '';
+  btn.innerHTML = (icon ? `<span class="rail-glyph">${icon}</span>` : `<span class="rail-glyph">${escapeHtml(navTabGlyph(tab))}</span>`) + (severity ? `<span class="status-dot ${severity}"></span>` : '');
   btn.onclick = () => switchToTab(tab.key);
   return btn;
 }
@@ -540,7 +550,8 @@ function renderNavRail(nav) {
       btn.title = `${section.label} (click to open)`;
       if (typeof btn.setAttribute === 'function') btn.setAttribute('aria-label', `Open ${section.label}`);
       const { severity } = navSectionSummary(section, { countOf: (k) => counts[k], severityOf: (k) => severityForTab(k, counts[k]) });
-      btn.innerHTML = `<span class="rail-glyph">${escapeHtml(section.label.charAt(0))}</span>` + (severity ? `<span class="status-dot ${severity}"></span>` : '');
+      const sectionIcon = typeof navSectionIcon === 'function' ? navSectionIcon(section, 20) : '';
+      btn.innerHTML = (sectionIcon ? `<span class="rail-glyph">${sectionIcon}</span>` : `<span class="rail-glyph">${escapeHtml(section.label.charAt(0))}</span>`) + (severity ? `<span class="status-dot ${severity}"></span>` : '');
       btn.onclick = () => {
         localStorage.setItem(navFoldKey(section.key), 'expanded');
         localStorage.removeItem(NAV_RAIL_KEY);
