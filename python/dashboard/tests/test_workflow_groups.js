@@ -140,7 +140,7 @@ test('collapseGraph does not mutate its input and gives the same result twice', 
 test('groupBoxes: a box around the laid-out children of an expanded group, none for a group without laid-out members', () => {
   const g = graph({ groups: [grp('group:ab', ['worker-a', 'worker-b'], { label: 'AB' }), grp('group:none', ['nobody'])] });
   const boxes = v.groupBoxes(g, { 'worker-a': { x: 100, y: 200 }, 'worker-b': { x: 400, y: 328 } }, { w: 272, h: 128 }, 12);
-  assert.deepEqual(plain(boxes), [{ id: 'group:ab', label: 'AB', x: 88, y: 160, w: 596, h: 308 }]);
+  assert.deepEqual(plain(boxes), [{ id: 'group:ab', label: 'AB', x: 88, y: 160, w: 296, h: 180, part: 0 }, { id: 'group:ab', label: 'AB', x: 388, y: 288, w: 296, h: 180, part: 1 }]);
   assert.deepEqual(plain(v.groupBoxes(g, {}, { w: 1, h: 1 })), []);
   assert.deepEqual(plain(v.groupBoxes(null, {}, {})), []);
 });
@@ -148,7 +148,7 @@ test('groupBoxes: a box around the laid-out children of an expanded group, none 
 test('groupBoxes: a group at the edge of the layout has negative coordinates, the default padding is 12, nested groups are enclosed', () => {
   const g = graph({ groups: [grp('group:out', ['group:in', 'worker-c']), grp('group:in', ['worker-a'])] });
   const boxes = v.groupBoxes(g, { 'worker-a': { x: 0, y: 0 }, 'worker-c': { x: 300, y: 0 } }, { w: 272, h: 128 });
-  assert.deepEqual(plain(boxes.map((b) => [b.id, b.x, b.y, b.w, b.h])), [['group:out', -12, -40, 596, 180], ['group:in', -12, -40, 296, 180]]);
+  assert.deepEqual(plain(boxes.map((b) => [b.id, b.x, b.y, b.w, b.h])), [['group:out', -12, -40, 296, 180], ['group:out', 288, -40, 296, 180], ['group:in', -12, -40, 296, 180]]);
 });
 
 test('the view draws a dashed box and a header button for an expanded group, escapes its label, and shifts the canvas when the box starts before the layout', () => {
@@ -322,7 +322,7 @@ test('nested groups three levels deep collapse into the outermost one only, and 
   const cyc = graph({ groups: [grp('group:a', ['group:b', 'worker-a']), grp('group:b', ['group:a', 'worker-b'])] });
   const c = v.collapseGraph(cyc, new Set(['group:a']));
   assert.equal(c.nodes.find((n) => n.id === 'group:a').memberCount, 2);
-  assert.deepEqual(v.groupBoxes(cyc, { 'worker-a': { x: 0, y: 0 }, 'worker-b': { x: 300, y: 0 } }, { w: 10, h: 10 }, 0).length, 2);
+  assert.deepEqual(v.groupBoxes(cyc, { 'worker-a': { x: 0, y: 0 }, 'worker-b': { x: 300, y: 0 } }, { w: 10, h: 10 }, 0).length, 4);
 });
 
 test('the aggregate status ignores services and sources and the counts ignore values that are not numbers', () => {
@@ -395,4 +395,53 @@ test('the canvas grows downward when a box ends below the last row', () => {
   assert.equal(lay.height, 272);
   const html = v.buildGraphHtml(g, lay, { selectedId: null });
   assert.ok(html.includes('<div class="wf-canvas" style="width:296px;height:284px">'), html.slice(html.indexOf('wf-canvas'), html.indexOf('wf-canvas') + 80));
+});
+
+test('groupBoxes: members in one column share one box (part 0), members in two columns get one box per column, left to right', () => {
+  const size = { w: 272, h: 128 };
+  const one = v.groupBoxes(graph({ groups: [grp('group:g', ['worker-a', 'worker-b', 'worker-c'])] }), { 'worker-a': { x: 0, y: 0 }, 'worker-b': { x: 0, y: 144 }, 'worker-c': { x: 0, y: 288 } }, size, 12);
+  assert.deepEqual(plain(one), [{ id: 'group:g', label: 'group:g', x: -12, y: -40, w: 296, h: 468, part: 0 }]);
+  const two = v.groupBoxes(graph({ groups: [grp('group:g', ['worker-a', 'worker-b', 'worker-c'])] }), { 'worker-c': { x: 600, y: 0 }, 'worker-a': { x: 0, y: 0 }, 'worker-b': { x: 0, y: 144 } }, size, 12);
+  assert.deepEqual(plain(two.map((b) => [b.part, b.x, b.y, b.w, b.h])), [[0, -12, -40, 296, 324], [1, 588, -40, 296, 180]]);
+});
+
+test('groupBoxes: a box covers none of the other cards of its column, nested members count, a collapsed or empty group has no box', () => {
+  const size = { w: 272, h: 128 };
+  const g = graph({ groups: [grp('group:out', ['group:in', 'worker-c']), grp('group:in', ['worker-a'])] });
+  const pos = { 'worker-a': { x: 0, y: 0 }, 'worker-b': { x: 0, y: 144 }, 'worker-c': { x: 0, y: 288 } };
+  const boxes = v.groupBoxes(g, pos, size, 12).filter((b) => b.id === 'group:out');
+  assert.equal(boxes.length, 1);
+  assert.ok(boxes[0].y <= pos['worker-a'].y - 12 - 28 && boxes[0].y + boxes[0].h >= pos['worker-c'].y + 128 + 12);
+  assert.deepEqual(plain(v.groupBoxes(graph({ groups: [grp('group:none', ['nobody'])] }), pos, size, 12)), []);
+  assert.deepEqual(plain(v.groupBoxes(graph({ groups: [grp('group:g', ['worker-a'])] }), {}, size, 12)), []);
+});
+
+test('the view draws one box and one header button per column of a group, and a click on the second button folds the group', async () => {
+  const main = setup(graph({ groups: [grp('group:ab', ['worker-a', 'worker-b'], { label: '<i>AB</i>' })] }));
+  await v.renderGraphView(main, false);
+  assert.equal((main.html.match(/class="wf-group-box"/g) || []).length, 2);
+  assert.equal(main.toggles.length, 2);
+  assert.equal((main.html.match(/&lt;i&gt;AB&lt;\/i&gt;/g) || []).length, 2);
+  assert.doesNotMatch(main.html, /<i>AB/);
+  await click(main.toggles[1]);
+  assert.ok(main.html.includes('data-group="1"') && !main.html.includes('wf-group-box'), 'folded from the second button');
+  assert.equal(vm.runInContext('wfState.toggles["group:ab"]', ctx), true);
+  delete ctx.document;
+});
+
+test('groupBoxes: boxes are numbered left to right whatever the order of the members, and bad input gives no boxes', () => {
+  const size = { w: 272, h: 128 };
+  const g = graph({ groups: [grp('group:g', ['worker-c', 'worker-b', 'worker-a'])] });
+  const boxes = v.groupBoxes(g, { 'worker-a': { x: 0, y: 0 }, 'worker-b': { x: 300, y: 0 }, 'worker-c': { x: 600, y: 0 } }, size, 12);
+  assert.deepEqual(plain(boxes.map((b) => [b.part, b.x])), [[0, -12], [1, 288], [2, 588]]);
+  const trap = { get 'worker-a'() { throw new Error('boom'); } };
+  assert.deepEqual(plain(v.groupBoxes(g, trap, size, 12)), []);
+  assert.deepEqual(plain(v.groupBoxes({ groups: 'x' }, {}, size, 12)), []);
+  assert.deepEqual(plain(v.groupBoxes(undefined, undefined, undefined)), []);
+});
+
+test('groupBoxes: a group without a label is boxed under its id', () => {
+  const g = graph({ groups: [grp('group:nolabel', ['worker-a'], { label: '' }), grp('group:nolabel2', ['worker-a'], { label: undefined })] });
+  const boxes = v.groupBoxes(g, { 'worker-a': { x: 0, y: 0 } }, { w: 272, h: 128 }, 12);
+  assert.deepEqual(plain(boxes.map((b) => b.label)), ['group:nolabel', 'group:nolabel2']);
 });
