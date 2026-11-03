@@ -237,6 +237,38 @@ process_drafting_file() {
     # The pattern is the FORGE_PAUSE_MESSAGE text (pinned by src/local-client-forge-pause.test.js so the copies cannot drift).
     printf '[worker-%s] draft paused for a Forge GPU session -- not counted as a failure; %s stays in drafting/ and resumes when the lease clears\n' "$INSTANCE_ID" "$task_id" >&2
     TICK_HAD_INFRA_FAILURE=true
+  elif grep -qE "gpu-arbiter: cancelled while waiting" <<< "$draft_result"; then
+    # 2026-11-03, Grimmethy: three tasks permanently parked in needs-clarification because a
+    # transient GPU-scheduling outcome (arbiter cancelled the wait because a higher-priority
+    # ticket arrived) was classified as a draft failure and counted toward the consecutive-
+    # failure give-up limit. The arbiter cancellation is a resource-contention outcome, not a
+    # draft or content failure: nothing about the task is wrong, and retrying on a later tick
+    # when the GPU is free will plausibly succeed. So: reset the failure counter (so only real
+    # failures accumulate), requeue to pending/ like any other transient outcome, and flag the
+    # tick so the worker yields this round. Without this branch the task keeps grinding through
+    # DRAFT_FAILURE_RETRY_LIMIT identical arbiter cancellations and then asks a human for help
+    # on something the human cannot fix.
+    local_name="$(basename "$wpath" .json)"
+    failure_count="$(node -e '
+      const fs = require("fs");
+      const p = process.argv[1];
+      try {
+        const o = JSON.parse(fs.readFileSync(p, "utf8"));
+        o.draftFailureCount = 0;
+        o.history = o.history || [];
+        o.history.push({
+          stage: "requeued",
+          at: new Date().toISOString(),
+          detail: "draft call cancelled by GPU arbiter while waiting -- not counted as a failure; requeued to pending/ for retry when GPU is available",
+        });
+        fs.writeFileSync(p, JSON.stringify(o, null, 2));
+        console.log(0);
+      } catch (e) { console.log(0); }
+    ' "$wpath")"
+    mkdir -p "${QUEUE_DIR}/pending" >/dev/null 2>&1
+    mv -n "$wpath" "${QUEUE_DIR}/pending/${local_name}"
+    printf '[worker-%s] draft call for %s cancelled by GPU arbiter while waiting -- not counted as a failure, requeued to pending/ for retry\n' "$INSTANCE_ID" "$task_id" >&2
+    TICK_HAD_INFRA_FAILURE=true
   else
     # Draft call itself failed (e.g. Ollama unreachable, or a real generation call timing
     # out under GPU contention) -- retry via the leftover-drafting resume pass at the top
