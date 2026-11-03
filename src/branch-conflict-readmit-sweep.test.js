@@ -9,6 +9,7 @@ const { execFileSync } = require('child_process');
 
 const { sweepBranchConflicts, appliedBranch, eligibleTask, SETTLE_MS, STATE_FILE } = require('./branch-conflict-readmit-sweep.js');
 const { priorVerdictBlock } = require('./lib/prompt-blocks.js');
+const queueEvents = require('./queue-events.js');
 
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -237,4 +238,108 @@ test('end to end with the real requeue: branch deleted and abandoned, fresh pend
   assert.equal(pending.promptContext.priorVerdict.attempt, 1);
   assert.equal(fs.existsSync(path.join(w.pipelineDir, 'queue', 'done', 't1.json')), false);
   assert.equal(git(w.repo, 'ls-remote', '--heads', 'origin', 'agent/t1').trim(), '');
+});
+
+
+// ---- ADR-0024: driven by the queue-events journal (HUB0330 piece 6) ----
+const OFF = { AGENT_MANAGER_QUEUE_EVENTS: 'off' };
+function countingFs() {
+  const readdirs = [];
+  const impl = { ...fs, readdirSync: (p, ...rest) => { readdirs.push(String(p)); return fs.readdirSync(p, ...rest); } };
+  return { impl, doneListings: () => readdirs.filter((d) => /queue[\\/]done$/.test(d)).length };
+}
+function gitCounter(override = null) {
+  const calls = [];
+  const fn = (repoRoot, args) => {
+    calls.push(args.join(' '));
+    if (override) { const r = override(args); if (r) return r; }
+    try { return { code: 0, out: execFileSync('git', args, { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }; } catch (e) { return { code: typeof e.status === 'number' ? e.status : 2, out: String(e.stdout || '') }; }
+  };
+  fn.calls = calls;
+  fn.perBranchCalls = () => calls.filter((c) => !c.startsWith('fetch')).length;
+  return fn;
+}
+const merged = (w, id = 'other') => queueEvents.append(w.pipelineDir, { type: 'branch_merged', branch: `agent/${id}`, taskId: id });
+const MIN = 60 * 1000;
+function quietWorld() {                                   // a pending-merge task that merges cleanly today and will conflict once main changes a.txt
+  const w = makeWorld();
+  w.commitOnBranch('agent/t1', 'a.txt', 'one\nTWO-branch\nthree\n');
+  putTask(w.pipelineDir, 't1', 'agent/t1');
+  return w;
+}
+
+test('journal mode: after the first full listing, a run that drained no merge event lists nothing and makes no per-branch git call', async () => {
+  const w = quietWorld();
+  const c = countingFs();
+  const g = gitCounter();
+  const t0 = Date.now();
+  const first = await run(w, t0, { fsImpl: c.impl, git: g, requeue: async () => ({ ok: true }) });
+  assert.deepEqual([first.journal.fullScan, first.checked], [true, 1]);
+  assert.equal(c.doneListings(), 1);
+  const before = g.perBranchCalls();
+  const idle = await run(w, t0 + 5 * MIN, { fsImpl: c.impl, git: g });
+  assert.deepEqual([idle.journal.idle, idle.journal.fullScan, idle.checked], [true, false, 0]);
+  assert.equal(c.doneListings(), 1, 'the idle run made ZERO readdirSync calls on done/');
+  assert.equal(g.perBranchCalls(), before, 'and no rev-parse, rev-list or merge-tree');
+  queueEvents.append(w.pipelineDir, { type: 'verdict_recorded', branch: 'agent/t1', sha: 'x', verdict: 'merge', source: 'chat' });
+  const other = await run(w, t0 + 6 * MIN, { fsImpl: c.impl, git: g });
+  assert.deepEqual([other.journal.idle, c.doneListings()], [true, 1], 'a verdict event is not a reason to look: the run is still idle, no listing');
+  assert.deepEqual(queueEvents.drain(w.pipelineDir, 'conflict-readmit').events, [], 'and that event was consumed');
+});
+
+test('journal mode: a branch_merged event lists done/ once, checks the pending-merge tasks, and the conflict it finds settles without a new event', async () => {
+  const w = quietWorld();
+  const c = countingFs();
+  const t0 = Date.now();
+  await run(w, t0, { fsImpl: c.impl });                                   // first run: merges cleanly, nothing observed
+  w.commitOnMain('a.txt', 'one\nTWO-main\nthree\n');                      // main moves and now conflicts with t1
+  merged(w);
+  const second = await run(w, t0 + MIN, { fsImpl: c.impl });
+  assert.deepEqual([second.journal.mergeRun, second.observed.length], [true, 1]);
+  assert.equal(c.doneListings(), 2, 'one listing for the run that had a merge event');
+  const early = await run(w, t0 + 2 * MIN, { fsImpl: c.impl });
+  assert.deepEqual([early.journal.pendingRun, early.settling.length, c.doneListings()], [true, 1, 2], 'a pending sighting is revisited without a listing');
+  const { calls, requeue } = (() => { const calls = []; return { calls, requeue: async (...a) => { calls.push(a); return { ok: true }; } }; })();
+  const third = await run(w, t0 + MIN + SETTLE_MS + 1000, { fsImpl: c.impl, requeue });
+  assert.deepEqual([third.requeued.length, calls.length, c.doneListings()], [1, 1, 2], 'requeued after SETTLE_MS with no new event and no listing');
+});
+
+test('journal mode: a conflict the reconcile scan newly finds while no merge event was drained is counted; the first run and an announced merge are not', async () => {
+  const t0 = Date.now();
+  const pre = conflictWorld();                                             // a conflict that already exists when the journal starts
+  const preFirst = await run(pre, t0, {});
+  assert.deepEqual([preFirst.journal.fullScan, preFirst.observed.length, preFirst.journal.corrections], [true, 1, 0]);
+  const silent = quietWorld();
+  await run(silent, t0, {});
+  silent.commitOnMain('a.txt', 'one\nTWO-main\nthree\n');                 // main moved without any event: a direct push
+  const found = await run(silent, t0 + 31 * MIN, {});
+  assert.deepEqual([found.journal.fullScan, found.observed.length, found.journal.corrections], [true, 1, 1]);
+  assert.deepEqual(queueEvents.readCorrections(silent.pipelineDir).byConsumer, { 'conflict-readmit': 1 });
+  const told = quietWorld();
+  await run(told, t0, {});
+  told.commitOnMain('a.txt', 'one\nTWO-main\nthree\n');
+  merged(told);
+  const counted = await run(told, t0 + 31 * MIN, {});
+  assert.deepEqual([counted.observed.length, counted.journal.corrections], [1, 0]);
+});
+
+test('journal mode: a failed conflict check keeps the merge event pending, so the next run looks again', async () => {
+  const w = quietWorld();
+  const t0 = Date.now();
+  await run(w, t0, {});
+  w.commitOnMain('a.txt', 'one\nTWO-main\nthree\n');
+  merged(w);
+  const broken = gitCounter((args) => (args[0] === 'merge-tree' ? { code: 2, out: '' } : null));
+  const failed = await run(w, t0 + MIN, { git: broken });
+  assert.equal(failed.observed.length, 0);
+  const again = await run(w, t0 + 2 * MIN, {});
+  assert.deepEqual([again.journal.mergeRun, again.observed.length], [true, 1], 'the same merge event was delivered again and the conflict is found now');
+});
+
+test('AGENT_MANAGER_QUEUE_EVENTS=off is the old behaviour: a full listing every run and no journal files', async () => {
+  const w = quietWorld();
+  const c = countingFs();
+  for (let i = 0; i < 3; i++) await run(w, Date.now() + i * MIN, { env: OFF, fsImpl: c.impl });
+  assert.equal(c.doneListings(), 3);
+  assert.equal(fs.existsSync(path.join(w.pipelineDir, 'queue-events')), false);
 });
