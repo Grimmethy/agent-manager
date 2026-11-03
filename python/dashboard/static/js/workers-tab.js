@@ -211,6 +211,7 @@ async function refreshNewestCompletedTasks() {
 // selects, i.e. the operator is actively mid-choice. The next 5s tick tries again.
 async function renderWorkers(isPoll) {
   const isStale = renderStaleCheck();
+  if (typeof workersViewMode === 'function' && workersViewMode() === 'graph') { await renderGraphView(document.getElementById('main'), isPoll); return; }
   if (isPoll) {
     const active = document.activeElement;
     if (active && (active.classList.contains('worker-type-select') || active.classList.contains('worker-task-select'))) {
@@ -290,7 +291,7 @@ async function renderWorkers(isPoll) {
   });
   const filterBar = `
     <div class="worker-filter-bar" style="margin-bottom:12px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px">
-      <div></div>
+      ${typeof workersViewToggleHtml === 'function' ? workersViewToggleHtml('cards') : '<div></div>'}
       <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
         <input type="checkbox" id="claude-pause-toggle" style="margin:0" ${workerModels.claudePaused ? 'checked' : ''}>
         Pause Claude (preserve subscription tokens)
@@ -463,6 +464,7 @@ async function renderWorkers(isPoll) {
   main.querySelectorAll('[data-open-task-anywhere]').forEach((link) => {
     link.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openTaskAnywhere(link.dataset.openTaskAnywhere); };
   });
+  if (typeof wireWorkersViewToggle === 'function') wireWorkersViewToggle(main);
   updateStaleTimers();
 }
 
