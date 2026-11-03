@@ -372,3 +372,49 @@ test('a reviewerId that is itself a lane id does not add a second node', () => {
   const g = buildWorkflowGraph({ lanes, instances: [makeInstance('worker-a')], topology: [], models: EMPTY_MODELS, now: FIXED_NOW });
   assert.equal(g.nodes.filter(n => n.id === 'worker-b').length, 1);
 });
+
+// ---- workflow overlay (piece W-C2) ----
+
+const OVERLAY_INPUT = () => ({
+  lanes: [makeLane({ id: 'worker-a', gpu: 'a' }), makeLane({ id: 'worker-b', gpu: 'b' })],
+  instances: [makeInstance('worker-a')],
+  topology: [{ name: 's1', slug: 's1', priority: 1, reasoningTier: 'low', workerType: 'ornith', liveCounts: { pending: 2 } }],
+  models: { overrides: {}, ollamaModels: [], claudeModels: [] },
+  now: FIXED_NOW,
+});
+
+test('the builder with a workflow config has the groups, parents, labels and authored edges', () => {
+  const g = buildWorkflowGraph({ ...OVERLAY_INPUT(), workflow: { schemaVersion: 1, groups: [{ id: 'group:gpus', label: 'GPUs', children: ['worker-a', 'worker-b'], collapsed: true }], edges: [{ from: 'source:s1', to: 'worker-b', kind: 'triggers', label: 'manual' }], labels: { 'worker-a': 'Alpha' } } });
+  assert.deepEqual(g.groups, [{ id: 'group:gpus', label: 'GPUs', children: ['worker-a', 'worker-b'], collapsed: true }]);
+  assert.equal(g.nodes.find((n) => n.id === 'worker-a').parent, 'group:gpus');
+  assert.equal(g.nodes.find((n) => n.id === 'worker-b').parent, 'group:gpus');
+  assert.equal(g.nodes.find((n) => n.id === 'worker-a').label, 'Alpha');
+  assert.ok(g.edges.some((e) => e.id === 'source:s1->worker-b:triggers' && e.label === 'manual'));
+});
+
+test('the builder without a workflow config, or with an empty one, returns the graph as it was built: no groups, no parents, same nodes and edges', () => {
+  const plain = buildWorkflowGraph(OVERLAY_INPUT());
+  assert.deepEqual(plain.groups, []);
+  assert.ok(plain.nodes.every((n) => n.parent === null));
+  for (const workflow of [undefined, null, {}, { schemaVersion: 1, groups: [], edges: [], labels: {} }, 'x', []]) {
+    assert.deepEqual(buildWorkflowGraph({ ...OVERLAY_INPUT(), workflow }), plain, JSON.stringify(workflow));
+  }
+});
+
+test('the builder CLI passes a workflow key through to the overlay', () => {
+  const input = JSON.stringify({ ...OVERLAY_INPUT(), now: undefined, workflow: { schemaVersion: 1, groups: [{ id: 'group:x', children: ['worker-a'] }] } });
+  const out = spawnSync(process.execPath, [path.join(__dirname, 'workflow-graph.js'), '--stdin'], { input, encoding: 'utf8' });
+  assert.equal(out.status, 0);
+  assert.equal(JSON.parse(out.stdout).groups[0].id, 'group:x');
+});
+
+test('the builder with watchdogScripts adds the service nodes and triggers edges, and without them is unchanged', () => {
+  const plain = buildWorkflowGraph(OVERLAY_INPUT());
+  const g = buildWorkflowGraph({ ...OVERLAY_INPUT(), watchdogScripts: [{ plugin: 'uiforge', root: '/r', script: 'harness/watchdog-trigger.js', abs: '/r/harness/watchdog-trigger.js' }] });
+  const id = 'service:watchdog-script:uiforge:watchdog-trigger';
+  assert.ok(g.nodes.some((n) => n.id === id && n.kind === 'service'));
+  assert.ok(g.edges.some((e) => e.id === `service:watchdog->${id}:triggers` && e.kind === 'triggers'));
+  for (const watchdogScripts of [undefined, null, [], 'x']) assert.deepEqual(buildWorkflowGraph({ ...OVERLAY_INPUT(), watchdogScripts }), plain, JSON.stringify(watchdogScripts));
+  const grouped = buildWorkflowGraph({ ...OVERLAY_INPUT(), watchdogScripts: [{ plugin: 'uiforge', script: 'a.js' }], workflow: { schemaVersion: 1, groups: [{ id: 'group:wd', children: ['service:watchdog', 'service:watchdog-script:uiforge:a'] }], edges: [], labels: {} } });
+  assert.equal(grouped.nodes.find((n) => n.id === 'service:watchdog-script:uiforge:a').parent, 'group:wd');
+});
