@@ -102,6 +102,8 @@ from app_catalog_helpers import (  # noqa: F401
     CONCEPT_STABLE_STATUSES,
     GHOST_CONCEPT_ID,
     _BRANCH_CACHE_TTL_SECONDS,
+    _ACTION_FETCH_REUSE_SECONDS,
+    _ACTION_FETCH_TIMEOUT_SECONDS,
     _BRANCH_FETCH_TTL_SECONDS,
     _COMMUNITY_ID_SUFFIX_RE,
     _DEEP_DIVE_ITEM_RE,
@@ -2270,7 +2272,7 @@ def _branch_content_already_on_main(repo_root, main_branch, full_ref):
         return False
 
 
-def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_dir=None):
+def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_dir=None, fetch_timeout=30):
     """The ACTIVE project's list by default. repo_root/pipeline_dir name another registered project (branch_projects.py): it always fetches (the caller owns that
     project's timer) and leaves the active project's held-hub cache and fetch timer alone."""
     other = repo_root is not None
@@ -2287,7 +2289,7 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
     with _branch_cache_lock:
         fetch_due = other or force_fetch or (time.time() - _branch_fetch_state["at"]) >= _BRANCH_FETCH_TTL_SECONDS
     if fetch_due:
-        _run_git(["fetch", "origin", "--prune"], repo_root, timeout=30)
+        _run_git(["fetch", "origin", "--prune"], repo_root, timeout=fetch_timeout)
         if not other:
             with _branch_cache_lock:
                 _branch_fetch_state["at"] = time.time()
@@ -2440,7 +2442,7 @@ def list_unmerged_branches(force=False, stale_ok=False):
             t.start()
         return stale
     try:
-        branches = _list_unmerged_branches_uncached(force_fetch=force)
+        branches = _list_unmerged_branches_uncached(force_fetch=force, **({"fetch_timeout": _ACTION_FETCH_TIMEOUT_SECONDS} if force else {}))
     except (RuntimeError, subprocess.SubprocessError, OSError) as e:
         # Best-effort, same "a check failing here must never block the rest of the
         # dashboard" rule as everything else that shells out in this file -- a git/network

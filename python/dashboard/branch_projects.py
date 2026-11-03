@@ -149,7 +149,8 @@ def find_or_refresh_other_project_branch(scope, branch):
 def refresh_branches(scope):
     """Recompute that project's list NOW (git fetch included) and cache it: an action must gate on the branch as it is, not on a list up to 5 minutes old."""
     import app
-    rows = app._list_unmerged_branches_uncached(force_fetch=True, repo_root=scope["repoRoot"], pipeline_dir=scope["pipelineDir"])
+    rows = app._list_unmerged_branches_uncached(force_fetch=True, repo_root=scope["repoRoot"], pipeline_dir=scope["pipelineDir"],
+                                                fetch_timeout=app._ACTION_FETCH_TIMEOUT_SECONDS)
     with _lock:
         _state["cache"][scope["repoRoot"]] = {"at": time.time(), "branches": rows, "error": None}
     return rows
