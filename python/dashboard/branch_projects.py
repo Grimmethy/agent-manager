@@ -20,10 +20,12 @@ _state = {"cache": {}, "thread": None}  # cache: real repo root -> {"at": epoch,
 
 
 def _ttl_seconds():
+    """How long another project's branch list is served before the background thread refetches it. Default 1800 s (was 300): with ~20 registered repos the old value meant
+    a `git fetch` about every 15 s on the shared disk (ADR-0024 measurement, 2026-11-03). Merge/discard in the active project invalidate its own cache separately."""
     try:
-        return max(30.0, float(os.environ.get("AGENT_MANAGER_BRANCH_OTHER_PROJECTS_TTL_SECONDS", "300")))
+        return max(30.0, float(os.environ.get("AGENT_MANAGER_BRANCH_OTHER_PROJECTS_TTL_SECONDS", "1800")))
     except ValueError:
-        return 300.0
+        return 1800.0
 
 
 def registered_projects(active_root):
