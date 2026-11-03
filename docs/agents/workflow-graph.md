@@ -80,18 +80,34 @@ Unit tests cannot see a clipped card or a page that scrolls sideways, so the gra
 
 With no `PLAYWRIGHT_DIR` the script prints `skipped: PLAYWRIGHT_DIR not set` and exits 0, so it is safe in any test run.
 
+## What phase B added (HUB0325)
+
+Phase B made the nodes configurable with the controls a worker card has, without changing any lane or pipeline behaviour.
+
+- **Lane fields on `/api/instances`.** Every entry now carries `provider` (`local`, `cloud`, `script` or null), `taskClasses` (the lane's allowlist or null) and `tierB`, taken from the lane whose id equals the
+  instance id (`app.worker_lane_defs()`); an instance that is not a lane, or any instance when the lane definitions are unavailable, gets nulls.
+- **A provider-aware model control** (`python/dashboard/static/js/worker-model-select.js`, shared by the Cards view and the node panel): a local lane keeps its model select; a cloud lane shows its model read-only
+  ("cloud model set by the gateway"), because the gateway ignores the model a caller sends; a script lane shows "script lane, no model"; the watchdog shows nothing.
+- **The node panel** (`python/dashboard/static/js/workflow-node-panel.js`): a selected loop node shows its facts, the Turn on / Turn off switch, the model control and a note that says when a change applies, and a worker
+  node also shows the task picker (`python/dashboard/static/js/worker-task-picker.js`, extracted unchanged from the Cards view). Choosing a task uses the same confirm dialog and the same assign-task route as the card.
+- **When a change applies.** A model override applies on the lane's **next tick** (about 30 seconds). A lane's provider, endpoint and task classes come from `lanes.json` and need a **pipeline restart**; the panel says so.
+- **Polling.** A poll never redraws while a model, type or task dropdown has focus, and a poll that fails (a slow route under load) keeps the graph that is drawn instead of replacing it with the unavailable message.
+- **Per-node local or cloud choice** was not built; see [workflow-node-provider.md](workflow-node-provider.md) for what it would take and the decisions it needs.
+
+Known gaps of phase B: the graph node carries only the model name and an overridden flag, so the select shows the model the lane currently runs (the override value itself is not in the graph); the task picker appears for
+every worker node even when a worker's heartbeat says it cannot be assigned tasks (the graph runtime has no such field); the detail panel sits below the graph.
+
 ## Known limits
 
 - Edges are **derived** routing, not authored; a node cannot be moved or connected by hand.
 - Changes to the lane registry (`lanes.json`) still need a pipeline restart: lane env is frozen at launch. Only the per-worker **model override**
-  (the existing Workers tab dropdown, `/api/worker-models`) applies on the next tick; the graph only shows it.
+  (the model control of a card or of a node panel, `/api/worker-models`) applies on the next tick.
 - The layout is a simple layered one (longest path, one ordering pass): with 20+ sources the left column is tall and edges cross. It is a first picture,
   not a tuned diagram.
 - Only loops with a lane or a legacy `worker-*` / `reviewer*` instance become nodes; other heartbeat names are ignored.
 
 ## Next phases (not built)
 
-- **Phase B, node options.** Per-node model and local-versus-cloud choice written back through the existing worker-model and lane routes. Not built.
 - **Phase C, `workflow.json`.** An authored workflow file: composable nodes, authored edges, and a `splitNode` operation that atomizes a large-model node
   into smaller ones. Not built.
 - **Phase D, priority follows the graph.** Task priority derived from a task's position in the workflow, behind an off-by-default flag,
