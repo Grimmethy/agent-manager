@@ -416,3 +416,121 @@ test('a sibling listed EARLIER whose file is still missing (no sibling creates i
   assert.equal(result.findings[0].kind, 'missing-file');
   assert.equal(result.findings[0].relPath, 'src/services/callLog.js');
 });
+
+// --- Context-based suppression (2026-11-04, HUB0237 follow-up) -- root-caused live:
+// three sub-tasks blocked with "sub-task premise may be stale: cites `<path>`, but that
+// file does not exist in the repo" where the cited path was EXPECTED TO BE CREATED by
+// the sub-task itself or a sibling. The staleness check treated every missing cited path
+// as a stale premise instead of distinguishing files to be created from files that should
+// already exist. ---
+
+test('sub-task creating a file it cites is not blocked when the file does not yet exist', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: {
+        pieces: [
+          {
+            id: 'self',
+            scopeLines: ['Files: src/carry-piece.js'],
+          },
+        ],
+      },
+      rawText: 'In src/carry-piece.js line 10, implement the core logic.',
+    },
+  };
+  const context = {
+    createdFiles: new Set(['src/carry-piece.js']),
+    siblingCreatedFiles: new Set(),
+  };
+  const result = detectStaleDecomposePremise(task, { repoRoot: '/r', lineCountFn: () => null, context });
+  assert.ok(result, 'must return a result (with suppressions)');
+  assert.equal(result.stale, false, 'must not be stale -- this task creates the file');
+  assert.ok(result.suppressions.length > 0, 'must record the suppression');
+  assert.equal(result.suppressions[0].reason, 'context-created-self');
+  assert.equal(result.suppressions[0].source, 'decompose-context');
+});
+
+test('sub-task citing a sibling-created file is not blocked while sibling is pending', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: {
+        pieces: [
+          {
+            id: 'sibling-1',
+            scopeLines: ['Files: lib/gpu-broker-url.js'],
+          },
+        ],
+      },
+      rawText: 'In lib/gpu-broker-url.js line 10, refactor the broker URL.',
+    },
+  };
+  const context = {
+    createdFiles: new Set(),
+    siblingCreatedFiles: new Set(['lib/gpu-broker-url.js']),
+  };
+  const result = detectStaleDecomposePremise(task, { repoRoot: '/r', lineCountFn: () => null, context });
+  assert.ok(result, 'must return a result (with suppressions)');
+  assert.equal(result.stale, false, 'must not be stale -- sibling creates the file');
+  assert.ok(result.suppressions.length > 0, 'must record the suppression');
+  assert.equal(result.suppressions[0].reason, 'context-created-sibling');
+  assert.equal(result.suppressions[0].source, 'decompose-context');
+});
+
+test('sub-task citing a truly missing pre-existing file is still blocked', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: {
+        pieces: [
+          {
+            id: 'self',
+            scopeLines: ['Files: src/other-thing.js'],
+          },
+        ],
+      },
+      rawText: 'In docs/projects.json.md line 10, update the docs.',
+    },
+  };
+  const context = {
+    createdFiles: new Set(['src/other-thing.js']), // this task creates a DIFFERENT file
+    siblingCreatedFiles: new Set(),
+  };
+  const result = detectStaleDecomposePremise(task, { repoRoot: '/r', lineCountFn: () => null, context });
+  assert.ok(result, 'must detect the stale premise');
+  assert.equal(result.stale, true, 'must be stale -- the cited file is truly missing');
+  assert.equal(result.findings[0].kind, 'missing-file');
+  assert.equal(result.findings[0].relPath, 'docs/projects.json.md');
+  assert.ok(result.reason.includes('not recorded as files to be created'), 'error message must distinguish cases');
+});
+
+test('error message distinguishes missing to-be-created paths from missing pre-existing paths', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: {
+        pieces: [
+          {
+            id: 'self',
+            scopeLines: ['Files: src/other-thing.js'],
+          },
+        ],
+      },
+      rawText: 'In docs/projects.json.md line 10, update the docs.',
+    },
+  };
+  const context = {
+    createdFiles: new Set(['src/other-thing.js']),
+    siblingCreatedFiles: new Set(),
+  };
+  const result = detectStaleDecomposePremise(task, { repoRoot: '/r', lineCountFn: () => null, context });
+  assert.ok(result);
+  assert.equal(result.stale, true);
+  // The reason must mention that the file is not recorded as files to be created
+  assert.ok(
+    result.reason.includes('not recorded as files to be created'),
+    `error message must distinguish cases, got: ${result.reason}`,
+  );
+  // The reason must NOT say "expected to be created" for a truly stale case
+  assert.ok(
+    !result.reason.includes('expected to be created'),
+    `error message must not claim "expected to be created" for a truly stale case, got: ${result.reason}`,
+  );
+});
