@@ -109,11 +109,13 @@ Baseline, 150 s sample, the owner's box: `sdb` 100% busy with ~4,600 write IOPS 
 - A hub's piece list is fixed at decomposition, so a corrective piece cannot yet be gated on (tracked as
   its own task); until then a follow-up piece needs a hold on the hub's branch card.
 
+## S1 status (2026-11-03)
+
+The queue-events journal is built (hub HUB0330): `src/queue-events.js` (the journal), `python/dashboard/queue_events.py` (its Python writer), the two producers in the dashboard (`record_verdict` emits `verdict_recorded`, the merge route emits `branch_merged`) and three sweeps converted to read it instead of rescanning `queue/done` on every tick: `src/redo-supersede-sweep.js`, `src/branch-defect-readmit-sweep.js` and `src/branch-conflict-readmit-sweep.js`. Each keeps a slow, counted reconcile pass; the count is shown as `queueEvents` in `/api/summary`. `scripts/sweep-idle-cost.js` measures one idle pass of each sweep with the journal on and off. How to use and extend it: `docs/agents/queue-events.md`.
+
 ## Open questions
 
-- Where the journal lives: tmpfs (`/dev/shm`, lost on reboot, healed by reconcile) or a file under
-  `queue/` (durable, on the HDD).
-- Wake primitive for bash lanes: a small node waiter on `fs.watch` or a sequence counter; `inotifywait`
-  is not installed here.
-- How python and bash writers emit (one shared helper, or a thin CLI).
-- Whether the dashboard should push (server-sent events) instead of polling `/api/summary` every 5 s.
+- ~~Where the journal lives.~~ Answered by S1: a durable file under the pipeline directory but OUTSIDE `queue/` (`<pipelineDir>/queue-events/journal.jsonl`). Durable because a lost journal would only be healed by the slow reconcile, and outside `queue/` because appending to it must not move the queue directory mtimes that `src/pool-projects.js` and `src/queue-cache.js` read.
+- ~~Wake primitive for bash lanes.~~ Answered by `src/wait-for-change.js`: a small node waiter on `fs.watch` with a fallback timeout (`inotifywait` is not installed here).
+- ~~How python and bash writers emit.~~ Answered by S1: one line format, two writers. Node and bash use the CLI `node src/queue-events.js emit ...`; Python uses `append_event` in `python/dashboard/queue_events.py`. A committed test has Python write and the real Node module read.
+- Whether the dashboard should push (server-sent events) instead of polling `/api/summary` every 5 s. Still open.
