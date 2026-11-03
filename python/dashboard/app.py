@@ -3208,6 +3208,7 @@ from routes.shared_misc import shared_misc_bp  # noqa: E402
 from routes.cloud_meter import cloud_meter_bp  # noqa: E402
 from routes.stalled_worker import stalled_worker_bp  # noqa: E402
 from routes.verifier_worker import verifier_worker_bp  # noqa: E402
+from routes.needswork_worker import needswork_worker_bp  # noqa: E402
 
 app.register_blueprint(reports_bp)
 app.register_blueprint(concepts_bp)
@@ -3237,6 +3238,7 @@ app.register_blueprint(plugins_bp)
 app.register_blueprint(cloud_meter_bp)
 app.register_blueprint(stalled_worker_bp)
 app.register_blueprint(verifier_worker_bp)
+app.register_blueprint(needswork_worker_bp)
 app.register_blueprint(task_bp)
 app.register_blueprint(shared_misc_bp)
 

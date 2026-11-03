@@ -38,21 +38,49 @@ def _gather(name, fetch, default, warnings):
         return default
 
 
-def assemble_graph(run_lanes, get_instances, get_topology, get_models, run_builder):
-    """Collect the four inputs through the injected callables and run the builder on them.
-    Returns the builder's graph (with one extra warning per failed input), or
+def _checked_workflow(value):
+    """The output of `node src/workflow-config.js`: { config: {...}, warnings: [...] }."""
+    if not isinstance(value, dict) or not isinstance(value.get("config"), dict):
+        raise ValueError("unexpected output (expected {config, warnings})")
+    return value
+
+
+def _checked_scripts(value):
+    """The `scripts` list of `node src/plugin-watchdog-scripts.js --json`."""
+    if not isinstance(value, list):
+        raise ValueError("unexpected output (expected a list)")
+    return value
+
+
+def assemble_graph(run_lanes, get_instances, get_topology, get_models, run_builder, get_workflow=None, get_watchdog_scripts=None):
+    """Collect the inputs through the injected callables and run the builder on them.
+    The four required inputs are lanes, instances, topology and models. Two more are optional (None = not asked for): get_workflow returns the
+    output of the workflow file loader ({config, warnings}) and goes to the builder as `workflow`; get_watchdog_scripts returns the list of watchdog
+    scripts and goes to the builder as `watchdogScripts`. A failing or malformed input only adds a warning naming it and its key is left out of the payload.
+    Returns the builder's graph (with one extra warning per failed input and the workflow file's own warnings), or
     {"available": False, "reason": ...} when the builder itself fails."""
     warnings = []
     lanes = _gather("lanes", run_lanes, [], warnings)
     instances = _gather("instances", get_instances, [], warnings)
     topology = _gather("topology", get_topology, [], warnings)
     models = _gather("models", get_models, {}, warnings)
+    payload = {"lanes": lanes, "instances": instances, "topology": topology, "models": models}
+    config_warnings = []
+    if get_workflow is not None:
+        workflow = _gather("workflow", lambda: _checked_workflow(get_workflow()), None, warnings)
+        if workflow is not None:
+            payload["workflow"] = workflow["config"]
+            config_warnings = [str(w) for w in (workflow.get("warnings") or [])]
+    if get_watchdog_scripts is not None:
+        scripts = _gather("watchdogScripts", lambda: _checked_scripts(get_watchdog_scripts()), None, warnings)
+        if scripts is not None:
+            payload["watchdogScripts"] = scripts
     try:
-        graph = run_builder({"lanes": lanes, "instances": instances, "topology": topology, "models": models})
+        graph = run_builder(payload)
     except Exception as exc:  # noqa: BLE001
         return {"available": False, "reason": (str(exc) or type(exc).__name__)[:300]}
-    if warnings and isinstance(graph, dict):
-        graph["warnings"] = list(graph.get("warnings") or []) + warnings
+    if (warnings or config_warnings) and isinstance(graph, dict):
+        graph["warnings"] = list(graph.get("warnings") or []) + warnings + config_warnings
     return graph
 
 
@@ -91,4 +119,6 @@ def api_workflow_graph():
         get_topology=get_topology,
         get_models=lambda: _json_of(api_worker_models()),
         run_builder=lambda payload: _run_node("workflow-graph.js", ["--stdin"], child_env, json.dumps(payload)),
+        get_workflow=lambda: _run_node("workflow-config.js", [], child_env),
+        get_watchdog_scripts=lambda: _run_node("plugin-watchdog-scripts.js", ["--json"], child_env).get("scripts"),
     ))
