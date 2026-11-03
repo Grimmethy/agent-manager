@@ -100,7 +100,7 @@ test('a verdict for an older commit is stale: reported, never requeued', async (
   assert.equal(s.stale.length, 1); assert.equal(s.requeued.length, 0); assert.equal(calls.length, 0);
 });
 
-test('only a chat or manual needs-work verdict that is not main-moved counts', async () => {
+test('only a chat, manual or worker needs-work verdict that is not main-moved counts', async () => {
   for (const pv of [{ source: 'deterministic' }, { source: 'sweep' }, { kind: 'main-moved' }, { verdict: 'discard' }, { reasons: [] }]) {
     const w = makeWorld();
     w.commitOnBranch('agent/t1', 'a.txt', 'x\n');
@@ -111,6 +111,7 @@ test('only a chat or manual needs-work verdict that is not main-moved counts', a
     assert.equal(s.checked, 0, JSON.stringify(pv)); assert.equal(calls.length, 0);
   }
   assert.equal(defectVerdict({ promptContext: { priorVerdict: verdict('abc', { source: 'manual' }) } }).source, 'manual');
+  assert.equal(defectVerdict({ promptContext: { priorVerdict: verdict('abc', { source: 'worker' }) } }).source, 'worker');
   assert.equal(defectVerdict({ promptContext: { priorVerdict: verdict('') } }), null);
 });
 
@@ -261,4 +262,24 @@ test('the mode comes from AGENT_MANAGER_DEFECT_READMIT and defaults to dry-run',
   } finally {
     if (saved === undefined) delete process.env.AGENT_MANAGER_DEFECT_READMIT; else process.env.AGENT_MANAGER_DEFECT_READMIT = saved;
   }
+});
+
+test('a worker needs-work verdict is observed, settled and requeued once; a second one on the new head is exhausted', async () => {
+  const w = makeWorld();
+  w.commitOnBranch('agent/t1', 'a.txt', 'one\nTWO\nthree\n');
+  putTask(w.pipelineDir, 't1', 'agent/t1', verdict(w.head('agent/t1'), { source: 'worker', reasons: ['automated check: the branch changes code (a.txt) but touches no test'] }));
+  const { calls, requeue } = recorder();
+  const t0 = Date.now();
+  const first = await run(w, t0, { requeue });
+  assert.equal(first.observed.length, 1); assert.equal(first.requeued.length, 0);
+  const second = await run(w, t0 + SETTLE_MS + 1000, { requeue });
+  assert.equal(second.requeued.length, 1); assert.equal(calls.length, 1);
+  assert.equal(countReadmits(readTask(w.pipelineDir, 't1')), 1);
+  // the redrafted branch comes back needs-work from the worker on its new head: left in place, reported exhausted
+  w.commitOnBranch('agent/t1', 'a.txt', 'one\nTHREE\nthree\n');
+  const t = readTask(w.pipelineDir, 't1');
+  t.promptContext.priorVerdict = verdict(w.head('agent/t1'), { source: 'worker' });
+  fs.writeFileSync(path.join(w.pipelineDir, 'queue', 'done', 't1.json'), JSON.stringify(t, null, 2));
+  const third = await run(w, t0 + 2 * SETTLE_MS + 5000, { requeue });
+  assert.equal(third.exhausted.length, 1); assert.equal(third.requeued.length, 0); assert.equal(calls.length, 1);
 });
