@@ -29,4 +29,46 @@ function flatPriorityOrder(topology) {
   }
 }
 
-module.exports = { flatPriorityOrder };
+// The authored group order next to the flat order (phase E). graph = the workflow graph (nodes with `parent`, groups in the order of the workflow file), flatOrder = flatPriorityOrder(topology).
+// Returns [{ name, flatRank, graphRank, group }] for every usable entry of flatOrder, in flatOrder's order. `group` is the id of the OUTERMOST group of the node `source:<name>` (start at node.parent; while another
+// group lists that group as a child go up, a cycle stops the walk; a parent that is not a group counts as none) or null. graphRank is the competition rank when all entries are sorted by
+// (index of the group in graph.groups, flat priority), ungrouped last. [] when no entry is in a group or the input is not usable. Pure; it changes no claim order and nothing reads it for one.
+function groupPriorityOrder(graph, flatOrder) {
+  try {
+    if (!Array.isArray(flatOrder)) return [];
+    const groups = graph.groups;
+    const index = Object.create(null);
+    groups.forEach((g, i) => { if (g && typeof g.id === 'string' && !(g.id in index)) index[g.id] = i; });
+    const up = Object.create(null);
+    groups.forEach((g) => {
+      if (!g || typeof g.id !== 'string' || !Array.isArray(g.children)) return;
+      g.children.forEach((c) => { if (typeof c === 'string' && !(c in up)) up[c] = g.id; });
+    });
+    const parentOf = Object.create(null);
+    graph.nodes.forEach((n) => { if (n && typeof n.id === 'string' && !(n.id in parentOf)) parentOf[n.id] = n.parent; });
+    const outermost = (name) => {
+      let g = parentOf['source:' + name];
+      g = typeof g === 'string' && g in index ? g : null;
+      const seen = Object.create(null);
+      while (g !== null && g in up && !seen[g]) { seen[g] = true; g = up[g]; }
+      return g;
+    };
+    const entries = [];
+    for (const e of flatOrder) {
+      if (!e || typeof e.name !== 'string' || !Number.isFinite(e.priority) || !Number.isFinite(e.rank)) continue;
+      const group = outermost(e.name);
+      entries.push({ name: e.name, flatRank: e.rank, priority: e.priority, group, order: group === null ? Infinity : index[group] });
+    }
+    if (!entries.some((e) => e.group !== null)) return [];
+    return entries.map((e) => ({
+      name: e.name,
+      flatRank: e.flatRank,
+      graphRank: 1 + entries.filter((o) => o.order < e.order || (o.order === e.order && o.priority < e.priority)).length,
+      group: e.group,
+    }));
+  } catch (err) {
+    return [];
+  }
+}
+
+module.exports = { flatPriorityOrder, groupPriorityOrder };
