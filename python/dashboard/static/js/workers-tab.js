@@ -1,36 +1,6 @@
 // Workers tab: the per-instance cards, recent-task and run-log lists, the completed-tasks section and the stale-heartbeat timers. Moved verbatim out of core-ui.js (2026-10-01); a plain global <script>, loaded by index.html right after core-ui.js and before the inline script that schedules updateStaleTimers.
 // No require()/module.exports: the browser loads this with a plain <script src> tag, so every name below is a shared global.
 
-function fmtAge(sec) {
-  if (sec == null) return '?';
-  if (sec < 60) return sec + 's';
-  if (sec < 3600) return Math.round(sec / 60) + 'm';
-  return Math.round(sec / 3600) + 'h';
-}
-
-function statusBadgeClass(status, stale) {
-  if (stale) return 'bad';
-  if (status === 'offline') return 'idle';
-  if (status === 'working' || status === 'checking') return 'ok';
-  if (status === 'idle') return 'idle';
-  // 'queued' (2026-08-19): a claimed task waiting its turn behind another lane at the
-  // single-flight lock (agent-manager-common.sh's acquire_single_flight_lock) -- amber,
-  // same as the generic 'warn' fallback below, but named explicitly so it reads as a
-  // deliberate third state (green=actively running, amber=waiting its turn, gray=idle)
-  // rather than falling through by accident.
-  if (status === 'queued') return 'warn';
-  // 'paused' / 'warming' (B3): the lane is yielding to a GPU session, or reloading its model after one. Amber like 'queued': deliberate, not broken.
-  if (status === 'paused' || status === 'warming') return 'warn';
-  return 'warn';
-}
-
-// What the badge says. Most statuses are shown as they are; the two GPU-session states say why in words.
-function statusLabel(status) {
-  if (status === 'paused') return 'paused: GPU session';
-  if (status === 'warming') return 'resuming: model warming';
-  return status;
-}
-
 function modelKindForInstance(inst) {
   if (inst.instanceId === 'watchdog') return null;
   return 'ollama'; // every lane runs a local model (lanes are one per GPU)
@@ -241,6 +211,7 @@ async function refreshNewestCompletedTasks() {
 // selects, i.e. the operator is actively mid-choice. The next 5s tick tries again.
 async function renderWorkers(isPoll) {
   const isStale = renderStaleCheck();
+  if (typeof workersViewMode === 'function' && workersViewMode() === 'graph') { await renderGraphView(document.getElementById('main'), isPoll); return; }
   if (isPoll) {
     const active = document.activeElement;
     if (active && (active.classList.contains('worker-type-select') || active.classList.contains('worker-task-select'))) {
@@ -320,7 +291,7 @@ async function renderWorkers(isPoll) {
   });
   const filterBar = `
     <div class="worker-filter-bar" style="margin-bottom:12px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px">
-      <div></div>
+      ${typeof workersViewToggleHtml === 'function' ? workersViewToggleHtml('cards') : '<div></div>'}
       <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
         <input type="checkbox" id="claude-pause-toggle" style="margin:0" ${workerModels.claudePaused ? 'checked' : ''}>
         Pause Claude (preserve subscription tokens)
@@ -493,6 +464,7 @@ async function renderWorkers(isPoll) {
   main.querySelectorAll('[data-open-task-anywhere]').forEach((link) => {
     link.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openTaskAnywhere(link.dataset.openTaskAnywhere); };
   });
+  if (typeof wireWorkersViewToggle === 'function') wireWorkersViewToggle(main);
   updateStaleTimers();
 }
 
