@@ -182,6 +182,10 @@
   .wf-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 8px 0; font-size: 12px; }
   .wf-facts dt { color: var(--muted); }
   .wf-facts dd { margin: 0; overflow-wrap: anywhere; }
+  .wf-controls { margin: 8px 0; }
+  .wf-control-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .wf-control-row .worker-model-select, .wf-control-row .worker-model-fixed { margin: 0; }
+  .wf-apply-note { margin: 0 0 8px; }
   .wf-warnings { margin: 8px 0 0; padding-left: 16px; font-size: 12px; color: var(--muted); }
   .recent-tasks-list { list-style: none; padding: 0; margin: 8px 0 0; }
   .recent-tasks-list li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-top: 1px solid var(--border); }
@@ -415,6 +419,7 @@
 <script src="/static/js/workers-tab.js"></script>
 <script src="/static/js/worker-switch-ui.js"></script>
 <script src="/static/js/workflow-layout.js"></script>
+<script src="/static/js/workflow-node-panel.js"></script>
 <script src="/static/js/workflow-graph-view.js"></script>
 <script src="/static/js/cloud-spend-panel.js"></script>
 <script src="/static/js/stalled-worker-panel.js"></script>

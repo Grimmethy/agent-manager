@@ -101,8 +101,8 @@ function wfRow(label, value) {
   return '<dt>' + wfEsc(label) + '</dt><dd>' + wfEsc(value === undefined || value === null || value === '' ? '-' : value) + '</dd>';
 }
 
-// Read-only side panel for the selected node. warnings = the graph's warnings array.
-function buildDetailHtml(node, warnings) {
+// Side panel for the selected node: the facts, with optional extra controls (extraHtml, from workflow-node-panel.js) under the title. warnings = the graph's warnings array.
+function buildDetailHtml(node, warnings, extraHtml) {
   if (!node) return '';
   const rows = [wfRow('Node', node.id), wfRow('Kind', node.kind)];
   const rt = node.runtime;
@@ -120,7 +120,7 @@ function buildDetailHtml(node, warnings) {
   }
   if (node.counts) rows.push(wfRow('Pending', node.counts.pending), wfRow('Drafting', node.counts.drafting));
   const warn = (warnings || []).length ? '<ul class="wf-warnings">' + warnings.map((w) => '<li>' + wfEsc(w) + '</li>').join('') + '</ul>' : '';
-  return '<div class="wf-detail" id="wf-detail"><div class="row"><span class="id">' + wfEsc(node.label || node.id) + '</span></div>'
+  return '<div class="wf-detail" id="wf-detail"><div class="row"><span class="id">' + wfEsc(node.label || node.id) + '</span></div>' + (extraHtml || '')
     + '<dl class="wf-facts">' + rows.join('') + '</dl>' + warn
     + (rt && node.kind === 'loop' ? '<div class="meta">Recent runs</div><div id="wf-runlog" class="wf-runlog"></div>' : '') + '</div>';
 }
@@ -141,7 +141,7 @@ function buildGraphHtml(graph, layout, state) {
     + '<div class="wf-surface" id="wf-surface"><div class="wf-canvas" style="width:' + wfEsc(lay.width) + 'px;height:' + wfEsc(lay.height) + 'px">'
     + '<svg class="wf-edges" width="' + wfEsc(lay.width) + '" height="' + wfEsc(lay.height) + '" aria-hidden="true"><defs><marker id="wf-arrow" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="8" markerHeight="8" orient="auto">'
     + '<path d="M0 0 L8 4 L0 8 z" class="wf-arrowhead"/></marker></defs>' + paths + '</svg>' + nodes + '</div></div>'
-    + (selected ? buildDetailHtml(selected, g.warnings) : '');
+    + (selected ? ((typeof buildNodePanelHtml === 'function' && buildNodePanelHtml(selected, g.warnings)) || buildDetailHtml(selected, g.warnings)) : '');
 }
 
 // What the poll compares: ids and the values the cards show. stateAgeSeconds is left out on purpose, it changes every poll.
@@ -150,7 +150,7 @@ function graphSignature(graph) {
   return JSON.stringify([nodes.map((n) => {
     const r = n.runtime || {};
     const c = n.counts || {};
-    return [n.id, r.status, r.stale, r.disabled, r.currentTaskId, r.currentPass, c.pending, c.drafting, n.model && n.model.name];
+    return [n.id, r.status, r.stale, r.disabled, r.currentTaskId, r.currentPass, c.pending, c.drafting, n.model && n.model.name, n.model && n.model.overridden];
   }), ((graph && graph.edges) || []).map((e) => e.id), (graph && graph.warnings) || []]);
 }
 
@@ -176,6 +176,7 @@ function wfDraw(main) {
   if (surface && scroll) { surface.scrollLeft = scroll.left; surface.scrollTop = scroll.top; }
   wireWorkersViewToggle(main);
   wireWorkerSwitchButtons(main);
+  if (typeof wireNodePanel === 'function') wireNodePanel(main, {});
   main.querySelectorAll('.wf-node').forEach((el) => {
     el.onclick = () => {
       wfState.selectedId = wfState.selectedId === el.dataset.nodeId ? null : el.dataset.nodeId;
@@ -191,12 +192,16 @@ function wfDraw(main) {
 }
 
 async function renderGraphView(main, isPoll) {
+  // Like the Cards view: a poll must not redraw while the operator is choosing in a model dropdown.
+  if (isPoll && typeof document !== 'undefined' && document.activeElement && document.activeElement.classList && document.activeElement.classList.contains('worker-model-select')) return;
   const isStale = renderStaleCheck();
   let graph = null;
   let reason = '';
   try { graph = await fetchJson('/api/workflow-graph'); } catch (e) { reason = e && e.message ? e.message : 'request failed'; }
   if (isStale()) return;
   if (!graph || graph.available === false || !Array.isArray(graph.nodes)) {
+    // A poll that fails (a slow route under load) keeps the graph that is already drawn, so the selection, the open panel and a dropdown survive; only a first or explicit render shows the message.
+    if (isPoll && main.querySelector('#wf-surface')) return;
     wfState.signature = null;
     main.innerHTML = wfMessageHtml('The workflow graph is unavailable' + (graph && graph.reason ? ': ' + graph.reason : reason ? ': ' + reason : '') + '.');
     wireWorkersViewToggle(main);
