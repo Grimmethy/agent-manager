@@ -528,23 +528,7 @@ borrow_from_pool() {
   return 0
 }
 
-# Idle wait (ADR-0024 stage S3): instead of sleeping ORC_TICK_SECS and re-checking, block until an entry is ADDED to a queue/pending or queue/adhoc directory of this
-# project or any registered project (src/wait-for-change.js), or AGENT_MANAGER_WAKE_FALLBACK_SECS (default 120) pass -- the safety net. Never ticks again sooner than
-# AGENT_MANAGER_WAKE_MIN_GAP_SECS (default 10) after the previous tick started, so a busy queue cannot make an idle lane tick MORE often than before.
-# AGENT_MANAGER_LANE_WAKE=off (or a failing waiter) restores the plain sleep. Sets LAST_WAKE for the reconcile counter in end_of_tick_pause.
-wait_for_queue_change() {
-  local fallback="${AGENT_MANAGER_WAKE_FALLBACK_SECS:-120}" min_gap="${AGENT_MANAGER_WAKE_MIN_GAP_SECS:-10}" out reason now elapsed
-  LAST_WAKE=sleep
-  if [[ "${AGENT_MANAGER_LANE_WAKE:-on}" == "off" ]] || "$ONCE"; then sleep "${ORC_TICK_SECS:-60}"; return; fi
-  if out="$(node "${PACKAGE_SRC_DIR}/wait-for-change.js" --timeout "$fallback" --since "$LAST_TICK_START_MS" --pool-queues "$QUEUE_DIR" 2>>"$LOG_FILE")"; then
-    reason="${out%% *}"
-    case "$reason" in event|catchup|timeout|sleep) LAST_WAKE="$reason" ;; *) LAST_WAKE=sleep ;; esac
-  else
-    sleep "${ORC_TICK_SECS:-60}"; return
-  fi
-  now="$(date +%s)"; elapsed=$(( now - LAST_TICK_START ))
-  if [[ "$min_gap" =~ ^[0-9]+$ ]] && (( elapsed < min_gap )); then sleep $(( min_gap - elapsed )); fi
-}
+source "${SCRIPT_DIR}/wake-common.sh"                                        # wait_for_queue_change (the idle wait; ADR-0024 S3), shared with review-runner.sh and apply-loop.sh
 
 # The pause at the end of a tick, shared by the normal tick and a tick that ended on a premium borrow (it reads did_work and
 # TICK_HAD_INFRA_FAILURE and maintains CONSECUTIVE_INFRA_FAILURES, exactly as when it was inline at the bottom of the loop).
