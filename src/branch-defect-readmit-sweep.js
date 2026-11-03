@@ -25,12 +25,20 @@
 //     already re-admitted once and is needs-work again is left in place and reported as `exhausted`.
 //
 // AGENT_MANAGER_DEFECT_READMIT=off|dry-run|on (default dry-run: records what it saw in the state file and the summary, changes no task and no branch).
+//
+// ADR-0024 (queue-events journal, HUB0330): the sweep no longer lists and parses all of queue/done on every watchdog tick. It drains the journal and examines only the tasks a
+// `verdict_recorded` event names (branch agent/<id> -> done/<id>.json) plus the tasks whose first sighting is still awaiting its second look (the SETTLE rule below needs
+// no new event). The FULL scan (the old behaviour) runs on the first run and every AGENT_MANAGER_EVENTS_RECONCILE_SECS (default 1800); a defect verdict that reconcile scan newly
+// observes and no event named is counted with recordCorrection (a producer forgot to emit; the first run is the catch-up and counts nothing). An idle run makes no git call, no fetch and no directory listing. The dashboard stamps priorVerdict on the
+// task just AFTER it records the verdict, so an event younger than STAMP_GRACE_MS whose task has no defect verdict yet keeps the journal position where it is and is read again.
+// AGENT_MANAGER_QUEUE_EVENTS=off restores the old full scan on every run exactly.
 // CLI: node branch-defect-readmit-sweep.js [--dry-run]
 
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { liveSiblingsOnBranch } = require('./lib/shared-branch.js');
+const { liveSiblingsOnBranch, buildQueueSnapshot } = require('./lib/shared-branch.js');
+const queueEvents = require('./queue-events.js');
 const { requeueBlockedTask } = require('./chat-task-requeue.js');
 const { appliedBranch, eligibleTask, SETTLE_MS } = require('./branch-conflict-readmit-sweep.js');
 
@@ -38,13 +46,22 @@ const MAX_READMITS = 1;
 const REASON_CHARS = 160;
 const STATE_FILE = 'branch-defect-readmit-state.json';
 const READMIT_STAGE = 'defect-readmit';
+const CONSUMER = 'defect-readmit';
+const STAMP_GRACE_MS = 2 * 60 * 1000;
+const journalOn = (env) => String(env.AGENT_MANAGER_QUEUE_EVENTS || 'on').toLowerCase() !== 'off';
+function reconcileMs(env) {
+  const n = Number(env.AGENT_MANAGER_EVENTS_RECONCILE_SECS);
+  return Number.isFinite(n) && n >= 0 ? n * 1000 : 30 * 60 * 1000;
+}
+const scanStatePath = (pipelineDir) => path.join(pipelineDir, 'queue-events', 'defect-readmit.scan.json');
+const taskIdOfBranch = (branch) => String(branch || '').replace(/^agent\//, '');
 
 function mode() {
   const v = String(process.env.AGENT_MANAGER_DEFECT_READMIT || 'dry-run').toLowerCase();
   return v === 'off' || v === 'false' || v === '0' ? 'off' : v === 'on' || v === 'true' || v === '1' ? 'on' : 'dry-run';
 }
 
-function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
+function readJson(p, fsImpl = fs) { try { return JSON.parse(fsImpl.readFileSync(p, 'utf8')); } catch { return null; } }
 function writeJson(p, data) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const tmp = `${p}.tmp`;
@@ -77,30 +94,75 @@ function countReadmits(task) {
 // { pipelineDir, repoRoot, mainBranch?, now?, dryRun?, git?, requeue?, fetch?, modeOverride? } -> Promise<summary>
 async function sweepBranchDefects({
   pipelineDir, repoRoot, mainBranch = 'main', now = Date.now(), dryRun = false,
-  git = defaultGit, requeue = requeueBlockedTask, fetch = true, modeOverride = null,
+  git = defaultGit, requeue = requeueBlockedTask, fetch = true, modeOverride = null, env = process.env, fsImpl = fs,
 } = {}) {
-  const summary = { mode: modeOverride || mode(), checked: 0, observed: [], settling: [], stale: [], requeued: [], exhausted: [], errors: 0 };
+  const summary = { mode: modeOverride || mode(), checked: 0, observed: [], settling: [], stale: [], requeued: [], exhausted: [], errors: 0, journal: { events: journalOn(env), fullScan: false, eventRun: false, idle: false, corrections: 0 } };
   if (summary.mode === 'off' || !pipelineDir || !repoRoot) return summary;
   const live = summary.mode === 'on' && !dryRun;
   const queueDir = path.join(pipelineDir, 'queue');
   const nowIso = new Date(now).toISOString();
-  if (fetch) git(repoRoot, ['fetch', '-q', 'origin']);
 
   const statePath = path.join(queueDir, STATE_FILE);
-  const state = readJson(statePath) || {};
-  const nextState = {};
-
+  const state = readJson(statePath, fsImpl) || {};
   const doneDir = path.join(queueDir, 'done');
-  let names = [];
+  const listDone = () => { try { return fsImpl.readdirSync(doneDir).filter((f) => f.endsWith('.json')); } catch { return []; } };
+
+  // ---- which done/ files to examine this run ----
+  let names;
+  const nextState = {};                                    // rebuilt every run, as before: every pending sighting is examined each run, so none needs carrying over
+  let drained = null;
+  let fullScan = true;
+  let reconcile = false;
+  const announced = new Set();
+  const eventAt = new Map();
+  if (!summary.journal.events) {
+    names = listDone();
+  } else {
+    drained = queueEvents.drain(pipelineDir, CONSUMER, { fs: fsImpl });
+    let scan = null;
+    try { scan = JSON.parse(fsImpl.readFileSync(scanStatePath(pipelineDir), 'utf8')); } catch { scan = null; }
+    fullScan = !scan || !Number.isFinite(scan.at) || now - scan.at >= reconcileMs(env);
+    reconcile = fullScan && !!scan;
+    for (const e of drained.events) {
+      if (e.type !== 'verdict_recorded' || !e.branch) continue;
+      const id = taskIdOfBranch(e.branch);
+      announced.add(id);
+      eventAt.set(id, e.at);
+    }
+    if (fullScan) {
+      names = listDone();
+    } else {
+      const pending = new Set(Object.values(state).map((x) => x && x.taskId).filter(Boolean));
+      const wanted = new Set([...announced, ...pending]);
+      names = [...wanted].map((id) => `${id}.json`).filter((n) => fsImpl.existsSync(path.join(doneDir, n)));
+    }
+    summary.journal.fullScan = fullScan;
+    summary.journal.eventRun = !fullScan && names.length > 0;
+    if (!fullScan && !names.length) {
+      summary.journal.idle = drained.events.length === 0;
+      drained.commit();                                    // events that name no examinable task are consumed; nothing else to do, no fetch, no git
+      return summary;
+    }
+  }
+
+  if (fetch) git(repoRoot, ['fetch', '-q', 'origin']);
+
   let superseded = 0;
-  try { names = fs.readdirSync(doneDir).filter((f) => f.endsWith('.json')); } catch { names = []; }
+  let holdCommit = false;
+  let snapshot = null;
+  const getSnapshot = () => (snapshot || (snapshot = buildQueueSnapshot(pipelineDir)));
+  const missedEvents = [];                                // verdicts the reconcile scan newly found that no event announced
 
   for (const name of names) {
     const filePath = path.join(doneDir, name);
-    const task = readJson(filePath);
+    const task = readJson(filePath, fsImpl);
     if (!eligibleTask(task, { allowHumanPrioritised: true })) continue;   // the trigger is a human verdict (defectVerdict below)
     const pv = defectVerdict(task);
-    if (!pv) continue;
+    if (!pv) {
+      const at = eventAt.get(name.replace(/\.json$/, ''));
+      if (at && now - Date.parse(at) < STAMP_GRACE_MS) holdCommit = true;   // the dashboard stamps priorVerdict just after it records the verdict: read this event again
+      continue;
+    }
     const branch = appliedBranch(task);
     if (!branch) continue;
     try {
@@ -109,7 +171,7 @@ async function sweepBranchDefects({
       const sha = String(head.out).trim();
       const ahead = git(repoRoot, ['rev-list', '--count', `origin/${mainBranch}..origin/${branch}`]);
       if (ahead.code !== 0 || !(parseInt(ahead.out, 10) > 0)) continue;   // merged or empty
-      const shared = liveSiblingsOnBranch({ pipelineDir, branch, selfId: task.id });
+      const shared = liveSiblingsOnBranch({ pipelineDir, branch, selfId: task.id, ...(summary.journal.events ? { snapshot: getSnapshot() } : {}) });
       if (shared.error || shared.siblings.length) continue;
 
       summary.checked += 1;
@@ -120,7 +182,11 @@ async function sweepBranchDefects({
       const same = prev && prev.sha === sha && prev.verdictAt === pv.at;
       const firstSeenAt = same ? prev.firstSeenAt : nowIso;
       nextState[branch] = { sha, verdictAt: pv.at, firstSeenAt, taskId: task.id };
-      if (!same) { summary.observed.push({ id: task.id, branch }); continue; }
+      if (!same) {
+        summary.observed.push({ id: task.id, branch });
+        if (reconcile && !announced.has(task.id)) missedEvents.push(task.id);   // found by the safety-net scan alone: a producer forgot to emit
+        continue;
+      }
       if (now - Date.parse(firstSeenAt) < SETTLE_MS) { summary.settling.push({ id: task.id, branch }); continue; }
 
       const entry = { id: task.id, branch };
@@ -139,6 +205,7 @@ async function sweepBranchDefects({
       delete nextState[branch];
       summary.requeued.push(entry);
       superseded++;
+      snapshot = null;                                       // the requeued task is now a live sibling on its branch: a stale snapshot would hide that
     } catch (e) {
       summary.errors += 1;
       console.error(`[branch-defect-readmit] ${task && task.id || name}: ${e.message}`);
@@ -146,6 +213,17 @@ async function sweepBranchDefects({
   }
 
   writeJson(statePath, nextState);
+  if (drained) {
+    if (missedEvents.length) {
+      try { queueEvents.recordCorrection(pipelineDir, CONSUMER, missedEvents.length, { fs: fsImpl }); summary.journal.corrections = missedEvents.length; } catch { /* the counter is best effort */ }
+    }
+    if (summary.errors === 0 && !holdCommit) {              // unfinished work (an error, an unstamped fresh verdict) keeps the events and the scan pending
+      drained.commit();
+      if (fullScan) {
+        try { fsImpl.mkdirSync(path.dirname(scanStatePath(pipelineDir)), { recursive: true }); fsImpl.writeFileSync(scanStatePath(pipelineDir), JSON.stringify({ at: now })); } catch { /* best effort */ }
+      }
+    }
+  }
   return summary;
 }
 

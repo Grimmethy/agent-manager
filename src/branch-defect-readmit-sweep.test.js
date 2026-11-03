@@ -9,6 +9,7 @@ const { execFileSync } = require('child_process');
 
 const { sweepBranchDefects, defectVerdict, countReadmits, SETTLE_MS, STATE_FILE, READMIT_STAGE } = require('./branch-defect-readmit-sweep.js');
 const { priorVerdictBlock } = require('./lib/prompt-blocks.js');
+const queueEvents = require('./queue-events.js');
 
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -49,6 +50,8 @@ function putTask(pipelineDir, id, branch, pv, extra = {}) {
 const readTask = (pipelineDir, id) => JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'done', `${id}.json`), 'utf8'));
 const readState = (pipelineDir) => JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', STATE_FILE), 'utf8'));
 
+// Two tests below sweep ONE project repeatedly and expect the same report again; under the queue-events journal a clean re-run with nothing new is (correctly) idle, so they run with it off.
+const OFF = { AGENT_MANAGER_QUEUE_EVENTS: 'off' };
 const run = (w, now, extra = {}) => sweepBranchDefects({
   pipelineDir: w.pipelineDir, repoRoot: w.repo, mainBranch: 'main', now, modeOverride: 'on', ...extra,
 });
@@ -96,7 +99,7 @@ test('a verdict for an older commit is stale: reported, never requeued', async (
   assert.notEqual(w.head('agent/t1'), old);
   const { calls, requeue } = recorder();
   const t0 = Date.now();
-  await run(w, t0, { requeue }); const s = await run(w, t0 + SETTLE_MS + 1000, { requeue });
+  await run(w, t0, { requeue, env: OFF }); const s = await run(w, t0 + SETTLE_MS + 1000, { requeue, env: OFF });
   assert.equal(s.stale.length, 1); assert.equal(s.requeued.length, 0); assert.equal(calls.length, 0);
 });
 
@@ -171,7 +174,7 @@ test('a task already re-admitted once is reported exhausted and not requeued aga
   assert.equal(countReadmits(readTask(w.pipelineDir, 't1')), 1);
   const { calls, requeue } = recorder();
   const t0 = Date.now();
-  await run(w, t0, { requeue }); const s = await run(w, t0 + SETTLE_MS + 1000, { requeue });
+  await run(w, t0, { requeue, env: OFF }); const s = await run(w, t0 + SETTLE_MS + 1000, { requeue, env: OFF });
   assert.equal(s.exhausted.length, 1); assert.equal(s.requeued.length, 0); assert.equal(calls.length, 0);
 });
 
@@ -280,6 +283,127 @@ test('a worker needs-work verdict is observed, settled and requeued once; a seco
   const t = readTask(w.pipelineDir, 't1');
   t.promptContext.priorVerdict = verdict(w.head('agent/t1'), { source: 'worker' });
   fs.writeFileSync(path.join(w.pipelineDir, 'queue', 'done', 't1.json'), JSON.stringify(t, null, 2));
+  queueEvents.append(w.pipelineDir, { type: 'verdict_recorded', branch: 'agent/t1', sha: w.head('agent/t1'), verdict: 'needs-work', source: 'worker' });   // the dashboard announces a recorded verdict
   const third = await run(w, t0 + 2 * SETTLE_MS + 5000, { requeue });
   assert.equal(third.exhausted.length, 1); assert.equal(third.requeued.length, 0); assert.equal(calls.length, 1);
+});
+
+
+// ---- ADR-0024: driven by the queue-events journal (HUB0330 piece 5) ----
+function countingFs() {
+  const readdirs = [];
+  const impl = { ...fs, readdirSync: (p, ...rest) => { readdirs.push(String(p)); return fs.readdirSync(p, ...rest); } };
+  return { impl, doneListings: () => readdirs.filter((d) => /queue[\\/]done$/.test(d)).length };
+}
+function gitCounter() {
+  const calls = [];
+  const fn = (repoRoot, args) => {
+    calls.push(args.join(' '));
+    try { return { code: 0, out: execFileSync('git', args, { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }; } catch (e) { return { code: typeof e.status === 'number' ? e.status : 2, out: String(e.stdout || '') }; }
+  };
+  fn.calls = calls;
+  return fn;
+}
+const announce = (w, id, branch = `agent/${id}`) => queueEvents.append(w.pipelineDir, { type: 'verdict_recorded', branch, sha: w.head(branch), verdict: 'needs-work', source: 'chat' });
+function twoTasks() {
+  const w = makeWorld();
+  for (const id of ['t1', 't2']) {
+    w.commitOnBranch(`agent/${id}`, 'a.txt', `one\nTWO-${id}\nthree\n`);
+    putTask(w.pipelineDir, id, `agent/${id}`, verdict(w.head(`agent/${id}`)));
+  }
+  return w;
+}
+
+test('journal mode: the first run scans done/, then an idle run lists nothing and makes no git call at all', async () => {
+  const w = twoTasks();
+  const c = countingFs();
+  const first = await run(w, Date.now(), { fsImpl: c.impl, git: gitCounter() });
+  assert.deepEqual([first.journal.fullScan, first.observed.length], [true, 2]);
+  assert.equal(c.doneListings(), 1);
+  const g = gitCounter();
+  // both first sightings are still waiting for their second look, so this is NOT idle yet: settle them first
+  const settled = await run(w, Date.now() + SETTLE_MS + 1000, { fsImpl: c.impl, git: g, requeue: recorder().requeue });
+  assert.equal(settled.requeued.length, 2);
+  const g2 = gitCounter();
+  const idle = await run(w, Date.now() + 2 * SETTLE_MS, { fsImpl: c.impl, git: g2 });
+  assert.deepEqual([idle.journal.idle, idle.journal.fullScan, idle.checked], [true, false, 0]);
+  assert.equal(c.doneListings(), 1, 'the idle run made ZERO readdirSync calls on done/');
+  assert.deepEqual(g2.calls, [], 'and no git call, so no fetch');
+});
+
+test('journal mode: a verdict_recorded event examines only the task it names', async () => {
+  const w = makeWorld();
+  for (const id of ['t1', 't2']) { w.commitOnBranch(`agent/${id}`, 'a.txt', `one\nTWO-${id}\nthree\n`); putTask(w.pipelineDir, id, `agent/${id}`, null); }
+  const t0 = Date.now();
+  const first = await run(w, t0, {});                                                // full scan: no verdict on either task yet
+  assert.equal(first.observed.length, 0);
+  for (const id of ['t1', 't2']) { const t = readTask(w.pipelineDir, id); t.promptContext.priorVerdict = verdict(w.head(`agent/${id}`)); fs.writeFileSync(path.join(w.pipelineDir, 'queue', 'done', `${id}.json`), JSON.stringify(t)); }
+  announce(w, 't1');                                                                 // only t1 is announced
+  const s = await run(w, t0 + 1000, {});
+  assert.deepEqual([s.journal.eventRun, s.journal.fullScan, s.checked], [true, false, 1]);
+  assert.deepEqual(s.observed.map((o) => o.id), ['t1']);
+});
+
+test('journal mode: a first sighting is re-examined after SETTLE_MS with no new event and then requeued', async () => {
+  const w = defectWorld();
+  const { calls, requeue } = recorder();
+  const t0 = Date.now();
+  const first = await run(w, t0, { requeue });
+  assert.equal(first.observed.length, 1);
+  const early = await run(w, t0 + SETTLE_MS / 2, { requeue });
+  assert.deepEqual([early.settling.length, calls.length], [1, 0], 'still settling, not idle: the pending sighting keeps the sweep looking');
+  const second = await run(w, t0 + SETTLE_MS + 1000, { requeue });
+  assert.deepEqual([second.requeued.length, calls.length], [1, 1]);
+});
+
+test('journal mode: a verdict the reconcile scan finds that no event announced is counted; an announced one and the first run are not', async () => {
+  const t0 = Date.now();
+  // the first run finds a verdict made before the journal existed: that is the catch-up, never a correction
+  const pre = defectWorld();
+  const preFirst = await run(pre, t0, {});
+  assert.deepEqual([preFirst.journal.fullScan, preFirst.observed.length, preFirst.journal.corrections], [true, 1, 0]);
+  // a verdict stamped without any event, found only by the safety-net scan 31 minutes later
+  const w = makeWorld();
+  w.commitOnBranch('agent/t1', 'a.txt', 'one\nTWO\nthree\n');
+  putTask(w.pipelineDir, 't1', 'agent/t1', null);
+  const first = await run(w, t0, {});
+  assert.equal(first.journal.corrections, 0, 'the first run is the catch-up, not a reconcile');
+  const t = readTask(w.pipelineDir, 't1'); t.promptContext.priorVerdict = verdict(w.head('agent/t1')); fs.writeFileSync(path.join(w.pipelineDir, 'queue', 'done', 't1.json'), JSON.stringify(t));
+  const second = await run(w, t0 + 31 * 60 * 1000, {});
+  assert.deepEqual([second.journal.fullScan, second.observed.length, second.journal.corrections], [true, 1, 1]);
+  assert.deepEqual(queueEvents.readCorrections(w.pipelineDir).byConsumer, { 'defect-readmit': 1 });
+  // the same stamp WITH its event is found by the event run, so the reconcile scan later counts nothing
+  const v = makeWorld();
+  v.commitOnBranch('agent/t1', 'a.txt', 'one\nTWO\nthree\n');
+  putTask(v.pipelineDir, 't1', 'agent/t1', null);
+  await run(v, t0, {});
+  const t2 = readTask(v.pipelineDir, 't1'); t2.promptContext.priorVerdict = verdict(v.head('agent/t1')); fs.writeFileSync(path.join(v.pipelineDir, 'queue', 'done', 't1.json'), JSON.stringify(t2));
+  announce(v, 't1');
+  const viaEvent = await run(v, t0 + 1000, {});
+  assert.deepEqual([viaEvent.observed.length, viaEvent.journal.corrections], [1, 0]);
+  const reconcile = await run(v, t0 + 31 * 60 * 1000, {});
+  assert.equal(reconcile.journal.corrections, 0);
+});
+
+test('journal mode: an event for a task whose priorVerdict is not stamped yet is read again, then examined once the stamp lands', async () => {
+  const w = makeWorld();
+  w.commitOnBranch('agent/t1', 'a.txt', 'one\nTWO\nthree\n');
+  putTask(w.pipelineDir, 't1', 'agent/t1', null);                                    // the verdict is recorded, the owning task not stamped yet
+  await run(w, Date.now() - 31 * 60 * 1000, {});                                     // first run: full scan consumes the scan state, nothing to see
+  announce(w, 't1');
+  const early = await run(w, Date.now(), {});
+  assert.equal(early.observed.length, 0);
+  const t = readTask(w.pipelineDir, 't1'); t.promptContext.priorVerdict = verdict(w.head('agent/t1')); fs.writeFileSync(path.join(w.pipelineDir, 'queue', 'done', 't1.json'), JSON.stringify(t));
+  const later = await run(w, Date.now() + 1000, {});
+  assert.equal(later.observed.length, 1, 'the same event was delivered again and now finds the stamp');
+});
+
+test('AGENT_MANAGER_QUEUE_EVENTS=off is the old behaviour: a full listing and a fetch every run, and no journal files', async () => {
+  const w = twoTasks();
+  const c = countingFs();
+  const g = gitCounter();
+  for (let i = 0; i < 3; i++) await run(w, Date.now() + i * 1000, { env: OFF, fsImpl: c.impl, git: g });
+  assert.equal(c.doneListings(), 3);
+  assert.equal(g.calls.filter((x) => x.startsWith('fetch')).length, 3);
+  assert.equal(fs.existsSync(path.join(w.pipelineDir, 'queue-events')), false);
 });
