@@ -343,3 +343,10 @@ test('the trigger heartbeat: "checked Ns ago" on the meta line and in the badge 
   assert.match(build(live({ trigger: { state: 'draining', checkedAgeS: 9999 } })), />draining</);
   assert.match(build(live({ trigger: { state: 'backlog', checkedAgeS: 20, endedAgeS: 30, stopped: 'cap' } })), /class="badge warn"[^>]*Checked 20s ago[^>]*>backlog</);
 });
+
+test('listening: a drain that is up and waiting is a green badge that never turns into "trigger silent", whatever the heartbeat age', () => {
+  assert.match(build(live({ trigger: { state: 'listening', checkedAgeS: 5 } })), /class="badge ok"[^>]*up and waiting[^>]*>listening</);
+  assert.match(build(live({ trigger: { state: 'listening', checkedAgeS: 9999 } })), />listening</);
+  assert.doesNotMatch(build(live({ trigger: { state: 'listening', checkedAgeS: 9999 } })), /trigger silent/);
+  assert.doesNotMatch(build(live({ trigger: { state: 'listening' } })), />draining</);
+});

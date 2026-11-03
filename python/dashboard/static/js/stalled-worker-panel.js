@@ -32,13 +32,14 @@ function stalledWorkerModeBadge(mode) {
   return '<span class="badge idle" title="No decision has been recorded yet">no runs yet</span>';
 }
 
-// The watchdog trigger (no timer): `t` is payload.trigger {state: 'draining' | 'backlog' | 'idle', endedAgeS, stopped} or null when it has never run.
+// The watchdog trigger (no timer): `t` is payload.trigger {state: 'listening' | 'draining' | 'backlog' | 'idle', endedAgeS, stopped} or null when it has never run.
 // The watchdog calls the trigger about once a minute and it rewrites its heartbeat every time, so a heartbeat older than this means the watchdog or the plugin entry is broken.
 const stalledWorkerTriggerSilentS = 300;
 
 function stalledWorkerTriggerBadge(t) {
   const ended = t && Number.isFinite(t.endedAgeS) ? ' The last drain ended ' + stalledWorkerAge(t.endedAgeS) + ' ago' + (t.stopped ? ' (' + stalledWorkerEsc(t.stopped) + ')' : '') + '.' : '';
   const checked = t && Number.isFinite(t.checkedAgeS) ? ' Checked ' + stalledWorkerAge(t.checkedAgeS) + ' ago.' : '';
+  if (t && t.state === 'listening') return '<span class="badge ok" title="The worker is up and waiting: it reacts within seconds of a push or any change it watches.">listening</span>';
   if (t && t.state === 'draining') return '<span class="badge ok" title="A drain is running: the watchdog saw new input and the worker is ticking through it.">draining</span>';
   if (t && Number.isFinite(t.checkedAgeS) && t.checkedAgeS > stalledWorkerTriggerSilentS) return '<span class="badge warn" title="The watchdog has not called the trigger for ' + stalledWorkerAge(t.checkedAgeS) + '. It normally does about once a minute: check the watchdog and watchdogScripts on the plugins.json entry.">trigger silent</span>';
   if (t && t.state === 'backlog') return '<span class="badge warn" title="The last drain stopped at its cap with work left; the next watchdog tick continues it.' + ended + checked + '">backlog</span>';
