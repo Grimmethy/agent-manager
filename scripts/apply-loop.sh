@@ -50,7 +50,14 @@ tick() {
 }
 
 if [[ "${1:-}" == "--once" ]]; then tick; exit 0; fi
+# ADR-0024 S3: instead of a fixed sleep, wake when an entry is ADDED to queue/approved of the active project or any registered project (src/wait-for-change.js),
+# else after AGENT_MANAGER_WAKE_FALLBACK_SECS (default 120). AGENT_MANAGER_LANE_WAKE=off restores the plain ORC_TICK_SECS sleep. A tick skipped because another
+# apply-task run holds the lock is retried at the fallback at the latest (it used to be retried 30 s later).
+source "${SCRIPT_DIR}/wake-common.sh"
+PACKAGE_SRC_DIR="${REPO_DIR}/src"; ONCE=false; LAST_TICK_START=0; LAST_TICK_START_MS=0
 while :; do
+  LAST_TICK_START="$(date +%s)"; LAST_TICK_START_MS="$(date +%s%3N)"
   tick
-  sleep "${ORC_TICK_SECS:-30}"
+  home_queue="$( { [[ -f "$ENV_FILE" ]] && { set -a; source "$ENV_FILE"; set +a; }; printf '%s/queue' "${AGENT_MANAGER_PIPELINE_DIR:-${AGENT_MANAGER_REPO_ROOT:-}}"; } )"
+  wait_for_queue_change approved "$home_queue"
 done
