@@ -77,10 +77,11 @@ function buildNodeHtml(node, selected, pos, size) {
   const sw = runtime ? buildWorkerSwitchHtml(runtime) : ''; // '' unless runtime.switchable === true
   const meta = [];
   if (n.kind && n.kind !== 'loop') meta.push('<span class="wf-kind">' + wfEsc(n.kind) + '</span>');
+  if (n.kind === 'group') meta.push('<span class="wf-members">' + wfEsc(n.memberCount) + ' member(s)</span>');
   if (n.model) meta.push(wfModelHtml(n.model));
   if (n.counts) meta.push(wfCountsHtml(n.counts));
   const task = runtime && runtime.currentTaskId ? '<div class="meta wf-task">' + wfEsc(runtime.currentTaskId) + (runtime.currentPass ? ' · ' + wfEsc(runtime.currentPass) : '') + '</div>' : '';
-  return '<div class="worker-card clickable wf-node' + (selected ? ' wf-selected' : '') + off + '" data-node-id="' + wfEsc(n.id) + '"' + place + '>'
+  return '<div class="worker-card clickable wf-node' + (n.kind === 'group' ? ' wf-group-node' : '') + (selected ? ' wf-selected' : '') + off + '" data-node-id="' + wfEsc(n.id) + '"' + (n.kind === 'group' ? ' data-group="1"' : '') + place + '>'
     + '<div class="row"><span class="id">' + wfEsc(n.label || n.id) + '</span>'
     + '<span class="badge-col"><span class="wf-status-line">' + wfStatusBadge(runtime) + timer + '</span>' + sw + '</span></div>'
     + '<div class="meta">' + (meta.join(' · ') || '&nbsp;') + '</div>' + task + '</div>';
@@ -133,13 +134,22 @@ function buildGraphHtml(graph, layout, state) {
   const selectedId = state && state.selectedId;
   const byEdge = {};
   (lay.edges || []).forEach((le) => { byEdge[le.id] = le; });
-  const paths = (g.edges || []).filter((e) => byEdge[e.id]).map((e) => buildEdgeSvg({ id: e.id, kind: e.kind, back: byEdge[e.id].back }, byEdge[e.id].points)).join('');
-  const nodes = (g.nodes || []).filter((n) => lay.positions[n.id]).map((n) => buildNodeHtml(n, n.id === selectedId, lay.positions[n.id])).join('');
+  // Expanded groups get a dashed box under everything; a box can start left of or above the layout, so the whole canvas is shifted by that amount (0 without groups).
+  const boxes = typeof groupBoxes === 'function' ? groupBoxes(g, lay.positions, { w: WF_LAYOUT_OPTS.nodeW, h: WF_LAYOUT_OPTS.nodeH }, 12) : [];
+  const dx = Math.max(0, ...boxes.map((b) => -b.x));
+  const dy = Math.max(0, ...boxes.map((b) => -b.y));
+  const width = Math.max(lay.width + dx, ...boxes.map((b) => b.x + dx + b.w));
+  const height = Math.max(lay.height + dy, ...boxes.map((b) => b.y + dy + b.h));
+  const shift = (pts) => (dx || dy ? (pts || []).map((p) => ({ x: p.x + dx, y: p.y + dy })) : pts);
+  const boxHtml = boxes.map((b) => '<div class="wf-group-box" data-group-id="' + wfEsc(b.id) + '" style="left:' + wfEsc(b.x + dx) + 'px;top:' + wfEsc(b.y + dy) + 'px;width:' + wfEsc(b.w) + 'px;height:' + wfEsc(b.h) + 'px">'
+    + '<button type="button" class="secondary wf-group-toggle" data-group-id="' + wfEsc(b.id) + '" aria-expanded="true" title="Collapse this group">▾ ' + wfEsc(b.label) + '</button></div>').join('');
+  const paths = (g.edges || []).filter((e) => byEdge[e.id]).map((e) => buildEdgeSvg({ id: e.id, kind: e.kind, back: byEdge[e.id].back }, shift(byEdge[e.id].points))).join('');
+  const nodes = (g.nodes || []).filter((n) => lay.positions[n.id]).map((n) => buildNodeHtml(n, n.id === selectedId, dx || dy ? { x: lay.positions[n.id].x + dx, y: lay.positions[n.id].y + dy } : lay.positions[n.id])).join('');
   const selected = (g.nodes || []).find((n) => n.id === selectedId);
   const warn = (g.warnings || []).length ? '<div class="meta wf-warn-line" title="' + wfEsc(g.warnings.join('\n')) + '">' + wfEsc(g.warnings.length) + ' warning(s) while building this graph: hover for details</div>' : '';
   return '<div class="worker-filter-bar wf-bar">' + workersViewToggleHtml('graph') + '</div>' + warn
-    + '<div class="wf-surface" id="wf-surface"><div class="wf-canvas" style="width:' + wfEsc(lay.width) + 'px;height:' + wfEsc(lay.height) + 'px">'
-    + '<svg class="wf-edges" width="' + wfEsc(lay.width) + '" height="' + wfEsc(lay.height) + '" aria-hidden="true"><defs><marker id="wf-arrow" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="8" markerHeight="8" orient="auto">'
+    + '<div class="wf-surface" id="wf-surface"><div class="wf-canvas" style="width:' + wfEsc(width) + 'px;height:' + wfEsc(height) + 'px">' + boxHtml
+    + '<svg class="wf-edges" width="' + wfEsc(width) + '" height="' + wfEsc(height) + '" aria-hidden="true"><defs><marker id="wf-arrow" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="8" markerHeight="8" orient="auto">'
     + '<path d="M0 0 L8 4 L0 8 z" class="wf-arrowhead"/></marker></defs>' + paths + '</svg>' + nodes + '</div></div>'
     + (selected ? ((typeof buildNodePanelHtml === 'function' && buildNodePanelHtml(selected, g.warnings, state && state.tasks)) || buildDetailHtml(selected, g.warnings)) : '');
 }
@@ -151,7 +161,7 @@ function graphSignature(graph) {
     const r = n.runtime || {};
     const c = n.counts || {};
     return [n.id, r.status, r.stale, r.disabled, r.currentTaskId, r.currentPass, c.pending, c.drafting, n.model && n.model.name, n.model && n.model.overridden];
-  }), ((graph && graph.edges) || []).map((e) => e.id), (graph && graph.warnings) || []]);
+  }), ((graph && graph.edges) || []).map((e) => e.id), (graph && graph.warnings) || [], ((graph && graph.groups) || []).map((g) => [g.id, g.label, g.children, g.collapsed])]);
 }
 
 // A poll redraws only when a visible value changed or nothing is drawn yet (the stored signature starts as null, which never equals a real one); a selected node and the scroll position are left alone otherwise.
@@ -162,7 +172,8 @@ function graphNeedsRedraw(previousSignature, nextSignature) {
 // ---- DOM wiring ----
 
 // tasks = { id, items, type, error } of the selected worker node's task picker; it lives here, like the selection, so it survives the 5 s poll.
-const wfState = { selectedId: null, signature: null, graph: null, tasks: null };
+// toggles = { <group id>: true|false }: the operator's collapsed or expanded choice per group (it wins over the group's own flag); shown = the graph as drawn (groups collapsed), which is where the selection is looked up.
+const wfState = { selectedId: null, signature: null, graph: null, tasks: null, toggles: {}, shown: null };
 
 function wfMessageHtml(text) {
   return '<div class="worker-filter-bar wf-bar">' + workersViewToggleHtml('graph') + '</div><div class="empty">' + wfEsc(text)
@@ -170,7 +181,8 @@ function wfMessageHtml(text) {
 }
 
 function wfSelectedNode() {
-  return (wfState.graph && wfState.graph.nodes || []).find((n) => n.id === wfState.selectedId) || null;
+  const g = wfState.shown || wfState.graph;
+  return (g && g.nodes || []).find((n) => n.id === wfState.selectedId) || null;
 }
 
 // Redraw only the task-pick slot (a chosen type, or a fresh task list), then wire its selects again.
@@ -206,10 +218,19 @@ async function wfLoadTasks(main) {
   if (changed) wfRedrawTaskSlot(main);
 }
 
+// Flip a group between collapsed and expanded (the operator's choice, kept in the view state) and redraw.
+function wfToggleGroup(groupId, main) {
+  wfState.toggles[groupId] = !effectiveCollapsed(wfState.graph, wfState.toggles).has(groupId);
+  wfDraw(main);
+}
+
 function wfDraw(main) {
   const old = main.querySelector('#wf-surface');
   const scroll = old ? { left: old.scrollLeft, top: old.scrollTop } : null;
-  main.innerHTML = buildGraphHtml(wfState.graph, layoutGraph(wfState.graph, WF_LAYOUT_OPTS), wfState);
+  const shown = typeof collapseGraph === 'function' ? collapseGraph(wfState.graph, effectiveCollapsed(wfState.graph, wfState.toggles)) : wfState.graph;
+  wfState.shown = shown;
+  if (wfState.selectedId && !(shown.nodes || []).some((n) => n.id === wfState.selectedId)) { wfState.selectedId = null; wfState.tasks = null; } // hidden inside a collapsed group
+  main.innerHTML = buildGraphHtml(shown, layoutGraph(shown, WF_LAYOUT_OPTS), wfState);
   const surface = main.querySelector('#wf-surface');
   if (surface && scroll) { surface.scrollLeft = scroll.left; surface.scrollTop = scroll.top; }
   wireWorkersViewToggle(main);
@@ -218,9 +239,13 @@ function wfDraw(main) {
   if (typeof isTaskPinNode === 'function') wfLoadTasks(main);
   main.querySelectorAll('.wf-node').forEach((el) => {
     el.onclick = () => {
+      if (el.dataset.group === '1') { wfToggleGroup(el.dataset.nodeId, main); return; }
       wfState.selectedId = wfState.selectedId === el.dataset.nodeId ? null : el.dataset.nodeId;
       wfDraw(main);
     };
+  });
+  main.querySelectorAll('.wf-group-toggle').forEach((btn) => {
+    btn.onclick = (e) => { e.stopPropagation(); wfToggleGroup(btn.dataset.groupId, main); };
   });
   const log = main.querySelector('#wf-runlog');
   if (log) {

@@ -182,6 +182,9 @@
   .wf-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 8px 0; font-size: 12px; }
   .wf-facts dt { color: var(--muted); }
   .wf-facts dd { margin: 0; overflow-wrap: anywhere; }
+  .wf-group-box { position: absolute; box-sizing: border-box; border: 1px dashed var(--border-strong, var(--border)); border-radius: 8px; pointer-events: none; }
+  .wf-group-toggle { pointer-events: auto; margin: 4px; padding: 4px 8px; font-size: 12px; }
+  .wf-group-node { border-style: dashed; }
   .wf-controls { margin: 8px 0; }
   .wf-control-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .wf-control-row .worker-model-select, .wf-control-row .worker-model-fixed { margin: 0; }
@@ -420,6 +423,7 @@
 <script src="/static/js/workers-tab.js"></script>
 <script src="/static/js/worker-switch-ui.js"></script>
 <script src="/static/js/workflow-layout.js"></script>
+<script src="/static/js/workflow-groups.js"></script>
 <script src="/static/js/workflow-node-panel.js"></script>
 <script src="/static/js/workflow-graph-view.js"></script>
 <script src="/static/js/cloud-spend-panel.js"></script>
