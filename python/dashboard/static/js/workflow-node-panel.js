@@ -37,8 +37,24 @@ function buildNodeControlsHtml(node, tasks) {
     + (isTaskPinNode(node) ? '<div class="wf-control-row"><div id="wf-taskpick" class="wf-taskpick">' + buildTaskPickSlotHtml(node, tasks) + '</div></div>' : '') + '</div>';
 }
 
-// The whole panel of a loop node (the facts of buildDetailHtml plus the controls); '' for any other node, which keeps the read-only panel.
-function buildNodePanelHtml(node, warnings, tasks) {
+// Where a task source stands in today's claim order: its registered priority, its competition rank among all sources and how many other sources share the priority.
+// priorityOrder = the graph's [{ name, priority, rank }] (src/workflow-priority.js); '' for a node that is not a source, or a source the list does not have.
+function buildSourcePriorityHtml(node, priorityOrder) {
+  if (!node || node.kind !== 'source' || !Array.isArray(priorityOrder)) return '';
+  const name = String(node.id).replace(/^source:/, '');
+  const entry = priorityOrder.find((e) => e && e.name === name);
+  if (!entry) return '';
+  const same = priorityOrder.filter((e) => e && e.name !== name && e.priority === entry.priority).length;
+  return '<div class="meta wf-priority">Flat priority ' + wfEsc(entry.priority) + ' · rank ' + wfEsc(entry.rank) + ' of ' + wfEsc(priorityOrder.length)
+    + (same ? ' · ' + same + ' other source(s) share this priority' : '') + '</div>';
+}
+
+// The whole panel of a loop node (the facts of buildDetailHtml plus the controls) or of a source with a priority line; '' for any other node, which keeps the read-only panel.
+function buildNodePanelHtml(node, warnings, tasks, priorityOrder) {
+  if (node && node.kind === 'source') {
+    const line = buildSourcePriorityHtml(node, priorityOrder);
+    return line ? buildDetailHtml(node, warnings, line) : '';
+  }
   if (!node || node.kind !== 'loop' || !node.runtime || !node.model) return '';
   return buildDetailHtml(node, warnings, buildNodeControlsHtml(node, tasks));
 }
@@ -82,4 +98,4 @@ function wireNodePanel(root, deps) {
   });
 }
 
-if (typeof module !== 'undefined') module.exports = { WF_APPLY_NOTES, isTaskPinNode, buildTaskPickSlotHtml, buildNodeControlsHtml, buildNodePanelHtml, wfSetModelDefault, wireNodePanel };
+if (typeof module !== 'undefined') module.exports = { WF_APPLY_NOTES, isTaskPinNode, buildTaskPickSlotHtml, buildNodeControlsHtml, buildNodePanelHtml, buildSourcePriorityHtml, wfSetModelDefault, wireNodePanel };
