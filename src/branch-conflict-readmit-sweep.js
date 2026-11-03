@@ -30,7 +30,7 @@
 // sightings revisits just those tasks, so the two-sightings SETTLE rule needs no new event. A FULL listing also runs on the first run and every AGENT_MANAGER_EVENTS_RECONCILE_SECS
 // (default 1800), to catch main moving without an announcement (a direct push); a conflict that reconcile scan newly observes while no merge event was drained is counted with
 // recordCorrection (the first run is the catch-up and counts nothing). Position and scan time advance only after a run with no errors and no failed conflict check.
-// AGENT_MANAGER_QUEUE_EVENTS=off restores the old full listing on every run exactly. (The `git fetch` at the top of a run is unchanged here; skipping it on idle runs is HUB0330-10.)
+// AGENT_MANAGER_QUEUE_EVENTS=off restores the old full listing on every run exactly. An idle run makes no git call at all, fetch included; every other run fetches once before it examines anything.
 // CLI: node branch-conflict-readmit-sweep.js [--dry-run]
 
 const fs = require('fs');
@@ -142,7 +142,7 @@ async function sweepBranchConflicts({
   const live = summary.mode === 'on' && !dryRun;
   const queueDir = path.join(pipelineDir, 'queue');
   const nowIso = new Date(now).toISOString();
-  if (fetch) git(repoRoot, ['fetch', '-q', 'origin']);
+  if (fetch && !summary.journal.events) git(repoRoot, ['fetch', '-q', 'origin']);   // journal off: the old behaviour, first thing on every run (journal on: see below)
 
   const statePath = path.join(queueDir, STATE_FILE);
   const state = readJson(statePath, fsImpl) || {};
@@ -180,6 +180,10 @@ async function sweepBranchConflicts({
       }
     }
   }
+
+  // Journal on: the fetch only matters when this run will actually examine tasks (a first run, a due reconcile, a merge event or a pending sighting). An idle run returned above
+  // and made no git call at all (ADR-0024: the watchdog's `git fetch origin` was measured at about 17 launches a minute).
+  if (fetch && summary.journal.events) git(repoRoot, ['fetch', '-q', 'origin']);
 
   let holdCommit = false;                                  // a failed conflict check leaves the events pending
   let snapshot = null;

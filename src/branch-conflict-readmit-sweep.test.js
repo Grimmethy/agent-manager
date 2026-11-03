@@ -343,3 +343,64 @@ test('AGENT_MANAGER_QUEUE_EVENTS=off is the old behaviour: a full listing every 
   assert.equal(c.doneListings(), 3);
   assert.equal(fs.existsSync(path.join(w.pipelineDir, 'queue-events')), false);
 });
+
+
+// ---- HUB0330 piece 10: no git call at all (fetch included) on an idle journal-mode run ----
+const fetchCount = (g) => g.calls.filter((c) => c.startsWith('fetch')).length;
+
+test('journal mode: an idle run makes no git call at all, not even the fetch', async () => {
+  const w = quietWorld();
+  const g = gitCounter();
+  const t0 = Date.now();
+  await run(w, t0, { git: g });                                        // first run: a full scan, which fetches
+  const before = g.calls.length;
+  const idle = await run(w, t0 + 5 * MIN, { git: g });
+  assert.equal(idle.journal.idle, true);
+  assert.equal(g.calls.length, before, 'the idle run added no git call');
+  assert.equal(fetchCount(g), 1, 'only the first run fetched');
+});
+
+test('journal mode: a run with a merge event fetches exactly once, before it examines anything', async () => {
+  const w = quietWorld();
+  const g = gitCounter();
+  const t0 = Date.now();
+  await run(w, t0, { git: g });
+  const before = g.calls.length;
+  w.commitOnMain('a.txt', 'one\nTWO-main\nthree\n');
+  merged(w);
+  await run(w, t0 + MIN, { git: g });
+  const added = g.calls.slice(before);
+  assert.equal(added.filter((c) => c.startsWith('fetch')).length, 1);
+  assert.ok(added[0].startsWith('fetch'), `the fetch comes first (${added[0]})`);
+  assert.ok(added.length > 1, 'and the task was then examined');
+});
+
+test('journal mode: the first (full scan) run and a pending-sighting run each fetch once', async () => {
+  const w = quietWorld();
+  const g = gitCounter();
+  const t0 = Date.now();
+  await run(w, t0, { git: g });
+  assert.equal(fetchCount(g), 1, 'first run');
+  w.commitOnMain('a.txt', 'one\nTWO-main\nthree\n');
+  merged(w);
+  await run(w, t0 + MIN, { git: g });                                   // observes the conflict: a sighting now waits for its second look
+  const afterEvent = fetchCount(g);
+  await run(w, t0 + 2 * MIN, { git: g });                               // pending-sighting run, no new event
+  assert.equal(fetchCount(g), afterEvent + 1, 'the pending-sighting run fetched once');
+});
+
+test('AGENT_MANAGER_QUEUE_EVENTS=off still fetches on every run', async () => {
+  const w = quietWorld();
+  const g = gitCounter();
+  for (let i = 0; i < 3; i++) await run(w, Date.now() + i * MIN, { env: OFF, git: g });
+  assert.equal(fetchCount(g), 3);
+});
+
+test('fetch: false never fetches, in either mode', async () => {
+  const w = quietWorld();
+  const g = gitCounter();
+  const t0 = Date.now();
+  await run(w, t0, { git: g, fetch: false });
+  await run(w, t0 + MIN, { git: g, fetch: false, env: OFF });
+  assert.equal(fetchCount(g), 0);
+});
