@@ -703,6 +703,17 @@ def _apply_post_merge_side_effects(context):
     return _sync_live_checkout(context["main_branch"])
 
 
+def _emit_branch_merged(qdir, branch, task_id):
+    """Announce a merge in the queue-events journal (ADR-0024). Best-effort and silent on failure: the merge already happened and must not be reported as failed
+    because of the journal. AGENT_MANAGER_QUEUE_EVENTS=off makes the writer skip it."""
+    try:
+        from queue_events import append_event
+        append_event(os.path.dirname(os.path.abspath(str(qdir))), {"type": "branch_merged", "branch": branch, "taskId": task_id})
+    except Exception as exc:  # noqa: BLE001 -- never let the journal break a merge
+        import logging
+        logging.getLogger(__name__).warning("queue-events: branch_merged not journaled for %s: %s", branch, exc)
+
+
 def _record_merge_in_task_file(branch, main_branch, qdir=None):
     """Step 4a: stamp mergedAt + a terminal `merged` history/disposition on the task's
     queue record, in whichever done/ location it sits. No-op without a queue dir or a
@@ -749,6 +760,7 @@ def _record_merge_in_task_file(branch, main_branch, qdir=None):
                 except OSError as exc:
                     logger.error("Failed to persist merge-state for branch %r to %s: %s", branch, candidate, exc)
                     raise
+                _emit_branch_merged(qdir, branch, task_id)    # announced only after the merge-state write succeeded
             break
 
 
