@@ -1,11 +1,6 @@
 // Workers tab: the per-instance cards, recent-task and run-log lists, the completed-tasks section and the stale-heartbeat timers. Moved verbatim out of core-ui.js (2026-10-01); a plain global <script>, loaded by index.html right after core-ui.js and before the inline script that schedules updateStaleTimers.
 // No require()/module.exports: the browser loads this with a plain <script src> tag, so every name below is a shared global.
 
-function modelKindForInstance(inst) {
-  if (inst.instanceId === 'watchdog') return null;
-  return 'ollama'; // every lane runs a local model (lanes are one per GPU)
-}
-
 async function setWorkerModel(instanceId, model) {
   await fetch(`/api/worker-models/${encodeURIComponent(instanceId)}`, {
     method: 'POST',
@@ -313,25 +308,7 @@ async function renderWorkers(isPoll) {
     <div class="worker-card clickable${typeof workerCardOffClass === 'function' ? workerCardOffClass(inst) : ''}" data-instance-id="${escapeAttr(inst.instanceId)}">
       <div class="row">
         <span class="id">${inst.instanceId}</span>
-        ${(() => {
-          const kind = modelKindForInstance(inst);
-          if (!kind) return '';
-          const current = overrides[inst.instanceId] || '';
-          const optionsFor = (label, values) => values.length
-            ? `<optgroup label="${escapeAttr(label)}">${values.map(m => `<option value="${escapeAttr(m.value)}" ${m.value === current ? 'selected' : ''}>${m.label}</option>`).join('')}</optgroup>`
-            : '';
-          let body;
-          if (kind === 'mixed') {
-            // Prefixed so local-worker.sh's refresh_active_model can tell which backend
-            // was picked -- see that function's own comment for why this is the fix for
-            // "reasoning only shows subscription models."
-            body = optionsFor('Claude (subscription)', (workerModels.claudeModels || []).map(m => ({ value: `claude:${m}`, label: m })))
-              + optionsFor('Local (Ollama)', (workerModels.ollamaModels || []).map(m => ({ value: `ollama:${m}`, label: m })));
-          } else {
-            body = (workerModels.ollamaModels || []).map(m => `<option value="${escapeAttr(m)}" ${m === current ? 'selected' : ''}>${m}</option>`).join('');
-          }
-          return `<select class="worker-model-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()"><option value="">(default)</option>${body}</select>`;
-        })()}
+        ${buildWorkerModelSelectHtml(inst, workerModels, overrides)}
         ${canAssignTask(inst) ? (() => {
           const items = assignableByInstance[inst.instanceId] || [];
           // Grouped by source (task TYPE) so the picker shows "pipeline_debrief (7)"
