@@ -416,6 +416,64 @@ function findNearMissRealPath(claimedPath, realPaths) {
   return best && !tie ? best.realPath : null;
 }
 
+// Extract missing file paths from a task's blockedReason or history. Returns an array of
+// path strings that were cited as missing. Used by Bucket M to identify what to re-ground.
+function extractMissingFilePaths(task) {
+  const paths = [];
+  const blockedReason = String(task.blockedReason || '');
+  
+  // Match patterns like "cites missing-file target(s): src/foo.js" or "missing-file: src/foo.js"
+  const missingFileRe = /(?:missing-file|cites missing-file)[^:]*:\s*([\s\S]*?)(?:;|\s*$)/i;
+  const match = blockedReason.match(missingFileRe);
+  if (match) {
+    const fileList = match[1].split(',').map((p) => p.trim()).filter(Boolean);
+    paths.push(...fileList);
+  }
+  
+  // Also check history for missing-file events
+  const history = Array.isArray(task.history) ? task.history : [];
+  for (const h of history) {
+    if (!h || h.stage !== 'blocked' || !h.reason) continue;
+    const histMatch = String(h.reason).match(/missing-file[^:]*:\s*([\s\S]*?)(?:;|\s*$)/i);
+    if (histMatch) {
+      const fileList = histMatch[1].split(',').map((p) => p.trim()).filter(Boolean);
+      paths.push(...fileList);
+    }
+  }
+  
+  // Deduplicate
+  return [...new Set(paths)];
+}
+
+// Recursively list all files in a repo directory. Returns relative paths.
+function listFilesInRepo(repoRoot) {
+  const files = [];
+  
+  function walk(dir, relDir) {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || entry.name === 'node_modules' || entry.name === '.git') continue;
+      const fullPath = path.join(dir, entry.name);
+      const relPath = relDir ? path.join(relDir, entry.name) : entry.name;
+      
+      if (entry.isDirectory()) {
+        walk(fullPath, relPath);
+      } else if (entry.isFile()) {
+        files.push(relPath);
+      }
+    }
+  }
+  
+  walk(repoRoot, '');
+  return files;
+}
+
 function log(line) {
   process.stderr.write(`[nc-triage] ${line}\n`);
 }
@@ -843,6 +901,69 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             continue;
           }
         }
+      }
+    }
+
+    // --- Bucket M: missing-file retry loop (blocked on missing file, retried with empty output) -> re-ground and retry ---
+    // Checked BEFORE the nc.reason allowlist: the signal is the missing-file signature in blockedReason/history, not the escalation reason.
+    // Root-caused live: a task's implement pass was blocked by plan-target-guard.js citing a missing file, the model retried with an empty implementResponse (no actual work), and escalated to needs-clarification. A blind requeue would reproduce the same failure; this bucket searches the repo for the missing file, and if a similar file exists, substitutes the real path and retries with a clean slate.
+    // Only acts when the missing-file citation is recoverable (a real path is a confident match); otherwise falls through to bucket C unchanged.
+    {
+      const id0 = task.id || name.replace(/\\.json$/, '');
+      const missingPaths = extractMissingFilePaths(task);
+      if (missingPaths.length > 0 && bucketAttempts(task, 'M') < MAX_REQUEUES) {
+        // Search the repo for similar files
+        const realPaths = listFilesInRepo(repoRoot);
+        const repairs = missingPaths.map((missing) => ({
+          missing,
+          real: findNearMissRealPath(missing, realPaths),
+        })).filter((r) => r.real);
+        
+        if (repairs.length > 0) {
+          const adhocPath = path.join(adhocDir, `${id0}.json`);
+          if (fs.existsSync(adhocPath)) {
+            log(`${id0}: bucket M but ${id0}.json already in adhoc/ -- already handled, skipping`);
+          } else {
+            summary.checked += 1;
+            const attempt = bucketAttempts(task, 'M') + 1;
+            log(`${id0}: bucket M (missing-file retry loop) -> re-grounded ${repairs.length} path(s), requeue ${attempt}/${MAX_REQUEUES}`);
+            summary.requeued += 1;
+            if (!DRY_RUN) {
+              // Substitute the real paths in implementResponse and planResponse
+              let implementText = String(task.implementResponse || '');
+              let planText = String(task.planResponse || '');
+              for (const r of repairs) {
+                implementText = implementText.split(r.missing).join(r.real);
+                planText = planText.split(r.missing).join(r.real);
+              }
+              task.implementResponse = implementText;
+              task.planResponse = planText;
+              
+              // Strip the retry state and requeue
+              for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+              resetStatusForFreshAdhocAttempt(task);
+              delete task.ncTriageDecision;
+              delete task.ncTriageReviewedAt;
+              bumpBucketAttempts(task, 'M');
+              appendHistoryEvent(task, 'requeued',
+                `needs-clarification-triage: missing-file retry loop -- re-grounded ${repairs.map((r) => `"${r.missing}" -> "${r.real}"`).join(', ')}, clean-state retry ${attempt}/${MAX_REQUEUES}`);
+              try {
+                await classifyRequeue(task, { reasonHint: 'bucket-M: missing-file retry loop re-grounded', requeueWriter: 'needs-clarification-triage', repoRoot });
+              } catch { /* classification must never block the real requeue */ }
+              try {
+                fs.mkdirSync(adhocDir, { recursive: true });
+                fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
+                fs.unlinkSync(file);
+              } catch (e) {
+                log(`${id0}: requeue move failed: ${e.message}`);
+                summary.requeued -= 1;
+                summary.errors += 1;
+              }
+            }
+            continue;
+          }
+        }
+        // No recovery possible -- fall through to bucket C
       }
     }
 
@@ -1436,6 +1557,8 @@ module.exports = {
   BLOCKER_TYPE_INFRA_ERROR_RE,
   hasFreshEscalationSince,
   isStillLeaveForHuman,
+  extractMissingFilePaths,
+  listFilesInRepo,
 };
 
 if (require.main === module) {
