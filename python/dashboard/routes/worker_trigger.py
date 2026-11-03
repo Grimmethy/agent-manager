@@ -3,7 +3,7 @@
 The stalled-task worker and the branch verifier have no timer. The agent-manager watchdog runs their `watchdogScripts` once per tick; each script starts a detached drain
 (`bin/<worker>-tick.js --drain`) when the worker's input changed. The pieces it leaves behind, all in ~/.local/state/pipeline-ops (the same names src/trigger.js `filesFor` writes):
 
-  <name>-trigger.json   written by a drain when it ends: {sig, endedAt, backlog, stopped, iterations}
+  <name>-trigger.json   written by a drain when it ends (a lingering drain: whenever it starts or stops listening): {sig, endedAt, backlog, stopped, iterations, lingering, working}
   <name>-drain.lock     held (flock) for as long as a drain runs
   <name>-trigger.beat   rewritten (an ISO time) by EVERY watchdog call of the trigger, even an idle one: how a quiet worker is told from a dead trigger
 
@@ -60,7 +60,7 @@ def lock_held(path):
 
 
 def read_trigger(name, env=None, now=None, held=lock_held):
-    """{state: 'draining'|'backlog'|'idle', checkedAt, checkedAgeS, endedAt, endedAgeS, stopped, iterations} or None when this worker has never been triggered."""
+    """{state: 'listening'|'draining'|'backlog'|'idle', checkedAt, checkedAgeS, endedAt, endedAgeS, stopped, iterations} or None when this worker has never been triggered."""
     now = time.time() if now is None else now
     try:
         draining = bool(held(lock_path(name, env)))
@@ -82,7 +82,10 @@ def read_trigger(name, env=None, now=None, held=lock_held):
         ended = datetime.fromisoformat(str(data.get("endedAt")).replace("Z", "+00:00")).timestamp()
     except (ValueError, TypeError):
         pass
-    state = "draining" if draining else ("backlog" if data.get("backlog") is True else "idle")
+    # A drain that lingers (the verifier's, which stays up and wakes on a change) holds the lock all the time: it is "listening" while it records lingering and not working, and
+    # "draining" while it ticks. A drain that ends (the stalled worker's) never writes lingering, so it reads as draining exactly as before.
+    listening = draining and data.get("lingering") is True and data.get("working") is False
+    state = "listening" if listening else ("draining" if draining else ("backlog" if data.get("backlog") is True else "idle"))
     return {"state": state, "checkedAt": datetime.fromtimestamp(checked, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if checked is not None else None,
             "checkedAgeS": max(0, int(now - checked)) if checked is not None else None, "endedAt": data.get("endedAt") if ended is not None else None, "endedAgeS": max(0, int(now - ended)) if ended is not None else None,
             "stopped": data.get("stopped") if isinstance(data.get("stopped"), str) else None, "iterations": data.get("iterations") if isinstance(data.get("iterations"), int) else None}
