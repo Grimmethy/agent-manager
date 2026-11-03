@@ -1,36 +1,6 @@
 // Workers tab: the per-instance cards, recent-task and run-log lists, the completed-tasks section and the stale-heartbeat timers. Moved verbatim out of core-ui.js (2026-10-01); a plain global <script>, loaded by index.html right after core-ui.js and before the inline script that schedules updateStaleTimers.
 // No require()/module.exports: the browser loads this with a plain <script src> tag, so every name below is a shared global.
 
-function fmtAge(sec) {
-  if (sec == null) return '?';
-  if (sec < 60) return sec + 's';
-  if (sec < 3600) return Math.round(sec / 60) + 'm';
-  return Math.round(sec / 3600) + 'h';
-}
-
-function statusBadgeClass(status, stale) {
-  if (stale) return 'bad';
-  if (status === 'offline') return 'idle';
-  if (status === 'working' || status === 'checking') return 'ok';
-  if (status === 'idle') return 'idle';
-  // 'queued' (2026-08-19): a claimed task waiting its turn behind another lane at the
-  // single-flight lock (agent-manager-common.sh's acquire_single_flight_lock) -- amber,
-  // same as the generic 'warn' fallback below, but named explicitly so it reads as a
-  // deliberate third state (green=actively running, amber=waiting its turn, gray=idle)
-  // rather than falling through by accident.
-  if (status === 'queued') return 'warn';
-  // 'paused' / 'warming' (B3): the lane is yielding to a GPU session, or reloading its model after one. Amber like 'queued': deliberate, not broken.
-  if (status === 'paused' || status === 'warming') return 'warn';
-  return 'warn';
-}
-
-// What the badge says. Most statuses are shown as they are; the two GPU-session states say why in words.
-function statusLabel(status) {
-  if (status === 'paused') return 'paused: GPU session';
-  if (status === 'warming') return 'resuming: model warming';
-  return status;
-}
-
 function modelKindForInstance(inst) {
   if (inst.instanceId === 'watchdog') return null;
   return 'ollama'; // every lane runs a local model (lanes are one per GPU)
