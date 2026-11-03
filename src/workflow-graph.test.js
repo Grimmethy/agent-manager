@@ -310,3 +310,65 @@ test('output is sorted: nodes by kind then id, edges by id', () => {
   const sorted = [...edgeIds].sort();
   assert.deepEqual(edgeIds, sorted);
 });
+
+// ---- corrective piece: the plain "reviewer" loop node ----
+
+const EMPTY_MODELS = { overrides: {}, ollamaModels: [], claudeModels: [] };
+const hostLane = () => makeLane({ id: 'worker-host', gpu: '3090', reviewer: true, reviewerId: 'reviewer', local: true });
+
+test('a host lane with reviewerId "reviewer" and a reviewer instance gets ONE reviewer node built from that instance', () => {
+  const g = buildWorkflowGraph({
+    lanes: [hostLane()],
+    instances: [makeInstance('worker-host'), makeInstance('reviewer', { status: 'working' })],
+    topology: [], models: EMPTY_MODELS, now: FIXED_NOW,
+  });
+  const nodes = g.nodes.filter(n => n.id === 'reviewer');
+  assert.equal(nodes.length, 1);
+  assert.equal(nodes[0].kind, 'loop');
+  assert.equal(nodes[0].runtime.instanceId, 'reviewer');
+  assert.equal(nodes[0].runtime.status, 'working');
+  const reviews = g.edges.filter(e => e.kind === 'reviews' && e.to === 'reviewer');
+  assert.deepEqual(reviews.map(e => e.from), ['worker-host']);
+});
+
+test('the same lane with no reviewer instance still gets an offline reviewer node', () => {
+  const g = buildWorkflowGraph({ lanes: [hostLane()], instances: [makeInstance('worker-host')], topology: [], models: EMPTY_MODELS, now: FIXED_NOW });
+  const nodes = g.nodes.filter(n => n.id === 'reviewer');
+  assert.equal(nodes.length, 1);
+  assert.equal(nodes[0].runtime.status, 'offline');
+});
+
+test('every edge endpoint is a node id and node ids are unique', () => {
+  const cases = [
+    { lanes: [hostLane()], instances: [makeInstance('worker-host'), makeInstance('reviewer')] },
+    { lanes: [hostLane()], instances: [makeInstance('worker-host')] },
+    { lanes: [], instances: [makeInstance('worker-p40'), makeInstance('reviewer-p40')] },
+  ];
+  for (const c of cases) {
+    const g = buildWorkflowGraph({ ...c, topology: [], models: EMPTY_MODELS, now: FIXED_NOW });
+    const ids = g.nodes.map(n => n.id);
+    assert.equal(new Set(ids).size, ids.length, 'node ids are unique');
+    for (const e of g.edges) {
+      assert.ok(ids.includes(e.from), `edge ${e.id} starts at a missing node`);
+      assert.ok(ids.includes(e.to), `edge ${e.id} ends at a missing node`);
+    }
+  }
+});
+
+test('the reviewer case builds the same graph on every call', () => {
+  const input = { lanes: [hostLane()], instances: [makeInstance('worker-host'), makeInstance('reviewer')], topology: [], models: EMPTY_MODELS, now: FIXED_NOW };
+  const copy = { ...JSON.parse(JSON.stringify({ lanes: input.lanes, instances: input.instances, topology: input.topology, models: input.models })), now: FIXED_NOW };
+  assert.deepEqual(buildWorkflowGraph(input), buildWorkflowGraph(copy));
+});
+
+test('a reviewer instance already used as a legacy loop is not built a second time', () => {
+  const lane = makeLane({ id: 'worker-d1', reviewer: true, reviewerId: 'reviewer-d1' });
+  const g = buildWorkflowGraph({ lanes: [lane], instances: [makeInstance('worker-d1'), makeInstance('reviewer-d1')], topology: [], models: EMPTY_MODELS, now: FIXED_NOW });
+  assert.equal(g.nodes.filter(n => n.id === 'reviewer-d1').length, 1);
+});
+
+test('a reviewerId that is itself a lane id does not add a second node', () => {
+  const lanes = [makeLane({ id: 'worker-a', reviewer: true, reviewerId: 'worker-b' }), makeLane({ id: 'worker-b' })];
+  const g = buildWorkflowGraph({ lanes, instances: [makeInstance('worker-a')], topology: [], models: EMPTY_MODELS, now: FIXED_NOW });
+  assert.equal(g.nodes.filter(n => n.id === 'worker-b').length, 1);
+});

@@ -336,7 +336,7 @@ function buildWorkflowGraph(opts) {
   }
   for (const rid of reviewerIdSet) {
     if (laneById.has(rid)) continue; // already a lane
-    if (instMap.has(rid)) continue; // already consumed
+    if (consumed.has(rid)) continue; // already consumed
     const inst = instMap.get(rid) || null;
     if (inst) consumed.add(rid);
     // offline placeholder: no real instance, build with offline runtime
