@@ -3192,6 +3192,7 @@ from routes.discovery import discovery_bp  # noqa: E402
 from routes.hygiene import hygiene_bp  # noqa: E402
 from routes.deep_dive import deep_dive_bp  # noqa: E402
 from routes.job_types import job_types_bp  # noqa: E402
+from routes.workflow_graph import workflow_graph_bp  # noqa: E402
 from routes.worker_models_1_more import worker_models_1_more_bp  # noqa: E402
 from routes.instances import instances_bp  # noqa: E402
 from routes.chat import chat_bp  # noqa: E402
@@ -3222,6 +3223,7 @@ app.register_blueprint(discovery_bp)
 app.register_blueprint(hygiene_bp)
 app.register_blueprint(deep_dive_bp)
 app.register_blueprint(job_types_bp)
+app.register_blueprint(workflow_graph_bp)
 app.register_blueprint(worker_models_1_more_bp)
 app.register_blueprint(instances_bp)
 app.register_blueprint(chat_bp)
