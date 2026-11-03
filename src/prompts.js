@@ -1588,14 +1588,44 @@ function genericFallbackPlanPrompt(task) {
 }
 
 function genericFallbackImplementPrompt(task, planText) {
-  return [
+  const blocks = [
     'Earlier you wrote this PLAN:',
     '',
     planText,
     '',
     'Now write ONLY the concrete next step described by step 1 of that plan -- keep it small ' +
       'and specific, not the whole plan at once.',
-  ].join('\n');
+  ];
+  
+  // Add RULE about tests if there's a prior "touches no test" verdict or rejection
+  const hasTouchesNoTestHistory = hasPriorTouchesNoTest(task);
+  if (hasTouchesNoTestHistory) {
+    blocks.push('');
+    blocks.push('RULE: Your previous attempt was rejected because it "touches no test". Every code change must include corresponding test changes. When editing, creating, or deleting source files, you MUST also update or create tests to verify the change works correctly.');
+  }
+  
+  return blocks.join('\n');
+}
+
+function hasPriorTouchesNoTest(task) {
+  // Check for prior verdict with "touches no test" reason
+  if (task && task.promptContext && task.promptContext.priorVerdict) {
+    const pv = task.promptContext.priorVerdict;
+    if (pv.verdict === 'needs-work' && Array.isArray(pv.reasons)) {
+      return pv.reasons.some(reason => 
+        typeof reason === 'string' && reason.toLowerCase().includes('touches no test')
+      );
+    }
+  }
+  
+  // Check for prior rejection feedback mentioning "touches no test"
+  if (task && Array.isArray(task.priorRejectionFeedback)) {
+    return task.priorRejectionFeedback.some(feedback =>
+      typeof feedback === 'string' && feedback.toLowerCase().includes('touches no test')
+    );
+  }
+  
+  return false;
 }
 
 // ---- Wire this package's 6 built-in sources' prompt builders into the registry ----
@@ -1767,6 +1797,7 @@ module.exports = {
   productSpecOutlinePlanPrompt, productSpecOutlineImplementPrompt,
   productSpecSectionPlanPrompt, productSpecSectionImplementPrompt,
   projectSearchPlanPrompt, projectSearchImplementPrompt,
+  genericFallbackImplementPrompt,
 };
 
 if (require.main === module) {
