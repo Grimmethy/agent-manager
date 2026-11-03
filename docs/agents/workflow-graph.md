@@ -106,9 +106,56 @@ every worker node even when a worker's heartbeat says it cannot be assigned task
   not a tuned diagram.
 - Only loops with a lane or a legacy `worker-*` / `reviewer*` instance become nodes; other heartbeat names are ignored.
 
+## What phase C added (HUB0326)
+
+Phase C added an optional authored layer over the derived graph. It is read-only: the dashboard never writes it, and nothing in it creates or changes a lane.
+
+**The workflow file.** `workflow.json` is optional. Its path is the environment variable `AGENT_MANAGER_WORKFLOW_PATH`, default `workflow.json` in the repo root; an absent file means no authoring (empty config, no warning).
+It never creates, removes or reconfigures a lane: lanes still come only from `src/lanes.js` and `lanes.json`.
+
+```json
+{
+  "schemaVersion": 1,
+  "groups": [
+    { "id": "group:gpus", "label": "GPU workers", "children": ["worker-3090", "worker-p40"], "collapsed": true },
+    { "id": "group:review", "label": "Review", "children": ["reviewer", "stage:review"], "collapsed": false }
+  ],
+  "edges": [ { "from": "source:adhoc", "to": "worker-cloud", "kind": "triggers", "label": "demo" } ],
+  "labels": { "worker-3090": "Big GPU" }
+}
+```
+
+**What the file can do.** Groups (a group lists node ids or other group ids; a node's `parent` becomes the first group that lists it), authored edges between existing nodes (a derived edge is never replaced or removed), and labels that replace a node's label.
+
+**Validation** (`validateWorkflowConfig` in `src/workflow-config.js`, pure, never throws, fail closed like `src/lanes.js`): a wrong or missing `schemaVersion`, a root that is not an object, or a file over 256 KB gives the empty config plus one warning. A bad entry is dropped with a warning that names it:
+a group id must match `^group:[a-z0-9][a-z0-9-]*$` (the first duplicate wins); a group label is 1 to 60 characters, else the id is used; `children` is a non-empty array of distinct non-empty strings, a group that lists itself or sits on a nesting cycle is dropped; `collapsed` is a boolean, default false;
+an edge needs string `from` and `to` that differ and a `kind` from `produces`, `claims`, `reviews`, `applies`, `triggers`, `refines`, and a `label` of at most 60 characters or null; at most 500 edges and 500 labels (the rest dropped with one warning); a label value is 1 to 60 characters.
+`readWorkflowConfig(env)` handles an absent file, an unreadable file and a file that is not JSON (empty config plus a warning). `node src/workflow-config.js` prints `{ config, warnings }`.
+
+**The overlay** (`src/workflow-overlay.js`, called by `buildWorkflowGraph` through its `workflow` and `watchdogScripts` options). `applyWorkflowConfig` drops children that are neither a node id nor a kept group, drops a group left empty, ignores a label for an unknown node and an authored edge with an unknown endpoint, each with a warning that is added to the graph's `warnings`.
+With neither option the graph is exactly what phase B produced. `GET /api/workflow-graph` reads the file and the watchdog scripts and passes both to the builder; a failure of either only adds a warning.
+
+**Watchdog script nodes.** `addWatchdogScriptNodes` adds one service node per plugin watchdog script (`src/plugin-watchdog-scripts.js`), id `service:watchdog-script:<plugin>:<file name without .js>`, label `<plugin>: <file name>`, and a `triggers` edge from `service:watchdog`. This is the first use of the `triggers` edge kind. A workflow file can label or group these nodes.
+
+**Groups in the Graph view** (`python/dashboard/static/js/workflow-groups.js`, pure, drawn by `workflow-graph-view.js`). An expanded group is a dashed box with a header button; a collapsed group is one card (`N member(s)`) that shows the worst status of its loop members (error, stale, paused, warming, queued, working, idle, offline, disabled), the summed counts and the re-pointed edges.
+Click the card or the header button to fold or unfold. The choice lives in the view and survives the 5 second poll; it is not saved, so a reload goes back to the file's `collapsed` values. A selection hidden by a fold is cleared.
+
+**`splitNode`** (`src/workflow-split.js`) is the pure seam a future task atomizer would use to replace one loop node by several: `splitNode(graph, nodeId, parts)` returns `{ ok: true, graph }` or `{ ok: false, error }`, copies every edge of the original to each part, and refuses a split that would orphan a task class. Nothing calls it yet.
+
+**Files and tests.**
+- `src/workflow-config.js`: `node --test src/workflow-config.test.js`
+- `src/workflow-overlay.js` and the builder hook in `src/workflow-graph.js`: `node --test src/workflow-overlay.test.js src/workflow-graph.test.js`
+- `python/dashboard/routes/workflow_graph.py`: `python -m unittest test_workflow_graph_route` from `python/dashboard`
+- `python/dashboard/static/js/workflow-groups.js`: `node --test python/dashboard/tests/test_workflow_groups.js`
+- `src/workflow-split.js`: `node --test src/workflow-split.test.js`
+
+**Known gaps of phase C.**
+- A group box is the bounding box of its members in the layered layout, which does not keep the members of a group next to each other: members in different layers give a box that also covers cards that are not members. Fixing it needs group-aware ordering in `workflow-layout.js`.
+- Nothing writes `workflow.json`; it is edited by hand.
+- The fold state is not saved across a reload.
+- `splitNode` has no caller and no way to apply its result to a lane.
+
 ## Next phases (not built)
 
-- **Phase C, `workflow.json`.** An authored workflow file: composable nodes, authored edges, and a `splitNode` operation that atomizes a large-model node
-  into smaller ones. Not built.
 - **Phase D, priority follows the graph.** Task priority derived from a task's position in the workflow, behind an off-by-default flag,
   with a golden snapshot of today's order first and a one-day comparison before any switch. Not built.
