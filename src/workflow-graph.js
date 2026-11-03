@@ -14,9 +14,12 @@
 //   topology - array of topology source entries (see /api/pipeline-map.sources)
 //   models   - { overrides: {instanceId: string}, ollamaModels: [string], claudeModels: [string] }
 //   now      - Date (default new Date()) for deterministic generatedAt
+//   workflow - optional validated workflow config (src/workflow-config.js): groups, parents, labels and authored edges, applied by src/workflow-overlay.js
 //
 // Output contract:
 //   { schemaVersion: 1, generatedAt: ISO string, nodes: [Node], edges: [Edge], groups: [], warnings: [string] }
+
+const { applyWorkflowConfig } = require('./workflow-overlay.js');
 
 const STAGE_NAMES = ['orient', 'plan', 'implement', 'review', 'apply'];
 const KIND_ORDER = { stage: 0, service: 1, loop: 2, source: 3 };
@@ -271,7 +274,7 @@ function buildEdges(nodes, lanes, topology) {
 // ---- main builder ----
 
 function buildWorkflowGraph(opts) {
-  const { lanes, instances, topology, models, now } = opts || {};
+  const { lanes, instances, topology, models, now, workflow } = opts || {};
   const validated = validateInput(lanes, instances, topology, models);
   const warnings = [...validated.warnings];
   const nowDate = now instanceof Date ? now : new Date();
@@ -383,7 +386,7 @@ function buildWorkflowGraph(opts) {
   // Sort edges by id
   builtEdges.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
-  return {
+  const graph = {
     schemaVersion: 1,
     generatedAt: nowDate.toISOString(),
     nodes,
@@ -391,6 +394,8 @@ function buildWorkflowGraph(opts) {
     groups: [],
     warnings,
   };
+  // The optional authored layer (workflow.json, validated by src/workflow-config.js): groups, parents, labels, authored edges. Without it the graph is returned as built.
+  return applyWorkflowConfig(graph, workflow);
 }
 
 // ---- CLI ----
