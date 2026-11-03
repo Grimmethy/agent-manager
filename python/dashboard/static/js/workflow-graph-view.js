@@ -141,7 +141,7 @@ function buildGraphHtml(graph, layout, state) {
     + '<div class="wf-surface" id="wf-surface"><div class="wf-canvas" style="width:' + wfEsc(lay.width) + 'px;height:' + wfEsc(lay.height) + 'px">'
     + '<svg class="wf-edges" width="' + wfEsc(lay.width) + '" height="' + wfEsc(lay.height) + '" aria-hidden="true"><defs><marker id="wf-arrow" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="8" markerHeight="8" orient="auto">'
     + '<path d="M0 0 L8 4 L0 8 z" class="wf-arrowhead"/></marker></defs>' + paths + '</svg>' + nodes + '</div></div>'
-    + (selected ? ((typeof buildNodePanelHtml === 'function' && buildNodePanelHtml(selected, g.warnings)) || buildDetailHtml(selected, g.warnings)) : '');
+    + (selected ? ((typeof buildNodePanelHtml === 'function' && buildNodePanelHtml(selected, g.warnings, state && state.tasks)) || buildDetailHtml(selected, g.warnings)) : '');
 }
 
 // What the poll compares: ids and the values the cards show. stateAgeSeconds is left out on purpose, it changes every poll.
@@ -161,11 +161,49 @@ function graphNeedsRedraw(previousSignature, nextSignature) {
 
 // ---- DOM wiring ----
 
-const wfState = { selectedId: null, signature: null, graph: null };
+// tasks = { id, items, type, error } of the selected worker node's task picker; it lives here, like the selection, so it survives the 5 s poll.
+const wfState = { selectedId: null, signature: null, graph: null, tasks: null };
 
 function wfMessageHtml(text) {
   return '<div class="worker-filter-bar wf-bar">' + workersViewToggleHtml('graph') + '</div><div class="empty">' + wfEsc(text)
     + '</div><div style="text-align:center"><button type="button" class="secondary wf-view-btn" data-view="cards">Back to Cards</button></div>';
+}
+
+function wfSelectedNode() {
+  return (wfState.graph && wfState.graph.nodes || []).find((n) => n.id === wfState.selectedId) || null;
+}
+
+// Redraw only the task-pick slot (a chosen type, or a fresh task list), then wire its selects again.
+function wfRedrawTaskSlot(main) {
+  const slot = main.querySelector('#wf-taskpick');
+  const node = wfSelectedNode();
+  if (!slot || !node) return;
+  slot.innerHTML = buildTaskPickSlotHtml(node, wfState.tasks && wfState.tasks.id === node.id ? wfState.tasks : null);
+  wireNodePanel(main, {});
+}
+
+function wfSetTaskType(instanceId, type) {
+  if (wfState.tasks && wfState.tasks.id === instanceId) wfState.tasks.type = type;
+  if (typeof document !== 'undefined') wfRedrawTaskSlot(document.getElementById('main'));
+}
+
+// Fetch the selected worker node's assignable tasks (fail soft) and redraw the slot when they changed; the type already chosen is kept.
+async function wfLoadTasks(main) {
+  const node = wfSelectedNode();
+  if (!node || !isTaskPinNode(node)) { wfState.tasks = null; return; }
+  const id = node.id;
+  let next;
+  try {
+    const r = await fetchJson('/api/instances/' + encodeURIComponent(id) + '/assignable-tasks');
+    next = { items: (r && r.items) || [], error: false };
+  } catch (e) {
+    next = { items: null, error: true };
+  }
+  if (wfState.selectedId !== id) return;
+  const cur = wfState.tasks && wfState.tasks.id === id ? wfState.tasks : null;
+  const changed = !cur || cur.error !== next.error || JSON.stringify(cur.items) !== JSON.stringify(next.items);
+  wfState.tasks = { id, type: cur ? cur.type : '', items: next.items, error: next.error };
+  if (changed) wfRedrawTaskSlot(main);
 }
 
 function wfDraw(main) {
@@ -177,6 +215,7 @@ function wfDraw(main) {
   wireWorkersViewToggle(main);
   wireWorkerSwitchButtons(main);
   if (typeof wireNodePanel === 'function') wireNodePanel(main, {});
+  if (typeof isTaskPinNode === 'function') wfLoadTasks(main);
   main.querySelectorAll('.wf-node').forEach((el) => {
     el.onclick = () => {
       wfState.selectedId = wfState.selectedId === el.dataset.nodeId ? null : el.dataset.nodeId;
@@ -192,8 +231,8 @@ function wfDraw(main) {
 }
 
 async function renderGraphView(main, isPoll) {
-  // Like the Cards view: a poll must not redraw while the operator is choosing in a model dropdown.
-  if (isPoll && typeof document !== 'undefined' && document.activeElement && document.activeElement.classList && document.activeElement.classList.contains('worker-model-select')) return;
+  // Like the Cards view: a poll must not redraw while the operator is choosing in a model or task dropdown.
+  if (isPoll && typeof document !== 'undefined' && document.activeElement && document.activeElement.classList && ['worker-model-select', 'worker-type-select', 'worker-task-select'].some((c) => document.activeElement.classList.contains(c))) return;
   const isStale = renderStaleCheck();
   let graph = null;
   let reason = '';
