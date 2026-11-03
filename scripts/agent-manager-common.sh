@@ -257,6 +257,19 @@ mem_marker_state() {
 # mem_pressure_high -> exit 0 if the lane should yield this tick, 1 otherwise.
 mem_pressure_high() {
   local state
+  # A lane whose model runs on ANOTHER machine (the rx580 on grimm-linux) does not load THIS host's RAM or disk with inference, so this host's
+  # pressure is no reason for it to idle (2026-11-03, owner: "the 580 is on a different machine"). Opt-in by host, never by "not loopback":
+  # the p40 VM (192.168.122.x) lives on this box's RAM and disk and must keep yielding. AGENT_MANAGER_MEM_GUARD_EXEMPT_HOSTS="100.96.112.78 host2".
+  local url="${OLLAMA_URL:-}" host exempt
+  host="${url#*://}"; host="${host%%/*}"; host="${host%%:*}"
+  if [[ -n "$host" ]]; then
+    for exempt in ${AGENT_MANAGER_MEM_GUARD_EXEMPT_HOSTS:-}; do
+      if [[ "$host" == "$exempt" ]]; then
+        printf '[common] host memory guard skipped: lane model runs on %s, a different machine\n' "$host" >>"${LOG_FILE:-/dev/null}" 2>&1
+        return 1
+      fi
+    done
+  fi
   if state="$(mem_marker_state)"; then
     case "$state" in
       tight|critical) printf '[common] host memory pressure %s (broker marker)\n' "$state" >>"${LOG_FILE:-/dev/null}" 2>&1; return 0 ;;

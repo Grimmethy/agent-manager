@@ -144,3 +144,13 @@ test('both lanes still ask mem_pressure_high (the wiring this guards)', () => {
     assert.match(fs.readFileSync(path.join(__dirname, f), 'utf8'), /if mem_pressure_high; then/, f);
   }
 });
+
+test('a lane whose Ollama host is on the exempt list does not yield on this host\'s pressure; p40 VM and unlisted hosts still do', () => {
+  const env = { AGENT_MANAGER_MEM_GUARD_EXEMPT_HOSTS: '100.96.112.78' };
+  const w = world({ marker: marker('critical'), env });
+  assert.equal(yields(w.run('OLLAMA_URL=http://100.96.112.78:11434 mem_pressure_high')), false, 'exempt remote host runs');
+  assert.match(w.run('OLLAMA_URL=http://100.96.112.78:11434 mem_pressure_high').log, /different machine/);
+  assert.equal(yields(w.run('OLLAMA_URL=http://192.168.122.29:11434 mem_pressure_high')), true, 'p40 VM shares this host');
+  assert.equal(yields(w.run('OLLAMA_URL=http://localhost:11434 mem_pressure_high')), true, 'local lane');
+  assert.equal(yields(world({ marker: marker('critical') }).run('OLLAMA_URL=http://100.96.112.78:11434 mem_pressure_high')), true, 'no list set = unchanged');
+});
