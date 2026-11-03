@@ -187,3 +187,115 @@ test('a node whose id getter throws gives the empty result instead of throwing',
   const bad = { get id() { throw new Error('boom'); } };
   assert.deepEqual(layoutGraph({ nodes: [bad], edges: [] }), { positions: {}, width: 0, height: 0, edges: [] });
 });
+
+// ---- groups (HUB0329 piece W-D1): the members of one group are placed next to each other in their column ----
+const G = (id, ...children) => ({ id, label: id, children, collapsed: false });
+const P = (id, parent) => ({ id, parent });
+const order = (r, ids) => ids.slice().sort((a, b) => r.positions[a].y - r.positions[b].y);
+
+test('two members of a group that the plain order separates end up adjacent', () => {
+  const plain = layoutGraph({ nodes: N('a', 'b', 'c'), edges: [] });
+  assert.deepEqual(order(plain, ['a', 'b', 'c']), ['a', 'b', 'c']);
+  const r = layoutGraph({ nodes: [P('a', 'group:g'), P('b', null), P('c', 'group:g')], edges: [], groups: [G('group:g', 'a', 'c')] });
+  assert.deepEqual(order(r, ['a', 'b', 'c']), ['a', 'c', 'b']);
+  assert.deepEqual([r.positions.a.y, r.positions.c.y, r.positions.b.y], [0, STEP_Y, STEP_Y * 2]);
+});
+
+test('two interleaved groups become two contiguous blocks', () => {
+  const r = layoutGraph({
+    nodes: [P('a', 'group:one'), P('b', 'group:two'), P('c', 'group:one'), P('d', 'group:two')], edges: [],
+    groups: [G('group:one', 'a', 'c'), G('group:two', 'b', 'd')],
+  });
+  assert.deepEqual(order(r, ['a', 'b', 'c', 'd']), ['a', 'c', 'b', 'd']);
+});
+
+test('the block sits where the first member was and keeps the old order inside', () => {
+  const r = layoutGraph({ nodes: [P('a', null), P('b', 'group:g'), P('c', null), P('d', 'group:g')], edges: [], groups: [G('group:g', 'd', 'b')] });
+  assert.deepEqual(order(r, ['a', 'b', 'c', 'd']), ['a', 'b', 'd', 'c']);
+});
+
+test('the members of a nested group count as members of the outer group', () => {
+  const r = layoutGraph({
+    nodes: [P('a', 'group:inner'), P('b', null), P('c', 'group:inner'), P('d', 'group:outer')], edges: [],
+    groups: [G('group:outer', 'group:inner', 'd'), G('group:inner', 'a', 'c')],
+  });
+  assert.deepEqual(order(r, ['a', 'b', 'c', 'd']), ['a', 'c', 'd', 'b']);
+});
+
+test('a cycle of group ids neither hangs nor throws', () => {
+  const r = layoutGraph({
+    nodes: [P('a', 'group:x'), P('b', null), P('c', 'group:y')], edges: [],
+    groups: [G('group:x', 'group:y'), G('group:y', 'group:x')],
+  });
+  assert.equal(Object.keys(r.positions).length, 3);
+});
+
+test('a parent that is not a group is no group, and groups in other columns change nothing', () => {
+  const unknown = layoutGraph({ nodes: [P('a', 'nope'), P('b', null), P('c', 'nope')], edges: [], groups: [] });
+  assert.deepEqual(order(unknown, ['a', 'b', 'c']), ['a', 'b', 'c']);
+  const base = layoutGraph({ nodes: N('a', 'b', 'c'), edges: E(['a', 'b']) });
+  const grouped = layoutGraph({ nodes: [P('a', 'group:g'), P('b', 'group:g'), P('c', null)], edges: E(['a', 'b']), groups: [G('group:g', 'a', 'b')] });
+  assert.deepEqual(grouped, base);
+});
+
+test('without groups, or without parents, the result is exactly the old one', () => {
+  const nodes = N('a', 'z', 'm', 'b', 'q');
+  const edges = E(['a', 'b'], ['a', 'm'], ['a', 'z'], ['q', 'z']);
+  const old = layoutGraph({ nodes, edges });
+  assert.deepEqual(layoutGraph({ nodes: nodes.map((n) => ({ ...n, parent: null })), edges, groups: [] }), old);
+  assert.deepEqual(layoutGraph({ nodes: nodes.map((n) => ({ ...n, parent: 'group:g' })), edges, groups: [] }), old);
+});
+
+test('the grouped layout is deterministic', () => {
+  const g = { nodes: [P('a', 'group:g'), P('b', null), P('c', 'group:g')], edges: [], groups: [G('group:g', 'a', 'c')] };
+  assert.deepEqual(layoutGraph(g), layoutGraph(g));
+});
+
+test('three levels of nesting resolve to the outermost group', () => {
+  const r = layoutGraph({
+    nodes: [P('a', 'group:l3'), P('b', null), P('c', 'group:l3'), P('d', 'group:l1')], edges: [],
+    groups: [G('group:l1', 'group:l2', 'd'), G('group:l2', 'group:l3'), G('group:l3', 'a', 'c')],
+  });
+  assert.deepEqual(order(r, ['a', 'b', 'c', 'd']), ['a', 'c', 'd', 'b']);
+});
+
+test('a group listed by two groups belongs to the first of them', () => {
+  const r = layoutGraph({
+    nodes: [P('a', 'group:in'), P('b', 'group:two'), P('c', 'group:in'), P('d', 'group:one'), P('e', 'group:two')], edges: [],
+    groups: [G('group:one', 'group:in', 'd'), G('group:two', 'group:in', 'b', 'e'), G('group:in', 'a', 'c')],
+  });
+  assert.deepEqual(order(r, ['a', 'b', 'c', 'd', 'e']), ['a', 'c', 'd', 'b', 'e']);
+});
+
+test('malformed groups are ignored and never throw', () => {
+  const nodes = [P('a', 'group:g'), P('b', null), P('c', 'group:g')];
+  const old = layoutGraph({ nodes: N('a', 'b', 'c'), edges: [] });
+  assert.deepEqual(layoutGraph({ nodes, edges: [], groups: [G('group:g', 'a', 'c'), null, { children: ['b'] }, { id: 'group:h', children: 'abc' }] }).positions.c, { x: 0, y: STEP_Y });
+  assert.deepEqual(layoutGraph({ nodes, edges: [], groups: 'x' }), old);
+  assert.deepEqual(layoutGraph({ nodes: [P('a', 'undefined'), P('b', null), P('c', 'undefined')], edges: [], groups: [{ children: ['a'] }] }), old);
+});
+
+test('ids that are names on Object.prototype are plain ids', () => {
+  const r = layoutGraph({
+    nodes: [P('a', 'constructor'), P('b', null), P('c', 'constructor')], edges: [],
+    groups: [G('constructor', 'a', 'c')],
+  });
+  assert.deepEqual(order(r, ['a', 'b', 'c']), ['a', 'c', 'b']);
+  const none = layoutGraph({ nodes: [P('a', 'toString'), P('b', null), P('c', 'toString')], edges: [], groups: [] });
+  assert.deepEqual(order(none, ['a', 'b', 'c']), ['a', 'b', 'c']);
+});
+
+test('with duplicate node ids the first node decides the group', () => {
+  const r = layoutGraph({
+    nodes: [P('a', 'group:g'), P('b', null), P('c', 'group:g'), P('a', null)], edges: [], groups: [G('group:g', 'a', 'c')],
+  });
+  assert.deepEqual(order(r, ['a', 'b', 'c']), ['a', 'c', 'b']);
+});
+
+test('a group id that is a name on Object.prototype nests like any other', () => {
+  const nested = layoutGraph({
+    nodes: [P('a', 'constructor'), P('b', null), P('c', 'constructor'), P('d', 'group:o')], edges: [],
+    groups: [G('group:o', 'constructor', 'd'), G('constructor', 'a', 'c')],
+  });
+  assert.deepEqual(order(nested, ['a', 'b', 'c', 'd']), ['a', 'c', 'd', 'b']);
+});

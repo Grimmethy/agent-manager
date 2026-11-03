@@ -162,6 +162,43 @@
     return pts.map(function (p) { return { x: up4(p.x), y: up4(p.y) }; });
   }
 
+  // The OUTERMOST group of every node that sits in a group: start at node.parent and, while another group lists that group as a child, go up (a cycle stops the walk).
+  // A parent that is not a group id of graph.groups counts as no group.
+  function groupKeys(graph) {
+    var nodes = graph.nodes;
+    var groups = Array.isArray(graph.groups) ? graph.groups : [];
+    var isGroup = Object.create(null);
+    var up = Object.create(null);
+    groups.forEach(function (g) { if (g && typeof g.id === 'string') isGroup[g.id] = true; });
+    groups.forEach(function (g) {
+      if (!g || typeof g.id !== 'string' || !Array.isArray(g.children)) return;
+      g.children.forEach(function (c) { if (typeof c === 'string' && !(c in up)) up[c] = g.id; });
+    });
+    var keys = Object.create(null);
+    nodes.forEach(function (n) {
+      if (!n || typeof n.id !== 'string' || n.id in keys) return;
+      var g = isGroup[n.parent] ? n.parent : null;
+      var seen = Object.create(null);
+      while (g !== null && g in up && !seen[g]) { seen[g] = true; g = up[g]; }
+      keys[n.id] = g;
+    });
+    return keys;
+  }
+
+  // Stable regrouping of one row: the members of a group move next to each other, at the place of the group's first member, keeping their order; a node without a group stays put.
+  function regroupRow(row, keys) {
+    var out = [];
+    var done = Object.create(null);
+    row.forEach(function (id) {
+      var k = keys[id];
+      if (k === null) { out.push(id); return; }
+      if (done[k]) return;
+      done[k] = true;
+      row.forEach(function (other) { if (keys[other] === k) out.push(other); });
+    });
+    return out;
+  }
+
   function layoutGraph(graph, opts) {
     try {
       var clean = cleanInput(graph);
@@ -170,7 +207,8 @@
       var backIds = findBackEdges(clean.ids, clean.edges);
       var forward = clean.edges.filter(function (e) { return !backIds[e.id]; });
       var layer = assignLayers(clean.ids, forward);
-      var rows = orderLayers(clean.ids, forward, layer);
+      var keys = groupKeys(graph);
+      var rows = orderLayers(clean.ids, forward, layer).map(function (row) { return regroupRow(row, keys); });
 
       var positions = {};
       var right = 0;

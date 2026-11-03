@@ -456,3 +456,66 @@ test('tasks of another node are not drawn in this node\'s slot, and a type for a
   delete ctx.document;
   assert.equal(vm.runInContext('wfState.tasks.type', ctx), '');
 });
+
+// ---- the flat priority line of a source node (HUB0329 piece W-D5) ----
+
+const ORDER = [
+  { name: 'first', priority: 1, rank: 1 }, { name: 'hygiene', priority: 40, rank: 2 }, { name: 'twin', priority: 40, rank: 2 },
+  { name: 'trio-a', priority: 70, rank: 4 }, { name: 'trio-b', priority: 70, rank: 4 }, { name: 'trio-c', priority: 70, rank: 4 },
+];
+const srcNode = (name) => ({ ...source, id: 'source:' + name, label: name });
+
+test('a source with an entry shows its flat priority, rank and the number of sources, and one other source sharing the priority', () => {
+  const html = v.buildNodePanelHtml(source, [], null, ORDER);
+  assert.match(html, /^<div class="wf-detail" id="wf-detail">/);
+  assert.equal(count(html, '<div class="meta wf-priority">Flat priority 40 · rank 2 of 6 · 1 other source(s) share this priority</div>'), 1);
+  assert.match(html, /<dt>Pending<\/dt><dd>3<\/dd>/);
+  assert.doesNotMatch(html, /wf-controls|worker-switch-btn|wf-runlog/);
+});
+
+test('three sources sharing a priority say 2 others, a source alone at its priority has no sharing sentence', () => {
+  assert.match(v.buildNodePanelHtml(srcNode('trio-b'), [], null, ORDER), /Flat priority 70 · rank 4 of 6 · 2 other source\(s\) share this priority<\/div>/);
+  const alone = v.buildNodePanelHtml(srcNode('first'), [], null, ORDER);
+  assert.match(alone, /Flat priority 1 · rank 1 of 6<\/div>/);
+  assert.doesNotMatch(alone, /share this priority/);
+});
+
+test('a source without an entry, or without a usable priority order, keeps the read-only panel', () => {
+  assert.equal(v.buildNodePanelHtml(srcNode('unknown'), [], null, ORDER), '');
+  for (const bad of [undefined, null, [], 'x', 5, {}, [null, 3]]) assert.equal(v.buildNodePanelHtml(source, [], null, bad), '', JSON.stringify(bad));
+  assert.equal(v.buildSourcePriorityHtml(stage, ORDER), '');
+  assert.equal(v.buildSourcePriorityHtml(null, ORDER), '');
+});
+
+test('the source name and the numbers are escaped', () => {
+  const html = v.buildNodePanelHtml(srcNode('<b>x'), [], null, [{ name: '<b>x', priority: '<i>1', rank: '<u>2' }]);
+  assert.match(html, /Flat priority &lt;i&gt;1 · rank &lt;u&gt;2 of 1<\/div>/);
+  assert.doesNotMatch(html, /<i>1|<u>2/);
+});
+
+test('a loop panel is the same with or without a priority order, and a stage or service stays read-only', () => {
+  assert.equal(v.buildNodePanelHtml(loop(), [], null, ORDER), v.buildNodePanelHtml(loop(), []));
+  assert.equal(v.buildNodePanelHtml(stage, [], null, ORDER), '');
+  assert.equal(v.buildNodePanelHtml(service, [], null, ORDER), '');
+});
+
+test('the graph passes its priorityOrder to the panel of a selected source', () => {
+  const g = { nodes: [loop(), source], edges: [], warnings: [], priorityOrder: ORDER };
+  const lay = v.layoutGraph(g);
+  assert.equal(count(v.buildGraphHtml(g, lay, { selectedId: 'source:hygiene' }), 'Flat priority 40 · rank 2 of 6'), 1);
+  assert.equal(count(v.buildGraphHtml({ ...g, priorityOrder: undefined }, lay, { selectedId: 'source:hygiene' }), 'Flat priority'), 0);
+  assert.equal(count(v.buildGraphHtml(g, lay, { selectedId: null }), 'Flat priority'), 0);
+});
+
+test('only a source node gets the priority line: the name of a loop, a stage or a prefixed id does not count', () => {
+  assert.equal(v.buildSourcePriorityHtml({ ...loop(), id: 'first' }, ORDER), '');
+  assert.equal(v.buildSourcePriorityHtml({ ...stage, id: 'first' }, ORDER), '');
+  assert.equal(v.buildSourcePriorityHtml({ ...source, id: 'not-a-source:first' }, ORDER), '');
+  assert.equal(v.buildSourcePriorityHtml({ ...source, id: 'firstsource:' }, ORDER), '');
+  assert.equal(v.buildSourcePriorityHtml({ ...source, id: 'first' }, ORDER).includes('Flat priority 1 · rank 1 of 6'), true);
+});
+
+test('empty entries in the priority order are skipped even when the source is found', () => {
+  const order = [null, { name: 'first', priority: 1, rank: 1 }, undefined, { name: 'other', priority: 1, rank: 1 }, 7];
+  assert.match(v.buildNodePanelHtml(srcNode('first'), [], null, order), /Flat priority 1 · rank 1 of 5 · 1 other source\(s\) share this priority/);
+});
