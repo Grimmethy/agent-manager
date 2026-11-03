@@ -100,8 +100,8 @@ const NEGATED_VERB_RE = /\b(?:do\s*n[o']?t|don['’]t|does\s*n[o']?t|doesn['’]
 // The sentence the needs-clarification picker appends to a human's answer ("This answer resolves the open question(s) above -- implement against it directly rather than
 // re-asking for clarification"): pipeline text, never a request to write code.
 const PIPELINE_BOILERPLATE_RE = /\bimplement against (?:it|this|that|the answer)\b[^.!?\n]*/gi;
-// An affirmative sentence whose object is a documentation file: "Append X to AGENTS.md", "Create a single NEW Markdown file at docs/research/x.md".
-const DOC_DELIVERABLE_RE = /\b(?:append|prepend|create|write|add|merge|insert|document|record|draft)\b[^.!?\n]{0,160}?(?:\.md\b|\.txt\b|\bdocs?\/|\bMarkdown\b|\bADR\b|\bREADME\b|\bAGENTS\b)/i;
+// 2026-11-03 (stalled-task clearing: HUB0027 "fix the stale README row", HUB0044 "update the runbook with install step"): the verb list was missing "update" / "fix" / "correct" / "revise" / "edit" and the doc-path list was missing "runbook" / "guide" / "manual" / "tutorial" / "howto". A task whose title is "update-the-runbook-with-..." and whose text says "Update the runbook" never tripped the old regex, so `wantsCodeChange` fell back to the legacy blind scan and rejected the doc-only diff.
+const DOC_DELIVERABLE_RE = /\b(?:append|prepend|create|write|add|merge|insert|document|record|draft|update|modify|fix|correct|revise|edit)\b[^\n]{0,160}?(?:\.md\b|\.txt\b|\bdocs?\/|\bMarkdown\b|\bADR\b|\bREADME\b|\bAGENTS\b|\brunbook\b|\bguide\b|\bmanual\b|\btutorial\b|\bhowto\b)/i;
 // A task that says outright its code is read-only / nothing else is touched (2026-10-15: "RULES: read-only on the code; write ONLY the one findings file named below (a NEW file, nothing else
 // changed)" was itself read as a code request because of "NEW file" and "write"). Only meaningful together with a stated documentation deliverable, see wantsCodeChange.
 const READ_ONLY_RE = /\bread-only\b|\bnothing else (?:is |was |gets )?(?:touched|changed|modified|edited)\b|\bchange nothing else\b|\bwrite ONLY the one\b/i;
