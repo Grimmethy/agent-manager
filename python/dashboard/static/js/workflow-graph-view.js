@@ -151,7 +151,7 @@ function buildGraphHtml(graph, layout, state) {
     + '<div class="wf-surface" id="wf-surface"><div class="wf-canvas" style="width:' + wfEsc(width) + 'px;height:' + wfEsc(height) + 'px">' + boxHtml
     + '<svg class="wf-edges" width="' + wfEsc(width) + '" height="' + wfEsc(height) + '" aria-hidden="true"><defs><marker id="wf-arrow" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="8" markerHeight="8" orient="auto">'
     + '<path d="M0 0 L8 4 L0 8 z" class="wf-arrowhead"/></marker></defs>' + paths + '</svg>' + nodes + '</div></div>'
-    + (selected ? ((typeof buildNodePanelHtml === 'function' && buildNodePanelHtml(selected, g.warnings, state && state.tasks, g.priorityOrder)) || buildDetailHtml(selected, g.warnings)) : '');
+    + (selected ? ((typeof buildNodePanelHtml === 'function' && buildNodePanelHtml(selected, g.warnings, state && state.tasks, g.priorityOrder, g.priorityCompare, g.groups)) || buildDetailHtml(selected, g.warnings)) : '');
 }
 
 // What the poll compares: ids and the values the cards show. stateAgeSeconds is left out on purpose, it changes every poll.

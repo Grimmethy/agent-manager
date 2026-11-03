@@ -440,7 +440,7 @@ test('priorityOrder is an empty list without topology entries, and the output ke
   assert.deepEqual(buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: [] }).priorityOrder, []);
   const g = buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: 'x' });
   assert.deepEqual(g.priorityOrder, []);
-  assert.deepEqual(Object.keys(g).sort(), ['edges', 'generatedAt', 'groups', 'nodes', 'priorityOrder', 'schemaVersion', 'warnings']);
+  assert.deepEqual(Object.keys(g).sort(), ['edges', 'generatedAt', 'groups', 'nodes', 'priorityCompare', 'priorityOrder', 'schemaVersion', 'warnings']);
 });
 
 test('priorityOrder survives the workflow overlay and the watchdog script nodes unchanged', () => {
@@ -464,4 +464,53 @@ test('the builder CLI prints the priorityOrder key', () => {
   const out = spawnSync(process.execPath, [path.join(__dirname, 'workflow-graph.js'), '--stdin'], { input, encoding: 'utf8' });
   assert.equal(out.status, 0);
   assert.deepEqual(JSON.parse(out.stdout).priorityOrder.map((e) => e.name), ['early', 'also-late', 'late']);
+});
+
+// ---- priorityCompare (HUB0331 piece W-E2) ----
+
+const GROUPED = { schemaVersion: 1, groups: [{ id: 'group:first', children: ['source:late'] }, { id: 'group:second', children: ['source:early'] }], edges: [], labels: {} };
+
+test('the builder returns the group order next to the flat order, computed after the overlay', () => {
+  const g = buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: TOPOLOGY_3, workflow: GROUPED });
+  // flat order: early 1, also-late 2, late 2; group order: group:first (late) 1, group:second (early) 2, the ungrouped also-late 3
+  assert.deepEqual(g.priorityCompare, [
+    { name: 'early', flatRank: 1, graphRank: 2, group: 'group:second' },
+    { name: 'also-late', flatRank: 2, graphRank: 3, group: null },
+    { name: 'late', flatRank: 2, graphRank: 1, group: 'group:first' },
+  ]);
+  assert.deepEqual(g.priorityOrder.map((e) => e.name), ['early', 'also-late', 'late']);
+});
+
+test('priorityCompare is empty without a workflow config, with an empty one and with groups that hold no source', () => {
+  const none = { ...OVERLAY_INPUT(), topology: TOPOLOGY_3 };
+  assert.deepEqual(buildWorkflowGraph(none).priorityCompare, []);
+  assert.deepEqual(buildWorkflowGraph({ ...none, workflow: { schemaVersion: 1, groups: [], edges: [], labels: {} } }).priorityCompare, []);
+  assert.deepEqual(buildWorkflowGraph({ ...none, workflow: { schemaVersion: 1, groups: [{ id: 'group:g', children: ['worker-a'] }], edges: [], labels: {} } }).priorityCompare, []);
+  assert.deepEqual(buildWorkflowGraph({ ...none, topology: [] , workflow: GROUPED }).priorityCompare, []);
+});
+
+test('the rest of the graph does not depend on the group order: nodes, edges, groups, warnings and priorityOrder are what the overlay produced', () => {
+  const input = { ...OVERLAY_INPUT(), topology: TOPOLOGY_3 };
+  const plain = buildWorkflowGraph(input);
+  const grouped = buildWorkflowGraph({ ...input, workflow: GROUPED });
+  const { priorityCompare, ...rest } = grouped;
+  assert.deepEqual(rest.priorityOrder, plain.priorityOrder);
+  assert.deepEqual(rest.edges, plain.edges);
+  assert.deepEqual(rest.nodes.map((n) => n.id), plain.nodes.map((n) => n.id));
+  assert.deepEqual(rest.groups.map((x) => x.id), ['group:first', 'group:second']);
+  assert.deepEqual(rest.warnings, plain.warnings);
+  assert.equal(Array.isArray(priorityCompare), true);
+});
+
+test('the builder CLI prints the priorityCompare key', () => {
+  const input = JSON.stringify({ ...OVERLAY_INPUT(), now: undefined, topology: TOPOLOGY_3, workflow: GROUPED });
+  const out = spawnSync(process.execPath, [path.join(__dirname, 'workflow-graph.js'), '--stdin'], { input, encoding: 'utf8' });
+  assert.equal(out.status, 0);
+  assert.deepEqual(JSON.parse(out.stdout).priorityCompare.map((e) => [e.name, e.graphRank]), [['early', 2], ['also-late', 3], ['late', 1]]);
+});
+
+test('priorityCompare is computed from the graph after the overlay: a source grouped only by the workflow file is grouped in the comparison', () => {
+  const g = buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: TOPOLOGY_3, workflow: GROUPED });
+  assert.equal(g.nodes.find((n) => n.id === 'source:late').parent, 'group:first');
+  assert.equal(g.priorityCompare.find((e) => e.name === 'late').group, 'group:first');
 });

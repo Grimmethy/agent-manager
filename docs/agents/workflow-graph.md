@@ -173,12 +173,39 @@ Phase D did two things: it fixed the group boxes, and it built the BASELINE for 
 - The layout keeps the members of the OUTERMOST group together. The members of a group nested inside another group keep their old order inside the outer block, so a box of the inner group can still cover another member of the outer group.
 - A node id that is a name on `Object.prototype` (for example `constructor`) breaks the layout, which then returns its empty result; no real node has such an id.
 
-**Not built: a priority derived from the graph.** There is no graph-derived priority and no switch that would change the claim order; the registered priorities and the claim order are exactly what they were. The reason is in the data: in the live graph measured on 2026-11-03 (52 sources, 6 lanes) the edges are 112 `claims` (a source to a lane), 4 `produces` (between the stage nodes), 4 `reviews`, 2 `applies` and 2 `refines`, and no source has an edge to any stage, so a source has no position in the workflow that could order it.
-The owner has to decide what "position in the workflow" means for a source before anything can be built. Two candidates that can be read from the code:
+**Why there was nothing to derive (decided in phase E).** Phase D itself built no graph-derived priority and no switch that would change the claim order; the registered priorities and the claim order are exactly what they were. The reason is in the data: in the live graph measured on 2026-11-03 (52 sources, 6 lanes) the edges are 112 `claims` (a source to a lane), 4 `produces` (between the stage nodes), 4 `reviews`, 2 `applies` and 2 `refines`, and no source has an edge to any stage, so a source has no position in the workflow that could order it.
+The owner had to decide what "position in the workflow" means for a source. Two candidates that could be read from the code:
 - the stage a source's output first enters. It needs an edge from each source to a stage, which the builder does not derive today; a `workflow.json` can author such edges between existing nodes, so the meaning could be tried by hand first.
 - the lanes that can claim it. The `claims` edges exist today, so a rank could come from, for example, how many lanes can take the source or which tier those lanes are; it would say how scarce the capacity is, not how far along the workflow the work is.
-The baseline above is what a comparison needs: today's order, per source, next to whatever the chosen meaning would give.
+The owner chose a third meaning, the order of the groups the owner authors in the workflow file; phase E builds it as a comparison (below). The baseline above is what that comparison is made against.
+
+## What phase E added (HUB0331)
+
+**The decision.** The owner's answer to "what is a source's position in the workflow" (2026-11-03): the order of the groups authored in `workflow.json`. The priority settings exist to decide which loops should run, given the compute available at the time and the sort of work that needs doing; the task lists are expected to become workflow loops themselves. Phase E makes the authored order visible next to today's flat order. It changes no claim order.
+
+**How to author it.** Group the sources in the workflow file; the order of the groups in the file is the order of the work. The example used in the real-browser check:
+
+```json
+{ "schemaVersion": 1,
+  "groups": [ { "id": "group:fixes", "label": "Fixes and audits first", "children": ["source:doc_drift_fix", "source:pipeline_forensics"], "collapsed": false },
+              { "id": "group:intake", "label": "Your own tasks", "children": ["source:derived_task", "source:adhoc"], "collapsed": false } ],
+  "edges": [], "labels": {} }
+```
+
+**The rule** (`groupPriorityOrder(graph, flatOrder)` in `src/workflow-priority.js`, pure, never throws). A source is the node `source:<name>`. Its group is its OUTERMOST group (from `node.parent`, going up while another group lists that group as a child; a cycle stops the walk; a parent that is not a group counts as none). Sources are ranked by the index of that group in the file, then by the flat priority, then by name, with ungrouped sources last; the rank is the competition rank (sources with the same group and priority share a rank and the next rank skips). It returns `[{ name, flatRank, graphRank, group }]` in the order of the flat list, and `[]` when no source is in a group, so a graph without authoring shows no comparison. Test: `node --test src/workflow-priority.test.js`.
+
+**Where it shows.** The builder returns the list as the graph's `priorityCompare` key, computed after the workflow overlay because the groups and parents come from it (`src/workflow-graph.js`; test: `node --test src/workflow-graph.test.js`). The node panel of a selected source shows a second line under the flat priority line, for example "Group order: rank 3 of 26 · group Your own tasks · 2 places lower than the flat order" (a difference of one reads "1 place"; no difference reads "same place as the flat order"; a source outside every group reads "group ungrouped"), using the group label from the groups list and the id when there is no label (`buildSourceGroupOrderHtml` in `python/dashboard/static/js/workflow-node-panel.js`; test: `node --test python/dashboard/tests/test_workflow_node_panel.js`).
+
+**Known limits of phase E.**
+- Only the order is shown. Nothing reads `priorityCompare` to choose a task, and nothing records how the two orders differ over time.
+- A task list that becomes a workflow loop is not modelled: the rule reads the nodes named `source:<name>`.
+- The header overlap of a group box described under phase D applies to groups of sources as well.
+
+**Not built, and what each would need.**
+- A switch that makes the claim path use the group order. The claim order comes from each source's registered priority: `src/task-sources.js` calls `registerTaskSource` (`src/task-source-registry.js`) with `taskPriority(name, default)` (`src/lib/task-priority.js`, which reads the per-source overrides of the config) when each source registers, and `src/next-claimable-task.js` ranks tasks by it. A derived order needs a new input at registration or a re-rank at claim time, and the claim path would have to read the workflow file and apply the overlay itself (`readWorkflowConfig` in `src/workflow-config.js` and `applyWorkflowConfig` in `src/workflow-overlay.js` are pure and could be used), because the dashboard builds the graph and the claim scripts do not.
+- A one-day comparison run before any switch: the panel shows the difference live, but nothing tallies it.
+- Choosing loops by the compute available and the sort of work: lanes carry task class allowlists and tiers (`src/lanes.js`) but the group order says nothing about which GPU is free; this is the longer goal the owner described.
 
 ## Next phases (not built)
 
-- **Phase D, the priority that follows the graph.** The baseline and the comparison aid are built (see above). A graph-derived priority, the off-by-default switch for it and a one-day comparison before any switch need the owner's decision on what a source's position in the workflow means. Not built.
+- **Priority that follows the graph, remaining work.** The baseline (phase D) and the authored group order shown next to it (phase E) are built. The switch for the claim path, a one-day comparison and choosing loops by compute and work type are not built (see "Not built, and what each would need" under phase E).
