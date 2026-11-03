@@ -3,7 +3,7 @@
 // wait-for-change.js -- block until one of the given directories changes, or the fallback time is up (ADR-0024 stage S3: lanes wake on change instead of
 // re-checking on a timer).
 //
-//   node src/wait-for-change.js --timeout <secs> [--since <epoch-ms>] [--debounce <ms>] [--pool-queues <homeQueueDir>] [dir ...]
+//   node src/wait-for-change.js --timeout <secs> [--since <epoch-ms>] [--debounce <ms>] [--subdirs a,b] [--pool-queues <homeQueueDir>] [dir ...]
 //
 // Prints ONE line to stdout and exits 0:
 //   event <dir>      an entry was ADDED to (or renamed into) a watched directory, after a short debounce so a burst is one wake. Removals are ignored on
@@ -17,7 +17,8 @@
 // Register, catch up once, then react (ADR-0024): the catch-up is --since, the reaction is the watch.
 // Watches are released on exit. fs.watch (inotify) works on the HDD queue dirs and on /dev/shm here; `inotifywait` is not installed.
 //
-// --pool-queues <homeQueueDir> adds queue/pending and queue/adhoc of the home project and of every registered project (lanes may borrow work from them).
+// --pool-queues <homeQueueDir> adds queue/<subdir> of the home project and of every registered project (lanes may borrow work from them); --subdirs picks which
+// (default pending,adhoc for worker lanes; the review daemon uses review, the apply loop approved).
 
 const fs = require('fs');
 const path = require('path');
@@ -73,9 +74,9 @@ function waitForChange({ dirs, timeoutMs, sinceMs = null, debounceMs = 1000, wat
   });
 }
 
-function poolQueueDirs(homeQueueDir) {
+function poolQueueDirs(homeQueueDir, subdirs = ['pending', 'adhoc']) {
   const dirs = [];
-  const add = (queueDir) => { for (const sub of ['pending', 'adhoc']) dirs.push(path.join(queueDir, sub)); };
+  const add = (queueDir) => { for (const sub of subdirs) dirs.push(path.join(queueDir, sub)); };
   if (homeQueueDir) add(homeQueueDir);
   try {
     const { registeredProjects } = require('./pool-projects.js');
@@ -90,12 +91,14 @@ if (require.main === module) {
   const args = process.argv.slice(2);
   const opt = { timeout: 120, since: null, debounce: 1000 };
   const dirs = [];
+  let subdirs = ['pending', 'adhoc'];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--timeout') opt.timeout = Number(args[++i]);
     else if (a === '--since') opt.since = Number(args[++i]);
     else if (a === '--debounce') opt.debounce = Number(args[++i]);
-    else if (a === '--pool-queues') dirs.push(...poolQueueDirs(args[++i]));
+    else if (a === '--subdirs') subdirs = String(args[++i]).split(',').map((x) => x.trim()).filter(Boolean);
+    else if (a === '--pool-queues') dirs.push(...poolQueueDirs(args[++i], subdirs));
     else dirs.push(a);
   }
   if (!Number.isFinite(opt.timeout) || opt.timeout <= 0) opt.timeout = 120;
