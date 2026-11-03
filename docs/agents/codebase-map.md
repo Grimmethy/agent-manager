@@ -66,7 +66,17 @@ out of it into `models-tab.js` on 2026-10-02. `task-detail-modal.js` (742 lines)
 (Workers, Job List, Discovery, ...), not tied to any one tab itself —
 `renderTaskDetailModal()` (L201).
 
-## Section 2 — Routes with no sidebar tab
+## Section 2 — Utility modules
+
+Pure JS modules that are not dashboard tabs themselves but are used by them.
+
+| Module | Path | Purpose | Exports | Storage |
+|---|---|---|---|---|
+| tab-stack | `python/dashboard/static/js/tab-stack.js` | Pure tab-stack registry: manages an array of tabs (id, name, open, width, lastActivatedAt) and an order list of ids, keyed per plugin via a storage key. No DOM, no localStorage. | Constants: `MAX_OPEN=6`, `MAX_TABS=24`, `DEFAULT_WIDTH=380`, `DEFAULT_TAB_ID='main'`<br>Functions: `registryKey(plugin)`, `deserializeRegistry(raw)`, `createTab(registry, plugin, name)`, `renameTab(registry, tabId, newName)`, `deleteTab(registry, tabId)`, `reorder(registry, tabId, direction)`, `setOpen(registry, tabId, open)`, `markActivated(registry, tabId)`, `mostRecentlyActivated(registry)`, `asideOrder(registry)`, `pillColumns(registry, asideWidth)` | `agentManagerPluginTabs:<plugin>` |
+
+Registry shape: `{tabs:[{id,name,open,width,lastActivatedAt}], order:[id]}`. Used by dashboard tabs to persist tab state across sessions. Loaded by `index.html` as a plain global `<script>`.
+
+## Section 3 — Routes with no sidebar tab
 
 | Feature | Route prefix(es) | Lines | Note |
 |---|---|---|---|
@@ -78,7 +88,7 @@ out of it into `models-tab.js` on 2026-10-02. `task-detail-modal.js` (742 lines)
 | Model benchmark panel | `/api/benchmark/*` | `app.py:2190-2373` | Launches/polls background model benchmark runs. |
 | Pipeline status/control | `/api/pipeline/status`, `/start`, `/stop` | `app.py:6680-7082, 8097-8148` | Overall daemon status and start/stop controls, surfaced inline on the Project tab rather than as a separate route-driven tab. |
 
-## Section 3 — Core pipeline mechanisms (seed section)
+## Section 4 — Core pipeline mechanisms (seed section)
 
 Grouped to match the categories AGENTS.md's own principles already describe — this
 section is meant to answer "where is the code for the thing that principle is talking
