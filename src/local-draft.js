@@ -904,9 +904,11 @@ async function runPlanPass(task, {
   // read-only tools before planning. runOrientPass skips itself (0 GPU) when grounding
   // already covers the task or when there's nothing concrete to orient on. Kill switch
   // AGENT_MANAGER_ADHOC_ORIENT=false.
+  let orientResult = null;
   if (substanceGated && grounding && process.env.AGENT_MANAGER_ADHOC_ORIENT !== 'false') {
     try {
       const orient = await runOrientPassFn(task, { grounding, maybeLocked });
+      orientResult = orient;
       recordOrient(attempt, { turnsUsed: orient.turnsUsed, skipped: orient.skipped });
       appendHistoryEvent(task, 'orient-done', orient.skipped ? 'skipped (grep-covered)' : `${orient.turnsUsed} turn(s)`);
       if (!orient.skipped && orient.notes) {
@@ -917,6 +919,19 @@ async function runPlanPass(task, {
     } catch (e) {
       if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
       appendHistoryEvent(task, 'advisory', `orient pass errored (non-fatal): ${String(e && e.message || e).slice(0, 160)}`);
+    }
+  }
+
+  // Context provenance stamp (2026-11-03): which grounding sources fed this draft.
+  // Pure module, deterministic, serialized size under 2048 bytes. Kill switch:
+  // AGENT_MANAGER_CONTEXT_PROVENANCE=false (default on). Failure is swallowed.
+  if (process.env.AGENT_MANAGER_CONTEXT_PROVENANCE !== 'false') {
+    try {
+      const { buildContextProvenance } = require('./lib/context-provenance.js');
+      const grounding = task._planGrounding || null;
+      task.contextProvenance = buildContextProvenance({ grounding, orient: orientResult, task });
+    } catch (e) {
+      console.warn(`[local-draft] context-provenance failed for ${task.id}: ${e.message}`);
     }
   }
 
