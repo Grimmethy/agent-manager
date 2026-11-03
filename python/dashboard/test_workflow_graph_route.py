@@ -92,6 +92,73 @@ class TestAssembleGraph(unittest.TestCase):
         self.assertEqual(calls, ["l", "i", "t", "m"])
 
 
+class TestOptionalInputs(unittest.TestCase):
+    CONFIG = {"schemaVersion": 1, "groups": [], "edges": [], "labels": {"a": "A"}}
+
+    def _assemble(self, **over):
+        recorder = Recorder()
+        parts = dict(run_lanes=_ok([]), get_instances=_ok([]), get_topology=_ok([]), get_models=_ok({}), run_builder=recorder)
+        parts.update(over)
+        return wg.assemble_graph(**parts), recorder
+
+    def test_without_the_optional_getters_the_payload_has_exactly_the_four_inputs(self):
+        out, builder = self._assemble()
+        self.assertEqual(set(builder.payload), {"lanes", "instances", "topology", "models"})
+        self.assertEqual(out, GRAPH)
+
+    def test_the_workflow_config_reaches_the_builder_and_its_warnings_follow_the_input_warnings(self):
+        out, builder = self._assemble(get_workflow=_ok({"config": self.CONFIG, "warnings": ["file: dropped a group"]}), get_instances=_boom("kaput"), run_builder=Recorder(dict(GRAPH, warnings=["from builder"])))
+        self.assertEqual(out["warnings"], ["from builder", "instances: kaput", "file: dropped a group"])
+
+    def test_the_workflow_config_is_passed_as_workflow(self):
+        _, builder = self._assemble(get_workflow=_ok({"config": self.CONFIG, "warnings": []}))
+        self.assertEqual(builder.payload["workflow"], self.CONFIG)
+        self.assertNotIn("watchdogScripts", builder.payload)
+
+    def test_the_watchdog_scripts_are_passed_as_watchdog_scripts(self):
+        scripts = [{"plugin": "p", "script": "a.js"}]
+        _, builder = self._assemble(get_watchdog_scripts=_ok(scripts))
+        self.assertEqual(builder.payload["watchdogScripts"], scripts)
+        self.assertNotIn("workflow", builder.payload)
+        _, empty = self._assemble(get_watchdog_scripts=_ok([]))
+        self.assertEqual(empty.payload["watchdogScripts"], [])
+
+    def test_a_failing_getter_adds_one_warning_naming_it_and_leaves_its_key_out(self):
+        out, builder = self._assemble(get_workflow=_boom("kaput"), get_watchdog_scripts=_ok([]))
+        self.assertEqual(out["warnings"], ["workflow: kaput"])
+        self.assertNotIn("workflow", builder.payload)
+        self.assertIn("watchdogScripts", builder.payload)
+        out, builder = self._assemble(get_workflow=_ok({"config": self.CONFIG, "warnings": []}), get_watchdog_scripts=_boom("nope"))
+        self.assertEqual(out["warnings"], ["watchdogScripts: nope"])
+        self.assertNotIn("watchdogScripts", builder.payload)
+        self.assertIn("workflow", builder.payload)
+
+    def test_a_malformed_result_is_treated_like_a_failure(self):
+        for bad in (["x"], None, "text", {"warnings": []}, {"config": "x"}, {"config": []}):
+            out, builder = self._assemble(get_workflow=_ok(bad))
+            self.assertNotIn("workflow", builder.payload, repr(bad))
+            self.assertEqual(len(out["warnings"]), 1, repr(bad))
+            self.assertTrue(out["warnings"][0].startswith("workflow: "))
+        for bad in ({"scripts": []}, None, "x", 5):
+            out, builder = self._assemble(get_watchdog_scripts=_ok(bad))
+            self.assertNotIn("watchdogScripts", builder.payload, repr(bad))
+            self.assertTrue(out["warnings"][0].startswith("watchdogScripts: "))
+
+    def test_warnings_keep_the_input_order_lanes_first_then_workflow_then_watchdog_scripts(self):
+        out, _ = self._assemble(run_lanes=_boom("a"), get_workflow=_boom("b"), get_watchdog_scripts=_boom("c"))
+        self.assertEqual(out["warnings"], ["lanes: a", "workflow: b", "watchdogScripts: c"])
+
+    def test_a_workflow_config_without_warnings_adds_none(self):
+        out, _ = self._assemble(get_workflow=_ok({"config": self.CONFIG}))
+        self.assertEqual(out, GRAPH)
+
+    def test_a_failing_builder_still_gives_available_false_when_the_optional_inputs_are_given(self):
+        def broken(_payload):
+            raise RuntimeError("builder down")
+        out, _ = self._assemble(run_builder=broken, get_workflow=_ok({"config": self.CONFIG, "warnings": ["w"]}), get_watchdog_scripts=_ok([]))
+        self.assertEqual(out, {"available": False, "reason": "builder down"})
+
+
 class TestJsonOf(unittest.TestCase):
     def test_unwraps_a_response_and_a_response_status_tuple(self):
         resp = Response(json.dumps({"a": 1}), mimetype="application/json")
@@ -117,7 +184,7 @@ class TestRoute(unittest.TestCase):
             resp = app.app.test_client().get("/api/workflow-graph")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json()["schemaVersion"], 1)
-        self.assertEqual(set(fake.call_args.kwargs), {"run_lanes", "get_instances", "get_topology", "get_models", "run_builder"})
+        self.assertEqual(set(fake.call_args.kwargs), {"run_lanes", "get_instances", "get_topology", "get_models", "run_builder", "get_workflow", "get_watchdog_scripts"})
 
     def test_view_answers_200_with_available_false_when_the_builder_fails(self):
         with mock.patch.object(wg, "assemble_graph", return_value={"available": False, "reason": "boom"}):
@@ -145,12 +212,21 @@ class TestRoute(unittest.TestCase):
 class TestViewWiring(unittest.TestCase):
     """The real view with every collaborator patched: checks which node script gets which arguments."""
 
-    def _get(self, topology_body):
+    WORKFLOW_OUT = {"config": {"schemaVersion": 1, "groups": [], "edges": [], "labels": {}}, "warnings": []}
+    SCRIPTS_OUT = {"scripts": [], "skipped": []}
+
+    def _get(self, topology_body, workflow_out=None, scripts_out=None):
         calls = []
 
         def fake_run_node(script, args, env, stdin_text=None):
             calls.append((script, list(args), stdin_text))
-            return [{"id": "worker-3090"}] if script == "lanes.js" else dict(GRAPH)
+            if script == "lanes.js":
+                return [{"id": "worker-3090"}]
+            if script == "workflow-config.js":
+                return self.WORKFLOW_OUT if workflow_out is None else workflow_out
+            if script == "plugin-watchdog-scripts.js":
+                return self.SCRIPTS_OUT if scripts_out is None else scripts_out
+            return dict(GRAPH)
 
         def resp(body):
             return lambda: Response(json.dumps(body), mimetype="application/json")
@@ -166,8 +242,10 @@ class TestViewWiring(unittest.TestCase):
         out, calls = self._get({"available": True, "sources": [{"name": "src-a"}]})
         self.assertEqual(out.status_code, 200)
         self.assertEqual(calls[0][:2], ("lanes.js", []))
-        self.assertEqual(calls[1][:2], ("workflow-graph.js", ["--stdin"]))
-        payload = json.loads(calls[1][2])
+        builder = [c for c in calls if c[0] == "workflow-graph.js"]
+        self.assertEqual(len(builder), 1)
+        self.assertEqual(builder[0][:2], ("workflow-graph.js", ["--stdin"]))
+        payload = json.loads(builder[0][2])
         self.assertEqual(payload["lanes"], [{"id": "worker-3090"}])
         self.assertEqual(payload["instances"], [{"instanceId": "reviewer"}])
         self.assertEqual(payload["topology"], [{"name": "src-a"}])
@@ -177,7 +255,7 @@ class TestViewWiring(unittest.TestCase):
     def test_an_unavailable_pipeline_map_gives_an_empty_topology_and_a_warning(self):
         out, calls = self._get({"available": False, "reason": "node missing"})
         self.assertEqual(out.status_code, 200)
-        self.assertEqual(json.loads(calls[1][2])["topology"], [])
+        self.assertEqual(json.loads([c for c in calls if c[0] == "workflow-graph.js"][0][2])["topology"], [])
         warnings = out.get_json()["warnings"]
         self.assertEqual(len(warnings), 1)
         self.assertTrue(warnings[0].startswith("topology: "))
@@ -185,6 +263,29 @@ class TestViewWiring(unittest.TestCase):
 
     def test_node_calls_time_out_after_15_seconds(self):
         self.assertEqual(wg.NODE_TIMEOUT_SECONDS, 15)
+
+    def test_the_workflow_file_and_the_watchdog_scripts_are_read_with_their_own_scripts_and_reach_the_builder(self):
+        config = {"schemaVersion": 1, "groups": [{"id": "group:x", "label": "X", "children": ["worker-3090"], "collapsed": False}], "edges": [], "labels": {}}
+        scripts = [{"plugin": "uiforge", "root": "/r", "script": "harness/watchdog-trigger.js", "abs": "/r/harness/watchdog-trigger.js"}]
+        out, calls = self._get({"available": True, "sources": []}, {"config": config, "warnings": ["workflow file: one thing was dropped"]}, {"scripts": scripts, "skipped": []})
+        names = [c[0] for c in calls]
+        self.assertEqual(names, ["lanes.js", "workflow-config.js", "plugin-watchdog-scripts.js", "workflow-graph.js"])
+        self.assertEqual(calls[1][:2], ("workflow-config.js", []))
+        self.assertEqual(calls[2][:2], ("plugin-watchdog-scripts.js", ["--json"]))
+        self.assertEqual(calls[3][:2], ("workflow-graph.js", ["--stdin"]))
+        payload = json.loads(calls[3][2])
+        self.assertEqual(payload["workflow"], config)
+        self.assertEqual(payload["watchdogScripts"], scripts)
+        self.assertEqual(out.get_json()["warnings"], ["workflow file: one thing was dropped"])
+
+    def test_a_watchdog_output_without_a_scripts_list_gives_a_warning_and_no_key(self):
+        out, calls = self._get({"available": True, "sources": []}, scripts_out={"skipped": []})
+        payload = json.loads([c for c in calls if c[0] == "workflow-graph.js"][0][2])
+        self.assertNotIn("watchdogScripts", payload)
+        self.assertIn("workflow", payload)
+        warnings = out.get_json()["warnings"]
+        self.assertEqual(len(warnings), 1)
+        self.assertTrue(warnings[0].startswith("watchdogScripts: "))
 
 
 if __name__ == "__main__":
