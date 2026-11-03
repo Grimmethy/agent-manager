@@ -58,6 +58,27 @@ class ReadTrigger(unittest.TestCase):
         r = self.read(held=lambda p: True)
         self.assertEqual((r["state"], r["endedAt"], r["endedAgeS"], r["stopped"], r["iterations"]), ("draining", None, None, None, None))
 
+    def test_a_lingering_drain_that_holds_the_lock_is_listening_until_it_ticks(self):
+        base = {"endedAt": ISO(5), "backlog": False, "stopped": "idle", "iterations": 3}
+        self.write("verifier", {**base, "lingering": True, "working": False})
+        self.assertEqual(self.read("verifier", held=lambda p: True)["state"], "listening")
+        self.write("verifier", {**base, "lingering": True, "working": True})
+        self.assertEqual(self.read("verifier", held=lambda p: True)["state"], "draining")
+        self.write("verifier", {**base, "lingering": False, "working": False})
+        self.assertEqual(self.read("verifier", held=lambda p: True)["state"], "draining")
+        self.write("verifier", base)
+        self.assertEqual(self.read("verifier", held=lambda p: True)["state"], "draining")                 # a drain that ends never writes lingering
+        self.write("verifier", {**base, "lingering": True})
+        self.assertEqual(self.read("verifier", held=lambda p: True)["state"], "draining")                 # no `working` field: not proven to be waiting
+        self.write("verifier", {**base, "lingering": "yes", "working": False})
+        self.assertEqual(self.read("verifier", held=lambda p: True)["state"], "draining")
+
+    def test_a_lingering_state_whose_drain_is_gone_is_not_listening(self):
+        self.write("verifier", {"endedAt": ISO(5), "backlog": False, "lingering": True, "working": False})
+        self.assertEqual(self.read("verifier", held=lambda p: False)["state"], "idle")
+        self.write("verifier", {"endedAt": ISO(5), "backlog": True, "lingering": True, "working": False})
+        self.assertEqual(self.read("verifier", held=lambda p: False)["state"], "backlog")
+
     def test_the_lock_check_is_asked_about_this_workers_own_lock(self):
         seen = []
         self.read("verifier", held=lambda p: seen.append(p) or False)
