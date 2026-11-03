@@ -418,3 +418,50 @@ test('the builder with watchdogScripts adds the service nodes and triggers edges
   const grouped = buildWorkflowGraph({ ...OVERLAY_INPUT(), watchdogScripts: [{ plugin: 'uiforge', script: 'a.js' }], workflow: { schemaVersion: 1, groups: [{ id: 'group:wd', children: ['service:watchdog', 'service:watchdog-script:uiforge:a'] }], edges: [], labels: {} } });
   assert.equal(grouped.nodes.find((n) => n.id === 'service:watchdog-script:uiforge:a').parent, 'group:wd');
 });
+
+// ---- priorityOrder (HUB0329 piece W-D4) ----
+
+const TOPOLOGY_3 = [
+  { name: 'late', slug: 'late', priority: 40, reasoningTier: 'low', workerType: 'ornith', liveCounts: {} },
+  { name: 'early', slug: 'early', priority: 10, reasoningTier: 'low', workerType: 'ornith', liveCounts: {} },
+  { name: 'also-late', slug: 'also-late', priority: 40, reasoningTier: 'low', workerType: 'ornith', liveCounts: {} },
+];
+
+test('the builder returns the flat priority order of the topology, in claim order with competition ranks', () => {
+  const g = buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: TOPOLOGY_3 });
+  assert.deepEqual(g.priorityOrder, [
+    { name: 'early', priority: 10, rank: 1 },
+    { name: 'also-late', priority: 40, rank: 2 },
+    { name: 'late', priority: 40, rank: 2 },
+  ]);
+});
+
+test('priorityOrder is an empty list without topology entries, and the output keys are exactly the contract', () => {
+  assert.deepEqual(buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: [] }).priorityOrder, []);
+  const g = buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: 'x' });
+  assert.deepEqual(g.priorityOrder, []);
+  assert.deepEqual(Object.keys(g).sort(), ['edges', 'generatedAt', 'groups', 'nodes', 'priorityOrder', 'schemaVersion', 'warnings']);
+});
+
+test('priorityOrder survives the workflow overlay and the watchdog script nodes unchanged', () => {
+  const plain = buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: TOPOLOGY_3 });
+  const workflow = { schemaVersion: 1, groups: [{ id: 'group:g', children: ['worker-a'] }], edges: [], labels: { 'worker-a': 'Alpha' } };
+  const scripts = [{ plugin: 'uiforge', script: 'a.js' }];
+  assert.deepEqual(buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: TOPOLOGY_3, workflow }).priorityOrder, plain.priorityOrder);
+  assert.deepEqual(buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: TOPOLOGY_3, watchdogScripts: scripts }).priorityOrder, plain.priorityOrder);
+  assert.deepEqual(buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: TOPOLOGY_3, workflow, watchdogScripts: scripts }).priorityOrder.length, 3);
+});
+
+test('the priority order does not change the nodes, edges, groups or warnings of the graph', () => {
+  const a = buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: TOPOLOGY_3 });
+  const b = buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: TOPOLOGY_3.map((t) => ({ ...t, priority: 99 })) });
+  const strip = (g) => ({ ...g, priorityOrder: undefined });
+  assert.deepEqual(strip(a), strip(b));
+});
+
+test('the builder CLI prints the priorityOrder key', () => {
+  const input = JSON.stringify({ ...OVERLAY_INPUT(), now: undefined, topology: TOPOLOGY_3 });
+  const out = spawnSync(process.execPath, [path.join(__dirname, 'workflow-graph.js'), '--stdin'], { input, encoding: 'utf8' });
+  assert.equal(out.status, 0);
+  assert.deepEqual(JSON.parse(out.stdout).priorityOrder.map((e) => e.name), ['early', 'also-late', 'late']);
+});
