@@ -18,9 +18,10 @@
 //   watchdogScripts - optional list of plugin watchdog scripts ({ plugin, script, ... } from src/plugin-watchdog-scripts.js): one service node each, with a triggers edge from service:watchdog
 //
 // Output contract:
-//   { schemaVersion: 1, generatedAt: ISO string, nodes: [Node], edges: [Edge], groups: [], warnings: [string] }
+//   { schemaVersion: 1, generatedAt: ISO string, nodes: [Node], edges: [Edge], groups: [], priorityOrder: [{ name, priority, rank }], priorityCompare: [{ name, flatRank, graphRank, group }] (both from src/workflow-priority.js), warnings: [string] }
 
 const { applyWorkflowConfig, addWatchdogScriptNodes } = require('./workflow-overlay.js');
+const { flatPriorityOrder, groupPriorityOrder } = require('./workflow-priority.js');
 
 const STAGE_NAMES = ['orient', 'plan', 'implement', 'review', 'apply'];
 const KIND_ORDER = { stage: 0, service: 1, loop: 2, source: 3 };
@@ -393,11 +394,14 @@ function buildWorkflowGraph(opts) {
     nodes,
     edges: builtEdges,
     groups: [],
+    priorityOrder: flatPriorityOrder(validated.topology),
     warnings,
   };
   // The plugin watchdog scripts become service nodes first, so the optional authored layer (workflow.json, validated by src/workflow-config.js: groups, parents, labels, authored edges) can label or group them.
   // Without either input the graph is returned as built.
-  return applyWorkflowConfig(addWatchdogScriptNodes(graph, watchdogScripts), workflow);
+  const out = applyWorkflowConfig(addWatchdogScriptNodes(graph, watchdogScripts), workflow);
+  // The group order next to the flat order needs the groups and parents the overlay sets, so it is computed after it ([] when no source is in a group). It changes no claim order.
+  return { ...out, priorityCompare: groupPriorityOrder(out, out.priorityOrder) };
 }
 
 // ---- CLI ----

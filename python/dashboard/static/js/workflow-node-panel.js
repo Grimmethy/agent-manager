@@ -37,8 +37,38 @@ function buildNodeControlsHtml(node, tasks) {
     + (isTaskPinNode(node) ? '<div class="wf-control-row"><div id="wf-taskpick" class="wf-taskpick">' + buildTaskPickSlotHtml(node, tasks) + '</div></div>' : '') + '</div>';
 }
 
-// The whole panel of a loop node (the facts of buildDetailHtml plus the controls); '' for any other node, which keeps the read-only panel.
-function buildNodePanelHtml(node, warnings, tasks) {
+// Where a task source stands in today's claim order: its registered priority, its competition rank among all sources and how many other sources share the priority.
+// priorityOrder = the graph's [{ name, priority, rank }] (src/workflow-priority.js); '' for a node that is not a source, or a source the list does not have.
+// With priorityCompare (the graph's [{ name, flatRank, graphRank, group }]) and groups (graph.groups, for the labels) a second line says where the authored group order puts the source and how far that is from the flat order.
+function buildSourcePriorityHtml(node, priorityOrder, priorityCompare, groups) {
+  if (!node || node.kind !== 'source' || !Array.isArray(priorityOrder)) return '';
+  const name = String(node.id).replace(/^source:/, '');
+  const entry = priorityOrder.find((e) => e && e.name === name);
+  if (!entry) return '';
+  const same = priorityOrder.filter((e) => e && e.name !== name && e.priority === entry.priority).length;
+  return '<div class="meta wf-priority">Flat priority ' + wfEsc(entry.priority) + ' · rank ' + wfEsc(entry.rank) + ' of ' + wfEsc(priorityOrder.length)
+    + (same ? ' · ' + same + ' other source(s) share this priority' : '') + '</div>' + buildSourceGroupOrderHtml(name, priorityCompare, groups);
+}
+
+// The group-order line of a source: '' without an entry for it in priorityCompare.
+function buildSourceGroupOrderHtml(name, priorityCompare, groups) {
+  if (!Array.isArray(priorityCompare)) return '';
+  const e = priorityCompare.find((x) => x && x.name === name);
+  if (!e) return '';
+  const ungrouped = e.group === null || e.group === undefined;
+  const g = (Array.isArray(groups) ? groups : []).find((x) => x && x.id === e.group);
+  const where = ungrouped ? 'ungrouped' : (g && g.label) || e.group;
+  const diff = e.flatRank - e.graphRank;
+  const move = diff === 0 ? 'same place as the flat order' : Math.abs(diff) + (Math.abs(diff) === 1 ? ' place ' : ' places ') + (diff > 0 ? 'higher' : 'lower') + ' than the flat order';
+  return '<div class="meta wf-priority-graph">Group order: rank ' + wfEsc(e.graphRank) + ' of ' + wfEsc(priorityCompare.length) + ' · group ' + wfEsc(where) + ' · ' + move + '</div>';
+}
+
+// The whole panel of a loop node (the facts of buildDetailHtml plus the controls) or of a source with a priority line; '' for any other node, which keeps the read-only panel.
+function buildNodePanelHtml(node, warnings, tasks, priorityOrder, priorityCompare, groups) {
+  if (node && node.kind === 'source') {
+    const line = buildSourcePriorityHtml(node, priorityOrder, priorityCompare, groups);
+    return line ? buildDetailHtml(node, warnings, line) : '';
+  }
   if (!node || node.kind !== 'loop' || !node.runtime || !node.model) return '';
   return buildDetailHtml(node, warnings, buildNodeControlsHtml(node, tasks));
 }
@@ -82,4 +112,4 @@ function wireNodePanel(root, deps) {
   });
 }
 
-if (typeof module !== 'undefined') module.exports = { WF_APPLY_NOTES, isTaskPinNode, buildTaskPickSlotHtml, buildNodeControlsHtml, buildNodePanelHtml, wfSetModelDefault, wireNodePanel };
+if (typeof module !== 'undefined') module.exports = { WF_APPLY_NOTES, isTaskPinNode, buildTaskPickSlotHtml, buildNodeControlsHtml, buildNodePanelHtml, buildSourcePriorityHtml, buildSourceGroupOrderHtml, wfSetModelDefault, wireNodePanel };

@@ -103,22 +103,23 @@ function collapseGraph(graph, collapsedIds) {
   }
 }
 
-// One box per EXPANDED group of the (collapsed) graph, around everything it holds: x, y, w, h in canvas pixels with `pad` around the children and a header strip on top.
-// positions = { id: { x, y } } from layoutGraph, size = { w, h } of a node card. A group none of whose members is laid out gets no box. x and y can be negative (a group at the edge of the layout):
-// the view shifts the whole canvas by that amount.
+// One box per COLUMN of every EXPANDED group of the (collapsed) graph: the laid-out members that share an x position are boxed together (x, y, w, h in canvas pixels, `pad` around them, a header strip on top), so a box
+// never spans the gap between two columns. { id, label, x, y, w, h, part }: `part` counts the group's boxes from the left, 0 first. positions = { id: { x, y } } from layoutGraph, size = { w, h } of a node card.
+// A group none of whose members is laid out gets no box. x and y can be negative (a group at the edge of the layout): the view shifts the whole canvas by that amount.
 function groupBoxes(graph, positions, size, pad) {
   try {
-    const groups = graph && Array.isArray(graph.groups) ? graph.groups : [];
+    const groups = graph.groups;
     const p = Number.isFinite(pad) ? pad : 12;
     const out = [];
     groups.forEach((g) => {
       const ids = groupMembers(groups, g.id).filter((id) => positions && positions[id]);
-      if (!ids.length) return;
-      const xs = ids.map((id) => positions[id].x);
-      const ys = ids.map((id) => positions[id].y);
-      const x = Math.min(...xs) - p;
-      const y = Math.min(...ys) - p - WF_GROUP_HEADER;
-      out.push({ id: g.id, label: g.label || g.id, x, y, w: Math.max(...xs) + size.w + p - x, h: Math.max(...ys) + size.h + p - y });
+      const columns = Array.from(new Set(ids.map((id) => positions[id].x))).sort((a, b) => a - b);
+      columns.forEach((cx, part) => {
+        const ys = ids.filter((id) => positions[id].x === cx).map((id) => positions[id].y);
+        const x = cx - p;
+        const y = Math.min(...ys) - p - WF_GROUP_HEADER;
+        out.push({ id: g.id, label: g.label || g.id, x, y, w: size.w + 2 * p, h: Math.max(...ys) + size.h + p - y, part });
+      });
     });
     return out;
   } catch (e) {

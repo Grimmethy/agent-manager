@@ -456,3 +456,122 @@ test('tasks of another node are not drawn in this node\'s slot, and a type for a
   delete ctx.document;
   assert.equal(vm.runInContext('wfState.tasks.type', ctx), '');
 });
+
+// ---- the flat priority line of a source node (HUB0329 piece W-D5) ----
+
+const ORDER = [
+  { name: 'first', priority: 1, rank: 1 }, { name: 'hygiene', priority: 40, rank: 2 }, { name: 'twin', priority: 40, rank: 2 },
+  { name: 'trio-a', priority: 70, rank: 4 }, { name: 'trio-b', priority: 70, rank: 4 }, { name: 'trio-c', priority: 70, rank: 4 },
+];
+const srcNode = (name) => ({ ...source, id: 'source:' + name, label: name });
+
+test('a source with an entry shows its flat priority, rank and the number of sources, and one other source sharing the priority', () => {
+  const html = v.buildNodePanelHtml(source, [], null, ORDER);
+  assert.match(html, /^<div class="wf-detail" id="wf-detail">/);
+  assert.equal(count(html, '<div class="meta wf-priority">Flat priority 40 · rank 2 of 6 · 1 other source(s) share this priority</div>'), 1);
+  assert.match(html, /<dt>Pending<\/dt><dd>3<\/dd>/);
+  assert.doesNotMatch(html, /wf-controls|worker-switch-btn|wf-runlog/);
+});
+
+test('three sources sharing a priority say 2 others, a source alone at its priority has no sharing sentence', () => {
+  assert.match(v.buildNodePanelHtml(srcNode('trio-b'), [], null, ORDER), /Flat priority 70 · rank 4 of 6 · 2 other source\(s\) share this priority<\/div>/);
+  const alone = v.buildNodePanelHtml(srcNode('first'), [], null, ORDER);
+  assert.match(alone, /Flat priority 1 · rank 1 of 6<\/div>/);
+  assert.doesNotMatch(alone, /share this priority/);
+});
+
+test('a source without an entry, or without a usable priority order, keeps the read-only panel', () => {
+  assert.equal(v.buildNodePanelHtml(srcNode('unknown'), [], null, ORDER), '');
+  for (const bad of [undefined, null, [], 'x', 5, {}, [null, 3]]) assert.equal(v.buildNodePanelHtml(source, [], null, bad), '', JSON.stringify(bad));
+  assert.equal(v.buildSourcePriorityHtml(stage, ORDER), '');
+  assert.equal(v.buildSourcePriorityHtml(null, ORDER), '');
+});
+
+test('the source name and the numbers are escaped', () => {
+  const html = v.buildNodePanelHtml(srcNode('<b>x'), [], null, [{ name: '<b>x', priority: '<i>1', rank: '<u>2' }]);
+  assert.match(html, /Flat priority &lt;i&gt;1 · rank &lt;u&gt;2 of 1<\/div>/);
+  assert.doesNotMatch(html, /<i>1|<u>2/);
+});
+
+test('a loop panel is the same with or without a priority order, and a stage or service stays read-only', () => {
+  assert.equal(v.buildNodePanelHtml(loop(), [], null, ORDER), v.buildNodePanelHtml(loop(), []));
+  assert.equal(v.buildNodePanelHtml(stage, [], null, ORDER), '');
+  assert.equal(v.buildNodePanelHtml(service, [], null, ORDER), '');
+});
+
+test('the graph passes its priorityOrder to the panel of a selected source', () => {
+  const g = { nodes: [loop(), source], edges: [], warnings: [], priorityOrder: ORDER };
+  const lay = v.layoutGraph(g);
+  assert.equal(count(v.buildGraphHtml(g, lay, { selectedId: 'source:hygiene' }), 'Flat priority 40 · rank 2 of 6'), 1);
+  assert.equal(count(v.buildGraphHtml({ ...g, priorityOrder: undefined }, lay, { selectedId: 'source:hygiene' }), 'Flat priority'), 0);
+  assert.equal(count(v.buildGraphHtml(g, lay, { selectedId: null }), 'Flat priority'), 0);
+});
+
+test('only a source node gets the priority line: the name of a loop, a stage or a prefixed id does not count', () => {
+  assert.equal(v.buildSourcePriorityHtml({ ...loop(), id: 'first' }, ORDER), '');
+  assert.equal(v.buildSourcePriorityHtml({ ...stage, id: 'first' }, ORDER), '');
+  assert.equal(v.buildSourcePriorityHtml({ ...source, id: 'not-a-source:first' }, ORDER), '');
+  assert.equal(v.buildSourcePriorityHtml({ ...source, id: 'firstsource:' }, ORDER), '');
+  assert.equal(v.buildSourcePriorityHtml({ ...source, id: 'first' }, ORDER).includes('Flat priority 1 · rank 1 of 6'), true);
+});
+
+test('empty entries in the priority order are skipped even when the source is found', () => {
+  const order = [null, { name: 'first', priority: 1, rank: 1 }, undefined, { name: 'other', priority: 1, rank: 1 }, 7];
+  assert.match(v.buildNodePanelHtml(srcNode('first'), [], null, order), /Flat priority 1 · rank 1 of 5 · 1 other source\(s\) share this priority/);
+});
+
+// ---- the group-order line of a source (HUB0331 piece W-E3) ----
+
+const COMPARE = [
+  { name: 'first', flatRank: 1, graphRank: 1, group: 'group:fix' },
+  { name: 'hygiene', flatRank: 2, graphRank: 5, group: 'group:late' },
+  { name: 'twin', flatRank: 2, graphRank: 1, group: null },
+  { name: 'trio-a', flatRank: 4, graphRank: 2, group: 'group:other' },
+];
+const GROUPS = [{ id: 'group:fix', label: 'Fixes first', children: [] }, { id: 'group:late', label: '', children: [] }, null];
+const html2 = (name, compare, groups) => v.buildNodePanelHtml(srcNode(name), [], null, ORDER, compare, groups);
+
+test('a source shows its group order under the flat priority, higher, lower or the same place', () => {
+  assert.match(html2('twin', COMPARE, GROUPS), /Flat priority 40 · rank 2 of 6 · 1 other source\(s\) share this priority<\/div><div class="meta wf-priority-graph">Group order: rank 1 of 4 · group ungrouped · 1 place higher than the flat order<\/div>/);
+  assert.match(html2('trio-a', COMPARE, GROUPS), /Group order: rank 2 of 4 · group group:other · 2 places higher than the flat order<\/div>/);
+  assert.match(html2('hygiene', COMPARE, GROUPS), /Group order: rank 5 of 4 · group group:late · 3 places lower than the flat order<\/div>/);
+  assert.match(html2('first', COMPARE, GROUPS), /Group order: rank 1 of 4 · group Fixes first · same place as the flat order<\/div>/);
+  assert.equal(count(html2('first', COMPARE, GROUPS), 'wf-priority-graph'), 1);
+});
+
+test('the group label is used when the groups list has a non-empty one, the id otherwise, and everything is escaped', () => {
+  const esc = v.buildNodePanelHtml(srcNode('first'), [], null, ORDER, [{ name: 'first', flatRank: 1, graphRank: '<u>', group: 'g' }], [{ id: 'g', label: '<b>"G"</b>' }]);
+  assert.match(esc, /Group order: rank &lt;u&gt; of 1 · group &lt;b&gt;&quot;G&quot;&lt;\/b&gt; · /);
+  assert.doesNotMatch(esc, /<b>"G"|<u>/);
+  assert.match(html2('hygiene', COMPARE, 'not an array'), /group group:late · /);
+  assert.match(html2('hygiene', COMPARE, undefined), /group group:late · /);
+});
+
+test('without an entry, without a usable priorityCompare or without the flat line the panel is what phase D built', () => {
+  const phaseD = v.buildNodePanelHtml(srcNode('hygiene'), [], null, ORDER);
+  for (const bad of [undefined, null, [], 'x', 5, {}, [null, 3], [{ name: 'other', flatRank: 1, graphRank: 1, group: null }]]) assert.equal(html2('hygiene', bad, GROUPS), phaseD, JSON.stringify(bad));
+  assert.equal(v.buildNodePanelHtml(srcNode('unknown'), [], null, ORDER, COMPARE, GROUPS), '');
+  assert.equal(v.buildNodePanelHtml(srcNode('first'), [], null, undefined, COMPARE, GROUPS), '');
+  assert.equal(v.buildNodePanelHtml(loop(), [], null, ORDER, COMPARE, GROUPS), v.buildNodePanelHtml(loop(), []));
+  assert.equal(v.buildSourceGroupOrderHtml('first', COMPARE, GROUPS).includes('Group order'), true);
+});
+
+test('empty entries in priorityCompare are skipped even when the source is found', () => {
+  assert.match(html2('twin', [null, undefined, 7, ...COMPARE], GROUPS), /Group order: rank 1 of 7 · group ungrouped/);
+});
+
+test('the graph passes priorityCompare and groups to the panel of the selected source', () => {
+  const g = { nodes: [loop(), source], edges: [], warnings: [], priorityOrder: ORDER, priorityCompare: COMPARE, groups: GROUPS };
+  const lay = v.layoutGraph(g);
+  assert.equal(count(v.buildGraphHtml(g, lay, { selectedId: 'source:hygiene' }), 'Group order: rank 5 of 4 · group group:late · 3 places lower than the flat order'), 1);
+  assert.equal(count(v.buildGraphHtml({ ...g, priorityCompare: undefined }, lay, { selectedId: 'source:hygiene' }), 'Group order'), 0);
+  assert.equal(count(v.buildGraphHtml({ ...g, groups: undefined }, lay, { selectedId: 'source:hygiene' }), 'group group:late'), 1);
+  assert.equal(count(v.buildGraphHtml(g, lay, { selectedId: null }), 'Group order'), 0);
+});
+
+test('an entry without a group key counts as ungrouped, and the view hands the groups to the panel for the label', () => {
+  assert.match(html2('twin', [{ name: 'twin', flatRank: 2, graphRank: 1 }], GROUPS), /group ungrouped · 1 place higher/);
+  const g = { nodes: [loop(), srcNode('first')], edges: [], warnings: [], priorityOrder: ORDER, priorityCompare: COMPARE, groups: GROUPS };
+  const html = v.buildGraphHtml(g, v.layoutGraph(g), { selectedId: 'source:first' });
+  assert.equal(count(html, 'group Fixes first · same place as the flat order'), 1);
+});
