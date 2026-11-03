@@ -26,7 +26,7 @@
 // as draft-file-guard.js.
 
 const { extractDeclaredTargets } = require('./adhoc-diff-sanity.js');
-const { checkFilePaths } = require('./fact-checker.js');
+const { checkFilePaths, findByBasename } = require('./fact-checker.js');
 
 // Plain-prose create-mode signal: extractDeclaredTargets has no structured mode:"create"
 // marker to read (unlike a Group-B JSON diff), so a declared target that doesn't exist
@@ -59,6 +59,7 @@ function mentionIndexes(text, needle) {
   for (let i = text.indexOf(needle); i !== -1; i = text.indexOf(needle, i + needle.length)) out.push(i);
   return out;
 }
+
 
 // Existence-acknowledgment signal (2026-09-18, pipeline hardening -- confirmed live: a
 // task literally titled "Create src/review-parity.test.js" burned 16 real drafting
@@ -96,6 +97,7 @@ function isDeclaredCreateTarget(planText, targetPath, taskText = '') {
   return tIdxs.length > 0 && (CREATE_FILE_VERBS_RE.test(win(tIdxs[0])) || tIdxs.some((i) => WRITE_FILE_PHRASE_RE.test(win(i)) || DIRECT_CREATE_RE.test(win(i)) || ONCE_IT_EXISTS_AFTER_RE.test(afterWin(i))));
 }
 
+
 // (task, planText, repoRoot, extraRoots, existsAtRef) -> { blocked, reason?, missing? }
 // existsAtRef (optional, injected so this stays a pure wrapper): (claimedPath) => boolean, "does it exist on the branch this task really builds
 // on". A STACKED task's files live on its shared branch tip, which the working tree at repoRoot does not show, so a target only that branch has
@@ -117,6 +119,23 @@ function extractExplicitTypes(planText) {
   }
   return types;
 }
+
+
+// 2026-11-10 (HUB0324 · 1/3): when a plan cites a missing file, suggest similar
+// filenames found in the repo so the operator can pick the real target without
+// re-drafting from scratch. Uses findByBasename from fact-checker.js which does a
+// synchronous directory walk and returns matching paths by basename (case-insensitive
+// substring match). Pure function, no side effects, no model calls.
+function recoverMissingFileTarget(missingPath, repoRoot) {
+  if (!missingPath || !repoRoot) return { suggestions: [], original: missingPath || '' };
+  const path = require('path');
+  const base = path.basename(missingPath);
+  if (!base) return { suggestions: [], original: missingPath };
+  const matches = findByBasename(repoRoot, base, 5);
+  const suggestions = matches.filter((m) => m !== missingPath).slice(0, 5);
+  return { suggestions, original: missingPath };
+}
+
 
 function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef = null) {
   let targets = [];
@@ -157,17 +176,29 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
   });
 
   if (missing.length === 0) return { blocked: false, targetSummary: { create: createPaths, modify: modifyPaths } };
-
   const paths = missing.map((entry) => entry.claimedPath);
   
   // 2026-11-08: include actionable feedback suggesting to mark as create target
-  const feedback = ' -- mark as a create target (e.g. "create `' + paths[0] + '`)") or correct the path';
+  const feedback = ' -- mark as a create target (e.g. "create `' + paths[0] + '`") or correct the path';
+  
+  // 2026-11-10 (HUB0324 · 1/3): attempt missing-file recovery -- suggest similar
+  // filenames so the operator can pick the real target without re-drafting.
+  const recovered = [];
+  for (const entry of missing) {
+    const rec = recoverMissingFileTarget(entry.claimedPath, repoRoot);
+    recovered.push(rec);
+  }
+  const recoveryHint = recovered
+    .filter((r) => r.suggestions.length > 0)
+    .map((r) => 'Did you mean: ' + r.suggestions.join(', ') + '?')
+    .join(' ');
   
   return {
     blocked: true,
-    reason: 'plan cites missing-file target(s): ' + paths.join(', ') + feedback + (hasHumanDecision(task) ? HUMAN_DECISION_HINT : ''),
+    reason: 'plan cites missing-file target(s): ' + paths.join(', ') + feedback + (recoveryHint ? ' ' + recoveryHint : '') + (hasHumanDecision(task) ? HUMAN_DECISION_HINT : ''),
     missing: paths,
     targetSummary: { create: createPaths, modify: modifyPaths },
+    recovered,
   };
 }
 
@@ -184,4 +215,5 @@ function existsOnBranch(existsAtRef, claimedPath) {
   try { return existsAtRef(claimedPath) === true; } catch { return false; }
 }
 
-module.exports = { planTargetGuard, isDeclaredCreateTarget };
+
+module.exports = { planTargetGuard, isDeclaredCreateTarget, recoverMissingFileTarget };
