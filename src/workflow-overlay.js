@@ -4,6 +4,7 @@
 // Pure, deterministic, never throws, and never mutates its input. Derived routing edges are never replaced or removed; the overlay only adds groups, parents, labels and authored edges.
 //
 //   applyWorkflowConfig(graph, config) -> a new graph, or the same graph unchanged when there is nothing to apply (no graph, or no config object).
+//   addWatchdogScriptNodes(graph, scripts) -> a new graph with one service node per plugin watchdog script (HUB0326 piece W-C4), or the same graph when there is nothing to add.
 //
 // The config is expected to be a validated one ({ schemaVersion, groups, edges, labels } from validateWorkflowConfig); everything is still checked against the graph here, because a group can
 // name a node that does not exist in this graph. Every such problem becomes a warning on the returned graph, never an error.
@@ -44,6 +45,46 @@ function keepGroups(configGroups, nodeById, warnings) {
     out.push({ id: g.id, label: typeof g.label === 'string' && g.label ? g.label : g.id, children, collapsed: g.collapsed === true });
   }
   return out;
+}
+
+const WATCHDOG_ID = 'service:watchdog';
+
+// The script's file name, which is the last path segment: 'harness/watchdog-trigger.js' -> 'watchdog-trigger.js'; a path that ends in a separator has none ('').
+function scriptFileName(script) {
+  return String(script).split(/[\\/]+/).pop() || '';
+}
+
+// One service node per script ({ plugin, script, ... } as listed by src/plugin-watchdog-scripts.js) and a `triggers` edge from the watchdog to it. The first use of that edge kind.
+// An entry without a string plugin and script is skipped with a warning; the same script twice is added once; without a service:watchdog node the script node is still added and its edge is skipped with a warning.
+function addWatchdogScriptNodes(graph, scripts) {
+  if (!isObject(graph) || !Array.isArray(graph.nodes) || !Array.isArray(scripts) || !scripts.length) return graph;
+  try {
+    const warnings = [];
+    const nodes = graph.nodes.map((n) => ({ ...n }));
+    const edges = (Array.isArray(graph.edges) ? graph.edges : []).map((e) => ({ ...e }));
+    const nodeIds = new Set(nodes.map((n) => n.id));
+    const edgeIds = new Set(edges.map((e) => e.id));
+    scripts.forEach((entry, i) => {
+      if (!isObject(entry) || typeof entry.plugin !== 'string' || !entry.plugin.trim() || typeof entry.script !== 'string' || !scriptFileName(entry.script)) {
+        warnings.push(`watchdog script #${i + 1} needs a plugin and a script; skipped`);
+        return;
+      }
+      const file = scriptFileName(entry.script);
+      const id = `service:watchdog-script:${entry.plugin}:${file.endsWith('.js') ? file.slice(0, -3) : file}`;
+      if (!nodeIds.has(id)) {
+        nodes.push({ id, kind: 'service', label: `${entry.plugin}: ${file}`, parent: null, runtime: null, model: null, work: null, counts: null });
+        nodeIds.add(id);
+      }
+      if (!nodeIds.has(WATCHDOG_ID)) { warnings.push(`watchdog script ${id}: there is no ${WATCHDOG_ID} node; its triggers edge was skipped`); return; }
+      const eid = edgeId(WATCHDOG_ID, id, 'triggers');
+      if (!edgeIds.has(eid)) { edges.push({ id: eid, from: WATCHDOG_ID, to: id, kind: 'triggers', label: null }); edgeIds.add(eid); }
+    });
+    nodes.sort(byKindThenId);
+    edges.sort(byId);
+    return { ...graph, nodes, edges, warnings: [...(Array.isArray(graph.warnings) ? graph.warnings : []), ...warnings] };
+  } catch (e) {
+    return graph;
+  }
 }
 
 function applyWorkflowConfig(graph, config) {
@@ -87,4 +128,4 @@ function applyWorkflowConfig(graph, config) {
   }
 }
 
-module.exports = { applyWorkflowConfig };
+module.exports = { applyWorkflowConfig, addWatchdogScriptNodes };

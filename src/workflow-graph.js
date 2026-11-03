@@ -15,11 +15,12 @@
 //   models   - { overrides: {instanceId: string}, ollamaModels: [string], claudeModels: [string] }
 //   now      - Date (default new Date()) for deterministic generatedAt
 //   workflow - optional validated workflow config (src/workflow-config.js): groups, parents, labels and authored edges, applied by src/workflow-overlay.js
+//   watchdogScripts - optional list of plugin watchdog scripts ({ plugin, script, ... } from src/plugin-watchdog-scripts.js): one service node each, with a triggers edge from service:watchdog
 //
 // Output contract:
 //   { schemaVersion: 1, generatedAt: ISO string, nodes: [Node], edges: [Edge], groups: [], warnings: [string] }
 
-const { applyWorkflowConfig } = require('./workflow-overlay.js');
+const { applyWorkflowConfig, addWatchdogScriptNodes } = require('./workflow-overlay.js');
 
 const STAGE_NAMES = ['orient', 'plan', 'implement', 'review', 'apply'];
 const KIND_ORDER = { stage: 0, service: 1, loop: 2, source: 3 };
@@ -274,7 +275,7 @@ function buildEdges(nodes, lanes, topology) {
 // ---- main builder ----
 
 function buildWorkflowGraph(opts) {
-  const { lanes, instances, topology, models, now, workflow } = opts || {};
+  const { lanes, instances, topology, models, now, workflow, watchdogScripts } = opts || {};
   const validated = validateInput(lanes, instances, topology, models);
   const warnings = [...validated.warnings];
   const nowDate = now instanceof Date ? now : new Date();
@@ -394,8 +395,9 @@ function buildWorkflowGraph(opts) {
     groups: [],
     warnings,
   };
-  // The optional authored layer (workflow.json, validated by src/workflow-config.js): groups, parents, labels, authored edges. Without it the graph is returned as built.
-  return applyWorkflowConfig(graph, workflow);
+  // The plugin watchdog scripts become service nodes first, so the optional authored layer (workflow.json, validated by src/workflow-config.js: groups, parents, labels, authored edges) can label or group them.
+  // Without either input the graph is returned as built.
+  return applyWorkflowConfig(addWatchdogScriptNodes(graph, watchdogScripts), workflow);
 }
 
 // ---- CLI ----

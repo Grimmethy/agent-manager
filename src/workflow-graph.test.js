@@ -407,3 +407,14 @@ test('the builder CLI passes a workflow key through to the overlay', () => {
   assert.equal(out.status, 0);
   assert.equal(JSON.parse(out.stdout).groups[0].id, 'group:x');
 });
+
+test('the builder with watchdogScripts adds the service nodes and triggers edges, and without them is unchanged', () => {
+  const plain = buildWorkflowGraph(OVERLAY_INPUT());
+  const g = buildWorkflowGraph({ ...OVERLAY_INPUT(), watchdogScripts: [{ plugin: 'uiforge', root: '/r', script: 'harness/watchdog-trigger.js', abs: '/r/harness/watchdog-trigger.js' }] });
+  const id = 'service:watchdog-script:uiforge:watchdog-trigger';
+  assert.ok(g.nodes.some((n) => n.id === id && n.kind === 'service'));
+  assert.ok(g.edges.some((e) => e.id === `service:watchdog->${id}:triggers` && e.kind === 'triggers'));
+  for (const watchdogScripts of [undefined, null, [], 'x']) assert.deepEqual(buildWorkflowGraph({ ...OVERLAY_INPUT(), watchdogScripts }), plain, JSON.stringify(watchdogScripts));
+  const grouped = buildWorkflowGraph({ ...OVERLAY_INPUT(), watchdogScripts: [{ plugin: 'uiforge', script: 'a.js' }], workflow: { schemaVersion: 1, groups: [{ id: 'group:wd', children: ['service:watchdog', 'service:watchdog-script:uiforge:a'] }], edges: [], labels: {} } });
+  assert.equal(grouped.nodes.find((n) => n.id === 'service:watchdog-script:uiforge:a').parent, 'group:wd');
+});

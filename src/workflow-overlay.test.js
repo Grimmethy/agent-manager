@@ -5,7 +5,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { applyWorkflowConfig } = require('./workflow-overlay.js');
+const { applyWorkflowConfig, addWatchdogScriptNodes } = require('./workflow-overlay.js');
 
 const node = (id, kind, label) => ({ id, kind, label: label || id, parent: null, runtime: null, model: null, work: null, counts: null });
 const edge = (from, to, kind, label = null) => ({ id: `${from}->${to}:${kind}`, from, to, kind, label });
@@ -167,4 +167,87 @@ test('a config that throws while it is read leaves the graph as it was', () => {
   const g = graph();
   const evil = { get groups() { throw new Error('boom'); }, edges: [], labels: {} };
   assert.equal(applyWorkflowConfig(g, evil), g);
+});
+
+// ---- watchdog script nodes (piece W-C4) ----
+
+const script = (plugin, file, over) => ({ plugin, root: '/r', script: file, abs: '/r/' + file, ...over });
+const wdNode = (id) => (g) => g.nodes.find((n) => n.id === id);
+
+test('one script adds one service node and one triggers edge from service:watchdog', () => {
+  const out = addWatchdogScriptNodes(graph(), [script('uiforge', 'harness/watchdog-trigger.js')]);
+  const id = 'service:watchdog-script:uiforge:watchdog-trigger';
+  assert.deepEqual(wdNode(id)(out), { id, kind: 'service', label: 'uiforge: watchdog-trigger.js', parent: null, runtime: null, model: null, work: null, counts: null });
+  assert.deepEqual(out.edges.find((e) => e.kind === 'triggers'), { id: `service:watchdog->${id}:triggers`, from: 'service:watchdog', to: id, kind: 'triggers', label: null });
+  assert.equal(out.nodes.length, graph().nodes.length + 1);
+  assert.equal(out.edges.length, graph().edges.length + 1);
+  assert.deepEqual(out.warnings, ['from the builder']);
+});
+
+test('the id and label use the file name: directories and the .js ending are handled', () => {
+  const out = addWatchdogScriptNodes(graph(), [script('p', 'a/b\\c/run.js'), script('p', 'plain.js'), script('p', 'noext'), script('p', 'deep/x.test.js')]);
+  assert.deepEqual(out.nodes.filter((n) => n.id.startsWith('service:watchdog-script:')).map((n) => `${n.id} | ${n.label}`), [
+    'service:watchdog-script:p:noext | p: noext', 'service:watchdog-script:p:plain | p: plain.js', 'service:watchdog-script:p:run | p: run.js', 'service:watchdog-script:p:x.test | p: x.test.js']);
+});
+
+test('two scripts of one plugin and a script of another plugin', () => {
+  const out = addWatchdogScriptNodes(graph(), [script('a', 'one.js'), script('a', 'two.js'), script('b', 'one.js')]);
+  assert.deepEqual(out.nodes.filter((n) => n.id.startsWith('service:watchdog-script:')).map((n) => n.id), ['service:watchdog-script:a:one', 'service:watchdog-script:a:two', 'service:watchdog-script:b:one']);
+  assert.equal(out.edges.filter((e) => e.kind === 'triggers').length, 3);
+});
+
+test('a duplicate entry is added once, also when the node is already in the graph', () => {
+  const twice = addWatchdogScriptNodes(graph(), [script('a', 'one.js'), script('a', 'dir/one.js')]);
+  assert.equal(twice.nodes.filter((n) => n.id === 'service:watchdog-script:a:one').length, 1);
+  assert.equal(twice.edges.filter((e) => e.kind === 'triggers').length, 1);
+  const again = addWatchdogScriptNodes(twice, [script('a', 'one.js')]);
+  assert.equal(again.nodes.length, twice.nodes.length);
+  assert.equal(again.edges.length, twice.edges.length);
+});
+
+test('an entry without a plugin or a script is skipped with a warning, the others are added', () => {
+  const out = addWatchdogScriptNodes(graph(), [null, 'x', { plugin: 'p' }, { script: 's.js' }, { plugin: '', script: 's.js' }, { plugin: 'p', script: '' }, { plugin: 'p', script: '/' }, { plugin: 'p', script: 'dir/' }, { plugin: 5, script: 's.js' }, script('ok', 'ok.js')]);
+  assert.equal(out.warnings.length, 1 + 9);
+  assert.match(out.warnings[1], /#1 /);
+  assert.deepEqual(out.nodes.filter((n) => n.id.startsWith('service:watchdog-script:')).map((n) => n.id), ['service:watchdog-script:ok:ok']);
+});
+
+test('null, a non-array and an empty array change nothing', () => {
+  const g = graph();
+  for (const scripts of [null, undefined, 'x', {}, 5, []]) assert.equal(addWatchdogScriptNodes(g, scripts), g, JSON.stringify(scripts));
+  assert.equal(addWatchdogScriptNodes(null, [script('a', 'x.js')]), null);
+  const noNodes = { edges: [] };
+  assert.equal(addWatchdogScriptNodes(noNodes, [script('a', 'x.js')]), noNodes);
+});
+
+test('without a service:watchdog node the script node is still added and its edge is skipped with a warning', () => {
+  const g = graph();
+  g.nodes = g.nodes.filter((n) => n.id !== 'service:watchdog');
+  const out = addWatchdogScriptNodes(g, [script('a', 'x.js')]);
+  assert.ok(wdNode('service:watchdog-script:a:x')(out));
+  assert.equal(out.edges.filter((e) => e.kind === 'triggers').length, 0);
+  assert.equal(out.warnings.length, 2);
+  assert.match(out.warnings[1], /there is no service:watchdog node/);
+});
+
+test('the result stays sorted, is deterministic and the input is not mutated', () => {
+  const scripts = [script('z', 'last.js'), script('a', 'first.js')];
+  const out = addWatchdogScriptNodes(deepFreeze(graph()), deepFreeze(JSON.parse(JSON.stringify(scripts))));
+  assert.deepEqual(out.nodes.map((n) => n.id), ['stage:plan', 'service:watchdog', 'service:watchdog-script:a:first', 'service:watchdog-script:z:last', 'reviewer', 'worker-a', 'worker-b', 'source:s1']);
+  assert.deepEqual(out.edges.map((e) => e.id), [...out.edges.map((e) => e.id)].sort());
+  assert.deepEqual(out, addWatchdogScriptNodes(graph(), scripts));
+});
+
+test('a script entry that makes the function throw leaves the graph as it was', () => {
+  const g = graph();
+  const evil = [{ get plugin() { throw new Error('boom'); }, script: 'x.js' }];
+  assert.equal(addWatchdogScriptNodes(g, evil), g);
+});
+
+test('a workflow config can label and group the watchdog script nodes when it is applied after them', () => {
+  const id = 'service:watchdog-script:a:x';
+  const withScripts = addWatchdogScriptNodes(graph(), [script('a', 'x.js')]);
+  const out = applyWorkflowConfig(withScripts, cfg({ groups: [grp('group:wd', ['service:watchdog', id])], labels: { [id]: 'Sweep' } }));
+  assert.equal(wdNode(id)(out).label, 'Sweep');
+  assert.equal(wdNode(id)(out).parent, 'group:wd');
 });
