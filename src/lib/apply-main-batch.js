@@ -11,6 +11,7 @@ const { writeTaskLogFile, taskLogRelPath, taskComputeForLog } = require('../task
 require('../task-sources.js');
 const { TRIAGE_BRANCH, ungatedMainPushAllowed } = require('./main-push-policy.js');
 const { coAuthorTrailer, usesGroupB, applyCandidateSplit, writeArtifact, closeOriginatingBrainDumpEntry, assertStageableFiles } = require('./apply-core.js');
+const { checkRemoteExists } = require('./git-remote-check.js');
 
 // The shared checkout must never be left on the triage branch. That branch is based on whatever main was when it was first created and is only brought up to date by merging main in on the next apply tick (never rebased: a rewritten branch was never pushed and looped, see git-runner.js prepareStackedBranch), so a
 // checkout parked on it (2026-09-20, PF: 4 h, 40 commits behind main) makes every read of "the repo" (plan grounding, review's live content, the staleness
