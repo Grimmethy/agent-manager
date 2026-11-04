@@ -46,7 +46,11 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
   // prepareStackedBranch syncs it from origin if it exists (earlier unmerged batches stay on it),
   // or starts it fresh off current main (also after a human merged + deleted it).
   const gated = !ungatedMainPushAllowed();
-  gitRunner.fetchMain();
+  // 2026-09-25: local-only clones have no origin remote; fetching would fail. Probe once
+  // and skip the fetch (and downstream push) when origin is missing, marking the commit
+  // as local-only so downstream task-disposition does not treat it as shipped.
+  const hasOrigin = checkRemoteExists('origin', { cwd: repoRoot });
+  if (hasOrigin) gitRunner.fetchMain();
   if (gated) {
     // Pre-flight BEFORE entering the branch: a dirty apply clone aborts prepareStackedBranch's `checkout -B` / `rebase`
     // (2026-09-23: ~266 change_review tasks blocked one-by-one on it). Self-heal a dedicated clone, else fail once, loudly.
@@ -134,6 +138,22 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
     gitRunner.commit(msgPath);
   } finally {
     fs.unlinkSync(msgPath);
+  }
+
+  // 2026-09-25: unified commit outcome. When origin is missing (local-only clone), skip
+  // push entirely and mark as local. Otherwise, push according to gated/ungated policy.
+  const projectName = path.basename(repoRoot);
+  if (!hasOrigin) {
+    // Local-only path: commit exists, but no remote to push to. Mark as local so
+    // downstream task-disposition does not treat it as shipped.
+    for (const s of staged) {
+      results[s.task.id] = {
+        succeeded: true,
+        doneMarker: `applied to local main (no remote) in ${projectName} -- origin not configured`,
+      };
+      closeOriginatingBrainDumpEntry(s.task, brainDumpPath, `Applied locally in ${projectName} (no origin remote) -- Task: ${s.task.id}`);
+    }
+    return { results, committed: true, pushed: false, branch: gitRunner.mainBranch, localOnly: true };
   }
 
   if (gated) {
