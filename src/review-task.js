@@ -1524,7 +1524,11 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     }
   }
 
-  // Inert additions (see formatInertAdditionsSection): a cheap diff + git-grep check, independent of the executed-verification switch. Advisory only.
+  // Inert additions (see formatInertAdditionsSection): a cheap diff + git-grep check, independent of the executed-verification switch.
+  // AGENT_MANAGER_REVIEW_INERT_BLOCK: 'off' = advisory only (no history event change), 'shadow' (default) = append a 'would block (shadow):' line,
+  // anything else (default on) = block the task before any vote is spent. Exempt when isHubChildTask (a later sibling may wire it), when the task
+  // text says 'foundation only' / 'inert until' / 'no caller yet', or when the task is stacked (already covered by isHubChildTask).
+  const inertBlockMode = process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK || 'shadow';
   if (process.env.AGENT_MANAGER_REVIEW_INERT_CHECK !== 'false'
       && resolveSourceName(task) === 'adhoc'
       && task.adhocResolution === 'implemented'
@@ -1538,7 +1542,26 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
         if (r && Array.isArray(r.inert)) {
           task.inertAdditions = summariseInertAdditions(r, isHubChildTask(task));
           if (r.inert.length) {
-            appendHistoryEvent(task, 'advisory', `inert-addition check: ${r.inert.length} unreferenced addition(s) (${r.inert.slice(0, 4).map((i) => i.name).join(', ')}${r.inert.length > 4 ? ', ...' : ''})${task.inertAdditions.hubChild ? ' -- hub slice, a sibling may wire it' : ''}`);
+            const names = r.inert.slice(0, 4).map((i) => i.name).join(', ') + (r.inert.length > 4 ? ', ...' : '');
+            const exempt = isHubChildTask(task)
+              || (typeof task.promptContext?.rawText === 'string' && /foundation only|inert until|no caller yet/i.test(task.promptContext.rawText));
+            if (inertBlockMode === 'off' || exempt) {
+              // Exempt cases and off mode: behave exactly as today (advisory only).
+              appendHistoryEvent(task, 'advisory', `inert-addition check: ${r.inert.length} unreferenced addition(s) (${names})${task.inertAdditions.hubChild ? ' -- hub slice, a sibling may wire it' : ''}`);
+            } else if (inertBlockMode === 'shadow') {
+              // Shadow mode: append a history event noting it would block, but never block.
+              appendHistoryEvent(task, 'advisory', `would block (shadow): ${r.inert.length} unreferenced addition(s): ${names}`);
+            } else {
+              // On mode: block the task before any vote is spent.
+              const inertItems = task.inertAdditions.inert.slice(0, INERT_MAX_ITEMS);
+              const reason = `Blocked: ${r.inert.length} unreferenced addition(s) with no caller in this change:\n${inertItems.map((i) => `- ${i.file}:${i.line} ${i.name}`).join('\n')}\nFix: add the caller in this change, or put "foundation only" in the task text if nothing should call it yet.`;
+              task.reviewProvider = 'deterministic-inert-addition';
+              task.blockedReason = reason;
+              recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+              appendHistoryEvent(task, 'blocked', `inert addition blocked: ${r.inert.length} unreferenced addition(s)`);
+              appendHistoryEvent(task, 'info', reason);
+              return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+            }
           }
         }
       }
@@ -1882,7 +1905,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { namesExtractedPieces, getDomainConfig, EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { namesExtractedPieces, getDomainConfig, EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview, INERT_MAX_ITEMS };
 
 if (require.main === module) {
   main();

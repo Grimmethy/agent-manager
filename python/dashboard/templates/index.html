@@ -155,9 +155,41 @@
   .worker-card .row { display: flex; justify-content: space-between; align-items: center; }
   .worker-card .id { font-weight: 600; }
   .worker-model-select { margin-left: 12px; margin-right: auto; font-size: 12px; max-width: 220px; }
+  .worker-model-fixed { margin: 0 auto 0 12px; }
   .worker-card .meta { color: var(--muted); font-size: 12px; margin-top: 8px; }
   .worker-card.clickable { cursor: pointer; }
   .worker-card.worker-off { opacity: .65; }
+  /* Workers Graph view (workflow-graph-view.js): edges under absolutely positioned node cards inside ONE scroll box, so the page itself never scrolls sideways. */
+  .wf-toggle { display: inline-flex; gap: 4px; }
+  .wf-view-btn.active { border-color: var(--accent, #58a6ff); color: var(--accent, #58a6ff); }
+  .wf-bar { margin-bottom: 12px; }
+  .wf-warn-line { margin: 0 0 8px; }
+  .wf-surface { overflow: auto; max-width: 100%; max-height: 70vh; border: 1px solid var(--border); border-radius: 8px; background: var(--bg, transparent); }
+  .wf-canvas { position: relative; }
+  .wf-edges { position: absolute; left: 0; top: 0; pointer-events: none; }
+  .wf-edge { stroke: var(--muted, #8b949e); stroke-width: 1.5; }
+  .wf-arrowhead { fill: var(--muted, #8b949e); }
+  .wf-node { position: absolute; box-sizing: border-box; margin: 0; padding: 8px 12px; overflow: hidden; }
+  .wf-node .row { align-items: flex-start; gap: 8px; }
+  .wf-node .badge-col { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+  .wf-status-line { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+  .wf-node .wf-task { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wf-node .worker-switch-btn { margin-top: 0 !important; white-space: nowrap; }
+  .wf-node .id { overflow-wrap: anywhere; }
+  .wf-node .meta { margin-top: 4px; }
+  .wf-selected { border-color: var(--accent, #58a6ff); }
+  .wf-detail { margin-top: 12px; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+  .wf-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 8px 0; font-size: 12px; }
+  .wf-facts dt { color: var(--muted); }
+  .wf-facts dd { margin: 0; overflow-wrap: anywhere; }
+  .wf-group-box { position: absolute; box-sizing: border-box; border: 1px dashed var(--border-strong, var(--border)); border-radius: 8px; pointer-events: none; }
+  .wf-group-toggle { pointer-events: auto; margin: 4px; padding: 4px 8px; font-size: 12px; }
+  .wf-group-node { border-style: dashed; }
+  .wf-controls { margin: 8px 0; }
+  .wf-control-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .wf-control-row .worker-model-select, .wf-control-row .worker-model-fixed { margin: 0; }
+  .wf-apply-note { margin: 0 0 8px; }
+  .wf-warnings { margin: 8px 0 0; padding-left: 16px; font-size: 12px; color: var(--muted); }
   .recent-tasks-list { list-style: none; padding: 0; margin: 8px 0 0; }
   .recent-tasks-list li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-top: 1px solid var(--border); }
   .recent-tasks-list li:first-child { border-top: none; }
@@ -385,11 +417,19 @@
 <script src="/static/js/nav-sections.js"></script>
 <script src="/static/js/queue-tab.js"></script>
 <script src="/static/js/plugins-tab.js"></script>
+<script src="/static/js/worker-task-picker.js"></script>
+<script src="/static/js/worker-model-select.js"></script>
+<script src="/static/js/worker-status-helpers.js"></script>
 <script src="/static/js/workers-tab.js"></script>
 <script src="/static/js/worker-switch-ui.js"></script>
+<script src="/static/js/workflow-layout.js"></script>
+<script src="/static/js/workflow-groups.js"></script>
+<script src="/static/js/workflow-node-panel.js"></script>
+<script src="/static/js/workflow-graph-view.js"></script>
 <script src="/static/js/cloud-spend-panel.js"></script>
 <script src="/static/js/stalled-worker-panel.js"></script>
 <script src="/static/js/verifier-worker-panel.js"></script>
+<script src="/static/js/needswork-worker-panel.js"></script>
 <script src="/static/js/sidebar-and-claude-panels.js"></script>
 <script src="{{ url_for('static', filename='js/analytics-and-discovery.js') }}"></script>
 <script src="/static/js/models-tab.js"></script>

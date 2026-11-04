@@ -243,6 +243,86 @@ class CrossProjectActions(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertTrue(res.get_json()["pending"])
 
+    # ---- parked verdicts of another project (found 2026-11-02: nothing drained them, so the cards never showed a verdict a worker had posted) ----
+    def _scope(self):
+        return branch_projects.resolve_scope(self.other_root, str(self.active["repo"]))
+
+    def _park(self, project, branch, sha, verdict="merge", source="worker"):
+        import branch_verdicts_pending as bvp
+        bvp.store_pending_verdict(project["pipe"] / "queue", branch, sha, verdict, ["parked evidence"], source)
+        return project["pipe"] / "queue" / "pending_verdicts" / (branch.replace("/", "_") + ".json")
+
+    def test_a_parked_verdict_is_applied_when_that_projects_list_is_computed_and_the_card_carries_it(self):
+        sha = git(["rev-parse", "agent/oth-1"], self.other["repo"]).strip()
+        pending = self._park(self.other, "agent/oth-1", sha)
+        self.assertTrue(pending.exists())
+        rows = branch_projects.refresh_branches(self._scope())
+        row = next(b for b in rows if b["branch"] == "agent/oth-1")
+        self.assertEqual((row.get("verdict"), row.get("source")), ("merge", "worker"))
+        self.assertEqual(row["reasons"], ["parked evidence"])
+        self.assertFalse(pending.exists())
+        self.assertIn("agent/oth-1", (self.other["pipe"] / "queue" / "branch-verdicts.json").read_text())
+
+    def test_the_background_refresh_applies_them_too(self):
+        sha = git(["rev-parse", "agent/oth-1"], self.other["repo"]).strip()
+        pending = self._park(self.other, "agent/oth-1", sha, verdict="needs-work")
+        branch_projects._refresh_stale([{**self._scope(), "active": False}])
+        cached = branch_projects._state["cache"][self.other_root]["branches"]
+        self.assertEqual(next(b for b in cached if b["branch"] == "agent/oth-1").get("verdict"), "needs-work")
+        self.assertFalse(pending.exists())
+
+    def test_a_parked_verdict_for_an_older_head_is_dropped_not_applied(self):
+        pending = self._park(self.other, "agent/oth-1", "0" * 40)
+        rows = branch_projects.refresh_branches(self._scope())
+        self.assertIsNone(next(b for b in rows if b["branch"] == "agent/oth-1").get("verdict"))
+        self.assertFalse(pending.exists())
+        self.assertFalse((self.other["pipe"] / "queue" / "branch-verdicts.json").exists())
+
+    def test_a_parked_verdict_for_a_branch_that_is_not_listed_keeps_waiting(self):
+        sha = git(["rev-parse", "agent/oth-1"], self.other["repo"]).strip()
+        pending = self._park(self.other, "agent/not-listed-yet", sha)
+        branch_projects.refresh_branches(self._scope())
+        self.assertTrue(pending.exists())
+
+    def test_refreshing_another_project_leaves_the_active_projects_parked_verdicts_alone(self):
+        sha = git(["rev-parse", "agent/act-1"], self.active["repo"]).strip()
+        mine = self._park(self.active, "agent/act-1", sha)
+        branch_projects.refresh_branches(self._scope())
+        self.assertTrue(mine.exists())
+
+    def test_a_parked_verdict_never_replaces_a_human_one(self):
+        sha = git(["rev-parse", "agent/oth-1"], self.other["repo"]).strip()
+        import branch_verdicts as bv
+        bv.record_verdict(self.other["pipe"] / "queue", "agent/oth-1", sha, "discard", ["a person decided"], "chat")
+        pending = self._park(self.other, "agent/oth-1", sha, verdict="merge", source="worker")
+        rows = branch_projects.refresh_branches(self._scope())
+        row = next(b for b in rows if b["branch"] == "agent/oth-1")
+        self.assertEqual((row.get("verdict"), row.get("source")), ("discard", "chat"))
+        self.assertFalse(pending.exists())
+
+    def test_a_failure_while_applying_never_breaks_the_listing(self):
+        import branch_verdicts_pending as bvp
+        sha = git(["rev-parse", "agent/oth-1"], self.other["repo"]).strip()
+        pending = self._park(self.other, "agent/oth-1", sha)
+        with mock.patch.object(bvp, "apply_pending_verdicts", side_effect=RuntimeError("boom")) as apply:
+            rows = branch_projects.refresh_branches(self._scope())
+        apply.assert_called_once()
+        self.assertEqual([b["branch"] for b in rows], ["agent/oth-1"])
+        self.assertTrue(pending.exists())                                  # nothing was lost: the next refresh tries again
+
+    def test_listing_the_active_project_does_not_apply_parked_verdicts_here(self):
+        """The active project drains its own through _store_branch_list; this path is for the others."""
+        sha = git(["rev-parse", "agent/act-1"], self.active["repo"]).strip()
+        mine = self._park(self.active, "agent/act-1", sha)
+        app._list_unmerged_branches_uncached(force_fetch=True)
+        self.assertTrue(mine.exists())
+
+    def test_nothing_parked_means_no_second_enrichment(self):
+        import branch_verdicts as bv
+        with mock.patch.object(bv, "enrich_branches_with_verdicts", wraps=bv.enrich_branches_with_verdicts) as enrich:
+            branch_projects.refresh_branches(self._scope())
+        self.assertEqual(enrich.call_count, 1)
+
     def test_a_verdict_for_an_unknown_project_or_unlisted_branch_is_a_404(self):
         body = {"verdict": "merge", "reasons": ["x"], "source": "chat"}
         self.assertEqual(self.post("agent/oth-1", "verdict", project="/no/such/project", body=body).status_code, 404)

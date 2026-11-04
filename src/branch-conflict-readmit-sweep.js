@@ -43,6 +43,12 @@ function mode() {
 }
 
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
+// Writes only when the content differs from what is there (a tick that decided nothing new must not rewrite the state file every minute).
+function writeJsonIfChanged(p, data, before) {
+  if (JSON.stringify(before) === JSON.stringify(data)) return;
+  writeJson(p, data);
+}
+
 function writeJson(p, data) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const tmp = `${p}.tmp`;
@@ -126,22 +132,33 @@ async function sweepBranchConflicts({
   const live = summary.mode === 'on' && !dryRun;
   const queueDir = path.join(pipelineDir, 'queue');
   const nowIso = new Date(now).toISOString();
-  if (fetch) git(repoRoot, ['fetch', '-q', 'origin']);
 
   const statePath = path.join(queueDir, STATE_FILE);
-  const state = readJson(statePath) || {};
+  const prevState = readJson(statePath);
+  const state = prevState || {};
   const nextState = {};
 
   const doneDir = path.join(queueDir, 'done');
   let names = [];
   try { names = fs.readdirSync(doneDir).filter((f) => f.endsWith('.json')); } catch { names = []; }
 
+  // Pre-pass (2026-11-03, pool rescan): the cheap local filters first, one read per task; `git fetch` only when a candidate is left (see branch-defect-readmit-sweep.js).
+  const candidates = [];
   for (const name of names) {
     const filePath = path.join(doneDir, name);
     const task = readJson(filePath);
     if (!eligibleTask(task)) continue;
     const branch = appliedBranch(task);
     if (!branch) continue;
+    candidates.push({ name, filePath, task, branch });
+  }
+  if (!candidates.length) {
+    if (Object.keys(state).length) writeJson(statePath, nextState);
+    return summary;
+  }
+  if (fetch) git(repoRoot, ['fetch', '-q', 'origin']);
+
+  for (const { name, filePath, task, branch } of candidates) {
     try {
       const head = git(repoRoot, ['rev-parse', '--verify', `origin/${branch}`]);
       if (head.code !== 0) continue;                       // branch gone: reconcile's business, not ours
@@ -191,7 +208,7 @@ async function sweepBranchConflicts({
     }
   }
 
-  if (summary.mode !== 'off') writeJson(statePath, nextState);
+  if (summary.mode !== 'off') writeJsonIfChanged(statePath, nextState, prevState);
   return summary;
 }
 

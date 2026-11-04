@@ -102,6 +102,8 @@ from app_catalog_helpers import (  # noqa: F401
     CONCEPT_STABLE_STATUSES,
     GHOST_CONCEPT_ID,
     _BRANCH_CACHE_TTL_SECONDS,
+    _ACTION_FETCH_REUSE_SECONDS,
+    _ACTION_FETCH_TIMEOUT_SECONDS,
     _BRANCH_FETCH_TTL_SECONDS,
     _COMMUNITY_ID_SUFFIX_RE,
     _DEEP_DIVE_ITEM_RE,
@@ -2270,7 +2272,7 @@ def _branch_content_already_on_main(repo_root, main_branch, full_ref):
         return False
 
 
-def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_dir=None):
+def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_dir=None, fetch_timeout=30):
     """The ACTIVE project's list by default. repo_root/pipeline_dir name another registered project (branch_projects.py): it always fetches (the caller owns that
     project's timer) and leaves the active project's held-hub cache and fetch timer alone."""
     other = repo_root is not None
@@ -2287,7 +2289,7 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
     with _branch_cache_lock:
         fetch_due = other or force_fetch or (time.time() - _branch_fetch_state["at"]) >= _BRANCH_FETCH_TTL_SECONDS
     if fetch_due:
-        _run_git(["fetch", "origin", "--prune"], repo_root, timeout=30)
+        _run_git(["fetch", "origin", "--prune"], repo_root, timeout=fetch_timeout)
         if not other:
             with _branch_cache_lock:
                 _branch_fetch_state["at"] = time.time()
@@ -2366,6 +2368,18 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
     _annotate_hub_sibling_conflicts(repo_root, branches)
     import branch_verdicts  # lazy: keeps app.py's import block untouched
     branch_verdicts.enrich_branches_with_verdicts(qdir, repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
+    if other and qdir:
+        # A verdict posted for a branch this project's list did not (yet) show waits in ITS queue/pending_verdicts. The active project's list applies its own after every
+        # refresh (_store_branch_list); no one drained the others', so those verdicts never reached a card. Apply them here, after the cards carry headSha (the apply drops a
+        # verdict whose listing row has none), then enrich again so THIS refresh already returns the verdict. A held hub branch is not in `branches`: its verdict keeps waiting.
+        try:
+            import branch_verdicts_pending as bvp
+            parked = len(bvp.list_pending_verdicts(qdir))
+            bvp.apply_pending_verdicts(qdir, repo_root, lambda force=False: branches, _run_git, branch_verdicts)      # returns at once when nothing is parked
+            if len(bvp.list_pending_verdicts(qdir)) != parked:
+                branch_verdicts.enrich_branches_with_verdicts(qdir, repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
+        except Exception as exc:  # noqa: BLE001 -- listing must never fail because of a parked verdict
+            print(f"[branches] pending verdict apply for {repo_root} failed (non-fatal): {exc}", file=sys.stderr)
     branches.sort(key=lambda b: b["pushedAt"])
     return branches
 
@@ -2428,7 +2442,7 @@ def list_unmerged_branches(force=False, stale_ok=False):
             t.start()
         return stale
     try:
-        branches = _list_unmerged_branches_uncached(force_fetch=force)
+        branches = _list_unmerged_branches_uncached(force_fetch=force, **({"fetch_timeout": _ACTION_FETCH_TIMEOUT_SECONDS} if force else {}))
     except (RuntimeError, subprocess.SubprocessError, OSError) as e:
         # Best-effort, same "a check failing here must never block the rest of the
         # dashboard" rule as everything else that shells out in this file -- a git/network
@@ -2474,6 +2488,22 @@ def _invalidate_branch_cache(refetch=True, drop_branch=None):
 
 
 def _sync_live_checkout(main_branch):
+    """Fast-forward the dashboard's own checkout after a merge (see _sync_live_checkout_unguarded).
+    The merge is already on origin when this runs, so git being too slow to answer (a fetch takes ~47 s
+    at load 25) must be reported as "not synced", never raised: raising turned a merge that had landed
+    into an uncaught 500 and skipped stamping the task record."""
+    try:
+        return _sync_live_checkout_unguarded(main_branch)
+    except subprocess.TimeoutExpired as exc:
+        cmd = " ".join(str(a) for a in (exc.cmd if isinstance(exc.cmd, (list, tuple)) else [exc.cmd]))
+        return {
+            "synced": False,
+            "reason": f"git did not answer in time while syncing the dashboard checkout (`{cmd}` took longer than {exc.timeout:g} s; the machine is busy). "
+                      "The merge itself is on origin: run `git pull --ff-only` in the dashboard checkout, or merge any other branch to retry.",
+        }
+
+
+def _sync_live_checkout_unguarded(main_branch):
     """After a branch lands on the ACTIVE repo root's main, fast-forward THIS dashboard's
     own repo (PACKAGE_ROOT) to match, if it's a clone of the same remote and clean enough
     to fast-forward safely. Never force/reset here -- a dirty PACKAGE_ROOT (e.g. a
@@ -2503,7 +2533,7 @@ def _sync_live_checkout(main_branch):
     # untracked file in the working tree, git pull --ff-only will refuse to
     # overwrite it. Report those paths so the user can resolve them.
     head = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
-    _run_git(["fetch", "origin"], PACKAGE_ROOT)
+    _run_git(["fetch", "origin"], PACKAGE_ROOT, timeout=_ACTION_FETCH_TIMEOUT_SECONDS)
     remote_ref = f"origin/{main_branch}"
     try:
         # name-status: lists paths with status codes (A=added, M=modified, D=deleted).
@@ -2524,8 +2554,7 @@ def _sync_live_checkout(main_branch):
 
     try:
         before = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
-        _run_git(["fetch", "origin"], PACKAGE_ROOT)
-        _run_git(["pull", "--ff-only", "origin", main_branch], PACKAGE_ROOT)
+        _run_git(["merge", "--ff-only", remote_ref], PACKAGE_ROOT, timeout=_ACTION_FETCH_TIMEOUT_SECONDS)
         after = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
     except RuntimeError as e:
         return {"synced": False, "reason": str(e)}
@@ -3180,6 +3209,7 @@ from routes.discovery import discovery_bp  # noqa: E402
 from routes.hygiene import hygiene_bp  # noqa: E402
 from routes.deep_dive import deep_dive_bp  # noqa: E402
 from routes.job_types import job_types_bp  # noqa: E402
+from routes.workflow_graph import workflow_graph_bp  # noqa: E402
 from routes.worker_models_1_more import worker_models_1_more_bp  # noqa: E402
 from routes.instances import instances_bp  # noqa: E402
 from routes.chat import chat_bp  # noqa: E402
@@ -3195,6 +3225,7 @@ from routes.shared_misc import shared_misc_bp  # noqa: E402
 from routes.cloud_meter import cloud_meter_bp  # noqa: E402
 from routes.stalled_worker import stalled_worker_bp  # noqa: E402
 from routes.verifier_worker import verifier_worker_bp  # noqa: E402
+from routes.needswork_worker import needswork_worker_bp  # noqa: E402
 
 app.register_blueprint(reports_bp)
 app.register_blueprint(concepts_bp)
@@ -3210,6 +3241,7 @@ app.register_blueprint(discovery_bp)
 app.register_blueprint(hygiene_bp)
 app.register_blueprint(deep_dive_bp)
 app.register_blueprint(job_types_bp)
+app.register_blueprint(workflow_graph_bp)
 app.register_blueprint(worker_models_1_more_bp)
 app.register_blueprint(instances_bp)
 app.register_blueprint(chat_bp)
@@ -3223,6 +3255,7 @@ app.register_blueprint(plugins_bp)
 app.register_blueprint(cloud_meter_bp)
 app.register_blueprint(stalled_worker_bp)
 app.register_blueprint(verifier_worker_bp)
+app.register_blueprint(needswork_worker_bp)
 app.register_blueprint(task_bp)
 app.register_blueprint(shared_misc_bp)
 

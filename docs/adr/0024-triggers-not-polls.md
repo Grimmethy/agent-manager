@@ -76,12 +76,19 @@ cross-process: node, python and bash writers append; consumers drain from their 
   reconcile (the same shape, built from stats). The event code takes the clock and filesystem as
   arguments and imports nothing from agent-manager, so it can move into the triggers repo unchanged.
 - **Interim hook (2026-11-02).** Plugins declare `watchdogScripts` in `plugins.json` and the watchdog runs them once per tick (`docs/PLUGIN_API.md`, "Watchdog scripts"), so a new plugin trigger registers with the one clock instead of adding a timer or a hardcoded block. Each such script is a cheap edge check that the journal's events will replace.
+- **Pool sweep gate (2026-11-03).** The interim gate above is now `src/sweep-gate.js`, wired in `scripts/queue-watcher.sh` through `sweep_gate_skips` (`scripts/agent-manager-common.sh`). Measured that day: one tick ran the defect, conflict and redo sweeps for each of 41 pool projects, and the global redo sweep alone read 10,825 task files (7 to 13 s of disk time) 41 times. Now a project's defect and conflict sweeps run only when its `done/`, verdict file or remote refs changed, a sweep is waiting for its second sighting, or the 30 minute safety net is due; the global redo sweep runs once per tick behind its own gate. It fails open and `AGENT_MANAGER_SWEEP_GATE=off` restores the old behaviour. Still a signature comparison, not an event: the journal-driven version stays S1.
 - **S2 — measure, then migrate by cost.** Time each of the 31 watchdog scripts for one idle tick; convert
   the most expensive ones first.
 - **S3 — lane wake-up.** Replace the idle `sleep` loops with a wake on change (node `fs.watch`, which
   works on the queue directories here, or a sequence counter in `/dev/shm`).
 - **S4 — extract.** Move the proven Node implementation into the triggers repo once a second consumer
   exists (Elementals' own components passing the conformance scenarios counts).
+
+## S2 measurement (2026-11-03)
+
+`scripts/idle-cost-audit.py` is the repeatable form of the S2 measurement: it samples `/proc` and prints node/python/git launches per minute by the lane or daemon that started them, plus the shared disk's IOPS, MB/s and busy percent. Counts are a lower bound (a process that starts and exits between two samples is missed); compare runs at the same `--interval`.
+
+Baseline, 150 s sample, the owner's box: `sdb` 100% busy with ~4,600 write IOPS and ~83 read IOPS (about 1 MB/s read); launches per minute: other Claude sessions' test runs ~234, lanes ~160 (worker-tuner 48, worker-uiconf 40, worker-rx580 35, review-runner 10, apply-loop 10, worker-p40 6, worker-3090 4), dashboard ~30 (`git fetch origin` ~7/min), queue-watcher ~14. Every lane tick repeats `pool-projects.js` (~40/min across lanes), `worker-switch.js`, `gpu-guard.js`, `next-claimable-task.js` and `task-sources.js`.
 
 ## Alternatives considered
 

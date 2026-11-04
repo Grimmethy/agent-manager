@@ -1,12 +1,14 @@
 'use strict';
 
-// branch-defect-readmit-sweep.js -- a watchdog one-shot that sends a single-task agent/* branch back for ONE redraft when a current chat/manual
-// needs-work verdict names defects in it.
+// branch-defect-readmit-sweep.js -- a watchdog one-shot that sends a single-task agent/* branch back for ONE redraft when a current chat, manual or
+// worker needs-work verdict names defects in it.
 //
 // Why (2026-10-24): 86 of the 87 branches in the Unmerged Branches list were needs-work, 82 of them from chat/manual verification, and for 61 the
 // pipeline's own task had already finished as done: review and apply approved changes that a second look found defective. A chat/manual needs-work
 // verdict is stamped onto the owning task as promptContext.priorVerdict (python/dashboard/branch_verdicts.py apply_prior_verdict) and the redraft
 // prompt reads it (lib/prompt-blocks.js priorVerdictBlock), but nothing requeued the task, so the branch sat until a human filed a replacement.
+// 2026-11-02: the branch verifier worker (agent-manager-pipeline-ops, verdict source 'worker') now records most verdicts and apply_prior_verdict stamps
+// them the same way, so its needs-work verdicts count here too (25 Needs-Work cards sat on the board with this sweep ignoring 7 of them).
 // branch-conflict-readmit-sweep.js is the paired re-admission for main conflicts; this is the one for defects. It reuses that module's eligibility
 // rules and requeues through the same code path (chat-task-requeue.js requeueBlockedTask: it deletes the superseded branch, records the removal and
 // marks the old attempt abandoned).
@@ -15,7 +17,7 @@
 //   - only a task in done/ with terminalDisposition 'pending-merge' whose latest `applied` event names an agent/* branch that still exists on origin
 //     and is ahead of <main>; never a hub child or stacked task, never a pinned task, never a branch with a live sibling on it. A human-queued or
 //     premium task IS eligible (owner decision 2026-10-30: the trigger here is a human verdict) and is requeued with its priority kept;
-//   - only a verdict that is current: priorVerdict.verdict 'needs-work', source 'chat' or 'manual', not kind 'main-moved', and priorVerdict.sha equal
+//   - only a verdict that is current: priorVerdict.verdict 'needs-work', source 'chat', 'manual' or 'worker', not kind 'main-moved', and priorVerdict.sha equal
 //     to the branch's CURRENT origin head. A verdict for an older commit is stale (the branch moved) and is ignored;
 //   - the same verdict on the same head must be seen on two runs at least SETTLE_MS apart (a merge, apply or re-verification may be in flight);
 //   - ONE redraft per task. The count is the number of 'defect-readmit' events in the task's history, NOT a field on priorVerdict: a later chat
@@ -43,6 +45,12 @@ function mode() {
 }
 
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
+// Writes only when the content differs from what is there (a tick that decided nothing new must not rewrite the state file every minute).
+function writeJsonIfChanged(p, data, before) {
+  if (JSON.stringify(before) === JSON.stringify(data)) return;
+  writeJson(p, data);
+}
+
 function writeJson(p, data) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const tmp = `${p}.tmp`;
@@ -58,11 +66,11 @@ function defaultGit(repoRoot, args) {
   }
 }
 
-// The task's priorVerdict when it is a defect verdict from a person (chat/manual), else null.
+// The task's priorVerdict when it is a defect verdict from a person or the verifier worker (chat/manual/worker), else null.
 function defectVerdict(task) {
   const pv = task && task.promptContext && typeof task.promptContext === 'object' ? task.promptContext.priorVerdict : null;
   if (!pv || typeof pv !== 'object' || pv.verdict !== 'needs-work' || pv.kind === 'main-moved') return null;
-  if (pv.source !== 'chat' && pv.source !== 'manual') return null;
+  if (pv.source !== 'chat' && pv.source !== 'manual' && pv.source !== 'worker') return null;
   if (typeof pv.sha !== 'string' || !pv.sha) return null;
   return Array.isArray(pv.reasons) && pv.reasons.some((r) => typeof r === 'string' && r.trim()) ? pv : null;
 }
@@ -82,10 +90,10 @@ async function sweepBranchDefects({
   const live = summary.mode === 'on' && !dryRun;
   const queueDir = path.join(pipelineDir, 'queue');
   const nowIso = new Date(now).toISOString();
-  if (fetch) git(repoRoot, ['fetch', '-q', 'origin']);
 
   const statePath = path.join(queueDir, STATE_FILE);
-  const state = readJson(statePath) || {};
+  const prevState = readJson(statePath);
+  const state = prevState || {};
   const nextState = {};
 
   const doneDir = path.join(queueDir, 'done');
@@ -93,6 +101,9 @@ async function sweepBranchDefects({
   let superseded = 0;
   try { names = fs.readdirSync(doneDir).filter((f) => f.endsWith('.json')); } catch { names = []; }
 
+  // Pre-pass (2026-11-03, pool rescan): the cheap local filters first, one read per task. The slow `git fetch` is only worth paying for when a task is left that git has to
+  // answer for; with 41 pool projects and no candidate in most of them, a fetch before the filters cost a fetch per project per tick for nothing.
+  const candidates = [];
   for (const name of names) {
     const filePath = path.join(doneDir, name);
     const task = readJson(filePath);
@@ -101,6 +112,15 @@ async function sweepBranchDefects({
     if (!pv) continue;
     const branch = appliedBranch(task);
     if (!branch) continue;
+    candidates.push({ name, filePath, task, pv, branch });
+  }
+  if (!candidates.length) {
+    if (Object.keys(state).length) writeJson(statePath, nextState);    // an empty state stays as it is: no write when nothing would change
+    return summary;
+  }
+  if (fetch) git(repoRoot, ['fetch', '-q', 'origin']);
+
+  for (const { name, filePath, task, pv, branch } of candidates) {
     try {
       const head = git(repoRoot, ['rev-parse', '--verify', `origin/${branch}`]);
       if (head.code !== 0) continue;                       // branch gone: reconcile's business, not ours
@@ -143,7 +163,7 @@ async function sweepBranchDefects({
     }
   }
 
-  writeJson(statePath, nextState);
+  writeJsonIfChanged(statePath, nextState, prevState);
   return summary;
 }
 
