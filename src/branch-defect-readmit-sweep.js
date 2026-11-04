@@ -62,6 +62,12 @@ function mode() {
 }
 
 function readJson(p, fsImpl = fs) { try { return JSON.parse(fsImpl.readFileSync(p, 'utf8')); } catch { return null; } }
+// Writes only when the content differs from what is there (a tick that decided nothing new must not rewrite the state file every minute).
+function writeJsonIfChanged(p, data, before) {
+  if (JSON.stringify(before) === JSON.stringify(data)) return;
+  writeJson(p, data);
+}
+
 function writeJson(p, data) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const tmp = `${p}.tmp`;
@@ -103,7 +109,9 @@ async function sweepBranchDefects({
   const nowIso = new Date(now).toISOString();
 
   const statePath = path.join(queueDir, STATE_FILE);
-  const state = readJson(statePath, fsImpl) || {};
+  const prevState = readJson(statePath, fsImpl);
+  const state = prevState || {};
+
   const doneDir = path.join(queueDir, 'done');
   const listDone = () => { try { return fsImpl.readdirSync(doneDir).filter((f) => f.endsWith('.json')); } catch { return []; } };
 
@@ -145,14 +153,31 @@ async function sweepBranchDefects({
     }
   }
 
-  if (fetch) git(repoRoot, ['fetch', '-q', 'origin']);
-
   let superseded = 0;
   let holdCommit = false;
   let snapshot = null;
   const getSnapshot = () => (snapshot || (snapshot = buildQueueSnapshot(pipelineDir)));
   const missedEvents = [];                                // verdicts the reconcile scan newly found that no event announced
 
+  // Journal bookkeeping, shared by BOTH exits (the no-candidate early return below and the end of the run): count what the scan found unannounced, consume the drained events and stamp
+  // the scan. Skipping it on the early return would leave the events pending forever and re-run the full scan every minute.
+  const finishJournal = () => {
+    if (drained) {
+      if (missedEvents.length) {
+        try { queueEvents.recordCorrection(pipelineDir, CONSUMER, missedEvents.length, { fs: fsImpl }); summary.journal.corrections = missedEvents.length; } catch { /* the counter is best effort */ }
+      }
+      if (summary.errors === 0 && !holdCommit) {              // unfinished work (an error, an unstamped fresh verdict) keeps the events and the scan pending
+        drained.commit();
+        if (fullScan) {
+          try { fsImpl.mkdirSync(path.dirname(scanStatePath(pipelineDir)), { recursive: true }); fsImpl.writeFileSync(scanStatePath(pipelineDir), JSON.stringify({ at: now })); } catch { /* best effort */ }
+        }
+      }
+    }
+  };
+
+  // Pre-pass (2026-11-03, pool rescan): the cheap local filters first, one read per task. The slow `git fetch` is only worth paying for when a task is left that git has to
+  // answer for; with 41 pool projects and no candidate in most of them, a fetch before the filters cost a fetch per project per tick for nothing.
+  const candidates = [];
   for (const name of names) {
     const filePath = path.join(doneDir, name);
     const task = readJson(filePath, fsImpl);
@@ -165,6 +190,16 @@ async function sweepBranchDefects({
     }
     const branch = appliedBranch(task);
     if (!branch) continue;
+    candidates.push({ name, filePath, task, pv, branch });
+  }
+  if (!candidates.length) {
+    if (Object.keys(state).length) writeJson(statePath, nextState);    // an empty state stays as it is: no write when nothing would change
+    finishJournal();
+    return summary;
+  }
+  if (fetch) git(repoRoot, ['fetch', '-q', 'origin']);
+
+  for (const { name, filePath, task, pv, branch } of candidates) {
     try {
       const head = git(repoRoot, ['rev-parse', '--verify', `origin/${branch}`]);
       if (head.code !== 0) continue;                       // branch gone: reconcile's business, not ours
@@ -212,18 +247,8 @@ async function sweepBranchDefects({
     }
   }
 
-  writeJson(statePath, nextState);
-  if (drained) {
-    if (missedEvents.length) {
-      try { queueEvents.recordCorrection(pipelineDir, CONSUMER, missedEvents.length, { fs: fsImpl }); summary.journal.corrections = missedEvents.length; } catch { /* the counter is best effort */ }
-    }
-    if (summary.errors === 0 && !holdCommit) {              // unfinished work (an error, an unstamped fresh verdict) keeps the events and the scan pending
-      drained.commit();
-      if (fullScan) {
-        try { fsImpl.mkdirSync(path.dirname(scanStatePath(pipelineDir)), { recursive: true }); fsImpl.writeFileSync(scanStatePath(pipelineDir), JSON.stringify({ at: now })); } catch { /* best effort */ }
-      }
-    }
-  }
+  writeJsonIfChanged(statePath, nextState, prevState);
+  finishJournal();
   return summary;
 }
 

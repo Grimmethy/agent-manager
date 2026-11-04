@@ -5,7 +5,7 @@ let currentBranches = [];
 let currentHeldHubs = [];
 
 async function fetchHeldHubs() {
-  try { return await fetchJson('/api/git/held-hub-branches', { timeoutMs: 30000 }); } catch (e) { return []; }
+  try { return await fetchJson('/api/git/held-hub-branches?projects=all', { timeoutMs: 30000 }); } catch (e) { return []; }
 }
 let branchesPollTimer = null;
 
@@ -75,6 +75,18 @@ function branchCardHtml(b) {
 // Wires one card's own click handlers -- called both after a full rebuild (every card)
 // and after appending a single new card during a background poll (just that one), so a
 // poll never has to re-wire cards that were already working.
+// What to tell the owner after a merge that SUCCEEDED but left something undone (the dashboard's own checkout could not be fast-forwarded,
+// or a record could not be stamped). '' when everything went through. The merge is on origin either way; never word it as a failure.
+function mergeNoticeText(result) {
+  const parts = [];
+  const sync = result && result.liveSync;
+  if (sync && sync.synced === false && sync.reason) parts.push(sync.reason);
+  for (const w of (result && Array.isArray(result.warnings)) ? result.warnings : []) {
+    if (w && !parts.includes(w)) parts.push(w);
+  }
+  return parts.length ? 'Merged, but not everything finished:\n\n' + parts.join('\n\n') : '';
+}
+
 function wireBranchCard(card) {
   card.onclick = (e) => {
     // Don't hijack the Merge/Discard buttons' own clicks -- each has its own handler
@@ -118,6 +130,8 @@ function wireBranchCard(card) {
         });
         const result = await resp.json();
         if (!resp.ok || !result.succeeded) throw new Error(result.reason || `HTTP ${resp.status}`);
+        const notice = mergeNoticeText(result);
+        if (notice) alert(notice);
         if (result.liveSync && result.liveSync.restartTriggered) {
           mergeBtn.textContent = 'Merged -- dashboard reloading...';
           // Werkzeug's reloader restart is near-instant but not synchronous with this
@@ -272,11 +286,9 @@ async function refreshBranchesTab() {
     }
   }
   currentBranches = branches;
-  refreshBranchVerdictFilterBar(main, branches);
   currentHeldHubs = await fetchHeldHubs();
-  const heldEl = main.querySelector('[data-held-hubs]');
-  if (heldEl) heldEl.outerHTML = heldHubsHtml(currentHeldHubs);
-  else main.insertAdjacentHTML('beforeend', heldHubsHtml(currentHeldHubs));
+  refreshBranchVerdictFilterBar(main, branches);       // the counts, including the hidden-hubs button
+  refreshHeldHubsPanel(main);
 }
 
 async function renderBranchDetailModal(b) {

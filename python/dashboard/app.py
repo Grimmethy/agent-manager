@@ -102,6 +102,8 @@ from app_catalog_helpers import (  # noqa: F401
     CONCEPT_STABLE_STATUSES,
     GHOST_CONCEPT_ID,
     _BRANCH_CACHE_TTL_SECONDS,
+    _ACTION_FETCH_REUSE_SECONDS,
+    _ACTION_FETCH_TIMEOUT_SECONDS,
     _BRANCH_FETCH_TTL_SECONDS,
     _COMMUNITY_ID_SUFFIX_RE,
     _DEEP_DIVE_ITEM_RE,
@@ -2270,7 +2272,7 @@ def _branch_content_already_on_main(repo_root, main_branch, full_ref):
         return False
 
 
-def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_dir=None):
+def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_dir=None, fetch_timeout=30):
     """The ACTIVE project's list by default. repo_root/pipeline_dir name another registered project (branch_projects.py): it always fetches (the caller owns that
     project's timer) and leaves the active project's held-hub cache and fetch timer alone."""
     other = repo_root is not None
@@ -2287,7 +2289,7 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
     with _branch_cache_lock:
         fetch_due = other or force_fetch or (time.time() - _branch_fetch_state["at"]) >= _BRANCH_FETCH_TTL_SECONDS
     if fetch_due:
-        _run_git(["fetch", "origin", "--prune"], repo_root, timeout=30)
+        _run_git(["fetch", "origin", "--prune"], repo_root, timeout=fetch_timeout)
         if not other:
             with _branch_cache_lock:
                 _branch_fetch_state["at"] = time.time()
@@ -2440,7 +2442,7 @@ def list_unmerged_branches(force=False, stale_ok=False):
             t.start()
         return stale
     try:
-        branches = _list_unmerged_branches_uncached(force_fetch=force)
+        branches = _list_unmerged_branches_uncached(force_fetch=force, **({"fetch_timeout": _ACTION_FETCH_TIMEOUT_SECONDS} if force else {}))
     except (RuntimeError, subprocess.SubprocessError, OSError) as e:
         # Best-effort, same "a check failing here must never block the rest of the
         # dashboard" rule as everything else that shells out in this file -- a git/network
@@ -2486,6 +2488,22 @@ def _invalidate_branch_cache(refetch=True, drop_branch=None):
 
 
 def _sync_live_checkout(main_branch):
+    """Fast-forward the dashboard's own checkout after a merge (see _sync_live_checkout_unguarded).
+    The merge is already on origin when this runs, so git being too slow to answer (a fetch takes ~47 s
+    at load 25) must be reported as "not synced", never raised: raising turned a merge that had landed
+    into an uncaught 500 and skipped stamping the task record."""
+    try:
+        return _sync_live_checkout_unguarded(main_branch)
+    except subprocess.TimeoutExpired as exc:
+        cmd = " ".join(str(a) for a in (exc.cmd if isinstance(exc.cmd, (list, tuple)) else [exc.cmd]))
+        return {
+            "synced": False,
+            "reason": f"git did not answer in time while syncing the dashboard checkout (`{cmd}` took longer than {exc.timeout:g} s; the machine is busy). "
+                      "The merge itself is on origin: run `git pull --ff-only` in the dashboard checkout, or merge any other branch to retry.",
+        }
+
+
+def _sync_live_checkout_unguarded(main_branch):
     """After a branch lands on the ACTIVE repo root's main, fast-forward THIS dashboard's
     own repo (PACKAGE_ROOT) to match, if it's a clone of the same remote and clean enough
     to fast-forward safely. Never force/reset here -- a dirty PACKAGE_ROOT (e.g. a
@@ -2515,7 +2533,7 @@ def _sync_live_checkout(main_branch):
     # untracked file in the working tree, git pull --ff-only will refuse to
     # overwrite it. Report those paths so the user can resolve them.
     head = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
-    _run_git(["fetch", "origin"], PACKAGE_ROOT)
+    _run_git(["fetch", "origin"], PACKAGE_ROOT, timeout=_ACTION_FETCH_TIMEOUT_SECONDS)
     remote_ref = f"origin/{main_branch}"
     try:
         # name-status: lists paths with status codes (A=added, M=modified, D=deleted).
@@ -2536,8 +2554,7 @@ def _sync_live_checkout(main_branch):
 
     try:
         before = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
-        _run_git(["fetch", "origin"], PACKAGE_ROOT)
-        _run_git(["pull", "--ff-only", "origin", main_branch], PACKAGE_ROOT)
+        _run_git(["merge", "--ff-only", remote_ref], PACKAGE_ROOT, timeout=_ACTION_FETCH_TIMEOUT_SECONDS)
         after = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
     except RuntimeError as e:
         return {"synced": False, "reason": str(e)}

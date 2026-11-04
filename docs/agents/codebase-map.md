@@ -43,7 +43,7 @@ prefix(es) the tab's own JS calls, plus the `app.py` line range those handlers l
 | Tab | Frontend | Backend routes | Note |
 |---|---|---|---|
 | Project | `project-tab.js` — `enterProjectTab()` (L1), `leaveProjectTab()` (L123), `refreshPipelineStatus()` (L127) | `/api/browse`, `/api/projects/history`, `/api/project/status`, `/api/project/build`, `/api/project/sync` (`app.py:5390-5639`); graph view at `/project/visualization`, `/project/positions` (`app.py:5640-5777`) | Bypasses the generic `renderMain()` dispatcher — driven by enter/leave lifecycle calls wired in `core-ui.js`'s nav click handler, not a `render*Tab` case like every other tab. |
-| Workers | `workers-tab.js` — `renderWorkers(isPoll)` | `/api/instances`, `/api/instances/<id>/recent-tasks`, `/run-log`, `/assignable-tasks`, `/assign-task`, `/api/worker-models*` (`app.py:1298-1352, 1647-1985, 2029-2073`) | Also owns `setWorkerModel`/`setWorkerTask`/`toggleWorkerExpand` helpers in the same file. The Cards | Graph toggle draws `workflow-graph-view.js` (`renderGraphView`, read-only) from `/api/workflow-graph` (`python/dashboard/routes/workflow_graph.py`, built by `src/workflow-graph.js`, laid out by `workflow-layout.js`); an optional workflow file (path in `AGENT_MANAGER_WORKFLOW_PATH`; `src/workflow-config.js`, `src/workflow-overlay.js`) adds groups, labels and authored edges, and `workflow-groups.js` folds the groups in the view; `src/workflow-priority.js` pins today's flat source order and compares it with the authored group order, both shown in the source node panel; shared status helpers live in `worker-status-helpers.js`; see `docs/agents/workflow-graph.md`. Moved out of `core-ui.js` 2026-10-01; `python/dashboard/static/js/index-script-order.test.js` guards that index.html loads it above the inline script. |
+| Workers | `workers-tab.js` — `renderWorkers(isPoll)` | `/api/instances`, `/api/instances/<id>/recent-tasks`, `/run-log`, `/assignable-tasks`, `/assign-task`, `/api/worker-models*` (`app.py:1298-1352, 1647-1985, 2029-2073`) | Also owns `setWorkerModel`/`setWorkerTask`/`toggleWorkerExpand` helpers in the same file. The Cards | Graph toggle draws `workflow-graph-view.js` (`renderGraphView`, read-only) from `/api/workflow-graph` (`python/dashboard/routes/workflow_graph.py`, built by `src/workflow-graph.js`, laid out by `workflow-layout.js`); an optional workflow file (path in `AGENT_MANAGER_WORKFLOW_PATH`; `src/workflow-config.js`, `src/workflow-overlay.js`) adds groups, labels and authored edges, and `workflow-groups.js` folds the groups in the view; `src/workflow-priority.js` pins today's flat source order and compares it with the authored group order, both shown in the source node panel; `src/workflow-claim-order.js` turns the authored groups into claim-order bands that `rankPriorityOfTask` uses only when `AGENT_MANAGER_PRIORITY_MODE=group`; shared status helpers live in `worker-status-helpers.js`; see `docs/agents/workflow-graph.md`. Moved out of `core-ui.js` 2026-10-01; `python/dashboard/static/js/index-script-order.test.js` guards that index.html loads it above the inline script. |
 | Hardware | `branches-joblist-hardware-tabs.js` — `renderHardwareTab()` (L703), `renderSparkline()` (L670) | `/api/hardware/stats` (`app.py:8149-8172`) | Shares its file with Job List and Unmerged Branches. |
 | Job List | `branches-joblist-hardware-tabs.js` — `renderJobListTab()` (L243) | `/api/queue/<state>` (`app.py:2374-2756`), `/api/job-types*`, `/api/job-log/<source>` (`app.py:7083-7433`), `/api/pipeline-map` (`app.py:6680-7082`) | Same file as Hardware/Unmerged Branches. Task detail is a shared modal, see `task-detail-modal.js` below. |
 | Plugins | `plugins-tab.js` — `renderPluginsTab()` | `/api/plugins`, `/toggle`, `/add`, `/install`, `/select-slot` (`app.py:7434-7745, 8173-8287`); marketplace browse/update (`app.py:7746-8096`) | Moved out of `core-ui.js` 2026-10-01 (with the Workers tab, the sidebar/Claude panels and the Queue tab). `core-ui.js` keeps nav, tab merging and plugin-tab dispatch. `plugins.json` (host-local, gitignored) wires plugin entries into the dashboard; see [PLUGIN_API.md "plugins.json is host-local"](../PLUGIN_API.md#pluginsjson-is-host-local) for the provisioning checklist and why the file is not tracked. |
@@ -66,7 +66,17 @@ out of it into `models-tab.js` on 2026-10-02. `task-detail-modal.js` (742 lines)
 (Workers, Job List, Discovery, ...), not tied to any one tab itself —
 `renderTaskDetailModal()` (L201).
 
-## Section 2 — Routes with no sidebar tab
+## Section 2 — Utility modules
+
+Pure JS modules that are not dashboard tabs themselves but are used by them.
+
+| Module | Path | Purpose | Exports | Storage |
+|---|---|---|---|---|
+| tab-stack | `python/dashboard/static/js/tab-stack.js` | Pure tab-stack registry: manages an array of tabs (id, name, open, width, lastActivatedAt) and an order list of ids, keyed per plugin via a storage key. No DOM, no localStorage. Tests in `python/dashboard/static/js/tab-stack.test.js`. | Constants: `MAX_OPEN=6`, `MAX_TABS=24`, `DEFAULT_WIDTH=380`, `DEFAULT_TAB_ID='main'`<br>Functions: `registryKey(plugin)`, `deserializeRegistry(raw)`, `createTab(registry, plugin, name)`, `renameTab(registry, tabId, newName)`, `deleteTab(registry, tabId)`, `reorder(registry, tabId, direction)`, `setOpen(registry, tabId, open)`, `markActivated(registry, tabId)`, `mostRecentlyActivated(registry)`, `asideOrder(registry)`, `pillColumns(registry, asideWidth)` | `agentManagerPluginTabs:<plugin>` |
+
+Registry shape: `{tabs:[{id,name,open,width,lastActivatedAt}], order:[id]}`. Used by dashboard tabs to persist tab state across sessions. Loaded by `index.html` as a plain global `<script>`.
+
+## Section 3 — Routes with no sidebar tab
 
 | Feature | Route prefix(es) | Lines | Note |
 |---|---|---|---|
@@ -78,7 +88,7 @@ out of it into `models-tab.js` on 2026-10-02. `task-detail-modal.js` (742 lines)
 | Model benchmark panel | `/api/benchmark/*` | `app.py:2190-2373` | Launches/polls background model benchmark runs. |
 | Pipeline status/control | `/api/pipeline/status`, `/start`, `/stop` | `app.py:6680-7082, 8097-8148` | Overall daemon status and start/stop controls, surfaced inline on the Project tab rather than as a separate route-driven tab. |
 
-## Section 3 — Core pipeline mechanisms (seed section)
+## Section 4 — Core pipeline mechanisms (seed section)
 
 Grouped to match the categories AGENTS.md's own principles already describe — this
 section is meant to answer "where is the code for the thing that principle is talking

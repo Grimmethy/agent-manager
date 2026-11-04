@@ -30,7 +30,7 @@
 // sightings revisits just those tasks, so the two-sightings SETTLE rule needs no new event. A FULL listing also runs on the first run and every AGENT_MANAGER_EVENTS_RECONCILE_SECS
 // (default 1800), to catch main moving without an announcement (a direct push); a conflict that reconcile scan newly observes while no merge event was drained is counted with
 // recordCorrection (the first run is the catch-up and counts nothing). Position and scan time advance only after a run with no errors and no failed conflict check.
-// AGENT_MANAGER_QUEUE_EVENTS=off restores the old full listing on every run exactly. An idle run makes no git call at all, fetch included; every other run fetches once before it examines anything.
+// AGENT_MANAGER_QUEUE_EVENTS=off restores the old full listing on every run exactly. An idle run makes no git call at all, fetch included; every other run fetches once, after the cheap local filters and only when a candidate is left (the pool rescan rule).
 // CLI: node branch-conflict-readmit-sweep.js [--dry-run]
 
 const fs = require('fs');
@@ -59,6 +59,12 @@ function mode() {
 }
 
 function readJson(p, fsImpl = fs) { try { return JSON.parse(fsImpl.readFileSync(p, 'utf8')); } catch { return null; } }
+// Writes only when the content differs from what is there (a tick that decided nothing new must not rewrite the state file every minute).
+function writeJsonIfChanged(p, data, before) {
+  if (JSON.stringify(before) === JSON.stringify(data)) return;
+  writeJson(p, data);
+}
+
 function writeJson(p, data) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const tmp = `${p}.tmp`;
@@ -142,10 +148,10 @@ async function sweepBranchConflicts({
   const live = summary.mode === 'on' && !dryRun;
   const queueDir = path.join(pipelineDir, 'queue');
   const nowIso = new Date(now).toISOString();
-  if (fetch && !summary.journal.events) git(repoRoot, ['fetch', '-q', 'origin']);   // journal off: the old behaviour, first thing on every run (journal on: see below)
 
   const statePath = path.join(queueDir, STATE_FILE);
-  const state = readJson(statePath, fsImpl) || {};
+  const prevState = readJson(statePath, fsImpl);
+  const state = prevState || {};
   const nextState = {};
   const doneDir = path.join(queueDir, 'done');
   const listDone = () => { try { return fsImpl.readdirSync(doneDir).filter((f) => f.endsWith('.json')); } catch { return []; } };
@@ -181,21 +187,45 @@ async function sweepBranchConflicts({
     }
   }
 
-  // Journal on: the fetch only matters when this run will actually examine tasks (a first run, a due reconcile, a merge event or a pending sighting). An idle run returned above
-  // and made no git call at all (ADR-0024: the watchdog's `git fetch origin` was measured at about 17 launches a minute).
-  if (fetch && summary.journal.events) git(repoRoot, ['fetch', '-q', 'origin']);
-
   let holdCommit = false;                                  // a failed conflict check leaves the events pending
   let snapshot = null;
   const getSnapshot = () => (snapshot || (snapshot = buildQueueSnapshot(pipelineDir)));
   const missedMerges = [];                                 // conflicts the reconcile scan newly found while no merge event was drained
 
+  // Journal bookkeeping, shared by BOTH exits (the no-candidate early return below and the end of the run): count what the scan found unannounced, consume the drained events and stamp
+  // the scan. Skipping it on the early return would leave the events pending forever and re-run the full scan every minute.
+  const finishJournal = () => {
+    if (drained) {
+      if (missedMerges.length) {
+        try { queueEvents.recordCorrection(pipelineDir, CONSUMER, missedMerges.length, { fs: fsImpl }); summary.journal.corrections = missedMerges.length; } catch { /* the counter is best effort */ }
+      }
+      if (summary.errors === 0 && !holdCommit) {
+        drained.commit();
+        if (fullScan) {
+          try { fsImpl.mkdirSync(path.dirname(scanStatePath(pipelineDir)), { recursive: true }); fsImpl.writeFileSync(scanStatePath(pipelineDir), JSON.stringify({ at: now })); } catch { /* best effort */ }
+        }
+      }
+    }
+  };
+
+  // Pre-pass (2026-11-03, pool rescan): the cheap local filters first, one read per task; `git fetch` only when a candidate is left (see branch-defect-readmit-sweep.js).
+  const candidates = [];
   for (const name of names) {
     const filePath = path.join(doneDir, name);
     const task = readJson(filePath, fsImpl);
     if (!eligibleTask(task)) continue;
     const branch = appliedBranch(task);
     if (!branch) continue;
+    candidates.push({ name, filePath, task, branch });
+  }
+  if (!candidates.length) {
+    if (Object.keys(state).length) writeJson(statePath, nextState);
+    finishJournal();
+    return summary;
+  }
+  if (fetch) git(repoRoot, ['fetch', '-q', 'origin']);
+
+  for (const { name, filePath, task, branch } of candidates) {
     try {
       const head = git(repoRoot, ['rev-parse', '--verify', `origin/${branch}`]);
       if (head.code !== 0) continue;                       // branch gone: reconcile's business, not ours
@@ -250,18 +280,8 @@ async function sweepBranchConflicts({
     }
   }
 
-  if (summary.mode !== 'off') writeJson(statePath, nextState);
-  if (drained) {
-    if (missedMerges.length) {
-      try { queueEvents.recordCorrection(pipelineDir, CONSUMER, missedMerges.length, { fs: fsImpl }); summary.journal.corrections = missedMerges.length; } catch { /* the counter is best effort */ }
-    }
-    if (summary.errors === 0 && !holdCommit) {
-      drained.commit();
-      if (fullScan) {
-        try { fsImpl.mkdirSync(path.dirname(scanStatePath(pipelineDir)), { recursive: true }); fsImpl.writeFileSync(scanStatePath(pipelineDir), JSON.stringify({ at: now })); } catch { /* best effort */ }
-      }
-    }
-  }
+  if (summary.mode !== 'off') writeJsonIfChanged(statePath, nextState, prevState);
+  finishJournal();
   return summary;
 }
 

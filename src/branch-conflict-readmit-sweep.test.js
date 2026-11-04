@@ -404,3 +404,81 @@ test('fetch: false never fetches, in either mode', async () => {
   await run(w, t0 + MIN, { git: g, fetch: false, env: OFF });
   assert.equal(fetchCount(g), 0);
 });
+
+// A git runner that records every call and delegates to real git (the sweeps' own defaultGit shape).
+function gitSpy() {
+  const calls = [];
+  const git = (cwd, args) => {
+    calls.push(args);
+    try { return { code: 0, out: execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }; } catch (e) { return { code: typeof e.status === 'number' ? e.status : 2, out: String(e.stdout || ''), err: String(e.stderr || '') }; }
+  };
+  return { calls, git, fetches: () => calls.filter((a) => a[0] === 'fetch').length };
+}
+
+test('no candidate: no git call at all and no state file is created', async () => {
+  const w = makeWorld();
+  const spy = gitSpy();
+  putTask(w.pipelineDir, 'hubchild', 'agent/hubchild', { parentHub: 'H' });
+  putTask(w.pipelineDir, 'merged', 'agent/merged', { terminalDisposition: 'merged' });
+  const s = await run(w, Date.now(), { git: spy.git });
+  assert.deepStrictEqual(spy.calls, []);
+  assert.strictEqual(s.checked, 0);
+  assert.strictEqual(fs.existsSync(path.join(w.pipelineDir, 'queue', STATE_FILE)), false);
+});
+
+test('one candidate fetches exactly once and first; two candidates still once; fetch:false never', async () => {
+  const w = conflictWorld();
+  const spy = gitSpy();
+  await run(w, Date.now(), { git: spy.git });
+  assert.strictEqual(spy.fetches(), 1);
+  assert.deepStrictEqual(spy.calls[0], ['fetch', '-q', 'origin']);
+  assert.ok(spy.calls.length > 1);
+  const w2 = makeWorld();
+  for (const id of ['t1', 't2']) { w2.commitOnBranch(`agent/${id}`, 'b.txt', `${id}\n`); putTask(w2.pipelineDir, id, `agent/${id}`); }
+  const spy2 = gitSpy();
+  const two = await run(w2, Date.now(), { git: spy2.git });
+  assert.strictEqual(spy2.fetches(), 1);
+  assert.strictEqual(two.checked, 2);                                      // both candidates are examined after the one fetch
+  const spy3 = gitSpy();
+  await run(conflictWorld(), Date.now(), { git: spy3.git, fetch: false });
+  assert.strictEqual(spy3.fetches(), 0);
+  assert.ok(spy3.calls.length > 0);
+});
+
+test('a leftover state entry with no candidate any more is cleared; an unchanged state is not rewritten; mode off writes nothing', async () => {
+  const w = makeWorld();
+  const statePath = path.join(w.pipelineDir, 'queue', STATE_FILE);
+  fs.writeFileSync(statePath, JSON.stringify({ 'agent/gone': { sha: 'x', firstSeenAt: '2026-10-01T00:00:00Z' } }));
+  await run(w, Date.now(), { git: gitSpy().git, modeOverride: 'off' });
+  assert.deepStrictEqual(Object.keys(JSON.parse(fs.readFileSync(statePath, 'utf8'))), ['agent/gone']);
+  await run(w, Date.now(), { git: gitSpy().git });
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(statePath, 'utf8')), {});
+  const old = new Date('2026-01-01T00:00:00Z');
+  fs.utimesSync(statePath, old, old);
+  await run(w, Date.now(), { git: gitSpy().git });
+  assert.strictEqual(fs.statSync(statePath).mtimeMs, old.getTime());
+  const c = conflictWorld();
+  const t0 = Date.now();
+  await run(c, t0);
+  const cs = path.join(c.pipelineDir, 'queue', STATE_FILE);
+  fs.utimesSync(cs, old, old);
+  await run(c, t0 + 1000);                                                 // the same observation: identical state, no rewrite
+  assert.strictEqual(fs.statSync(cs).mtimeMs, old.getTime());
+});
+
+// The pool-rescan early return (no candidate left after the cheap filters) must still finish the journal work, or the first scan is never recorded and every run is a full scan.
+test('journal mode: a run with no candidate still stamps the scan and consumes its events, so the next run is idle', async () => {
+  const w = makeWorld();                                                   // no pending-merge task at all
+  const g = gitCounter();
+  const t0 = Date.now();
+  const first = await run(w, t0, { git: g });
+  assert.equal(first.journal.fullScan, true);
+  assert.equal(fs.existsSync(path.join(w.pipelineDir, 'queue-events', 'conflict-readmit.scan.json')), true, 'the full scan was recorded');
+  merged(w);                                                               // a merge event while there is nothing to check
+  const second = await run(w, t0 + MIN, { git: g });
+  assert.equal(second.journal.fullScan, false, 'no second full scan');
+  assert.deepEqual(queueEvents.drain(w.pipelineDir, 'conflict-readmit').events, [], 'and the event was consumed');
+  const third = await run(w, t0 + 2 * MIN, { git: g });
+  assert.equal(third.journal.idle, true);
+  assert.deepEqual(g.calls, [], 'no git call, so no fetch, in any of the three runs');
+});
