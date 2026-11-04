@@ -1,0 +1,37 @@
+diff --git a/lib/engine.py b/lib/engine.py
+--- a/lib/engine.py
++++ b/lib/engine.py
+@@ -5,3 +5,10 @@
+ import os
+ 
++def processMessage(text):
++    """Process an incoming chat message.
++
++    Strips whitespace, uppercases, and routes to the handler.
++    """
++    cleaned = text.strip()
++    return cleaned.upper()
++
+diff --git a/tests/test_engine.py b/tests/test_engine.py
+--- a/tests/test_engine.py
++++ b/tests/test_engine.py
+@@ -1,5 +1,14 @@
++from unittest.mock import patch
+ import unittest
++from engine import processMessage
+ 
++@patch('engine.processMessage')
+ class TestEngine(unittest.TestCase):
+-    def test_placeholder(self):
+-        pass
++    def test_process_roundtrip(self, mock_process):
++        mock_process.return_value = 'HELLO'
++        result = processMessage('  hello  ')
++        self.assertEqual(result, 'HELLO')
++        mock_process.assert_called_once_with('  hello  ')
++
++
++class TestEngineIntegration(unittest.TestCase):
++    def test_process_real(self):
++        result = processMessage('  world  ')
++        self.assertEqual(result, 'WORLD')
