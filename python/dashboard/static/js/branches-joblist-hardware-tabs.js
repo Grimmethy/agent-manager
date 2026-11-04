@@ -5,7 +5,7 @@ let currentBranches = [];
 let currentHeldHubs = [];
 
 async function fetchHeldHubs() {
-  try { return await fetchJson('/api/git/held-hub-branches', { timeoutMs: 30000 }); } catch (e) { return []; }
+  try { return await fetchJson('/api/git/held-hub-branches?projects=all', { timeoutMs: 30000 }); } catch (e) { return []; }
 }
 let branchesPollTimer = null;
 
@@ -286,11 +286,9 @@ async function refreshBranchesTab() {
     }
   }
   currentBranches = branches;
-  refreshBranchVerdictFilterBar(main, branches);
   currentHeldHubs = await fetchHeldHubs();
-  const heldEl = main.querySelector('[data-held-hubs]');
-  if (heldEl) heldEl.outerHTML = heldHubsHtml(currentHeldHubs);
-  else main.insertAdjacentHTML('beforeend', heldHubsHtml(currentHeldHubs));
+  refreshBranchVerdictFilterBar(main, branches);       // the counts, including the hidden-hubs button
+  refreshHeldHubsPanel(main);
 }
 
 async function renderBranchDetailModal(b) {
