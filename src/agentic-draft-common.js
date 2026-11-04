@@ -27,7 +27,8 @@ const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
 const { validProposalFiles } = require('./proposal-files.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
-const GIT_TIMEOUT_MS = 60_000;
+const { gitTimeoutMs } = require('./lib/git-timeout.js');
+const GIT_TIMEOUT_MS = gitTimeoutMs();   // AGENT_MANAGER_GIT_TIMEOUT_MS overrides the 60 s default
 
 function runGit(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
