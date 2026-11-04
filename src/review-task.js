@@ -1574,10 +1574,9 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   // the very function being modified, indicating a double rather than real behaviour.
   // Honors AGENT_MANAGER_REVIEW_MOCK_SEAM_CHECK (false | advisory | block, default advisory).
   const mockSeamMode = getConfig().reviewMockSeamCheck;
-  if (mockSeamMode !== 'false'
-      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
+  if (mockSeamMode !== 'false') {
     try {
-      const { seams, advisory } = analyzeMockSeams({ diff: task.rawDiff, config: { AGENT_MANAGER_REVIEW_MOCK_SEAM_CHECK: mockSeamMode } });
+      const { seams, advisory } = analyzeMockSeams({ diff: task.rawDiff, config: {} });
       if (seams.length > 0) {
         task.mockSeams = { count: seams.length, seams };
         const affectedFns = seams.map((s) => s.changedFn);
