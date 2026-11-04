@@ -20,7 +20,9 @@ const GIT_ENV = {
   GIT_TERMINAL_PROMPT: '0',
   GCM_INTERACTIVE: 'never',
 };
-const GIT_TIMEOUT_MS = 60_000;
+const { gitTimeoutMs } = require('./lib/git-timeout.js');   // AGENT_MANAGER_GIT_TIMEOUT_MS (default 60000), read on each call
+const FETCH_RETRY_PAUSE_MS = 2000;
+const FETCH_RETRY_TIMEOUT_FACTOR = 3;
 
 // Stable prefix of the error assertCleanTree() throws. apply-retry-check.js matches on it to treat the
 // failure as INFRASTRUCTURE (a git-state problem, not a draft-quality one): no retry burned, no redraft.
@@ -44,7 +46,7 @@ function detectDefaultBranch(repoRoot) {
   const candidates = [process.env.AGENT_MANAGER_MAIN_BRANCH, 'main', 'master'].filter(Boolean);
   for (const branch of candidates) {
     try {
-      execFileSync('git', ['rev-parse', '--verify', `origin/${branch}`], { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+      execFileSync('git', ['rev-parse', '--verify', `origin/${branch}`], { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: gitTimeoutMs() });
       return branch;
     } catch {
       continue;
@@ -67,13 +69,24 @@ function annotateGitTimeout(err, args, timeoutMs) {
  * Production adapter: real git via child_process, against a real repoRoot on disk.
  * @param {string} repoRoot - Absolute path to the git repo to operate on.
  */
-function createRealGitRunner(repoRoot) {
+// `exec` and `sleepMs` are injectable so the retry can be tested without real git or real waiting.
+function syncSleep(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSleep } = {}) {
   const mainBranch = detectDefaultBranch(repoRoot);
   function run(args, extra = {}) {
+    const attempt = (timeout) => exec('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout, ...extra });
+    const limit = gitTimeoutMs();
     try {
-      return execFileSync('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, ...extra });
+      return attempt(limit);
     } catch (e) {
-      throw annotateGitTimeout(e, args, GIT_TIMEOUT_MS);
+      // A fetch is network- and disk-bound and safe to repeat: when it times out (the shared disk is saturated), wait briefly and try ONCE more with a longer limit.
+      // Nothing else is retried (a push, checkout, reset or merge that timed out may have half-happened). A second timeout throws the same annotated error as before.
+      if (args[0] === 'fetch' && e && e.code === 'ETIMEDOUT') {
+        sleepMs(FETCH_RETRY_PAUSE_MS);
+        const longer = limit * FETCH_RETRY_TIMEOUT_FACTOR;
+        try { return attempt(longer); } catch (e2) { throw annotateGitTimeout(e2, args, longer); }
+      }
+      throw annotateGitTimeout(e, args, limit);
     }
   }
   function isAncestor(a, b) {
@@ -128,7 +141,7 @@ function createRealGitRunner(repoRoot) {
       const dir = path.join(gitDir, 'agent-manager-quarantine');
       fs.mkdirSync(dir, { recursive: true });
       const patch = execFileSync('git', ['stash', 'show', '-p', '--include-untracked', 'stash@{0}'], {
-        cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, maxBuffer: 256 * 1024 * 1024,
+        cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: gitTimeoutMs(), maxBuffer: 256 * 1024 * 1024,
       });
       if (!patch.trim()) return null;
       const file = path.join(dir, `stray-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}.patch`);

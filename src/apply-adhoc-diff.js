@@ -28,7 +28,8 @@ const { validProposalFiles } = require('./proposal-files.js');
 const { targetHintForFailure } = require('./apply-target-hint.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
-const GIT_TIMEOUT_MS = 60_000;
+const { gitTimeoutMs } = require('./lib/git-timeout.js');
+const GIT_TIMEOUT_MS = gitTimeoutMs();   // AGENT_MANAGER_GIT_TIMEOUT_MS overrides the 60 s default
 
 function slugify(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
