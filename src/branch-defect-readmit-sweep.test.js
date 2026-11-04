@@ -283,3 +283,68 @@ test('a worker needs-work verdict is observed, settled and requeued once; a seco
   const third = await run(w, t0 + 2 * SETTLE_MS + 5000, { requeue });
   assert.equal(third.exhausted.length, 1); assert.equal(third.requeued.length, 0); assert.equal(calls.length, 1);
 });
+
+// A git runner that records every call and delegates to real git (the sweeps' own defaultGit shape).
+function gitSpy() {
+  const calls = [];
+  const git = (cwd, args) => {
+    calls.push(args);
+    try { return { code: 0, out: execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }; } catch (e) { return { code: typeof e.status === 'number' ? e.status : 2, out: String(e.stdout || ''), err: String(e.stderr || '') }; }
+  };
+  return { calls, git, fetches: () => calls.filter((a) => a[0] === 'fetch').length };
+}
+
+test('no candidate: no git call at all, no state file is created, and the summary is the usual empty one', async () => {
+  const w = makeWorld();
+  const spy = gitSpy();
+  putTask(w.pipelineDir, 'plain', 'agent/plain', null);                    // pending-merge but no defect verdict
+  putTask(w.pipelineDir, 'hubchild', 'agent/hubchild', verdict('abc'), { parentHub: 'H' });   // a verdict, but a hub child: not eligible
+  const s = await run(w, Date.now(), { git: spy.git });
+  assert.deepStrictEqual(spy.calls, []);
+  assert.strictEqual(s.checked, 0);
+  assert.deepStrictEqual([s.observed, s.settling, s.stale, s.requeued, s.exhausted], [[], [], [], [], []]);
+  assert.strictEqual(fs.existsSync(path.join(w.pipelineDir, 'queue', STATE_FILE)), false);
+  const empty = await run(makeWorld(), Date.now(), { git: spy.git });
+  assert.strictEqual(empty.checked, 0);
+  assert.deepStrictEqual(spy.calls, []);
+});
+
+test('one candidate fetches exactly once, before any other git call; two candidates still once; fetch:false never', async () => {
+  const w = defectWorld();
+  const spy = gitSpy();
+  await run(w, Date.now(), { git: spy.git });
+  assert.strictEqual(spy.fetches(), 1);
+  assert.deepStrictEqual(spy.calls[0], ['fetch', '-q', 'origin']);
+  assert.ok(spy.calls.length > 1);
+  const w2 = makeWorld();
+  for (const id of ['t1', 't2']) { w2.commitOnBranch(`agent/${id}`, 'a.txt', `${id}\n`); putTask(w2.pipelineDir, id, `agent/${id}`, verdict(w2.head(`agent/${id}`))); }
+  const spy2 = gitSpy();
+  const two = await run(w2, Date.now(), { git: spy2.git });
+  assert.strictEqual(spy2.fetches(), 1);
+  assert.strictEqual(two.checked, 2);                                      // both candidates are examined after the one fetch
+  const spy3 = gitSpy();
+  await run(defectWorld(), Date.now(), { git: spy3.git, fetch: false });
+  assert.strictEqual(spy3.fetches(), 0);
+  assert.ok(spy3.calls.length > 0);
+});
+
+test('a leftover state entry with no candidate any more is cleared; an unchanged state is not rewritten', async () => {
+  const w = makeWorld();
+  const statePath = path.join(w.pipelineDir, 'queue', STATE_FILE);
+  fs.writeFileSync(statePath, JSON.stringify({ 'agent/gone': { sha: 'x', firstSeenAt: '2026-10-01T00:00:00Z' } }));
+  await run(w, Date.now(), { git: gitSpy().git });
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(statePath, 'utf8')), {});
+  const old = new Date('2026-01-01T00:00:00Z');
+  fs.utimesSync(statePath, old, old);
+  await run(w, Date.now(), { git: gitSpy().git });                         // empty and unchanged
+  assert.strictEqual(fs.statSync(statePath).mtimeMs, old.getTime());
+  const c = defectWorld();
+  const t0 = Date.now();
+  await run(c, t0);
+  const cs = path.join(c.pipelineDir, 'queue', STATE_FILE);
+  fs.utimesSync(cs, old, old);
+  await run(c, t0 + 1000);                                                 // the same observation again: identical state
+  assert.strictEqual(fs.statSync(cs).mtimeMs, old.getTime());
+  await run(c, t0 + SETTLE_MS + 5000);                                     // now it acts: the state changes (the entry is removed on requeue or kept)
+  assert.ok(readState(c.pipelineDir) !== undefined);
+});

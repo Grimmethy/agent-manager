@@ -45,6 +45,12 @@ function mode() {
 }
 
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
+// Writes only when the content differs from what is there (a tick that decided nothing new must not rewrite the state file every minute).
+function writeJsonIfChanged(p, data, before) {
+  if (JSON.stringify(before) === JSON.stringify(data)) return;
+  writeJson(p, data);
+}
+
 function writeJson(p, data) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const tmp = `${p}.tmp`;
@@ -84,10 +90,10 @@ async function sweepBranchDefects({
   const live = summary.mode === 'on' && !dryRun;
   const queueDir = path.join(pipelineDir, 'queue');
   const nowIso = new Date(now).toISOString();
-  if (fetch) git(repoRoot, ['fetch', '-q', 'origin']);
 
   const statePath = path.join(queueDir, STATE_FILE);
-  const state = readJson(statePath) || {};
+  const prevState = readJson(statePath);
+  const state = prevState || {};
   const nextState = {};
 
   const doneDir = path.join(queueDir, 'done');
@@ -95,6 +101,9 @@ async function sweepBranchDefects({
   let superseded = 0;
   try { names = fs.readdirSync(doneDir).filter((f) => f.endsWith('.json')); } catch { names = []; }
 
+  // Pre-pass (2026-11-03, pool rescan): the cheap local filters first, one read per task. The slow `git fetch` is only worth paying for when a task is left that git has to
+  // answer for; with 41 pool projects and no candidate in most of them, a fetch before the filters cost a fetch per project per tick for nothing.
+  const candidates = [];
   for (const name of names) {
     const filePath = path.join(doneDir, name);
     const task = readJson(filePath);
@@ -103,6 +112,15 @@ async function sweepBranchDefects({
     if (!pv) continue;
     const branch = appliedBranch(task);
     if (!branch) continue;
+    candidates.push({ name, filePath, task, pv, branch });
+  }
+  if (!candidates.length) {
+    if (Object.keys(state).length) writeJson(statePath, nextState);    // an empty state stays as it is: no write when nothing would change
+    return summary;
+  }
+  if (fetch) git(repoRoot, ['fetch', '-q', 'origin']);
+
+  for (const { name, filePath, task, pv, branch } of candidates) {
     try {
       const head = git(repoRoot, ['rev-parse', '--verify', `origin/${branch}`]);
       if (head.code !== 0) continue;                       // branch gone: reconcile's business, not ours
@@ -145,7 +163,7 @@ async function sweepBranchDefects({
     }
   }
 
-  writeJson(statePath, nextState);
+  writeJsonIfChanged(statePath, nextState, prevState);
   return summary;
 }
 
