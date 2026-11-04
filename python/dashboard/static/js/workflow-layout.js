@@ -32,14 +32,14 @@
   function cleanInput(graph) {
     var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
     var edges = graph && Array.isArray(graph.edges) ? graph.edges : [];
-    var ids = {};
+    var ids = Object.create(null);
     var order = [];
     nodes.forEach(function (n) {
       if (!n || typeof n.id !== 'string' || Object.prototype.hasOwnProperty.call(ids, n.id)) return;
       ids[n.id] = true;
       order.push(n.id);
     });
-    var seen = {};
+    var seen = Object.create(null);
     var kept = [];
     edges.forEach(function (e) {
       if (!e || !Object.prototype.hasOwnProperty.call(ids, e.from) || !Object.prototype.hasOwnProperty.call(ids, e.to)) return;
@@ -55,15 +55,15 @@
   // the stack). An edge that reaches a node still on the walk's stack closes a cycle
   // and is marked back. Returns { backIds: {edgeId: true} }.
   function findBackEdges(ids, edges) {
-    var out = {};
+    var out = Object.create(null);
     edges.forEach(function (e) {
       (out[e.from] = out[e.from] || []).push(e);
     });
     Object.keys(out).forEach(function (k) {
       out[k].sort(function (a, b) { return cmp(a.to, b.to) || cmp(a.id, b.id); });
     });
-    var state = {}; // undefined = unvisited, 1 = on stack, 2 = done
-    var back = {};
+    var state = Object.create(null); // undefined = unvisited, 1 = on stack, 2 = done
+    var back = Object.create(null);
     ids.forEach(function (root) {
       if (state[root]) return;
       var stack = [{ id: root, i: 0 }];
@@ -90,14 +90,14 @@
 
   // Layer = longest path from a node with no incoming (non-back) edge.
   function assignLayers(ids, forward) {
-    var indeg = {};
-    var out = {};
+    var indeg = Object.create(null);
+    var out = Object.create(null);
     ids.forEach(function (id) { indeg[id] = 0; });
     forward.forEach(function (e) {
       indeg[e.to] += 1;
       (out[e.from] = out[e.from] || []).push(e.to);
     });
-    var layer = {};
+    var layer = Object.create(null);
     var queue = ids.filter(function (id) { return indeg[id] === 0; });
     queue.forEach(function (id) { layer[id] = 0; });
     var head = 0;
@@ -115,17 +115,17 @@
   // One ordering pass: layer 0 by id, later layers by the average index of their
   // already placed predecessors, ties by id.
   function orderLayers(ids, forward, layer) {
-    var preds = {};
+    var preds = Object.create(null);
     forward.forEach(function (e) { (preds[e.to] = preds[e.to] || []).push(e.from); });
     var maxLayer = 0;
     ids.forEach(function (id) { if (layer[id] > maxLayer) maxLayer = layer[id]; });
     var rows = [];
     for (var l = 0; l <= maxLayer; l++) rows.push([]);
     ids.forEach(function (id) { rows[layer[id]].push(id); });
-    var index = {};
+    var index = Object.create(null);
     rows[0].forEach(function (id, i) { index[id] = i; });
     for (var r = 1; r <= maxLayer; r++) {
-      var key = {};
+      var key = Object.create(null);
       rows[r].forEach(function (id) {
         var ps = preds[id] || [];
         var sum = 0;

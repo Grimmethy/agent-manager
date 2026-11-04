@@ -445,3 +445,36 @@ test('groupBoxes: a group without a label is boxed under its id', () => {
   const boxes = v.groupBoxes(g, { 'worker-a': { x: 0, y: 0 } }, { w: 272, h: 128 }, 12);
   assert.deepEqual(plain(boxes.map((b) => b.label)), ['group:nolabel', 'group:nolabel2']);
 });
+
+test('node ID "constructor" does not collide with Object.prototype.constructor', () => {
+  const g = graph({ nodes: [node('constructor', 'loop', 'working'), node('worker-b', 'loop', 'idle')], groups: [] });
+  const out = v.collapseGraph(g, new Set(['group:x']));
+  assert.deepEqual(ids(out), ['constructor', 'worker-b']);
+  const lay = v.layoutGraph(g);
+  assert.ok(lay.positions['constructor'], 'constructor node has a position');
+  assert.ok(lay.positions['worker-b'], 'worker-b has a position');
+  assert.notEqual(lay.positions['constructor'], Object.prototype.constructor);
+  assert.equal(typeof lay.positions['constructor'].x, 'number');
+});
+
+test('node ID "toString" does not collide with Object.prototype.toString', () => {
+  const g = graph({ nodes: [node('toString', 'loop', 'working'), node('worker-b', 'loop', 'idle')], groups: [] });
+  const out = v.collapseGraph(g, new Set(['group:x']));
+  assert.deepEqual(ids(out), ['toString', 'worker-b']);
+  const lay = v.layoutGraph(g);
+  assert.ok(lay.positions['toString'], 'toString node has a position');
+  assert.ok(lay.positions['worker-b'], 'worker-b has a position');
+  assert.notEqual(lay.positions['toString'], Object.prototype.toString);
+  assert.equal(typeof lay.positions['toString'].x, 'number');
+});
+
+test('node ID "__proto__" does not collide with Object.prototype.__proto__', () => {
+  const g = graph({ nodes: [node('__proto__', 'loop', 'working'), node('worker-b', 'loop', 'idle')], groups: [] });
+  const out = v.collapseGraph(g, new Set(['group:x']));
+  assert.deepEqual(ids(out), ['__proto__', 'worker-b']);
+  const lay = v.layoutGraph(g);
+  assert.ok(lay.positions['__proto__'], '__proto__ node has a position');
+  assert.ok(lay.positions['worker-b'], 'worker-b has a position');
+  assert.notEqual(lay.positions['__proto__'], Object.prototype.__proto__);
+  assert.equal(typeof lay.positions['__proto__'].x, 'number');
+});
