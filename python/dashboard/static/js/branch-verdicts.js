@@ -17,6 +17,10 @@ const BRANCH_VERDICT_FILTERS = [
 ];
 
 let branchVerdictFilter = 'all';
+// Whether the hidden-hubs panel is open. Closed by default (the owner asked for a button, 2026-11-04); the choice survives a reload.
+const HELD_HUBS_OPEN_KEY = 'branches-held-hubs-open';
+let heldHubsOpen = false;
+try { heldHubsOpen = localStorage.getItem(HELD_HUBS_OPEN_KEY) === '1'; } catch (e) { /* no storage (tests, private mode): closed */ }
 
 // The bucket a branch falls in. A stale verdict is "unverified" -- it vouches for an older commit.
 function branchVerdictKey(b) {
@@ -66,7 +70,7 @@ function filterBranchesByVerdict(branches, filterKey) {
   return branches.filter((b) => branchVerdictKey(b) === filterKey);
 }
 
-function branchVerdictFilterBarHtml(branches, activeKey) {
+function branchVerdictFilterBarHtml(branches, activeKey, heldGroups = [], heldOpen = false) {
   const counts = {};
   for (const b of branches) counts[branchVerdictKey(b)] = (counts[branchVerdictKey(b)] || 0) + 1;
   // .row is only a flex container inside a card (templates/index.html), so the bar sets its own flex: that is what lets the Discard-all button's margin-left:auto push it right.
@@ -74,7 +78,7 @@ function branchVerdictFilterBarHtml(branches, activeKey) {
     const n = f.key === 'all' ? branches.length : (counts[f.key] || 0);
     const cls = f.key === activeKey ? 'action' : 'secondary';
     return `<button class="${cls}" data-verdict-filter="${f.key}">${_bvEscape(f.label)} (${n})</button>`;
-  }).join('') + discardAllButtonHtml(branches, activeKey) + '</div>';
+  }).join('') + heldHubsToggleHtml(heldGroups, heldOpen) + discardAllButtonHtml(branches, activeKey) + '</div>';
 }
 
 // ---- Discard all (owner request 2026-10-31) -- pure helpers; the browser wiring is wireDiscardAll below. Server: POST /api/git/branches/discard-batch.
@@ -163,27 +167,48 @@ async function runDiscardAll(main) {
 
 // Browser-only: (re)build the filter bar + filtered card list into `main`. Uses the globals
 // branchCardHtml / wireBranchCard from branches-joblist-hardware-tabs.js at CALL time.
-// Hubs whose built pieces are pushed but held out of the list until every piece is built (server: partition_held_hub_branches).
-function heldHubsHtml(groups) {
+// Hubs whose built pieces are pushed but held out of the list until every piece is built (server: partition_held_hub_branches). They are not ready to merge, so they are
+// neither listed nor verified; the button shows how many there are and opens the panel below.
+function heldHubsToggleHtml(groups, open) {
+  const n = Array.isArray(groups) ? groups.length : 0;
+  const label = `${open ? 'Hide hidden hubs' : 'Show hidden hubs'} (${n})`;
+  return `<button class="${open ? 'action' : 'secondary'}" data-held-hubs-toggle aria-pressed="${open ? 'true' : 'false'}"${n ? '' : ' disabled'} `
+    + 'title="Hubs with unfinished pieces are not ready to merge: their branches are not listed here and are not verified until every piece is built">' + label + '</button>';
+}
+
+function heldHubRowHtml(g) {
+  const p = g.progress || {};
+  const waiting = (g.waitingOn || []).map(_bvEscape).join(', ');
+  const names = (g.branches || []).map((b) => `<span title="${_bvEscape(b)}">${_bvEscape(String(b).replace(/^agent\//, '').slice(0, 60))}</span>`).join(', ');
+  return `<div class="meta" style="margin:4px 0">${_bvEscape(String(g.title || g.hubId).slice(0, 70))}: ${p.built || 0} of ${p.total || 0} built, `
+    + `${(g.branches || []).length} held${waiting ? ', waiting on ' + waiting : ''}</div>`
+    + (names ? `<div class="meta" style="margin:0 0 8px 16px">${names}</div>` : '');
+}
+
+// open=false renders the empty placeholder (so the poll can still find and swap the element); the default is open so a caller that only passes the groups sees them.
+function heldHubsHtml(groups, open = true) {
   const list = Array.isArray(groups) ? groups : [];
-  if (!list.length) return '<div data-held-hubs></div>';
-  const rows = list.map((g) => {
-    const p = g.progress || {};
-    const waiting = (g.waitingOn || []).map(_bvEscape).join(', ');
-    return `<div class="meta" style="margin:4px 0">${_bvEscape(String(g.title || g.hubId).slice(0, 70))}: ${p.built || 0} of ${p.total || 0} built, `
-      + `${(g.branches || []).length} held${waiting ? ', waiting on ' + waiting : ''}</div>`;
-  }).join('');
+  if (!list.length || !open) return '<div data-held-hubs></div>';
+  const byProject = new Map();
+  for (const g of list) {
+    const label = (g.project && g.project.label) || '';
+    if (!byProject.has(label)) byProject.set(label, []);
+    byProject.get(label).push(g);
+  }
+  const rows = [...byProject.entries()].sort((x, y) => x[0].localeCompare(y[0])).map(([label, gs]) => (label
+    ? `<div class="meta" style="margin:8px 0 4px"><b>${_bvEscape(label)}</b> (${gs.length})</div>` : '') + gs.map(heldHubRowHtml).join('')).join('');
   return '<div data-held-hubs style="margin-top:16px;padding:8px 12px;border:1px dashed #888;border-radius:6px">'
-    + `<div class="meta"><b>Waiting on siblings (${list.length})</b> -- pushed, but not listed until every piece of the hub is built</div>${rows}</div>`;
+    + `<div class="meta"><b>Hidden hubs (${list.length})</b> -- pushed, but not listed (and not verified) until every piece of the hub is built</div>${rows}</div>`;
 }
 
 function renderBranchListInto(main, branches) {
   const shown = filterBranchesByVerdict(branches, branchVerdictFilter);
-  main.innerHTML = branchVerdictFilterBarHtml(branches, branchVerdictFilter)
+  const held = typeof currentHeldHubs === 'undefined' ? [] : currentHeldHubs;
+  main.innerHTML = branchVerdictFilterBarHtml(branches, branchVerdictFilter, held, heldHubsOpen)
     + (typeof branchProjectsPendingHtml === 'function' ? branchProjectsPendingHtml(branchProjectsPending) : '')
     + (typeof branchListRefreshingHtml === 'function' ? branchListRefreshingHtml(branchListRefreshing) : '')
     + (shown.length ? (typeof branchListWithProjectHeadersHtml === 'function' ? branchListWithProjectHeadersHtml(shown, branchCardHtml) : shown.map(branchCardHtml).join('')) : `<div class="empty">${branches.length ? 'No branches match this filter.' : 'Nothing is ready to verify yet.'}</div>`)
-    + heldHubsHtml(typeof currentHeldHubs === 'undefined' ? [] : currentHeldHubs);
+    + heldHubsHtml(held, heldHubsOpen);
   main.querySelectorAll('[data-branch-row]').forEach(wireBranchCard);
   wireBranchVerdictFilterBar(main);
 }
@@ -191,6 +216,13 @@ function renderBranchListInto(main, branches) {
 function wireBranchVerdictFilterBar(main) {
   const all = main.querySelector('[data-discard-all]');
   if (all) all.onclick = () => runDiscardAll(main);
+  const toggle = main.querySelector('[data-held-hubs-toggle]');
+  if (toggle) toggle.onclick = () => {
+    heldHubsOpen = !heldHubsOpen;
+    try { localStorage.setItem(HELD_HUBS_OPEN_KEY, heldHubsOpen ? '1' : '0'); } catch (e) { /* private mode: the choice lasts until reload */ }
+    refreshBranchVerdictFilterBar(main, currentBranches);
+    refreshHeldHubsPanel(main);
+  };
   main.querySelectorAll('[data-verdict-filter]').forEach((btn) => {
     btn.onclick = () => { branchVerdictFilter = btn.dataset.verdictFilter; renderBranchListInto(main, currentBranches); };
   });
@@ -200,8 +232,16 @@ function wireBranchVerdictFilterBar(main) {
 function refreshBranchVerdictFilterBar(main, branches) {
   const bar = main.querySelector('[data-verdict-filter-bar]');
   if (!bar) return;
-  bar.outerHTML = branchVerdictFilterBarHtml(branches, branchVerdictFilter);
+  bar.outerHTML = branchVerdictFilterBarHtml(branches, branchVerdictFilter, typeof currentHeldHubs === 'undefined' ? [] : currentHeldHubs, heldHubsOpen);
   wireBranchVerdictFilterBar(main);
 }
 
-if (typeof module !== 'undefined') module.exports = { branchVerdictKey, branchVerdictBorderStyle, branchVerdictBadgeHtml, branchVerdictDetailHtml, filterBranchesByVerdict, branchVerdictFilterBarHtml, BRANCH_VERDICT_FILTERS, heldHubsHtml, discardAllCandidates, discardAllButtonHtml, DISCARD_ALL_INSET_PX, discardAllDialogText, discardAllConfirmOk, discardAllPayload, discardAllResultText, discardOpenHubBranches };
+// Swap the hidden-hubs panel for the current groups and the current open/closed choice (or add it at the end of the tab when it is not there yet).
+function refreshHeldHubsPanel(main) {
+  const html = heldHubsHtml(typeof currentHeldHubs === 'undefined' ? [] : currentHeldHubs, heldHubsOpen);
+  const el = main.querySelector('[data-held-hubs]');
+  if (el) el.outerHTML = html;
+  else main.insertAdjacentHTML('beforeend', html);
+}
+
+if (typeof module !== 'undefined') module.exports = { branchVerdictKey, branchVerdictBorderStyle, branchVerdictBadgeHtml, branchVerdictDetailHtml, filterBranchesByVerdict, branchVerdictFilterBarHtml, BRANCH_VERDICT_FILTERS, heldHubsHtml, heldHubsToggleHtml, discardAllCandidates, discardAllButtonHtml, DISCARD_ALL_INSET_PX, discardAllDialogText, discardAllConfirmOk, discardAllPayload, discardAllResultText, discardOpenHubBranches };
