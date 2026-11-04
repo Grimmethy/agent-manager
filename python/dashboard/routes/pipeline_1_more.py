@@ -708,6 +708,26 @@ def _apply_post_merge_side_effects(context):
     return _sync_live_checkout(context["main_branch"])
 
 
+def _guarded_post_merge_step(step, warnings, action):
+    """Run one step that happens AFTER a merge landed on origin. A git timeout, a git failure or a write error is
+    appended to `warnings` as a plain sentence and None is returned; it never propagates (the merge is done, a 500 would
+    tell the owner it failed). Returns the step's own result otherwise."""
+    from app import logger
+
+    try:
+        result = action()
+    except subprocess.TimeoutExpired as exc:
+        reason = f"Git did not answer in time while {step} (took longer than {exc.timeout:g} s; the machine is busy). The merge itself is on origin."
+        logger.warning("Post-merge step timed out (non-fatal): %s", reason)
+    except (RuntimeError, OSError) as exc:
+        reason = f"Problem while {step}: {exc}. The merge itself is on origin."
+        logger.warning("Post-merge step failed (non-fatal): %s", reason, exc_info=True)
+    else:
+        return result
+    warnings.append(reason)
+    return None
+
+
 def _record_merge_in_task_file(branch, main_branch, qdir=None):
     """Step 4a: stamp mergedAt + a terminal `merged` history/disposition on the task's
     queue record, in whichever done/ location it sits. No-op without a queue dir or a
@@ -840,10 +860,15 @@ def api_git_merge_branch(branch):
     except RuntimeError as e:
         return jsonify({"succeeded": False, "reason": str(e)}), 500
 
-    live_sync = _apply_post_merge_side_effects(context)
+    # The merge is already on origin here, so nothing below may turn the response into a failure: each step is guarded on its own, a
+    # failure becomes a warning, and the later steps still run (the task record must be stamped even when the live-checkout sync was too slow).
+    warnings = []
     qdir = scope["qdir"] if scope else None
-    _record_merge_in_task_file(branch, context["main_branch"], qdir)
-    _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir)
+    live_sync = _guarded_post_merge_step("syncing the dashboard checkout", warnings, lambda: _apply_post_merge_side_effects(context))
+    if live_sync is None:
+        live_sync = {"synced": False, "reason": warnings[-1]}
+    _guarded_post_merge_step("stamping the task record", warnings, lambda: _record_merge_in_task_file(branch, context["main_branch"], qdir))
+    _guarded_post_merge_step("closing the task log", warnings, lambda: _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir))
 
     # Check which plugins are behind after merge (if the merged repo is a plugin's repo).
     # Mirrors the pattern in routes/plugins.py: iterate manifest, call behind_checkout,
@@ -868,6 +893,7 @@ def api_git_merge_branch(branch):
         "branch": branch,
         "mainBranch": context["main_branch"],
         "liveSync": live_sync,
+        "warnings": warnings,
         "restartNeeded": restart_needed,
     })
 
