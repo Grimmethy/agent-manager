@@ -110,6 +110,25 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
   function isAncestor(a, b) {
     try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
   }
+  // A push that hits the time cap may still have landed (2026-11-04: apply's `git push` of agent/<id> timed out after 60 s while the branch was arriving on GitHub; apply recorded
+  // a failure for work that was already on origin, and the sanctioned retry then collided with its own first push as a non-fast-forward: 33 minutes of a 38 minute build).
+  // After a TIMED-OUT push only, ask the remote what it holds: the push succeeded exactly when the remote tip of `name` is the local tip. Any doubt (no such branch there, a
+  // different tip, ls-remote or rev-parse failing) leaves the original error to be thrown. A rejection or any other push failure never gets here.
+  function pushLanded(name) {
+    try {
+      const remoteTip = String(run(['ls-remote', '--heads', 'origin', `refs/heads/${name}`])).trim().split(/\s+/)[0];
+      const localTip = String(run(['rev-parse', `refs/heads/${name}`])).trim();
+      return Boolean(remoteTip) && remoteTip === localTip;
+    } catch { return false; }
+  }
+  function pushBranch(name) {
+    try {
+      return run(['push', '-u', 'origin', name]);
+    } catch (e) {
+      if (e && e.code === 'ETIMEDOUT' && pushLanded(name)) return '';
+      throw e;
+    }
+  }
   // True only when a diverged local branch adds NOTHING its remote counterpart lacks -- it is a duplicate of origin's content (typically the same commits under
   // different SHAs after the stale-main rebase rewrote one side), so a rescue branch would only be a stale snapshot of the rolling branch. Seen 2026-10-04/05 on
   // TaxHarvest: 12 rescue branches in ~6 h, every one a near-copy of agent/triage-queue. Two signals, either suffices: (a) `git cherry <remote> <name>` lists no '+'
@@ -456,7 +475,7 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
     pruneRetractedCandidates: () => require('./lib/prune-retracted-candidates.js').pruneRetractedCandidates({ repoRoot, git: run, mainRef: `origin/${mainBranch}` }),
     add: (files) => run(['add', ...files]),
     commit: (messageFilePath) => run(['commit', '-F', messageFilePath]),
-    push: (branchName) => run(['push', '-u', 'origin', branchName]),
+    push: (branchName) => pushBranch(branchName),
     // 2026-09-24: closes the specific gap that produced two real incidents (a human
     // manually rescuing agent/triage-queue by hand on 2026-09-23, then four more identical
     // blocks on 2026-09-24) -- an ordinary non-fast-forward push rejection (origin moved
@@ -495,7 +514,7 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
       if (!ungatedMainPushAllowed()) {
         throw new Error(`pushMain refused: pushing ${mainBranch} to origin without a human gate is disabled (set AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH=true to override). Push a branch and merge it via the dashboard/PR instead.`);
       }
-      return run(['push', '-u', 'origin', mainBranch]);
+      return pushBranch(mainBranch);
     },
   };
 }
