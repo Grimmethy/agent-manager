@@ -254,6 +254,14 @@ mem_marker_state() {
   printf '%s\n' "$state"
 }
 
+# sweep_gate_skips <project <pipelineDir> | global-redo> -> exit 0 only when src/sweep-gate.js answers exactly `skip` (nothing the sweep reads has changed). Any other answer, a crash or a
+# missing script means run: the gate fails open, exactly as before it existed (ADR-0024).
+sweep_gate_skips() {
+  local answer
+  answer="$(node "${PACKAGE_SRC_DIR}/sweep-gate.js" "$@" 2>/dev/null)" || return 1
+  [[ "$answer" == "skip" ]]
+}
+
 # mem_pressure_high -> exit 0 if the lane should yield this tick, 1 otherwise.
 mem_pressure_high() {
   local state
