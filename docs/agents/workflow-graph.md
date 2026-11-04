@@ -140,20 +140,17 @@ With neither option the graph is exactly what phase B produced. `GET /api/workfl
 **Groups in the Graph view** (`python/dashboard/static/js/workflow-groups.js`, pure, drawn by `workflow-graph-view.js`). An expanded group is a dashed box with a header button; a collapsed group is one card (`N member(s)`) that shows the worst status of its loop members (error, stale, paused, warming, queued, working, idle, offline, disabled), the summed counts and the re-pointed edges.
 Click the card or the header button to fold or unfold. The choice lives in the view and survives the 5 second poll; it is not saved, so a reload goes back to the file's `collapsed` values. A selection hidden by a fold is cleared.
 
-**`splitNode`** (`src/workflow-split.js`) is the pure seam a future task atomizer would use to replace one loop node by several: `splitNode(graph, nodeId, parts)` returns `{ ok: true, graph }` or `{ ok: false, error }`, copies every edge of the original to each part, and refuses a split that would orphan a task class. Nothing calls it yet.
-
 **Files and tests.**
 - `src/workflow-config.js`: `node --test src/workflow-config.test.js`
 - `src/workflow-overlay.js` and the builder hook in `src/workflow-graph.js`: `node --test src/workflow-overlay.test.js src/workflow-graph.test.js`
 - `python/dashboard/routes/workflow_graph.py`: `python -m unittest test_workflow_graph_route` from `python/dashboard`
 - `python/dashboard/static/js/workflow-groups.js`: `node --test python/dashboard/tests/test_workflow_groups.js`
-- `src/workflow-split.js`: `node --test src/workflow-split.test.js`
 
 **Known gaps of phase C.**
 - The group box defect found when phase C was checked in a real browser (a box covering cards that are not members) is fixed by phase D; see "What phase D added" for what still remains.
 - Nothing writes `workflow.json`; it is edited by hand.
 - The fold state is not saved across a reload.
-- `splitNode` has no caller and no way to apply its result to a lane.
+
 
 ## What phase D added (HUB0329)
 
