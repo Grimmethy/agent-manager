@@ -4511,3 +4511,123 @@ test('a source that does not opt in via skipImplementWhenNoHarnessHits keeps a "
     assert.equal(task.implementResponse, 'no real file to adapt');
   });
 });
+
+// 2026-11-03, context-provenance: stamp which grounding sources fed each drafted task.
+// Pure module tests are in src/lib/context-provenance.test.js; these integration tests
+// verify the stamp is actually attached by runPlanPass and survives persistence.
+test('draftTask attaches task.contextProvenance with expected shape', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'context-provenance-shape', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount++;
+      if (callCount === 1) return { response: 'confident match: none -- no real match', degenerate: null, attempts: 1 };
+      if (callCount === 2) return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+
+    assert.ok(task.contextProvenance, 'contextProvenance must be attached');
+    assert.equal(task.contextProvenance.v, 1);
+    assert.equal(typeof task.contextProvenance.anchorFileCount, 'number');
+    assert.ok(Array.isArray(task.contextProvenance.anchorPaths));
+    assert.equal(typeof task.contextProvenance.grepQueryCount, 'number');
+    assert.equal(typeof task.contextProvenance.grepHitFileCount, 'number');
+    assert.ok(Array.isArray(task.contextProvenance.grepHitFiles));
+    assert.equal(typeof task.contextProvenance.groundingChars, 'number');
+    assert.equal(typeof task.contextProvenance.planWasGrounded, 'boolean');
+    assert.equal(typeof task.contextProvenance.orientRan, 'boolean');
+    assert.ok(task.contextProvenance.orientTurns === null || typeof task.contextProvenance.orientTurns === 'number');
+    assert.equal(typeof task.contextProvenance.priorRejectionCount, 'number');
+    assert.equal(typeof task.contextProvenance.priorVerdictCount, 'number');
+  });
+});
+
+test('draftTask: a task that names a real file is stamped as grounded (the stamp reads the grounding OBJECT, not its text); one that names nothing is not', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    const fsx = require('fs');
+    const pathx = require('path');
+    fsx.mkdirSync(pathx.join(dir, 'src'), { recursive: true });
+    fsx.writeFileSync(pathx.join(dir, 'src', 'stamp-target.js'), "'use strict';\n\nfunction stampTarget(x) {\n  return x;\n}\n\nmodule.exports = { stampTarget };\n");
+    const mk = (id, rawText) => ({ id, domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText } });
+    const run = async (task) => {
+      let callCount = 0;
+      const localCall = async () => {
+        callCount++;
+        if (callCount === 1) return { response: 'confident match: none -- no real match', degenerate: null, attempts: 1 };
+        if (callCount === 2) return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1 };
+        return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+      };
+      await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+      return task.contextProvenance;
+    };
+    const grounded = await run(mk('context-provenance-grounded', 'Change stampTarget in src/stamp-target.js so that it returns its argument unchanged and add a test for it.'));
+    assert.equal(grounded.planWasGrounded, true);
+    assert.ok(grounded.groundingChars > 0, 'groundingChars must count the grounding text');
+    assert.ok(grounded.anchorPaths.includes('src/stamp-target.js'), 'the named file must be an anchor');
+    assert.ok(grounded.anchorFileCount >= 1);
+    assert.equal(grounded.orientRan, true, 'the orient result of a grounded plan pass reaches the stamp (a skipped orient still counts as ran with 0 turns)');
+    assert.equal(grounded.orientTurns, 0);
+    const bare = await run(mk('context-provenance-bare', 'do the thing'));
+    assert.equal(bare.planWasGrounded, false);
+    assert.equal(bare.groundingChars, 0);
+    assert.equal(bare.anchorFileCount, 0);
+    assert.equal(bare.orientRan, false);
+    assert.equal(bare.orientTurns, null);
+  });
+});
+
+test('draftTask: contextProvenance survives persistence (write then read back)', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    const task = { id: 'context-provenance-persist', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount++;
+      if (callCount === 1) return { response: 'confident match: none -- no real match', degenerate: null, attempts: 1 };
+      if (callCount === 2) return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+
+    // Write the task to disk (simulating persistence).
+    const fs = require('fs');
+    const path = require('path');
+    const queueDir = path.join(dir, 'queue', 'pending');
+    fs.mkdirSync(queueDir, { recursive: true });
+    fs.writeFileSync(path.join(queueDir, `${task.id}.json`), JSON.stringify(task));
+
+    // Read it back.
+    const readBack = JSON.parse(fs.readFileSync(path.join(queueDir, `${task.id}.json`), 'utf8'));
+    assert.ok(readBack.contextProvenance, 'contextProvenance must survive persistence');
+    assert.equal(readBack.contextProvenance.v, 1);
+    assert.equal(readBack.contextProvenance.planWasGrounded, task.contextProvenance.planWasGrounded);
+  });
+});
+
+test('draftTask: kill switch AGENT_MANAGER_CONTEXT_PROVENANCE=false removes the stamp', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const prevEnv = process.env.AGENT_MANAGER_CONTEXT_PROVENANCE;
+    process.env.AGENT_MANAGER_CONTEXT_PROVENANCE = 'false';
+    try {
+      const task = { id: 'context-provenance-kill', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+
+      let callCount = 0;
+      const localCall = async () => {
+        callCount++;
+        if (callCount === 1) return { response: 'confident match: none -- no real match', degenerate: null, attempts: 1 };
+        if (callCount === 2) return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1 };
+        return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+      };
+
+      await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+
+      assert.equal(task.contextProvenance, undefined, 'contextProvenance must NOT be attached when kill switch is on');
+    } finally {
+      if (prevEnv === undefined) delete process.env.AGENT_MANAGER_CONTEXT_PROVENANCE; else process.env.AGENT_MANAGER_CONTEXT_PROVENANCE = prevEnv;
+    }
+  });
+});
