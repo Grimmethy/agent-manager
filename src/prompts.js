@@ -1601,11 +1601,19 @@ function genericFallbackImplementPrompt(task, planText) {
       'and specific, not the whole plan at once.',
   ];
   
-  // Add RULE about tests if there's a prior "touches no test" verdict or rejection
+  // Always include the test requirement: every code change must include corresponding tests.
+  // This is the shared cause of the "touches no test" class of needs-work branches -- the
+  // prompt previously only added this rule after a prior rejection, so the first attempt never
+  // got the instruction and agents routinely produced code-only changes that the automatic
+  // check (review-verify.js) flags as needs-work.
+  blocks.push('');
+  blocks.push('RULE: Every code change must include corresponding test changes. When editing, creating, or deleting source files, you MUST also update or create tests to verify the change works correctly.');
+  
+  // Add a stronger reminder if there's a prior "touches no test" verdict or rejection
   const hasTouchesNoTestHistory = hasPriorTouchesNoTest(task);
   if (hasTouchesNoTestHistory) {
     blocks.push('');
-    blocks.push('RULE: Your previous attempt was rejected because it "touches no test". Every code change must include corresponding test changes. When editing, creating, or deleting source files, you MUST also update or create tests to verify the change works correctly.');
+    blocks.push('NOTE: Your previous attempt was rejected because it "touches no test". You MUST include tests with this revision.');
   }
   
   return blocks.join('\n');
