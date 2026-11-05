@@ -78,6 +78,17 @@ test('settings-changed redraws only the Job List and Models tabs', () => {
   for (const tab of ['pending', 'workers', 'adhoc', 'hardware']) assert.deepEqual(lu.planForEvent('settings-changed', tab), lu.NO_PLAN, tab);
 });
 
+test('hardware-changed, tokenfold-changed and reports-changed redraw only their own tabs', () => {
+  const want = { 'hardware-changed': ['hardware'], 'tokenfold-changed': ['tokenfold', 'reports'], 'reports-changed': ['reports'] };
+  for (const [name, tabs] of Object.entries(want)) {
+    for (const tab of tabs) assert.deepEqual(lu.planForEvent(name, tab), plan({ main: true }), name + ' ' + tab);
+    for (const tab of ['pending', 'workers', 'joblist', 'models', 'hardware', 'tokenfold', 'reports'].filter((t) => !tabs.includes(t))) assert.deepEqual(lu.planForEvent(name, tab), lu.NO_PLAN, name + ' ' + tab);
+  }
+  assert.deepEqual([...lu.HARDWARE_DRIVEN_TABS], ['hardware']);
+  assert.deepEqual([...lu.TOKENFOLD_DRIVEN_TABS], ['tokenfold', 'reports']);
+  assert.deepEqual([...lu.REPORTS_DRIVEN_TABS], ['reports']);
+});
+
 test('benchmark-changed redraws only the Models tab', () => {
   assert.deepEqual(lu.planForEvent('benchmark-changed', 'models'), plan({ main: true }));
   for (const tab of ['pending', 'workers', 'joblist', 'hardware']) assert.deepEqual(lu.planForEvent('benchmark-changed', tab), lu.NO_PLAN, tab);
@@ -128,15 +139,16 @@ test('a plugin that replaces a self-rendering tab (an iframe) is never put on th
 });
 
 test('the transitional list is exactly the tabs that have no events yet', () => {
-  assert.deepEqual(lu.TRANSITIONAL_POLLED_TABS, ['hardware', 'plugins', 'deepdive', 'discovery', 'reports', 'tokenfold']);
+  assert.deepEqual(lu.TRANSITIONAL_POLLED_TABS, ['plugins', 'deepdive', 'discovery']);
   for (const t of lu.TRANSITIONAL_POLLED_TABS) assert.equal(lu.transitionalPollDue(t), true, t);
   for (const t of ['pending', 'blocked', 'done']) assert.equal(lu.transitionalPollDue(t), false, t);
   for (const t of lu.SELF_RENDERING_TABS) assert.equal(lu.transitionalPollDue(t), false, t);
   assert.equal(lu.transitionalPollDue('myplugin', (x) => x === 'myplugin'), true);
 });
 
-test('the Workers, Adhoc, Job List and Models tabs no longer need the redraw timer: they have events', () => {
-  for (const tab of ['workers', 'adhoc', 'joblist', 'models']) assert.equal(lu.transitionalPollDue(tab), false, tab);
+test('the Workers, Adhoc, Job List, Models, Hardware, TokenFold and Reports tabs no longer need the redraw timer: they have events', () => {
+  for (const tab of ['workers', 'adhoc', 'joblist', 'models', 'hardware', 'tokenfold', 'reports']) assert.equal(lu.transitionalPollDue(tab), false, tab);
+  for (const e of ['hardware-changed', 'tokenfold-changed', 'reports-changed']) assert.ok(lu.LIVE_EVENTS.includes(e), e);
   assert.ok(lu.LIVE_EVENTS.includes('settings-changed'));
   assert.ok(lu.LIVE_EVENTS.includes('benchmark-changed'));
   assert.ok(lu.LIVE_EVENTS.includes('worker-panels-changed'));
@@ -242,7 +254,7 @@ test('the transitional timer redraws only while the active tab still depends on 
   h.fire(0);
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(h.applied, []);
-  h.setTab('hardware');
+  h.setTab('discovery');
   h.fire(0);
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(h.applied, [plan({ main: true })]);

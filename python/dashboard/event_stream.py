@@ -20,9 +20,11 @@ it finds that no event announced is announced then AND counted (`corrections`): 
 The module imports nothing from agent-manager: the filesystem, the clock and the waiter are arguments, so it can move into the triggers repo unchanged.
 """
 import json
+import math
 import os
 import threading
 import time
+import urllib.request
 from collections import deque
 
 EVENT_NAMES = ("counts-changed", "workers-changed", "branches-changed", "plugins-changed", "project-changed")
@@ -97,6 +99,43 @@ def dir_files_fact(specs_fn, extra_files_fn=None, subdirs=False):
     return fact
 
 
+def coarse(value, digits=2):
+    """`value` with every number rounded to `digits` significant figures (JSON-like structures, recursively; bools and None are untouched, anything else that is not a number or a container becomes its text). A live metric (a GPU utilisation, a VRAM figure, a
+    token count) then changes this value only when it moves by a visible amount, so a provider built on it announces real change and not every wobble."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value) or value == 0:
+            return value
+        exponent = math.floor(math.log10(abs(value)))
+        step = 10 ** (exponent - digits + 1)
+        rounded = round(value / step) * step
+        return int(rounded) if isinstance(value, int) or float(rounded).is_integer() else float("%.*g" % (digits, rounded))
+    if isinstance(value, dict):
+        return {str(k): coarse(v, digits) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(value, (list, tuple)):
+        return [coarse(v, digits) for v in value]
+    return str(value)
+
+
+def http_json_fact(url_fn, project=None, timeout=3.0, opener=None, digits=2):
+    """A provider for Hub(providers={name: (fact, interval_s)}): GET url_fn() (None means not configured), parse the JSON, apply project(data), round every number with coarse() and return the result as
+    a canonical JSON string. ANY failure (no URL, refused connection, timeout, bad JSON) is the value None, never an error: an unavailable service is a state, and its coming back is a change."""
+    def fact(full=False):
+        url = url_fn()
+        if not url:
+            return None
+        try:
+            with (opener or urllib.request.urlopen)(url, timeout=timeout) as r:
+                data = json.loads(r.read().decode())
+            if project is not None:
+                data = project(data)
+            return json.dumps(coarse(data, digits), sort_keys=True, separators=(",", ":"))
+        except Exception:   # noqa: BLE001
+            return None
+    return fact
+
+
 def counts_signature(queue_dir, full=False):
     """((name, mtime_ns[, entry count]), ...) for the queue directory and each state directory below it. `full` counts entries too (the reconcile pass)."""
     if not queue_dir:
@@ -168,7 +207,16 @@ class Hub:
 
     def __init__(self, resolve, watch_s=WATCH_S, reconcile_s=RECONCILE_S, clock=time.monotonic, idle_exit_s=IDLE_EXIT_S, providers=None):
         self._resolve = resolve
-        self._providers = dict(providers or {})      # event name -> fact(full) callable; announced in registration order after the built-in four
+        self._providers = {}                         # event name -> fact(full) callable; announced in registration order after the built-in four
+        self._intervals = {}                         # event name -> seconds between evaluations (the single clock: a sampled provider is not asked every pass)
+        self._prov_cache = {}                        # event name -> (clock time, last value)
+        for name, spec in (providers or {}).items():
+            fact, interval = spec if isinstance(spec, tuple) else (spec, None)
+            if interval is not None and (isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval <= 0):
+                raise ValueError("a provider interval must be a positive number of seconds: %r" % (interval,))
+            self._providers[name] = fact
+            if interval is not None:
+                self._intervals[name] = interval
         for name in self._providers:
             if not (isinstance(name, str) and name.endswith("-changed")) or name in EVENT_NAMES:
                 raise ValueError("a provider event name must end in -changed and not be a built-in one: %r" % (name,))
@@ -197,10 +245,17 @@ class Hub:
         counts = counts_signature(queue, full=full)
         extra = {}
         for name, fact in self._providers.items():
+            interval = self._intervals.get(name)
+            cached = self._prov_cache.get(name)
+            if interval is not None and not full and cached is not None and self._clock() - cached[0] < interval:
+                extra[name] = cached[1]
+                continue
             try:
                 extra[name] = fact(full)
             except Exception:   # noqa: BLE001 -- one broken provider must not silence the others
                 extra[name] = None
+            if interval is not None:
+                self._prov_cache[name] = (self._clock(), extra[name])
         return {
             **extra,
             "project": str(queue) if queue else None,
