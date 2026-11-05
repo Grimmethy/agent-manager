@@ -153,6 +153,8 @@ const READING_LEAD_RE = /^(?:read|ground|check|confirm|verify|compare|survey|ins
 function opensWithImperative(c) {
   const m = /^[\s>*\-\d.)]*([A-Za-z][A-Za-z-]*)(?=\s)/.exec(c);
   if (!m || NON_IMPERATIVE_LEAD_RE.test(m[1]) || !TARGET_PATH_RE.test(c)) return false;
+  // A first word followed by a colon is a label/heading (e.g. "Questions: which functions..."), not an imperative verb
+  if (/^[\s>*\-\d.)]*[A-Za-z][A-Za-z-]*\s*:/.test(c)) return false;
   return !(READING_LEAD_RE.test(m[1]) && !AFFIRMATIVE_EDIT_VERB_RE.test(c));
 }
 // A sentence still counts as asking for code when it has a phrase signal, an affirmative edit verb, or opens with an imperative.
