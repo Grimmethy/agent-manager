@@ -1,4 +1,4 @@
-"""The Workers tab's payload for the two context workers (routes/context_worker.py), 2026-11-04.
+"""The Workers tab's payload for the three context workers (routes/context_worker.py), 2026-11-04 and 2026-11-05.
 
 Everything the route reads is faked or lives in a temp dir: no real ledger, no real drain, no network.
 Run: .venv/bin/python -m unittest python.dashboard.test_context_worker -v   (from the repo root)
@@ -19,7 +19,8 @@ from routes import context_worker as cw  # noqa: E402
 
 _ISO_DIR = tempfile.mkdtemp(prefix="context-worker-tests-")
 _ISO_ENV = mock.patch.dict(os.environ, {"HOME": _ISO_DIR, "AGENT_MANAGER_CONTEXT_OPS_STATE_DIR": os.path.join(_ISO_DIR, "state"),
-                                        "CONTEXT_MAP_DISABLED_PATH": os.path.join(_ISO_DIR, "map-marker"), "CONTEXT_MEMORY_DISABLED_PATH": os.path.join(_ISO_DIR, "memory-marker")})
+                                        "CONTEXT_MAP_DISABLED_PATH": os.path.join(_ISO_DIR, "map-marker"), "CONTEXT_MEMORY_DISABLED_PATH": os.path.join(_ISO_DIR, "memory-marker"),
+                                        "CONTEXT_IMPACT_DISABLED_PATH": os.path.join(_ISO_DIR, "impact-marker")})
 
 
 def setUpModule():
@@ -33,7 +34,7 @@ def tearDownModule():
 
 NOW = 1_800_000_000.0                       # 2027-01-15T08:00:00Z
 ISO = lambda secs_ago: datetime.fromtimestamp(NOW - secs_ago, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
-ITEMS = {"map": "codebase-map", "memory": "memory-index"}
+ITEMS = {"map": "codebase-map", "memory": "memory-index", "impact": "context-impact"}
 SWITCH_ON = {"disabled": False, "disabledAt": None}
 TRIG = {"state": "listening", "endedAt": "2027-01-15T07:59:00Z", "endedAgeS": 60, "stopped": "idle", "iterations": 1}
 
@@ -48,8 +49,8 @@ def pair(name, outcome, ago, mode="dry-run", executed=None, detail=None, result_
             {"kind": "result", "at": ISO(ago), "loop": name, "item": item, "outcome": result_outcome or outcome, "detail": rdetail}]
 
 
-def build(name="map", rows=(), trigger=TRIG, env=None, switch=SWITCH_ON, now=NOW):
-    return cw.build_context_worker(name, env=env or {}, now=now, read_rows=lambda p: list(rows), trigger=lambda: trigger, read_sw=lambda n, e: switch)
+def build(name="map", rows=(), trigger=TRIG, env=None, switch=SWITCH_ON, now=NOW, events=()):
+    return cw.build_context_worker(name, env=env or {}, now=now, read_rows=lambda p: list(rows), trigger=lambda: trigger, read_sw=lambda n, e: switch, read_events=lambda p: list(events))
 
 
 class Paths(unittest.TestCase):
@@ -234,6 +235,154 @@ class Switch(unittest.TestCase):
             cw.set_enabled("map", False, {"HOME": self.dir, "CONTEXT_MAP_DISABLED_PATH": os.path.join(blocker, "sub", "marker")}, now=NOW)
 
 
+def ev_open(i, kind="map-edit"):
+    return {"event": "open", "id": i, "kind": kind, "at": ISO(9000), "reDueAt": ISO(1000), "before": {}}
+
+
+def ev_done(i, verdict, kind="map-edit"):
+    return {"event": "evaluated", "id": i, "kind": kind, "at": ISO(10), "verdict": verdict}
+
+
+def impact_pair(outcome, ago, mode="dry-run", detail=None, result_detail=None):
+    return pair("impact", outcome, ago, mode=mode, detail=detail, result_detail=result_detail)
+
+
+class Impact(unittest.TestCase):
+    def test_paths_are_pinned_next_to_the_other_workers(self):
+        env = {"HOME": "/h"}
+        self.assertEqual(cw.ledger_path("impact", env), "/h/.local/state/pipeline-ops/context-impact-ledger.jsonl")
+        self.assertEqual(cw.switch_path("impact", env), "/h/.local/state/pipeline-ops/context-impact-disabled")
+        self.assertEqual(cw.interventions_path(env), "/h/.local/state/pipeline-ops/context-impact-interventions.jsonl")
+        moved = {"HOME": "/h", "AGENT_MANAGER_CONTEXT_OPS_STATE_DIR": "/s", "CONTEXT_IMPACT_DISABLED_PATH": "/x/i-off", "CONTEXT_MAP_DISABLED_PATH": "/x/m-off"}
+        self.assertEqual(cw.ledger_path("impact", moved), "/s/context-impact-ledger.jsonl")
+        self.assertEqual(cw.interventions_path(moved), "/s/context-impact-interventions.jsonl")
+        self.assertEqual(cw.switch_path("impact", moved), "/x/i-off")
+
+    def test_identity_and_the_impact_section_exists_for_impact_only(self):
+        p = build("impact", rows=impact_pair("SNAPSHOT", 30, detail={"outcomes": ["SNAPSHOT", "INSUFFICIENT-DATA"]}))
+        self.assertEqual((p["name"], p["worker"], p["mode"], p["decisions"]), ("impact", "context-impact", "dry-run", 1))
+        self.assertIn("impact", p)
+        self.assertEqual(p["recent"][0]["summary"], "SNAPSHOT, INSUFFICIENT-DATA")
+        for other in ("map", "memory"):
+            self.assertNotIn("impact", build(other, rows=pair(other, "OK", 30)))
+
+    def test_nothing_at_all_for_impact_is_not_configured(self):
+        self.assertEqual(build("impact", trigger=None), {"configured": False})
+
+    def test_the_latest_finding_comes_from_the_newest_non_error_decision(self):
+        older = impact_pair("REGRESSED", 500, detail={"regressed": ["old.gauge"]})
+        newer = impact_pair("REGRESSED", 100, detail={"regressed": ["pipeline.a", "map.b"], "improved": ["friction.per100"], "insufficient": ["state.map"],
+                                                       "wouldFile": [{"gauge": "pipeline.a", "hash": "h"}, {"gauge": "map.b"}]})
+        error = [{"kind": "intent", "at": ISO(21), "loop": "impact", "item": "context-impact", "outcome": "SNAPSHOT", "detail": {"mode": "on"}},
+                 {"kind": "result", "at": ISO(20), "loop": "impact", "item": "context-impact", "outcome": "error", "detail": {"error": "boom"}}]
+        latest = build("impact", rows=older + newer + error)["impact"]["latest"]
+        self.assertEqual(latest, {"at": ISO(100), "regressed": ["pipeline.a", "map.b"], "improved": ["friction.per100"], "insufficient": ["state.map"], "wouldFile": ["pipeline.a", "map.b"]})
+
+    def test_odd_detail_fields_read_as_empty_lists(self):
+        odd = impact_pair("SNAPSHOT", 10, detail={"regressed": "x", "improved": 5, "insufficient": {"a": 1}, "wouldFile": [None, 3, {"gauge": 7}, {"hash": "h"}, {"gauge": "ok"}]})
+        latest = build("impact", rows=odd)["impact"]["latest"]
+        self.assertEqual((latest["regressed"], latest["improved"], latest["insufficient"], latest["wouldFile"]), ([], [], [], ["ok"]))
+        mixed = impact_pair("SNAPSHOT", 10, detail={"regressed": ["a", 3, None, "b"]})
+        self.assertEqual(build("impact", rows=mixed)["impact"]["latest"]["regressed"], ["a", "b"])
+
+    def test_no_decision_gives_no_latest_and_nothing_filed(self):
+        p = build("impact", rows=[], trigger=TRIG)
+        self.assertEqual(p["impact"], {"latest": None, "filedCount": 0, "filed": [], "interventions": {"map-edit": {"HELPED": 0, "NO-EFFECT": 0, "HARMED": 0, "open": 0}, "memory-edit": {"HELPED": 0, "NO-EFFECT": 0, "HARMED": 0, "open": 0}},
+                                     "gate": {"open": False, "evaluated": 0, "helped": 0}})
+
+    def test_filed_tasks_come_from_executed_on_mode_decisions_with_a_text_task_id_only(self):
+        def filed(*items):
+            return {"filed": list(items)}
+        rows = (impact_pair("FILE-FINDING", 900, mode="on", result_detail=filed({"hash": "h", "gauge": "pipeline.a", "taskId": "task-1"}))
+                + impact_pair("FILE-FINDING", 800, mode="on", result_detail={"executed": False, **filed({"gauge": "map.b", "taskId": "task-x"})})
+                + impact_pair("REGRESSED", 700, mode="dry-run", result_detail=filed({"gauge": "friction.per100", "taskId": "task-y"}))
+                + impact_pair("FILE-FINDING", 600, mode="on", result_detail=filed({"gauge": "g", "taskId": ""}, {"gauge": "g"}, None, {"gauge": "map.c", "taskId": "task-2"}, {"taskId": "task-3"}, {"gauge": 5, "taskId": "task-4"}, {"gauge": "g", "taskId": 7})))
+        sec = build("impact", rows=rows)["impact"]
+        self.assertEqual([(f["gauge"], f["taskId"]) for f in sec["filed"]], [("pipeline.a", "task-1"), ("map.c", "task-2"), (None, "task-3"), (None, "task-4")])
+        self.assertEqual(sec["filedCount"], 4)
+        self.assertEqual(sec["filed"][0]["at"], ISO(900))
+
+    def test_a_decision_of_another_mode_or_an_unexecuted_one_never_counts_as_filed_even_when_its_result_lists_a_task(self):
+        # Raw rows on purpose: the pair() helper replaces the result detail of every dry-run decision, which would hide exactly this case.
+        def raw(mode, ago, rdetail):
+            return [{"kind": "intent", "at": ISO(ago + 1), "loop": "impact", "item": "context-impact", "outcome": "FILE-FINDING", "detail": {"mode": mode, "factsKey": f"k{ago}"}},
+                    {"kind": "result", "at": ISO(ago), "loop": "impact", "item": "context-impact", "outcome": "FILE-FINDING", "detail": rdetail}]
+        listed = {"filed": [{"hash": "h", "gauge": "g", "taskId": "task-1"}]}
+        rows = raw("dry-run", 400, listed) + raw("off", 300, listed) + raw("on", 200, {"executed": False, **listed})
+        self.assertEqual(build("impact", rows=rows)["impact"]["filedCount"], 0)
+        self.assertEqual(build("impact", rows=rows + raw("on", 100, listed))["impact"]["filedCount"], 1)
+
+    def test_only_the_ten_newest_filed_tasks_are_listed_but_all_are_counted(self):
+        rows = []
+        for i in range(12):
+            rows += impact_pair("FILE-FINDING", 5000 - i * 100, mode="on", result_detail={"filed": [{"gauge": "g", "taskId": f"task-{i}"}]})
+        sec = build("impact", rows=rows)["impact"]
+        self.assertEqual(sec["filedCount"], 12)
+        self.assertEqual([f["taskId"] for f in sec["filed"]], [f"task-{i}" for i in range(2, 12)])
+
+    def test_the_intervention_ledger_is_summarized_per_kind_and_the_gate_matches_the_node_side(self):
+        events = [ev_open("map-edit:a1"), ev_done("map-edit:a1", "HELPED"), ev_open("map-edit:a2"), ev_done("map-edit:a2", "HELPED"), ev_open("map-edit:a3"), ev_done("map-edit:a3", "NO-EFFECT"),
+                  ev_open("map-edit:a4"), ev_open("memory-edit:m1", "memory-edit"), ev_done("memory-edit:m1", "HARMED", "memory-edit")]
+        sec = build("impact", events=events)["impact"]
+        self.assertEqual(sec["interventions"]["map-edit"], {"HELPED": 2, "NO-EFFECT": 1, "HARMED": 0, "open": 1})
+        self.assertEqual(sec["interventions"]["memory-edit"], {"HELPED": 0, "NO-EFFECT": 0, "HARMED": 1, "open": 0})
+        self.assertEqual(sec["gate"], {"open": True, "evaluated": 3, "helped": 2})
+
+    def test_the_gate_needs_three_evaluated_and_more_than_half_helped(self):
+        def gate(*verdicts):
+            ev = []
+            for i, v in enumerate(verdicts):
+                ev += [ev_open(f"map-edit:{i}"), ev_done(f"map-edit:{i}", v)]
+            return build("impact", events=ev)["impact"]["gate"]
+        self.assertEqual(gate("HELPED", "HELPED"), {"open": False, "evaluated": 2, "helped": 2})
+        self.assertEqual(gate("HELPED", "HELPED", "NO-EFFECT"), {"open": True, "evaluated": 3, "helped": 2})
+        self.assertEqual(gate("HELPED", "HELPED", "NO-EFFECT", "HARMED"), {"open": False, "evaluated": 4, "helped": 2})
+        self.assertEqual(gate("HELPED", "NO-EFFECT", "NO-EFFECT", "NO-EFFECT"), {"open": False, "evaluated": 4, "helped": 1})
+        self.assertEqual(gate("HELPED", "HELPED", "HELPED", "NO-EFFECT"), {"open": True, "evaluated": 4, "helped": 3})
+
+    def test_folding_ignores_unknown_kinds_ids_verdicts_and_a_second_open_or_evaluation(self):
+        events = [ev_open("map-edit:a1"), ev_open("map-edit:a1"), ev_done("map-edit:a1", "HELPED"), ev_done("map-edit:a1", "HARMED"), ev_open("map-edit:a1"),
+                  ev_done("map-edit:ghost", "HELPED"), ev_open("x", "weird"), {"event": "open", "kind": "map-edit"}, {"event": "weird", "id": "map-edit:a1", "kind": "map-edit", "verdict": "HARMED"},
+                  ev_open("map-edit:a2"), ev_done("map-edit:a2", "MAYBE"), None, 5, "x", {}]
+        counts, gate = cw.intervention_summary(events)
+        self.assertEqual(counts["map-edit"], {"HELPED": 1, "NO-EFFECT": 0, "HARMED": 0, "open": 1})
+        self.assertEqual(gate, {"open": False, "evaluated": 1, "helped": 1})
+        self.assertEqual(cw.intervention_summary(None)[0]["map-edit"]["open"], 0)
+        self.assertEqual(cw.intervention_summary("x")[1], {"open": False, "evaluated": 0, "helped": 0})
+
+    def test_an_unreadable_intervention_file_leaves_the_rest_of_the_payload_intact(self):
+        def boom(path):
+            raise OSError("no")
+        p = cw.build_context_worker("impact", env={}, now=NOW, read_rows=lambda path: impact_pair("SNAPSHOT", 30), trigger=lambda: TRIG, read_sw=lambda n, e: SWITCH_ON, read_events=boom)
+        self.assertTrue(p["configured"])
+        self.assertIsNone(p["impact"])
+        self.assertEqual(p["decisions"], 1)
+
+    def test_the_events_are_read_from_the_intervention_file_of_the_state_directory(self):
+        seen = []
+        cw.build_context_worker("impact", env={"HOME": "/h", "AGENT_MANAGER_CONTEXT_OPS_STATE_DIR": "/s"}, now=NOW, read_rows=lambda path: seen.append(path) or [], trigger=lambda: TRIG,
+                                read_sw=lambda n, e: SWITCH_ON, read_events=lambda path: seen.append(path) or [])
+        self.assertEqual(seen, ["/s/context-impact-ledger.jsonl", "/s/context-impact-interventions.jsonl"])
+        seen.clear()
+        cw.build_context_worker("map", env={"HOME": "/h"}, now=NOW, read_rows=lambda path: seen.append(path) or [], trigger=lambda: TRIG, read_sw=lambda n, e: SWITCH_ON, read_events=lambda path: seen.append(path) or [])
+        self.assertEqual(seen, ["/h/.local/state/pipeline-ops/context-map-ledger.jsonl"])
+
+    def test_a_hold_of_the_impact_worker_shows_its_question_and_recommendation(self):
+        rows = impact_pair("HOLD-FOR-OWNER", 60, detail={"question": "The map-edit change map-edit:aaaaaaaa read NO-EFFECT. Is it worth keeping?", "recommendation": "Keep it only if it has another reason."})
+        p = build("impact", rows=rows)
+        self.assertEqual(p["holdCount"], 1)
+        self.assertEqual((p["holds"][0]["question"], p["holds"][0]["recommendation"]), ("The map-edit change map-edit:aaaaaaaa read NO-EFFECT. Is it worth keeping?", "Keep it only if it has another reason."))
+
+    def test_the_three_switches_are_independent(self):
+        d = tempfile.mkdtemp(prefix="cw-impact-")
+        env = {"HOME": d}
+        cw.set_enabled("impact", False, env, now=NOW)
+        self.assertTrue(cw.read_switch("impact", env)["disabled"])
+        self.assertFalse(cw.read_switch("map", env)["disabled"])
+        self.assertFalse(cw.read_switch("memory", env)["disabled"])
+        self.assertTrue(os.path.isfile(os.path.join(d, ".local", "state", "pipeline-ops", "context-impact-disabled")))
+
+
 class Routes(unittest.TestCase):
     def setUp(self):
         self.client = app.app.test_client()
@@ -257,6 +406,20 @@ class Routes(unittest.TestCase):
         self.assertTrue(os.path.isfile(marker))
         self.assertTrue(self.client.get("/api/context-worker/memory").get_json()["switch"]["disabled"])
         r = self.client.post("/api/context-worker/memory/enabled", json={"enabled": True})
+        self.assertEqual((r.status_code, r.get_json()["switch"]["disabled"]), (200, False))
+        self.assertFalse(os.path.exists(marker))
+
+    def test_the_impact_worker_has_a_route_and_a_switch_that_stays_inside_the_temp_dir(self):
+        self.assertEqual(self.client.get("/api/context-worker/impact").get_json(), {"configured": False})
+        marker = cw.switch_path("impact")
+        self.assertTrue(marker.startswith(_ISO_DIR), marker)
+        r = self.client.post("/api/context-worker/impact/enabled", json={"enabled": False})
+        self.assertEqual((r.status_code, r.get_json()["switch"]["disabled"]), (200, True))
+        self.assertTrue(os.path.isfile(marker))
+        got = self.client.get("/api/context-worker/impact").get_json()
+        self.assertEqual((got["configured"], got["enabled"], got["worker"]), (True, False, "context-impact"))
+        self.assertFalse(os.path.exists(cw.switch_path("map")))
+        r = self.client.post("/api/context-worker/impact/enabled", json={"enabled": True})
         self.assertEqual((r.status_code, r.get_json()["switch"]["disabled"]), (200, False))
         self.assertFalse(os.path.exists(marker))
 
