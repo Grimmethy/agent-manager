@@ -226,7 +226,7 @@ async function renderWorkers(isPoll) {
   // call-level data (review-task.js's majorityVote never calls recordCall, see that
   // route's own docstring) so it keeps the existing terminal-state recent-tasks view.
   const expandedIsWorker = !!(expandedWorkerId && expandedWorkerId.startsWith('worker'));
-  const [instances, workerModels, costSummary, recentTasks, cloudMeter, stalledWorker, verifierWorker, needsworkWorker, contextMapWorker, contextMemoryWorker] = await Promise.all([
+  const [instances, workerModels, costSummary, recentTasks, cloudMeter, stalledWorker, verifierWorker, needsworkWorker, contextMapWorker, contextMemoryWorker, pipelineOpsWorkers] = await Promise.all([
     fetchJson('/api/instances'),
     fetchJson('/api/worker-models'),
     fetchJson('/api/models/cost-summary'),
@@ -246,6 +246,8 @@ async function renderWorkers(isPoll) {
     // Context-worker cards (context-worker-panel.js): fail soft the same way.
     fetchJson('/api/context-worker/map').catch(() => null),
     fetchJson('/api/context-worker/memory').catch(() => null),
+    // Pipeline-ops worker cards (pipeline-ops-workers-panel.js): fail soft the same way.
+    fetchJson('/api/pipeline-ops-workers').catch(() => null),
   ]);
   // Candidate list for each worker's own "assign task" override dropdown (2026-09-07
   // follow-up, Grimmethy after live-testing the override: "the only tasks I have
@@ -336,7 +338,7 @@ async function renderWorkers(isPoll) {
         ${recentTasks ? (recentTasks.runs ? renderRunLogList(recentTasks.runs) : renderRecentTasksList(recentTasks.tasks || [])) : '<div class="meta">Loading…</div>'}
       </div>` : ''}
     </div>
-  `).join('')) + (typeof renderCloudSpendSection === 'function' ? renderCloudSpendSection(cloudMeter) : '') + (typeof renderStalledWorkerSection === 'function' ? renderStalledWorkerSection(stalledWorker) : '') + (typeof renderVerifierWorkerSection === 'function' ? renderVerifierWorkerSection(verifierWorker) : '') + (typeof renderNeedsworkWorkerSection === 'function' ? renderNeedsworkWorkerSection(needsworkWorker) : '') + (typeof renderContextWorkerSection === 'function' ? renderContextWorkerSection(contextMapWorker, contextMemoryWorker) : '') + renderCompletedTasksSection();
+  `).join('')) + (typeof renderCloudSpendSection === 'function' ? renderCloudSpendSection(cloudMeter) : '') + (typeof renderStalledWorkerSection === 'function' ? renderStalledWorkerSection(stalledWorker) : '') + (typeof renderVerifierWorkerSection === 'function' ? renderVerifierWorkerSection(verifierWorker) : '') + (typeof renderNeedsworkWorkerSection === 'function' ? renderNeedsworkWorkerSection(needsworkWorker) : '') + (typeof renderContextWorkerSection === 'function' ? renderContextWorkerSection(contextMapWorker, contextMemoryWorker) : '') + (typeof renderPipelineOpsWorkersSection === 'function' ? renderPipelineOpsWorkersSection(pipelineOpsWorkers) : '') + renderCompletedTasksSection();
   window.scrollTo(0, scrollY);
   setupCompletedTasksObserver();
   if (!completedTasksLog.length && !completedTasksLoading && !completedTasksExhausted) {
@@ -354,6 +356,8 @@ async function renderWorkers(isPoll) {
   if (typeof wireNeedsworkWorkerExpand === 'function') wireNeedsworkWorkerExpand(main, renderWorkers);
   if (typeof wireContextWorkerSwitch === 'function') wireContextWorkerSwitch(main);
   if (typeof wireContextWorkerExpand === 'function') wireContextWorkerExpand(main, renderWorkers);
+  if (typeof wirePipelineOpsWorkerSwitch === 'function') wirePipelineOpsWorkerSwitch(main);
+  if (typeof wirePipelineOpsWorkerExpand === 'function') wirePipelineOpsWorkerExpand(main, renderWorkers);
   const claudePauseToggle = main.querySelector('#claude-pause-toggle');
   if (claudePauseToggle) {
     claudePauseToggle.onchange = (e) => setClaudePaused(e.target.checked);
