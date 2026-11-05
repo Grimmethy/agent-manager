@@ -27,6 +27,7 @@ def _providers():
             "plugin-states-changed": (_plugin_states, PLUGIN_STATES_INTERVAL_S),
             "pipeline-state-changed": (_pipeline_state, PIPELINE_STATE_INTERVAL_S),
             "brain-dump-changed": event_stream.dir_files_fact(lambda: [], _brain_dump_files),
+            "hygiene-changed": event_stream.dir_files_fact(_hygiene_specs),
             "settings-changed": event_stream.dir_files_fact(lambda: [], _settings_files),
             "benchmark-changed": event_stream.dir_files_fact(_benchmark_specs, subdirs=True),
             "worker-panels-changed": event_stream.dir_files_fact(_panel_specs, _panel_files), "memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), re.sub(r"\d+", "#", str(d.get("reason") or ""))))}
@@ -92,6 +93,24 @@ def _brain_dump_files():
     Whoever writes an entry (the tab, the chat, a pipeline sweep, a hand edit) replaces or grows the file, so its stat key moves and the open tab is told."""
     from app import brain_dump_path
     return [brain_dump_path()]
+
+
+_HYGIENE_FLAGS = re.compile(r"-flags\.json$")
+_HYGIENE_CANDIDATES = re.compile(r"_CANDIDATES\.md$")
+
+
+def _hygiene_specs():
+    """The files the Hygiene inventory is joined from that nothing else announces, for the ACTIVE project (resolved on every pass): the scanners' queue/*-flags.json and the repo's
+    Docs/*_CANDIDATES.md. The queue's task records are counts-changed, the unmerged candidate docs are branches-changed; a missing directory contributes nothing."""
+    from app import get_active_repo_root, queue_dir
+    specs = []
+    q = queue_dir()
+    if q:
+        specs.append((str(q), _HYGIENE_FLAGS))
+    root = get_active_repo_root()
+    if root:
+        specs.append((os.path.join(root, "Docs"), _HYGIENE_CANDIDATES))
+    return specs
 
 
 def _pipeline_state(full=False):

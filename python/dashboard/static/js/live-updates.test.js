@@ -108,7 +108,21 @@ test('pipeline-state-changed and project-build-changed refresh the Project tab p
     for (const tab of ['pending', 'workers', 'plugins', 'branches', 'brain-dump', 'hygiene']) assert.deepEqual(lu.planForEvent(ev, tab), lu.NO_PLAN, ev + ' ' + tab);
     assert.ok(lu.LIVE_EVENTS.includes(ev), ev);
   }
-  assert.deepEqual([...lu.PANEL_TABS], ['project', 'brain-dump']);
+  assert.deepEqual([...lu.PANEL_TABS], ['project', 'brain-dump', 'hygiene']);
+});
+
+test('the Hygiene inventory reloads on hygiene-changed, counts-changed and branches-changed, only while that tab is open', () => {
+  for (const ev of ['hygiene-changed', 'counts-changed', 'branches-changed']) {
+    assert.equal(lu.planForEvent(ev, 'hygiene').panels, true, ev);
+    for (const tab of ['pending', 'project', 'brain-dump', 'branches', 'workers', 'plugins']) assert.equal(lu.planForEvent(ev, tab).panels, false, ev + ' ' + tab);
+  }
+  assert.deepEqual(lu.planForEvent('hygiene-changed', 'hygiene'), plan({ panels: true }));
+  assert.deepEqual(lu.planForEvent('hygiene-changed', 'branches'), lu.NO_PLAN);
+  assert.ok(lu.LIVE_EVENTS.includes('hygiene-changed'));
+  for (const ev of ['memory-changed', 'workers-changed', 'brain-dump-changed']) assert.equal(lu.planForEvent(ev, 'hygiene').panels, false, ev);
+  // the other plan keys of those events are unchanged by the Hygiene panel
+  assert.deepEqual(lu.planForEvent('counts-changed', 'hygiene'), plan({ summary: true, nav: true, panels: true }));
+  assert.deepEqual(lu.planForEvent('branches-changed', 'branches'), plan({ branches: true }));
 });
 
 test('brain-dump-changed refreshes the Brain Dump entry list only, never redraws anything whole', () => {

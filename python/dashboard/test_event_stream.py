@@ -1127,6 +1127,34 @@ class Route(Base):
         with mock.patch.object(app, "brain_dump_path", lambda: None):
             self.assertEqual(route._providers()["brain-dump-changed"](), ())      # no active project
 
+    def test_the_route_registers_a_hygiene_provider_over_the_scanner_flags_and_the_candidate_docs(self):
+        queue = Path(self.pipe) / "hq"
+        docs = Path(self.pipe) / "repo" / "Docs"
+        queue.mkdir()
+        docs.mkdir(parents=True)
+        with mock.patch.object(app, "queue_dir", lambda: queue), mock.patch.object(app, "get_active_repo_root", lambda: str(docs.parent)):
+            fact = route._providers()["hygiene-changed"]
+            self.assertEqual(fact(), ())
+            (queue / "file-length-flags.json").write_text("{}")
+            first = fact()
+            self.assertEqual([os.path.basename(t[0]) for t in first], ["file-length-flags.json"])
+            self.assertEqual(fact(), first)                                          # unchanged: announces nothing
+            (queue / "file-length-flags.json").write_text('{"flags": [1]}')
+            second = fact()
+            self.assertNotEqual(second, first)
+            (docs / "DEAD_CODE_CANDIDATES.md").write_text("### AC-1")
+            third = fact()
+            self.assertEqual(sorted(os.path.basename(t[0]) for t in third), ["DEAD_CODE_CANDIDATES.md", "file-length-flags.json"])
+            (docs / "DEAD_CODE_CANDIDATES.md").write_text("### AC-1 and more")
+            self.assertNotEqual(fact(), third)
+            before = fact()
+            (queue / "queue-task.json").write_text("{}")                               # a task record is counts-changed, not a flag file
+            (docs / "README.md").write_text("x")                                       # nor is any other doc
+            (queue / "notflags.json.bak").write_text("{}")
+            self.assertEqual(fact(), before)
+        with mock.patch.object(app, "queue_dir", lambda: None), mock.patch.object(app, "get_active_repo_root", lambda: None):
+            self.assertEqual(route._providers()["hygiene-changed"](), ())             # no active project
+
     def test_the_route_registers_a_benchmark_provider_over_the_runs_directory(self):
         base = Path(self.pipe) / "benchmarks"
         with mock.patch.object(app, "BENCHMARK_STATE_DIR", base):

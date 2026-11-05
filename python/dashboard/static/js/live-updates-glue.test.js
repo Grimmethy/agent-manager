@@ -220,3 +220,35 @@ test('the Brain Dump tab has no timer, no interval variable and core has no leav
   assert.doesNotMatch(fs.readFileSync(path.join(__dirname, 'core-ui.js'), 'utf8'), /leaveBrainDumpTab/);
   assert.doesNotMatch(fs.readFileSync(path.join(__dirname, '..', '..', 'templates', 'index.html'), 'utf8'), /brainDumpEntriesInterval/);
 });
+
+test('applyLivePlan: a panels plan reloads the Hygiene inventory QUIETLY, and only for that tab', async () => {
+  const { ctx, calls } = load({ activeTab: 'hygiene' });
+  ctx.loadHygiene = async (...a) => { calls.push(['hygiene:' + JSON.stringify(a)]); };
+  ctx.refreshBrainDumpEntries = async () => { calls.push(['entries']); };
+  await ctx.applyLivePlan({ summary: false, plugins: false, nav: false, main: false, branches: false, panels: true });
+  assert.deepEqual(names(calls), ['hygiene:[{"quiet":true}]']);
+  const other = load({ activeTab: 'pending' });
+  other.ctx.loadHygiene = async () => { other.calls.push(['hygiene']); };
+  await other.ctx.applyLivePlan({ summary: false, plugins: false, nav: false, main: false, branches: false, panels: true });
+  assert.deepEqual(other.calls, []);
+});
+
+test('startPageLiveUpdates: counts-changed and hygiene-changed reload the open Hygiene tab and no interval is started', async () => {
+  const { ctx, calls, timers } = load({ activeTab: 'hygiene' });
+  ctx.loadHygiene = async () => { calls.push(['hygiene']); };
+  ctx.startPageLiveUpdates();
+  assert.equal(timers.length, 0);
+  FakeEventSource.last.emit('hygiene-changed');
+  await settle();
+  assert.ok(names(calls).includes('hygiene'));
+  calls.length = 0;
+  FakeEventSource.last.emit('counts-changed');
+  await settle();
+  assert.ok(names(calls).includes('hygiene'));
+});
+
+test('the Hygiene tab has no timer, no poll constant and core has no leaveHygieneTab hook', () => {
+  const tab = fs.readFileSync(path.join(__dirname, 'hygiene-tab.js'), 'utf8');
+  assert.doesNotMatch(tab, /setInterval|hygienePollTimer|HYGIENE_POLL_MS|leaveHygieneTab/);
+  assert.doesNotMatch(fs.readFileSync(path.join(__dirname, 'core-ui.js'), 'utf8'), /leaveHygieneTab/);
+});
