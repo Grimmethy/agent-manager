@@ -2,6 +2,7 @@
 
 const { GIT_OWNERSHIP_RULE } = require('./lib/git-ownership.js');
 const { candidateSplitToHubEnabled } = require('./lib/candidate-split-route.js');
+const { PLAN_LINES: POLL_PLAN_LINES, IMPLEMENT_LINES: POLL_IMPLEMENT_LINES } = require('./lib/poll-avoidance-lines.js');
 
 const path = require('path');
 
@@ -315,6 +316,7 @@ function adhocPlanPrompt(task) {
     ...skipPathDirective(task, 'plan'),
     'Write a numbered, actionable PLAN.',
     GIT_OWNERSHIP_RULE,
+    POLL_PLAN_LINES,
     'IMPORTANT: This promptContext\'s shape is NOT standardized. Treat anything not explicitly stated in it as unknown — do not assume a field exists just because a similar-sounding one appeared in another kind of task.',
     ...statedAcceptanceBlock(task),
     '',
@@ -1572,6 +1574,8 @@ function adhocImplementPrompt(task, planText) {
     '',
     ...skipPathDirective(task, 'implement'),
     ...fixedLiteralsBlock(task),
+    POLL_IMPLEMENT_LINES,
+    '',
     groupBJsonInstructions,
   ].join('\n');
 }
