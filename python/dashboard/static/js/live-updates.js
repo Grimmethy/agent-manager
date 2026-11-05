@@ -9,7 +9,8 @@
 //   branches-changed  a verdict was recorded or a branch merged          -> refresh the Branches tab
 //   plugins-changed   plugins.json changed                               -> re-sync the plugin tabs, redraw the Plugins tab
 //   memory-changed    the host-memory chip's state or reason changed     -> refresh /api/summary (the chip)
-//   worker-panels-changed  a ledger, index, on/off marker, the cloud spend ledger or the model-stats database a Workers-tab panel reads changed -> redraw the Workers tab
+//   worker-panels-changed  a ledger, index, on/off marker, the cloud spend ledger or the model-stats database a Workers-tab panel reads changed -> redraw the Workers and Job List tabs
+//   settings-changed  agent-manager.env or dashboard-settings.json changed (the Job List's allowlist, priorities, approval modes) -> redraw the Job List tab
 //   project-changed / snapshot   the pipeline changed, or this page just (re)connected -> refresh everything
 //
 // TRANSITIONAL: a tab whose data has no event yet keeps a redraw timer WHILE IT IS THE ACTIVE TAB (TRANSITIONAL_POLLED_TABS and every plugin-owned tab). The list is the
@@ -17,14 +18,20 @@
 // If the stream is unavailable (the server answers 404, EventSource gives up) the page falls back to the old 5 s full refresh until it is reloaded.
 
 const LIVE_STREAM_URL = '/api/stream';
-const LIVE_EVENTS = ['snapshot', 'counts-changed', 'workers-changed', 'branches-changed', 'plugins-changed', 'memory-changed', 'worker-panels-changed', 'project-changed'];
+const LIVE_EVENTS = ['snapshot', 'counts-changed', 'workers-changed', 'branches-changed', 'plugins-changed', 'memory-changed', 'worker-panels-changed', 'settings-changed', 'project-changed'];
 const TRANSITIONAL_POLL_MS = 5000;
 // Tabs that manage their own rendering and are never redrawn by a refresh (they keep a half-typed note, an iframe, an open folder, a click in flight).
 const SELF_RENDERING_TABS = ['project', 'brain-dump', 'filed', 'hygiene', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'];
 // Every tab with its own renderer; anything else is a plain queue-state tab (renderQueueTab), whose content is exactly what counts-changed announces.
 const NON_QUEUE_TABS = ['workers', 'hardware', 'models', 'joblist', 'plugins', 'deepdive', 'discovery', 'branches', 'reports', 'tokenfold', 'promptforge', 'adforge',
   'scriptforge', 'adhoc', 'concepts', 'filed', 'hygiene', 'project', 'brain-dump'];
-const TRANSITIONAL_POLLED_TABS = ['hardware', 'models', 'joblist', 'plugins', 'deepdive', 'discovery', 'reports', 'tokenfold', 'adhoc'];
+const TRANSITIONAL_POLLED_TABS = ['hardware', 'models', 'plugins', 'deepdive', 'discovery', 'reports', 'tokenfold'];
+
+// Tabs that show data derived from what each event announces, beyond the queue-state tabs: the completed-task and queue-record lists (counts-changed), the workers' ledgers, indexes and the
+// model-stats database (worker-panels-changed: the Job List's performed counters and turn statistics), and the settings files (settings-changed: the Job List's allowlist and priorities).
+const COUNT_DRIVEN_TABS = ['workers', 'adhoc', 'joblist'];
+const PANEL_DRIVEN_TABS = ['workers', 'joblist'];
+const SETTINGS_DRIVEN_TABS = ['joblist'];
 
 const NO_PLAN = Object.freeze({ summary: false, plugins: false, nav: false, main: false, branches: false });
 
@@ -46,7 +53,7 @@ function planForEvent(name, tab, isPluginTab) {
       break;
     case 'counts-changed':
       plan.summary = plan.nav = true;
-      plan.main = isQueueTab(tab, isPluginTab) || tab === 'workers';        // every self-rendering tab is in NON_QUEUE_TABS, so it is never a queue tab; the Workers tab also lists completed tasks
+      plan.main = isQueueTab(tab, isPluginTab) || COUNT_DRIVEN_TABS.includes(tab);        // every self-rendering tab is in NON_QUEUE_TABS, so it is never a queue tab
       break;
     case 'memory-changed':
       plan.summary = true;
@@ -56,8 +63,13 @@ function planForEvent(name, tab, isPluginTab) {
       plan.main = tab === 'plugins';
       break;
     case 'workers-changed':
-    case 'worker-panels-changed':
       plan.main = tab === 'workers';
+      break;
+    case 'worker-panels-changed':
+      plan.main = PANEL_DRIVEN_TABS.includes(tab);
+      break;
+    case 'settings-changed':
+      plan.main = SETTINGS_DRIVEN_TABS.includes(tab);
       break;
     case 'branches-changed':
       plan.branches = tab === 'branches';
@@ -156,6 +168,6 @@ function startLiveUpdates(deps) {
 }
 
 if (typeof module !== 'undefined') module.exports = {
-  LIVE_STREAM_URL, LIVE_EVENTS, TRANSITIONAL_POLL_MS, SELF_RENDERING_TABS, NON_QUEUE_TABS, TRANSITIONAL_POLLED_TABS, NO_PLAN,
+  LIVE_STREAM_URL, LIVE_EVENTS, TRANSITIONAL_POLL_MS, SELF_RENDERING_TABS, NON_QUEUE_TABS, TRANSITIONAL_POLLED_TABS, COUNT_DRIVEN_TABS, PANEL_DRIVEN_TABS, SETTINGS_DRIVEN_TABS, NO_PLAN,
   isSelfRenderingTab, isQueueTab, planForEvent, mergePlans, isEmptyPlan, transitionalPollDue, startLiveUpdates,
 };
