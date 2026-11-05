@@ -593,6 +593,36 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   // (Files this task says to CREATE are left out here: "Create docs/x.md ... Then update src/y.js" must still read as asking for code.)
   const docOnlyTargets = declaredEditTargetsAllDocs(task, planText);
   if (nonDoc.length === 0 && !docOnlyTargets) {
+    // 2026-11-04 (TaxHarvest stall clearing): when the diff is docs-only, also check whether the task itself is plausibly a documentation task -- title/description mentions
+    // README / runbook / docs / documentation and the diff only touches those named docs, with NO imperative verb aimed at a code path AND no code file in any declared target.
+    // A task whose text is about updating documentation should not be rejected for producing exactly that. This sits BEFORE the legacy `taskWantsCodeFromText` check so a genuine
+    // docs task passes even when its description cites code paths as evidence (the very shape that stalls adhoc tasks).
+    const taskTitle = task.title || '';
+    const taskDesc = (task.promptContext && task.promptContext.rawText) || '';
+    const combinedTitleDesc = `${taskTitle}\n${taskDesc}`;
+    const mentionsDocs = /README|runbook|documentation|\bdocs?\b/i.test(combinedTitleDesc);
+    // Check if the diff only touches documentation files
+    const allFilesAreDocs = files.length > 0 && files.every((f) => isDocPath(f.path));
+    // Check for any code-related signal that would indicate this is a mixed task (code + docs)
+    // rather than a pure docs task:
+    // 1. A Files: line that includes a code path
+    // 2. An imperative verb aimed at a code path
+    // 3. A declared target that is a code file
+    // 4. A declared target that doesn't match the diff (task says create X, diff creates Y)
+    const hasCodeInFilesLine = extractDeclaredFiles(rawText) && extractDeclaredFiles(rawText).some((p) => !isDocPath(p));
+    const hasCodeImperative = scanForCodeSignals(rawText).tripping.some(opensWithImperative);
+    const allTargets = extractDeclaredTargets(task, planText, { includeCreated: true });
+    const hasCodeTarget = allTargets.length > 0 && allTargets.some((t) => !isDocPath(t));
+    // Check if the diff creates a different doc than declared
+    const declaredDocs = allTargets.filter((t) => isDocPath(t));
+    const hasMismatchedDoc = declaredDocs.length > 0 && !declaredDocs.some((d) => files.some((f) => pathsRefEqual(f.path, d)));
+    // If any code signal is present OR the diff doesn't match the declared docs, this is not a pure docs task
+    if (mentionsDocs && allFilesAreDocs && (hasCodeInFilesLine || hasCodeImperative || hasCodeTarget || hasMismatchedDoc)) {
+      // Fall through to the legacy check below
+    } else if (mentionsDocs && allFilesAreDocs) {
+      // Pure docs task: no code signals, diff matches declared docs -> pass
+      return null;
+    }
     if (taskWantsCodeFromText(rawText, combined) && !isCreatedDocDeliverable(task, planText, rawText, files)) {
       return {
         code: 'docs-only',
