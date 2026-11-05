@@ -28,6 +28,7 @@ def _providers():
             "pipeline-state-changed": (_pipeline_state, PIPELINE_STATE_INTERVAL_S),
             "brain-dump-changed": event_stream.dir_files_fact(lambda: [], _brain_dump_files),
             "hygiene-changed": event_stream.dir_files_fact(_hygiene_specs),
+            "task-records-changed": event_stream.dir_files_fact(_live_task_specs),
             "settings-changed": event_stream.dir_files_fact(lambda: [], _settings_files),
             "benchmark-changed": event_stream.dir_files_fact(_benchmark_specs, subdirs=True),
             "worker-panels-changed": event_stream.dir_files_fact(_panel_specs, _panel_files), "memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), re.sub(r"\d+", "#", str(d.get("reason") or ""))))}
@@ -93,6 +94,19 @@ def _brain_dump_files():
     Whoever writes an entry (the tab, the chat, a pipeline sweep, a hand edit) replaces or grows the file, so its stat key moves and the open tab is told."""
     from app import brain_dump_path
     return [brain_dump_path()]
+
+
+_TASK_JSON = re.compile(r"\.json$")
+LIVE_TASK_STATES = ("drafting", "review", "coordinating")     # the queue states whose records the pipeline rewrites while a task is mid-pass (task-detail-modal.js TASK_DETAIL_LIVE_STATES)
+
+
+def _live_task_specs():
+    """The in-flight task records of the ACTIVE project (resolved on every pass): every pass flushes a new Pipeline History checkpoint into the record in drafting/, review/ or
+    coordinating/, which moves its size and mtime, so the open task-detail modal is told instead of polling. A task that moves between states is counts-changed. These
+    directories hold only the handful of tasks being worked on, so the stat key is a few files."""
+    from app import queue_dir
+    q = queue_dir()
+    return [(os.path.join(str(q), state), _TASK_JSON) for state in LIVE_TASK_STATES] if q else []
 
 
 _HYGIENE_FLAGS = re.compile(r"-flags\.json$")
