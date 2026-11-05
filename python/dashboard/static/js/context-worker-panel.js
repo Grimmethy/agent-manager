@@ -1,7 +1,7 @@
-// Context-worker cards for the Workers tab (agent-manager-context-ops docs/context-workers-spec.md): the codebase-map worker and the memory-index worker. Like the branch verifier and the
+// Context-worker cards for the Workers tab (agent-manager-context-ops docs/context-workers-spec.md and docs/context-impact-spec.md): the codebase-map worker, the memory-index worker and the context-impact worker. Like the branch verifier and the
 // Needs-Work worker they are CLIs started by the watchdog trigger (no timer), not lanes: same layout as the Needs-Work card (id left; mode badge, trigger badge, "last tick" and the
 // Turn on/off button stacked right; one meta line; click the card to open the recent decisions). A plain global <script> of pure string builders (no DOM, no fetch, no require), loaded
-// by index.html after needswork-worker-panel.js; workers-tab.js appends renderContextWorkerSection(mapPayload, memoryPayload). Each payload is a GET /api/context-worker/<map|memory>
+// by index.html after needswork-worker-panel.js; workers-tab.js appends renderContextWorkerSection(mapPayload, memoryPayload, nowMs, impactPayload). Each payload is a GET /api/context-worker/<map|memory|impact>
 // body (routes/context_worker.py). A DRY-RUN decision is shown plainly as a dry-run twin that was NOT acted; a switched-off worker says "switched off", never an error.
 
 function contextWorkerEsc(value) {
@@ -36,11 +36,13 @@ function contextWorkerAgeSince(iso, nowMs) {
   return Number.isFinite(t) && Number.isFinite(nowMs) ? Math.max(0, Math.floor((nowMs - t) / 1000)) : null;
 }
 
-// The two workers: payload.name -> title, icon and what the Turn off button says it switches.
+// The three workers: payload.name -> title, icon and what the Turn off button says it switches.
 const contextWorkerInfo = {
   map: { title: 'Context map worker', icon: '🗺', what: 'the codebase-map worker' },
   memory: { title: 'Context memory worker', icon: '🧠', what: 'the memory-index worker' },
+  impact: { title: 'Context impact worker', icon: '📈', what: 'the context-impact worker' },
 };
+const contextWorkerKnown = (name) => Object.prototype.hasOwnProperty.call(contextWorkerInfo, name);
 
 function contextWorkerModeBadge(mode) {
   if (mode === 'on') return '<span class="badge ok" title="The worker acts for real: the map worker files one adhoc task per map, the memory worker writes a proposal file">live</span>';
@@ -84,7 +86,7 @@ function contextWorkerSwitchButton(name, sw) {
 }
 
 // Open/closed state of each card's recent-decisions section; a click on the card flips it and redraws.
-const contextWorkerExpanded = { map: false, memory: false };
+const contextWorkerExpanded = { map: false, memory: false, impact: false };
 
 // How many questions a collapsed card shows, and how long one may be before it is cut (the full text stays in the tooltip).
 const contextWorkerHoldLimit = 2;
@@ -113,6 +115,44 @@ function contextWorkerFindingsHtml(f) {
   const text = plural(f.rewriteRows, 'row to rewrite', 'rows to rewrite') + ', ' + plural(f.fixRanges, 'fix', 'fixes') + ', ' + plural(suggestions.anchors, 'suggestion', 'suggestions');
   const rows = Number(suggestions.rows) > 0 ? ' · ' + contextWorkerInt(suggestions.rows) + ' source files are not cited by the map' : '';
   return '<div class="meta" style="margin-top:2px" title="' + contextWorkerEsc('Findings ' + String(f.hash || '').slice(0, 12) + rows) + '">map: ' + contextWorkerEsc(text) + '</div>';
+}
+
+// The impact worker's own lines (payload.impact from routes/context_worker.py): what its newest decision found, the investigation tasks it has filed, the intervention ledger per kind and the
+// authority gate. Collapsed: two lines; open: the lists behind them. A missing section (its reader failed) draws nothing; fields that are not lists or numbers read as empty or zero.
+const contextWorkerImpactShown = 3;
+
+function contextWorkerImpactHtml(impact, open) {
+  if (!impact || typeof impact !== 'object') return '';
+  const list = (v) => (Array.isArray(v) ? v : []);
+  const names = (v) => list(v).filter((x) => typeof x === 'string');
+  const latest = impact.latest && typeof impact.latest === 'object' ? impact.latest : null;
+  const regressed = names(latest && latest.regressed);
+  const improved = names(latest && latest.improved);
+  const insufficient = names(latest && latest.insufficient);
+  const wouldFile = names(latest && latest.wouldFile);
+  const filedCount = Number(impact.filedCount) > 0 ? Math.floor(Number(impact.filedCount)) : 0;
+  const shown = (arr) => arr.slice(0, contextWorkerImpactShown).map((x) => contextWorkerEsc(contextWorkerCut(x, 48))).join(', ') + (arr.length > contextWorkerImpactShown ? ' +' + (arr.length - contextWorkerImpactShown) + ' more' : '');
+  const line = (text, tip) => '<div class="meta" style="margin-top:2px"' + (tip ? ' title="' + contextWorkerEsc(tip) + '"' : '') + '>' + text + '</div>';
+  const summary = latest
+    ? 'impact: ' + contextWorkerInt(regressed.length) + ' regressed, ' + contextWorkerInt(improved.length) + ' improved, ' + contextWorkerInt(insufficient.length) + ' channel' + (insufficient.length === 1 ? '' : 's') + ' short of data'
+    : 'impact: no decision yet';
+  const interventions = impact.interventions && typeof impact.interventions === 'object' ? impact.interventions : {};
+  const kindText = (kind) => {
+    const c = interventions[kind] && typeof interventions[kind] === 'object' ? interventions[kind] : {};
+    return kind + ' ' + contextWorkerInt(c.HELPED) + ' helped / ' + contextWorkerInt(c['NO-EFFECT']) + ' no effect / ' + contextWorkerInt(c.HARMED) + ' harmed / ' + contextWorkerInt(c.open) + ' waiting';
+  };
+  const gate = impact.gate && typeof impact.gate === 'object' ? impact.gate : {};
+  const gateText = 'authority gate ' + (gate.open === true ? 'OPEN' : 'closed') + ' (' + contextWorkerInt(gate.evaluated) + ' map edit' + (Number(gate.evaluated) === 1 ? '' : 's') + ' evaluated, ' + contextWorkerInt(gate.helped) + ' helped)';
+  let html = line(contextWorkerEsc(summary) + (regressed.length ? ' · ' + shown(regressed) : ''), regressed.join(', '))
+    + line(contextWorkerInt(filedCount) + ' investigation task' + (filedCount === 1 ? '' : 's') + ' filed · ' + contextWorkerEsc(gateText), 'The gate opens at 3 evaluated map edits with more than half helped: only then may a change of the default grounding source be proposed.');
+  if (!open) return html;
+  if (improved.length) html += line('improved: ' + shown(improved));
+  if (insufficient.length) html += line('not enough data: ' + shown(insufficient), insufficient.join(', '));
+  if (wouldFile.length) html += line('dry run: would file ' + contextWorkerInt(wouldFile.length) + ' investigation task' + (wouldFile.length === 1 ? '' : 's') + ': ' + shown(wouldFile), wouldFile.join(', '));
+  const filed = list(impact.filed).filter((f) => f && typeof f === 'object' && typeof f.taskId === 'string');
+  if (filed.length) html += line('filed: ' + filed.slice(-contextWorkerImpactShown).map((f) => contextWorkerEsc(contextWorkerCut(f.taskId, 40))).join(', ') + (filed.length > contextWorkerImpactShown ? ' (newest ' + contextWorkerImpactShown + ' of ' + contextWorkerInt(filedCount) + ')' : ''), filed.map((f) => f.taskId).join(', '));
+  html += line(contextWorkerEsc(kindText('map-edit'))) + line(contextWorkerEsc(kindText('memory-edit')));
+  return html;
 }
 
 // "last decision: FILE-TASK (DRY RUN, not acted) 12m ago: 14 findings (0 fix, 14 rewrite)".
@@ -156,7 +196,7 @@ function contextWorkerRecentHtml(recent) {
 // One card. `p` is the payload; `nowMs` (default Date.now()) only dates the last decision.
 function buildContextWorkerHtml(p, nowMs) {
   if (!p || !p.configured) return '';
-  const name = p.name === 'memory' ? 'memory' : 'map';
+  const name = contextWorkerKnown(p.name) ? p.name : 'map';
   const info = contextWorkerInfo[name];
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
   const off = !!(p.switch && p.switch.disabled === true);
@@ -173,12 +213,13 @@ function buildContextWorkerHtml(p, nowMs) {
   const detail = open ? '<div class="worker-recent-tasks"><div class="meta" style="margin-top:8px"><strong>Today</strong> ' + contextWorkerTodayText(p) + '</div>'
     + contextWorkerRecentHtml(p.recent) + '</div>' : '';
   return '<div id="context-' + name + '-worker-panel" class="worker-card clickable' + (off ? ' worker-off' : '') + '" data-context-expand="' + name + '" aria-expanded="' + open + '">'
-    + head + meta + contextWorkerLastDecisionHtml(p, now) + contextWorkerFindingsHtml(p.findings) + contextWorkerErrorHtml(p.errors) + holds + toggle + detail + '</div>';
+    + head + meta + contextWorkerLastDecisionHtml(p, now) + contextWorkerFindingsHtml(p.findings) + (name === 'impact' ? contextWorkerImpactHtml(p.impact, open) : '') + contextWorkerErrorHtml(p.errors) + holds + toggle + detail + '</div>';
 }
 
-// What renderWorkers() appends: the map card then the memory card, each nothing at all unless that worker has left a trace (ledger, trigger state or a switched-off marker).
-function renderContextWorkerSection(mapPayload, memoryPayload, nowMs) {
-  return buildContextWorkerHtml(mapPayload, nowMs) + buildContextWorkerHtml(memoryPayload, nowMs);
+// What renderWorkers() appends: the map card, the memory card, then the impact card, each nothing at all unless that worker has left a trace (ledger, trigger state or a switched-off marker).
+// `nowMs` only dates the last decision; the fourth argument is optional so a caller that knows two workers still works.
+function renderContextWorkerSection(mapPayload, memoryPayload, nowMs, impactPayload) {
+  return buildContextWorkerHtml(mapPayload, nowMs) + buildContextWorkerHtml(memoryPayload, nowMs) + buildContextWorkerHtml(impactPayload, nowMs);
 }
 
 // POST the switch, then redraw the Workers tab. Returns true on success.

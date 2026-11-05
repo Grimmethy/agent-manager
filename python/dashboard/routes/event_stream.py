@@ -1,6 +1,7 @@
 """GET /api/stream -- the dashboard's server-sent-event channel (event_stream.py). The page listens to it (static/js/live-updates.js); the pieces of 'UI triggers, not polls' that built it are listed in docs/adr/0024-triggers-not-polls.md."""
 import os
 import re
+import urllib.request
 
 from flask import Blueprint, Response, jsonify, request, stream_with_context
 
@@ -19,7 +20,12 @@ def _providers():
     """Facts the hub cannot derive from the queue directories. memory-changed: the host-memory chip's state and reason, from the gpu-broker's marker file."""
     import memory_status
     # The marker's reason carries live numbers ("memory stall 11.64%"): announce a change of the STATE or of the reason's wording, never of a number inside it.
-    return {"settings-changed": event_stream.dir_files_fact(lambda: [], _settings_files),
+    return {"hardware-changed": (_http(_hardware_url), HARDWARE_INTERVAL_S),
+            "tokenfold-changed": (_http(_tokenfold_url), TOKENFOLD_INTERVAL_S),
+            "reports-changed": event_stream.dir_files_fact(_reports_specs),
+            "discovery-changed": event_stream.dir_files_fact(lambda: [], _discovery_files),
+            "plugin-states-changed": (_plugin_states, PLUGIN_STATES_INTERVAL_S),
+            "settings-changed": event_stream.dir_files_fact(lambda: [], _settings_files),
             "benchmark-changed": event_stream.dir_files_fact(_benchmark_specs, subdirs=True),
             "worker-panels-changed": event_stream.dir_files_fact(_panel_specs, _panel_files), "memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), re.sub(r"\d+", "#", str(d.get("reason") or ""))))}
 
@@ -46,6 +52,96 @@ def _settings_files():
     from app import SRC_DIR, read_env_file
     registry = {**os.environ, **read_env_file(ENV_FILE_PATH)}.get("AGENT_MANAGER_LANES_PATH") or str(SRC_DIR.parent / "lanes.json")
     return [ENV_FILE_PATH, DASHBOARD_SETTINGS_PATH, registry]
+
+
+# Sampled sources: the hardware plugin's stats and the TokenFold proxy's stats are live numbers behind HTTP, with no file to watch. ONE shared sampler asks them (the hub's single clock, only while a page
+# is connected) every few seconds and announces a change only when a number moved by a visible amount (event_stream.coarse: two significant figures); a service that goes away or comes back is a change too.
+HARDWARE_INTERVAL_S = 5.0
+PLUGIN_STATES_INTERVAL_S = 5.0            # one shared sampler pass over the plugin pid files; the Plugins tab never samples
+TOKENFOLD_INTERVAL_S = 10.0
+
+
+def _hardware_url():
+    from routes.hardware import _active_hardware_plugin
+    active = _active_hardware_plugin()
+    return "%s/api/hardware/stats" % active["url"] if active and active.get("url") else None
+
+
+def _tokenfold_url():
+    return "http://localhost:%s/tokenfold/stats" % os.environ.get("TOKENFOLD_PORT", "9339")
+
+
+def _http(url_fn):
+    # the opener is looked up at call time so a test can replace urllib.request.urlopen
+    return event_stream.http_json_fact(url_fn, opener=lambda *a, **k: urllib.request.urlopen(*a, **k))
+
+
+def _reports_specs():
+    """The Markdown reports the Reports tab lists: <Second Brain>/Agent Manager Reports/<period>/<file>.md for every period."""
+    from app import _REPORT_PERIODS
+    from routes.reports import _reports_root
+    root = _reports_root()
+    return [(str(root / period), re.compile(r"\.md$")) for period in _REPORT_PERIODS] if root else []
+
+
+def _mtime_ns(path):
+    try:
+        return os.stat(path).st_mtime_ns
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _head_log_path(cwd):
+    """`logs/HEAD` of the git directory that governs `cwd` (git's own upward search: the nearest ancestor holding `.git`, a directory or a worktree's `gitdir:` file), or None.
+    Pure file reads: the reflog is appended on every commit, pull, merge and checkout, so its mtime is the cheap signal that "HEAD moved"."""
+    path = os.path.abspath(cwd)
+    while True:
+        dot_git = os.path.join(path, ".git")
+        if os.path.isdir(dot_git):
+            return os.path.join(dot_git, "logs", "HEAD")
+        if os.path.isfile(dot_git):
+            try:
+                with open(dot_git, encoding="utf-8") as f:
+                    line = f.readline().strip()
+            except OSError:
+                return None
+            if line.startswith("gitdir:"):
+                return os.path.join(os.path.normpath(os.path.join(path, line[len("gitdir:"):].strip())), "logs", "HEAD")
+            return None
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+
+
+def _plugin_states(full=False):
+    """What the Plugins tab shows beyond plugins.json, as a value that changes exactly when the tab would look different: for every plugin that owns a process
+    (a slot or a processName) whether it is running, when its pid file was written (a restart) and when its checkout last moved (`.git/logs/HEAD` of the directory behind_checkout runs git in: a commit, pull or
+    checkout, which is what flips "restart needed"). Stat calls only: no git process is spawned on the sampler's clock. Never raises: an unreadable manifest is ()."""
+    import plugin_process_manager as ppm
+    from app import _read_plugins_manifest
+    try:
+        manifest = _read_plugins_manifest()
+    except Exception:
+        return ()
+    rows = []
+    for entry in manifest if isinstance(manifest, list) else []:
+        if not isinstance(entry, dict) or not (entry.get("slot") or entry.get("processName")):
+            continue
+        key = ppm.process_key(entry)
+        cwd = entry.get("cwd") or os.getcwd()                     # the same directory plugin_process_manager.behind_checkout runs git in
+        head = _head_log_path(cwd) if isinstance(cwd, str) else None
+        rows.append([str(entry.get("name") or key), bool(ppm.is_running(key)), _mtime_ns(ppm._pidfile(key)), _mtime_ns(head)])
+    return tuple(sorted(rows, key=lambda r: r[0]))
+
+
+def _discovery_files():
+    """The files the Deep Dive and Discovery tabs read, for the ACTIVE project (resolved on every pass): the project-search index (the scouted leads), the deep-dive coverage file, the arch-discovery community
+    coverage file and the architecture review candidates document. A path that does not exist (or no active project) simply contributes nothing. The arch-discovery TASKS the Discovery tab lists live in the
+    queue, which counts-changed already announces."""
+    from app import arch_candidates_path, community_coverage_path, project_search_index_path
+    from routes.deep_dive import deep_dive_coverage_path
+    return [project_search_index_path(), deep_dive_coverage_path(), community_coverage_path(), arch_candidates_path()]
 
 
 def _benchmark_specs():

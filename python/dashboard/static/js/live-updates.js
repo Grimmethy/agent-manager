@@ -8,10 +8,14 @@
 //   workers-changed   a worker's status / pass / task changed           -> redraw the Workers tab
 //   branches-changed  a verdict was recorded or a branch merged          -> refresh the Branches tab
 //   plugins-changed   plugins.json changed                               -> re-sync the plugin tabs, redraw the Plugins tab
+//   plugin-states-changed  a plugin process started, stopped or restarted, or its checkout moved (the "restart needed" flag) -> redraw the Plugins tab
 //   memory-changed    the host-memory chip's state or reason changed     -> refresh /api/summary (the chip)
 //   worker-panels-changed  a ledger, index, on/off marker, the cloud spend ledger or the model-stats database a Workers-tab panel reads changed -> redraw the Workers and Job List tabs
 //   settings-changed  agent-manager.env, dashboard-settings.json or the lanes registry changed (the Job List's allowlist, priorities, approval modes; the Models tab's lane models) -> redraw the Job List and Models tabs
 //   benchmark-changed  a benchmark run directory or the current-run pointer changed -> redraw the Models tab
+//   hardware-changed / tokenfold-changed  the server's shared sampler saw a visible change in the hardware plugin's or the TokenFold proxy's stats (or the service went away or came back) -> redraw the Hardware / TokenFold and Reports tabs
+//   reports-changed   a Markdown report file appeared or changed -> redraw the Reports tab
+//   discovery-changed the project-search index, the deep-dive or community coverage file or the architecture candidates document changed -> redraw the Deep Dive and Discovery tabs
 //   project-changed / snapshot   the pipeline changed, or this page just (re)connected -> refresh everything
 //
 // TRANSITIONAL: a tab whose data has no event yet keeps a redraw timer WHILE IT IS THE ACTIVE TAB (TRANSITIONAL_POLLED_TABS and every plugin-owned tab). The list is the
@@ -19,21 +23,25 @@
 // If the stream is unavailable (the server answers 404, EventSource gives up) the page falls back to the old 5 s full refresh until it is reloaded.
 
 const LIVE_STREAM_URL = '/api/stream';
-const LIVE_EVENTS = ['snapshot', 'counts-changed', 'workers-changed', 'branches-changed', 'plugins-changed', 'memory-changed', 'worker-panels-changed', 'settings-changed', 'benchmark-changed', 'project-changed'];
+const LIVE_EVENTS = ['snapshot', 'counts-changed', 'workers-changed', 'branches-changed', 'plugins-changed', 'plugin-states-changed', 'memory-changed', 'worker-panels-changed', 'settings-changed', 'benchmark-changed', 'hardware-changed', 'tokenfold-changed', 'reports-changed', 'discovery-changed', 'project-changed'];
 const TRANSITIONAL_POLL_MS = 5000;
 // Tabs that manage their own rendering and are never redrawn by a refresh (they keep a half-typed note, an iframe, an open folder, a click in flight).
 const SELF_RENDERING_TABS = ['project', 'brain-dump', 'filed', 'hygiene', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'];
 // Every tab with its own renderer; anything else is a plain queue-state tab (renderQueueTab), whose content is exactly what counts-changed announces.
 const NON_QUEUE_TABS = ['workers', 'hardware', 'models', 'joblist', 'plugins', 'deepdive', 'discovery', 'branches', 'reports', 'tokenfold', 'promptforge', 'adforge',
   'scriptforge', 'adhoc', 'concepts', 'filed', 'hygiene', 'project', 'brain-dump'];
-const TRANSITIONAL_POLLED_TABS = ['hardware', 'plugins', 'deepdive', 'discovery', 'reports', 'tokenfold'];
+const TRANSITIONAL_POLLED_TABS = [];
 
 // Tabs that show data derived from what each event announces, beyond the queue-state tabs: the completed-task and queue-record lists (counts-changed), the workers' ledgers, indexes and the
 // model-stats database (worker-panels-changed: the Job List's performed counters and turn statistics), and the settings files (settings-changed: the Job List's allowlist and priorities).
-const COUNT_DRIVEN_TABS = ['workers', 'adhoc', 'joblist'];
+const COUNT_DRIVEN_TABS = ['workers', 'adhoc', 'joblist', 'discovery'];
 const PANEL_DRIVEN_TABS = ['workers', 'joblist', 'models'];          // the Models tab's statistics, usage and capability come from the model-stats database
 const SETTINGS_DRIVEN_TABS = ['joblist', 'models'];                   // and the models each lane runs from the env file and the lanes registry
 const BENCHMARK_DRIVEN_TABS = ['models'];                             // and the benchmark runs from the benchmark state directory
+const HARDWARE_DRIVEN_TABS = ['hardware'];                            // hardware-changed: the hardware plugin's stats, sampled by the server (a change of two significant figures)
+const TOKENFOLD_DRIVEN_TABS = ['tokenfold', 'reports'];               // tokenfold-changed: the TokenFold proxy's stats, sampled the same way
+const REPORTS_DRIVEN_TABS = ['reports'];                              // reports-changed: a Markdown report file appeared or changed
+const DISCOVERY_DRIVEN_TABS = ['deepdive', 'discovery'];              // discovery-changed: the project-search index, the deep-dive and community coverage files or the architecture candidates document changed
 
 const NO_PLAN = Object.freeze({ summary: false, plugins: false, nav: false, main: false, branches: false });
 
@@ -64,6 +72,9 @@ function planForEvent(name, tab, isPluginTab) {
       plan.plugins = plan.nav = true;
       plan.main = tab === 'plugins';
       break;
+    case 'plugin-states-changed':
+      plan.main = tab === 'plugins';
+      break;
     case 'workers-changed':
       plan.main = tab === 'workers';
       break;
@@ -75,6 +86,18 @@ function planForEvent(name, tab, isPluginTab) {
       break;
     case 'benchmark-changed':
       plan.main = BENCHMARK_DRIVEN_TABS.includes(tab);
+      break;
+    case 'hardware-changed':
+      plan.main = HARDWARE_DRIVEN_TABS.includes(tab);
+      break;
+    case 'tokenfold-changed':
+      plan.main = TOKENFOLD_DRIVEN_TABS.includes(tab);
+      break;
+    case 'reports-changed':
+      plan.main = REPORTS_DRIVEN_TABS.includes(tab);
+      break;
+    case 'discovery-changed':
+      plan.main = DISCOVERY_DRIVEN_TABS.includes(tab);
       break;
     case 'branches-changed':
       plan.branches = tab === 'branches';
@@ -173,6 +196,6 @@ function startLiveUpdates(deps) {
 }
 
 if (typeof module !== 'undefined') module.exports = {
-  LIVE_STREAM_URL, LIVE_EVENTS, TRANSITIONAL_POLL_MS, SELF_RENDERING_TABS, NON_QUEUE_TABS, TRANSITIONAL_POLLED_TABS, COUNT_DRIVEN_TABS, PANEL_DRIVEN_TABS, SETTINGS_DRIVEN_TABS, BENCHMARK_DRIVEN_TABS, NO_PLAN,
+  LIVE_STREAM_URL, LIVE_EVENTS, TRANSITIONAL_POLL_MS, SELF_RENDERING_TABS, NON_QUEUE_TABS, TRANSITIONAL_POLLED_TABS, COUNT_DRIVEN_TABS, PANEL_DRIVEN_TABS, SETTINGS_DRIVEN_TABS, BENCHMARK_DRIVEN_TABS, HARDWARE_DRIVEN_TABS, TOKENFOLD_DRIVEN_TABS, REPORTS_DRIVEN_TABS, DISCOVERY_DRIVEN_TABS, NO_PLAN,
   isSelfRenderingTab, isQueueTab, planForEvent, mergePlans, isEmptyPlan, transitionalPollDue, startLiveUpdates,
 };

@@ -301,7 +301,8 @@ test('the wiring helpers exist as plain globals and the scripts are loaded by in
   const tab = fs.readFileSync(path.join(__dirname, 'workers-tab.js'), 'utf8');
   assert.match(tab, /fetchJson\('\/api\/context-worker\/map'\)\.catch\(\(\) => null\)/);
   assert.match(tab, /fetchJson\('\/api\/context-worker\/memory'\)\.catch\(\(\) => null\)/);
-  assert.match(tab, /renderContextWorkerSection\(contextMapWorker, contextMemoryWorker\)/);
+  assert.match(tab, /fetchJson\('\/api\/context-worker\/impact'\)\.catch\(\(\) => null\)/);
+  assert.match(tab, /renderContextWorkerSection\(contextMapWorker, contextMemoryWorker, Date\.now\(\), contextImpactWorker\)/);
   assert.match(tab, /wireContextWorkerSwitch\(main\)/);
   assert.match(tab, /wireContextWorkerExpand\(main, renderWorkers\)/);
 });
@@ -362,10 +363,151 @@ test('wireContextWorkerExpand: a click flips only that card and redraws; a secon
   ctx.root = fakeRoot('[data-context-expand]', [mapCard, memCard]); ctx.redraw = () => { redraws += 1; };
   vm.runInContext('wireContextWorkerExpand(root, redraw)', ctx);
   mapCard.onclick();
-  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(contextWorkerExpanded)', ctx)), { map: true, memory: false });
+  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(contextWorkerExpanded)', ctx)), { map: true, memory: false, impact: false });
   mapCard.onclick();
-  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(contextWorkerExpanded)', ctx)), { map: false, memory: false });
+  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(contextWorkerExpanded)', ctx)), { map: false, memory: false, impact: false });
   memCard.onclick();
-  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(contextWorkerExpanded)', ctx)), { map: false, memory: true });
+  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(contextWorkerExpanded)', ctx)), { map: false, memory: true, impact: false });
   assert.equal(redraws, 3);
+});
+
+const impPayload = (over = {}) => ({
+  ...mapPayload(), name: 'impact', worker: 'context-impact', findings: null, lastDecision: { at: '2026-11-04T11:50:00Z', outcome: 'REGRESSED', mode: 'dry-run', executed: false, summary: '1 regressed' },
+  impact: {
+    latest: { at: '2026-11-04T11:50:00Z', regressed: ['pipeline.firstPassApproval'], improved: ['map.staleCitations'], insufficient: ['state.friction', 'pipeline.redrafts'], wouldFile: ['pipeline.firstPassApproval'] },
+    filedCount: 4, filed: [{ taskId: 't-1' }, { taskId: 't-2' }, { taskId: 't-3' }, { taskId: 't-4' }],
+    interventions: { 'map-edit': { HELPED: 2, 'NO-EFFECT': 1, HARMED: 0, open: 1 }, 'memory-edit': { HELPED: 0, 'NO-EFFECT': 0, HARMED: 1, open: 0 } },
+    gate: { open: false, evaluated: 3, helped: 2 },
+  }, ...over,
+});
+
+test('the impact card: own id, title and icon, third in the section, and the section still works with three arguments', () => {
+  const h = build(impPayload());
+  assert.match(h, /^<div id="context-impact-worker-panel" class="worker-card clickable" data-context-expand="impact" aria-expanded="false">/);
+  assert.match(h, /📈 Context impact worker/);
+  const s = call('renderContextWorkerSection', mapPayload(), memPayload(), NOW, impPayload());
+  assert.ok(s.indexOf('context-map-worker-panel') < s.indexOf('context-memory-worker-panel') && s.indexOf('context-memory-worker-panel') < s.indexOf('context-impact-worker-panel'));
+  assert.equal(section(mapPayload(), memPayload()), build(mapPayload()) + build(memPayload()));
+  assert.equal(call('renderContextWorkerSection', { configured: false }, { configured: false }, NOW, { configured: false }), '');
+  assert.match(visible(build(impPayload({ switch: { disabled: false } }))), /Turn off/);
+});
+
+test('the impact card collapsed shows counts, filed count and the closed gate; no list lines', () => {
+  const t = visible(build(impPayload()));
+  assert.match(t, /impact: 1 regressed, 1 improved, 2 channels short of data · pipeline\.firstPassApproval/);
+  assert.match(t, /4 investigation tasks filed · authority gate closed \(3 map edits evaluated, 2 helped\)/);
+  assert.doesNotMatch(t, /dry run: would file|not enough data|filed: |map-edit 2 helped/);
+  assert.match(visible(build(impPayload({ impact: { ...impPayload().impact, gate: { open: true, evaluated: 1, helped: 1 }, filedCount: 1 } }))), /1 investigation task filed · authority gate OPEN \(1 map edit evaluated, 1 helped\)/);
+});
+
+test('the impact card opened lists improved, thin channels, would-file, newest filed ids and both intervention kinds', () => {
+  const t = visible(buildOpen(impPayload()));
+  assert.match(t, /improved: map\.staleCitations/);
+  assert.match(t, /not enough data: state\.friction, pipeline\.redrafts/);
+  assert.match(t, /dry run: would file 1 investigation task: pipeline\.firstPassApproval/);
+  assert.match(t, /filed: t-2, t-3, t-4 \(newest 3 of 4\)/);
+  assert.doesNotMatch(t, /filed: t-1/);
+  assert.match(t, /map-edit 2 helped \/ 1 no effect \/ 0 harmed \/ 1 waiting/);
+  assert.match(t, /memory-edit 0 helped \/ 0 no effect \/ 1 harmed \/ 0 waiting/);
+});
+
+test('the impact section is missing, empty or malformed: nothing breaks and nothing invented is drawn', () => {
+  for (const imp of [undefined, null, 'x', 7]) assert.doesNotMatch(visible(build(impPayload({ impact: imp }))), /impact: |authority gate/);
+  const t = visible(buildOpen(impPayload({ impact: { latest: null, filedCount: 'many', filed: 'no', interventions: null, gate: null } })));
+  assert.match(t, /impact: no decision yet/);
+  assert.match(t, /0 investigation tasks filed · authority gate closed \(0 map edits evaluated, 0 helped\)/);
+  assert.match(t, /map-edit 0 helped \/ 0 no effect \/ 0 harmed \/ 0 waiting/);
+  assert.doesNotMatch(t, /undefined|NaN|\[object/);
+});
+
+test('impact text from the payload is escaped, and the map and memory cards never show impact lines', () => {
+  const h = buildOpen(impPayload({ impact: { ...impPayload().impact, latest: { regressed: ['<img src=x onerror=1>'], improved: ['<b>'], insufficient: [], wouldFile: [] }, filed: [{ taskId: '<script>' }] } }));
+  assert.doesNotMatch(h, /<img|<script>|<b>/);
+  assert.match(h, /&lt;img/);
+  assert.doesNotMatch(visible(build(mapPayload({ impact: impPayload().impact }))), /authority gate/);
+  assert.doesNotMatch(visible(build(memPayload({ impact: impPayload().impact }))), /authority gate/);
+});
+
+test('the impact lists show at most three names and say how many more; exactly three show no suffix', () => {
+  const five = ['a1', 'a2', 'a3', 'a4', 'a5'];
+  const t = visible(buildOpen(impPayload({ impact: { ...impPayload().impact, latest: { regressed: five, improved: five, insufficient: five, wouldFile: five } } })));
+  assert.match(t, /impact: 5 regressed, 5 improved, 5 channels short of data · a1, a2, a3 \+2 more/);
+  assert.match(t, /improved: a1, a2, a3 \+2 more/);
+  assert.match(t, /not enough data: a1, a2, a3 \+2 more/);
+  assert.match(t, /would file 5 investigation tasks: a1, a2, a3 \+2 more/);
+  const three = ['a1', 'a2', 'a3'];
+  const u = visible(buildOpen(impPayload({ impact: { ...impPayload().impact, latest: { regressed: three, improved: three, insufficient: three, wouldFile: three } } })));
+  assert.match(u, /a1, a2, a3/);
+  assert.doesNotMatch(u, /more/);
+});
+
+test('the impact card keeps each verdict count apart, rounds a fractional filed count down and cuts a very long name', () => {
+  const t = visible(buildOpen(impPayload({ impact: { ...impPayload().impact, filedCount: 2.7, interventions: { 'map-edit': { HELPED: 5, 'NO-EFFECT': 6, HARMED: 7, open: 8 }, 'memory-edit': {} } } })));
+  assert.match(t, /map-edit 5 helped \/ 6 no effect \/ 7 harmed \/ 8 waiting/);
+  assert.match(t, /^.*\b2 investigation tasks filed/);
+  const long = 'x'.repeat(100);
+  const u = visible(buildOpen(impPayload({ impact: { ...impPayload().impact, latest: { regressed: [long], improved: [], insufficient: [], wouldFile: [] }, filed: [{ taskId: long }] } })));
+  assert.doesNotMatch(u, /x{60}/);
+  assert.match(u, /x{10}/);
+});
+
+test('an unknown payload name falls back to the map card instead of throwing', () => {
+  const h = build({ ...mapPayload(), name: 'nope' });
+  assert.match(h, /id="context-map-worker-panel"/);
+  assert.match(h, /🗺 Context map worker/);
+  assert.doesNotMatch(build({ ...mapPayload(), name: 'constructor' }), /undefined/);
+});
+
+test('malformed impact fields are ignored: non-object latest, gate and intervention kinds, non-string names, odd filed entries', () => {
+  const base = impPayload().impact;
+  const t1 = visible(buildOpen(impPayload({ impact: { ...base, latest: 'x', gate: 'x', interventions: { 'map-edit': 'x', 'memory-edit': 7 }, filed: [], filedCount: 0 } })));
+  assert.match(t1, /impact: no decision yet/);
+  assert.match(t1, /authority gate closed \(0 map edits evaluated, 0 helped\)/);
+  assert.match(t1, /map-edit 0 helped \/ 0 no effect \/ 0 harmed \/ 0 waiting/);
+  assert.match(t1, /memory-edit 0 helped \/ 0 no effect \/ 0 harmed \/ 0 waiting/);
+  const t2 = visible(buildOpen(impPayload({ impact: { ...base, gate: { open: 'true', evaluated: 3, helped: 2 }, latest: { regressed: [1, null, {}, 'ok'], improved: [], insufficient: [], wouldFile: [] } } })));
+  assert.match(t2, /impact: 1 regressed, 0 improved, 0 channels short of data · ok/);
+  assert.match(t2, /authority gate closed/);
+  const t3 = visible(buildOpen(impPayload({ impact: { ...base, filed: [null, 5, {}, { taskId: 7 }, { taskId: 'good-1' }], filedCount: 5 } })));
+  assert.match(t3, /filed: good-1 \(newest 3 of 5\)|filed: good-1/);
+  assert.doesNotMatch(t3, /filed: [^·]*(\b7\b|null|\[object)/);
+  assert.doesNotMatch(t3, /undefined|NaN|\[object/);
+});
+
+test('empty lists draw no names suffix and no list lines, even opened', () => {
+  const none = { latest: { regressed: [], improved: [], insufficient: [], wouldFile: [] }, filedCount: 0, filed: [], interventions: {}, gate: { open: false, evaluated: 0, helped: 0 } };
+  const t = visible(buildOpen(impPayload({ impact: none })));
+  assert.match(t, /impact: 0 regressed, 0 improved, 0 channels short of data 0 investigation tasks filed/);
+  assert.doesNotMatch(t, / · \S+ 0 investigation/);
+  assert.doesNotMatch(t, /improved: |not enough data: |would file|filed: /);
+});
+
+test('singular wording: one thin channel, one would-file task, one filed task, one evaluated edit', () => {
+  const one = { latest: { regressed: [], improved: [], insufficient: ['c'], wouldFile: ['w'] }, filedCount: 1, filed: [{ taskId: 'only' }], interventions: {}, gate: { open: false, evaluated: 1, helped: 0 } };
+  const t = visible(buildOpen(impPayload({ impact: one })));
+  assert.match(t, /1 channel short of data/);
+  assert.match(t, /would file 1 investigation task: w/);
+  assert.match(t, /1 investigation task filed/);
+  assert.match(t, /filed: only(?! \()/);
+  assert.match(t, /\(1 map edit evaluated/);
+});
+
+test('impact edge cases: a null intervention kind, exactly three filed ids, tooltips only where there is a tip, cut limits are exact', () => {
+  const base = impPayload().impact;
+  assert.doesNotThrow(() => buildOpen(impPayload({ impact: { ...base, interventions: { 'map-edit': null, 'memory-edit': null } } })));
+  const three = visible(buildOpen(impPayload({ impact: { ...base, filedCount: 3, filed: [{ taskId: 'f1' }, { taskId: 'f2' }, { taskId: 'f3' }] } })));
+  assert.match(three, /filed: f1, f2, f3(?! \()/);
+  const raw = buildOpen(impPayload());
+  assert.match(raw, /title="pipeline\.firstPassApproval"/);
+  assert.doesNotMatch(raw, /title=""|title="undefined"/);
+  const impOf = (n) => ({ ...base, latest: { regressed: ['y'.repeat(n)], improved: [], insufficient: [], wouldFile: [] }, filed: [{ taskId: 'z'.repeat(n) }] });
+  const at48 = visible(buildOpen(impPayload({ impact: impOf(48) })));
+  assert.match(at48, /y{48}/);
+  assert.doesNotMatch(visible(buildOpen(impPayload({ impact: impOf(49) }))), /y{49}/);
+  assert.match(visible(buildOpen(impPayload({ impact: impOf(40) }))), /z{40}/);
+  assert.doesNotMatch(visible(buildOpen(impPayload({ impact: impOf(41) }))), /z{41}/);
+});
+
+test('a negative filed count reads as zero', () => {
+  assert.match(visible(build(impPayload({ impact: { ...impPayload().impact, filedCount: -3 } }))), /0 investigation tasks filed/);
 });
