@@ -63,12 +63,26 @@ test('plugins-changed re-syncs the plugin tabs and redraws only the Plugins tab'
   assert.deepEqual(lu.planForEvent('plugins-changed', 'plugins'), plan({ plugins: true, nav: true, main: true }));
 });
 
-test('workers-changed and worker-panels-changed redraw only the Workers tab', () => {
-  for (const name of ['workers-changed', 'worker-panels-changed']) {
-    assert.deepEqual(lu.planForEvent(name, 'workers'), plan({ main: true }), name);
-    assert.deepEqual(lu.planForEvent(name, 'pending'), lu.NO_PLAN, name);
-    assert.deepEqual(lu.planForEvent(name, 'hardware'), lu.NO_PLAN, name);
-  }
+test('workers-changed redraws only the Workers tab', () => {
+  assert.deepEqual(lu.planForEvent('workers-changed', 'workers'), plan({ main: true }));
+  for (const tab of ['pending', 'hardware', 'joblist', 'adhoc']) assert.deepEqual(lu.planForEvent('workers-changed', tab), lu.NO_PLAN, tab);
+});
+
+test('worker-panels-changed redraws the Workers and Job List tabs only', () => {
+  for (const tab of ['workers', 'joblist']) assert.deepEqual(lu.planForEvent('worker-panels-changed', tab), plan({ main: true }), tab);
+  for (const tab of ['pending', 'hardware', 'adhoc', 'models']) assert.deepEqual(lu.planForEvent('worker-panels-changed', tab), lu.NO_PLAN, tab);
+});
+
+test('settings-changed redraws only the Job List tab', () => {
+  assert.deepEqual(lu.planForEvent('settings-changed', 'joblist'), plan({ main: true }));
+  for (const tab of ['pending', 'workers', 'adhoc', 'hardware']) assert.deepEqual(lu.planForEvent('settings-changed', tab), lu.NO_PLAN, tab);
+});
+
+test('counts-changed also redraws the Workers, Adhoc and Job List tabs', () => {
+  for (const tab of ['workers', 'adhoc', 'joblist']) assert.deepEqual(lu.planForEvent('counts-changed', tab), plan({ summary: true, nav: true, main: true }), tab);
+  assert.deepEqual([...lu.COUNT_DRIVEN_TABS], ['workers', 'adhoc', 'joblist']);
+  assert.deepEqual([...lu.PANEL_DRIVEN_TABS], ['workers', 'joblist']);
+  assert.deepEqual([...lu.SETTINGS_DRIVEN_TABS], ['joblist']);
 });
 
 test('branches-changed refreshes only the Branches tab', () => {
@@ -108,15 +122,16 @@ test('a plugin that replaces a self-rendering tab (an iframe) is never put on th
 });
 
 test('the transitional list is exactly the tabs that have no events yet', () => {
-  assert.deepEqual(lu.TRANSITIONAL_POLLED_TABS, ['hardware', 'models', 'joblist', 'plugins', 'deepdive', 'discovery', 'reports', 'tokenfold', 'adhoc']);
+  assert.deepEqual(lu.TRANSITIONAL_POLLED_TABS, ['hardware', 'models', 'plugins', 'deepdive', 'discovery', 'reports', 'tokenfold']);
   for (const t of lu.TRANSITIONAL_POLLED_TABS) assert.equal(lu.transitionalPollDue(t), true, t);
   for (const t of ['pending', 'blocked', 'done']) assert.equal(lu.transitionalPollDue(t), false, t);
   for (const t of lu.SELF_RENDERING_TABS) assert.equal(lu.transitionalPollDue(t), false, t);
   assert.equal(lu.transitionalPollDue('myplugin', (x) => x === 'myplugin'), true);
 });
 
-test('the Workers tab no longer needs the redraw timer: it has events', () => {
-  assert.equal(lu.transitionalPollDue('workers'), false);
+test('the Workers, Adhoc and Job List tabs no longer need the redraw timer: they have events', () => {
+  for (const tab of ['workers', 'adhoc', 'joblist']) assert.equal(lu.transitionalPollDue(tab), false, tab);
+  assert.ok(lu.LIVE_EVENTS.includes('settings-changed'));
   assert.ok(lu.LIVE_EVENTS.includes('worker-panels-changed'));
 });
 

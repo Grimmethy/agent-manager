@@ -616,6 +616,21 @@ class Route(Base):
             Path(ops, "needswork-drain.log").write_text("idle")
             self.assertEqual(sorted(os.path.basename(t[0]) for t in fact()), names)
 
+    def test_the_route_registers_a_settings_provider_over_the_env_file_and_the_dashboard_settings(self):
+        env_file = Path(self.pipe) / "agent-manager.env"
+        settings = Path(self.pipe) / "dashboard-settings.json"
+        with mock.patch.object(app, "ENV_FILE_PATH", env_file), mock.patch("app_settings_helpers.DASHBOARD_SETTINGS_PATH", settings):
+            fact = route._providers()["settings-changed"]
+            self.assertEqual(fact(), ())
+            env_file.write_text("A=1\n")
+            settings.write_text("{}")
+            first = fact()
+            self.assertEqual(sorted(os.path.basename(t[0]) for t in first), ["agent-manager.env", "dashboard-settings.json"])
+            env_file.write_text("A=22\n")
+            self.assertNotEqual(fact(), first)
+            Path(self.pipe, "unrelated.json").write_text("x")
+            self.assertEqual(fact(), fact())
+
     def test_a_number_inside_the_reason_does_not_announce_but_new_wording_does(self):
         marker = os.path.join(self.pipe, "mem2.json")
         with mock.patch.dict(os.environ, {"AGENT_MANAGER_MEM_PRESSURE_MARKER": marker}):

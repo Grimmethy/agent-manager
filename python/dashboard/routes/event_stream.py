@@ -19,7 +19,8 @@ def _providers():
     """Facts the hub cannot derive from the queue directories. memory-changed: the host-memory chip's state and reason, from the gpu-broker's marker file."""
     import memory_status
     # The marker's reason carries live numbers ("memory stall 11.64%"): announce a change of the STATE or of the reason's wording, never of a number inside it.
-    return {"worker-panels-changed": event_stream.dir_files_fact(_panel_specs, _panel_files), "memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), re.sub(r"\d+", "#", str(d.get("reason") or ""))))}
+    return {"settings-changed": event_stream.dir_files_fact(lambda: [], _settings_files),
+            "worker-panels-changed": event_stream.dir_files_fact(_panel_specs, _panel_files), "memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), re.sub(r"\d+", "#", str(d.get("reason") or ""))))}
 
 
 # The files the Workers tab's panels read (routes/stalled_worker.py, verifier_worker.py, needswork_worker.py, context_worker.py, pipeline_ops_workers.py, cloud_meter.py, worker_switch.py and the
@@ -34,6 +35,13 @@ def _panel_specs():
     from routes import context_worker
     ops = context_worker.state_dir()
     return [(ops, PANEL_FILE_RE), (os.path.join(ops, "gateway"), PANEL_FILE_RE), (worker_switch.switch_dir(), WORKER_MARKER_RE)]
+
+
+def _settings_files():
+    """The files the Job List tab's settings come from (routes/job_types.py): agent-manager.env (the task-source allowlist, priorities, approval modes, worker types) and dashboard-settings.json."""
+    from app import ENV_FILE_PATH
+    from app_settings_helpers import DASHBOARD_SETTINGS_PATH
+    return [ENV_FILE_PATH, DASHBOARD_SETTINGS_PATH]
 
 
 def _panel_files():
