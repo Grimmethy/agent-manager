@@ -572,7 +572,7 @@ class Announce(Base):
                 self.hub.announce(name, plugin="books")
         self.assertEqual(len(self.hub._ring), 0)
         self.assertEqual(self.hub.generation("plugin-changed"), 0)
-        self.assertEqual(es.ANNOUNCE_EVENTS, ("plugin-changed",))
+        self.assertEqual(es.ANNOUNCE_EVENTS, ("plugin-changed", "project-build-changed"))
 
     def test_an_announcement_wakes_a_waiting_reader(self):
         seen = []
@@ -583,6 +583,106 @@ class Announce(Base):
         t.join(3)
         self.assertFalse(t.is_alive())
         self.assertEqual(seen[0][0][0]["event"], "plugin-changed")
+
+
+class ModuleAnnounce(Base):
+    def test_without_a_hub_a_writers_announcement_does_nothing(self):
+        with mock.patch.object(es, "_hub", None):
+            self.assertIsNone(es.announce("project-build-changed", path="/p"))
+
+    def test_with_a_hub_it_publishes_and_returns_the_seq(self):
+        with mock.patch.object(es, "_hub", self.hub):
+            self.assertEqual(es.announce("project-build-changed", path="/p"), 1)
+        self.assertEqual(self.hub._ring[-1]["event"], "project-build-changed")
+        self.assertEqual(self.hub._ring[-1]["data"], {"path": "/p", "seq": 1, "why": "announce"})
+
+    def test_a_failing_or_refused_announcement_never_raises_into_the_writer(self):
+        with mock.patch.object(es, "_hub", self.hub):
+            self.assertIsNone(es.announce("counts-changed"))                  # not announceable
+            with mock.patch.object(self.hub, "announce", side_effect=RuntimeError("boom")):
+                self.assertIsNone(es.announce("project-build-changed", path="/p"))
+        self.assertEqual(len(self.hub._ring), 0)
+
+
+class PipelineState(Base):
+    def _patch(self, **over):
+        vals = {"ENV_FILE_PATH": "env", "_pipeline_running": lambda: False, "_pipeline_stoppable": lambda: False, "get_active_repo_root": lambda: "/repo",
+                "read_env_file": lambda p: {"AGENT_MANAGER_INCLUDE_APPLY": "true", "AGENT_MANAGER_APPLY_SKIP_PUSH": "false"}}
+        vals.update(over)
+        ps = [mock.patch.object(app, k, v) for k, v in vals.items()]
+        for p in ps:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_the_provider_is_registered_on_a_three_second_clock(self):
+        fact, interval = route._providers()["pipeline-state-changed"]
+        self.assertEqual(interval, 3.0)
+        self.assertEqual(route.PIPELINE_STATE_INTERVAL_S, 3.0)
+        self.assertIs(fact, route._pipeline_state)
+
+    def test_the_value_follows_running_stoppable_the_toggles_and_the_repo(self):
+        self._patch()
+        base = route._pipeline_state()
+        self.assertEqual(base, ("/repo", False, False, True, False))
+        self.assertEqual(route._pipeline_state(), base)                           # nothing moved: an equal value announces nothing
+        self._patch(_pipeline_stoppable=lambda: True)
+        self.assertEqual(route._pipeline_state(), ("/repo", False, True, True, False))
+        self._patch(_pipeline_running=lambda: True)
+        self.assertEqual(route._pipeline_state(), ("/repo", True, True, True, False))   # running implies stoppable
+        self._patch(get_active_repo_root=lambda: "/other")
+        self.assertEqual(route._pipeline_state()[0], "/other")
+        self._patch(read_env_file=lambda p: {})
+        self.assertEqual(route._pipeline_state()[3:], (False, True))              # the route's own defaults
+
+    def test_the_value_mirrors_the_status_route_field_for_field(self):
+        self._patch(_pipeline_running=lambda: True)
+        body = app.app.test_client().get("/api/pipeline/status").get_json()
+        self.assertEqual(route._pipeline_state(), (body["activeRepoRoot"], body["running"], body["stoppable"], body["includeApply"], body["skipPush"]))
+
+    def test_an_error_is_the_value_none_not_an_exception(self):
+        for exc in (OSError("boom"), ValueError("bad"), KeyError("k"), RuntimeError("x")):
+            self._patch(_pipeline_running=mock.Mock(side_effect=exc))
+            self.assertIsNone(route._pipeline_state(), repr(exc))
+
+
+class BuildAnnouncements(Base):
+    def _run(self, build):
+        cache = {k: Path(self.pipe) / (k + ".json") for k in ("graph", "coverage", "file_cache", "positions", "meta")}
+        with mock.patch.object(es, "announce") as ann, mock.patch.object(app, "resolve_writable_cache", return_value=cache), \
+                mock.patch.object(app.graph_build, "build_graph_data", side_effect=build), mock.patch.object(app.graph_build, "merge_coverage", return_value={}):
+            with app._build_lock:
+                app._build_state["/p"] = {"running": True, "log": [], "error": None}
+            app._run_build("/p", [])
+        return ann.call_args_list, app._build_state["/p"]
+
+    def test_every_log_line_and_the_finish_announce_the_project_path(self):
+        def build(path, dirs, url, model, progress=None, **kw):
+            progress("one")
+            progress("two")
+            return {"graph": {"nodes": []}, "coverage": {}}
+        calls, state = self._run(build)
+        self.assertEqual(calls, [mock.call("project-build-changed", path="/p")] * 3)
+        self.assertEqual((state["running"], state["log"]), (False, ["one", "two"]))
+
+    def test_a_failed_build_announces_its_end_too(self):
+        def build(path, dirs, url, model, progress=None, **kw):
+            progress("start")
+            raise RuntimeError("graph failed")
+        calls, state = self._run(build)
+        self.assertEqual(calls, [mock.call("project-build-changed", path="/p")] * 2)
+        self.assertEqual((state["running"], state["error"]), (False, "graph failed"))
+
+    def test_starting_a_build_announces_before_the_thread_runs(self):
+        order = []
+        with mock.patch.object(es, "announce", side_effect=lambda *a, **k: order.append(("announce", k))), \
+                mock.patch.object(app, "_run_build", side_effect=lambda *a: order.append(("run", a))), mock.patch.object(app, "record_project_used"):
+            r = app.app.test_client().post("/api/project/build", json={"path": self.pipe})
+            time.sleep(0.2)
+        self.assertEqual(r.get_json()["started"], True)
+        self.assertEqual(order[0], ("announce", {"path": self.pipe}))
+        with app._build_lock:
+            app._build_state.pop(self.pipe, None)
+
 
 
 class Coarse(unittest.TestCase):

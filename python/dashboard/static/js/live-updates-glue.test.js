@@ -146,3 +146,48 @@ test('startPageLiveUpdates: a queue tab has no owner plugin and no timer', async
   await settle();
   assert.deepEqual(calls, []);
 });
+
+test('applyLivePlan: a panels plan refreshes the Project tab pipeline and status panels, in that order, and only for that tab', async () => {
+  const { ctx, calls } = load({ activeTab: 'project' });
+  ctx.refreshPipelineStatus = async () => { calls.push(['pipeline-panel']); };
+  ctx.refreshProjectStatus = async () => { calls.push(['status-panel']); };
+  await ctx.applyLivePlan({ summary: false, plugins: false, nav: false, main: false, branches: false, panels: true });
+  assert.deepEqual(names(calls), ['pipeline-panel', 'status-panel']);
+  const other = load({ activeTab: 'pending' });
+  other.ctx.refreshPipelineStatus = async () => { other.calls.push(['pipeline-panel']); };
+  other.ctx.refreshProjectStatus = async () => { other.calls.push(['status-panel']); };
+  await other.ctx.applyLivePlan({ summary: false, plugins: false, nav: false, main: false, branches: false, panels: true });
+  assert.deepEqual(other.calls, []);
+  const none = load({ activeTab: 'project' });
+  none.ctx.refreshPipelineStatus = async () => { none.calls.push(['pipeline-panel']); };
+  await none.ctx.applyLivePlan({ summary: false, plugins: false, nav: false, main: false, branches: false, panels: false });
+  assert.deepEqual(none.calls, []);
+});
+
+test('startPageLiveUpdates: the stream events refresh the Project tab panels, and the closed-stream fallback does too', async () => {
+  const { ctx, calls, timers } = load({ activeTab: 'project' });
+  ctx.refreshPipelineStatus = async () => { calls.push(['pipeline-panel']); };
+  ctx.refreshProjectStatus = async () => { calls.push(['status-panel']); };
+  ctx.startPageLiveUpdates();
+  assert.equal(timers.length, 0);
+  FakeEventSource.last.emit('pipeline-state-changed');
+  await settle();
+  assert.deepEqual(names(calls), ['pipeline-panel', 'status-panel']);
+  calls.length = 0;
+  FakeEventSource.last.emit('project-build-changed', { path: '/x' });
+  await settle();
+  assert.deepEqual(names(calls), ['pipeline-panel', 'status-panel']);
+  calls.length = 0;
+  FakeEventSource.last.readyState = 2;
+  FakeEventSource.last.emit('error');
+  timers[0].fn();
+  await settle();
+  assert.deepEqual(names(calls).slice(-2), ['pipeline-panel', 'status-panel']);
+});
+
+test('the Project tab has no timer of its own and core no longer calls a leaveProjectTab hook', () => {
+  const tab = fs.readFileSync(path.join(__dirname, 'project-tab.js'), 'utf8');
+  assert.doesNotMatch(tab, /setInterval|projectStatusInterval|leaveProjectTab/);
+  const core = fs.readFileSync(path.join(__dirname, 'core-ui.js'), 'utf8');
+  assert.doesNotMatch(core, /leaveProjectTab/);
+});

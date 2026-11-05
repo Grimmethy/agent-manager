@@ -40,6 +40,7 @@ from werkzeug.exceptions import HTTPException
 # dashboard/ -- added explicitly rather than relying on an installed package, matching
 # this whole project's no-build-step, run-from-source philosophy.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import event_stream  # noqa: E402
 import graph_build  # noqa: E402
 from app_proactive_sweep import proactive_sweep_argv, proactive_sweep_lock_path  # noqa: E402
 from response_compression import compress_response  # noqa: E402
@@ -1811,6 +1812,7 @@ def _run_build(path_str: str, grep_dirs: list[str]):
         log_lines.append(msg)
         with _build_lock:
             _build_state[path_str]["log"] = list(log_lines)
+        event_stream.announce("project-build-changed", path=path_str)
 
     try:
         ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -1853,10 +1855,12 @@ def _run_build(path_str: str, grep_dirs: list[str]):
 
         with _build_lock:
             _build_state[path_str]["running"] = False
+        event_stream.announce("project-build-changed", path=path_str)
     except Exception as e:
         with _build_lock:
             _build_state[path_str]["running"] = False
             _build_state[path_str]["error"] = str(e)
+        event_stream.announce("project-build-changed", path=path_str)
 
 
 def _pipeline_daemon_pids() -> list:

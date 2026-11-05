@@ -9,6 +9,8 @@
 //   branches-changed  a verdict was recorded or a branch merged          -> refresh the Branches tab
 //   plugins-changed   plugins.json changed                               -> re-sync the plugin tabs, redraw the Plugins tab
 //   plugin-states-changed  a plugin process started, stopped or restarted, or its checkout moved (the "restart needed" flag) -> redraw the Plugins tab
+//   pipeline-state-changed  the pipeline started or stopped, its apply toggles or the active repo changed (a shared 3 s sampler) -> the Project tab refreshes its pipeline panel
+//   project-build-changed   a Project-tab graph build started, logged a line or finished (the build thread announces) -> the Project tab refreshes its status panel
 //   memory-changed    the host-memory chip's state or reason changed     -> refresh /api/summary (the chip)
 //   worker-panels-changed  a ledger, index, on/off marker, the cloud spend ledger or the model-stats database a Workers-tab panel reads changed -> redraw the Workers and Job List tabs
 //   settings-changed  agent-manager.env, dashboard-settings.json or the lanes registry changed (the Job List's allowlist, priorities, approval modes; the Models tab's lane models) -> redraw the Job List and Models tabs
@@ -24,7 +26,7 @@
 // If the stream is unavailable (the server answers 404, EventSource gives up) the page falls back to the old 5 s full refresh until it is reloaded.
 
 const LIVE_STREAM_URL = '/api/stream';
-const LIVE_EVENTS = ['snapshot', 'counts-changed', 'workers-changed', 'branches-changed', 'plugins-changed', 'plugin-states-changed', 'plugin-changed', 'memory-changed', 'worker-panels-changed', 'settings-changed', 'benchmark-changed', 'hardware-changed', 'tokenfold-changed', 'reports-changed', 'discovery-changed', 'project-changed'];
+const LIVE_EVENTS = ['snapshot', 'counts-changed', 'workers-changed', 'branches-changed', 'plugins-changed', 'plugin-states-changed', 'plugin-changed', 'pipeline-state-changed', 'project-build-changed', 'memory-changed', 'worker-panels-changed', 'settings-changed', 'benchmark-changed', 'hardware-changed', 'tokenfold-changed', 'reports-changed', 'discovery-changed', 'project-changed'];
 const FALLBACK_POLL_MS = 5000;                  // the ONLY interval left: the full refresh while the stream is closed
 // Tabs that manage their own rendering and are never redrawn by a refresh (they keep a half-typed note, an iframe, an open folder, a click in flight).
 const SELF_RENDERING_TABS = ['project', 'brain-dump', 'filed', 'hygiene', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'];
@@ -43,7 +45,9 @@ const TOKENFOLD_DRIVEN_TABS = ['tokenfold', 'reports'];               // tokenfo
 const REPORTS_DRIVEN_TABS = ['reports'];                              // reports-changed: a Markdown report file appeared or changed
 const DISCOVERY_DRIVEN_TABS = ['deepdive', 'discovery'];              // discovery-changed: the project-search index, the deep-dive and community coverage files or the architecture candidates document changed
 
-const NO_PLAN = Object.freeze({ summary: false, plugins: false, nav: false, main: false, branches: false });
+// panels: the open self-rendering tab's OWN refresh (it keeps a half-typed field or an iframe, so it is never redrawn whole; page glue calls its panel refreshers)
+const NO_PLAN = Object.freeze({ summary: false, plugins: false, nav: false, main: false, branches: false, panels: false });
+const PANEL_TABS = ['project'];                                          // self-rendering tabs that refresh their own panels: pipeline-state-changed and project-build-changed (the Project tab)
 
 function isSelfRenderingTab(tab) { return SELF_RENDERING_TABS.includes(tab); }
 
@@ -60,6 +64,11 @@ function planForEvent(name, tab, isPluginTab, data, pluginNameOf) {
       plan.summary = plan.plugins = plan.nav = true;
       plan.main = !isSelfRenderingTab(tab);
       plan.branches = tab === 'branches';
+      plan.panels = PANEL_TABS.includes(tab);
+      break;
+    case 'pipeline-state-changed':
+    case 'project-build-changed':
+      plan.panels = tab === 'project';
       break;
     case 'counts-changed':
       plan.summary = plan.nav = true;
@@ -112,10 +121,10 @@ function planForEvent(name, tab, isPluginTab, data, pluginNameOf) {
 }
 
 function mergePlans(a, b) {
-  return { summary: a.summary || b.summary, plugins: a.plugins || b.plugins, nav: a.nav || b.nav, main: a.main || b.main, branches: a.branches || b.branches };
+  return { summary: a.summary || b.summary, plugins: a.plugins || b.plugins, nav: a.nav || b.nav, main: a.main || b.main, branches: a.branches || b.branches, panels: a.panels || b.panels };
 }
 
-function isEmptyPlan(p) { return !(p.summary || p.plugins || p.nav || p.main || p.branches); }
+function isEmptyPlan(p) { return !(p.summary || p.plugins || p.nav || p.main || p.branches || p.panels); }
 
 // deps: { EventSource, url?, apply(plan) -> Promise, poll() -> Promise (the old full refresh), getTab(), isPluginTab?(tab), setStatus?(text),
 //         pluginNameOf?(tab) -> the plugin that owns a plugin tab or null, setIntervalFn?, clearIntervalFn?, pollMs? }
@@ -192,6 +201,6 @@ function startLiveUpdates(deps) {
 }
 
 if (typeof module !== 'undefined') module.exports = {
-  LIVE_STREAM_URL, LIVE_EVENTS, FALLBACK_POLL_MS, SELF_RENDERING_TABS, NON_QUEUE_TABS, COUNT_DRIVEN_TABS, PANEL_DRIVEN_TABS, SETTINGS_DRIVEN_TABS, BENCHMARK_DRIVEN_TABS, HARDWARE_DRIVEN_TABS, TOKENFOLD_DRIVEN_TABS, REPORTS_DRIVEN_TABS, DISCOVERY_DRIVEN_TABS, NO_PLAN,
+  LIVE_STREAM_URL, LIVE_EVENTS, FALLBACK_POLL_MS, SELF_RENDERING_TABS, NON_QUEUE_TABS, COUNT_DRIVEN_TABS, PANEL_DRIVEN_TABS, PANEL_TABS, SETTINGS_DRIVEN_TABS, BENCHMARK_DRIVEN_TABS, HARDWARE_DRIVEN_TABS, TOKENFOLD_DRIVEN_TABS, REPORTS_DRIVEN_TABS, DISCOVERY_DRIVEN_TABS, NO_PLAN,
   isSelfRenderingTab, isQueueTab, planForEvent, mergePlans, isEmptyPlan, startLiveUpdates,
 };

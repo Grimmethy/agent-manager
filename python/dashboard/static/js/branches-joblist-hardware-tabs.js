@@ -1163,13 +1163,22 @@ async function applyLivePlan(plan) {
   if (plan.nav) renderNav();
   if (plan.main) await refreshMain();
   if (plan.branches && typeof refreshBranchesTab === 'function') await refreshBranchesTab();
+  if (plan.panels) await refreshActiveTabPanels();
+}
+
+// The open self-rendering tab's own panel refreshers (it is never redrawn whole). Today only the Project tab: its pipeline panel and its status panel.
+async function refreshActiveTabPanels() {
+  if (activeTab === 'project' && typeof refreshPipelineStatus === 'function') {
+    await refreshPipelineStatus();
+    if (typeof refreshProjectStatus === 'function') await refreshProjectStatus();
+  }
 }
 
 function startPageLiveUpdates() {
   return startLiveUpdates({
     EventSource: typeof EventSource !== 'undefined' ? EventSource : null,
     apply: (plan) => runRefreshGuarded(() => applyLivePlan(plan)),
-    poll: refresh,
+    poll: async () => { await refresh(); await refreshActiveTabPanels(); },     // the closed-stream fallback also keeps the open tab's panels current
     getTab: () => activeTab,
     isPluginTab: (tab) => { const t = typeof findTabByKey === 'function' ? findTabByKey(tab) : null; return !!(t && t.pluginScript); },
     pluginNameOf: (tab) => { const t = typeof findTabByKey === 'function' ? findTabByKey(tab) : null; return (t && t.pluginScript && typeof t.pluginName === 'string') ? t.pluginName : null; },
