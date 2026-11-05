@@ -572,7 +572,7 @@ class Announce(Base):
                 self.hub.announce(name, plugin="books")
         self.assertEqual(len(self.hub._ring), 0)
         self.assertEqual(self.hub.generation("plugin-changed"), 0)
-        self.assertEqual(es.ANNOUNCE_EVENTS, ("plugin-changed", "project-build-changed"))
+        self.assertEqual(es.ANNOUNCE_EVENTS, ("plugin-changed", "project-build-changed", "branch-list-changed"))
 
     def test_an_announcement_wakes_a_waiting_reader(self):
         seen = []
@@ -683,6 +683,92 @@ class BuildAnnouncements(Base):
         with app._build_lock:
             app._build_state.pop(self.pipe, None)
 
+
+
+class BranchListAnnouncements(Base):
+    def test_the_digest_is_stable_across_key_order_and_moves_with_any_change(self):
+        a = es.digest([{"branch": "x", "ahead": 1}, None])
+        self.assertEqual(a, es.digest([{"ahead": 1, "branch": "x"}, None]))
+        self.assertNotEqual(a, es.digest([{"branch": "x", "ahead": 2}, None]))
+        self.assertNotEqual(es.digest([]), es.digest(None))
+        self.assertEqual(es.digest({"when": object.__class__}), es.digest({"when": object.__class__}))      # not JSON-able values are stringified, never raised
+
+    def _cache_guard(self):
+        saved = dict(app._branch_cache)
+        self.addCleanup(lambda: (app._branch_cache.clear(), app._branch_cache.update(saved)))
+        app._branch_cache.pop("digest", None)
+
+    def test_the_active_projects_cache_announces_only_when_the_list_really_changed(self):
+        self._cache_guard()
+        with mock.patch.object(es, "announce") as ann, mock.patch.object(app, "queue_dir", lambda: None):
+            app._store_branch_list([{"branch": "a"}])
+            app._store_branch_list([{"branch": "a"}])                              # the same list again: silence
+            self.assertEqual(ann.call_args_list, [mock.call("branch-list-changed", project="active")])
+            app._store_branch_list([{"branch": "a"}, {"branch": "b"}])
+            self.assertEqual(ann.call_count, 2)
+            app._branch_cache["held"] = [{"hub": "H1"}]                            # a held hub group is part of what the tab shows
+            app._store_branch_list([{"branch": "a"}, {"branch": "b"}])
+            self.assertEqual(ann.call_count, 3)
+            app._branch_cache["held_other"] = {"/other": [{"hub": "H2"}]}
+            app._store_branch_list([{"branch": "a"}, {"branch": "b"}])
+            self.assertEqual(ann.call_count, 4)
+
+    def test_another_projects_refresh_announces_with_its_root_and_only_on_a_change(self):
+        import branch_projects as bp
+        project = {"repoRoot": "/other-repo", "pipelineDir": "/other-pipe", "label": "other"}
+        saved = dict(bp._state["cache"])
+        self.addCleanup(lambda: (bp._state["cache"].clear(), bp._state["cache"].update(saved)))
+        bp._state["cache"].clear()
+        lists = [[{"branch": "x"}], [{"branch": "x"}], [{"branch": "x"}, {"branch": "y"}]]
+        with mock.patch.object(es, "announce") as ann, mock.patch.object(app, "_list_unmerged_branches_uncached", side_effect=lambda **kw: lists.pop(0)):
+            for _ in range(3):
+                bp._refresh_stale([project])
+        self.assertEqual(ann.call_args_list, [mock.call("branch-list-changed", project="/other-repo")] * 2)
+        self.assertEqual(bp._state["cache"]["/other-repo"]["branches"], [{"branch": "x"}, {"branch": "y"}])
+
+    def test_expiring_the_other_projects_keeps_their_last_good_lists(self):
+        import branch_projects as bp
+        saved = dict(bp._state["cache"])
+        self.addCleanup(lambda: (bp._state["cache"].clear(), bp._state["cache"].update(saved)))
+        bp._state["cache"].clear()
+        bp._state["cache"]["/r1"] = {"at": time.time(), "branches": [{"branch": "k"}], "error": None}
+        bp._state["cache"]["/r2"] = {"at": time.time(), "branches": [], "error": "boom"}
+        bp.expire_all()
+        self.assertEqual([e["at"] for e in bp._state["cache"].values()], [0.0, 0.0])
+        self.assertEqual(bp._state["cache"]["/r1"]["branches"], [{"branch": "k"}])
+        self.assertEqual(bp._state["cache"]["/r2"]["error"], "boom")
+
+
+class BranchListKick(Base):
+    def setUp(self):
+        super().setUp()
+        self.client = app.app.test_client()
+
+    def _get(self, query):
+        import branch_projects as bp
+        with mock.patch.object(app, "_invalidate_branch_cache") as inv, mock.patch.object(app, "list_unmerged_branches", return_value=[]) as lst, \
+                mock.patch.object(bp, "expire_all") as exp, mock.patch.object(bp, "combined_branches", return_value=([], [])):
+            r = self.client.get("/api/git/unmerged-branches" + query)
+        return r, inv, lst, exp
+
+    def test_a_kick_starts_the_refresh_now_and_still_answers_from_the_cache(self):
+        r, inv, lst, exp = self._get("?projects=all&kick=1")
+        self.assertEqual(r.status_code, 200)
+        inv.assert_called_once_with(refetch=True)
+        exp.assert_called_once_with()
+        lst.assert_called_once_with(force=False, stale_ok=True)               # the request itself never recomputes
+
+    def test_a_kick_without_all_projects_leaves_the_other_projects_alone(self):
+        r, inv, lst, exp = self._get("?kick=1")
+        inv.assert_called_once_with(refetch=True)
+        exp.assert_not_called()
+
+    def test_without_a_kick_nothing_is_invalidated(self):
+        for q in ("?projects=all", "?projects=all&kick=0", ""):
+            r, inv, lst, exp = self._get(q)
+            self.assertEqual(r.status_code, 200)
+            inv.assert_not_called()
+            exp.assert_not_called()
 
 
 class Coarse(unittest.TestCase):

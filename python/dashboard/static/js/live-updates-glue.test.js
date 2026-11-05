@@ -252,3 +252,34 @@ test('the Hygiene tab has no timer, no poll constant and core has no leaveHygien
   assert.doesNotMatch(tab, /setInterval|hygienePollTimer|HYGIENE_POLL_MS|leaveHygieneTab/);
   assert.doesNotMatch(fs.readFileSync(path.join(__dirname, 'core-ui.js'), 'utf8'), /leaveHygieneTab/);
 });
+
+test('applyLivePlan: a branches plan passes the kick flag on to the Branches refresh', async () => {
+  for (const kick of [true, false]) {
+    const { ctx, calls } = load({ activeTab: 'branches' });
+    ctx.refreshBranchesTab = async (...a) => { calls.push(['branches:' + JSON.stringify(a)]); };
+    await ctx.applyLivePlan({ summary: false, plugins: false, nav: false, main: false, branches: true, panels: false, kick });
+    assert.deepEqual(names(calls), ['branches:[{"kick":' + kick + '}]'], 'kick=' + kick);
+  }
+});
+
+test('startPageLiveUpdates: counts-changed kicks the Branches refresh, branch-list-changed does not, and no interval is started', async () => {
+  const { ctx, calls, timers } = load({ activeTab: 'branches' });
+  ctx.refreshBranchesTab = async (...a) => { calls.push(['branches:' + JSON.stringify(a)]); };
+  ctx.startPageLiveUpdates();
+  assert.equal(timers.length, 0);
+  FakeEventSource.last.emit('counts-changed');
+  await settle();
+  assert.ok(names(calls).includes('branches:[{"kick":true}]'));
+  calls.length = 0;
+  FakeEventSource.last.emit('branch-list-changed', { project: 'active' });
+  await settle();
+  assert.deepEqual(names(calls), ['branches:[{"kick":false}]']);
+});
+
+test('fetchBranchList adds kick=1 to the list URL only when asked, and the Branches tab has no timer or leave hook', () => {
+  const src = fs.readFileSync(path.join(__dirname, 'branch-projects.js'), 'utf8');
+  assert.match(src, /kick \? BRANCHES_URL \+ '&kick=1' : BRANCHES_URL/);
+  const tab = fs.readFileSync(path.join(__dirname, 'branches-joblist-hardware-tabs.js'), 'utf8');
+  assert.doesNotMatch(tab, /branchesPollTimer|leaveBranchesTab/);
+  assert.doesNotMatch(fs.readFileSync(path.join(__dirname, 'core-ui.js'), 'utf8'), /leaveBranchesTab/);
+});
