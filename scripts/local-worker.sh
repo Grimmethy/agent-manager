@@ -237,6 +237,22 @@ process_drafting_file() {
     # The pattern is the FORGE_PAUSE_MESSAGE text (pinned by src/local-client-forge-pause.test.js so the copies cannot drift).
     printf '[worker-%s] draft paused for a Forge GPU session -- not counted as a failure; %s stays in drafting/ and resumes when the lease clears\n' "$INSTANCE_ID" "$task_id" >&2
     TICK_HAD_INFRA_FAILURE=true
+  elif echo "$draft_result" | grep -qE '"reason"[[:space:]]*:[[:space:]]*"gpu-arbiter: cancelled while waiting"'; then
+    # 2026-11-05, gpu-arbiter cancellation: local-client.js's gpu-arbiter returned succeeded=false with reason
+    # "gpu-arbiter: cancelled while waiting" because the caller was evicted from the scheduling queue before the
+    # GPU was granted. This is a TRANSIENT resource-contention outcome (the queue is full right now, not broken),
+    # NOT a draft or content failure. The task itself is fine; retrying next tick when capacity opens is the
+    # correct recovery. Without this branch, N consecutive arbiter cancellations (N >= DRAFT_MAX_FAILS) would
+    # push the task to needs-clarification with a stale blockedReason from an earlier real failure, because the
+    # consecutive-failure counter would be incremented by cancellations that have nothing to do with the task.
+    # The pattern matches the exact JSON shape local-client.js's gpu-arbiter-wait-error produces (reason field
+    # with the full "gpu-arbiter: cancelled while waiting" string).
+    printf '[worker-%s] draft call cancelled by GPU arbiter (transient, not counted as a failure); %s stays in drafting/ and resumes when capacity is available\n' "$INSTANCE_ID" "$task_id" >&2
+    # Increment the cancellation counter so the give-up message can report how many were cancellations vs real failures.
+    gpu_arbiter_cancellations=$((gpu_arbiter_cancellations + 1))
+    # Skip failure counting entirely: do NOT touch draftFailureCount, do NOT requeue, do NOT block.
+    # The task remains in drafting/ and will be retried by the leftover-drafting resume pass on a later tick.
+    continue
   else
     # Draft call itself failed (e.g. Ollama unreachable, or a real generation call timing
     # out under GPU contention) -- retry via the leftover-drafting resume pass at the top
@@ -297,6 +313,12 @@ process_drafting_file() {
       TICK_HAD_INFRA_FAILURE=true
     fi
 
+    # 2026-11-05: reset the GPU arbiter cancellation counter for each draft attempt so
+    # that a sequence of cancellations across multiple ticks doesn't accumulate indefinitely.
+    # Each tick's give-up message reports how many cancellations happened during THAT tick's
+    # attempts (which is what the operator needs to know), not a running total across hours.
+    gpu_arbiter_cancellations=0
+
     failure_count="$(node -e '
       const fs = require("fs");
       const p = process.argv[1];
@@ -344,6 +366,11 @@ process_drafting_file() {
       mv -n "$wpath" "${QUEUE_DIR}/blocked/${name}"
       printf '[worker-%s] %s looks structurally oversized (ran out of turns twice on attempt 1) -- blocked immediately instead of retrying %s more times\n' "$INSTANCE_ID" "$task_id" "$(( ${DRAFT_FAILURE_RETRY_LIMIT:-5} - 1 ))" >&2
     elif [[ "${failure_count:-1}" -ge "${DRAFT_FAILURE_RETRY_LIMIT:-5}" ]]; then
+      # 2026-11-05: include gpu_arbiter_cancellations in the give-up message so the operator
+      # can see how many of the failures were transient arbiter cancellations vs real draft
+      # failures (the cause of the stall). Without this, a task blocked by 5 real failures
+      # followed by 10 arbiter cancellations would show the same message as one blocked by
+      # 15 real failures, making the root cause unreadable.
       # 2026-08-23, Grimmethy: "draft call failed 5 times in a row... giving up rather
       # than retrying every tick forever and starving this lane" -- caught live via a
       # staleness_audit attempt on an adhoc-domain candidate that hit exactly this path,
@@ -367,6 +394,7 @@ process_drafting_file() {
         const draftResult = process.argv[2];
         const failureCount = process.argv[3];
         const infraRequeueLimit = parseInt(process.argv[4], 10) || 3;
+        const gpuArbiterCancellations = parseInt(process.argv[5], 10) || 0;
         // 2026-09-05, Grimmethy: "investigate blocked adhoc task" -- found live, 76
         // project_search tasks permanently blocked in one shot by a ~2hr window where the
         // P40 VM Ollama endpoint was unreachable ("connect EHOSTUNREACH
@@ -433,16 +461,20 @@ process_drafting_file() {
           fs.writeFileSync(p, JSON.stringify(o, null, 2));
           console.log("requeue");
         } else {
+          let reasonSuffix = ` (most recent: ${draftResult})`;
+          if (gpuArbiterCancellations > 0) {
+            reasonSuffix += ` -- ${gpuArbiterCancellations} of these were transient GPU arbiter cancellations (not counted as failures)`;
+          }
           const reason = isInfra
-            ? `draft call failed on an apparent infra outage that did not clear even after ${infraRequeueCount} requeue round(s) -- giving up rather than retrying forever (most recent: ${draftResult})`
-            : `draft call failed ${failureCount} times in a row (most recent: ${draftResult}) -- giving up rather than retrying every tick forever and starving this lane`;
+            ? `draft call failed on an apparent infra outage that did not clear even after ${infraRequeueCount} requeue round(s) -- giving up rather than retrying forever${reasonSuffix}`
+            : `draft call failed ${failureCount} times in a row${reasonSuffix} -- giving up rather than retrying every tick forever and starving this lane`;
           o.blockedStage = "draft";
           o.blockedReason = reason;
           o.history.push({ stage: "blocked", at: new Date().toISOString(), detail: reason });
           fs.writeFileSync(p, JSON.stringify(o, null, 2));
           console.log("block");
         }
-      ' "$wpath" "$draft_result" "$failure_count" "${DRAFT_INFRA_REQUEUE_LIMIT:-3}")"
+      ' "$wpath" "$draft_result" "$failure_count" "${DRAFT_INFRA_REQUEUE_LIMIT:-3}" "$gpu_arbiter_cancellations")"
 
       if [[ "$action" == "requeue" ]]; then
         mkdir -p "${QUEUE_DIR}/pending" >/dev/null 2>&1
