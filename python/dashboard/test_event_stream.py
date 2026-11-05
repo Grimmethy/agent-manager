@@ -550,6 +550,178 @@ class DirFilesFact(Base):
         self.assertEqual(hub.poll_once(), ["worker-panels-changed"])
 
 
+class Coarse(unittest.TestCase):
+    def test_numbers_keep_two_significant_figures(self):
+        self.assertEqual(es.coarse(12345), 12000)
+        self.assertEqual(es.coarse(12600), 13000)
+        self.assertEqual(es.coarse(0.123456), 0.12)
+        self.assertEqual(es.coarse(0.5712), 0.57)              # not 0.5700000000000001
+        self.assertEqual(es.coarse(87.6), 88)
+        self.assertEqual(es.coarse(5), 5)
+        self.assertEqual(es.coarse(-4567), -4600)
+        self.assertEqual(es.coarse(99.9), 100)
+
+    def test_digits_is_the_number_of_significant_figures(self):
+        self.assertEqual(es.coarse(12345, digits=3), 12300)
+        self.assertEqual(es.coarse(12345, digits=1), 10000)
+
+    def test_zero_non_finite_bool_none_and_text_are_untouched(self):
+        self.assertEqual(es.coarse(0), 0)
+        self.assertEqual(es.coarse(0.0), 0.0)
+        self.assertTrue(es.coarse(float("inf")) == float("inf"))
+        self.assertIs(es.coarse(True), True)
+        self.assertIs(es.coarse(None), None)
+        self.assertEqual(es.coarse("12345"), "12345")
+
+    def test_it_recurses_into_dicts_and_lists_and_sorts_keys(self):
+        out = es.coarse({"b": [1234, {"x": 5678}], "a": 0.5555, 3: "t"})
+        self.assertEqual(out, {"3": "t", "a": 0.56, "b": [1200, {"x": 5700}]})
+        self.assertEqual(list(out), ["3", "a", "b"])
+        self.assertEqual(es.coarse((1234, 5678)), [1200, 5700])
+
+    def test_an_unknown_object_becomes_its_text(self):
+        self.assertEqual(es.coarse(object).startswith("<class"), True)
+
+    def test_small_wobble_is_the_same_value_and_a_visible_move_is_not(self):
+        self.assertEqual(es.coarse(12010), es.coarse(11990))
+        self.assertNotEqual(es.coarse(12000), es.coarse(13000))
+
+
+class HttpJsonFact(unittest.TestCase):
+    def opener(self, payload=None, raises=None, seen=None):
+        class Resp:
+            def __init__(self, data):
+                self.data = data
+
+            def read(self):
+                return self.data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fn(url, timeout=None):
+            if seen is not None:
+                seen.append((url, timeout))
+            if raises:
+                raise raises
+            return Resp(payload if isinstance(payload, bytes) else json.dumps(payload).encode())
+        return fn
+
+    def test_returns_a_canonical_json_string_of_the_rounded_data(self):
+        seen = []
+        fact = es.http_json_fact(lambda: "http://x/y", opener=self.opener({"gpu": {"util": 87.4, "mb": 12345}}, seen=seen), timeout=2.5)
+        self.assertEqual(fact(), '{"gpu":{"mb":12000,"util":87}}')
+        self.assertEqual(seen, [("http://x/y", 2.5)])
+
+    def test_project_is_applied_before_rounding(self):
+        fact = es.http_json_fact(lambda: "u", project=lambda d: d["keep"], opener=self.opener({"keep": [1234], "drop": 1}))
+        self.assertEqual(fact(), "[1200]")
+
+    def test_no_url_and_every_failure_are_none(self):
+        self.assertIsNone(es.http_json_fact(lambda: None)())
+        self.assertIsNone(es.http_json_fact(lambda: "")())
+        self.assertIsNone(es.http_json_fact(lambda: "u", opener=self.opener(raises=OSError("refused")))())
+        self.assertIsNone(es.http_json_fact(lambda: "u", opener=self.opener(payload=b"not json"))())
+        self.assertIsNone(es.http_json_fact(lambda: "u", project=lambda d: d["nope"], opener=self.opener({"a": 1}))())
+
+    def test_wobble_does_not_change_the_value_and_a_visible_move_does(self):
+        data = {"v": 12010}
+        fact = es.http_json_fact(lambda: "u", opener=lambda url, timeout=None: self.opener(dict(data))(url, timeout))
+        a = fact()
+        data["v"] = 11990
+        self.assertEqual(fact(), a)
+        data["v"] = 15000
+        self.assertNotEqual(fact(), a)
+
+    def test_digits_is_passed_to_coarse(self):
+        fact = es.http_json_fact(lambda: "u", opener=self.opener({"v": 12345}), digits=3)
+        self.assertEqual(fact(), '{"v":12300}')
+
+    def test_without_a_url_nothing_is_fetched(self):
+        calls = []
+        fact = es.http_json_fact(lambda: None, opener=lambda url, timeout=None: calls.append(url))
+        self.assertIsNone(fact())
+        self.assertEqual(calls, [])
+
+    def test_the_default_opener_is_urllib(self):
+        with mock.patch.object(es.urllib.request, "urlopen", self.opener({"v": 1})):
+            self.assertEqual(es.http_json_fact(lambda: "u")(), '{"v":1}')
+
+
+class ProviderIntervals(Base):
+    def make(self, fact, interval, now):
+        return es.Hub(lambda: dict(self.paths), watch_s=0, clock=lambda: now[0], providers={"sample-changed": (fact, interval)})
+
+    def test_an_interval_provider_is_evaluated_at_most_once_per_interval(self):
+        calls = []
+        now = [100.0]
+        hub = self.make(lambda full=False: calls.append(1) or len(calls), 5.0, now)
+        hub.poll_once()
+        for t in (101.0, 102.0, 104.9):
+            now[0] = t
+            self.assertEqual(hub.poll_once(), [])
+        self.assertEqual(len(calls), 1)
+        now[0] = 105.0
+        self.assertEqual(hub.poll_once(), ["sample-changed"])
+        self.assertEqual(len(calls), 2)
+
+    def test_the_cached_value_is_what_the_pass_compares_between_samples(self):
+        values = iter([1, 2, 2, 3])
+        now = [0.0]
+        hub = self.make(lambda full=False: next(values), 10.0, now)
+        hub.poll_once()
+        now[0] = 3.0
+        self.assertEqual(hub.poll_once(), [])
+        now[0] = 10.0
+        self.assertEqual(hub.poll_once(), ["sample-changed"])
+        now[0] = 20.0
+        self.assertEqual(hub.poll_once(), [])
+        now[0] = 30.0
+        self.assertEqual(hub.poll_once(), ["sample-changed"])
+
+    def test_the_reconcile_pass_always_samples(self):
+        calls = []
+        now = [0.0]
+        hub = self.make(lambda full=False: calls.append(full) or 1, 100.0, now)
+        hub.poll_once()
+        hub.reconcile()
+        self.assertEqual(calls, [False, True])
+
+    def test_a_raising_sampler_is_none_and_is_still_cached_for_its_interval(self):
+        calls = []
+        now = [0.0]
+
+        def boom(full=False):
+            calls.append(1)
+            raise RuntimeError("x")
+        hub = self.make(boom, 5.0, now)
+        hub.poll_once()
+        now[0] = 1.0
+        hub.poll_once()
+        self.assertEqual(len(calls), 1)
+
+    def test_a_provider_without_an_interval_is_evaluated_every_pass(self):
+        calls = []
+        hub = es.Hub(lambda: dict(self.paths), watch_s=0, clock=lambda: 0, providers={"plain-changed": lambda full=False: calls.append(1)})
+        hub.poll_once()
+        hub.poll_once()
+        hub.poll_once()
+        self.assertEqual(len(calls), 3)
+
+    def test_invalid_intervals_are_refused(self):
+        for bad in (0, -1, "5", True, [1]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    es.Hub(lambda: {}, providers={"x-changed": (lambda full=False: 1, bad)})
+
+    def test_an_int_interval_is_accepted(self):
+        hub = es.Hub(lambda: {}, providers={"x-changed": (lambda full=False: 1, 3)})
+        self.assertEqual(hub._intervals, {"x-changed": 3})
+
+
 class Status(unittest.TestCase):
     def test_hub_status_shapes(self):
         with mock.patch.dict(os.environ, {"AGENT_MANAGER_EVENT_STREAM": "off"}):
@@ -682,6 +854,57 @@ class Route(Base):
             (base / "run-1" / "status.json").write_text("{}")
             os.utime(base / "run-1", ns=(time.time_ns() + 9_000_000_000, time.time_ns() + 9_000_000_000))
             self.assertNotEqual(fact(), first)
+
+    def test_the_route_registers_sampled_hardware_and_tokenfold_providers_with_their_intervals(self):
+        providers = route._providers()
+        self.assertEqual(providers["hardware-changed"][1], route.HARDWARE_INTERVAL_S)
+        self.assertEqual(providers["tokenfold-changed"][1], route.TOKENFOLD_INTERVAL_S)
+        self.assertEqual((route.HARDWARE_INTERVAL_S, route.TOKENFOLD_INTERVAL_S), (5.0, 10.0))
+
+    def test_the_tokenfold_url_follows_its_port_and_the_hardware_url_follows_the_active_plugin(self):
+        with mock.patch.dict(os.environ, {"TOKENFOLD_PORT": "9999"}):
+            self.assertEqual(route._tokenfold_url(), "http://localhost:9999/tokenfold/stats")
+        os.environ.pop("TOKENFOLD_PORT", None)
+        self.assertEqual(route._tokenfold_url(), "http://localhost:9339/tokenfold/stats")
+        with mock.patch("routes.hardware._active_hardware_plugin", return_value={"url": "http://h:1", "name": "p"}):
+            self.assertEqual(route._hardware_url(), "http://h:1/api/hardware/stats")
+        with mock.patch("routes.hardware._active_hardware_plugin", return_value=None):
+            self.assertIsNone(route._hardware_url())
+        with mock.patch("routes.hardware._active_hardware_plugin", return_value={"name": "p"}):
+            self.assertIsNone(route._hardware_url())
+
+    def test_the_sampled_providers_read_through_urlopen_and_round_what_they_get(self):
+        class Resp:
+            def read(self):
+                return json.dumps({"gpu": 12345, "util": 87.4}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        providers = route._providers()
+        with mock.patch.object(route.urllib.request, "urlopen", return_value=Resp()) as urlopen:
+            self.assertEqual(providers["tokenfold-changed"][0](), '{"gpu":12000,"util":87}')
+        self.assertEqual(urlopen.call_args.args[0], route._tokenfold_url())
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 3.0)
+        with mock.patch.object(route.urllib.request, "urlopen", side_effect=OSError("down")):
+            self.assertIsNone(providers["tokenfold-changed"][0]())
+
+    def test_the_route_registers_a_reports_provider_over_every_period_directory(self):
+        root = Path(self.pipe) / "sb" / "Agent Manager Reports"
+        for period in ("hourly", "daily", "weekly"):
+            (root / period).mkdir(parents=True)
+        (root / "hourly" / "2026-11-05T05h.md").write_text("r")
+        (root / "daily" / "notes.txt").write_text("not a report")
+        with mock.patch("routes.reports._reports_root", return_value=root):
+            fact = route._providers()["reports-changed"]
+            first = fact()
+            self.assertEqual([os.path.basename(t[0]) for t in first], ["2026-11-05T05h.md"])
+            (root / "weekly" / "2026-W45.md").write_text("w")
+            self.assertEqual(sorted(os.path.basename(t[0]) for t in fact()), ["2026-11-05T05h.md", "2026-W45.md"])
+        with mock.patch("routes.reports._reports_root", return_value=None):
+            self.assertEqual(route._providers()["reports-changed"](), ())
 
     def test_a_number_inside_the_reason_does_not_announce_but_new_wording_does(self):
         marker = os.path.join(self.pipe, "mem2.json")

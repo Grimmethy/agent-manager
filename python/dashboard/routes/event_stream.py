@@ -1,6 +1,7 @@
 """GET /api/stream -- the dashboard's server-sent-event channel (event_stream.py). The page listens to it (static/js/live-updates.js); the pieces of 'UI triggers, not polls' that built it are listed in docs/adr/0024-triggers-not-polls.md."""
 import os
 import re
+import urllib.request
 
 from flask import Blueprint, Response, jsonify, request, stream_with_context
 
@@ -19,7 +20,10 @@ def _providers():
     """Facts the hub cannot derive from the queue directories. memory-changed: the host-memory chip's state and reason, from the gpu-broker's marker file."""
     import memory_status
     # The marker's reason carries live numbers ("memory stall 11.64%"): announce a change of the STATE or of the reason's wording, never of a number inside it.
-    return {"settings-changed": event_stream.dir_files_fact(lambda: [], _settings_files),
+    return {"hardware-changed": (_http(_hardware_url), HARDWARE_INTERVAL_S),
+            "tokenfold-changed": (_http(_tokenfold_url), TOKENFOLD_INTERVAL_S),
+            "reports-changed": event_stream.dir_files_fact(_reports_specs),
+            "settings-changed": event_stream.dir_files_fact(lambda: [], _settings_files),
             "benchmark-changed": event_stream.dir_files_fact(_benchmark_specs, subdirs=True),
             "worker-panels-changed": event_stream.dir_files_fact(_panel_specs, _panel_files), "memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), re.sub(r"\d+", "#", str(d.get("reason") or ""))))}
 
@@ -46,6 +50,35 @@ def _settings_files():
     from app import SRC_DIR, read_env_file
     registry = {**os.environ, **read_env_file(ENV_FILE_PATH)}.get("AGENT_MANAGER_LANES_PATH") or str(SRC_DIR.parent / "lanes.json")
     return [ENV_FILE_PATH, DASHBOARD_SETTINGS_PATH, registry]
+
+
+# Sampled sources: the hardware plugin's stats and the TokenFold proxy's stats are live numbers behind HTTP, with no file to watch. ONE shared sampler asks them (the hub's single clock, only while a page
+# is connected) every few seconds and announces a change only when a number moved by a visible amount (event_stream.coarse: two significant figures); a service that goes away or comes back is a change too.
+HARDWARE_INTERVAL_S = 5.0
+TOKENFOLD_INTERVAL_S = 10.0
+
+
+def _hardware_url():
+    from routes.hardware import _active_hardware_plugin
+    active = _active_hardware_plugin()
+    return "%s/api/hardware/stats" % active["url"] if active and active.get("url") else None
+
+
+def _tokenfold_url():
+    return "http://localhost:%s/tokenfold/stats" % os.environ.get("TOKENFOLD_PORT", "9339")
+
+
+def _http(url_fn):
+    # the opener is looked up at call time so a test can replace urllib.request.urlopen
+    return event_stream.http_json_fact(url_fn, opener=lambda *a, **k: urllib.request.urlopen(*a, **k))
+
+
+def _reports_specs():
+    """The Markdown reports the Reports tab lists: <Second Brain>/Agent Manager Reports/<period>/<file>.md for every period."""
+    from app import _REPORT_PERIODS
+    from routes.reports import _reports_root
+    root = _reports_root()
+    return [(str(root / period), re.compile(r"\.md$")) for period in _REPORT_PERIODS] if root else []
 
 
 def _benchmark_specs():
