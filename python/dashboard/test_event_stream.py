@@ -1108,6 +1108,25 @@ class Route(Base):
         self.addCleanup(shutil.rmtree, bare, True)
         self.assertIsNone(route._head_log_path(str(bare)))
 
+    def test_the_route_registers_a_brain_dump_provider_over_the_active_projects_file(self):
+        f = Path(self.pipe) / "brain-dump.json"
+        with mock.patch.object(app, "brain_dump_path", lambda: f):
+            fact = route._providers()["brain-dump-changed"]
+            self.assertEqual(fact(), ())                                           # no file yet: nothing
+            f.write_text("[]")
+            first = fact()
+            self.assertEqual([os.path.basename(t[0]) for t in first], ["brain-dump.json"])
+            self.assertEqual(fact(), first)                                        # unchanged: an equal value announces nothing
+            f.write_text('[{"id": 1}]')                                            # an entry written: size and mtime move
+            self.assertNotEqual(fact(), first)
+            other = Path(self.pipe) / "other.json"
+            other.write_text("x")                                                  # a neighbouring file is not the Brain Dump file
+            before = fact()
+            other.write_text("changed")
+            self.assertEqual(fact(), before)
+        with mock.patch.object(app, "brain_dump_path", lambda: None):
+            self.assertEqual(route._providers()["brain-dump-changed"](), ())      # no active project
+
     def test_the_route_registers_a_benchmark_provider_over_the_runs_directory(self):
         base = Path(self.pipe) / "benchmarks"
         with mock.patch.object(app, "BENCHMARK_STATE_DIR", base):

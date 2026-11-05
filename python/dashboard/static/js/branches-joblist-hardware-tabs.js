@@ -1166,11 +1166,13 @@ async function applyLivePlan(plan) {
   if (plan.panels) await refreshActiveTabPanels();
 }
 
-// The open self-rendering tab's own panel refreshers (it is never redrawn whole). Today only the Project tab: its pipeline panel and its status panel.
+// The open self-rendering tab's own panel refreshers (it is never redrawn whole): the Project tab's pipeline and status panels, the Brain Dump tab's entry list (unforced: it skips an open edit or discussion).
 async function refreshActiveTabPanels() {
   if (activeTab === 'project' && typeof refreshPipelineStatus === 'function') {
     await refreshPipelineStatus();
     if (typeof refreshProjectStatus === 'function') await refreshProjectStatus();
+  } else if (activeTab === 'brain-dump' && typeof refreshBrainDumpEntries === 'function') {
+    await refreshBrainDumpEntries();
   }
 }
 
