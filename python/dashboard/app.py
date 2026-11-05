@@ -2404,6 +2404,11 @@ def _store_branch_list(branches):
         _branch_cache["at"] = time.time()
         _branch_cache["branches"] = branches
         _branch_cache["filled"] = True   # a list was computed at least once: an invalidated cache still has a last good list to serve
+        fingerprint = event_stream.digest([branches, _branch_cache.get("held"), _branch_cache.get("held_other")])
+        changed = fingerprint != _branch_cache.get("digest")
+        _branch_cache["digest"] = fingerprint
+    if changed:
+        event_stream.announce("branch-list-changed", project="active")      # the Branches tab re-reads the cached list (a recompute that found nothing new says nothing)
     # Apply any pending verdicts for branches that are now in the listing
     try:
         import branch_verdicts_pending as bvp

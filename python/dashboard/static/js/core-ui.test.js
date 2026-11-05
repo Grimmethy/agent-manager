@@ -107,7 +107,6 @@ function loadDashboardScripts(overrides = {}) {
     counts: {},
     CORE_TABS: [{ key: 'adhoc', label: 'Adhoc' }, { key: 'models', label: 'Models' }],
     renderModelsTab: async () => {},
-    leaveBranchesTab() {},
     enterProjectTab() {}, enterBrainDumpTab() {}, enterBranchesTab() {}, enterHygieneTab() {},
     renderNav() {},
     escapeHtml: (s) => String(s == null ? '' : s),

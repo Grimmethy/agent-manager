@@ -122,7 +122,7 @@ test('the Hygiene inventory reloads on hygiene-changed, counts-changed and branc
   for (const ev of ['memory-changed', 'workers-changed', 'brain-dump-changed']) assert.equal(lu.planForEvent(ev, 'hygiene').panels, false, ev);
   // the other plan keys of those events are unchanged by the Hygiene panel
   assert.deepEqual(lu.planForEvent('counts-changed', 'hygiene'), plan({ summary: true, nav: true, panels: true }));
-  assert.deepEqual(lu.planForEvent('branches-changed', 'branches'), plan({ branches: true }));
+  assert.deepEqual(lu.planForEvent('branches-changed', 'branches'), plan({ branches: true, kick: true }));
 });
 
 test('brain-dump-changed refreshes the Brain Dump entry list only, never redraws anything whole', () => {
@@ -161,8 +161,25 @@ test('counts-changed also redraws the Workers, Adhoc and Job List tabs', () => {
   assert.deepEqual([...lu.SETTINGS_DRIVEN_TABS], ['joblist', 'models']);
 });
 
+test('branch-list-changed re-reads the cached list on the Branches tab WITHOUT a kick (a kick would loop), and nowhere else', () => {
+  assert.deepEqual(lu.planForEvent('branch-list-changed', 'branches'), plan({ branches: true }));
+  for (const tab of ['pending', 'project', 'hygiene', 'brain-dump', 'workers', 'plugins']) assert.deepEqual(lu.planForEvent('branch-list-changed', tab), lu.NO_PLAN, tab);
+  assert.ok(lu.LIVE_EVENTS.includes('branch-list-changed'));
+});
+
+test('counts-changed and branches-changed on the Branches tab ask the server to look now; other tabs never kick', () => {
+  assert.deepEqual(lu.planForEvent('counts-changed', 'branches'), plan({ summary: true, nav: true, branches: true, kick: true }));
+  for (const ev of ['counts-changed', 'branches-changed']) {
+    for (const tab of ['pending', 'project', 'hygiene', 'workers', 'brain-dump']) assert.equal(lu.planForEvent(ev, tab).kick, false, ev + ' ' + tab);
+  }
+  for (const ev of ['snapshot', 'project-changed', 'memory-changed']) assert.equal(lu.planForEvent(ev, 'branches').kick, false, ev);
+  assert.equal(lu.mergePlans(plan({}), plan({ kick: true })).kick, true);
+  assert.equal(lu.mergePlans(plan({ kick: true }), plan({})).kick, true);
+  assert.equal(lu.isEmptyPlan(plan({ kick: true })), false);
+});
+
 test('branches-changed refreshes only the Branches tab', () => {
-  assert.deepEqual(lu.planForEvent('branches-changed', 'branches'), plan({ branches: true }));
+  assert.deepEqual(lu.planForEvent('branches-changed', 'branches'), plan({ branches: true, kick: true }));
   assert.deepEqual(lu.planForEvent('branches-changed', 'pending'), lu.NO_PLAN);
 });
 

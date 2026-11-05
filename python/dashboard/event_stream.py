@@ -27,7 +27,7 @@ import time
 import urllib.request
 from collections import deque
 
-ANNOUNCE_EVENTS = ("plugin-changed", "project-build-changed")     # events a writer announces itself (Hub.announce), not derived from a file by the watcher
+ANNOUNCE_EVENTS = ("plugin-changed", "project-build-changed", "branch-list-changed")     # events a writer announces itself (Hub.announce), not derived from a file by the watcher
 EVENT_NAMES = ("counts-changed", "workers-changed", "branches-changed", "plugins-changed", "project-changed")
 WATCH_S = 1.0
 RECONCILE_S = 60.0
@@ -396,6 +396,13 @@ def get_hub(resolve, providers=None):
         if _hub is None:
             _hub = Hub(resolve, providers=providers)
         return _hub
+
+
+def digest(value):
+    """A short stable fingerprint of a JSON-able value (key order does not matter). A cache that stores a recomputed list compares it with the one it replaces, so the page is told
+    only when the list really changed, not on every refresh."""
+    import hashlib
+    return hashlib.sha1(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def announce(name, **data):

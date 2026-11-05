@@ -7,7 +7,6 @@ let currentHeldHubs = [];
 async function fetchHeldHubs() {
   try { return await fetchJson('/api/git/held-hub-branches?projects=all', { timeoutMs: 30000 }); } catch (e) { return []; }
 }
-let branchesPollTimer = null;
 
 function branchCardHtml(b) {
   // willConflict is a git merge-tree preview (app.py's _check_merge_conflict) -- a
@@ -211,16 +210,8 @@ async function renderBranchesTab() {
 // started here instead of picked up by refresh()'s renderMain() dispatch.
 async function enterBranchesTab() {
   await renderBranchesTab();
-  if (branchesPollTimer) clearInterval(branchesPollTimer);
-  // 15s, not 5s: this route is already the expensive one (server-side git work scales
-  // with branch count, confirmed 9s+ with a modest 17 branches) -- polling it as often
-  // as the old blind 5s cycle did was a real part of why fetches piled up and the tab
-  // kept showing "timed out" instead of settling.
-  branchesPollTimer = setInterval(refreshBranchesTab, 15000);
-}
-
-function leaveBranchesTab() {
-  if (branchesPollTimer) { clearInterval(branchesPollTimer); branchesPollTimer = null; }
+  // No timer: this route is the expensive one (server-side git work scales with branch count), so the list is re-read when the server says it changed
+  // (branch-list-changed) and the server is asked to look when something that feeds the list happened (counts-changed, branches-changed; see live-updates.js).
 }
 
 // The actual fix for "the reset needs to stop happening": a background poll now only
@@ -231,11 +222,11 @@ function leaveBranchesTab() {
 // replacing it with an error banner. The full renderBranchesTab() (tab entry, and after
 // a deliberate merge/discard) is untouched and still shows a real error if IT fails --
 // there's nothing yet on screen worth preserving at that point.
-async function refreshBranchesTab() {
+async function refreshBranchesTab({ kick = false } = {}) {
   if (activeTab !== 'branches') return;
   let branches;
   try {
-    branches = await fetchBranchList();
+    branches = await fetchBranchList({ kick });
   } catch (e) {
     console.warn('[branches] background refresh failed (non-fatal, keeping current list):', e.message);
     return;
@@ -1162,7 +1153,7 @@ async function applyLivePlan(plan) {
   if (plan.plugins && await refreshPluginTabs()) return;
   if (plan.nav) renderNav();
   if (plan.main) await refreshMain();
-  if (plan.branches && typeof refreshBranchesTab === 'function') await refreshBranchesTab();
+  if (plan.branches && typeof refreshBranchesTab === 'function') await refreshBranchesTab({ kick: !!plan.kick });
   if (plan.panels) await refreshActiveTabPanels();
 }
 
