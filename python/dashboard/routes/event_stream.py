@@ -20,6 +20,7 @@ def _providers():
     import memory_status
     # The marker's reason carries live numbers ("memory stall 11.64%"): announce a change of the STATE or of the reason's wording, never of a number inside it.
     return {"settings-changed": event_stream.dir_files_fact(lambda: [], _settings_files),
+            "benchmark-changed": event_stream.dir_files_fact(_benchmark_specs, subdirs=True),
             "worker-panels-changed": event_stream.dir_files_fact(_panel_specs, _panel_files), "memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), re.sub(r"\d+", "#", str(d.get("reason") or ""))))}
 
 
@@ -38,10 +39,19 @@ def _panel_specs():
 
 
 def _settings_files():
-    """The files the Job List tab's settings come from (routes/job_types.py): agent-manager.env (the task-source allowlist, priorities, approval modes, worker types) and dashboard-settings.json."""
+    """The files the Job List and Models tabs' settings come from (routes/job_types.py, routes/worker_models_1_more.py): agent-manager.env (the task-source allowlist, priorities, approval modes, worker types,
+    the lane models), dashboard-settings.json and the lanes registry file (the models each lane runs)."""
     from app import ENV_FILE_PATH
     from app_settings_helpers import DASHBOARD_SETTINGS_PATH
-    return [ENV_FILE_PATH, DASHBOARD_SETTINGS_PATH]
+    from app import SRC_DIR, read_env_file
+    registry = {**os.environ, **read_env_file(ENV_FILE_PATH)}.get("AGENT_MANAGER_LANES_PATH") or str(SRC_DIR.parent / "lanes.json")
+    return [ENV_FILE_PATH, DASHBOARD_SETTINGS_PATH, registry]
+
+
+def _benchmark_specs():
+    """The benchmark state: <repo>/.agent-manager-cache/benchmarks holds the current-run-id.txt pointer and one directory per run (a run directory changes while a benchmark runs)."""
+    from app import BENCHMARK_STATE_DIR
+    return [(str(BENCHMARK_STATE_DIR), re.compile(r"."))]
 
 
 def _panel_files():
