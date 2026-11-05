@@ -89,6 +89,12 @@ test('hardware-changed, tokenfold-changed and reports-changed redraw only their 
   assert.deepEqual([...lu.REPORTS_DRIVEN_TABS], ['reports']);
 });
 
+test('discovery-changed redraws only the Deep Dive and Discovery tabs', () => {
+  for (const tab of ['deepdive', 'discovery']) assert.deepEqual(lu.planForEvent('discovery-changed', tab), plan({ main: true }), tab);
+  for (const tab of ['pending', 'workers', 'models', 'reports', 'plugins']) assert.deepEqual(lu.planForEvent('discovery-changed', tab), lu.NO_PLAN, tab);
+  assert.deepEqual([...lu.DISCOVERY_DRIVEN_TABS], ['deepdive', 'discovery']);
+});
+
 test('benchmark-changed redraws only the Models tab', () => {
   assert.deepEqual(lu.planForEvent('benchmark-changed', 'models'), plan({ main: true }));
   for (const tab of ['pending', 'workers', 'joblist', 'hardware']) assert.deepEqual(lu.planForEvent('benchmark-changed', tab), lu.NO_PLAN, tab);
@@ -96,8 +102,9 @@ test('benchmark-changed redraws only the Models tab', () => {
 });
 
 test('counts-changed also redraws the Workers, Adhoc and Job List tabs', () => {
-  for (const tab of ['workers', 'adhoc', 'joblist']) assert.deepEqual(lu.planForEvent('counts-changed', tab), plan({ summary: true, nav: true, main: true }), tab);
-  assert.deepEqual([...lu.COUNT_DRIVEN_TABS], ['workers', 'adhoc', 'joblist']);
+  for (const tab of ['workers', 'adhoc', 'joblist', 'discovery']) assert.deepEqual(lu.planForEvent('counts-changed', tab), plan({ summary: true, nav: true, main: true }), tab);
+  assert.deepEqual(lu.planForEvent('counts-changed', 'deepdive'), plan({ summary: true, nav: true }));
+  assert.deepEqual([...lu.COUNT_DRIVEN_TABS], ['workers', 'adhoc', 'joblist', 'discovery']);
   assert.deepEqual([...lu.PANEL_DRIVEN_TABS], ['workers', 'joblist', 'models']);
   assert.deepEqual([...lu.SETTINGS_DRIVEN_TABS], ['joblist', 'models']);
 });
@@ -139,7 +146,7 @@ test('a plugin that replaces a self-rendering tab (an iframe) is never put on th
 });
 
 test('the transitional list is exactly the tabs that have no events yet', () => {
-  assert.deepEqual(lu.TRANSITIONAL_POLLED_TABS, ['plugins', 'deepdive', 'discovery']);
+  assert.deepEqual(lu.TRANSITIONAL_POLLED_TABS, ['plugins']);
   for (const t of lu.TRANSITIONAL_POLLED_TABS) assert.equal(lu.transitionalPollDue(t), true, t);
   for (const t of ['pending', 'blocked', 'done']) assert.equal(lu.transitionalPollDue(t), false, t);
   for (const t of lu.SELF_RENDERING_TABS) assert.equal(lu.transitionalPollDue(t), false, t);
@@ -147,8 +154,8 @@ test('the transitional list is exactly the tabs that have no events yet', () => 
 });
 
 test('the Workers, Adhoc, Job List, Models, Hardware, TokenFold and Reports tabs no longer need the redraw timer: they have events', () => {
-  for (const tab of ['workers', 'adhoc', 'joblist', 'models', 'hardware', 'tokenfold', 'reports']) assert.equal(lu.transitionalPollDue(tab), false, tab);
-  for (const e of ['hardware-changed', 'tokenfold-changed', 'reports-changed']) assert.ok(lu.LIVE_EVENTS.includes(e), e);
+  for (const tab of ['workers', 'adhoc', 'joblist', 'models', 'hardware', 'tokenfold', 'reports', 'deepdive', 'discovery']) assert.equal(lu.transitionalPollDue(tab), false, tab);
+  for (const e of ['hardware-changed', 'tokenfold-changed', 'reports-changed', 'discovery-changed']) assert.ok(lu.LIVE_EVENTS.includes(e), e);
   assert.ok(lu.LIVE_EVENTS.includes('settings-changed'));
   assert.ok(lu.LIVE_EVENTS.includes('benchmark-changed'));
   assert.ok(lu.LIVE_EVENTS.includes('worker-panels-changed'));
@@ -254,7 +261,7 @@ test('the transitional timer redraws only while the active tab still depends on 
   h.fire(0);
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(h.applied, []);
-  h.setTab('discovery');
+  h.setTab('plugins');
   h.fire(0);
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(h.applied, [plan({ main: true })]);
