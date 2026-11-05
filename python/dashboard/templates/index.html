@@ -694,6 +694,8 @@ let completedTasksObserver = null;
 // Ticks every second independent of the 5s /api/instances poll, so "stale for" reads as a
 // live counter instead of jumping in 5s increments. Computed purely from lastHeartbeat +
 // staleThresholdSeconds (both already on each instance) -- no extra fetch needed.
+// ADR-0024: allowed because it is display-only (it rewrites two text nodes from the clock; it never fetches or redraws).
+// static/js/no-timer-redraws.test.js fails if this ticker starts to fetch or redraw, or if any other timer is added.
 setInterval(updateStaleTimers, 1000);
 
 // Sort state lives outside the function so it survives the 5s poll re-rendering the
