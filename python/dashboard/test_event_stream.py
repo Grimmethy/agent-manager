@@ -270,6 +270,94 @@ class Clients(Base):
         self.assertIsNone(hub._last_counts_full)
 
 
+class Providers(Base):
+    def make(self, fact):
+        return es.Hub(lambda: dict(self.paths), watch_s=0, clock=lambda: 0, providers={"memory-changed": fact})
+
+    def test_a_provider_value_change_fires_its_own_event_after_the_built_in_ones(self):
+        value = ["ok"]
+        hub = self.make(lambda full=False: value[0])
+        hub.poll_once()
+        self.assertEqual(hub.poll_once(), [])
+        value[0] = "tight"
+        self.beat("worker-a")
+        self.assertEqual(hub.poll_once(), ["workers-changed", "memory-changed"])
+        self.assertEqual(hub.poll_once(), [])
+
+    def test_event_names_lists_the_providers_between_the_built_ins_and_project_changed(self):
+        hub = self.make(lambda full=False: 1)
+        self.assertEqual(hub.event_names(), ["counts-changed", "workers-changed", "branches-changed", "plugins-changed", "memory-changed", "project-changed"])
+        self.assertEqual(self.hub.event_names(), list(es.EVENT_NAMES))
+
+    def test_a_raising_provider_is_none_and_does_not_silence_the_others(self):
+        calls = []
+        def boom(full=False):
+            raise RuntimeError("x")
+        hub = es.Hub(lambda: dict(self.paths), watch_s=0, clock=lambda: 0, providers={"a-changed": boom, "b-changed": lambda full=False: calls.append(1) or len(calls)})
+        hub.poll_once()
+        self.assertEqual(hub.poll_once(), ["b-changed"])
+
+    def test_provider_names_are_validated(self):
+        for bad in ("memory", "counts-changed", "project-changed", ""):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    es.Hub(lambda: {}, providers={bad: lambda full=False: 1})
+
+    def test_the_reconcile_pass_asks_providers_for_a_full_read_and_counts_what_it_finds(self):
+        seen = []
+        state = {"v": 1}
+        def fact(full=False):
+            seen.append(full)
+            return state["v"] if full else 1          # the cheap read cannot see the change
+        hub = self.make(fact)
+        hub.poll_once()
+        state["v"] = 2
+        self.assertEqual(hub.poll_once(), [])
+        self.assertEqual(hub.reconcile(), ["memory-changed"])
+        self.assertEqual(seen[-1], True)
+        self.assertEqual(hub.status()["corrections"]["byEvent"], {"memory-changed": 1})
+
+
+class JsonFileFact(Base):
+    def write(self, data, name="m.json"):
+        path = os.path.join(self.pipe, name)
+        Path(path).write_text(data if isinstance(data, str) else json.dumps(data))
+        return path
+
+    def test_projects_the_parsed_object(self):
+        path = self.write({"state": "tight", "reason": "io", "numbers": {"x": 1}})
+        fact = es.json_file_fact(lambda: path, lambda d: (d.get("state"), d.get("reason")))
+        self.assertEqual(fact(), ("tight", "io"))
+
+    def test_missing_broken_and_non_object_files_are_none(self):
+        project = lambda d: "x"
+        self.assertIsNone(es.json_file_fact(lambda: os.path.join(self.pipe, "nope.json"), project)())
+        self.assertIsNone(es.json_file_fact(lambda: self.write("{bad"), project)())
+        self.assertIsNone(es.json_file_fact(lambda: self.write("[1]"), project)())
+        self.assertIsNone(es.json_file_fact(lambda: None, project)())
+
+    def test_an_unchanged_stat_key_is_not_read_again_but_full_always_is(self):
+        path = self.write({"state": "ok"})
+        reads = []
+        fact = es.json_file_fact(lambda: path, lambda d: reads.append(1) or d["state"])
+        self.assertEqual(fact(), "ok")
+        self.assertEqual(fact(), "ok")
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(fact(full=True), "ok")
+        self.assertEqual(len(reads), 2)
+
+    def test_a_changed_file_and_a_changed_path_are_read_again(self):
+        path = self.write({"state": "ok"})
+        cur = [path]
+        fact = es.json_file_fact(lambda: cur[0], lambda d: d["state"])
+        self.assertEqual(fact(), "ok")
+        Path(path).write_text(json.dumps({"state": "critical", "pad": "xxxx"}))
+        self.assertEqual(fact(), "critical")
+        other = self.write({"state": "tight"}, "o.json")
+        cur[0] = other
+        self.assertEqual(fact(), "tight")
+
+
 class Status(unittest.TestCase):
     def test_hub_status_shapes(self):
         with mock.patch.dict(os.environ, {"AGENT_MANAGER_EVENT_STREAM": "off"}):
@@ -312,6 +400,34 @@ class Route(Base):
         self.assertEqual(r.status_code, 404)
         self.assertEqual(r.get_json(), {"enabled": False})
 
+    def test_the_snapshot_names_the_providers_events_too(self):
+        self.hub._providers = {"memory-changed": lambda full=False: 1}
+        r = self.client.get("/api/stream", buffered=False)
+        it = iter(r.response)
+        take = lambda: (lambda c: c.decode() if isinstance(c, bytes) else c)(next(it))
+        take()
+        self.assertIn('"memory-changed"', take())
+        r.close()
+
+    def test_the_route_builds_the_hub_with_its_providers(self):
+        with mock.patch.object(es, "_hub", None):
+            r = self.client.get("/api/stream", buffered=False)
+            it = iter(r.response)
+            next(it)
+            self.assertIn("memory-changed", es._hub.event_names())
+            r.close()
+            es._hub._thread = None
+
+    def test_the_route_registers_a_memory_provider_reading_the_broker_marker(self):
+        marker = os.path.join(self.pipe, "mem.json")
+        with mock.patch.dict(os.environ, {"AGENT_MANAGER_MEM_PRESSURE_MARKER": marker}):
+            fact = route._providers()["memory-changed"]
+            self.assertIsNone(fact())
+            Path(marker).write_text(json.dumps({"state": "tight", "reason": "io stall", "numbers": {"io_full": 40}}))
+            self.assertEqual(fact(), ("tight", "io stall"))
+            Path(marker).write_text(json.dumps({"state": "tight", "reason": "io stall", "numbers": {"io_full": 41}, "pad": 1}))
+            self.assertEqual(fact(), ("tight", "io stall"))      # the numbers moved; the chip's state did not, so no announcement
+
     def test_connect_sends_retry_then_a_snapshot_then_named_events_then_a_keepalive(self):
         r = self.client.get("/api/stream", buffered=False)
         self.assertEqual(r.status_code, 200)
@@ -353,6 +469,7 @@ class Route(Base):
         r.close()
 
     def test_a_restart_mid_stream_sends_a_snapshot_and_continues_from_the_new_counter(self):
+        self.hub._providers = {"memory-changed": lambda full=False: 1}
         self.hub._publish(["counts-changed"], "t")
         self.hub._publish(["plugins-changed"], "t")
         r = self.client.get("/api/stream", headers={"Last-Event-ID": "2"}, buffered=False)
@@ -364,6 +481,7 @@ class Route(Base):
         self.hub._ring = type(self.hub._ring)([self.hub._ring[0]], maxlen=es.RING_SIZE)
         snap = take()
         self.assertTrue(snap.startswith("id: 1\nevent: snapshot"))
+        self.assertIn('"memory-changed"', snap)
         self.hub._publish(["workers-changed"], "t")
         self.assertEqual(take(), 'id: 2\nevent: workers-changed\ndata: {"seq":2,"why":"t"}\n\n')
         r.close()

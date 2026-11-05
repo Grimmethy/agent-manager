@@ -12,11 +12,17 @@ def _resolve():
     return {"queue": queue_dir(), "instances": instances_dir(), "plugins": PLUGINS_MANIFEST_PATH}
 
 
+def _providers():
+    """Facts the hub cannot derive from the queue directories. memory-changed: the host-memory chip's state and reason, from the gpu-broker's marker file."""
+    import memory_status
+    return {"memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), str(d.get("reason") or "")))}
+
+
 @event_stream_bp.route("/api/stream")
 def api_stream():
     if not event_stream.enabled():
         return jsonify({"enabled": False}), 404
-    hub = event_stream.get_hub(_resolve)
+    hub = event_stream.get_hub(_resolve, _providers())
     try:
         last_id = int(request.headers.get("Last-Event-ID", ""))
     except ValueError:
@@ -28,7 +34,7 @@ def api_stream():
             yield "retry: 3000\n\n"
             events, resync = ([], True) if last_id is None else hub.events_after(last_id, 0)
             if resync:
-                yield event_stream.sse("snapshot", {"seq": seq, "events": list(event_stream.EVENT_NAMES)}, seq)
+                yield event_stream.sse("snapshot", {"seq": seq, "events": hub.event_names()}, seq)
                 cursor = seq
             else:
                 cursor = last_id
@@ -39,7 +45,7 @@ def api_stream():
                 events, resync = hub.events_after(cursor, KEEPALIVE_S)
                 if resync:
                     cursor = hub.status()["seq"]       # read once, BEFORE the yield: an event published while the snapshot is being sent must still be delivered next
-                    yield event_stream.sse("snapshot", {"seq": cursor, "events": list(event_stream.EVENT_NAMES)}, cursor)
+                    yield event_stream.sse("snapshot", {"seq": cursor, "events": hub.event_names()}, cursor)
                     continue
                 if not events:
                     yield ": keepalive\n\n"

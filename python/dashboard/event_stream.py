@@ -7,6 +7,8 @@ ONE shared watcher announces what changed; every browser tab that holds GET /api
   branches-changed  the queue-events journal grew (a verdict was recorded or a branch merged; src/queue-events.js, python/dashboard/queue_events.py)
   plugins-changed   plugins.json changed (inode, size or mtime)
   project-changed   the active pipeline directory changed: the client must re-fetch everything
+  <name>-changed    any further fact a caller registers as a PROVIDER (Hub(providers={...})): a callable returning a comparable value, announced when the value changes. The first
+                    one is memory-changed (the host-memory chip's state and reason, read from the broker's marker file only when that file's stat key moved).
 
 Why this still reads files once a second: the writers of queue state are bash `mv`, node and python, and Python's standard library has no inotify. One shared watcher doing
 a handful of stat() calls (and a read of a heartbeat file only when its mtime moved) replaces N browsers x 5 s x several fetches; it runs only while a client is connected.
@@ -29,6 +31,7 @@ RECONCILE_S = 60.0
 RING_SIZE = 200
 IDLE_EXIT_S = 30.0
 EDGE_KEYS = ("status", "currentPass", "currentTaskId", "stateSince")
+BUILTIN_CHANGE_EVENTS = EVENT_NAMES[:4]       # the four facts the hub derives itself, in announcement order; providers follow
 
 
 def enabled(env=None):
@@ -43,6 +46,31 @@ def _stat_key(path):
     except OSError:
         return None
     return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def json_file_fact(path_fn, project, stat=None, read=None):
+    """A provider for Hub(providers=...): the value `project(parsed JSON)` of the file at path_fn(), re-read only when its stat key moved (or on the reconcile pass, `full`).
+    A missing, unreadable or non-object file is the value None, never an error. Quantise what `project` returns: every distinct value is an announcement."""
+    stat = stat or _stat_key
+    cache = {}
+
+    def fact(full=False):
+        path = path_fn()
+        if not path:
+            return None
+        key = stat(path)
+        if not full and cache.get("path") == path and cache.get("key") == key:
+            return cache["value"]
+        value = None
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            value = project(data) if isinstance(data, dict) else None
+        except (OSError, ValueError):
+            value = None
+        cache.update(path=path, key=key, value=value)
+        return value
+    return fact
 
 
 def counts_signature(queue_dir, full=False):
@@ -114,8 +142,12 @@ def workers_signature(instances_dir, cache, full=False):
 class Hub:
     """Shared change announcer. resolve() -> {"queue": path|None, "instances": path|None, "plugins": path|None}, called every pass (the active project can change)."""
 
-    def __init__(self, resolve, watch_s=WATCH_S, reconcile_s=RECONCILE_S, clock=time.monotonic, idle_exit_s=IDLE_EXIT_S):
+    def __init__(self, resolve, watch_s=WATCH_S, reconcile_s=RECONCILE_S, clock=time.monotonic, idle_exit_s=IDLE_EXIT_S, providers=None):
         self._resolve = resolve
+        self._providers = dict(providers or {})      # event name -> fact(full) callable; announced in registration order after the built-in four
+        for name in self._providers:
+            if not (isinstance(name, str) and name.endswith("-changed")) or name in EVENT_NAMES:
+                raise ValueError("a provider event name must end in -changed and not be a built-in one: %r" % (name,))
         self._watch_s = watch_s
         self._reconcile_s = reconcile_s
         self._clock = clock
@@ -138,7 +170,14 @@ class Hub:
         queue, inst, plugins = paths.get("queue"), paths.get("instances"), paths.get("plugins")
         journal = os.path.join(os.path.dirname(os.path.abspath(str(queue))), "queue-events", "journal.jsonl") if queue else None
         counts = counts_signature(queue, full=full)
+        extra = {}
+        for name, fact in self._providers.items():
+            try:
+                extra[name] = fact(full)
+            except Exception:   # noqa: BLE001 -- one broken provider must not silence the others
+                extra[name] = None
         return {
+            **extra,
             "project": str(queue) if queue else None,
             "counts-changed": tuple(x[:2] for x in counts),     # what the cheap pass can see: names and mtimes
             "counts-full": counts if full else None,           # the reconcile pass also counts entries
@@ -164,7 +203,7 @@ class Hub:
             self._last = facts
             self._publish(["project-changed"], "pipeline")
             return ["project-changed"]
-        changed = [n for n in EVENT_NAMES[:4] if facts[n] != self._last[n]]
+        changed = [n for n in self.change_events() if facts[n] != self._last[n]]
         if full:
             if "counts-changed" not in changed and self._last_counts_full is not None and facts["counts-full"] != self._last_counts_full:
                 changed.insert(0, "counts-changed")
@@ -184,6 +223,13 @@ class Hub:
                 for n in found:
                     self._corrections["byEvent"][n] = self._corrections["byEvent"].get(n, 0) + 1
         return found
+
+    def change_events(self):
+        return list(BUILTIN_CHANGE_EVENTS) + list(self._providers)
+
+    def event_names(self):
+        """Every event name this hub can announce (what a snapshot tells the client to re-fetch)."""
+        return self.change_events() + ["project-changed"]
 
     # ---- clients ------------------------------------------------------------------------------------------------------------------------------------------
     def status(self):
@@ -246,11 +292,11 @@ _hub = None
 _hub_lock = threading.Lock()
 
 
-def get_hub(resolve):
+def get_hub(resolve, providers=None):
     global _hub
     with _hub_lock:
         if _hub is None:
-            _hub = Hub(resolve)
+            _hub = Hub(resolve, providers=providers)
         return _hub
 
 
