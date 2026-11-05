@@ -1122,7 +1122,9 @@ async function unloadOllamaFromChip() {
   }
 }
 
-async function refreshCycle() {
+// The page's refresh, in the parts the live updates (live-updates.js) ask for one at a time. refreshCycle() below is all of them in order: the page-load refresh, the
+// action-triggered refreshes and the fallback poll when the event stream is unavailable.
+async function refreshSummary() {
   try {
     counts = await fetchJson('/api/summary');
     document.getElementById('pipeline-status').textContent = 'connected';
@@ -1130,36 +1132,48 @@ async function refreshCycle() {
   } catch (e) {
     document.getElementById('pipeline-status').textContent = 'disconnected';
   }
-  // Re-sync plugin-declared tabs every cycle (piece 5; Docs/hub-tasks-extraction-plan.md
-  // section 5) so a plugin toggled off/removed from elsewhere (another browser tab, a
-  // pipeline restart, a hand-edited plugins.json) drops its nav row promptly instead of
-  // only at next page load. If the row the user is currently looking at is the one that
-  // just vanished, redirectFromGoneActiveTab() runs the full leave/enter transition to a
-  // safe fallback tab itself (via switchToTab) -- in that case skip the render calls below,
-  // which would otherwise double-render on top of what the redirect already did.
+}
+
+// Re-sync plugin-declared tabs (piece 5; Docs/hub-tasks-extraction-plan.md section 5) so a plugin toggled off/removed from elsewhere drops its nav row promptly instead of
+// only at next page load. -> true when the tab the user was looking at vanished and redirectFromGoneActiveTab() already did the full leave/enter transition to a safe
+// fallback tab: the caller must then skip its own render calls, which would double-render on top of that.
+async function refreshPluginTabs() {
   await syncPluginTabs();
-  if (redirectFromGoneActiveTab()) return;
+  return redirectFromGoneActiveTab();
+}
+
+// Project and Brain Dump tabs manage their own rendering (enter*Tab/leave*Tab) so a user's in-progress folder browsing or a half-typed capture note isn't wiped out by a
+// generic redraw; promptforge / adforge / scriptforge are embedded iframes that a redraw would reload out from under the user's inputs; concepts, filed and branches lost
+// clicks to a mid-click rebuild (branches also has its own diffing refresh, refreshBranchesTab). The list is SELF_RENDERING_TABS in live-updates.js.
+async function refreshMain() {
+  if (!isSelfRenderingTab(activeTab)) await renderMain();
+}
+
+async function refreshCycle() {
+  await refreshSummary();
+  if (await refreshPluginTabs()) return;
   renderNav();
-  // Project and Brain Dump tabs manage their own rendering (enter*Tab/leave*Tab) so a
-  // user's in-progress folder browsing or a half-typed capture note isn't wiped out by
-  // this generic 5s cycle -- only the nav badge counts above still update while open.
-  // promptforge / adforge / scriptforge are embedded iframes -- re-running
-  // renderMain() every 5s would rebuild them and reload the app out from under the
-  // user's inputs, same reason project / brain-dump opt out here.
-  // concepts (2026-09-06): confirmed live -- a "View timeline" click could lose the
-  // race against this same 5s cycle rebuilding the tab's DOM via innerHTML mid-click,
-  // silently discarding the interaction with no error. Same class of bug Brain Dump's
-  // own opt-out already exists to prevent; re-entering the tab still re-fetches once.
-  // filed (2026-09-14): same reasoning as brain-dump's own opt-out just above -- a
-  // suppress/prioritize/delete click mid-flight (button disabled, awaiting its fetch)
-  // shouldn't get its DOM silently rebuilt out from under it by this 5s cycle.
-  // branches (2026-09-15): same class of bug again, plus its own wrinkle -- the route
-  // behind this tab is the slow one (server-side git work scales with branch count,
-  // 9s+ measured with just 17), so this blind 5s full-teardown cycle was firing a fresh
-  // request before the last one had even resolved, and replacing the whole list with a
-  // "timed out" error on every miss. enterBranchesTab()/leaveBranchesTab() now run
-  // their own 15s poll that diffs in new/removed branches instead of rebuilding.
-  if (!['project', 'brain-dump', 'filed', 'hygiene', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'].includes(activeTab)) await renderMain();
+  await refreshMain();
+}
+
+// What the event stream asked for (a plan from planForEvent), in the same order refreshCycle uses.
+async function applyLivePlan(plan) {
+  if (plan.summary) await refreshSummary();
+  if (plan.plugins && await refreshPluginTabs()) return;
+  if (plan.nav) renderNav();
+  if (plan.main) await refreshMain();
+  if (plan.branches && typeof refreshBranchesTab === 'function') await refreshBranchesTab();
+}
+
+function startPageLiveUpdates() {
+  return startLiveUpdates({
+    EventSource: typeof EventSource !== 'undefined' ? EventSource : null,
+    apply: (plan) => runRefreshGuarded(() => applyLivePlan(plan)),
+    poll: refresh,
+    getTab: () => activeTab,
+    isPluginTab: (tab) => { const t = typeof findTabByKey === 'function' ? findTabByKey(tab) : null; return !!(t && t.pluginScript); },
+    setStatus: (text) => { document.getElementById('pipeline-status').textContent = text; },
+  });
 }
 
 function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }

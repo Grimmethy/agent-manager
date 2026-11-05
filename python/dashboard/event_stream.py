@@ -156,6 +156,7 @@ class Hub:
         self._ring = deque(maxlen=RING_SIZE)
         self._seq = 0
         self._clients = 0
+        self._gen = {}               # event name -> how many times it was announced (lets a cache notice that its data is older than the last announcement)
         self._thread = None
         self._wcache = {}
         self._last = None            # the last facts announced: dict of name -> value
@@ -192,6 +193,7 @@ class Hub:
             for name in names:
                 self._seq += 1
                 self._ring.append({"id": self._seq, "event": name, "data": {"seq": self._seq, "why": why}})
+                self._gen[name] = self._gen.get(name, 0) + 1
             self._cond.notify_all()
 
     def poll_once(self, full=False):
@@ -223,6 +225,10 @@ class Hub:
                 for n in found:
                     self._corrections["byEvent"][n] = self._corrections["byEvent"].get(n, 0) + 1
         return found
+
+    def generation(self, name):
+        with self._cond:
+            return self._gen.get(name, 0)
 
     def change_events(self):
         return list(BUILTIN_CHANGE_EVENTS) + list(self._providers)
@@ -298,6 +304,17 @@ def get_hub(resolve, providers=None):
         if _hub is None:
             _hub = Hub(resolve, providers=providers)
         return _hub
+
+
+def generation(name):
+    """How many times the shared hub announced `name` (0 before the hub exists). A cache stores this beside its payload and drops the payload when it moved."""
+    h = _hub
+    if h is None:
+        return 0
+    try:
+        return h.generation(name)
+    except Exception:   # noqa: BLE001
+        return 0
 
 
 def hub_status():
