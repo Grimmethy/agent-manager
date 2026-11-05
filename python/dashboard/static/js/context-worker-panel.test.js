@@ -511,3 +511,20 @@ test('impact edge cases: a null intervention kind, exactly three filed ids, tool
 test('a negative filed count reads as zero', () => {
   assert.match(visible(build(impPayload({ impact: { ...impPayload().impact, filedCount: -3 } }))), /0 investigation tasks filed/);
 });
+
+test('impact overflow: more than 3 regressed/improved/insufficient/would-file names shows "+N more", exactly 3 does not', () => {
+  const base = impPayload().impact;
+  const four = { ...base, latest: { regressed: ['a', 'b', 'c', 'd'], improved: ['e', 'f', 'g', 'h'], insufficient: ['i', 'j', 'k', 'l'], wouldFile: ['w1', 'w2', 'w3', 'w4'] }, filedCount: 0, filed: [], interventions: {}, gate: { open: false, evaluated: 0, helped: 0 } };
+  const t = visible(buildOpen(impPayload({ impact: four })));
+  assert.match(t, /4 regressed.*a, b, c \+1 more/);
+  assert.match(t, /improved: e, f, g \+1 more/);
+  assert.match(t, /not enough data: i, j, k \+1 more/);
+  assert.match(t, /would file 4 investigation tasks: w1, w2, w3 \+1 more/);
+  const three = { ...base, latest: { regressed: ['a', 'b', 'c'], improved: ['d', 'e', 'f'], insufficient: ['g', 'h', 'i'], wouldFile: ['w1', 'w2', 'w3'] }, filedCount: 0, filed: [], interventions: {}, gate: { open: false, evaluated: 0, helped: 0 } };
+  const u = visible(buildOpen(impPayload({ impact: three })));
+  assert.doesNotMatch(u, /\+0 more|\+1 more|\+2 more|\+3 more/);
+  assert.match(u, /3 regressed.*a, b, c/);
+  assert.match(u, /improved: d, e, f/);
+  assert.match(u, /not enough data: g, h, i/);
+  assert.match(u, /would file 3 investigation tasks: w1, w2, w3/);
+});
