@@ -862,6 +862,81 @@ class Route(Base):
                 mock.patch.object(app, "community_coverage_path", lambda: None), mock.patch.object(app, "arch_candidates_path", lambda: None):
             self.assertEqual(route._providers()["discovery-changed"](), ())
 
+    def _plugin_fixture(self):
+        """A fake plugin pid directory, a fake manifest and a fake checkout whose reflog we can touch. Returns (pid_dir, repo, manifest list)."""
+        import plugin_process_manager as ppm
+        pid_dir = Path(self.pipe) / "pids"
+        pid_dir.mkdir()
+        repo = Path(self.pipe) / "plugin-repo"
+        (repo / ".git" / "logs").mkdir(parents=True)
+        (repo / ".git" / "logs" / "HEAD").write_text("one\n")
+        manifest = [{"name": "alpha", "slot": "hardware-tab", "cwd": str(repo)}, {"name": "beta-tab", "processName": "beta", "cwd": str(repo)}, {"name": "plain", "tab": True}]
+        return ppm, pid_dir, repo, manifest
+
+    def test_the_route_registers_a_plugin_states_provider_on_a_five_second_clock(self):
+        fact, interval = route._providers()["plugin-states-changed"]
+        self.assertEqual(interval, 5.0)
+        self.assertEqual(route.PLUGIN_STATES_INTERVAL_S, 5.0)
+        self.assertIs(fact, route._plugin_states)
+
+    def test_plugin_states_change_when_a_plugin_starts_stops_restarts_or_its_checkout_moves(self):
+        ppm, pid_dir, repo, manifest = self._plugin_fixture()
+        with mock.patch.object(ppm, "PID_DIR", pid_dir), mock.patch.object(app, "_read_plugins_manifest", lambda: manifest):
+            first = route._plugin_states()
+            self.assertEqual([r[0] for r in first], ["alpha", "beta-tab"])            # the entry with neither slot nor processName owns no process
+            self.assertEqual([r[1] for r in first], [False, False])
+            self.assertEqual(route._plugin_states(), first)                            # nothing moved: the same value, so no announcement
+            (pid_dir / "plugin-alpha.pid").write_text(str(os.getpid()))
+            started = route._plugin_states()
+            self.assertNotEqual(started, first)
+            self.assertEqual([r[1] for r in started], [True, False])
+            os.utime(pid_dir / "plugin-alpha.pid", ns=(1_000_000_000, 2_000_000_000))  # a restart rewrites the pid file
+            restarted = route._plugin_states()
+            self.assertNotEqual(restarted, started)
+            self.assertEqual([r[1] for r in restarted], [True, False])
+            os.utime(repo / ".git" / "logs" / "HEAD", ns=(1_000_000_000, 3_000_000_000))  # a commit or pull moves the reflog: "restart needed" may flip
+            self.assertNotEqual(route._plugin_states(), restarted)
+            (pid_dir / "plugin-alpha.pid").write_text("2147483646")                    # a dead pid is "not running"
+            self.assertEqual([r[1] for r in route._plugin_states()], [False, False])
+            (pid_dir / "plugin-beta.pid").write_text(str(os.getpid()))                 # beta-tab is tracked under its processName
+            self.assertEqual([r[1] for r in route._plugin_states()], [False, True])
+
+    def test_a_plugin_entry_without_a_cwd_follows_the_reflog_of_the_dashboards_own_directory(self):
+        ppm, pid_dir, repo, manifest = self._plugin_fixture()
+        bare = [{"name": "alpha", "slot": "hardware-tab"}]                           # the live manifest has no top-level cwd: behind_checkout runs git in os.getcwd()
+        sub = repo / "python" / "dashboard"
+        sub.mkdir(parents=True)
+        with mock.patch.object(ppm, "PID_DIR", pid_dir), mock.patch.object(app, "_read_plugins_manifest", lambda: bare), mock.patch.object(os, "getcwd", lambda: str(sub)):
+            before = route._plugin_states()
+            self.assertIsNotNone(before[0][3])
+            os.utime(repo / ".git" / "logs" / "HEAD", ns=(1_000_000_000, 5_000_000_000))
+            self.assertNotEqual(route._plugin_states(), before)
+
+    def test_plugin_states_survive_a_broken_manifest_a_missing_checkout_and_odd_entries(self):
+        ppm, pid_dir, repo, manifest = self._plugin_fixture()
+        with mock.patch.object(ppm, "PID_DIR", pid_dir):
+            for bad in (lambda: (_ for _ in ()).throw(ValueError("boom")), lambda: {"not": "a list"}, lambda: [], lambda: ["str", 3, None, {"slot": "x", "name": "s", "cwd": 7}]):
+                with mock.patch.object(app, "_read_plugins_manifest", bad):
+                    value = route._plugin_states()
+                    self.assertIsInstance(value, tuple)
+            with mock.patch.object(app, "_read_plugins_manifest", lambda: [{"name": "gone", "slot": "s", "cwd": str(Path(self.pipe) / "no-such-dir")}]):
+                self.assertEqual(route._plugin_states(), (["gone", False, None, None],))
+
+    def test_the_head_log_is_found_like_gits_own_upward_search(self):
+        root = Path(self.pipe) / "r"
+        (root / ".git" / "logs").mkdir(parents=True)
+        (root / "a" / "b").mkdir(parents=True)
+        self.assertEqual(route._head_log_path(str(root / "a" / "b")), str(root / ".git" / "logs" / "HEAD"))
+        wt = Path(self.pipe) / "wt"
+        wt.mkdir()
+        (wt / ".git").write_text("gitdir: " + str(root / ".git") + "\n")
+        self.assertEqual(route._head_log_path(str(wt)), str(root / ".git" / "logs" / "HEAD"))
+        (wt / ".git").write_text("not a gitdir line\n")
+        self.assertIsNone(route._head_log_path(str(wt)))
+        bare = Path(tempfile.mkdtemp(dir="/dev/shm" if os.path.isdir("/dev/shm") else None))
+        self.addCleanup(shutil.rmtree, bare, True)
+        self.assertIsNone(route._head_log_path(str(bare)))
+
     def test_the_route_registers_a_benchmark_provider_over_the_runs_directory(self):
         base = Path(self.pipe) / "benchmarks"
         with mock.patch.object(app, "BENCHMARK_STATE_DIR", base):
