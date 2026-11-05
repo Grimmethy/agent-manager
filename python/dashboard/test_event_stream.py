@@ -842,6 +842,26 @@ class Route(Base):
             os.environ.pop("AGENT_MANAGER_LANES_PATH", None)
             self.assertIn(str(app.SRC_DIR.parent / "lanes.json"), [str(x) for x in route._settings_files()])
 
+    def test_the_route_registers_a_discovery_provider_over_the_four_files_of_the_active_project(self):
+        d = Path(self.pipe) / "disc"
+        d.mkdir()
+        paths = {"idx": d / "INDEX.md", "dd": d / "deep-dive.json", "cc": d / "community-coverage.json", "ac": d / "ARCH_REVIEW_CANDIDATES.md"}
+        with mock.patch.object(app, "project_search_index_path", lambda: paths["idx"]), mock.patch("routes.deep_dive.deep_dive_coverage_path", lambda: paths["dd"]), \
+                mock.patch.object(app, "community_coverage_path", lambda: paths["cc"]), mock.patch.object(app, "arch_candidates_path", lambda: paths["ac"]):
+            fact = route._providers()["discovery-changed"]
+            self.assertEqual(fact(), ())
+            for key, p in paths.items():
+                before = fact()
+                p.write_text("x")
+                self.assertNotEqual(fact(), before, key)
+            self.assertEqual(sorted(os.path.basename(t[0]) for t in fact()), sorted(p.name for p in paths.values()))
+            before = fact()
+            paths["cc"].write_text("changed contents, longer")
+            self.assertNotEqual(fact(), before)
+        with mock.patch.object(app, "project_search_index_path", lambda: None), mock.patch("routes.deep_dive.deep_dive_coverage_path", lambda: None), \
+                mock.patch.object(app, "community_coverage_path", lambda: None), mock.patch.object(app, "arch_candidates_path", lambda: None):
+            self.assertEqual(route._providers()["discovery-changed"](), ())
+
     def test_the_route_registers_a_benchmark_provider_over_the_runs_directory(self):
         base = Path(self.pipe) / "benchmarks"
         with mock.patch.object(app, "BENCHMARK_STATE_DIR", base):

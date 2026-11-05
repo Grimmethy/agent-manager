@@ -23,6 +23,7 @@ def _providers():
     return {"hardware-changed": (_http(_hardware_url), HARDWARE_INTERVAL_S),
             "tokenfold-changed": (_http(_tokenfold_url), TOKENFOLD_INTERVAL_S),
             "reports-changed": event_stream.dir_files_fact(_reports_specs),
+            "discovery-changed": event_stream.dir_files_fact(lambda: [], _discovery_files),
             "settings-changed": event_stream.dir_files_fact(lambda: [], _settings_files),
             "benchmark-changed": event_stream.dir_files_fact(_benchmark_specs, subdirs=True),
             "worker-panels-changed": event_stream.dir_files_fact(_panel_specs, _panel_files), "memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), re.sub(r"\d+", "#", str(d.get("reason") or ""))))}
@@ -79,6 +80,15 @@ def _reports_specs():
     from routes.reports import _reports_root
     root = _reports_root()
     return [(str(root / period), re.compile(r"\.md$")) for period in _REPORT_PERIODS] if root else []
+
+
+def _discovery_files():
+    """The files the Deep Dive and Discovery tabs read, for the ACTIVE project (resolved on every pass): the project-search index (the scouted leads), the deep-dive coverage file, the arch-discovery community
+    coverage file and the architecture review candidates document. A path that does not exist (or no active project) simply contributes nothing. The arch-discovery TASKS the Discovery tab lists live in the
+    queue, which counts-changed already announces."""
+    from app import arch_candidates_path, community_coverage_path, project_search_index_path
+    from routes.deep_dive import deep_dive_coverage_path
+    return [project_search_index_path(), deep_dive_coverage_path(), community_coverage_path(), arch_candidates_path()]
 
 
 def _benchmark_specs():
