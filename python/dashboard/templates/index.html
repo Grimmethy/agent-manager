@@ -939,11 +939,12 @@ const SUBTASK_STATUS_META = {
 // While a task is mid-pass (drafting or review), the pipeline now flushes each new
 // Pipeline History checkpoint to the task file as it happens (task-history.js's persist
 // hook -- 2026-08-31, Grimmethy: "Anything that I can observe is good"). The modal is a
-// one-shot fetch, so poll while it's open and a live task is showing, re-rendering only
+// one-shot fetch, so while it's open and a live task is showing it WATCHES the task (taskDetailWatch) and
+// re-reads it when the pipeline announces a change (refreshTaskDetailModal, driven by live-updates.js), re-rendering only
 // when something actually changed. task-anywhere follows the task across the
 // drafting->review->approved->done moves, so the modal keeps tracking it without a manual
-// reopen; a terminal state stops the poll.
-let taskDetailPoll = null;
+// reopen; a terminal state stops the watch. There is no timer.
+let taskDetailWatch = null;
 const TASK_DETAIL_LIVE_STATES = new Set(['drafting', 'review', 'coordinating']);
 // Sources whose real deliverable is a prose report in implementResponse (advisoryProse),
 // not a diff -- the task modal promotes it to the top under "Root-Cause Report".

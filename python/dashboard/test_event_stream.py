@@ -1241,6 +1241,33 @@ class Route(Base):
         with mock.patch.object(app, "queue_dir", lambda: None), mock.patch.object(app, "get_active_repo_root", lambda: None):
             self.assertEqual(route._providers()["hygiene-changed"](), ())             # no active project
 
+    def test_the_route_registers_a_task_records_provider_over_the_in_flight_queue_states(self):
+        queue = Path(self.pipe) / "tq"
+        for state in ("drafting", "review", "coordinating", "pending", "done"):
+            (queue / state).mkdir(parents=True)
+        with mock.patch.object(app, "queue_dir", lambda: queue):
+            fact = route._providers()["task-records-changed"]
+            self.assertEqual(fact(), ())
+            rec = queue / "drafting" / "t1.json"
+            rec.write_text('{"history": []}')
+            first = fact()
+            self.assertEqual([os.path.basename(t[0]) for t in first], ["t1.json"])
+            self.assertEqual(fact(), first)                                          # unchanged: announces nothing
+            rec.write_text('{"history": [{"stage": "orient-done"}]}')                  # a pass flushed a checkpoint into the record
+            second = fact()
+            self.assertNotEqual(second, first)
+            (queue / "review" / "t2.json").write_text("{}")
+            (queue / "coordinating" / "h1.json").write_text("{}")
+            self.assertEqual(sorted(os.path.basename(t[0]) for t in fact()), ["h1.json", "t1.json", "t2.json"])
+            before = fact()
+            (queue / "pending" / "p.json").write_text("{}")                            # queue states that are not in flight are counts-changed
+            (queue / "done" / "d.json").write_text("{}")
+            (queue / "drafting" / "note.txt").write_text("x")                          # only .json records
+            self.assertEqual(fact(), before)
+            self.assertEqual(route.LIVE_TASK_STATES, ("drafting", "review", "coordinating"))
+        with mock.patch.object(app, "queue_dir", lambda: None):
+            self.assertEqual(route._providers()["task-records-changed"](), ())      # no active project
+
     def test_the_route_registers_a_benchmark_provider_over_the_runs_directory(self):
         base = Path(self.pipe) / "benchmarks"
         with mock.patch.object(app, "BENCHMARK_STATE_DIR", base):

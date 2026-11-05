@@ -283,3 +283,29 @@ test('fetchBranchList adds kick=1 to the list URL only when asked, and the Branc
   assert.doesNotMatch(tab, /branchesPollTimer|leaveBranchesTab/);
   assert.doesNotMatch(fs.readFileSync(path.join(__dirname, 'core-ui.js'), 'utf8'), /leaveBranchesTab/);
 });
+
+test('applyLivePlan: a modal plan asks the task-detail modal to refresh, and nothing else does', async () => {
+  const { ctx, calls } = load({ activeTab: 'pending' });
+  ctx.refreshTaskDetailModal = async () => { calls.push(['modal']); };
+  await ctx.applyLivePlan({ summary: false, plugins: false, nav: false, main: false, branches: false, panels: false, kick: false, modal: true });
+  assert.deepEqual(names(calls), ['modal']);
+  calls.length = 0;
+  await ctx.applyLivePlan({ summary: false, plugins: false, nav: false, main: false, branches: false, panels: false, kick: false, modal: false });
+  assert.deepEqual(calls, []);
+});
+
+test('startPageLiveUpdates: task-records-changed refreshes the modal, the closed-stream fallback does too, and no interval is started', async () => {
+  const { ctx, calls, timers } = load({ activeTab: 'pending' });
+  ctx.refreshTaskDetailModal = async () => { calls.push(['modal']); };
+  ctx.startPageLiveUpdates();
+  assert.equal(timers.length, 0);
+  FakeEventSource.last.emit('task-records-changed');
+  await settle();
+  assert.deepEqual(names(calls), ['modal']);
+  calls.length = 0;
+  FakeEventSource.last.readyState = 2;
+  FakeEventSource.last.emit('error');
+  timers[0].fn();
+  await settle();
+  assert.ok(names(calls).includes('modal'));
+});
