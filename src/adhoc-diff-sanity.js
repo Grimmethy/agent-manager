@@ -379,12 +379,12 @@ function extractDeclaredTargets(task, planText = '', { includeCreated = true } =
 // Rule 7 of extractDeclaredTargets: "create|write|generate [the|a ... file] [at] <path>" or "deliverable is ... <path>" in a sentence that is not itself a restriction.
 function createTargets(text) {
   const out = [];
-  const PATH = '`?([\\w./@-]+\\.\\w+)`?(?!\\()';
+  const PATH = '`?([\w./@-]+\.\w+)`?(?!\\()';
   for (const frag of String(text || '').split(/(?<=[.!?;])\s+|\n+/)) {
     if (RESTRICTION_SENTENCE_RE.test(frag) || IMPERATIVE_PROHIBITION_RE.test(frag)) continue;
-    const a = new RegExp(`^[\\s\\d.)*>#-]*(?:create|write|generate|author)\\s+(?:the\\s+|a\\s+|an\\s+|new\\s+|single\\s+|plain-text\\s+|deliverable\\s+|as\\s+)*(?:file\\s+)?(?:at\\s+|named\\s+)?${PATH}`, 'i').exec(frag);
+    const a = new RegExp(`^[\s\\d.)*>#-]*(?:create|write|generate|author)\s+(?:the\s+|a\s+|an\s+|new\s+|single\s+|plain-text\s+|deliverable\s+|as\s+)*(?:file\s+)?(?:at\s+|named\s+)?${PATH}`, 'i').exec(frag);
     if (a) out.push(a[1]);
-    const b = new RegExp(`\\bdeliverable\\s+is\\s+(?:exactly\\s+)?(?:the\\s+|one\\s+)?(?:\\w+\\s+){0,3}?(?:file\\s+)?${PATH}`, 'i').exec(frag);
+    const b = new RegExp(`\bdeliverable\s+is\s+(?:exactly\s+)?(?:the\s+|one\s+)?(?:\w+\s+){0,3}?(?:file\s+)?${PATH}`, 'i').exec(frag);
     if (b) out.push(b[1]);
   }
   return out;
@@ -623,11 +623,27 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
       // Pure docs task: no code signals, diff matches declared docs -> pass
       return null;
     }
+    // Mixed task (code + docs) that only produced docs: provide specific feedback about missing code
     if (taskWantsCodeFromText(rawText, combined) && !isCreatedDocDeliverable(task, planText, rawText, files)) {
+      // Identify what code the task asked for but the diff didn't include
+      const declaredFiles = extractDeclaredFiles(rawText);
+      const declaredCodePaths = declaredFiles ? declaredFiles.filter((p) => !isDocPath(p)) : [];
+      const codeImperativeTargets = scanForCodeSignals(rawText).tripping
+        .filter((sen) => opensWithImperative(sen))
+        .map((sen) => {
+          const m = /\b(?:in|into|to|inside|within)\s+(?:the\s+|its\s+|a\s+)?([\w.-]+\/[\w.-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css))\b/i.exec(sen);
+          return m ? m[1] : null;
+        })
+        .filter(Boolean);
+      const missingCode = [...new Set([...declaredCodePaths, ...codeImperativeTargets])];
+      const feedbackBase = `Your diff only created/edited documentation (${files.map((f) => f.path).join(', ')}). That is not the deliverable -- the task asks for a real code change. ${PLAN_TARGETS_HINT}. A doc/ADR, if the task asks for one at all, comes LAST, after the code is written and checked.`;
+      const specificFeedback = missingCode.length > 0
+        ? ` The task mentions these code paths that your diff should include: ${missingCode.join(', ')}.`
+        : '';
       return {
         code: 'docs-only',
         reason: `diff only touches documentation (${files.map((f) => f.path).join(', ')}) -- the task asks for a code change`,
-        retryFeedback: `Your diff only created/edited documentation (${files.map((f) => f.path).join(', ')}). That is not the deliverable -- the task asks for a real code change. ${PLAN_TARGETS_HINT}. A doc/ADR, if the task asks for one at all, comes LAST, after the code is written and checked.`,
+        retryFeedback: `${feedbackBase}${specificFeedback}`,
       };
     }
   }
