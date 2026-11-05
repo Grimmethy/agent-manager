@@ -133,7 +133,6 @@ function severityForTab(tabKey, count) {
 // Docs/hub-tasks-extraction-plan.md section 5) -- the redirect needs the real leave/enter
 // semantics, not just an activeTab assignment, so it reuses this instead of duplicating it.
 function switchToTab(key) {
-  if (activeTab === 'brain-dump' && key !== 'brain-dump') leaveBrainDumpTab();
   if (activeTab === 'branches' && key !== 'branches') leaveBranchesTab();
   if (activeTab === 'hygiene' && key !== 'hygiene') leaveHygieneTab();
   bumpRenderGeneration(); // any in-flight render for the tab being left is now stale

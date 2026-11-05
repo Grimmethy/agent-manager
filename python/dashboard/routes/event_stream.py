@@ -26,6 +26,7 @@ def _providers():
             "discovery-changed": event_stream.dir_files_fact(lambda: [], _discovery_files),
             "plugin-states-changed": (_plugin_states, PLUGIN_STATES_INTERVAL_S),
             "pipeline-state-changed": (_pipeline_state, PIPELINE_STATE_INTERVAL_S),
+            "brain-dump-changed": event_stream.dir_files_fact(lambda: [], _brain_dump_files),
             "settings-changed": event_stream.dir_files_fact(lambda: [], _settings_files),
             "benchmark-changed": event_stream.dir_files_fact(_benchmark_specs, subdirs=True),
             "worker-panels-changed": event_stream.dir_files_fact(_panel_specs, _panel_files), "memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), re.sub(r"\d+", "#", str(d.get("reason") or ""))))}
@@ -84,6 +85,13 @@ def _reports_specs():
     from routes.reports import _reports_root
     root = _reports_root()
     return [(str(root / period), re.compile(r"\.md$")) for period in _REPORT_PERIODS] if root else []
+
+
+def _brain_dump_files():
+    """The one file the Brain Dump tab shows: brain-dump.json of the active project (the path is resolved on every pass; None, a missing file or no active project contributes nothing).
+    Whoever writes an entry (the tab, the chat, a pipeline sweep, a hand edit) replaces or grows the file, so its stat key moves and the open tab is told."""
+    from app import brain_dump_path
+    return [brain_dump_path()]
 
 
 def _pipeline_state(full=False):

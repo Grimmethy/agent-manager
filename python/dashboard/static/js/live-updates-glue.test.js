@@ -191,3 +191,32 @@ test('the Project tab has no timer of its own and core no longer calls a leavePr
   const core = fs.readFileSync(path.join(__dirname, 'core-ui.js'), 'utf8');
   assert.doesNotMatch(core, /leaveProjectTab/);
 });
+
+test('applyLivePlan: a panels plan refreshes the Brain Dump entry list UNFORCED, and only for that tab', async () => {
+  const { ctx, calls } = load({ activeTab: 'brain-dump' });
+  ctx.refreshBrainDumpEntries = async (...a) => { calls.push(['entries:' + JSON.stringify(a)]); };
+  ctx.refreshPipelineStatus = async () => { calls.push(['pipeline-panel']); };
+  await ctx.applyLivePlan({ summary: false, plugins: false, nav: false, main: false, branches: false, panels: true });
+  assert.deepEqual(names(calls), ['entries:[]']);                          // no argument: the entry list keeps its guard against an open edit or discussion
+  const other = load({ activeTab: 'pending' });
+  other.ctx.refreshBrainDumpEntries = async () => { other.calls.push(['entries']); };
+  await other.ctx.applyLivePlan({ summary: false, plugins: false, nav: false, main: false, branches: false, panels: true });
+  assert.deepEqual(other.calls, []);
+});
+
+test('startPageLiveUpdates: brain-dump-changed refreshes the open Brain Dump tab and no interval is started', async () => {
+  const { ctx, calls, timers } = load({ activeTab: 'brain-dump' });
+  ctx.refreshBrainDumpEntries = async () => { calls.push(['entries']); };
+  ctx.startPageLiveUpdates();
+  assert.equal(timers.length, 0);
+  FakeEventSource.last.emit('brain-dump-changed');
+  await settle();
+  assert.deepEqual(names(calls), ['entries']);
+});
+
+test('the Brain Dump tab has no timer, no interval variable and core has no leaveBrainDumpTab hook', () => {
+  const tab = fs.readFileSync(path.join(__dirname, 'brain-dump-and-second-brain.js'), 'utf8');
+  assert.doesNotMatch(tab, /setInterval|brainDumpEntriesInterval|leaveBrainDumpTab\(\)/);
+  assert.doesNotMatch(fs.readFileSync(path.join(__dirname, 'core-ui.js'), 'utf8'), /leaveBrainDumpTab/);
+  assert.doesNotMatch(fs.readFileSync(path.join(__dirname, '..', '..', 'templates', 'index.html'), 'utf8'), /brainDumpEntriesInterval/);
+});
