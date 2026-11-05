@@ -42,11 +42,11 @@ function harness(over = {}) {
 }
 
 test('counts-changed: summary and nav always, a redraw only for a queue tab', () => {
-  assert.deepEqual(lu.planForEvent('counts-changed', 'pending'), plan({ summary: true, nav: true, main: true }));
-  assert.deepEqual(lu.planForEvent('counts-changed', 'blocked'), plan({ summary: true, nav: true, main: true }));
-  assert.deepEqual(lu.planForEvent('counts-changed', 'workers'), plan({ summary: true, nav: true, main: true }));      // the Workers tab lists completed tasks
-  assert.deepEqual(lu.planForEvent('counts-changed', 'project'), plan({ summary: true, nav: true }));
-  assert.deepEqual(lu.planForEvent('counts-changed', 'myplugin', (t) => t === 'myplugin'), plan({ summary: true, nav: true }));
+  assert.deepEqual(lu.planForEvent('counts-changed', 'pending'), plan({ modal: true, summary: true, nav: true, main: true }));
+  assert.deepEqual(lu.planForEvent('counts-changed', 'blocked'), plan({ modal: true, summary: true, nav: true, main: true }));
+  assert.deepEqual(lu.planForEvent('counts-changed', 'workers'), plan({ modal: true, summary: true, nav: true, main: true }));      // the Workers tab lists completed tasks
+  assert.deepEqual(lu.planForEvent('counts-changed', 'project'), plan({ modal: true, summary: true, nav: true }));
+  assert.deepEqual(lu.planForEvent('counts-changed', 'myplugin', (t) => t === 'myplugin'), plan({ modal: true, summary: true, nav: true }));
 });
 
 test('a queue tab that is also self-rendering is never redrawn', () => {
@@ -121,7 +121,7 @@ test('the Hygiene inventory reloads on hygiene-changed, counts-changed and branc
   assert.ok(lu.LIVE_EVENTS.includes('hygiene-changed'));
   for (const ev of ['memory-changed', 'workers-changed', 'brain-dump-changed']) assert.equal(lu.planForEvent(ev, 'hygiene').panels, false, ev);
   // the other plan keys of those events are unchanged by the Hygiene panel
-  assert.deepEqual(lu.planForEvent('counts-changed', 'hygiene'), plan({ summary: true, nav: true, panels: true }));
+  assert.deepEqual(lu.planForEvent('counts-changed', 'hygiene'), plan({ modal: true, summary: true, nav: true, panels: true }));
   assert.deepEqual(lu.planForEvent('branches-changed', 'branches'), plan({ branches: true, kick: true }));
 });
 
@@ -147,6 +147,19 @@ test('plans merge and empty-check the panels key', () => {
   assert.equal(lu.isEmptyPlan(lu.NO_PLAN), true);
 });
 
+test('task-records-changed, counts-changed and the snapshot refresh the open task modal; other events never do', () => {
+  assert.deepEqual(lu.planForEvent('task-records-changed', 'pending'), plan({ modal: true }));
+  assert.deepEqual(lu.planForEvent('task-records-changed', 'workers'), plan({ modal: true }));
+  for (const tab of ['pending', 'project', 'branches']) {
+    for (const ev of ['counts-changed', 'snapshot', 'project-changed']) assert.equal(lu.planForEvent(ev, tab).modal, true, ev + ' ' + tab);
+  }
+  for (const ev of ['memory-changed', 'workers-changed', 'branches-changed', 'plugins-changed', 'hygiene-changed', 'brain-dump-changed', 'branch-list-changed', 'hardware-changed']) assert.equal(lu.planForEvent(ev, 'pending').modal, false, ev);
+  assert.ok(lu.LIVE_EVENTS.includes('task-records-changed'));
+  assert.equal(lu.mergePlans(plan({}), plan({ modal: true })).modal, true);
+  assert.equal(lu.mergePlans(plan({ modal: true }), plan({})).modal, true);
+  assert.equal(lu.isEmptyPlan(plan({ modal: true })), false);
+});
+
 test('benchmark-changed redraws only the Models tab', () => {
   assert.deepEqual(lu.planForEvent('benchmark-changed', 'models'), plan({ main: true }));
   for (const tab of ['pending', 'workers', 'joblist', 'hardware']) assert.deepEqual(lu.planForEvent('benchmark-changed', tab), lu.NO_PLAN, tab);
@@ -154,8 +167,8 @@ test('benchmark-changed redraws only the Models tab', () => {
 });
 
 test('counts-changed also redraws the Workers, Adhoc and Job List tabs', () => {
-  for (const tab of ['workers', 'adhoc', 'joblist', 'discovery']) assert.deepEqual(lu.planForEvent('counts-changed', tab), plan({ summary: true, nav: true, main: true }), tab);
-  assert.deepEqual(lu.planForEvent('counts-changed', 'deepdive'), plan({ summary: true, nav: true }));
+  for (const tab of ['workers', 'adhoc', 'joblist', 'discovery']) assert.deepEqual(lu.planForEvent('counts-changed', tab), plan({ modal: true, summary: true, nav: true, main: true }), tab);
+  assert.deepEqual(lu.planForEvent('counts-changed', 'deepdive'), plan({ modal: true, summary: true, nav: true }));
   assert.deepEqual([...lu.COUNT_DRIVEN_TABS], ['workers', 'adhoc', 'joblist', 'discovery']);
   assert.deepEqual([...lu.PANEL_DRIVEN_TABS], ['workers', 'joblist', 'models']);
   assert.deepEqual([...lu.SETTINGS_DRIVEN_TABS], ['joblist', 'models']);
@@ -168,7 +181,7 @@ test('branch-list-changed re-reads the cached list on the Branches tab WITHOUT a
 });
 
 test('counts-changed and branches-changed on the Branches tab ask the server to look now; other tabs never kick', () => {
-  assert.deepEqual(lu.planForEvent('counts-changed', 'branches'), plan({ summary: true, nav: true, branches: true, kick: true }));
+  assert.deepEqual(lu.planForEvent('counts-changed', 'branches'), plan({ modal: true, summary: true, nav: true, branches: true, kick: true }));
   for (const ev of ['counts-changed', 'branches-changed']) {
     for (const tab of ['pending', 'project', 'hygiene', 'workers', 'brain-dump']) assert.equal(lu.planForEvent(ev, tab).kick, false, ev + ' ' + tab);
   }
@@ -185,9 +198,9 @@ test('branches-changed refreshes only the Branches tab', () => {
 
 test('snapshot and project-changed refresh everything the active tab allows', () => {
   for (const name of ['snapshot', 'project-changed']) {
-    assert.deepEqual(lu.planForEvent(name, 'pending'), plan({ summary: true, plugins: true, nav: true, main: true }));
-    assert.deepEqual(lu.planForEvent(name, 'project'), plan({ summary: true, plugins: true, nav: true, panels: true }));
-    assert.deepEqual(lu.planForEvent(name, 'branches'), plan({ summary: true, plugins: true, nav: true, branches: true }));
+    assert.deepEqual(lu.planForEvent(name, 'pending'), plan({ modal: true, summary: true, plugins: true, nav: true, main: true }));
+    assert.deepEqual(lu.planForEvent(name, 'project'), plan({ modal: true, summary: true, plugins: true, nav: true, panels: true }));
+    assert.deepEqual(lu.planForEvent(name, 'branches'), plan({ modal: true, summary: true, plugins: true, nav: true, branches: true }));
   }
 });
 
@@ -258,7 +271,7 @@ test('an event applies its plan for the active tab', async () => {
   const h = harness({ tab: 'pending' });
   FakeEventSource.last.emit('counts-changed');
   await new Promise((r) => setImmediate(r));
-  assert.deepEqual(h.applied, [plan({ summary: true, nav: true, main: true })]);
+  assert.deepEqual(h.applied, [plan({ modal: true, summary: true, nav: true, main: true })]);
 });
 
 test('an event with nothing to do for this tab applies nothing', async () => {
@@ -287,7 +300,7 @@ test('events that arrive while a plan is being applied are merged and applied af
   release();
   await new Promise((r) => setTimeout(r, 10));
   assert.equal(seen.length, 2);
-  assert.deepEqual(seen[1], plan({ summary: true, plugins: true, nav: true, main: true }));
+  assert.deepEqual(seen[1], plan({ modal: true, summary: true, plugins: true, nav: true, main: true }));
   assert.equal(maxActive, 1);
   assert.equal(h.live.state().running, false);
 });
