@@ -205,7 +205,7 @@ test('workers-tab.js fetches, renders and wires the cards, app.py registers the 
   assert.match(tab, /fetchJson\('\/api\/pipeline-ops-workers'\)\.catch\(\(\) => null\)/);
   assert.match(tab, /renderPipelineOpsWorkersSection\(pipelineOpsWorkers\)/);
   // the call is its own term of the concatenation, not the else branch of the context cards' ternary (found in the real browser: the cards were dropped whenever the context renderer existed)
-  assert.match(tab, /renderContextWorkerSection\(contextMapWorker, contextMemoryWorker\) : ''\) \+ \(typeof renderPipelineOpsWorkersSection === 'function' \? renderPipelineOpsWorkersSection\(pipelineOpsWorkers\) : ''\)/);
+  assert.match(tab, /renderContextWorkerSection\(contextMapWorker, contextMemoryWorker, Date\.now\(\), contextImpactWorker\) : ''\) \+ \(typeof renderPipelineOpsWorkersSection === 'function' \? renderPipelineOpsWorkersSection\(pipelineOpsWorkers\) : ''\)/);
   assert.match(tab, /if \(typeof wirePipelineOpsWorkerSwitch === 'function'\) wirePipelineOpsWorkerSwitch\(main\);/);
   assert.match(tab, /if \(typeof wirePipelineOpsWorkerExpand === 'function'\) wirePipelineOpsWorkerExpand\(main, renderWorkers\);/);
   const html = fs.readFileSync(path.join(__dirname, '..', '..', 'templates', 'index.html'), 'utf8');
