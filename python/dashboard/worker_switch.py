@@ -11,8 +11,17 @@ WORKER_ID_RE = re.compile(r"^worker-[a-z0-9]+$")
 
 
 def is_switchable(instance_id) -> bool:
-    """Only worker lanes (worker-<letters or digits>) have a switch; reviewers and the watchdog do not."""
-    return isinstance(instance_id, str) and bool(WORKER_ID_RE.match(instance_id))
+    """Only worker lanes (worker-<letters or digits>) have a switch; reviewers and the watchdog do not. fullmatch: the same rule as the node check (no trailing newline slips through)."""
+    return isinstance(instance_id, str) and bool(WORKER_ID_RE.fullmatch(instance_id))
+
+
+def switch_dir() -> str:
+    """The marker directory, by the same rule as src/worker-switch.js switchDir(): AGENT_MANAGER_DISABLED_WORKERS_DIR, else $HOME/.local/state/agent-manager/disabled-workers."""
+    override = str(os.environ.get("AGENT_MANAGER_DISABLED_WORKERS_DIR") or "").strip()
+    if override:
+        return override
+    home = os.path.expanduser("~")          # $HOME first, then the password database: the same order node's env.HOME || os.homedir() uses
+    return os.path.join(home, ".local", "state", "agent-manager", "disabled-workers")
 
 
 def _run(*args):
@@ -20,14 +29,12 @@ def _run(*args):
 
 
 def disabled_workers() -> set:
-    """The ids currently switched off. Fails open (an empty set) when node or the directory cannot be read: a broken switch must never hide the Workers tab."""
+    """The ids currently switched off. READ-ONLY and in-process: one directory listing, no `node` start (the Workers tab asks on every redraw, and a node start took seconds when the
+    shared disk was busy: /api/instances measured 9 to 15 s on 2026-11-04). The marker-file RULE still lives once, in src/worker-switch.js (it also decides is-disabled for the bash worker and
+    does every WRITE); this is only its `list` command, with a parity test. Fails open (an empty set) when the directory cannot be read: a broken switch must never hide the Workers tab."""
     try:
-        r = _run("list")
-        if r.returncode != 0:
-            return set()
-        import json
-        return {i for i in json.loads(r.stdout) if is_switchable(i)}
-    except (OSError, subprocess.SubprocessError, ValueError):
+        return {name for name in os.listdir(switch_dir()) if is_switchable(name)}
+    except OSError:
         return set()
 
 
