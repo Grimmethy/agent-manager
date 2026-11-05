@@ -312,6 +312,12 @@ class Impact(unittest.TestCase):
         self.assertEqual(build("impact", rows=rows)["impact"]["filedCount"], 0)
         self.assertEqual(build("impact", rows=rows + raw("on", 100, listed))["impact"]["filedCount"], 1)
 
+    def test_a_dry_run_decision_with_filed_tasks_never_counts_them(self):
+        # Raw rows on purpose: pair() would set executed:false on dry-run, hiding the mode check.
+        rows = [{"kind": "intent", "at": ISO(400), "loop": "impact", "item": "context-impact", "outcome": "FILE-FINDING", "detail": {"mode": "dry-run"}},
+                {"kind": "result", "at": ISO(300), "loop": "impact", "item": "context-impact", "outcome": "FILE-FINDING", "detail": {"filed": [{"gauge": "g", "taskId": "task-1"}]}}]
+        self.assertEqual(build("impact", rows=rows)["impact"]["filedCount"], 0)
+
     def test_only_the_ten_newest_filed_tasks_are_listed_but_all_are_counted(self):
         rows = []
         for i in range(12):
