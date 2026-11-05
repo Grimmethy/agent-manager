@@ -1051,3 +1051,37 @@ test('docs-only: a created-document task whose declared targets include a code f
   const t = adhoc(`${AUDIT_TASK}\nFiles: docs/audit-batch-write-bypass-2026-10-02.md, src/product-spec-to-hub.js`);
   assert.equal(adhocDiffSubstanceProblem(t, createDiff('docs/audit-batch-write-bypass-2026-10-02.md')).code, 'docs-only');
 });
+
+// HUB0340 4/4: comprehensive test coverage for docs-only gate acceptance criteria
+test('docs-only gate AC1: README-only task with README-only diff passes', () => {
+  const t = adhoc('Update the README to clarify the installation prerequisites for the Python runtime.');
+  const p = adhocDiffSubstanceProblem(t, editDiff('README.md'));
+  assert.equal(p, null, 'a task asking only to update README with a README-only diff must pass');
+});
+
+test('docs-only gate AC2: runbook-only task with runbook-only diff passes', () => {
+  const t = adhoc('Update the runbook under docs/runbook.md to document the new retry policy.');
+  const p = adhocDiffSubstanceProblem(t, editDiff('docs/runbook.md'));
+  assert.equal(p, null, 'a task asking only to update a runbook with a runbook-only diff must pass');
+});
+
+test('docs-only gate AC3: code-change task with docs-only diff is rejected', () => {
+  const t = adhoc('Implement the new task source in src/task-sources.js to support the GitHub integration.');
+  const p = adhocDiffSubstanceProblem(t, createDiff('docs/adr/0042-task-source.md'));
+  assert.equal(p.code, 'docs-only', 'a code task with only a docs diff must be rejected with docs-only');
+  assert.match(p.retryFeedback, /only created\/edited documentation/);
+});
+
+test('docs-only gate AC4: mixed code+docs task with docs-only diff is rejected', () => {
+  const t = adhoc('Implement the new endpoint in src/api/routes.js and write an ADR in docs/adr/ explaining the design.');
+  const p = adhocDiffSubstanceProblem(t, createDiff('docs/adr/0043-endpoint-design.md'));
+  assert.equal(p.code, 'docs-only', 'a mixed task with only a docs diff must be rejected with docs-only');
+  assert.match(p.retryFeedback, /only created\/edited documentation/);
+});
+
+test('docs-only gate AC5: code+docs in same sentence with docs-only diff is rejected', () => {
+  const t = adhoc('Implement the new helper in src/utils.js and document it in the API reference.');
+  const p = adhocDiffSubstanceProblem(t, createDiff('docs/api-reference.md'));
+  assert.equal(p.code, 'docs-only', 'a task mentioning both code and docs in the same sentence with only a docs diff must be rejected');
+  assert.match(p.retryFeedback, /only created\/edited documentation/);
+});
