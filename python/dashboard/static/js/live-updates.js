@@ -8,6 +8,7 @@
 //   workers-changed   a worker's status / pass / task changed           -> redraw the Workers tab
 //   branches-changed  a verdict was recorded or a branch merged          -> refresh the Branches tab
 //   plugins-changed   plugins.json changed                               -> re-sync the plugin tabs, redraw the Plugins tab
+//   plugin-states-changed  a plugin process started, stopped or restarted, or its checkout moved (the "restart needed" flag) -> redraw the Plugins tab
 //   memory-changed    the host-memory chip's state or reason changed     -> refresh /api/summary (the chip)
 //   worker-panels-changed  a ledger, index, on/off marker, the cloud spend ledger or the model-stats database a Workers-tab panel reads changed -> redraw the Workers and Job List tabs
 //   settings-changed  agent-manager.env, dashboard-settings.json or the lanes registry changed (the Job List's allowlist, priorities, approval modes; the Models tab's lane models) -> redraw the Job List and Models tabs
@@ -22,14 +23,14 @@
 // If the stream is unavailable (the server answers 404, EventSource gives up) the page falls back to the old 5 s full refresh until it is reloaded.
 
 const LIVE_STREAM_URL = '/api/stream';
-const LIVE_EVENTS = ['snapshot', 'counts-changed', 'workers-changed', 'branches-changed', 'plugins-changed', 'memory-changed', 'worker-panels-changed', 'settings-changed', 'benchmark-changed', 'hardware-changed', 'tokenfold-changed', 'reports-changed', 'discovery-changed', 'project-changed'];
+const LIVE_EVENTS = ['snapshot', 'counts-changed', 'workers-changed', 'branches-changed', 'plugins-changed', 'plugin-states-changed', 'memory-changed', 'worker-panels-changed', 'settings-changed', 'benchmark-changed', 'hardware-changed', 'tokenfold-changed', 'reports-changed', 'discovery-changed', 'project-changed'];
 const TRANSITIONAL_POLL_MS = 5000;
 // Tabs that manage their own rendering and are never redrawn by a refresh (they keep a half-typed note, an iframe, an open folder, a click in flight).
 const SELF_RENDERING_TABS = ['project', 'brain-dump', 'filed', 'hygiene', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'];
 // Every tab with its own renderer; anything else is a plain queue-state tab (renderQueueTab), whose content is exactly what counts-changed announces.
 const NON_QUEUE_TABS = ['workers', 'hardware', 'models', 'joblist', 'plugins', 'deepdive', 'discovery', 'branches', 'reports', 'tokenfold', 'promptforge', 'adforge',
   'scriptforge', 'adhoc', 'concepts', 'filed', 'hygiene', 'project', 'brain-dump'];
-const TRANSITIONAL_POLLED_TABS = ['plugins'];
+const TRANSITIONAL_POLLED_TABS = [];
 
 // Tabs that show data derived from what each event announces, beyond the queue-state tabs: the completed-task and queue-record lists (counts-changed), the workers' ledgers, indexes and the
 // model-stats database (worker-panels-changed: the Job List's performed counters and turn statistics), and the settings files (settings-changed: the Job List's allowlist and priorities).
@@ -69,6 +70,9 @@ function planForEvent(name, tab, isPluginTab) {
       break;
     case 'plugins-changed':
       plan.plugins = plan.nav = true;
+      plan.main = tab === 'plugins';
+      break;
+    case 'plugin-states-changed':
       plan.main = tab === 'plugins';
       break;
     case 'workers-changed':

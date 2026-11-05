@@ -95,6 +95,12 @@ test('discovery-changed redraws only the Deep Dive and Discovery tabs', () => {
   assert.deepEqual([...lu.DISCOVERY_DRIVEN_TABS], ['deepdive', 'discovery']);
 });
 
+test('plugin-states-changed redraws only the Plugins tab and touches no nav or summary', () => {
+  assert.deepEqual(lu.planForEvent('plugin-states-changed', 'plugins'), plan({ main: true }));
+  for (const tab of ['pending', 'workers', 'models', 'deepdive', 'branches']) assert.deepEqual(lu.planForEvent('plugin-states-changed', tab), lu.NO_PLAN, tab);
+  assert.ok(lu.LIVE_EVENTS.includes('plugin-states-changed'));
+});
+
 test('benchmark-changed redraws only the Models tab', () => {
   assert.deepEqual(lu.planForEvent('benchmark-changed', 'models'), plan({ main: true }));
   for (const tab of ['pending', 'workers', 'joblist', 'hardware']) assert.deepEqual(lu.planForEvent('benchmark-changed', tab), lu.NO_PLAN, tab);
@@ -146,7 +152,8 @@ test('a plugin that replaces a self-rendering tab (an iframe) is never put on th
 });
 
 test('the transitional list is exactly the tabs that have no events yet', () => {
-  assert.deepEqual(lu.TRANSITIONAL_POLLED_TABS, ['plugins']);
+  assert.deepEqual(lu.TRANSITIONAL_POLLED_TABS, []);
+  assert.equal(lu.transitionalPollDue('plugins'), false);
   for (const t of lu.TRANSITIONAL_POLLED_TABS) assert.equal(lu.transitionalPollDue(t), true, t);
   for (const t of ['pending', 'blocked', 'done']) assert.equal(lu.transitionalPollDue(t), false, t);
   for (const t of lu.SELF_RENDERING_TABS) assert.equal(lu.transitionalPollDue(t), false, t);
@@ -256,15 +263,18 @@ test('a constructor that throws goes to the fallback', () => {
   assert.equal(h.live.state().fallback, true);
 });
 
-test('the transitional timer redraws only while the active tab still depends on it', async () => {
-  const h = harness({ tab: 'pending' });
+test('the transitional timer redraws only while the active tab still depends on it (now only a plugin-owned tab)', async () => {
+  const h = harness({ tab: 'pending', isPluginTab: (t) => t === 'myplugin' });
   h.fire(0);
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(h.applied, []);
-  h.setTab('plugins');
+  h.setTab('myplugin');
   h.fire(0);
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(h.applied, [plan({ main: true })]);
+  h.setTab('plugins');                                   // the Plugins tab has events now: the timer leaves it alone
+  h.fire(0);
+  await new Promise((r) => setImmediate(r));
   h.setTab('project');
   h.fire(0);
   await new Promise((r) => setImmediate(r));
