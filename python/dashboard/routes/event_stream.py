@@ -156,6 +156,23 @@ def _panel_files():
     return [db, (str(db) + "-wal") if db else None]
 
 
+@event_stream_bp.route("/api/plugins/<name>/announce", methods=["POST"])
+def api_plugin_announce(name):
+    """A plugin tells the dashboard that what its tab shows changed (ADR-0024: the writer announces). The open tab of THAT plugin redraws; nothing else does.
+    The name must be a plugin of the manifest, so the request cannot invent events or target a tab that is not a plugin's."""
+    from app import _read_plugins_manifest
+    if not event_stream.enabled():
+        return jsonify({"enabled": False}), 404
+    try:
+        known = {str(p.get("name")) for p in _read_plugins_manifest() if isinstance(p, dict)}
+    except Exception:
+        known = set()
+    if name not in known:
+        return jsonify({"ok": False, "error": "unknown plugin"}), 404
+    hub = event_stream.get_hub(_resolve, _providers())
+    return jsonify({"ok": True, "plugin": name, "seq": hub.announce("plugin-changed", plugin=name)})
+
+
 @event_stream_bp.route("/api/stream")
 def api_stream():
     if not event_stream.enabled():
