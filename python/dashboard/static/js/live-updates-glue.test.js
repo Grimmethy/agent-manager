@@ -10,7 +10,7 @@ const vm = require('node:vm');
 class FakeEventSource {
   constructor(url) { this.url = url; this.listeners = {}; this.readyState = 0; FakeEventSource.last = this; }
   addEventListener(n, f) { (this.listeners[n] = this.listeners[n] || []).push(f); }
-  emit(n) { (this.listeners[n] || []).forEach((f) => f({})); }
+  emit(n, d) { (this.listeners[n] || []).forEach((f) => f(d === undefined ? {} : { data: JSON.stringify(d) })); }
   close() { this.readyState = 2; }
 }
 
@@ -118,26 +118,31 @@ test('startPageLiveUpdates: when the stream is closed the fallback timer runs th
   FakeEventSource.last.readyState = 2;
   FakeEventSource.last.emit('error');
   assert.equal(status.textContent, 'disconnected (polling)');
-  assert.equal(timers.length, 2);
-  timers[1].fn();
+  assert.equal(timers.length, 1);
+  timers[0].fn();
   await settle();
   assert.deepEqual(names(calls), ['fetch:/api/summary', 'chip', 'sync', 'redirect?', 'nav', 'main']);
 });
 
-test('startPageLiveUpdates: a plugin-owned active tab is redrawn by the transitional timer', async () => {
+test('startPageLiveUpdates: a plugin announcement redraws the active tab of that plugin through the guard, nothing else does', async () => {
   const { ctx, calls, timers } = load({ activeTab: 'myplugin' });
-  ctx.findTabByKey = (k) => (k === 'myplugin' ? { key: k, pluginScript: 'x.js' } : null);
+  ctx.findTabByKey = (k) => (k === 'myplugin' ? { key: k, pluginScript: 'x.js', pluginName: 'my-plugin' } : null);
   ctx.startPageLiveUpdates();
-  timers[0].fn();
+  assert.equal(timers.length, 0);                                    // no interval is started at all while the stream is open
+  FakeEventSource.last.emit('plugin-changed', { plugin: 'other-plugin' });
+  await settle();
+  assert.deepEqual(calls, []);
+  FakeEventSource.last.emit('plugin-changed', { plugin: 'my-plugin' });
   await settle();
   assert.deepEqual(names(calls), ['main']);
 });
 
-test('startPageLiveUpdates: a queue tab is not redrawn by the transitional timer', async () => {
+test('startPageLiveUpdates: a queue tab has no owner plugin and no timer', async () => {
   const { ctx, calls, timers } = load({ activeTab: 'pending' });
   ctx.findTabByKey = () => null;
   ctx.startPageLiveUpdates();
-  timers[0].fn();
+  assert.equal(timers.length, 0);
+  FakeEventSource.last.emit('plugin-changed', { plugin: 'my-plugin' });
   await settle();
   assert.deepEqual(calls, []);
 });

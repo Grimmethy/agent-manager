@@ -27,6 +27,7 @@ import time
 import urllib.request
 from collections import deque
 
+ANNOUNCE_EVENTS = ("plugin-changed",)     # events a writer announces itself (Hub.announce), not derived from a file by the watcher
 EVENT_NAMES = ("counts-changed", "workers-changed", "branches-changed", "plugins-changed", "project-changed")
 WATCH_S = 1.0
 RECONCILE_S = 60.0
@@ -274,6 +275,18 @@ class Hub:
                 self._ring.append({"id": self._seq, "event": name, "data": {"seq": self._seq, "why": why}})
                 self._gen[name] = self._gen.get(name, 0) + 1
             self._cond.notify_all()
+
+    def announce(self, name, **data):
+        """A WRITER's own announcement (ADR-0024: the party that changes something says so). Only the names in ANNOUNCE_EVENTS are accepted, so a request cannot invent an event;
+        `data` rides along (the plugin's name) under the hub's own `seq` and `why`. Works whether or not a client is connected (the ring replays it). Returns the sequence number."""
+        if name not in ANNOUNCE_EVENTS:
+            raise ValueError("not an announceable event: %r" % (name,))
+        with self._cond:
+            self._seq += 1
+            self._ring.append({"id": self._seq, "event": name, "data": {**data, "seq": self._seq, "why": "announce"}})
+            self._gen[name] = self._gen.get(name, 0) + 1
+            self._cond.notify_all()
+            return self._seq
 
     def poll_once(self, full=False):
         """One watcher pass -> the list of event names announced. The first pass only records the baseline (a client's snapshot covers it)."""

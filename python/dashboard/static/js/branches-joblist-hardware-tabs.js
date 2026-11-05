@@ -1172,6 +1172,7 @@ function startPageLiveUpdates() {
     poll: refresh,
     getTab: () => activeTab,
     isPluginTab: (tab) => { const t = typeof findTabByKey === 'function' ? findTabByKey(tab) : null; return !!(t && t.pluginScript); },
+    pluginNameOf: (tab) => { const t = typeof findTabByKey === 'function' ? findTabByKey(tab) : null; return (t && t.pluginScript && typeof t.pluginName === 'string') ? t.pluginName : null; },
     setStatus: (text) => { document.getElementById('pipeline-status').textContent = text; },
   });
 }

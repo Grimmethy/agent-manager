@@ -18,19 +18,19 @@
 //   discovery-changed the project-search index, the deep-dive or community coverage file or the architecture candidates document changed -> redraw the Deep Dive and Discovery tabs
 //   project-changed / snapshot   the pipeline changed, or this page just (re)connected -> refresh everything
 //
-// TRANSITIONAL: a tab whose data has no event yet keeps a redraw timer WHILE IT IS THE ACTIVE TAB (TRANSITIONAL_POLLED_TABS and every plugin-owned tab). The list is the
-// work still to do: each later piece gives a tab its events and removes it from the list, and the build ends when the list is empty and the timer is gone.
+//   plugin-changed   a plugin announced (POST /api/plugins/<name>/announce) that what its tab shows changed -> redraw the open tab of THAT plugin only
+//
+// No tab has a redraw timer. A plugin-owned tab is redrawn when its plugin announces a change (the writer announces, ADR-0024); until a plugin does, its tab shows what it drew when it was opened.
 // If the stream is unavailable (the server answers 404, EventSource gives up) the page falls back to the old 5 s full refresh until it is reloaded.
 
 const LIVE_STREAM_URL = '/api/stream';
-const LIVE_EVENTS = ['snapshot', 'counts-changed', 'workers-changed', 'branches-changed', 'plugins-changed', 'plugin-states-changed', 'memory-changed', 'worker-panels-changed', 'settings-changed', 'benchmark-changed', 'hardware-changed', 'tokenfold-changed', 'reports-changed', 'discovery-changed', 'project-changed'];
-const TRANSITIONAL_POLL_MS = 5000;
+const LIVE_EVENTS = ['snapshot', 'counts-changed', 'workers-changed', 'branches-changed', 'plugins-changed', 'plugin-states-changed', 'plugin-changed', 'memory-changed', 'worker-panels-changed', 'settings-changed', 'benchmark-changed', 'hardware-changed', 'tokenfold-changed', 'reports-changed', 'discovery-changed', 'project-changed'];
+const FALLBACK_POLL_MS = 5000;                  // the ONLY interval left: the full refresh while the stream is closed
 // Tabs that manage their own rendering and are never redrawn by a refresh (they keep a half-typed note, an iframe, an open folder, a click in flight).
 const SELF_RENDERING_TABS = ['project', 'brain-dump', 'filed', 'hygiene', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'];
 // Every tab with its own renderer; anything else is a plain queue-state tab (renderQueueTab), whose content is exactly what counts-changed announces.
 const NON_QUEUE_TABS = ['workers', 'hardware', 'models', 'joblist', 'plugins', 'deepdive', 'discovery', 'branches', 'reports', 'tokenfold', 'promptforge', 'adforge',
   'scriptforge', 'adhoc', 'concepts', 'filed', 'hygiene', 'project', 'brain-dump'];
-const TRANSITIONAL_POLLED_TABS = [];
 
 // Tabs that show data derived from what each event announces, beyond the queue-state tabs: the completed-task and queue-record lists (counts-changed), the workers' ledgers, indexes and the
 // model-stats database (worker-panels-changed: the Job List's performed counters and turn statistics), and the settings files (settings-changed: the Job List's allowlist and priorities).
@@ -52,7 +52,7 @@ function isQueueTab(tab, isPluginTab) {
 }
 
 // -> what to refresh for one event while `tab` is the active tab. `main` is never true for a self-rendering tab.
-function planForEvent(name, tab, isPluginTab) {
+function planForEvent(name, tab, isPluginTab, data, pluginNameOf) {
   const plan = { ...NO_PLAN };
   switch (name) {
     case 'snapshot':
@@ -74,6 +74,9 @@ function planForEvent(name, tab, isPluginTab) {
       break;
     case 'plugin-states-changed':
       plan.main = tab === 'plugins';
+      break;
+    case 'plugin-changed':                  // a plugin announced that its own data changed: only the open tab of THAT plugin is redrawn
+      plan.main = !isSelfRenderingTab(tab) && typeof pluginNameOf === 'function' && !!data && typeof data.plugin === 'string' && pluginNameOf(tab) === data.plugin;
       break;
     case 'workers-changed':
       plan.main = tab === 'workers';
@@ -114,23 +117,16 @@ function mergePlans(a, b) {
 
 function isEmptyPlan(p) { return !(p.summary || p.plugins || p.nav || p.main || p.branches); }
 
-// True while this tab still depends on the redraw timer (no event announces its data yet).
-function transitionalPollDue(tab, isPluginTab) {
-  if (isSelfRenderingTab(tab)) return false;
-  return TRANSITIONAL_POLLED_TABS.includes(tab) || (typeof isPluginTab === 'function' && !!isPluginTab(tab));
-}
-
 // deps: { EventSource, url?, apply(plan) -> Promise, poll() -> Promise (the old full refresh), getTab(), isPluginTab?(tab), setStatus?(text),
-//         setIntervalFn?, clearIntervalFn?, pollMs? }
+//         pluginNameOf?(tab) -> the plugin that owns a plugin tab or null, setIntervalFn?, clearIntervalFn?, pollMs? }
 // -> { close(), state() }.  Events that arrive while a plan is being applied are merged and applied right after it (nothing is dropped, nothing runs twice at once).
 function startLiveUpdates(deps) {
   const setIntervalFn = deps.setIntervalFn || setInterval;
   const clearIntervalFn = deps.clearIntervalFn || clearInterval;
-  const pollMs = deps.pollMs || TRANSITIONAL_POLL_MS;
+  const pollMs = deps.pollMs || FALLBACK_POLL_MS;
   const status = (text) => { if (deps.setStatus) deps.setStatus(text); };
   let closed = false;
   let fallbackTimer = null;
-  let transitionalTimer = null;
   let running = false;
   let pending = null;
   let stream = null;
@@ -155,7 +151,7 @@ function startLiveUpdates(deps) {
     return drain();
   }
 
-  function onEvent(name) { return schedule(planForEvent(name, deps.getTab(), deps.isPluginTab)); }
+  function onEvent(name, data) { return schedule(planForEvent(name, deps.getTab(), deps.isPluginTab, data, deps.pluginNameOf)); }
 
   function enterFallback() {
     if (fallbackTimer || closed) return;
@@ -175,27 +171,27 @@ function startLiveUpdates(deps) {
       status('disconnected');
       if (stream.readyState === 2) enterFallback();     // CLOSED: the server said no (404) or the browser gave up; the browser keeps retrying while it is CONNECTING
     });
-    for (const name of LIVE_EVENTS) stream.addEventListener(name, () => { onEvent(name); });
+    for (const name of LIVE_EVENTS) {
+      stream.addEventListener(name, (e) => {
+        let data = null;
+        try { data = e && typeof e.data === 'string' ? JSON.parse(e.data) : null; } catch (err) { data = null; }
+        onEvent(name, data);
+      });
+    }
   }
-
-  transitionalTimer = setIntervalFn(() => {
-    if (fallbackTimer) return;                         // the fallback already refreshes everything (after close() the drain loop runs nothing)
-    if (transitionalPollDue(deps.getTab(), deps.isPluginTab)) schedule({ ...NO_PLAN, main: true });
-  }, pollMs);
 
   return {
     close() {
       closed = true;
       if (stream) stream.close();
       if (fallbackTimer) clearIntervalFn(fallbackTimer);
-      if (transitionalTimer) clearIntervalFn(transitionalTimer);
-      fallbackTimer = transitionalTimer = null;
+      fallbackTimer = null;
     },
     state() { return { fallback: !!fallbackTimer, closed, running, pending: !!pending }; },
   };
 }
 
 if (typeof module !== 'undefined') module.exports = {
-  LIVE_STREAM_URL, LIVE_EVENTS, TRANSITIONAL_POLL_MS, SELF_RENDERING_TABS, NON_QUEUE_TABS, TRANSITIONAL_POLLED_TABS, COUNT_DRIVEN_TABS, PANEL_DRIVEN_TABS, SETTINGS_DRIVEN_TABS, BENCHMARK_DRIVEN_TABS, HARDWARE_DRIVEN_TABS, TOKENFOLD_DRIVEN_TABS, REPORTS_DRIVEN_TABS, DISCOVERY_DRIVEN_TABS, NO_PLAN,
-  isSelfRenderingTab, isQueueTab, planForEvent, mergePlans, isEmptyPlan, transitionalPollDue, startLiveUpdates,
+  LIVE_STREAM_URL, LIVE_EVENTS, FALLBACK_POLL_MS, SELF_RENDERING_TABS, NON_QUEUE_TABS, COUNT_DRIVEN_TABS, PANEL_DRIVEN_TABS, SETTINGS_DRIVEN_TABS, BENCHMARK_DRIVEN_TABS, HARDWARE_DRIVEN_TABS, TOKENFOLD_DRIVEN_TABS, REPORTS_DRIVEN_TABS, DISCOVERY_DRIVEN_TABS, NO_PLAN,
+  isSelfRenderingTab, isQueueTab, planForEvent, mergePlans, isEmptyPlan, startLiveUpdates,
 };

@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -550,6 +551,40 @@ class DirFilesFact(Base):
         self.assertEqual(hub.poll_once(), ["worker-panels-changed"])
 
 
+class Announce(Base):
+    def test_a_writers_announcement_is_published_with_its_data_under_the_hubs_own_seq(self):
+        seq = self.hub.announce("plugin-changed", plugin="books")
+        self.assertEqual(seq, 1)
+        self.assertEqual(self.hub.generation("plugin-changed"), 1)
+        events, resync = self.hub.events_after(0, 0)
+        self.assertFalse(resync)
+        self.assertEqual(events, [{"id": 1, "event": "plugin-changed", "data": {"plugin": "books", "seq": 1, "why": "announce"}}])
+        self.assertEqual(self.hub.announce("plugin-changed", plugin="mail"), 2)
+        self.assertEqual(self.hub.generation("plugin-changed"), 2)
+
+    def test_the_data_cannot_overwrite_the_hubs_seq_or_why(self):
+        self.hub.announce("plugin-changed", plugin="books", seq=99, why="evil")
+        self.assertEqual(self.hub._ring[-1]["data"], {"plugin": "books", "seq": 1, "why": "announce"})
+
+    def test_only_announceable_events_are_accepted_and_a_refusal_publishes_nothing(self):
+        for name in ("counts-changed", "snapshot", "", "plugin-changedX", None):
+            with self.assertRaises(ValueError):
+                self.hub.announce(name, plugin="books")
+        self.assertEqual(len(self.hub._ring), 0)
+        self.assertEqual(self.hub.generation("plugin-changed"), 0)
+        self.assertEqual(es.ANNOUNCE_EVENTS, ("plugin-changed",))
+
+    def test_an_announcement_wakes_a_waiting_reader(self):
+        seen = []
+        t = threading.Thread(target=lambda: seen.append(self.hub.events_after(0, 5)))
+        t.start()
+        time.sleep(0.1)
+        self.hub.announce("plugin-changed", plugin="books")
+        t.join(3)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(seen[0][0][0]["event"], "plugin-changed")
+
+
 class Coarse(unittest.TestCase):
     def test_numbers_keep_two_significant_figures(self):
         self.assertEqual(es.coarse(12345), 12000)
@@ -757,6 +792,42 @@ class Route(Base):
         h.start()
         self.addCleanup(h.stop)
         self.hub._thread = mock.Mock(is_alive=lambda: True)
+
+    def test_a_known_plugin_can_announce_and_the_open_stream_receives_it(self):
+        with mock.patch.object(app, "_read_plugins_manifest", lambda: ["junk", {"name": "books"}, {"name": "mail"}]):
+            r = self.client.get("/api/stream", buffered=False)
+            it = iter(r.response)
+            take = lambda: (lambda c: c.decode() if isinstance(c, bytes) else c)(next(it))
+            take()
+            take()                                                           # the retry line and the snapshot
+            a = self.client.post("/api/plugins/books/announce")
+            self.assertEqual(a.status_code, 200)
+            self.assertEqual(a.get_json(), {"ok": True, "plugin": "books", "seq": self.hub._seq})
+            got = ""
+            for _ in range(40):
+                got += take()
+                if "plugin-changed" in got:
+                    break
+            r.close()
+        self.assertIn("event: plugin-changed", got)
+        self.assertIn('"plugin":"books"', got)
+
+    def test_an_unknown_plugin_or_an_unreadable_manifest_publishes_nothing(self):
+        with mock.patch.object(app, "_read_plugins_manifest", lambda: [{"name": "books"}, 7, None]):
+            for name in ("nope", "boo", "Books", "7", "None"):
+                r = self.client.post("/api/plugins/%s/announce" % name)
+                self.assertEqual((r.status_code, r.get_json()), (404, {"ok": False, "error": "unknown plugin"}), name)
+        with mock.patch.object(app, "_read_plugins_manifest", mock.Mock(side_effect=ValueError("boom"))):
+            self.assertEqual(self.client.post("/api/plugins/books/announce").status_code, 404)
+        self.assertEqual(self.hub._seq, 0)
+
+    def test_announce_follows_the_off_switch_and_accepts_post_only(self):
+        with mock.patch.object(app, "_read_plugins_manifest", lambda: [{"name": "books"}]):
+            with mock.patch.dict(os.environ, {"AGENT_MANAGER_EVENT_STREAM": "off"}):
+                r = self.client.post("/api/plugins/books/announce")
+            self.assertEqual((r.status_code, r.get_json()), (404, {"enabled": False}))
+            self.assertEqual(self.client.get("/api/plugins/books/announce").status_code, 405)
+        self.assertEqual(self.hub._seq, 0)
 
     def test_off_switch_answers_404(self):
         with mock.patch.dict(os.environ, {"AGENT_MANAGER_EVENT_STREAM": "off"}):

@@ -11,7 +11,7 @@ const plan = (o) => ({ ...lu.NO_PLAN, ...o });
 class FakeEventSource {
   constructor(url) { this.url = url; this.listeners = {}; this.readyState = 0; this.closed = false; FakeEventSource.last = this; }
   addEventListener(name, fn) { (this.listeners[name] = this.listeners[name] || []).push(fn); }
-  emit(name) { (this.listeners[name] || []).forEach((fn) => fn({ type: name })); }
+  emit(name, data) { (this.listeners[name] || []).forEach((fn) => fn({ type: name, data: data === undefined ? undefined : (typeof data === 'string' ? data : JSON.stringify(data)) })); }
   close() { this.closed = true; this.readyState = 2; }
 }
 
@@ -33,6 +33,7 @@ function harness(over = {}) {
     poll: async () => { polls.push(1); },
     getTab: () => tab,
     isPluginTab: over.isPluginTab,
+    pluginNameOf: over.pluginNameOf,
     setStatus: (t) => statuses.push(t),
     setIntervalFn: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
     clearIntervalFn: (id) => cleared.push(id),
@@ -146,30 +147,41 @@ test('mergePlans keeps every flag from either side', () => {
   }
 });
 
-test('a plugin that replaces a self-rendering tab (an iframe) is never put on the transitional timer', () => {
-  assert.equal(lu.transitionalPollDue('promptforge', () => true), false);
-  assert.equal(lu.transitionalPollDue('project', () => true), false);
+test('plugin-changed redraws only the open tab of the plugin that announced, never a self-rendering tab', () => {
+  const owner = (t) => ({ books: 'books', promptforge: 'promptforge-plugin', other: 'other-plugin' }[t] || null);
+  const ev = (tab, data, fn = owner) => lu.planForEvent('plugin-changed', tab, () => true, data, fn);
+  assert.deepEqual(ev('books', { plugin: 'books' }), plan({ main: true }));
+  assert.deepEqual(ev('other', { plugin: 'books' }), lu.NO_PLAN);                       // another plugin's tab
+  assert.deepEqual(ev('pending', { plugin: 'books' }), lu.NO_PLAN);                      // not a plugin tab at all
+  assert.deepEqual(ev('promptforge', { plugin: 'promptforge-plugin' }), lu.NO_PLAN);     // a self-rendering tab keeps its half-typed state
+  assert.deepEqual(ev('books', null), lu.NO_PLAN);
+  assert.deepEqual(ev('books', {}), lu.NO_PLAN);
+  assert.deepEqual(ev('books', { plugin: 7 }), lu.NO_PLAN);
+  assert.deepEqual(ev('pending', { plugin: null }), lu.NO_PLAN);                         // a tab with no owner (null) must not match an announcement without a name (null)
+  assert.deepEqual(ev('books', { plugin: 'books' }, undefined), plan({ main: true }));   // the default owner function above
+  assert.deepEqual(lu.planForEvent('plugin-changed', 'books', () => true, { plugin: 'books' }), lu.NO_PLAN);   // no pluginNameOf: nothing to match
+  assert.ok(lu.LIVE_EVENTS.includes('plugin-changed'));
 });
 
-test('the transitional list is exactly the tabs that have no events yet', () => {
-  assert.deepEqual(lu.TRANSITIONAL_POLLED_TABS, []);
-  assert.equal(lu.transitionalPollDue('plugins'), false);
-  for (const t of lu.TRANSITIONAL_POLLED_TABS) assert.equal(lu.transitionalPollDue(t), true, t);
-  for (const t of ['pending', 'blocked', 'done']) assert.equal(lu.transitionalPollDue(t), false, t);
-  for (const t of lu.SELF_RENDERING_TABS) assert.equal(lu.transitionalPollDue(t), false, t);
-  assert.equal(lu.transitionalPollDue('myplugin', (x) => x === 'myplugin'), true);
+test('no tab has a redraw timer any more: the transitional list and its helper are gone', () => {
+  assert.equal(lu.TRANSITIONAL_POLLED_TABS, undefined);
+  assert.equal(lu.transitionalPollDue, undefined);
+  assert.equal(lu.TRANSITIONAL_POLL_MS, undefined);
+  assert.equal(lu.FALLBACK_POLL_MS, 5000);
+  const src = fs.readFileSync(path.join(__dirname, 'live-updates.js'), 'utf8');
+  assert.doesNotMatch(src, /transitional/i);
+  assert.equal((src.match(/setIntervalFn\(/g) || []).length, 1);                        // the fallback is the only interval
 });
 
 test('the Workers, Adhoc, Job List, Models, Hardware, TokenFold and Reports tabs no longer need the redraw timer: they have events', () => {
-  for (const tab of ['workers', 'adhoc', 'joblist', 'models', 'hardware', 'tokenfold', 'reports', 'deepdive', 'discovery']) assert.equal(lu.transitionalPollDue(tab), false, tab);
   for (const e of ['hardware-changed', 'tokenfold-changed', 'reports-changed', 'discovery-changed']) assert.ok(lu.LIVE_EVENTS.includes(e), e);
   assert.ok(lu.LIVE_EVENTS.includes('settings-changed'));
   assert.ok(lu.LIVE_EVENTS.includes('benchmark-changed'));
   assert.ok(lu.LIVE_EVENTS.includes('worker-panels-changed'));
 });
 
-test('every transitional or self-rendering tab is a known non-queue tab', () => {
-  for (const t of [...lu.TRANSITIONAL_POLLED_TABS, ...lu.SELF_RENDERING_TABS]) assert.ok(lu.NON_QUEUE_TABS.includes(t), t);
+test('every self-rendering tab is a known non-queue tab', () => {
+  for (const t of lu.SELF_RENDERING_TABS) assert.ok(lu.NON_QUEUE_TABS.includes(t), t);
 });
 
 test('the connection opens the stream URL and listens to every event name', () => {
@@ -235,7 +247,7 @@ test('an error while the browser is retrying shows disconnected but does not sta
   FakeEventSource.last.emit('error');
   assert.deepEqual(h.statuses, ['disconnected']);
   assert.equal(h.live.state().fallback, false);
-  assert.equal(h.timers.length, 1);        // only the transitional timer
+  assert.equal(h.timers.length, 0);        // no timer at all until the stream is really closed
 });
 
 test('a closed stream (the server said no) falls back to the 5 s full refresh, once', async () => {
@@ -244,9 +256,9 @@ test('a closed stream (the server said no) falls back to the 5 s full refresh, o
   FakeEventSource.last.emit('error');
   FakeEventSource.last.emit('error');
   assert.equal(h.live.state().fallback, true);
-  assert.equal(h.timers.length, 2);
-  assert.equal(h.timers[1].ms, 5000);
-  h.fire(1);
+  assert.equal(h.timers.length, 1);
+  assert.equal(h.timers[0].ms, 5000);
+  h.fire(0);
   await new Promise((r) => setImmediate(r));
   assert.equal(h.polls.length, 1);
   assert.deepEqual(h.statuses, ['disconnected', 'disconnected (polling)', 'disconnected']);
@@ -263,47 +275,35 @@ test('a constructor that throws goes to the fallback', () => {
   assert.equal(h.live.state().fallback, true);
 });
 
-test('the transitional timer redraws only while the active tab still depends on it (now only a plugin-owned tab)', async () => {
-  const h = harness({ tab: 'pending', isPluginTab: (t) => t === 'myplugin' });
-  h.fire(0);
-  await new Promise((r) => setImmediate(r));
-  assert.deepEqual(h.applied, []);
-  h.setTab('myplugin');
-  h.fire(0);
+test('no timer is created while the stream is open, and a plugin announcement redraws the open plugin tab only', async () => {
+  const owner = (t) => (t === 'myplugin' ? 'my-plugin' : null);
+  const h = harness({ tab: 'myplugin', isPluginTab: (t) => t === 'myplugin', pluginNameOf: owner });
+  assert.equal(h.timers.length, 0);
+  FakeEventSource.last.emit('plugin-changed', { plugin: 'my-plugin', seq: 3 });
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(h.applied, [plan({ main: true })]);
-  h.setTab('plugins');                                   // the Plugins tab has events now: the timer leaves it alone
-  h.fire(0);
-  await new Promise((r) => setImmediate(r));
-  h.setTab('project');
-  h.fire(0);
+  FakeEventSource.last.emit('plugin-changed', { plugin: 'another-plugin' });
+  FakeEventSource.last.emit('plugin-changed', 'not json at all');
+  FakeEventSource.last.emit('plugin-changed');
   await new Promise((r) => setImmediate(r));
   assert.equal(h.applied.length, 1);
 });
 
-test('a plugin-owned tab uses the transitional timer too', async () => {
+test('in fallback the stream is gone and the plugin tab is refreshed by the full refresh only', async () => {
   const h = harness({ tab: 'myplugin', isPluginTab: (t) => t === 'myplugin' });
-  h.fire(0);
-  await new Promise((r) => setImmediate(r));
-  assert.deepEqual(h.applied, [plan({ main: true })]);
-});
-
-test('in fallback the transitional timer stays quiet (the fallback refreshes everything)', async () => {
-  const h = harness({ tab: 'hardware' });
   FakeEventSource.last.readyState = 2;
   FakeEventSource.last.emit('error');
-  h.fire(0);
-  await new Promise((r) => setImmediate(r));
+  assert.equal(h.live.state().fallback, true);
   assert.deepEqual(h.applied, []);
 });
 
-test('close() stops the stream and both timers and ignores later events', async () => {
+test('close() stops the stream and the fallback timer and ignores later events', async () => {
   const h = harness({ tab: 'pending' });
   FakeEventSource.last.readyState = 2;
   FakeEventSource.last.emit('error');
   h.live.close();
   assert.equal(FakeEventSource.last.closed, true);
-  assert.deepEqual(h.cleared.sort(), [1, 2]);
+  assert.deepEqual(h.cleared, [1]);
   assert.equal(h.live.state().closed, true);
   FakeEventSource.last.emit('counts-changed');
   await new Promise((r) => setImmediate(r));
@@ -324,10 +324,10 @@ test('close() while a plan is being applied drops what was queued behind it', as
   assert.equal(seen.length, 1);
 });
 
-test('close() before any fallback clears just the transitional timer', () => {
+test('close() before any fallback has no timer to clear', () => {
   const h = harness();
   h.live.close();
-  assert.deepEqual(h.cleared, [1]);
+  assert.deepEqual(h.cleared, []);
 });
 
 test('the page loads live-updates.js before the inline script and the 5 s timer is gone from index.html', () => {
