@@ -523,8 +523,9 @@ def _with_memory(counts, qdir=None):
     """The cached queue counts plus the host-memory state for the header chip, and the queue-events journal counter. Computed per call, NOT cached with the counts:
     each is one tiny file read (see memory_status.py and queue_events_status.py) and the chip must show a pressure change on the very next refresh."""
     import memory_status
+    import event_stream
     import queue_events_status
-    return {**dict(counts), "memory": memory_status.memory_status(), "queueEvents": queue_events_status.queue_events_status(qdir)}
+    return {**dict(counts), "memory": memory_status.memory_status(), "queueEvents": queue_events_status.queue_events_status(qdir), "eventStream": event_stream.hub_status()}
 
 
 @shared_misc_bp.route("/api/memory/unload-ollama", methods=["POST"])
