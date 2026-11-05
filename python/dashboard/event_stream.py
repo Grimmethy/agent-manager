@@ -73,17 +73,18 @@ def json_file_fact(path_fn, project, stat=None, read=None):
     return fact
 
 
-def dir_files_fact(specs_fn, extra_files_fn=None):
+def dir_files_fact(specs_fn, extra_files_fn=None, subdirs=False):
     """A provider for Hub(providers=...): a tuple of (path, inode, size, mtime_ns) for the files a page panel reads. specs_fn() -> [(directory, compiled regex)]: every regular file directly in
     `directory` whose NAME matches the regex; extra_files_fn() -> [path, ...] are stat'ed as they are. One scandir per directory and one stat per matching file, nothing is opened or read, a missing
-    directory or file simply contributes nothing. A writer that appends to or replaces one of those files changes the tuple, so the panel that shows it is told, instead of asking on a timer."""
+    directory or file simply contributes nothing. A writer that appends to or replaces one of those files changes the tuple, so the panel that shows it is told, instead of asking on a timer.
+    subdirs=True also lists each immediate SUBDIRECTORY whose name matches, by its own stat key (its mtime moves when a file in it is added, removed or replaced by rename), without looking inside it."""
     def fact(full=False):
         out = []
         for directory, pattern in specs_fn():
             try:
                 with os.scandir(directory) as it:
                     for e in it:
-                        if pattern.search(e.name) and e.is_file(follow_symlinks=False):
+                        if pattern.search(e.name) and (e.is_file(follow_symlinks=False) or (subdirs and e.is_dir(follow_symlinks=False))):
                             st = e.stat(follow_symlinks=False)
                             out.append((e.path, st.st_ino, st.st_size, st.st_mtime_ns))
             except OSError:

@@ -516,6 +516,30 @@ class DirFilesFact(Base):
         fact = es.dir_files_fact(lambda: [(os.path.join(self.pipe, "nope"), self.pat), (self.d, self.pat)])
         self.assertEqual(fact(), ())
 
+    def test_with_subdirs_a_matching_subdirectory_is_listed_by_its_own_stat_key_without_looking_inside(self):
+        sub = os.path.join(self.d, "run-ledger.jsonl")
+        os.makedirs(sub)
+        fact = es.dir_files_fact(lambda: [(self.d, self.pat)], subdirs=True)
+        first = fact()
+        self.assertEqual([os.path.basename(t[0]) for t in first], ["run-ledger.jsonl"])
+        Path(sub, "inner.txt").write_text("x")                       # a file inside moves the directory's mtime
+        os.utime(sub, ns=(time.time_ns() + 6_000_000_000, time.time_ns() + 6_000_000_000))
+        self.assertNotEqual(fact(), first)
+        os.makedirs(os.path.join(self.d, "other-dir"))               # a subdirectory whose name does not match is ignored
+        self.assertEqual([os.path.basename(t[0]) for t in fact()], ["run-ledger.jsonl"])
+
+    def test_without_subdirs_a_matching_directory_name_is_never_listed(self):
+        os.makedirs(os.path.join(self.d, "run-ledger.jsonl"))
+        self.assertEqual(es.dir_files_fact(lambda: [(self.d, self.pat)])(), ())
+
+    def test_with_subdirs_the_files_are_still_listed_and_nothing_below_a_subdirectory_is(self):
+        self.put("a-ledger.jsonl")
+        sub = os.path.join(self.d, "b-ledger.jsonl")
+        os.makedirs(sub)
+        Path(sub, "c-ledger.jsonl").write_text("x")
+        out = es.dir_files_fact(lambda: [(self.d, self.pat)], subdirs=True)()
+        self.assertEqual(sorted(os.path.basename(t[0]) for t in out), ["a-ledger.jsonl", "b-ledger.jsonl"])
+
     def test_it_works_as_a_hub_provider_and_announces_a_ledger_append(self):
         self.put("stalled-ledger.jsonl", "a\n")
         hub = es.Hub(lambda: dict(self.paths), watch_s=0, clock=lambda: 0, providers={"worker-panels-changed": self.fact()})
@@ -630,6 +654,34 @@ class Route(Base):
             self.assertNotEqual(fact(), first)
             Path(self.pipe, "unrelated.json").write_text("x")
             self.assertEqual(fact(), fact())
+
+    def test_the_settings_provider_also_covers_the_lanes_registry(self):
+        env_file = Path(self.pipe) / "agent-manager.env"
+        registry = Path(self.pipe) / "lanes.json"
+        with mock.patch.object(app, "ENV_FILE_PATH", env_file), mock.patch.dict(os.environ, {"AGENT_MANAGER_LANES_PATH": str(registry)}):
+            fact = route._providers()["settings-changed"]
+            self.assertEqual(fact(), ())
+            registry.write_text("[]")
+            first = fact()
+            self.assertEqual([os.path.basename(t[0]) for t in first], ["lanes.json"])
+            registry.write_text('[{"gpu": "x"}]')
+            self.assertNotEqual(fact(), first)
+        with mock.patch.object(app, "ENV_FILE_PATH", env_file), mock.patch.dict(os.environ, {}):
+            os.environ.pop("AGENT_MANAGER_LANES_PATH", None)
+            self.assertIn(str(app.SRC_DIR.parent / "lanes.json"), [str(x) for x in route._settings_files()])
+
+    def test_the_route_registers_a_benchmark_provider_over_the_runs_directory(self):
+        base = Path(self.pipe) / "benchmarks"
+        with mock.patch.object(app, "BENCHMARK_STATE_DIR", base):
+            fact = route._providers()["benchmark-changed"]
+            self.assertEqual(fact(), ())
+            (base / "run-1").mkdir(parents=True)
+            (base / "current-run-id.txt").write_text("run-1")
+            first = fact()
+            self.assertEqual(sorted(os.path.basename(t[0]) for t in first), ["current-run-id.txt", "run-1"])
+            (base / "run-1" / "status.json").write_text("{}")
+            os.utime(base / "run-1", ns=(time.time_ns() + 9_000_000_000, time.time_ns() + 9_000_000_000))
+            self.assertNotEqual(fact(), first)
 
     def test_a_number_inside_the_reason_does_not_announce_but_new_wording_does(self):
         marker = os.path.join(self.pipe, "mem2.json")
