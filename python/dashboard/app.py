@@ -3227,8 +3227,10 @@ from routes.stalled_worker import stalled_worker_bp  # noqa: E402
 from routes.verifier_worker import verifier_worker_bp  # noqa: E402
 from routes.needswork_worker import needswork_worker_bp  # noqa: E402
 from routes.context_worker import context_worker_bp  # noqa: E402
+from routes.event_stream import event_stream_bp  # noqa: E402
 
 app.register_blueprint(reports_bp)
+app.register_blueprint(event_stream_bp)
 app.register_blueprint(concepts_bp)
 app.register_blueprint(second_brain_bp)
 app.register_blueprint(brain_dump_bp)
