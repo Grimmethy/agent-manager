@@ -102,6 +102,30 @@ test('plugin-states-changed redraws only the Plugins tab and touches no nav or s
   assert.ok(lu.LIVE_EVENTS.includes('plugin-states-changed'));
 });
 
+test('pipeline-state-changed and project-build-changed refresh the Project tab panels only, never redraw anything whole', () => {
+  for (const ev of ['pipeline-state-changed', 'project-build-changed']) {
+    assert.deepEqual(lu.planForEvent(ev, 'project'), plan({ panels: true }), ev);
+    for (const tab of ['pending', 'workers', 'plugins', 'branches', 'brain-dump', 'hygiene']) assert.deepEqual(lu.planForEvent(ev, tab), lu.NO_PLAN, ev + ' ' + tab);
+    assert.ok(lu.LIVE_EVENTS.includes(ev), ev);
+  }
+  assert.deepEqual([...lu.PANEL_TABS], ['project']);
+});
+
+test('a snapshot or a project change also refreshes the panels of the open Project tab', () => {
+  for (const ev of ['snapshot', 'project-changed']) {
+    assert.equal(lu.planForEvent(ev, 'project').panels, true, ev);
+    assert.equal(lu.planForEvent(ev, 'pending').panels, false, ev);
+  }
+  assert.equal(lu.planForEvent('counts-changed', 'project').panels, false);
+});
+
+test('plans merge and empty-check the panels key', () => {
+  assert.equal(lu.mergePlans(plan({}), plan({ panels: true })).panels, true);
+  assert.equal(lu.mergePlans(plan({ panels: true }), plan({})).panels, true);
+  assert.equal(lu.isEmptyPlan(plan({ panels: true })), false);
+  assert.equal(lu.isEmptyPlan(lu.NO_PLAN), true);
+});
+
 test('benchmark-changed redraws only the Models tab', () => {
   assert.deepEqual(lu.planForEvent('benchmark-changed', 'models'), plan({ main: true }));
   for (const tab of ['pending', 'workers', 'joblist', 'hardware']) assert.deepEqual(lu.planForEvent('benchmark-changed', tab), lu.NO_PLAN, tab);
@@ -124,7 +148,7 @@ test('branches-changed refreshes only the Branches tab', () => {
 test('snapshot and project-changed refresh everything the active tab allows', () => {
   for (const name of ['snapshot', 'project-changed']) {
     assert.deepEqual(lu.planForEvent(name, 'pending'), plan({ summary: true, plugins: true, nav: true, main: true }));
-    assert.deepEqual(lu.planForEvent(name, 'project'), plan({ summary: true, plugins: true, nav: true }));
+    assert.deepEqual(lu.planForEvent(name, 'project'), plan({ summary: true, plugins: true, nav: true, panels: true }));
     assert.deepEqual(lu.planForEvent(name, 'branches'), plan({ summary: true, plugins: true, nav: true, branches: true }));
   }
 });

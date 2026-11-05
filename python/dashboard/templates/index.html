@@ -491,7 +491,7 @@ let counts = {};
 
 // Project tab state -- kept separate from the generic 5s poll-and-rerender cycle used by
 // every other tab, since re-rendering over a user's in-progress folder navigation every
-// 5s would be a bad experience. See renderProject()/enterProjectTab()/leaveProjectTab().
+// 5s would be a bad experience. See renderProject()/enterProjectTab(); its panels refresh on events (pipeline-state-changed, project-build-changed), not on a timer.
 let projectPath = localStorage.getItem('agentManagerProjectPath') || '';
 // Last activeRepoRoot value seen from the server (see enterProjectTab's sync below).
 // Starts equal to projectPath so the very first sync is a no-op when they already agree --

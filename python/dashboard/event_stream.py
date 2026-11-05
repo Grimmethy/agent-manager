@@ -27,7 +27,7 @@ import time
 import urllib.request
 from collections import deque
 
-ANNOUNCE_EVENTS = ("plugin-changed",)     # events a writer announces itself (Hub.announce), not derived from a file by the watcher
+ANNOUNCE_EVENTS = ("plugin-changed", "project-build-changed")     # events a writer announces itself (Hub.announce), not derived from a file by the watcher
 EVENT_NAMES = ("counts-changed", "workers-changed", "branches-changed", "plugins-changed", "project-changed")
 WATCH_S = 1.0
 RECONCILE_S = 60.0
@@ -396,6 +396,15 @@ def get_hub(resolve, providers=None):
         if _hub is None:
             _hub = Hub(resolve, providers=providers)
         return _hub
+
+
+def announce(name, **data):
+    """The module-level way for a WRITER inside the dashboard process (a background build thread) to announce. Returns None, and does nothing, while no hub exists (nobody has
+    connected yet: a client's snapshot covers what it missed) and never raises: a failed announcement must not break the work that triggered it."""
+    try:
+        return _hub.announce(name, **data)       # with no hub yet this is an AttributeError on None: the same quiet None
+    except Exception:
+        return None
 
 
 def generation(name):

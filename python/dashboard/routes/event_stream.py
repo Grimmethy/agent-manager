@@ -25,6 +25,7 @@ def _providers():
             "reports-changed": event_stream.dir_files_fact(_reports_specs),
             "discovery-changed": event_stream.dir_files_fact(lambda: [], _discovery_files),
             "plugin-states-changed": (_plugin_states, PLUGIN_STATES_INTERVAL_S),
+            "pipeline-state-changed": (_pipeline_state, PIPELINE_STATE_INTERVAL_S),
             "settings-changed": event_stream.dir_files_fact(lambda: [], _settings_files),
             "benchmark-changed": event_stream.dir_files_fact(_benchmark_specs, subdirs=True),
             "worker-panels-changed": event_stream.dir_files_fact(_panel_specs, _panel_files), "memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), re.sub(r"\d+", "#", str(d.get("reason") or ""))))}
@@ -57,6 +58,7 @@ def _settings_files():
 # Sampled sources: the hardware plugin's stats and the TokenFold proxy's stats are live numbers behind HTTP, with no file to watch. ONE shared sampler asks them (the hub's single clock, only while a page
 # is connected) every few seconds and announces a change only when a number moved by a visible amount (event_stream.coarse: two significant figures); a service that goes away or comes back is a change too.
 HARDWARE_INTERVAL_S = 5.0
+PIPELINE_STATE_INTERVAL_S = 3.0           # the Project tab's pipeline panel: running, stoppable, the apply toggles and the active repo, sampled once for every browser
 PLUGIN_STATES_INTERVAL_S = 5.0            # one shared sampler pass over the plugin pid files; the Plugins tab never samples
 TOKENFOLD_INTERVAL_S = 10.0
 
@@ -82,6 +84,19 @@ def _reports_specs():
     from routes.reports import _reports_root
     root = _reports_root()
     return [(str(root / period), re.compile(r"\.md$")) for period in _REPORT_PERIODS] if root else []
+
+
+def _pipeline_state(full=False):
+    """What /api/pipeline/status reports, as one value (the route's own functions, so the two can never disagree): (active repo, running, stoppable, includeApply, skipPush).
+    Never raises: an error is the value None, which differs from any real state and so announces once."""
+    try:
+        from app import ENV_FILE_PATH, _pipeline_running, _pipeline_stoppable, get_active_repo_root, read_env_file
+        env = read_env_file(ENV_FILE_PATH)
+        running = bool(_pipeline_running())
+        return (get_active_repo_root(), running, True if running else bool(_pipeline_stoppable()),
+                env.get("AGENT_MANAGER_INCLUDE_APPLY", "false") == "true", env.get("AGENT_MANAGER_APPLY_SKIP_PUSH", "true") == "true")
+    except Exception:
+        return None
 
 
 def _mtime_ns(path):
