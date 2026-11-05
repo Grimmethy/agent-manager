@@ -1,5 +1,5 @@
-"""The Workers tab's payload for the two CONTEXT workers: the codebase-map worker (`map`) and the memory-index worker (`memory`)
-(agent-manager-context-ops docs/context-workers-spec.md, 2026-11-04).
+"""The Workers tab's payload for the three CONTEXT workers: the codebase-map worker (`map`), the memory-index worker (`memory`) and the context-impact worker (`impact`)
+(agent-manager-context-ops docs/context-workers-spec.md and docs/context-impact-spec.md, 2026-11-04 and 2026-11-05).
 
 Like the branch verifier and the Needs-Work worker, they are NOT lanes: each is a CLI that the agent-manager watchdog triggers (a `watchdogScripts` entry in plugins.json starts a
 detached drain when its input changed). This route only READS what they leave behind and writes ONE thing, the on/off marker the Turn off button owns:
@@ -8,6 +8,10 @@ detached drain when its input changed). This route only READS what they leave be
            carries {mode, factsKey, ...}; a HOLD-FOR-OWNER decision carries the one question and a recommendation. A DRY-RUN decision is a pair whose result detail is {executed: false}.
   marker   <name> -> context-<name>-disabled (the on/off file the worker's tick checks first)
   trigger  the <worker>-trigger.json / .beat / -drain.lock files (routes/worker_trigger.py, worker 'context-<name>')
+
+The impact worker also leaves context-impact-interventions.jsonl (events {event: 'open'|'evaluated', id, kind, ...}); for `impact` the payload gains an `impact` section: the newest decision's findings,
+the investigation tasks filed so far (executed on-mode decisions only), the intervention ledger per kind and the authority gate. The folding mirrors foldEvents, summarize and
+mapAuthorityGate of the context-ops plugin's interventions module (each repo pins the same numbers in its own test).
 
 State directory: AGENT_MANAGER_CONTEXT_OPS_STATE_DIR when set, else $HOME/.local/state/pipeline-ops (the same rule as agent-manager-context-ops src/memory/run.js proposalDirFor). The
 marker does NOT follow that override: it is CONTEXT_MAP_DISABLED_PATH / CONTEXT_MEMORY_DISABLED_PATH or $HOME/.local/state/pipeline-ops/context-<name>-disabled, exactly the default of
@@ -28,10 +32,14 @@ from routes.worker_trigger import read_trigger
 
 context_worker_bp = Blueprint("context-worker-bp", __name__)
 
-WORKERS = {"map": "codebase-map", "memory": "memory-index"}
+WORKERS = {"map": "codebase-map", "memory": "memory-index", "impact": "context-impact"}
 RECENT_COUNT = 8
 HOLDS_CAP = 50
 HOLD = "HOLD-FOR-OWNER"
+INTERVENTION_KINDS = ("map-edit", "memory-edit")
+INTERVENTION_VERDICTS = ("HELPED", "NO-EFFECT", "HARMED")
+GATE_MIN_EVALUATED = 3
+FILED_SHOWN = 10
 
 
 def _home(env):
@@ -45,6 +53,10 @@ def state_dir(env=None):
 
 def ledger_path(name, env=None):
     return os.path.join(state_dir(env), f"context-{name}-ledger.jsonl")
+
+
+def interventions_path(env=None):
+    return os.path.join(state_dir(env), "context-impact-interventions.jsonl")
 
 
 def switch_path(name, env=None):
@@ -120,8 +132,56 @@ def _summary(d):
     return str(d["outcome"] or "")
 
 
-def build_context_worker(name, env=None, now=None, read_rows=read_ledger_tail, trigger=None, read_sw=read_switch):
-    """The panel payload for worker `name` ('map' or 'memory'). See the module docstring. Never raises."""
+def intervention_summary(events):
+    """(per-kind counts, authority gate) from the impact worker's intervention events. The FIRST open of an id wins, an evaluation counts only for a known id and a known verdict and only
+    once, anything else is skipped. The gate opens at GATE_MIN_EVALUATED evaluated map edits with MORE than half helped. Mirrors the interventions module of the context-ops plugin."""
+    state = {}
+    for e in events if isinstance(events, list) else []:
+        if not isinstance(e, dict) or not isinstance(e.get("id"), str) or e.get("kind") not in INTERVENTION_KINDS:
+            continue
+        if e.get("event") == "open":
+            state.setdefault(e["id"], {"kind": e["kind"], "verdict": None})
+        elif e.get("event") == "evaluated" and e.get("verdict") in INTERVENTION_VERDICTS:
+            cur = state.get(e["id"])
+            if cur is not None and cur["verdict"] is None:
+                cur["verdict"] = e["verdict"]
+    counts = {k: {"HELPED": 0, "NO-EFFECT": 0, "HARMED": 0, "open": 0} for k in INTERVENTION_KINDS}
+    for it in state.values():
+        counts[it["kind"]][it["verdict"] or "open"] += 1
+    m = counts["map-edit"]
+    evaluated = m["HELPED"] + m["NO-EFFECT"] + m["HARMED"]
+    return counts, {"open": evaluated >= GATE_MIN_EVALUATED and m["HELPED"] * 2 > evaluated, "evaluated": evaluated, "helped": m["HELPED"]}
+
+
+def impact_section(ds, events):
+    """The impact worker's part of the payload: what the newest non-error decision found, the investigation tasks filed so far (executed on-mode decisions with a text task id), the
+    intervention ledger per kind and the authority gate. Every list field that is not a list reads as empty."""
+    def as_list(v):
+        return v if isinstance(v, list) else []
+
+    def strings(v):
+        return [x for x in as_list(v) if isinstance(x, str)]
+
+    good = [d for d in ds if not d["error"]]
+    newest = good[-1] if good else None
+    latest = None
+    if newest is not None:
+        det = newest["intentDetail"]
+        latest = {"at": newest["at"], "regressed": strings(det.get("regressed")), "improved": strings(det.get("improved")), "insufficient": strings(det.get("insufficient")),
+                  "wouldFile": [w["gauge"] for w in as_list(det.get("wouldFile")) if isinstance(w, dict) and isinstance(w.get("gauge"), str)]}
+    filed = []
+    for d in good:
+        if d["mode"] != "on" or not d["executed"]:
+            continue
+        for f in as_list(d["resultDetail"].get("filed")):
+            if isinstance(f, dict) and isinstance(f.get("taskId"), str) and f["taskId"] != "":
+                filed.append({"at": d["at"], "gauge": f["gauge"] if isinstance(f.get("gauge"), str) else None, "taskId": f["taskId"]})
+    interventions, gate = intervention_summary(events)
+    return {"latest": latest, "filedCount": len(filed), "filed": filed[-FILED_SHOWN:], "interventions": interventions, "gate": gate}
+
+
+def build_context_worker(name, env=None, now=None, read_rows=read_ledger_tail, trigger=None, read_sw=read_switch, read_events=read_ledger_tail):
+    """The panel payload for worker `name` ('map', 'memory' or 'impact'). See the module docstring. Never raises."""
     env = os.environ if env is None else env
     now = time.time() if now is None else now
 
@@ -164,7 +224,7 @@ def build_context_worker(name, env=None, now=None, read_rows=read_ledger_tail, t
             findings = {"hash": d.get("hash"), "findings": d.get("findings"), "fixRanges": d.get("fixRanges"), "rewriteRows": d.get("rewriteRows"), "suggestions": d.get("suggestions"), "at": r.get("at")}
             break
     last_mode = next((r["detail"]["mode"] for r in reversed(rows) if r.get("kind") == "intent" and isinstance(r.get("detail"), dict) and isinstance(r["detail"].get("mode"), str)), None)
-    return {
+    payload = {
         "configured": True,
         "name": name,
         "worker": f"context-{name}",
@@ -184,6 +244,9 @@ def build_context_worker(name, env=None, now=None, read_rows=read_ledger_tail, t
         "findings": findings,
         "recent": [{"at": d["at"], "outcome": d["outcome"], "mode": d["mode"], "executed": d["executed"], "summary": _summary(d)} for d in ds[-RECENT_COUNT:]][::-1],
     }
+    if name == "impact":
+        payload["impact"] = safe(lambda: impact_section(ds, read_events(interventions_path(env))), None)
+    return payload
 
 
 @context_worker_bp.route("/api/context-worker/<name>")
