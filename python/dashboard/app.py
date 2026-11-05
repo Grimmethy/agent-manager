@@ -732,40 +732,35 @@ def index():
     return render_template("index.html")
 
 
-def worker_lane_ids() -> list[str]:
-    """The pipeline's worker lane ids -- one per GPU, named for the GPU (worker-3090, worker-p40).
-    src/lanes.js is the single definition (launch.sh, the watchdog's restart rule and this list
-    all read it); shelled out to rather than re-derived here so the two languages can never drift,
-    and cached briefly because this is called from status polls. Falls back to the last good answer
-    (or a single 'worker-local') if node is unavailable."""
-    now = time.monotonic()
-    if _LANE_IDS_CACHE["ids"] and now - _LANE_IDS_CACHE["at"] < _LANE_IDS_TTL_S:
-        return list(_LANE_IDS_CACHE["ids"])
-    ids: list[str] = []
+def _lane_inputs_key():
+    """What src/lanes.js reads, as a cheap comparable value: the lanes registry file and the env file (stat keys) and the AGENT_MANAGER_* environment. While it is unchanged the cached lane
+    definitions are still right; when it changes the cache is stale (swr_cache.py) and is refreshed in the background."""
+    env = {**os.environ, **read_env_file(ENV_FILE_PATH)}
+    registry = env.get("AGENT_MANAGER_LANES_PATH") or str(SRC_DIR.parent / "lanes.json")
+
+    def stat_key(path):
+        try:
+            st = os.stat(path)
+            return (st.st_ino, st.st_size, st.st_mtime_ns)
+        except OSError:
+            return None
+    return (stat_key(registry), stat_key(ENV_FILE_PATH), hash(tuple(sorted((k, v) for k, v in env.items() if k.startswith("AGENT_MANAGER_")))))
+
+
+def _compute_lane_ids() -> list[str]:
     try:
         cp = subprocess.run(
             ["node", str(SRC_DIR / "lanes.js"), "--ids"],
             capture_output=True, text=True, timeout=5,
             env={**os.environ, **read_env_file(ENV_FILE_PATH)},
         )
-        ids = [line.strip() for line in cp.stdout.splitlines() if line.strip()]
+        return [line.strip() for line in cp.stdout.splitlines() if line.strip()]
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("could not read worker lanes from src/lanes.js: %s", exc)
-    if ids:
-        _LANE_IDS_CACHE.update(at=now, ids=ids)
-        return list(ids)
-    return list(_LANE_IDS_CACHE["ids"]) or ["worker-local"]
+        return []
 
 
-def worker_lane_defs() -> list[dict]:
-    """The pipeline's lanes as full definitions ({id, gpu, local, preempt, taskClasses, env}), in lane order.
-    Same single source as worker_lane_ids() (src/lanes.js: the host lane, the legacy P40 lane, and the lanes registry file), shelled out to
-    so the two languages cannot drift, and cached briefly. Returns the last good answer, or [] when node/lanes.js is unavailable --
-    callers must treat [] as "unknown" and fall back, never as "no lanes"."""
-    now = time.monotonic()
-    if _LANE_DEFS_CACHE["lanes"] and now - _LANE_DEFS_CACHE["at"] < _LANE_IDS_TTL_S:
-        return list(_LANE_DEFS_CACHE["lanes"])
-    lanes: list[dict] = []
+def _compute_lane_defs() -> list[dict]:
     try:
         cp = subprocess.run(
             ["node", str(SRC_DIR / "lanes.js")],
@@ -774,13 +769,29 @@ def worker_lane_defs() -> list[dict]:
         )
         parsed = json.loads(cp.stdout)
         if isinstance(parsed, list):
-            lanes = [l for l in parsed if isinstance(l, dict) and l.get("id")]
+            return [l for l in parsed if isinstance(l, dict) and l.get("id")]
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         logger.warning("could not read worker lane definitions from src/lanes.js: %s", exc)
-    if lanes:
-        _LANE_DEFS_CACHE.update(at=now, lanes=lanes)
-        return list(lanes)
-    return list(_LANE_DEFS_CACHE["lanes"])
+    return []
+
+
+def worker_lane_ids() -> list[str]:
+    """The pipeline's worker lane ids -- one per GPU, named for the GPU (worker-3090, worker-p40).
+    src/lanes.js is the single definition (launch.sh, the watchdog's restart rule and this list
+    all read it); shelled out to rather than re-derived here so the two languages can never drift.
+    Cached by what lanes.js reads, not by a clock, and refreshed in the background when that changed (swr_cache.py): a request never waits for node
+    once a value exists. Falls back to the last good answer (or a single 'worker-local') if node is unavailable."""
+    import swr_cache
+    ids = swr_cache.cached_value(_LANE_IDS_CACHE, "ids", _lane_inputs_key, _compute_lane_ids, _LANE_IDS_TTL_S)
+    return ids or ["worker-local"]
+
+
+def worker_lane_defs() -> list[dict]:
+    """The pipeline's lanes as full definitions ({id, gpu, local, preempt, taskClasses, env}), in lane order.
+    Same single source and the same cache rule as worker_lane_ids() (src/lanes.js: the host lane, the legacy P40 lane, and the lanes registry file).
+    Returns the last good answer, or [] when node/lanes.js is unavailable -- callers must treat [] as "unknown" and fall back, never as "no lanes"."""
+    import swr_cache
+    return swr_cache.cached_value(_LANE_DEFS_CACHE, "lanes", _lane_inputs_key, _compute_lane_defs, _LANE_IDS_TTL_S)
 
 
 def reviewer_instance_ids() -> list[str]:
