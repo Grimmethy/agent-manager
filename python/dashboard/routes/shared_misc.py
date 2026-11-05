@@ -543,15 +543,20 @@ def api_summary():
     qdir = queue_dir()
     key = str(qdir) if qdir else None
 
+    import event_stream
+
     def fresh_value():
+        # The 3 s cache is also dropped when the event stream announced a queue change since the payload was computed: a page told "counts changed" must get the new counts.
         entry = _summary_state["entry"]
-        if entry and entry[0] == key and time.monotonic() - entry[1] < _SUMMARY_TTL_S:
+        if entry and entry[0] == key and time.monotonic() - entry[1] < _SUMMARY_TTL_S and _summary_state.get("gen") == event_stream.generation("counts-changed"):
             return entry[2]
         return None
 
     def recompute():
+        gen = event_stream.generation("counts-changed")      # read BEFORE computing: a change announced while computing must still invalidate this payload
         value = _compute_summary_counts(qdir)
         _summary_state["entry"] = (key, time.monotonic(), value)
+        _summary_state["gen"] = gen
         return value
 
     value = fresh_value()

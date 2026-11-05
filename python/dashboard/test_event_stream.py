@@ -358,6 +358,66 @@ class JsonFileFact(Base):
         self.assertEqual(fact(), "tight")
 
 
+class Generation(Base):
+    def test_each_announcement_bumps_its_event_generation(self):
+        self.assertEqual(self.hub.generation("counts-changed"), 0)
+        self.hub._publish(["counts-changed", "workers-changed"], "t")
+        self.hub._publish(["counts-changed"], "t")
+        self.assertEqual(self.hub.generation("counts-changed"), 2)
+        self.assertEqual(self.hub.generation("workers-changed"), 1)
+        self.assertEqual(self.hub.generation("plugins-changed"), 0)
+
+    def test_module_generation_is_zero_without_a_hub_and_when_the_hub_raises(self):
+        with mock.patch.object(es, "_hub", None):
+            self.assertEqual(es.generation("counts-changed"), 0)
+        with mock.patch.object(es, "_hub", mock.Mock(generation=mock.Mock(side_effect=RuntimeError("x")))):
+            self.assertEqual(es.generation("counts-changed"), 0)
+        with mock.patch.object(es, "_hub", self.hub):
+            self.hub._publish(["counts-changed"], "t")
+            self.assertEqual(es.generation("counts-changed"), 1)
+
+
+class SummaryInvalidation(Base):
+    def setUp(self):
+        super().setUp()
+        from routes import shared_misc
+        self.sm = shared_misc
+        self.n = [0]
+        self.client = app.app.test_client()
+
+        def compute(qdir):
+            self.n[0] += 1
+            if self.mid_compute:
+                self.hub._publish(["counts-changed"], "mid")
+            return {"n": self.n[0]}
+        self.mid_compute = False
+        for p in (mock.patch.object(es, "_hub", self.hub), mock.patch.object(self.sm, "_SUMMARY_TTL_S", 1000.0), mock.patch.object(app, "queue_dir", lambda: Path(self.q)),
+                  mock.patch.object(self.sm, "_compute_summary_counts", compute)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.sm._summary_state["entry"] = None
+        self.sm._summary_state.pop("gen", None)
+
+    def get(self):
+        return self.client.get("/api/summary").get_json()["n"]
+
+    def test_the_cache_serves_until_the_stream_announces_a_queue_change(self):
+        self.assertEqual(self.get(), 1)
+        self.assertEqual(self.get(), 1)
+        self.hub._publish(["workers-changed"], "t")
+        self.assertEqual(self.get(), 1)               # another event does not matter to the counts
+        self.hub._publish(["counts-changed"], "t")
+        self.assertEqual(self.get(), 2)
+        self.assertEqual(self.get(), 2)
+
+    def test_a_change_announced_while_computing_still_invalidates_that_payload(self):
+        self.mid_compute = True
+        self.assertEqual(self.get(), 1)
+        self.mid_compute = False
+        self.assertEqual(self.get(), 2)
+        self.assertEqual(self.get(), 2)
+
+
 class Status(unittest.TestCase):
     def test_hub_status_shapes(self):
         with mock.patch.dict(os.environ, {"AGENT_MANAGER_EVENT_STREAM": "off"}):
@@ -427,6 +487,19 @@ class Route(Base):
             self.assertEqual(fact(), ("tight", "io stall"))
             Path(marker).write_text(json.dumps({"state": "tight", "reason": "io stall", "numbers": {"io_full": 41}, "pad": 1}))
             self.assertEqual(fact(), ("tight", "io stall"))      # the numbers moved; the chip's state did not, so no announcement
+
+    def test_a_number_inside_the_reason_does_not_announce_but_new_wording_does(self):
+        marker = os.path.join(self.pipe, "mem2.json")
+        with mock.patch.dict(os.environ, {"AGENT_MANAGER_MEM_PRESSURE_MARKER": marker}):
+            fact = route._providers()["memory-changed"]
+            Path(marker).write_text(json.dumps({"state": "tight", "reason": "memory stall 11.64%"}))
+            first = fact()
+            Path(marker).write_text(json.dumps({"state": "tight", "reason": "memory stall 12.01% and more"}))
+            self.assertNotEqual(fact(), first)
+            Path(marker).write_text(json.dumps({"state": "tight", "reason": "memory stall 99.5%"}))
+            self.assertEqual(fact(), first)
+            Path(marker).write_text(json.dumps({"state": "tight", "reason": "holding until pressure eases"}))
+            self.assertNotEqual(fact(), first)
 
     def test_connect_sends_retry_then_a_snapshot_then_named_events_then_a_keepalive(self):
         r = self.client.get("/api/stream", buffered=False)

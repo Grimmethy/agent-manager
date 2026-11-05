@@ -1,4 +1,6 @@
-"""GET /api/stream -- the dashboard's server-sent-event channel (event_stream.py). Piece 1 of 'UI triggers, not polls': the server half; the page does not use it yet."""
+"""GET /api/stream -- the dashboard's server-sent-event channel (event_stream.py). The page listens to it (static/js/live-updates.js); the pieces of 'UI triggers, not polls' that built it are listed in docs/adr/0024-triggers-not-polls.md."""
+import re
+
 from flask import Blueprint, Response, jsonify, request, stream_with_context
 
 import event_stream
@@ -15,7 +17,8 @@ def _resolve():
 def _providers():
     """Facts the hub cannot derive from the queue directories. memory-changed: the host-memory chip's state and reason, from the gpu-broker's marker file."""
     import memory_status
-    return {"memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), str(d.get("reason") or "")))}
+    # The marker's reason carries live numbers ("memory stall 11.64%"): announce a change of the STATE or of the reason's wording, never of a number inside it.
+    return {"memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), re.sub(r"\d+", "#", str(d.get("reason") or ""))))}
 
 
 @event_stream_bp.route("/api/stream")

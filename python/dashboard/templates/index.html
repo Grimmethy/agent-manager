@@ -446,6 +446,7 @@
 <script src="/static/js/brain-dump-chips.js"></script>
 <script src="/static/js/brain-dump-and-second-brain.js"></script>
 <script src="/static/js/hygiene-tab.js"></script>
+<script src="/static/js/live-updates.js"></script>
 <script>
 // CORE_TABS is the hardcoded tab-bar row set. TABS (core-ui.js) starts as a copy of it and
 // folds in any plugin-declared `tab` on top (Docs/hub-tasks-extraction-plan.md section 5,
@@ -1234,7 +1235,7 @@ document.getElementById('main').addEventListener('click', (e) => {
 // already folds in any plugin-declared tab before the first paint.
 refresh();  // always -- populates counts + renders nav regardless of which tab is active
 if (activeTab === 'project') enterProjectTab();
-setInterval(refresh, 5000);
+startPageLiveUpdates();   // the event stream (live-updates.js); the old 5 s refresh only runs if the stream is unavailable
 mountPersistentSidebarPlugins();
 
 // The graph iframe's CSS box resizes correctly on window resize (flex:1 fills whatever
