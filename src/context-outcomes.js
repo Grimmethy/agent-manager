@@ -13,7 +13,7 @@
 // and the stage names that mean a retry or a stop. FIRST PASS = approved, never requeued, never blocked, never sent to clarification,
 // and drafted once (at most one draft-started stage). Read-only: it reads queue/<state>/*.json and writes nothing.
 //
-//   joinContextOutcomes({ pipelineDir, sinceMs, nowMs, readDir })   readDir(dir, minMtimeMs) -> [record] (injected in tests)
+//   joinContextOutcomes({ pipelineDir, sinceMs, nowMs, untilMs, readDir })   readDir(dir, minMtimeMs) -> [record] (injected in tests)
 //   CLI: node src/context-outcomes.js [--since 14d] [--pipeline-dir <dir>]   prints JSON; pipeline dir defaults to AGENT_MANAGER_PIPELINE_DIR,
 //   then AGENT_MANAGER_REPO_ROOT, then the working directory.
 
@@ -100,10 +100,11 @@ function cell(items) {
   };
 }
 
-function joinContextOutcomes({ pipelineDir, sinceMs = DEFAULT_SINCE_MS, nowMs = Date.now(), readDir = defaultReadDir } = {}) {
+// untilMs is the strict upper end of the window (default: nowMs plus a day of clock skew). The debrief passes the end of ITS window so both cover the same tasks.
+function joinContextOutcomes({ pipelineDir, sinceMs = DEFAULT_SINCE_MS, nowMs = Date.now(), untilMs = nowMs + DAY_MS, readDir = defaultReadDir } = {}) {
   const cutoff = nowMs - sinceMs;
   const dirOf = (state) => path.join(pipelineDir || '.', 'queue', state);
-  const inWindow = (task) => { const ts = Date.parse(terminalTs(task) || ''); return Number.isFinite(ts) && ts >= cutoff && ts <= nowMs + DAY_MS; };
+  const inWindow = (task) => { const ts = Date.parse(terminalTs(task) || ''); return Number.isFinite(ts) && ts >= cutoff && ts <= untilMs; };
 
   const counts = { shipped: 0, excludedDone: 0, blocked: 0, needsClarification: 0, stamped: 0, unstamped: 0 };
   const byStratum = new Map();

@@ -199,3 +199,16 @@ test('the median of an even number of cell tasks is the mean of the two middle s
   const odd = run({ done: [...many(5, (i) => rec({ id: `f${i}`, stamp: stamp(), stages: four })), ...many(6, (i) => rec({ id: `s${i}`, stamp: stamp(), stages: six }))] });
   assert.equal(odd.strata.manual.cells.orientRan.true.medianHistoryStages, 6);
 });
+
+test('untilMs is a strict upper end: a task after it is left out, and the default still allows an hour of clock skew', () => {
+  const dirs = { done: [rec({ id: 'in', agoMs: 3 * DAY }), rec({ id: 'late', agoMs: DAY })] };
+  const bounded = run(dirs, { untilMs: NOW - 2 * DAY });
+  assert.equal(bounded.counts.shipped, 1);
+  assert.equal(run(dirs).counts.shipped, 2);
+  assert.equal(run({ done: [rec({ id: 'skew', agoMs: -60 * 60 * 1000 })] }).counts.shipped, 1);
+});
+
+test('the default upper end allows one day of clock skew, not more: a task dated a day and a half ahead is left out', () => {
+  assert.equal(run({ done: [rec({ id: 'ahead', agoMs: -1.5 * DAY })] }).counts.shipped, 0);
+  assert.equal(run({ done: [rec({ id: 'ahead', agoMs: -0.9 * DAY })] }).counts.shipped, 1);
+});
