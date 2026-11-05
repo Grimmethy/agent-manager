@@ -134,7 +134,6 @@ function severityForTab(tabKey, count) {
 // semantics, not just an activeTab assignment, so it reuses this instead of duplicating it.
 function switchToTab(key) {
   if (activeTab === 'branches' && key !== 'branches') leaveBranchesTab();
-  if (activeTab === 'hygiene' && key !== 'hygiene') leaveHygieneTab();
   bumpRenderGeneration(); // any in-flight render for the tab being left is now stale
   activeTab = key;
   renderNav();
