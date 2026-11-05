@@ -418,6 +418,114 @@ class SummaryInvalidation(Base):
         self.assertEqual(self.get(), 2)
 
 
+class DirFilesFact(Base):
+    def setUp(self):
+        super().setUp()
+        import re as _re
+        self.re = _re
+        self.d = os.path.join(self.pipe, "ops")
+        os.makedirs(os.path.join(self.d, "gateway"))
+        self.pat = _re.compile(r"(-ledger\.jsonl|-index\.json|-disabled)$")
+        self.db = os.path.join(self.pipe, "stats.db")
+
+    def fact(self, extra=True):
+        return es.dir_files_fact(lambda: [(self.d, self.pat), (os.path.join(self.d, "gateway"), self.pat)], (lambda: [self.db, self.db + "-wal", None]) if extra else None)
+
+    def put(self, rel, text="x"):
+        Path(self.d, rel).write_text(text)
+
+    def test_only_the_files_a_panel_reads_are_listed_and_nothing_is_read(self):
+        for name in ("stalled-ledger.jsonl", "verifier-index.json", "context-map-disabled", "needswork-drain.log", "needswork-trigger.beat", "needswork-trigger.json", "x.lock"):
+            self.put(name)
+        self.put("gateway/spend-ledger.jsonl")
+        self.put("gateway/other.txt")
+        out = self.fact()()
+        self.assertEqual(sorted(os.path.basename(t[0]) for t in out), ["context-map-disabled", "spend-ledger.jsonl", "stalled-ledger.jsonl", "verifier-index.json"])
+        for t in out:
+            self.assertEqual(len(t), 4)
+
+    def test_an_append_a_replace_and_a_new_file_each_change_the_value(self):
+        self.put("stalled-ledger.jsonl", "a\n")
+        fact = self.fact()
+        v0 = fact()
+        with open(os.path.join(self.d, "stalled-ledger.jsonl"), "a") as f:
+            f.write("b\n")
+        v1 = fact()
+        self.assertNotEqual(v0, v1)
+        self.put("verifier-ledger.jsonl")
+        v2 = fact()
+        self.assertNotEqual(v1, v2)
+        self.assertEqual(fact(), v2)
+
+    def test_each_part_of_the_stat_key_alone_is_enough_to_notice_a_change(self):
+        path = os.path.join(self.d, "stalled-ledger.jsonl")
+        self.put("stalled-ledger.jsonl", "aaaa")
+        fixed = os.stat(path).st_mtime_ns
+        fact = self.fact()
+        base = fact()
+        # size alone: same inode, same mtime, longer content
+        Path(path).write_text("aaaaaaaa")
+        os.utime(path, ns=(fixed, fixed))
+        self.assertNotEqual(fact(), base, "size")
+        # mtime alone: same inode, same size
+        Path(path).write_text("aaaa")
+        os.utime(path, ns=(fixed, fixed))
+        self.assertEqual(fact(), base)
+        os.utime(path, ns=(fixed + 5_000_000_000, fixed + 5_000_000_000))
+        self.assertNotEqual(fact(), base, "mtime")
+        # inode alone: a rename over the file with the same size and mtime
+        os.utime(path, ns=(fixed, fixed))
+        before = fact()
+        other = os.path.join(self.d, "tmp-new")
+        Path(other).write_text("aaaa")
+        os.utime(other, ns=(fixed, fixed))
+        os.replace(other, path)
+        self.assertNotEqual(fact(), before, "inode")
+
+    def test_the_value_does_not_depend_on_the_order_the_directories_are_listed(self):
+        self.put("a-ledger.jsonl")
+        self.put("gateway/spend-ledger.jsonl")
+        forward = [(self.d, self.pat), (os.path.join(self.d, "gateway"), self.pat)]
+        order = [forward]
+        fact = es.dir_files_fact(lambda: order[0])
+        v = fact()
+        order[0] = list(reversed(forward))
+        self.assertEqual(fact(), v)
+
+    def test_a_noisy_file_does_not_change_the_value(self):
+        self.put("stalled-ledger.jsonl")
+        fact = self.fact()
+        v = fact()
+        self.put("needswork-drain.log", "idle\n")
+        self.put("needswork-trigger.json", "{}")
+        self.assertEqual(fact(), v)
+
+    def test_the_extra_files_are_stat_ed_and_a_missing_one_or_none_contributes_nothing(self):
+        fact = self.fact()
+        self.assertEqual(fact(), ())
+        Path(self.db).write_text("db")
+        Path(self.db + "-wal").write_text("w")
+        out = fact()
+        self.assertEqual([os.path.basename(t[0]) for t in out], ["stats.db", "stats.db-wal"])
+        self.assertEqual(len(out[0]), 4)
+        Path(self.db + "-wal").write_text("ww")
+        self.assertNotEqual(fact(), out)
+
+    def test_a_missing_directory_and_subdirectories_contribute_nothing(self):
+        os.makedirs(os.path.join(self.d, "sub-ledger.jsonl"))
+        fact = es.dir_files_fact(lambda: [(os.path.join(self.pipe, "nope"), self.pat), (self.d, self.pat)])
+        self.assertEqual(fact(), ())
+
+    def test_it_works_as_a_hub_provider_and_announces_a_ledger_append(self):
+        self.put("stalled-ledger.jsonl", "a\n")
+        hub = es.Hub(lambda: dict(self.paths), watch_s=0, clock=lambda: 0, providers={"worker-panels-changed": self.fact()})
+        hub.poll_once()
+        self.assertEqual(hub.poll_once(), [])
+        with open(os.path.join(self.d, "stalled-ledger.jsonl"), "a") as f:
+            f.write("b\n")
+        self.assertEqual(hub.poll_once(), ["worker-panels-changed"])
+
+
 class Status(unittest.TestCase):
     def test_hub_status_shapes(self):
         with mock.patch.dict(os.environ, {"AGENT_MANAGER_EVENT_STREAM": "off"}):
@@ -487,6 +595,26 @@ class Route(Base):
             self.assertEqual(fact(), ("tight", "io stall"))
             Path(marker).write_text(json.dumps({"state": "tight", "reason": "io stall", "numbers": {"io_full": 41}, "pad": 1}))
             self.assertEqual(fact(), ("tight", "io stall"))      # the numbers moved; the chip's state did not, so no announcement
+
+    def test_the_route_registers_the_worker_panels_provider_over_the_real_panel_files(self):
+        ops = os.path.join(self.pipe, "opsstate")
+        os.makedirs(os.path.join(ops, "gateway"))
+        switches = os.path.join(self.pipe, "switches")
+        os.makedirs(switches)
+        db = os.path.join(self.pipe, "model-stats.db")
+        with mock.patch.dict(os.environ, {"AGENT_MANAGER_CONTEXT_OPS_STATE_DIR": ops, "AGENT_MANAGER_DISABLED_WORKERS_DIR": switches, "AGENT_MANAGER_MODEL_STATS_DB_PATH": db}):
+            fact = route._providers()["worker-panels-changed"]
+            self.assertEqual(fact(), ())
+            for rel in ("needswork-ledger.jsonl", "gateway/spend-ledger.jsonl", "stalled-index.json", "context-map-disabled"):
+                Path(ops, rel).write_text("x")
+            Path(switches, "worker-cloud").write_text("{}")
+            Path(switches, "reviewer").write_text("{}")
+            Path(db).write_text("db")
+            Path(db + "-wal").write_text("wal")
+            names = sorted(os.path.basename(t[0]) for t in fact())
+            self.assertEqual(names, ["context-map-disabled", "model-stats.db", "model-stats.db-wal", "needswork-ledger.jsonl", "spend-ledger.jsonl", "stalled-index.json", "worker-cloud"])
+            Path(ops, "needswork-drain.log").write_text("idle")
+            self.assertEqual(sorted(os.path.basename(t[0]) for t in fact()), names)
 
     def test_a_number_inside_the_reason_does_not_announce_but_new_wording_does(self):
         marker = os.path.join(self.pipe, "mem2.json")

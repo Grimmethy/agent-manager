@@ -43,7 +43,7 @@ function harness(over = {}) {
 test('counts-changed: summary and nav always, a redraw only for a queue tab', () => {
   assert.deepEqual(lu.planForEvent('counts-changed', 'pending'), plan({ summary: true, nav: true, main: true }));
   assert.deepEqual(lu.planForEvent('counts-changed', 'blocked'), plan({ summary: true, nav: true, main: true }));
-  assert.deepEqual(lu.planForEvent('counts-changed', 'workers'), plan({ summary: true, nav: true }));
+  assert.deepEqual(lu.planForEvent('counts-changed', 'workers'), plan({ summary: true, nav: true, main: true }));      // the Workers tab lists completed tasks
   assert.deepEqual(lu.planForEvent('counts-changed', 'project'), plan({ summary: true, nav: true }));
   assert.deepEqual(lu.planForEvent('counts-changed', 'myplugin', (t) => t === 'myplugin'), plan({ summary: true, nav: true }));
 });
@@ -63,9 +63,12 @@ test('plugins-changed re-syncs the plugin tabs and redraws only the Plugins tab'
   assert.deepEqual(lu.planForEvent('plugins-changed', 'plugins'), plan({ plugins: true, nav: true, main: true }));
 });
 
-test('workers-changed redraws only the Workers tab', () => {
-  assert.deepEqual(lu.planForEvent('workers-changed', 'workers'), plan({ main: true }));
-  assert.deepEqual(lu.planForEvent('workers-changed', 'pending'), lu.NO_PLAN);
+test('workers-changed and worker-panels-changed redraw only the Workers tab', () => {
+  for (const name of ['workers-changed', 'worker-panels-changed']) {
+    assert.deepEqual(lu.planForEvent(name, 'workers'), plan({ main: true }), name);
+    assert.deepEqual(lu.planForEvent(name, 'pending'), lu.NO_PLAN, name);
+    assert.deepEqual(lu.planForEvent(name, 'hardware'), lu.NO_PLAN, name);
+  }
 });
 
 test('branches-changed refreshes only the Branches tab', () => {
@@ -105,11 +108,16 @@ test('a plugin that replaces a self-rendering tab (an iframe) is never put on th
 });
 
 test('the transitional list is exactly the tabs that have no events yet', () => {
-  assert.deepEqual(lu.TRANSITIONAL_POLLED_TABS, ['workers', 'hardware', 'models', 'joblist', 'plugins', 'deepdive', 'discovery', 'reports', 'tokenfold', 'adhoc']);
+  assert.deepEqual(lu.TRANSITIONAL_POLLED_TABS, ['hardware', 'models', 'joblist', 'plugins', 'deepdive', 'discovery', 'reports', 'tokenfold', 'adhoc']);
   for (const t of lu.TRANSITIONAL_POLLED_TABS) assert.equal(lu.transitionalPollDue(t), true, t);
   for (const t of ['pending', 'blocked', 'done']) assert.equal(lu.transitionalPollDue(t), false, t);
   for (const t of lu.SELF_RENDERING_TABS) assert.equal(lu.transitionalPollDue(t), false, t);
   assert.equal(lu.transitionalPollDue('myplugin', (x) => x === 'myplugin'), true);
+});
+
+test('the Workers tab no longer needs the redraw timer: it has events', () => {
+  assert.equal(lu.transitionalPollDue('workers'), false);
+  assert.ok(lu.LIVE_EVENTS.includes('worker-panels-changed'));
 });
 
 test('every transitional or self-rendering tab is a known non-queue tab', () => {
