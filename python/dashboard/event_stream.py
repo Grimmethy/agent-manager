@@ -27,6 +27,7 @@ import time
 import urllib.request
 from collections import deque
 
+ANNOUNCE_EVENTS = ("plugin-changed", "project-build-changed", "branch-list-changed")     # events a writer announces itself (Hub.announce), not derived from a file by the watcher
 EVENT_NAMES = ("counts-changed", "workers-changed", "branches-changed", "plugins-changed", "project-changed")
 WATCH_S = 1.0
 RECONCILE_S = 60.0
@@ -275,6 +276,18 @@ class Hub:
                 self._gen[name] = self._gen.get(name, 0) + 1
             self._cond.notify_all()
 
+    def announce(self, name, **data):
+        """A WRITER's own announcement (ADR-0024: the party that changes something says so). Only the names in ANNOUNCE_EVENTS are accepted, so a request cannot invent an event;
+        `data` rides along (the plugin's name) under the hub's own `seq` and `why`. Works whether or not a client is connected (the ring replays it). Returns the sequence number."""
+        if name not in ANNOUNCE_EVENTS:
+            raise ValueError("not an announceable event: %r" % (name,))
+        with self._cond:
+            self._seq += 1
+            self._ring.append({"id": self._seq, "event": name, "data": {**data, "seq": self._seq, "why": "announce"}})
+            self._gen[name] = self._gen.get(name, 0) + 1
+            self._cond.notify_all()
+            return self._seq
+
     def poll_once(self, full=False):
         """One watcher pass -> the list of event names announced. The first pass only records the baseline (a client's snapshot covers it)."""
         facts = self._facts(full)
@@ -383,6 +396,22 @@ def get_hub(resolve, providers=None):
         if _hub is None:
             _hub = Hub(resolve, providers=providers)
         return _hub
+
+
+def digest(value):
+    """A short stable fingerprint of a JSON-able value (key order does not matter). A cache that stores a recomputed list compares it with the one it replaces, so the page is told
+    only when the list really changed, not on every refresh."""
+    import hashlib
+    return hashlib.sha1(json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def announce(name, **data):
+    """The module-level way for a WRITER inside the dashboard process (a background build thread) to announce. Returns None, and does nothing, while no hub exists (nobody has
+    connected yet: a client's snapshot covers what it missed) and never raises: a failed announcement must not break the work that triggered it."""
+    try:
+        return _hub.announce(name, **data)       # with no hub yet this is an AttributeError on None: the same quiet None
+    except Exception:
+        return None
 
 
 def generation(name):

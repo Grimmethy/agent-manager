@@ -491,7 +491,7 @@ let counts = {};
 
 // Project tab state -- kept separate from the generic 5s poll-and-rerender cycle used by
 // every other tab, since re-rendering over a user's in-progress folder navigation every
-// 5s would be a bad experience. See renderProject()/enterProjectTab()/leaveProjectTab().
+// 5s would be a bad experience. See renderProject()/enterProjectTab(); its panels refresh on events (pipeline-state-changed, project-build-changed), not on a timer.
 let projectPath = localStorage.getItem('agentManagerProjectPath') || '';
 // Last activeRepoRoot value seen from the server (see enterProjectTab's sync below).
 // Starts equal to projectPath so the very first sync is a no-op when they already agree --
@@ -538,7 +538,6 @@ let projectHistory = [];
 // capture note and reset the second-brain folder browser back to its root every tick.
 let brainDumpBrowsePath = localStorage.getItem('agentManagerBrainDumpBrowsePath') || '';
 let brainDumpSelectedFile = null;
-let brainDumpEntriesInterval = null;
 // '' (Unprocessed, /api/brain-dump's own default) | 'actioned' (Processed) | 'all' --
 // mirrors the ?status= values api_brain_dump() (app.py) already accepts; not persisted
 // to localStorage, same as queueSourceFilter's per-tab-visit reset (queue-source-filter).

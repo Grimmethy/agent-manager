@@ -394,7 +394,14 @@ def api_pipeline_stop():
 @pipeline_1_more_bp.route("/api/git/unmerged-branches")
 def api_git_unmerged_branches():
     # Served from the cache (stale-while-revalidate, see app.list_unmerged_branches): the forced full recompute took ~37 s under load, past the tab's 30 s timeout.
-    from app import _branch_cache, _branch_cache_lock, branch_list_refreshing, list_unmerged_branches
+    from app import _branch_cache, _branch_cache_lock, _invalidate_branch_cache, branch_list_refreshing, list_unmerged_branches
+    if request.args.get("kick") == "1":
+        # The page was told that something that feeds the list happened (a task finished, a verdict, a merge): start the background refresh NOW instead of waiting for the
+        # TTL, and still answer from the last good list. The refresh announces branch-list-changed when it finds a difference, and the page reads the list again.
+        _invalidate_branch_cache(refetch=True)
+        if request.args.get("projects") == "all":
+            import branch_projects
+            branch_projects.expire_all()
     branches = list_unmerged_branches(force=False, stale_ok=True)   # never recomputes inside the request: last good list now, refresh in the background
     with _branch_cache_lock:
         filled = _branch_cache["at"]

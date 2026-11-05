@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -550,6 +551,226 @@ class DirFilesFact(Base):
         self.assertEqual(hub.poll_once(), ["worker-panels-changed"])
 
 
+class Announce(Base):
+    def test_a_writers_announcement_is_published_with_its_data_under_the_hubs_own_seq(self):
+        seq = self.hub.announce("plugin-changed", plugin="books")
+        self.assertEqual(seq, 1)
+        self.assertEqual(self.hub.generation("plugin-changed"), 1)
+        events, resync = self.hub.events_after(0, 0)
+        self.assertFalse(resync)
+        self.assertEqual(events, [{"id": 1, "event": "plugin-changed", "data": {"plugin": "books", "seq": 1, "why": "announce"}}])
+        self.assertEqual(self.hub.announce("plugin-changed", plugin="mail"), 2)
+        self.assertEqual(self.hub.generation("plugin-changed"), 2)
+
+    def test_the_data_cannot_overwrite_the_hubs_seq_or_why(self):
+        self.hub.announce("plugin-changed", plugin="books", seq=99, why="evil")
+        self.assertEqual(self.hub._ring[-1]["data"], {"plugin": "books", "seq": 1, "why": "announce"})
+
+    def test_only_announceable_events_are_accepted_and_a_refusal_publishes_nothing(self):
+        for name in ("counts-changed", "snapshot", "", "plugin-changedX", None):
+            with self.assertRaises(ValueError):
+                self.hub.announce(name, plugin="books")
+        self.assertEqual(len(self.hub._ring), 0)
+        self.assertEqual(self.hub.generation("plugin-changed"), 0)
+        self.assertEqual(es.ANNOUNCE_EVENTS, ("plugin-changed", "project-build-changed", "branch-list-changed"))
+
+    def test_an_announcement_wakes_a_waiting_reader(self):
+        seen = []
+        t = threading.Thread(target=lambda: seen.append(self.hub.events_after(0, 5)))
+        t.start()
+        time.sleep(0.1)
+        self.hub.announce("plugin-changed", plugin="books")
+        t.join(3)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(seen[0][0][0]["event"], "plugin-changed")
+
+
+class ModuleAnnounce(Base):
+    def test_without_a_hub_a_writers_announcement_does_nothing(self):
+        with mock.patch.object(es, "_hub", None):
+            self.assertIsNone(es.announce("project-build-changed", path="/p"))
+
+    def test_with_a_hub_it_publishes_and_returns_the_seq(self):
+        with mock.patch.object(es, "_hub", self.hub):
+            self.assertEqual(es.announce("project-build-changed", path="/p"), 1)
+        self.assertEqual(self.hub._ring[-1]["event"], "project-build-changed")
+        self.assertEqual(self.hub._ring[-1]["data"], {"path": "/p", "seq": 1, "why": "announce"})
+
+    def test_a_failing_or_refused_announcement_never_raises_into_the_writer(self):
+        with mock.patch.object(es, "_hub", self.hub):
+            self.assertIsNone(es.announce("counts-changed"))                  # not announceable
+            with mock.patch.object(self.hub, "announce", side_effect=RuntimeError("boom")):
+                self.assertIsNone(es.announce("project-build-changed", path="/p"))
+        self.assertEqual(len(self.hub._ring), 0)
+
+
+class PipelineState(Base):
+    def _patch(self, **over):
+        vals = {"ENV_FILE_PATH": "env", "_pipeline_running": lambda: False, "_pipeline_stoppable": lambda: False, "get_active_repo_root": lambda: "/repo",
+                "read_env_file": lambda p: {"AGENT_MANAGER_INCLUDE_APPLY": "true", "AGENT_MANAGER_APPLY_SKIP_PUSH": "false"}}
+        vals.update(over)
+        ps = [mock.patch.object(app, k, v) for k, v in vals.items()]
+        for p in ps:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_the_provider_is_registered_on_a_three_second_clock(self):
+        fact, interval = route._providers()["pipeline-state-changed"]
+        self.assertEqual(interval, 3.0)
+        self.assertEqual(route.PIPELINE_STATE_INTERVAL_S, 3.0)
+        self.assertIs(fact, route._pipeline_state)
+
+    def test_the_value_follows_running_stoppable_the_toggles_and_the_repo(self):
+        self._patch()
+        base = route._pipeline_state()
+        self.assertEqual(base, ("/repo", False, False, True, False))
+        self.assertEqual(route._pipeline_state(), base)                           # nothing moved: an equal value announces nothing
+        self._patch(_pipeline_stoppable=lambda: True)
+        self.assertEqual(route._pipeline_state(), ("/repo", False, True, True, False))
+        self._patch(_pipeline_running=lambda: True)
+        self.assertEqual(route._pipeline_state(), ("/repo", True, True, True, False))   # running implies stoppable
+        self._patch(get_active_repo_root=lambda: "/other")
+        self.assertEqual(route._pipeline_state()[0], "/other")
+        self._patch(read_env_file=lambda p: {})
+        self.assertEqual(route._pipeline_state()[3:], (False, True))              # the route's own defaults
+
+    def test_the_value_mirrors_the_status_route_field_for_field(self):
+        self._patch(_pipeline_running=lambda: True)
+        body = app.app.test_client().get("/api/pipeline/status").get_json()
+        self.assertEqual(route._pipeline_state(), (body["activeRepoRoot"], body["running"], body["stoppable"], body["includeApply"], body["skipPush"]))
+
+    def test_an_error_is_the_value_none_not_an_exception(self):
+        for exc in (OSError("boom"), ValueError("bad"), KeyError("k"), RuntimeError("x")):
+            self._patch(_pipeline_running=mock.Mock(side_effect=exc))
+            self.assertIsNone(route._pipeline_state(), repr(exc))
+
+
+class BuildAnnouncements(Base):
+    def _run(self, build):
+        cache = {k: Path(self.pipe) / (k + ".json") for k in ("graph", "coverage", "file_cache", "positions", "meta")}
+        with mock.patch.object(es, "announce") as ann, mock.patch.object(app, "resolve_writable_cache", return_value=cache), \
+                mock.patch.object(app.graph_build, "build_graph_data", side_effect=build), mock.patch.object(app.graph_build, "merge_coverage", return_value={}):
+            with app._build_lock:
+                app._build_state["/p"] = {"running": True, "log": [], "error": None}
+            app._run_build("/p", [])
+        return ann.call_args_list, app._build_state["/p"]
+
+    def test_every_log_line_and_the_finish_announce_the_project_path(self):
+        def build(path, dirs, url, model, progress=None, **kw):
+            progress("one")
+            progress("two")
+            return {"graph": {"nodes": []}, "coverage": {}}
+        calls, state = self._run(build)
+        self.assertEqual(calls, [mock.call("project-build-changed", path="/p")] * 3)
+        self.assertEqual((state["running"], state["log"]), (False, ["one", "two"]))
+
+    def test_a_failed_build_announces_its_end_too(self):
+        def build(path, dirs, url, model, progress=None, **kw):
+            progress("start")
+            raise RuntimeError("graph failed")
+        calls, state = self._run(build)
+        self.assertEqual(calls, [mock.call("project-build-changed", path="/p")] * 2)
+        self.assertEqual((state["running"], state["error"]), (False, "graph failed"))
+
+    def test_starting_a_build_announces_before_the_thread_runs(self):
+        order = []
+        with mock.patch.object(es, "announce", side_effect=lambda *a, **k: order.append(("announce", k))), \
+                mock.patch.object(app, "_run_build", side_effect=lambda *a: order.append(("run", a))), mock.patch.object(app, "record_project_used"):
+            r = app.app.test_client().post("/api/project/build", json={"path": self.pipe})
+            time.sleep(0.2)
+        self.assertEqual(r.get_json()["started"], True)
+        self.assertEqual(order[0], ("announce", {"path": self.pipe}))
+        with app._build_lock:
+            app._build_state.pop(self.pipe, None)
+
+
+
+class BranchListAnnouncements(Base):
+    def test_the_digest_is_stable_across_key_order_and_moves_with_any_change(self):
+        a = es.digest([{"branch": "x", "ahead": 1}, None])
+        self.assertEqual(a, es.digest([{"ahead": 1, "branch": "x"}, None]))
+        self.assertNotEqual(a, es.digest([{"branch": "x", "ahead": 2}, None]))
+        self.assertNotEqual(es.digest([]), es.digest(None))
+        self.assertEqual(es.digest({"when": object.__class__}), es.digest({"when": object.__class__}))      # not JSON-able values are stringified, never raised
+
+    def _cache_guard(self):
+        saved = dict(app._branch_cache)
+        self.addCleanup(lambda: (app._branch_cache.clear(), app._branch_cache.update(saved)))
+        app._branch_cache.pop("digest", None)
+
+    def test_the_active_projects_cache_announces_only_when_the_list_really_changed(self):
+        self._cache_guard()
+        with mock.patch.object(es, "announce") as ann, mock.patch.object(app, "queue_dir", lambda: None):
+            app._store_branch_list([{"branch": "a"}])
+            app._store_branch_list([{"branch": "a"}])                              # the same list again: silence
+            self.assertEqual(ann.call_args_list, [mock.call("branch-list-changed", project="active")])
+            app._store_branch_list([{"branch": "a"}, {"branch": "b"}])
+            self.assertEqual(ann.call_count, 2)
+            app._branch_cache["held"] = [{"hub": "H1"}]                            # a held hub group is part of what the tab shows
+            app._store_branch_list([{"branch": "a"}, {"branch": "b"}])
+            self.assertEqual(ann.call_count, 3)
+            app._branch_cache["held_other"] = {"/other": [{"hub": "H2"}]}
+            app._store_branch_list([{"branch": "a"}, {"branch": "b"}])
+            self.assertEqual(ann.call_count, 4)
+
+    def test_another_projects_refresh_announces_with_its_root_and_only_on_a_change(self):
+        import branch_projects as bp
+        project = {"repoRoot": "/other-repo", "pipelineDir": "/other-pipe", "label": "other"}
+        saved = dict(bp._state["cache"])
+        self.addCleanup(lambda: (bp._state["cache"].clear(), bp._state["cache"].update(saved)))
+        bp._state["cache"].clear()
+        lists = [[{"branch": "x"}], [{"branch": "x"}], [{"branch": "x"}, {"branch": "y"}]]
+        with mock.patch.object(es, "announce") as ann, mock.patch.object(app, "_list_unmerged_branches_uncached", side_effect=lambda **kw: lists.pop(0)):
+            for _ in range(3):
+                bp._refresh_stale([project])
+        self.assertEqual(ann.call_args_list, [mock.call("branch-list-changed", project="/other-repo")] * 2)
+        self.assertEqual(bp._state["cache"]["/other-repo"]["branches"], [{"branch": "x"}, {"branch": "y"}])
+
+    def test_expiring_the_other_projects_keeps_their_last_good_lists(self):
+        import branch_projects as bp
+        saved = dict(bp._state["cache"])
+        self.addCleanup(lambda: (bp._state["cache"].clear(), bp._state["cache"].update(saved)))
+        bp._state["cache"].clear()
+        bp._state["cache"]["/r1"] = {"at": time.time(), "branches": [{"branch": "k"}], "error": None}
+        bp._state["cache"]["/r2"] = {"at": time.time(), "branches": [], "error": "boom"}
+        bp.expire_all()
+        self.assertEqual([e["at"] for e in bp._state["cache"].values()], [0.0, 0.0])
+        self.assertEqual(bp._state["cache"]["/r1"]["branches"], [{"branch": "k"}])
+        self.assertEqual(bp._state["cache"]["/r2"]["error"], "boom")
+
+
+class BranchListKick(Base):
+    def setUp(self):
+        super().setUp()
+        self.client = app.app.test_client()
+
+    def _get(self, query):
+        import branch_projects as bp
+        with mock.patch.object(app, "_invalidate_branch_cache") as inv, mock.patch.object(app, "list_unmerged_branches", return_value=[]) as lst, \
+                mock.patch.object(bp, "expire_all") as exp, mock.patch.object(bp, "combined_branches", return_value=([], [])):
+            r = self.client.get("/api/git/unmerged-branches" + query)
+        return r, inv, lst, exp
+
+    def test_a_kick_starts_the_refresh_now_and_still_answers_from_the_cache(self):
+        r, inv, lst, exp = self._get("?projects=all&kick=1")
+        self.assertEqual(r.status_code, 200)
+        inv.assert_called_once_with(refetch=True)
+        exp.assert_called_once_with()
+        lst.assert_called_once_with(force=False, stale_ok=True)               # the request itself never recomputes
+
+    def test_a_kick_without_all_projects_leaves_the_other_projects_alone(self):
+        r, inv, lst, exp = self._get("?kick=1")
+        inv.assert_called_once_with(refetch=True)
+        exp.assert_not_called()
+
+    def test_without_a_kick_nothing_is_invalidated(self):
+        for q in ("?projects=all", "?projects=all&kick=0", ""):
+            r, inv, lst, exp = self._get(q)
+            self.assertEqual(r.status_code, 200)
+            inv.assert_not_called()
+            exp.assert_not_called()
+
+
 class Coarse(unittest.TestCase):
     def test_numbers_keep_two_significant_figures(self):
         self.assertEqual(es.coarse(12345), 12000)
@@ -758,6 +979,42 @@ class Route(Base):
         self.addCleanup(h.stop)
         self.hub._thread = mock.Mock(is_alive=lambda: True)
 
+    def test_a_known_plugin_can_announce_and_the_open_stream_receives_it(self):
+        with mock.patch.object(app, "_read_plugins_manifest", lambda: ["junk", {"name": "books"}, {"name": "mail"}]):
+            r = self.client.get("/api/stream", buffered=False)
+            it = iter(r.response)
+            take = lambda: (lambda c: c.decode() if isinstance(c, bytes) else c)(next(it))
+            take()
+            take()                                                           # the retry line and the snapshot
+            a = self.client.post("/api/plugins/books/announce")
+            self.assertEqual(a.status_code, 200)
+            self.assertEqual(a.get_json(), {"ok": True, "plugin": "books", "seq": self.hub._seq})
+            got = ""
+            for _ in range(40):
+                got += take()
+                if "plugin-changed" in got:
+                    break
+            r.close()
+        self.assertIn("event: plugin-changed", got)
+        self.assertIn('"plugin":"books"', got)
+
+    def test_an_unknown_plugin_or_an_unreadable_manifest_publishes_nothing(self):
+        with mock.patch.object(app, "_read_plugins_manifest", lambda: [{"name": "books"}, 7, None]):
+            for name in ("nope", "boo", "Books", "7", "None"):
+                r = self.client.post("/api/plugins/%s/announce" % name)
+                self.assertEqual((r.status_code, r.get_json()), (404, {"ok": False, "error": "unknown plugin"}), name)
+        with mock.patch.object(app, "_read_plugins_manifest", mock.Mock(side_effect=ValueError("boom"))):
+            self.assertEqual(self.client.post("/api/plugins/books/announce").status_code, 404)
+        self.assertEqual(self.hub._seq, 0)
+
+    def test_announce_follows_the_off_switch_and_accepts_post_only(self):
+        with mock.patch.object(app, "_read_plugins_manifest", lambda: [{"name": "books"}]):
+            with mock.patch.dict(os.environ, {"AGENT_MANAGER_EVENT_STREAM": "off"}):
+                r = self.client.post("/api/plugins/books/announce")
+            self.assertEqual((r.status_code, r.get_json()), (404, {"enabled": False}))
+            self.assertEqual(self.client.get("/api/plugins/books/announce").status_code, 405)
+        self.assertEqual(self.hub._seq, 0)
+
     def test_off_switch_answers_404(self):
         with mock.patch.dict(os.environ, {"AGENT_MANAGER_EVENT_STREAM": "off"}):
             r = self.client.get("/api/stream")
@@ -936,6 +1193,53 @@ class Route(Base):
         bare = Path(tempfile.mkdtemp(dir="/dev/shm" if os.path.isdir("/dev/shm") else None))
         self.addCleanup(shutil.rmtree, bare, True)
         self.assertIsNone(route._head_log_path(str(bare)))
+
+    def test_the_route_registers_a_brain_dump_provider_over_the_active_projects_file(self):
+        f = Path(self.pipe) / "brain-dump.json"
+        with mock.patch.object(app, "brain_dump_path", lambda: f):
+            fact = route._providers()["brain-dump-changed"]
+            self.assertEqual(fact(), ())                                           # no file yet: nothing
+            f.write_text("[]")
+            first = fact()
+            self.assertEqual([os.path.basename(t[0]) for t in first], ["brain-dump.json"])
+            self.assertEqual(fact(), first)                                        # unchanged: an equal value announces nothing
+            f.write_text('[{"id": 1}]')                                            # an entry written: size and mtime move
+            self.assertNotEqual(fact(), first)
+            other = Path(self.pipe) / "other.json"
+            other.write_text("x")                                                  # a neighbouring file is not the Brain Dump file
+            before = fact()
+            other.write_text("changed")
+            self.assertEqual(fact(), before)
+        with mock.patch.object(app, "brain_dump_path", lambda: None):
+            self.assertEqual(route._providers()["brain-dump-changed"](), ())      # no active project
+
+    def test_the_route_registers_a_hygiene_provider_over_the_scanner_flags_and_the_candidate_docs(self):
+        queue = Path(self.pipe) / "hq"
+        docs = Path(self.pipe) / "repo" / "Docs"
+        queue.mkdir()
+        docs.mkdir(parents=True)
+        with mock.patch.object(app, "queue_dir", lambda: queue), mock.patch.object(app, "get_active_repo_root", lambda: str(docs.parent)):
+            fact = route._providers()["hygiene-changed"]
+            self.assertEqual(fact(), ())
+            (queue / "file-length-flags.json").write_text("{}")
+            first = fact()
+            self.assertEqual([os.path.basename(t[0]) for t in first], ["file-length-flags.json"])
+            self.assertEqual(fact(), first)                                          # unchanged: announces nothing
+            (queue / "file-length-flags.json").write_text('{"flags": [1]}')
+            second = fact()
+            self.assertNotEqual(second, first)
+            (docs / "DEAD_CODE_CANDIDATES.md").write_text("### AC-1")
+            third = fact()
+            self.assertEqual(sorted(os.path.basename(t[0]) for t in third), ["DEAD_CODE_CANDIDATES.md", "file-length-flags.json"])
+            (docs / "DEAD_CODE_CANDIDATES.md").write_text("### AC-1 and more")
+            self.assertNotEqual(fact(), third)
+            before = fact()
+            (queue / "queue-task.json").write_text("{}")                               # a task record is counts-changed, not a flag file
+            (docs / "README.md").write_text("x")                                       # nor is any other doc
+            (queue / "notflags.json.bak").write_text("{}")
+            self.assertEqual(fact(), before)
+        with mock.patch.object(app, "queue_dir", lambda: None), mock.patch.object(app, "get_active_repo_root", lambda: None):
+            self.assertEqual(route._providers()["hygiene-changed"](), ())             # no active project
 
     def test_the_route_registers_a_benchmark_provider_over_the_runs_directory(self):
         base = Path(self.pipe) / "benchmarks"

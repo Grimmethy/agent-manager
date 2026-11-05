@@ -25,6 +25,9 @@ def _providers():
             "reports-changed": event_stream.dir_files_fact(_reports_specs),
             "discovery-changed": event_stream.dir_files_fact(lambda: [], _discovery_files),
             "plugin-states-changed": (_plugin_states, PLUGIN_STATES_INTERVAL_S),
+            "pipeline-state-changed": (_pipeline_state, PIPELINE_STATE_INTERVAL_S),
+            "brain-dump-changed": event_stream.dir_files_fact(lambda: [], _brain_dump_files),
+            "hygiene-changed": event_stream.dir_files_fact(_hygiene_specs),
             "settings-changed": event_stream.dir_files_fact(lambda: [], _settings_files),
             "benchmark-changed": event_stream.dir_files_fact(_benchmark_specs, subdirs=True),
             "worker-panels-changed": event_stream.dir_files_fact(_panel_specs, _panel_files), "memory-changed": event_stream.json_file_fact(memory_status.marker_path, lambda d: (d.get("state"), re.sub(r"\d+", "#", str(d.get("reason") or ""))))}
@@ -57,6 +60,7 @@ def _settings_files():
 # Sampled sources: the hardware plugin's stats and the TokenFold proxy's stats are live numbers behind HTTP, with no file to watch. ONE shared sampler asks them (the hub's single clock, only while a page
 # is connected) every few seconds and announces a change only when a number moved by a visible amount (event_stream.coarse: two significant figures); a service that goes away or comes back is a change too.
 HARDWARE_INTERVAL_S = 5.0
+PIPELINE_STATE_INTERVAL_S = 3.0           # the Project tab's pipeline panel: running, stoppable, the apply toggles and the active repo, sampled once for every browser
 PLUGIN_STATES_INTERVAL_S = 5.0            # one shared sampler pass over the plugin pid files; the Plugins tab never samples
 TOKENFOLD_INTERVAL_S = 10.0
 
@@ -82,6 +86,44 @@ def _reports_specs():
     from routes.reports import _reports_root
     root = _reports_root()
     return [(str(root / period), re.compile(r"\.md$")) for period in _REPORT_PERIODS] if root else []
+
+
+def _brain_dump_files():
+    """The one file the Brain Dump tab shows: brain-dump.json of the active project (the path is resolved on every pass; None, a missing file or no active project contributes nothing).
+    Whoever writes an entry (the tab, the chat, a pipeline sweep, a hand edit) replaces or grows the file, so its stat key moves and the open tab is told."""
+    from app import brain_dump_path
+    return [brain_dump_path()]
+
+
+_HYGIENE_FLAGS = re.compile(r"-flags\.json$")
+_HYGIENE_CANDIDATES = re.compile(r"_CANDIDATES\.md$")
+
+
+def _hygiene_specs():
+    """The files the Hygiene inventory is joined from that nothing else announces, for the ACTIVE project (resolved on every pass): the scanners' queue/*-flags.json and the repo's
+    Docs/*_CANDIDATES.md. The queue's task records are counts-changed, the unmerged candidate docs are branches-changed; a missing directory contributes nothing."""
+    from app import get_active_repo_root, queue_dir
+    specs = []
+    q = queue_dir()
+    if q:
+        specs.append((str(q), _HYGIENE_FLAGS))
+    root = get_active_repo_root()
+    if root:
+        specs.append((os.path.join(root, "Docs"), _HYGIENE_CANDIDATES))
+    return specs
+
+
+def _pipeline_state(full=False):
+    """What /api/pipeline/status reports, as one value (the route's own functions, so the two can never disagree): (active repo, running, stoppable, includeApply, skipPush).
+    Never raises: an error is the value None, which differs from any real state and so announces once."""
+    try:
+        from app import ENV_FILE_PATH, _pipeline_running, _pipeline_stoppable, get_active_repo_root, read_env_file
+        env = read_env_file(ENV_FILE_PATH)
+        running = bool(_pipeline_running())
+        return (get_active_repo_root(), running, True if running else bool(_pipeline_stoppable()),
+                env.get("AGENT_MANAGER_INCLUDE_APPLY", "false") == "true", env.get("AGENT_MANAGER_APPLY_SKIP_PUSH", "true") == "true")
+    except Exception:
+        return None
 
 
 def _mtime_ns(path):
@@ -154,6 +196,23 @@ def _panel_files():
     from app import model_stats_db_path
     db = model_stats_db_path()
     return [db, (str(db) + "-wal") if db else None]
+
+
+@event_stream_bp.route("/api/plugins/<name>/announce", methods=["POST"])
+def api_plugin_announce(name):
+    """A plugin tells the dashboard that what its tab shows changed (ADR-0024: the writer announces). The open tab of THAT plugin redraws; nothing else does.
+    The name must be a plugin of the manifest, so the request cannot invent events or target a tab that is not a plugin's."""
+    from app import _read_plugins_manifest
+    if not event_stream.enabled():
+        return jsonify({"enabled": False}), 404
+    try:
+        known = {str(p.get("name")) for p in _read_plugins_manifest() if isinstance(p, dict)}
+    except Exception:
+        known = set()
+    if name not in known:
+        return jsonify({"ok": False, "error": "unknown plugin"}), 404
+    hub = event_stream.get_hub(_resolve, _providers())
+    return jsonify({"ok": True, "plugin": name, "seq": hub.announce("plugin-changed", plugin=name)})
 
 
 @event_stream_bp.route("/api/stream")

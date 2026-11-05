@@ -40,6 +40,7 @@ from werkzeug.exceptions import HTTPException
 # dashboard/ -- added explicitly rather than relying on an installed package, matching
 # this whole project's no-build-step, run-from-source philosophy.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import event_stream  # noqa: E402
 import graph_build  # noqa: E402
 from app_proactive_sweep import proactive_sweep_argv, proactive_sweep_lock_path  # noqa: E402
 from response_compression import compress_response  # noqa: E402
@@ -1811,6 +1812,7 @@ def _run_build(path_str: str, grep_dirs: list[str]):
         log_lines.append(msg)
         with _build_lock:
             _build_state[path_str]["log"] = list(log_lines)
+        event_stream.announce("project-build-changed", path=path_str)
 
     try:
         ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -1853,10 +1855,12 @@ def _run_build(path_str: str, grep_dirs: list[str]):
 
         with _build_lock:
             _build_state[path_str]["running"] = False
+        event_stream.announce("project-build-changed", path=path_str)
     except Exception as e:
         with _build_lock:
             _build_state[path_str]["running"] = False
             _build_state[path_str]["error"] = str(e)
+        event_stream.announce("project-build-changed", path=path_str)
 
 
 def _pipeline_daemon_pids() -> list:
@@ -2400,6 +2404,11 @@ def _store_branch_list(branches):
         _branch_cache["at"] = time.time()
         _branch_cache["branches"] = branches
         _branch_cache["filled"] = True   # a list was computed at least once: an invalidated cache still has a last good list to serve
+        fingerprint = event_stream.digest([branches, _branch_cache.get("held"), _branch_cache.get("held_other")])
+        changed = fingerprint != _branch_cache.get("digest")
+        _branch_cache["digest"] = fingerprint
+    if changed:
+        event_stream.announce("branch-list-changed", project="active")      # the Branches tab re-reads the cached list (a recompute that found nothing new says nothing)
     # Apply any pending verdicts for branches that are now in the listing
     try:
         import branch_verdicts_pending as bvp
