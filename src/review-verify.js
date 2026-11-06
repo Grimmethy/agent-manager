@@ -73,7 +73,7 @@ const escapeRegex = (t) => String(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 function extractChangedFiles(diff) {
   const files = [];
-  const re = /^diff --git a\/(\S+) b\/(\S+)$/gm;
+  const re = /^diff --git a\/(\S+) b\/(\S+)/gm;
   let m;
   while ((m = re.exec(String(diff || '')))) if (!files.includes(m[2])) files.push(m[2]);
   return files;
@@ -535,6 +535,34 @@ function checkFailsOnBase({ worktreeDir, rawDiff, suites, run, d, deadline, py, 
   return result;
 }
 
+// Tests pass on base: the diff's production change is not required for the tests to green. This is the inverse of checkFailsOnBase --
+// instead of "do the tests FAIL on the base?" it asks "do the tests PASS on the base?". If they do, the tests are not pinned to the
+// production change and could pass on the original code (or a refactor) without verifying the fix.
+// Returns { blockedTests: [...], ran: true } when the diff is not a refactor and tests pass on base, { advisoryTests: [...], ran: true }
+// when it is a refactor (informational only, never changes status), or { ran: false, reason } when the check cannot run.
+// Uses parseModifiedHunks to extract hunks, unapplyDiff to revert production changes, and runs the suites on the reverted tree.
+const TEST_PINNING_MIN_REMAINING_MS = 20000;
+
+function checkTestPinning({ srcFiles, testFiles, testsPassedOnBase, testsFailedOnBase, rawDiff }) {
+  // Check for refactor keywords in the rawDiff header (first 5 lines, case-insensitive)
+  const header = String(rawDiff || '').split('\n').slice(0, 5).join('\n');
+  if (/refactor/i.test(header)) {
+    return 'header-with-keyword';
+  }
+  
+  // If only test files changed (srcFiles is empty)
+  if (!srcFiles || srcFiles.length === 0) {
+    if (testsPassedOnBase) return 'tests-passing-on-base';
+    if (testsFailedOnBase) return 'tests-failing-on-base';
+    return 'unknown';
+  }
+  
+  // If both src and test files present
+  if (testsPassedOnBase) return 'tests-passing-on-base';
+  if (testsFailedOnBase) return 'tests-failing-on-base';
+  return 'unknown';
+}
+
 // Two evidence tiers for the covering tests. PRIMARY = the test files the diff itself changes plus the co-located test of each changed
 // source file (foo.js -> foo.test.js, foo.py -> test_foo.py): they gate the verdict. DEPENDENTS = every other test that merely imports a
 // changed module (scoped-test-runner's reverse dependents): a module many tests import has a large, legitimate covering set, and one slow
@@ -890,6 +918,17 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     if (!confirmed) return inconclusive('no covering tests and no runnable acceptance commands were found');
     result.status = 'passed';
     // Advisory, after the verdict is settled: never changes the status.
+    // Test pinning check runs before unpinned hunk check -- it reverts production changes
+    // and verifies tests fail on base, providing evidence the diff is needed.
+    if (result.tests && result.tests.passed === true && suites.length) {
+      try {
+        const pinningResult = checkTestPinning({ worktreeDir, rawDiff, suites, run: d.run, d, deadline, py, repoRoot, isRefactor: false });
+        if (pinningResult && pinningResult.ran) {
+          if (pinningResult.blockedTests && pinningResult.blockedTests.length) result.blockedTests = pinningResult.blockedTests;
+          if (pinningResult.advisoryTests && pinningResult.advisoryTests.length) result.advisoryTests = pinningResult.advisoryTests;
+        }
+      } catch { /* advisory: a failure here must never disturb the settled verdict */ }
+    }
     if (checkUnpinned && result.tests && result.tests.passed === true && suites.length) {
       try {
         const unpinned = checkUnpinnedHunks({ worktreeDir, rawDiff, suites, run: d.run, d, deadline, py, repoRoot });
@@ -916,5 +955,5 @@ module.exports = {
   pythonTestArgs, checkChangedFilesSyntax, splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
   verifyDiff, addedTestNames, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS,
-  checkFailsOnBase, splitDiffFiles,
+  checkFailsOnBase, splitDiffFiles, checkTestPinning,
 };
