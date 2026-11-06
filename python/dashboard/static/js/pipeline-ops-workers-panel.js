@@ -36,8 +36,9 @@ const poWorkerInfo = {
   checker: { label: '✅ merge-ready checker', does: 'records a merge verdict for branches that pass every check' },
   merger: { label: '🔀 merger', does: 'merges branches the checker approved' },
   steward: { label: '📉 idle-cost steward', does: 'files a task for the worst rising idle-cost originator' },
+  hub: { label: '🧩 hub worker', does: 'drains the hidden hubs: answers or requeues stuck pieces, replaces abandoned ones, retires dead hubs' },
 };
-const poWorkerOrder = ['scout', 'checker', 'merger', 'steward'];
+const poWorkerOrder = ['scout', 'checker', 'merger', 'steward', 'hub'];
 
 function poWorkerLabel(name) {
   return poWorkerInfo[name] ? poWorkerInfo[name].label : name;

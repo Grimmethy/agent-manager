@@ -124,7 +124,7 @@ class BuildWorker(unittest.TestCase):
         self.assertEqual(got["decisions"], 1)
 
     def test_workers_are_independent_and_named(self):
-        self.assertEqual(po.WORKERS, ("scout", "checker", "merger", "steward"))
+        self.assertEqual(po.WORKERS, ("scout", "checker", "merger", "steward", "hub"))
         self.assertEqual(build(name="checker", trigger=TRIG)["name"], "checker")
 
 
@@ -141,6 +141,11 @@ class Paths(unittest.TestCase):
         self.assertEqual(po.switch_path("checker", {"HOME": home, "CHECKER_DISABLED_PATH": "/x/m"}), "/x/m")
         self.assertEqual(po.ledger_path("merger", {"HOME": home, "MERGER_LEDGER_PATH": "/x/l"}), "/x/l")
         self.assertEqual(po.ledger_path("steward", {"HOME": home}), os.path.join(base, "steward-ledger.jsonl"))
+        # the hub worker (docs/hub-worker.md) uses the same keyed paths and variable names as the others
+        self.assertEqual(po.ledger_path("hub", {"HOME": home}), os.path.join(base, "hub-ledger.jsonl"))
+        self.assertEqual(po.ledger_path("hub", {"HOME": home, "HUB_LEDGER_PATH": "/x/h"}), "/x/h")
+        self.assertEqual(po.switch_path("hub", {"HOME": home}), os.path.join(base, "hub-disabled"))
+        self.assertEqual(po.switch_path("hub", {"HOME": home, "HUB_DISABLED_PATH": "/x/m"}), "/x/m")
 
 
 class Switch(unittest.TestCase):

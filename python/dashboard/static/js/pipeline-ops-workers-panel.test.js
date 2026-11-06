@@ -45,6 +45,14 @@ test('one card per configured worker, in the fixed order, with unknown workers l
   assert.match(html, /📉 idle-cost steward/);
 });
 
+test('the hub worker has a card after the steward, with its own name and what it does', () => {
+  const html = section({ workers: { custom: live({ name: 'custom' }), hub: live({ name: 'hub' }), steward: live({ name: 'steward' }), scout: live() } });
+  const ids = [...html.matchAll(/id="po-worker-panel-([a-z]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(ids, ['scout', 'steward', 'hub', 'custom']);
+  assert.match(html, /🧩 hub worker/);
+  assert.match(html, /drains the hidden hubs/);
+});
+
 test('the card has the id, the mode and trigger badges, the age of the last tick, the meta line and the switch', () => {
   const html = build('scout', live());
   assert.match(html, /<span class="id">🔎 poll scout<\/span>/);
