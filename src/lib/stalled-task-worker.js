@@ -106,7 +106,7 @@ class StalledTaskWorker {
     return resolvedPlan;
   }
 
-  // Detect plan truncation and generate retry prompt with unresolved file references.
+  // Detect plan truncation and generate retry prompt with modified conditions.
   retryPlan(plan, history) {
     if (!plan || typeof plan !== 'string') return null;
 
@@ -128,27 +128,103 @@ class StalledTaskWorker {
 
     if (unresolved.length === 0) return null;
 
+    // Calculate modified retry conditions based on retry history
+    const retryCount = history.retryCount || 0;
+    const maxRetries = history.maxRetries || 3;
+    
+    // If we've exceeded max retries, mark as truly stuck
+    if (retryCount >= maxRetries) {
+      const dismissal = this.dismissalHistory.record({
+        taskId: history.taskId,
+        bucket: 'retry',
+        reason: 'Plan truncated: exceeded maximum retry attempts',
+        timestamp: new Date().toISOString(),
+        resolution: {
+          action: 'mark-stuck',
+          retryCount,
+          unresolvedRefs
+        }
+      });
+      return { stuck: true, dismissal };
+    }
+
+    // Modify conditions for this retry
+    const modifiedConditions = this._calculateModifiedConditions(retryCount, unresolvedRefs);
+
     // Record dismissal
     const dismissal = this.dismissalHistory.record({
       taskId: history.taskId,
       bucket: 'retry',
       reason: 'Plan truncated with unresolved file references',
       timestamp: new Date().toISOString(),
-      resolution: 'retry-with-context'
+      resolution: {
+        action: 'retry-with-modified-conditions',
+        retryCount: retryCount + 1,
+        modifiedConditions,
+        unresolvedRefs
+      }
     });
 
-    // Generate retry prompt
-    const prompt = [
-      'The previous plan was truncated. Please complete it:',
-      '',
-      'Unresolved file references:',
-      ...unresolved.map(ref => `  - ${ref}`),
-      '',
-      'Original plan:',
-      plan,
-    ].join('\n');
+    // Generate retry prompt with modified conditions
+    const prompt = this._generateRetryPrompt(plan, unresolved, modifiedConditions);
 
-    return { prompt, dismissal };
+    return { prompt, dismissal, modifiedConditions };
+  }
+
+  // Calculate modified conditions for retry based on attempt number and unresolved refs.
+  _calculateModifiedConditions(retryCount, unresolvedRefs) {
+    const conditions = {
+      // Reduce context by trimming older messages (keep last N messages)
+      contextTrimming: retryCount > 0 ? 'trim-older-messages' : 'none',
+      
+      // Increase output budget (multiply by 1.5x for each retry)
+      outputBudgetMultiplier: 1 + (retryCount * 0.5),
+      
+      // Use lower temperature for more focused output
+      temperature: Math.max(0.1, 0.7 - (retryCount * 0.1)),
+      
+      // Include unresolved file references in prompt
+      includeUnresolvedRefs: true,
+      
+      // Add explicit instruction to complete the plan
+      explicitCompletionInstruction: true
+    };
+
+    // For later retries, add more aggressive modifications
+    if (retryCount >= 2) {
+      conditions.contextTrimming = 'aggressive-trim';
+      conditions.outputBudgetMultiplier *= 1.5;
+      conditions.temperature = Math.max(0.1, conditions.temperature - 0.1);
+    }
+
+    return conditions;
+  }
+
+  // Generate retry prompt incorporating modified conditions.
+  _generateRetryPrompt(plan, unresolvedRefs, conditions) {
+    const lines = [
+      'The previous plan was truncated. Please complete it with the following modifications:',
+      '',
+      'Modified conditions:',
+      `  - Context: ${conditions.contextTrimming}`,
+      `  - Output budget multiplier: ${conditions.outputBudgetMultiplier}x`,
+      `  - Temperature: ${conditions.temperature}`,
+    ];
+
+    if (conditions.includeUnresolvedRefs && unresolvedRefs.length > 0) {
+      lines.push('', 'Unresolved file references:');
+      unresolvedRefs.forEach(ref => {
+        lines.push(`  - ${ref}`);
+      });
+    }
+
+    if (conditions.explicitCompletionInstruction) {
+      lines.push('', 'IMPORTANT: Complete the plan from where it was truncated. Do not restart from the beginning.');
+    }
+
+    lines.push('', 'Original plan:', plan);
+
+    return lines.join('\n');
   }
 }
 
