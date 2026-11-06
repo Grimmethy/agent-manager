@@ -92,6 +92,17 @@ def validate_verdict_body(verdict, reasons, source):
     return None
 
 
+def _emit_verdict_event(queue_dir, branch, sha, verdict, source):
+    """Announce a recorded verdict in the queue-events journal (ADR-0024: the writer announces, the sweeps react). Best-effort: a journal problem must never break
+    recording a verdict, so everything is caught and logged. AGENT_MANAGER_QUEUE_EVENTS=off makes the writer skip it."""
+    try:
+        from queue_events import append_event
+        pipeline_dir = os.path.dirname(os.path.abspath(str(queue_dir)))
+        append_event(pipeline_dir, {"type": "verdict_recorded", "branch": branch, "sha": sha, "verdict": verdict, "source": source, "taskId": None})
+    except Exception as exc:  # noqa: BLE001 -- never let the journal break a verdict
+        logger.warning("queue-events: verdict_recorded not journaled for %s: %s", branch, exc)
+
+
 def record_verdict(queue_dir, branch, sha, verdict, reasons, source):
     """Persist a verdict for (branch, sha). Returns (record, written).
 
@@ -116,6 +127,7 @@ def record_verdict(queue_dir, branch, sha, verdict, reasons, source):
         for old in sorted(per_branch, key=lambda s: per_branch[s].get("verifiedAt", ""))[:-_KEEP_SHAS]:
             del per_branch[old]
     save_verdicts(queue_dir, verdicts)
+    _emit_verdict_event(queue_dir, branch, sha, verdict, source)
     return record, True
 
 
@@ -224,9 +236,9 @@ def _check_conflicts(run_git, repo_root, main_branch, branch):
     if ok:
         return None
     files = sorted(set(_CONFLICT_RE.findall(out)))
-    if not files and "CONFLICT" not in out:
-        return None  # the check itself failed (not a real conflict) -- never report that as one
-    return ("needs-work", ["conflicts with " + main_branch + " on: " + (", ".join(files) if files else "unknown files")])
+    if not files:
+        return None  # no actual conflict markers found -- the check itself failed (not a real conflict) -- never report that as one
+    return ("needs-work", ["conflicts with " + main_branch + " on: " + (", ".join(files))])
 
 
 def run_deterministic_checks(repo_root, main_branch, branch, run_git, extra_reasons=()):

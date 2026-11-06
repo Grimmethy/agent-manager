@@ -20,10 +20,12 @@ _state = {"cache": {}, "thread": None}  # cache: real repo root -> {"at": epoch,
 
 
 def _ttl_seconds():
+    """How long another project's branch list is served before the background thread refetches it. Default 1800 s (was 300): with ~20 registered repos the old value meant
+    a `git fetch` about every 15 s on the shared disk (ADR-0024 measurement, 2026-11-03). Merge/discard in the active project invalidate its own cache separately."""
     try:
-        return max(30.0, float(os.environ.get("AGENT_MANAGER_BRANCH_OTHER_PROJECTS_TTL_SECONDS", "300")))
+        return max(30.0, float(os.environ.get("AGENT_MANAGER_BRANCH_OTHER_PROJECTS_TTL_SECONDS", "1800")))
     except ValueError:
-        return 300.0
+        return 1800.0
 
 
 def registered_projects(active_root):
@@ -56,6 +58,14 @@ def project_tag(project):
     return {"label": project["label"], "repoRoot": project["repoRoot"], "active": bool(project["active"])}
 
 
+def expire_all():
+    """Mark every other project's cached list stale (its `at` back to 0, the last good list kept) so the next request starts ONE background refresh at once instead of
+    waiting for the TTL. Used when something announced that branches changed."""
+    with _lock:
+        for entry in _state["cache"].values():
+            entry["at"] = 0.0
+
+
 def _refresh_stale(projects):
     """Background thread body: recompute each stale project in turn. A failure stamps the entry anyway (keeping any previous list) so a broken repo is retried at the
     next TTL, not on every request."""
@@ -70,8 +80,12 @@ def _refresh_stale(projects):
                 print(f"[branches] project {p['label']} failed (non-fatal): {err}", file=sys.stderr)
                 with _lock:
                     branches = list((_state["cache"].get(p["repoRoot"]) or {}).get("branches") or [])
+            import event_stream
             with _lock:
+                previous = _state["cache"].get(p["repoRoot"]) or {}
                 _state["cache"][p["repoRoot"]] = {"at": time.time(), "branches": branches, "error": err}
+            if event_stream.digest(branches) != event_stream.digest(previous.get("branches")):
+                event_stream.announce("branch-list-changed", project=p["repoRoot"])
     finally:
         with _lock:
             _state["thread"] = None
@@ -147,7 +161,8 @@ def find_or_refresh_other_project_branch(scope, branch):
 def refresh_branches(scope):
     """Recompute that project's list NOW (git fetch included) and cache it: an action must gate on the branch as it is, not on a list up to 5 minutes old."""
     import app
-    rows = app._list_unmerged_branches_uncached(force_fetch=True, repo_root=scope["repoRoot"], pipeline_dir=scope["pipelineDir"])
+    rows = app._list_unmerged_branches_uncached(force_fetch=True, repo_root=scope["repoRoot"], pipeline_dir=scope["pipelineDir"],
+                                                fetch_timeout=app._ACTION_FETCH_TIMEOUT_SECONDS)
     with _lock:
         _state["cache"][scope["repoRoot"]] = {"at": time.time(), "branches": rows, "error": None}
     return rows

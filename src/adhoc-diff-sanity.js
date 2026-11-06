@@ -153,6 +153,8 @@ const READING_LEAD_RE = /^(?:read|ground|check|confirm|verify|compare|survey|ins
 function opensWithImperative(c) {
   const m = /^[\s>*\-\d.)]*([A-Za-z][A-Za-z-]*)(?=\s)/.exec(c);
   if (!m || NON_IMPERATIVE_LEAD_RE.test(m[1]) || !TARGET_PATH_RE.test(c)) return false;
+  // A first word followed by a colon is a label/heading (e.g. "Questions: which functions..."), not an imperative verb
+  if (/^[\s>*\-\d.)]*[A-Za-z][A-Za-z-]*\s*:/.test(c)) return false;
   return !(READING_LEAD_RE.test(m[1]) && !AFFIRMATIVE_EDIT_VERB_RE.test(c));
 }
 // A sentence still counts as asking for code when it has a phrase signal, an affirmative edit verb, or opens with an imperative.
@@ -379,12 +381,12 @@ function extractDeclaredTargets(task, planText = '', { includeCreated = true } =
 // Rule 7 of extractDeclaredTargets: "create|write|generate [the|a ... file] [at] <path>" or "deliverable is ... <path>" in a sentence that is not itself a restriction.
 function createTargets(text) {
   const out = [];
-  const PATH = '`?([\\w./@-]+\\.\\w+)`?(?!\\()';
+  const PATH = '`?([\w./@-]+\.\w+)`?(?!\\()';
   for (const frag of String(text || '').split(/(?<=[.!?;])\s+|\n+/)) {
     if (RESTRICTION_SENTENCE_RE.test(frag) || IMPERATIVE_PROHIBITION_RE.test(frag)) continue;
-    const a = new RegExp(`^[\\s\\d.)*>#-]*(?:create|write|generate|author)\\s+(?:the\\s+|a\\s+|an\\s+|new\\s+|single\\s+|plain-text\\s+|deliverable\\s+|as\\s+)*(?:file\\s+)?(?:at\\s+|named\\s+)?${PATH}`, 'i').exec(frag);
+    const a = new RegExp(`^[\s\\d.)*>#-]*(?:create|write|generate|author)\s+(?:the\s+|a\s+|an\s+|new\s+|single\s+|plain-text\s+|deliverable\s+|as\s+)*(?:file\s+)?(?:at\s+|named\s+)?${PATH}`, 'i').exec(frag);
     if (a) out.push(a[1]);
-    const b = new RegExp(`\\bdeliverable\\s+is\\s+(?:exactly\\s+)?(?:the\\s+|one\\s+)?(?:\\w+\\s+){0,3}?(?:file\\s+)?${PATH}`, 'i').exec(frag);
+    const b = new RegExp(`\bdeliverable\s+is\s+(?:exactly\s+)?(?:the\s+|one\s+)?(?:\w+\s+){0,3}?(?:file\s+)?${PATH}`, 'i').exec(frag);
     if (b) out.push(b[1]);
   }
   return out;
@@ -593,11 +595,57 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   // (Files this task says to CREATE are left out here: "Create docs/x.md ... Then update src/y.js" must still read as asking for code.)
   const docOnlyTargets = declaredEditTargetsAllDocs(task, planText);
   if (nonDoc.length === 0 && !docOnlyTargets) {
+    // 2026-11-04 (TaxHarvest stall clearing): when the diff is docs-only, also check whether the task itself is plausibly a documentation task -- title/description mentions
+    // README / runbook / docs / documentation and the diff only touches those named docs, with NO imperative verb aimed at a code path AND no code file in any declared target.
+    // A task whose text is about updating documentation should not be rejected for producing exactly that. This sits BEFORE the legacy `taskWantsCodeFromText` check so a genuine
+    // docs task passes even when its description cites code paths as evidence (the very shape that stalls adhoc tasks).
+    const taskTitle = task.title || '';
+    const taskDesc = (task.promptContext && task.promptContext.rawText) || '';
+    const combinedTitleDesc = `${taskTitle}\n${taskDesc}`;
+    const mentionsDocs = /README|runbook|documentation|\bdocs?\b/i.test(combinedTitleDesc);
+    // Check if the diff only touches documentation files
+    const allFilesAreDocs = files.length > 0 && files.every((f) => isDocPath(f.path));
+    // Check for any code-related signal that would indicate this is a mixed task (code + docs)
+    // rather than a pure docs task:
+    // 1. A Files: line that includes a code path
+    // 2. An imperative verb aimed at a code path
+    // 3. A declared target that is a code file
+    // 4. A declared target that doesn't match the diff (task says create X, diff creates Y)
+    const hasCodeInFilesLine = extractDeclaredFiles(rawText) && extractDeclaredFiles(rawText).some((p) => !isDocPath(p));
+    const hasCodeImperative = scanForCodeSignals(rawText).tripping.some(opensWithImperative);
+    const allTargets = extractDeclaredTargets(task, planText, { includeCreated: true });
+    const hasCodeTarget = allTargets.length > 0 && allTargets.some((t) => !isDocPath(t));
+    // Check if the diff creates a different doc than declared
+    const declaredDocs = allTargets.filter((t) => isDocPath(t));
+    const hasMismatchedDoc = declaredDocs.length > 0 && !declaredDocs.some((d) => files.some((f) => pathsRefEqual(f.path, d)));
+    // If any code signal is present OR the diff doesn't match the declared docs, this is not a pure docs task
+    if (mentionsDocs && allFilesAreDocs && (hasCodeInFilesLine || hasCodeImperative || hasCodeTarget || hasMismatchedDoc)) {
+      // Fall through to the legacy check below
+    } else if (mentionsDocs && allFilesAreDocs) {
+      // Pure docs task: no code signals, diff matches declared docs -> pass
+      return null;
+    }
+    // Mixed task (code + docs) that only produced docs: provide specific feedback about missing code
     if (taskWantsCodeFromText(rawText, combined) && !isCreatedDocDeliverable(task, planText, rawText, files)) {
+      // Identify what code the task asked for but the diff didn't include
+      const declaredFiles = extractDeclaredFiles(rawText);
+      const declaredCodePaths = declaredFiles ? declaredFiles.filter((p) => !isDocPath(p)) : [];
+      const codeImperativeTargets = scanForCodeSignals(rawText).tripping
+        .filter((sen) => opensWithImperative(sen))
+        .map((sen) => {
+          const m = /\b(?:in|into|to|inside|within)\s+(?:the\s+|its\s+|a\s+)?([\w.-]+\/[\w.-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css))\b/i.exec(sen);
+          return m ? m[1] : null;
+        })
+        .filter(Boolean);
+      const missingCode = [...new Set([...declaredCodePaths, ...codeImperativeTargets])];
+      const feedbackBase = `Your diff only created/edited documentation (${files.map((f) => f.path).join(', ')}). That is not the deliverable -- the task asks for a real code change. ${PLAN_TARGETS_HINT}. A doc/ADR, if the task asks for one at all, comes LAST, after the code is written and checked.`;
+      const specificFeedback = missingCode.length > 0
+        ? ` The task mentions these code paths that your diff should include: ${missingCode.join(', ')}.`
+        : '';
       return {
         code: 'docs-only',
         reason: `diff only touches documentation (${files.map((f) => f.path).join(', ')}) -- the task asks for a code change`,
-        retryFeedback: `Your diff only created/edited documentation (${files.map((f) => f.path).join(', ')}). That is not the deliverable -- the task asks for a real code change. ${PLAN_TARGETS_HINT}. A doc/ADR, if the task asks for one at all, comes LAST, after the code is written and checked.`,
+        retryFeedback: `${feedbackBase}${specificFeedback}`,
       };
     }
   }

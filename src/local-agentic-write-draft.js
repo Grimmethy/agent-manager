@@ -43,6 +43,36 @@ const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { stampTaskShape, shapeBlocksDecompose, preliminaryDecomposeDecision } = require('./task-shape.js');
 
+// Extract file paths declared in a piece's "Files:" scope lines. Used by the stale-premise
+// gate to determine which files a sub-task (or its siblings) are meant to create, so the
+// staleness check can distinguish "expected to be created" from "truly missing".
+function extractScopeFiles(task) {
+  const scopeLines = task?.promptContext?.decomposedFrom?.pieces?.[0]?.scopeLines || [];
+  const files = new Set();
+  for (const line of scopeLines) {
+    if (typeof line === 'string' && line.startsWith('Files:')) {
+      const trimmed = line.slice('Files:'.length).trim();
+      if (trimmed) files.add(trimmed);
+    }
+  }
+  return files;
+}
+
+function extractSiblingScopeFiles(decomposeCtx) {
+  const siblings = decomposeCtx?.pieces || [];
+  const files = new Set();
+  for (const sib of siblings) {
+    const scopeLines = sib?.scopeLines || [];
+    for (const line of scopeLines) {
+      if (typeof line === 'string' && line.startsWith('Files:')) {
+        const trimmed = line.slice('Files:'.length).trim();
+        if (trimmed) files.add(trimmed);
+      }
+    }
+  }
+  return files;
+}
+
 // A leaf that blows a full tier-3 budget with zero edits is auto-decomposed as a backstop
 // (the preliminary check in local-draft.js should catch most of these first). Bounded: a
 // child that was auto-decomposed and STILL exhausts gets one more split, then falls
@@ -729,7 +759,14 @@ async function draftAdhocViaLocalAgenticWrite(task, {
   // Gates on .stale, not just truthiness: the check can also return { stale: false,
   // suppressions: [...] } when every dismissal is recorded but nothing blocking remains
   // (e.g. a file the task's whole point is to create).
-  const staleDecompose = detectStaleDecomposePremise(task, { repoRoot: getConfig().repoRoot });
+  // Context extraction: which files this sub-task and its siblings create, so the
+  // staleness check can distinguish "expected to be created" from "truly missing".
+  const decomposeCtx = task?.promptContext?.decomposedFrom;
+  const context = {
+    createdFiles: extractScopeFiles(task),
+    siblingCreatedFiles: extractSiblingScopeFiles(decomposeCtx),
+  };
+  const staleDecompose = detectStaleDecomposePremise(task, { repoRoot: getConfig().repoRoot, context });
   if (staleDecompose && staleDecompose.stale) {
     return {
       succeeded: true,

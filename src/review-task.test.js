@@ -120,7 +120,7 @@ require('./task-sources.js');
   }
 }
 
-const { reviewTask, buildVerdictPrompt, renderImplementResponseForReview } = require('./review-task.js');
+const { reviewTask, buildVerdictPrompt, renderImplementResponseForReview, INERT_MAX_ITEMS } = require('./review-task.js');
 
 // A generic reviewable task that DOES go through the LLM majority vote. (brain_dump_sort
 // stopped doing that in 2026-09-03 -- it uses deterministicReview now, see
@@ -2626,7 +2626,7 @@ test('the inert finder is not called while its switch is off, or for a task that
   })();
 });
 
-test('end to end: an inert finding is recorded, noted in the history and shown to the voters, and it never blocks', withInertCheck(async () => {
+test('end to end: an inert finding is recorded, noted in the history and shown to the voters, and it never blocks (shadow default)', withInertCheck(async () => {
   const { repoRoot, domainsPath } = makeFixture();
   const task = adhocImplementedTask({ id: 'inert-e2e' });
   const captured = [];
@@ -2638,7 +2638,8 @@ test('end to end: an inert finding is recorded, noted in the history and shown t
   assert.equal(seen.repoRoot, repoRoot);
   assert.equal(task.inertAdditions.total, 2);
   assert.equal(task.inertAdditions.hubChild, false);
-  assert.match(task.history.find((h) => h.stage === 'advisory' && /inert-addition check/.test(h.detail)).detail, /2 unreferenced addition\(s\) \(orphanHelper, new-lib\.js\)$/);
+  // Shadow default: history event says "would block (shadow):" but never blocks.
+  assert.match(task.history.find((h) => h.stage === 'advisory' && /would block \(shadow\):/.test(h.detail)).detail, /would block \(shadow\): 2 unreferenced addition\(s\): orphanHelper, new-lib\.js$/);
   assert.match(captured[0], /Unreferenced additions \(deterministic check; advisory\)/);
   assert.match(captured[0], /Nothing in this task wires them in/);
 }));
@@ -2685,6 +2686,147 @@ test('replay: the real inert check, against a real git remote, tells the voters 
 }));
 
 
+
+// --- inert block modes: shadow / on / off (brain dump #1665 slice 3) ---------------------------------------------------------------------------------
+test('shadow default never blocks and records the would-block line', withInertCheck(async () => {
+  delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK;  // ensure default
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'inert-shadow' });
+  const captured = [];
+  await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+  assert.equal(task.history.some((h) => /would block \(shadow\):/.test(h.detail)), true, 'shadow appends the would-block line');
+  assert.equal(captured.length, 1, 'shadow never blocks the vote');
+}));
+
+test('on mode blocks a non-exempt standalone task with a clear reason', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-on-block' });
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(result.verdict, 'blocked');
+    assert.ok(task.blockedReason, 'blockedReason is set');
+    assert.match(task.blockedReason, /Blocked: 2 unreferenced addition\(s\)/);
+    assert.match(task.blockedReason, /orphanHelper/);
+    assert.match(task.blockedReason, /new-lib\.js/);
+    assert.match(task.blockedReason, /Fix: add the caller in this change, or put "foundation only" in the task text/);
+    assert.equal(task.history.some((h) => h.stage === 'blocked' && /inert addition blocked/.test(h.detail)), true);
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('on mode does not block a hub child', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-hub-on', dependsOn: ['HUB0001-01-a'] });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'hub child still votes');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('on mode does not block a stacked task', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-stacked-on', stacked: { branch: 'agent/x', seq: 2, total: 3 } });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'stacked task still votes');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('on mode does not block a task with "foundation only" in prompt', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-foundation', promptContext: { rawText: 'Add a foundation only helper' } });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'foundation only still votes');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('on mode does not block a task with "inert until" in prompt', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-inert-until', promptContext: { rawText: 'This is inert until the next slice' } });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'inert until still votes');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('on mode does not block a task with "no caller yet" in prompt', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-no-caller', promptContext: { rawText: 'Add this with no caller yet' } });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'no caller yet still votes');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('off mode behaves exactly as today (advisory only)', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'off';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-off' });
+    const captured = [];
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(captured.length, 1, 'off mode still votes');
+    assert.equal(task.history.some((h) => /would block \(shadow\):/.test(h.detail)), false, 'off mode does not append shadow line');
+    assert.equal(task.history.some((h) => /inert-addition check:/.test(h.detail)), true, 'off mode appends advisory history');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('AGENT_MANAGER_REVIEW_INERT_CHECK=false changes nothing', async () => {
+  delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK;
+  process.env.AGENT_MANAGER_REVIEW_INERT_CHECK = 'false';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-check-off' });
+    let calls = 0;
+    const finder = () => { calls += 1; return INERT_FOUND; };
+    const captured = [];
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: finder });
+    assert.equal(calls, 0, 'finder not called');
+    assert.equal(captured.length, 1, 'vote still happens');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_CHECK; }
+});
+
+test('no inert additions never blocks', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-clean' });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => ({ considered: 2, unknown: 0, inert: [] }) });
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'clean task still votes');
+    assert.equal(task.history.some((h) => /inert addition blocked/.test(h.detail)), false, 'no blocked history');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('blockedReason lists at most INERT_MAX_ITEMS names', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const manyInert = { considered: 10, unknown: 0, inert: Array.from({ length: 12 }, (_, i) => ({ kind: 'function', name: `orphan${i}`, file: 'src/a.js', line: i })) };
+    const task = adhocImplementedTask({ id: 'inert-many' });
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {}, findInertFn: () => manyInert });
+    assert.equal(result.verdict, 'blocked');
+    const inertItems = task.inertAdditions.inert;
+    assert.ok(inertItems.length <= INERT_MAX_ITEMS, `blockedReason lists at most ${INERT_MAX_ITEMS} items, got ${inertItems.length}`);
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
 
 // --- the voters are told when a diff adds a skip / dismiss / early-exit path (brain dump #1667) ---------------------------------------------------------
 function withSkipPathRule(fn) {

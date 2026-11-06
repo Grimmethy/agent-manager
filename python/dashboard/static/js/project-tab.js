@@ -117,11 +117,6 @@ async function enterProjectTab() {
   await loadProjectDropdown();
   await refreshPipelineStatus();
   await refreshProjectStatus();
-  projectStatusInterval = setInterval(() => { refreshPipelineStatus(); refreshProjectStatus(); }, 3000);
-}
-
-function leaveProjectTab() {
-  if (projectStatusInterval) { clearInterval(projectStatusInterval); projectStatusInterval = null; }
 }
 
 async function refreshPipelineStatus() {

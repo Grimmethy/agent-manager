@@ -1005,18 +1005,13 @@ async function sbDiscussEnd(sessionId, btn) {
 async function enterBrainDumpTab() {
   renderBrainDumpShell();
   // force=true -- brainDumpEditingId/brainDumpDiscussingId are module-level and outlive
-  // leaveBrainDumpTab() (by design, so an in-progress discussion survives a tab switch).
+  // a tab switch (by design, so an in-progress discussion survives it).
   // An unforced call here would hit refreshBrainDumpEntries' own guard against those same
   // flags and skip the list entirely on every return to this tab, appearing to hang
   // indefinitely with no spinner (confirmed live 2026-08-17, see the brain-dump entry
-  // this fix closes out). The periodic poll below stays unforced on purpose -- that guard
-  // is still correct there, to keep a 5s tick from clobbering an open discussion/edit.
+  // this fix closes out). The refresh a brain-dump-changed event triggers stays unforced on purpose -- that guard
+  // is still correct there, to keep an announcement from clobbering an open discussion/edit (finishing one refreshes at once).
   await refreshBrainDumpEntries(true);
-  brainDumpEntriesInterval = setInterval(refreshBrainDumpEntries, 5000);
-}
-
-function leaveBrainDumpTab() {
-  if (brainDumpEntriesInterval) { clearInterval(brainDumpEntriesInterval); brainDumpEntriesInterval = null; }
 }
 
 // Filed Findings tab (2026-09-14, Grimmethy: "Brain dump needs to go back to human input
