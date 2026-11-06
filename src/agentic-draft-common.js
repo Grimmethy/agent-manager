@@ -27,7 +27,8 @@ const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
 const { validProposalFiles } = require('./proposal-files.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
-const GIT_TIMEOUT_MS = 60_000;
+const { gitTimeoutMs } = require('./lib/git-timeout.js');
+const GIT_TIMEOUT_MS = gitTimeoutMs();   // AGENT_MANAGER_GIT_TIMEOUT_MS overrides the 60 s default
 
 function runGit(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
@@ -170,6 +171,47 @@ function detectPrerequisiteStop(text) {
 // `RESOLUTION: needs-human-decision`. When present, it is AUTHORITATIVE -- it wins over
 // both regex/structural heuristics below rather than needing to also satisfy them.
 const BLOCKER_TYPE_RE = /BLOCKER-TYPE:\s*(design-question|budget-exhausted|infra-error)\b/i;
+
+// 2026-11 (misdirected-task fix): when an implement pass tags BLOCKER-TYPE: infra-error,
+// the agent's own report may in fact show the failure is NOT a tool/environment fault
+// but a task-routing problem -- the target code, file, or branch does not exist in the
+// assigned repository. A retry would hit the same wrong checkout or missing branch and
+// fail identically, so the task never progresses. This function detects that signal so
+// the pipeline can reclassify the block as a routing/escalation problem instead of a
+// transient infra failure. Returns the extracted target description (e.g. "branch
+// 'foo' does not exist in this repository") or null if no missing-target signal is
+// present. The regexes are drawn from real agent reports observed in the stalled queue:
+// they are deliberately narrow (multi-word phrases, not bare tokens) to avoid false
+// positives on legitimate infra failures that happen to mention "repo" or "branch"
+// incidentally.
+const MISSING_TARGET_SIGNALS = [
+  /does not exist in any repo I can access/i,
+  /is misdirected to the wrong repository/i,
+  /the requested branch does not exist in this repository/i,
+  /target code.*not found/i,
+  /file.*absent from checkout/i,
+  /branch.*does not exist.*repository/i,
+  /code.*not present in.*repo/i,
+  /repository.*does not contain/i,
+  /no matching file.*in this repo/i,
+  /requested path.*not found in/i,
+  /target\s+\S+\s+does not exist/i,
+  /the\s+\S+\s+branch does not exist/i,
+];
+
+function detectMissingTargetReport(summary) {
+  if (!summary || typeof summary !== 'string') return null;
+  for (const pattern of MISSING_TARGET_SIGNALS) {
+    const match = pattern.exec(summary);
+    if (match) {
+      // Extract a useful target description: grab ~200 chars around the match for context
+      const start = Math.max(0, match.index - 50);
+      const end = Math.min(summary.length, match.index + match[0].length + 150);
+      return summary.slice(start, end).trim();
+    }
+  }
+  return null;
+}
 
 // Finds the FIRST top-level `[...]` array in text by depth-counting brackets (both `[`/`]`
 // and `{`/`}`, since the array's own elements are objects) while skipping over string
@@ -472,6 +514,37 @@ function resolveNoResolutionForced(ctx) {
       capturedDiff: undefined,
     };
   }
+  // 2026-11-02 (stalled-task loop: 40 needs-clarification tasks, 31 premium, all parked as 'design-decision' with the placeholder below as their only question):
+  // the pass spent its turns, the forced final turn produced NO text, and either edits landed that no diff captured or a partial diff exists. That is the same
+  // budget exhaustion the explicit BLOCKER-TYPE: budget-exhausted path handles, not a question for a human. Same ladder: a partial diff continues (bounded by
+  // MAX_AGENTIC_CONTINUATIONS), otherwise flag the exhaustion (sticky, which also unlocks RESOLUTION: decompose for a leaf) and requeue as a retryable block.
+  if (!String(summary || '').trim()) {
+    const continuations = Number(task.agenticContinuationCount) || 0;
+    if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
+      task.agenticContinuationCount = continuations + 1;
+      task.agenticContinuationNote = 'the pass ran out of turns and its forced final turn produced no text; finish from the partial diff';
+      task.priorPartialDiff = capturedDiff;
+      task.retryableDraftBlock = true;
+      task.isAgenticContinuation = true;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: `Agentic implement pass ran out of turns with partial work and no final text -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS}`,
+        ...meta,
+        capturedDiff,
+      };
+    }
+    task.turnBudgetExhausted = true;
+    task.retryableDraftBlock = true;
+    task.turnBudgetExhaustedBefore = true;
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: 'Agentic implement pass ran out of turns and its forced final turn produced no text -- budget exhaustion, not a design question; requeued for a smaller scope',
+      ...meta,
+      capturedDiff: undefined,
+    };
+  }
   // Otherwise the model got somewhere (partial work in the worktree, or the forced
   // summary produced real content) -- keep the existing human-clarification path.
   task.adhocResolution = 'needs-human-decision';
@@ -693,7 +766,32 @@ function resolveNeedsHuman(ctx) {
   // carries "over-explored, edit sooner" grounding + unlocks decompose for a leaf, wrong
   // for an infra fault. reject-retry-check.js bounds it by MAX_LOCAL_REJECT_RETRIES and,
   // on exhaustion, escalates with reason:'infra-error' (not design-decision).
+  //
+  // 2026-11 (misdirected-task fix): BEFORE treating this as a transient infra error,
+  // check whether the agent's own report shows the failure is actually a task-routing
+  // problem -- the target code, file, or branch does not exist in the assigned
+  // repository. A retry would hit the same wrong checkout or missing branch and fail
+  // identically, so the task never progresses. If we detect that signal, reclassify the
+  // block as a routing/escalation problem (needs-clarification with a clear reason
+  // naming the missing or misdirected target) instead of requeuing. This does NOT
+  // remove the infra-error retry path for genuine tool/environment faults -- those keep
+  // flowing through unchanged.
   if (blockerType === 'infra-error') {
+    const missingTarget = detectMissingTargetReport(summary);
+    if (missingTarget) {
+      task.blockedStage = 'needs-clarification';
+      task.blockedReason = `Agentic implement pass tagged BLOCKER-TYPE: infra-error but the agent's own report shows the target is missing or misdirected: ${missingTarget}`;
+      appendHistoryEvent(task, 'misdirected-target-detected', { missingTarget });
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedStage: 'needs-clarification',
+        blockedReason: task.blockedReason,
+        ...meta,
+        capturedDiff: undefined,
+        needsClarification: true,
+      };
+    }
     if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
       task.agenticContinuationCount = continuations + 1;
       task.agenticContinuationNote = summary;
@@ -1072,4 +1170,6 @@ module.exports = {
   BLOCKER_TYPE_RE,
   SELF_DECLARED_PARTIAL_SCOPE_RE, fileSelfDeclaredPartialScopeFollowUp,
   detectPrerequisiteStop,
+  detectMissingTargetReport,
+  MISSING_TARGET_SIGNALS,
 };

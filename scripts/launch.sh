@@ -51,6 +51,39 @@ echo "[launch] Repo root: $REPO_DIR"
 export MODEL_URL="${MODEL_URL:-$REPO_DIR/model.example}"
 export HOME_LOGS="${HOME_LOGS:-$LOG_DIR}"
 
+# Snapshot file for queue tick sharing: --snapshot-file CLI flag wins, then
+# QUEUE_SNAPSHOT_FILE env var, then a default path built from
+# AGENT_MANAGER_INSTANCE_ID. Exported so every child daemon (workers,
+# review-runner, queue-watcher, apply-loop) inherits it without per-script
+# re-parsing. liveSiblingsOnBranch in src/lib/shared-branch.js reads it via
+# process.env.QUEUE_SNAPSHOT_FILE when provided.
+_SNAPSHOT_FILE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --snapshot-file)
+      if [[ -n "${2:-}" ]]; then
+        _SNAPSHOT_FILE="$2"
+        shift 2
+      else
+        echo "[launch] --snapshot-file requires a path argument" >&2
+        shift
+      fi
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [[ -z "$_SNAPSHOT_FILE" && -n "${QUEUE_SNAPSHOT_FILE:-}" ]]; then
+  _SNAPSHOT_FILE="$QUEUE_SNAPSHOT_FILE"
+elif [[ -z "$_SNAPSHOT_FILE" && -n "${AGENT_MANAGER_INSTANCE_ID:-}" ]]; then
+  _SNAPSHOT_FILE="/dev/shm/agent-manager-queue-tick-${AGENT_MANAGER_INSTANCE_ID}.json"
+fi
+if [[ -n "$_SNAPSHOT_FILE" ]]; then
+  export QUEUE_SNAPSHOT_FILE="$_SNAPSHOT_FILE"
+  printf '[launch] QUEUE_SNAPSHOT_FILE=%s\n' "$_SNAPSHOT_FILE"
+fi
+
 is_running() {
   local pidfile="$1"
   [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null

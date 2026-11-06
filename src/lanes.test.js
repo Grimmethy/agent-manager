@@ -312,3 +312,100 @@ test('isCloudEndpoint: true only for an enabled cloud lane endpoint (trailing sl
   assert.equal(isCloudEndpoint('http://127.0.0.1:7450', withRegistry('{ not json')), false, 'a garbage registry never throws');
   assert.equal(isCloudEndpoint('http://127.0.0.1:7450', noRegistry), false);
 });
+
+// ---- provider: 'script' lanes (a script handler, no model; 2026-11-02) ----
+const SCRIPT = { gpu: 'tuner', provider: 'script', ollamaUrl: 'http://127.0.0.1:7449', taskClasses: ['tuning_experiment'] };
+
+test('script: an entry with a taskClasses allowlist becomes a bounded lane carrying provider and script, and the model defaults to "script"', () => {
+  const lane = getLanes(withRegistry([SCRIPT]))[1];
+  assert.equal(lane.id, 'worker-tuner');
+  assert.equal(lane.script, true);
+  assert.equal(lane.provider, 'script');
+  assert.equal('cloud' in lane, false, 'a script lane is not a cloud lane');
+  assert.deepEqual(lane.taskClasses, ['tuning_experiment']);
+  assert.equal(lane.preempt, 'never');
+  assert.equal(lane.reviewer, false);
+  assert.equal(lane.model, 'script');
+  assert.deepEqual(lane.env, { OLLAMA_URL: 'http://127.0.0.1:7449', LOCAL_MODEL: 'script', AGENT_MANAGER_GPU_YIELD_APPS: '' });
+});
+
+test('script: an explicit model is kept, an empty or non-string model drops the entry', () => {
+  assert.equal(getLanes(withRegistry([{ ...SCRIPT, model: 'my-script' }]))[1].model, 'my-script');
+  assert.deepEqual(idsOf([{ ...SCRIPT, model: '' }]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...SCRIPT, model: 7 }]), ['worker-3090']);
+});
+
+test('script: fail closed -- no allowlist (absent, null, empty or not an array) drops the lane, siblings survive', () => {
+  const { taskClasses, ...bare } = SCRIPT;
+  assert.deepEqual(idsOf([bare]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...SCRIPT, taskClasses: null }]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...SCRIPT, taskClasses: [] }]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...SCRIPT, taskClasses: 'tuning_experiment' }]), ['worker-3090']);
+  assert.deepEqual(idsOf([bare, RX580]), ['worker-3090', 'worker-rx580']);
+});
+
+test('script: preempt other than never, a reviewer daemon, or a missing ollamaUrl drops the entry', () => {
+  assert.deepEqual(idsOf([{ ...SCRIPT, preempt: 'always' }]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...SCRIPT, preempt: 'age-gated' }]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...SCRIPT, preempt: 'never' }]), ['worker-3090', 'worker-tuner']);
+  assert.deepEqual(idsOf([{ ...SCRIPT, reviewer: true }]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...SCRIPT, ollamaUrl: 'not a url' }]), ['worker-3090']);
+});
+
+test('script: numCtx and numBatch describe a GPU, so they are ignored (even invalid values) and never reach the env', () => {
+  const lane = getLanes(withRegistry([{ ...SCRIPT, numCtx: 100, numBatch: 5 }]))[1];
+  assert.equal(lane.id, 'worker-tuner');
+  assert.equal(lane.numCtx, null);
+  assert.equal(lane.numBatch, null);
+  assert.deepEqual(Object.keys(lane.env).sort(), ['AGENT_MANAGER_GPU_YIELD_APPS', 'LOCAL_MODEL', 'OLLAMA_URL']);
+});
+
+test('script: laneAllowsSource honours the allowlist (the tuning source yes, an adhoc task and unknown sources no)', () => {
+  const lane = getLanes(withRegistry([SCRIPT, RX580]))[1];
+  assert.equal(lane.id, 'worker-tuner');
+  assert.equal(laneAllowsSource(lane, 'tuning_experiment'), true);
+  assert.equal(laneAllowsSource(lane, 'adhoc'), false);
+  assert.equal(laneAllowsSource(lane, 'something_else'), false);
+  assert.equal(laneAllowsSource(lane, undefined), false);
+  assert.equal(laneAllowsSource(getLanes(withRegistry([SCRIPT, RX580]))[2], 'adhoc'), true, 'the rx580 lane (no allowlist) is unaffected');
+});
+
+test('script: ollama and cloud lanes gain no script key, and a script lane coexists with them in registry order', () => {
+  for (const lane of getLanes(withRegistry([RX580, CLOUD, SCRIPT])).filter((l) => l.id !== 'worker-tuner')) {
+    assert.equal('script' in lane, false, `${lane.id} must not gain a script key`);
+  }
+  assert.deepEqual(idsOf([RX580, CLOUD, SCRIPT]), ['worker-3090', 'worker-rx580', 'worker-cloud', 'worker-tuner']);
+});
+
+test('script: an unknown provider is still refused (the allowed list is ollama, cloud and script)', () => {
+  assert.deepEqual(idsOf([{ ...SCRIPT, provider: 'scripts' }]), ['worker-3090']);
+});
+
+test('lanes.example.json ships a disabled script entry that becomes a valid bounded lane once enabled', () => {
+  const entries = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'lanes.example.json'), 'utf8'));
+  const example = entries.find((e) => e.provider === 'script');
+  assert.ok(example, 'example has a script entry');
+  assert.equal(example.enabled, false);
+  assert.deepEqual(example.taskClasses, ['tuning_experiment']);
+  assert.equal(idsOf(entries).includes('worker-tuner'), false, 'disabled: no lane');
+  const enabled = entries.map((e) => (e.provider === 'script' ? { ...e, enabled: true } : e));
+  const lane = getLanes(withRegistry(enabled)).find((l) => l.id === 'worker-tuner');
+  assert.equal(lane.script, true);
+  assert.deepEqual(lane.taskClasses, ['tuning_experiment']);
+});
+
+const { isScriptEndpoint } = require('./lanes.js');
+
+test('isScriptEndpoint: true only for an enabled script lane endpoint (trailing slash ignored), false for GPU and cloud lanes, disabled entries and junk', () => {
+  const env = withRegistry([RX580, CLOUD, SCRIPT]);
+  assert.equal(isScriptEndpoint('http://127.0.0.1:7449', env), true);
+  assert.equal(isScriptEndpoint('http://127.0.0.1:7449/', env), true);
+  assert.equal(isScriptEndpoint(' http://127.0.0.1:7449 ', env), true);
+  assert.equal(isScriptEndpoint(RX580.ollamaUrl, env), false);
+  assert.equal(isScriptEndpoint(CLOUD.ollamaUrl, env), false, 'the cloud gateway is not a script endpoint');
+  assert.equal(isScriptEndpoint('', env), false);
+  assert.equal(isScriptEndpoint(undefined, env), false);
+  assert.equal(isScriptEndpoint('http://127.0.0.1:7449', withRegistry([{ ...SCRIPT, enabled: false }])), false);
+  assert.equal(isScriptEndpoint('http://127.0.0.1:7449', withRegistry('{ not json')), false);
+  assert.equal(isCloudEndpoint('http://127.0.0.1:7449', env), false, 'and a script endpoint is not a cloud endpoint');
+});

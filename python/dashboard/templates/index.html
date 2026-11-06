@@ -8,6 +8,8 @@
   :root {
     --bg: #0f1115; --panel: #171a21; --border: #2a3358; --text: #e6e8eb; --muted: #8a90a0;
     --accent: #5b9dff; --ok: #4caf7d; --warn: #e0a940; --bad: #e0575c;
+    /* Hairlines and the scrollbar thumb: 3:1 against --bg and --panel, a step brighter than the decorative --border. */
+    --border-strong: #5668a0;
     /* Lighter than --accent specifically for link text -- #5b9dff reads fine for borders/
        badges/fills but is too close to --bg (#0f1115) for thin anchor text to stay
        legible at a glance (Grimmethy, 2026-08-19: "links... blend in too much with the
@@ -22,6 +24,22 @@
      given element already uses -- no per-color math needed here. */
   .hl-bright { filter: brightness(1.3); }
   * { box-sizing: border-box; }
+  /* Scrollbars (owner request 2026-11-02: they no longer matched the app): slim, fully rounded, blue. The thumb is --border-strong (3:1 against the page and the cards)
+     and --accent on hover over a faint blue track; the transparent border inset makes the thumb a floating pill. Chrome, Edge and Safari take the ::-webkit-scrollbar
+     rules; browsers without them (Firefox) get the standard thin scrollbar in the same colours. The Chat panel is a separate page and carries its own copy. */
+  ::-webkit-scrollbar { width: 12px; height: 12px; }
+  ::-webkit-scrollbar-track { background: rgba(91, 157, 255, .06); border-radius: 999px; }
+  ::-webkit-scrollbar-thumb { background: var(--border-strong); background-clip: padding-box; border: 3px solid transparent; border-radius: 999px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
+  ::-webkit-scrollbar-corner { background: transparent; }
+  @supports not selector(::-webkit-scrollbar) { * { scrollbar-width: thin; scrollbar-color: var(--border-strong) rgba(91, 157, 255, .06); } }
+  /* Form controls (owner request 2026-11-02, "continue with the restyle"): bare inputs, selects and textareas showed the browser's white and light-grey boxes on the dark theme.
+     One base style at zero specificity (:where), so every control that already has its own rule or inline style keeps it. 13px text, 4px grid, --border-strong outline, blue focus ring. */
+  :root { color-scheme: dark; accent-color: var(--accent); }
+  :where(input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="hidden"], [type="color"]), select, textarea) { background: var(--panel); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 4px 8px; font-size: 13px; font-family: inherit; }
+  :where(input, select, textarea):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  :where(input, select, textarea):disabled { opacity: .5; cursor: not-allowed; }
+  :where(input, textarea)::placeholder { color: var(--muted); }
   body { margin: 0; font-family: -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; }
   a { color: var(--link); }
   a:hover { text-decoration: underline; }
@@ -33,7 +51,7 @@
      does, so a long tab list and a long #main page no longer share one page scroll. 53px is the
      header height both rules already assume. align-self:flex-start stops the flex row from
      stretching nav to #main's height (which would defeat the fixed height). */
-  nav { width: 200px; flex-shrink: 0; padding: 16px 0; border-right: 2px solid var(--border); height: calc(100vh - 53px); position: sticky; top: 53px; align-self: flex-start; overflow-y: auto; overscroll-behavior: contain; }
+  nav { width: 232px; flex-shrink: 0; padding: 16px 0; border-right: 2px solid var(--border); height: calc(100vh - 53px); position: sticky; top: 53px; align-self: flex-start; overflow-y: auto; overscroll-behavior: contain; }
   /* Chat panel (Brain Dump #153): a third flex sibling of nav/main, not a modal -- see
      app.py/chat_sessions.py for the backend. Collapsed state is a plain width/visibility
      toggle (localStorage-persisted, same convention nav-group expand/collapse already
@@ -57,25 +75,69 @@
   .plugin-sidebar iframe { width: 100%; height: 100%; border: none; display: block; }
   .plugin-sidebar-toggle { position: fixed; right: 0; top: 70px; writing-mode: vertical-rl; background: var(--panel); border: 2px solid var(--border); border-right: none; border-radius: 6px 0 0 6px; color: var(--muted); padding: 10px 6px; cursor: pointer; font-size: 12px; z-index: 5; }
   .plugin-sidebar-toggle:hover { color: var(--text); }
-  nav button { display: flex; justify-content: space-between; width: 100%; padding: 10px 20px; background: none; border: none; color: var(--text); text-align: left; cursor: pointer; font-size: 13px; }
+  nav button { display: flex; justify-content: space-between; width: 100%; padding: 8px 20px; background: none; border: none; color: var(--text); text-align: left; cursor: pointer; font-size: 14px; }
   nav button:hover { background: var(--panel); }
   nav button.active { background: var(--panel); border-left: 3px solid var(--accent); color: var(--accent); }
+  /* Floating notch (nav-notch.js): a ball in a ring at the right edge of the active tab; it hops to the newly chosen tab. */
+  nav button { padding-right: 32px; }
+  /* Sidebar sections (nav-sections.js, renderNavSections in core-ui.js): a small label per section with a fold chevron, and a hairline that fades out at both ends between sections. */
+  .nav-div { height: 1px; margin: 12px 8px; background: linear-gradient(90deg, transparent, var(--border-strong), transparent); }
+  nav button.nav-sh { display: flex; align-items: center; justify-content: flex-start; gap: 8px; padding: 8px 20px; font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  nav button.nav-sh:hover { background: none; color: var(--text); }
+  nav button.nav-sub-sh { padding-left: 32px; text-transform: none; letter-spacing: 0; font-weight: 500; }
+  .nav-sh .nav-sh-label { flex: 1; text-align: left; }
+  .nav-sh em { font-style: normal; font-variant-numeric: tabular-nums; letter-spacing: 0; color: var(--muted); }
+  .nav-chev { display: inline-flex; transition: transform .1s ease; }
+  .nav-chev.closed { transform: rotate(-90deg); }
+  /* Collapse button + icon rail (core-ui.js renderNavTop / renderNavRail): a round chevron button beside a "Collapse" pill; collapsed, the sidebar is a 72px strip of icons. */
+  :root { --accent-text: #0b0d12; }
+  .nav-top { display: flex; align-items: center; gap: 8px; padding: 0 12px 8px; }
+  nav button.nav-collapse-btn { width: 28px; height: 28px; padding: 0; flex: none; border: 2px solid var(--border-strong); border-radius: 50%; background: var(--bg); color: var(--text); display: grid; place-items: center; }
+  nav button.nav-collapse-btn:hover { background: var(--bg); border-color: var(--accent); color: var(--accent); }
+  nav button.nav-collapse-btn:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+  .nav-collapse-pill { font-size: 12px; font-weight: 600; line-height: 20px; padding: 2px 12px; border-radius: 999px; background: var(--accent); color: var(--accent-text); }
+  nav.nav-rail { width: 72px; }
+  nav.nav-rail .nav-top { justify-content: center; padding: 0 0 8px; }
+  nav.nav-rail .nav-div { margin: 8px 12px; }
+  nav.nav-rail button.rail-btn { position: relative; justify-content: center; width: 100%; padding: 8px 0; border-left: 3px solid transparent; }
+  nav.nav-rail button.rail-btn.active { background: var(--accent); color: var(--accent-text); border-left-color: transparent; }
+  .rail-glyph { font-size: 18px; line-height: 24px; }
+  nav.nav-rail button.rail-section .rail-glyph { font-size: 12px; font-weight: 600; letter-spacing: .06em; color: var(--muted); }
+  nav.nav-rail .status-dot { position: absolute; top: 6px; right: 14px; }
+  nav.nav-rail .nav-notch { display: none; }
+  nav { transition: width .15s ease; }
+  @media (prefers-reduced-motion: reduce) { nav { transition: none; } }
+  /* Line icons (nav-icons.js): the tab label is an icon plus the name; the icon follows the text colour, accent when active. */
+  .nav-tab-label { display: inline-flex; align-items: center; gap: 10px; min-width: 0; }
+  .nav-ic { flex: none; color: var(--muted); }
+  nav button:hover .nav-ic { color: var(--text); }
+  nav button.active .nav-ic { color: var(--accent); }
+  nav.nav-rail button.rail-btn .nav-ic { color: inherit; }
+  nav.nav-rail button.rail-btn:not(.active) { color: var(--muted); }
+  nav.nav-rail button.rail-btn:hover { color: var(--text); }
+  nav.nav-rail button.rail-btn.active .nav-ic { color: var(--accent-text); }
+  .nav-here { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
+  @media (prefers-reduced-motion: reduce) { .nav-chev { transition: none; } }
+  .nav-notch { position: absolute; top: 0; left: calc(100% - 16px); width: 12px; height: 12px; pointer-events: none; will-change: transform; }
+  .nav-notch::before { content: ''; position: absolute; inset: -4px; border: 2px solid var(--border); border-radius: 50%; background: var(--bg); }
+  .nav-notch-ball { position: absolute; inset: 0; border-radius: 50%; background: var(--accent); }
   nav .count { color: var(--muted); font-variant-numeric: tabular-nums; }
   /* min-width:0 lets main shrink below its content (a flex item's default min-width:auto kept it at its widest child, so nav + main + the 380px
      sidebar summed past the window and the whole page scrolled sideways, clipping the sidebar's right edge); overflow-x:auto scrolls wide content
      inside main instead of widening the page. */
   main { flex: 1; min-width: 0; overflow-x: auto; padding: 20px; }
   table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; padding: 8px 10px; color: var(--muted); font-weight: 500; font-size: 12px; border-bottom: 2px solid var(--border); }
-  td { padding: 9px 10px; border-bottom: 2px solid var(--border); vertical-align: top; }
+  th { text-align: left; padding: 8px 12px; color: var(--muted); font-weight: 500; font-size: 12px; border-bottom: 2px solid var(--border); }
+  td { padding: 8px 12px; border-bottom: 2px solid var(--border); vertical-align: top; }
   tr.clickable { cursor: pointer; }
   tr.clickable:hover td { background: var(--panel); }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge { display: inline-block; padding: 0 8px; line-height: 20px; border-radius: 10px; font-size: 12px; font-weight: 600; }
   .badge.ok { background: rgba(76,175,125,.15); color: var(--ok); }
   .badge.warn { background: rgba(224,169,64,.15); color: var(--warn); }
   .badge.bad { background: rgba(224,87,92,.15); color: var(--bad); }
+  .badge.hold { background: rgba(91,157,255,.15); color: var(--accent); }
   .badge.idle { background: rgba(138,144,160,.15); color: var(--muted); }
-  .badge-col { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+  .badge-col { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
   /* Brain Dump entry serial number -- a short, stable handle ("#12") to reference a
      specific entry by in conversation instead of its long slugified id. Monospace so
      digits stay visually distinct from the surrounding prose text they're prefixed to. */
@@ -87,19 +149,64 @@
   .status-dot.ok { background: var(--ok); }
   .status-dot.warn { background: var(--warn); }
   .status-dot.bad { background: var(--bad); }
-  .stale-timer { color: var(--bad); font-size: 11px; font-variant-numeric: tabular-nums; }
-  .state-timer { color: var(--muted, #8b949e); font-size: 11px; font-variant-numeric: tabular-nums; }
-  .worker-card { background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
+  .stale-timer { color: var(--bad); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .state-timer { color: var(--muted, #8b949e); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .worker-card { background: var(--panel); border: 2px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 12px; }
   .worker-card .row { display: flex; justify-content: space-between; align-items: center; }
   .worker-card .id { font-weight: 600; }
-  .worker-model-select { margin-left: 10px; margin-right: auto; font-size: 12px; max-width: 220px; }
-  .worker-card .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .worker-model-select { margin-left: 12px; margin-right: auto; font-size: 12px; max-width: 220px; }
+  .worker-model-fixed { margin: 0 auto 0 12px; }
+  .worker-card .meta { color: var(--muted); font-size: 12px; margin-top: 8px; }
   .worker-card.clickable { cursor: pointer; }
   .worker-card.worker-off { opacity: .65; }
-  .recent-tasks-list { list-style: none; padding: 0; margin: 6px 0 0; }
-  .recent-tasks-list li { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-top: 1px solid var(--border); }
+  /* Workers Graph view (workflow-graph-view.js): edges under absolutely positioned node cards inside ONE scroll box, so the page itself never scrolls sideways. */
+  .wf-toggle { display: inline-flex; gap: 4px; }
+  .wf-view-btn.active { border-color: var(--accent, #58a6ff); color: var(--accent, #58a6ff); }
+  .wf-bar { margin-bottom: 12px; }
+  .wf-warn-line { margin: 0 0 8px; }
+  .wf-surface { overflow: auto; max-width: 100%; max-height: 70vh; border: 1px solid var(--border); border-radius: 8px; background: var(--bg, transparent); }
+  .wf-canvas { position: relative; }
+  .wf-edges { position: absolute; left: 0; top: 0; pointer-events: none; }
+  .wf-edge { stroke: var(--muted, #8b949e); stroke-width: 1.5; }
+  .wf-arrowhead { fill: var(--muted, #8b949e); }
+  .wf-node { position: absolute; box-sizing: border-box; margin: 0; padding: 8px 12px; overflow: hidden; }
+  .wf-node .row { align-items: flex-start; gap: 8px; }
+  .wf-node .badge-col { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+  .wf-status-line { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+  .wf-node .wf-task { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wf-node .worker-switch-btn { margin-top: 0 !important; white-space: nowrap; }
+  .wf-node .id { overflow-wrap: anywhere; }
+  .wf-node .meta { margin-top: 4px; }
+  .wf-selected { border-color: var(--accent, #58a6ff); }
+  .wf-detail { margin-top: 12px; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+  .wf-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 8px 0; font-size: 12px; }
+  .wf-facts dt { color: var(--muted); }
+  .wf-facts dd { margin: 0; overflow-wrap: anywhere; }
+  .wf-group-box { position: absolute; box-sizing: border-box; border: 1px dashed var(--border-strong, var(--border)); border-radius: 8px; pointer-events: none; }
+  .wf-group-toggle { pointer-events: auto; margin: 4px; padding: 4px 8px; font-size: 12px; }
+  .wf-group-node { border-style: dashed; }
+  .wf-controls { margin: 8px 0; }
+  .wf-control-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .wf-control-row .worker-model-select, .wf-control-row .worker-model-fixed { margin: 0; }
+  .wf-apply-note { margin: 0 0 8px; }
+  .wf-warnings { margin: 8px 0 0; padding-left: 16px; font-size: 12px; color: var(--muted); }
+  .recent-tasks-list { list-style: none; padding: 0; margin: 8px 0 0; }
+  .recent-tasks-list li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-top: 1px solid var(--border); }
   .recent-tasks-list li:first-child { border-top: none; }
-  .empty { color: var(--muted); padding: 30px; text-align: center; }
+  .empty { color: var(--muted); padding: 32px; text-align: center; }
+  /* Skeleton shimmer (skeleton.js): shown while a tab loads. A soft light band sweeps left to right every 1.4 s; reduced motion keeps the shapes still. */
+  .skeleton { padding: 8px 0; position: relative; }
+  .skeleton-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .skeleton-caption { color: var(--muted); margin: 0 0 16px; }
+  .skeleton-title, .skeleton-block, .skeleton-line { position: relative; overflow: hidden; background: var(--panel); border-radius: 6px; display: block; }
+  .skeleton-title { height: 24px; width: 28%; margin-bottom: 20px; }
+  .skeleton-row { display: flex; gap: 16px; padding: 16px; margin-bottom: 12px; border: 2px solid var(--border); border-radius: 10px; }
+  .skeleton-block { width: 48px; height: 48px; flex: none; }
+  .skeleton-lines { flex: 1; display: flex; flex-direction: column; gap: 12px; justify-content: center; }
+  .skeleton-line { height: 12px; }
+  .skeleton-title::after, .skeleton-block::after, .skeleton-line::after { content: ''; position: absolute; inset: 0; transform: translateX(-100%); background: linear-gradient(90deg, transparent, rgba(255,255,255,.09), transparent); animation: skeleton-sweep 1.4s linear infinite; }
+  @keyframes skeleton-sweep { to { transform: translateX(100%); } }
+  @media (prefers-reduced-motion: reduce) { .skeleton-title::after, .skeleton-block::after, .skeleton-line::after { animation: none; } }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   tr.top-row td:first-child { border-left: 2px solid var(--ok); }
@@ -114,7 +221,7 @@
      too much text for the models list's nowrap chip layout, so each case gets its own
      wrapping block row instead. */
   .bench-category-group .benchmark-check { display: block; white-space: normal; margin-top: 3px; }
-  .bench-case-stats { color: var(--muted); font-size: 11px; margin-left: 6px; }
+  .bench-case-stats { color: var(--muted); font-size: 12px; margin-left: 8px; }
   .ok-text { color: var(--ok); }
   .bad-text { color: var(--bad); }
   /* Reasoning benchmark radar chart: the Responses table (the run's test prompts) sits on
@@ -133,9 +240,9 @@
   .modal h2 { margin-top: 0; font-size: 15px; }
   .modal pre { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 12px; font-size: 12px; max-height: 400px; overflow-y: auto; }
   .modal .close { float: right; cursor: pointer; color: var(--muted); background: none; border: none; font-size: 18px; }
-  .field-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-top: 14px; }
-  .task-history { border-left: 2px solid var(--border); padding-left: 10px; margin-top: 4px; }
-  .task-history-row { font-size: 12px; padding: 3px 0; }
+  .field-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; margin-top: 16px; }
+  .task-history { border-left: 2px solid var(--border); padding-left: 12px; margin-top: 4px; }
+  .task-history-row { font-size: 12px; padding: 4px 0; }
   .task-history-stage { font-family: monospace; font-weight: 600; }
   .task-history-row .meta { display: inline; }
   /* Draft Attempts: one <details> per draftTask() run (draft-attempt-record.js). */
@@ -147,19 +254,19 @@
   .da-outcome-succeeded { color: var(--good, #4caf50); }
   .da-tier { font-size: 12px; padding: 4px 0; border-top: 1px dashed var(--border); margin-top: 6px; }
   .da-tier-name { font-family: monospace; font-weight: 600; }
-  .da-tools { font-size: 11px; color: var(--muted); font-family: monospace; }
+  .da-tools { font-size: 12px; color: var(--muted); font-family: monospace; }
   .draft-attempt pre { max-height: 260px; }
   /* Work Log: full per-tier tool transcript (task._workLog, src/work-log.js) for auditing. */
   .work-log { border: 2px solid var(--border); border-radius: 6px; margin-top: 6px; padding: 0 10px; }
   .work-log > summary { cursor: pointer; padding: 8px 0; font-weight: 600; list-style-position: inside; }
   .work-log[open] > summary { border-bottom: 1px solid var(--border); margin-bottom: 6px; }
   .wl-tier { border-top: 1px dashed var(--border); margin-top: 6px; padding-top: 4px; }
-  .wl-call { font-family: monospace; font-size: 11px; padding: 2px 0; line-height: 1.5; }
+  .wl-call { font-family: monospace; font-size: 12px; padding: 4px 0; line-height: 1.5; }
   .wl-call > summary { cursor: pointer; }
   .wl-call.wl-err { color: var(--bad); }
   .wl-n { color: var(--muted); }
   .wl-tool { font-weight: 600; }
-  .work-log pre { max-height: 220px; font-size: 11px; }
+  .work-log pre { max-height: 220px; font-size: 12px; }
   /* Base state (Ornith) also gets its own look, not just the Claude state -- previously
      only .provider-toggle-claude had a distinct color, so the default Ornith state was
      visually identical to a plain .secondary button (Discuss/Edit/Delete), which is how
@@ -173,25 +280,26 @@
   #toast.toast-error { background: var(--bad); color: #fff; }
   #toast.toast-info { background: var(--panel); color: var(--text); border: 2px solid var(--border); }
   .path-row { display: flex; gap: 8px; margin-bottom: 12px; }
-  .path-row input { flex: 1; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-family: monospace; font-size: 13px; }
-  button.action { background: var(--accent); color: #0b1220; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
+  .path-row input { flex: 1; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-family: monospace; font-size: 13px; }
+  button.action { background: var(--accent); color: #0b1220; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 14px; }
   button.action:disabled { opacity: .5; cursor: not-allowed; }
-  button.secondary { background: var(--panel); color: var(--text); border: 2px solid var(--border); padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-  button.danger { background: var(--bad); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
+  button.secondary { background: var(--panel); color: var(--text); border: 2px solid var(--border); padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  button.danger { background: var(--bad); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 14px; }
   button.danger:disabled { opacity: .5; cursor: not-allowed; }
   .worker-filter-bar { display: flex; gap: 8px; }
-  .worker-filter-bar button { background: var(--panel); color: var(--muted); border: 2px solid var(--border); padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+  .worker-filter-bar button { background: var(--panel); color: var(--muted); border: 2px solid var(--border); padding: 8px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
   .worker-filter-bar button.active { color: var(--accent); border-color: var(--accent); }
+  [data-verdict-filter-bar] button { padding: 8px 12px; }   /* the Unmerged Branches filter chips: 14px text with 12px sides keeps the row on one line */
   .browser-panel { background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 16px; max-height: 300px; overflow-y: auto; }
   .browser-crumb { color: var(--muted); font-size: 12px; margin-bottom: 8px; word-break: break-all; }
   .browser-crumb .crumb-link { color: var(--link); cursor: pointer; }
   .browser-crumb .crumb-link:hover { text-decoration: underline; }
-  .browser-entry { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-radius: 4px; cursor: pointer; }
+  .browser-entry { display: flex; justify-content: space-between; align-items: center; padding: 8px; border-radius: 4px; cursor: pointer; }
   .browser-entry:hover { background: var(--bg); }
-  .browser-entry .git-badge { font-size: 10px; color: var(--ok); border: 1px solid var(--ok); padding: 1px 6px; border-radius: 8px; }
-  .browser-entry .entry-count { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-  .browser-entry .set-active-project, .browser-entry .create-github-project { font-size: 11px; padding: 3px 9px; }
-  .stat-row { display: flex; gap: 24px; margin: 14px 0; }
+  .browser-entry .git-badge { font-size: 12px; color: var(--ok); border: 1px solid var(--ok); padding: 0 8px; line-height: 16px; border-radius: 8px; }
+  .browser-entry .entry-count { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .browser-entry .set-active-project, .browser-entry .create-github-project { font-size: 12px; padding: 4px 8px; }
+  .stat-row { display: flex; gap: 24px; margin: 16px 0; }
   .stat { color: var(--muted); font-size: 12px; }
   .stat strong { color: var(--text); font-size: 16px; display: block; }
   .build-log { background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 10px 12px; font-family: monospace; font-size: 12px; max-height: 180px; overflow-y: auto; margin-top: 10px; }
@@ -199,16 +307,32 @@
   iframe.viz { width: 100%; flex: 1; min-height: 0; border: 2px solid var(--border); border-radius: 8px; margin-top: 16px; }
   .split-pane { display: flex; gap: 16px; align-items: flex-start; }
   .split-pane > div { flex: 1; min-width: 0; }
-  .capture-row { display: flex; gap: 8px; margin-bottom: 14px; }
-  .capture-row input { flex: 1; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; }
-  .bd-entry { background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .capture-row { display: flex; gap: 8px; margin-bottom: 16px; }
+  /* A wide data table scrolls inside its own box instead of pushing the whole tab sideways (Job List was 1669px wide in a 754px tab). */
+  .table-scroll { overflow-x: auto; border: 2px solid var(--border); border-radius: 8px; margin-bottom: 16px; }
+  .table-scroll > table { margin: 0; }
+  .capture-row input { flex: 1; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-size: 13px; }
+  /* Checkboxes and radios: the browser's 3px 3px 3px 4px margin is off the 4px grid. */
+  input[type="checkbox"], input[type="radio"] { margin: 4px; }
+  .bd-entry { background: var(--panel); border: 2px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 8px; }
   .bd-entry .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
   .bd-entry .text { font-size: 13px; }
-  .bd-entry .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .bd-entry .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  /* Small outlined tag next to an entry's text; colour comes from the modifier, size and spacing sit on the 4px grid. */
+  .chip { display: inline-block; margin-left: 8px; padding: 4px 8px; border: 1px solid var(--muted); border-radius: 4px; color: var(--muted); font-size: 12px; }
+  .chip.chip-warn { border-color: var(--warn); color: var(--warn); }
+  .chip.clickable { cursor: pointer; }
+  .chip.chip-bad { border-color: var(--bad); color: var(--bad); }
+  .chip.chip-accent { border-color: var(--accent); color: var(--accent); }
+  .chip.chip-link { border-color: var(--link); color: var(--link); }
+  .chip.chip-solo { margin-left: 0; }
+  .chip.chip-block { margin-left: 0; margin-bottom: 4px; }
+  .chip-gap { margin-left: 8px; }
+  .chip-note { margin-left: 4px; font-size: 12px; }
   .bd-entry a.jump { color: var(--link); font-size: 12px; text-decoration: none; }
   .note-content { white-space: pre-wrap; word-break: break-word; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 12px; font-size: 13px; max-height: 500px; overflow-y: auto; font-family: monospace; }
   .grill-transcript { max-height: 360px; overflow-y: auto; background: var(--bg); border: 2px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 10px; }
-  .grill-msg-role { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .grill-msg-role { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
   .grill-msg-assistant .grill-msg-role { color: var(--accent); }
   .grill-msg-text { font-size: 13px; white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
   /* 2026-09-01 (Grimmethy: "each thinking segment to include a full blank line space
@@ -218,14 +342,14 @@
      blank-line gap between it and the next segment. */
   .grill-msg-text p { margin: 0 0 1em 0; }
   .grill-msg-text p:last-child { margin-bottom: 0; }
-  .grill-seg-ts { display: inline-block; font-size: 10px; font-variant-numeric: tabular-nums; color: var(--muted); margin-right: 0.5em; }
+  .grill-seg-ts { display: inline-block; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); margin-right: 0.5em; }
   .grill-msg-user { align-self: flex-end; max-width: 85%; }
   .grill-msg-user .grill-msg-role { text-align: right; }
   .grill-msg-user .grill-msg-text { background: var(--panel); border-radius: 6px; padding: 6px 10px; }
-  .grill-session .grill-answer { display: block; width: 100%; box-sizing: border-box; resize: vertical; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; margin-top: 10px; font-family: inherit; }
+  .grill-session .grill-answer { display: block; width: 100%; box-sizing: border-box; resize: vertical; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-size: 13px; margin-top: 8px; font-family: inherit; }
   .grill-enriched-badge { color: var(--ok); font-size: 12px; margin-top: 10px; }
   .browser-entry.active { background: var(--bg); color: var(--accent); }
-  .priority-input { width: 60px; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 6px 8px; border-radius: 6px; font-size: 13px; }
+  .priority-input { width: 60px; background: var(--panel); border: 2px solid var(--border); color: var(--text); padding: 8px; border-radius: 6px; font-size: 13px; }
   .priority-input:focus { outline: 1px solid var(--accent); }
 
   /* Mobile layout: below this width there isn't room for the fixed 200px nav rail plus a
@@ -244,6 +368,7 @@
     nav { width: 100%; height: auto; position: static; overflow-y: visible; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); display: flex; overflow-x: auto; padding: 6px 8px; -webkit-overflow-scrolling: touch; }
     nav button { width: auto; white-space: nowrap; padding: 8px 12px; }
     nav button.active { border-left: none; border-bottom: 3px solid var(--accent); }
+    .nav-notch { display: none; }
     main { padding: 12px; overflow-x: auto; }
     table { min-width: 560px; }
     .plugin-sidebar { position: fixed; left: 0; right: 0; bottom: 0; top: auto; width: 100%; height: 65vh; border-left: none; border-top: 2px solid var(--border); z-index: 15; }
@@ -255,7 +380,7 @@
     .plugin-sidebar-toggle.sidebar-open { bottom: calc(65vh + 10px); }
     .worker-card .row { flex-wrap: wrap; row-gap: 6px; }
     .worker-model-select { margin-left: 0; margin-right: 0; max-width: none; width: 100%; }
-    .stat-row { flex-wrap: wrap; row-gap: 10px; }
+    .stat-row { flex-wrap: wrap; row-gap: 12px; }
     .split-pane { flex-direction: column; }
     .path-row, .capture-row { flex-wrap: wrap; }
     .modal-backdrop { padding: 12px; }
@@ -268,6 +393,7 @@
 <header>
   <h1>agent-manager</h1>
   <span class="pipeline-dir" id="pipeline-status">loading...</span>
+  <span id="memory-chip" hidden></span>
   <button class="action" id="global-brain-dump-btn" style="margin-left:auto" title="Capture a quick note to Brain Dump from any tab">+ Brain Dump</button>
 </header>
 <div class="layout" id="layout">
@@ -286,11 +412,26 @@
 </div>
 
 <script src="{{ url_for('static', filename='js/core-ui.js') }}"></script>
+<script src="/static/js/nav-notch.js"></script>
+<script src="/static/js/nav-icons.js"></script>
+<script src="/static/js/nav-sections.js"></script>
 <script src="/static/js/queue-tab.js"></script>
 <script src="/static/js/plugins-tab.js"></script>
+<script src="/static/js/worker-task-picker.js"></script>
+<script src="/static/js/worker-model-select.js"></script>
+<script src="/static/js/worker-status-helpers.js"></script>
 <script src="/static/js/workers-tab.js"></script>
 <script src="/static/js/worker-switch-ui.js"></script>
+<script src="/static/js/workflow-layout.js"></script>
+<script src="/static/js/workflow-groups.js"></script>
+<script src="/static/js/workflow-node-panel.js"></script>
+<script src="/static/js/workflow-graph-view.js"></script>
 <script src="/static/js/cloud-spend-panel.js"></script>
+<script src="/static/js/stalled-worker-panel.js"></script>
+<script src="/static/js/verifier-worker-panel.js"></script>
+<script src="/static/js/needswork-worker-panel.js"></script>
+<script src="/static/js/context-worker-panel.js"></script>
+<script src="/static/js/pipeline-ops-workers-panel.js"></script>
 <script src="/static/js/sidebar-and-claude-panels.js"></script>
 <script src="{{ url_for('static', filename='js/analytics-and-discovery.js') }}"></script>
 <script src="/static/js/models-tab.js"></script>
@@ -299,11 +440,13 @@
 <script src="/static/js/task-detail-modal.js"></script>
 <script src="/static/js/branch-verdicts.js"></script>
 <script src="/static/js/branch-projects.js"></script>
+<script src="/static/js/skeleton.js"></script>
 <script src="/static/js/branches-joblist-hardware-tabs.js"></script>
 <script src="/static/js/project-tab.js"></script>
 <script src="/static/js/brain-dump-chips.js"></script>
 <script src="/static/js/brain-dump-and-second-brain.js"></script>
 <script src="/static/js/hygiene-tab.js"></script>
+<script src="/static/js/live-updates.js"></script>
 <script>
 // CORE_TABS is the hardcoded tab-bar row set. TABS (core-ui.js) starts as a copy of it and
 // folds in any plugin-declared `tab` on top (Docs/hub-tasks-extraction-plan.md section 5,
@@ -348,7 +491,7 @@ let counts = {};
 
 // Project tab state -- kept separate from the generic 5s poll-and-rerender cycle used by
 // every other tab, since re-rendering over a user's in-progress folder navigation every
-// 5s would be a bad experience. See renderProject()/enterProjectTab()/leaveProjectTab().
+// 5s would be a bad experience. See renderProject()/enterProjectTab(); its panels refresh on events (pipeline-state-changed, project-build-changed), not on a timer.
 let projectPath = localStorage.getItem('agentManagerProjectPath') || '';
 // Last activeRepoRoot value seen from the server (see enterProjectTab's sync below).
 // Starts equal to projectPath so the very first sync is a no-op when they already agree --
@@ -395,7 +538,6 @@ let projectHistory = [];
 // capture note and reset the second-brain folder browser back to its root every tick.
 let brainDumpBrowsePath = localStorage.getItem('agentManagerBrainDumpBrowsePath') || '';
 let brainDumpSelectedFile = null;
-let brainDumpEntriesInterval = null;
 // '' (Unprocessed, /api/brain-dump's own default) | 'actioned' (Processed) | 'all' --
 // mirrors the ?status= values api_brain_dump() (app.py) already accepts; not persisted
 // to localStorage, same as queueSourceFilter's per-tab-visit reset (queue-source-filter).
@@ -552,6 +694,8 @@ let completedTasksObserver = null;
 // Ticks every second independent of the 5s /api/instances poll, so "stale for" reads as a
 // live counter instead of jumping in 5s increments. Computed purely from lastHeartbeat +
 // staleThresholdSeconds (both already on each instance) -- no extra fetch needed.
+// ADR-0024: allowed because it is display-only (it rewrites two text nodes from the clock; it never fetches or redraws).
+// static/js/no-timer-redraws.test.js fails if this ticker starts to fetch or redraw, or if any other timer is added.
 setInterval(updateStaleTimers, 1000);
 
 // Sort state lives outside the function so it survives the 5s poll re-rendering the
@@ -797,11 +941,12 @@ const SUBTASK_STATUS_META = {
 // While a task is mid-pass (drafting or review), the pipeline now flushes each new
 // Pipeline History checkpoint to the task file as it happens (task-history.js's persist
 // hook -- 2026-08-31, Grimmethy: "Anything that I can observe is good"). The modal is a
-// one-shot fetch, so poll while it's open and a live task is showing, re-rendering only
+// one-shot fetch, so while it's open and a live task is showing it WATCHES the task (taskDetailWatch) and
+// re-reads it when the pipeline announces a change (refreshTaskDetailModal, driven by live-updates.js), re-rendering only
 // when something actually changed. task-anywhere follows the task across the
 // drafting->review->approved->done moves, so the modal keeps tracking it without a manual
-// reopen; a terminal state stops the poll.
-let taskDetailPoll = null;
+// reopen; a terminal state stops the watch. There is no timer.
+let taskDetailWatch = null;
 const TASK_DETAIL_LIVE_STATES = new Set(['drafting', 'review', 'coordinating']);
 // Sources whose real deliverable is a prose report in implementResponse (advisoryProse),
 // not a diff -- the task modal promotes it to the top under "Root-Cause Report".
@@ -1092,7 +1237,7 @@ document.getElementById('main').addEventListener('click', (e) => {
 // already folds in any plugin-declared tab before the first paint.
 refresh();  // always -- populates counts + renders nav regardless of which tab is active
 if (activeTab === 'project') enterProjectTab();
-setInterval(refresh, 5000);
+startPageLiveUpdates();   // the event stream (live-updates.js); the old 5 s refresh only runs if the stream is unavailable
 mountPersistentSidebarPlugins();
 
 // The graph iframe's CSS box resizes correctly on window resize (flex:1 fills whatever

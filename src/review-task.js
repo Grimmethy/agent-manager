@@ -41,6 +41,7 @@
 
 const fs = require('fs');
 const { sharedInstancesDir } = require('./instances-dir.js');
+const { REVIEW_LINES: REVIEW_POLL_LINES } = require('./lib/poll-avoidance-lines.js');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig, ensureRegistered } = require('./config.js');
@@ -63,6 +64,7 @@ const { classifyNullOutcome } = require('./advisory-null-outcome.js');
 const { getDecomposeProposalDetection } = require('./hub-review-detection.js');
 const { getSplitCoverageJudging } = require('./split-coverage-judging-route.js');
 const { verifyDeterministicDraft } = require('./decompose-review-registry.js');
+const { analyzeMockSeams } = require('./review-mock-seam.js');
 // script-extract.js stays in core (also required directly by scripts/extract-core-ui.js,
 // a standalone dev CLI that can't depend on an optional plugin) -- this require reaches
 // its registerDeterministicReview('script-extract', ...) side effect normally, same as any
@@ -474,6 +476,7 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   // source, not just research (a code claim citing "as of today" could hit the same trap).
   lines.push(`The real current date is ${new Date().toISOString().slice(0, 10)}. Do not assume any earlier date is "now," and do not reject a cited source, URL, or claimed date merely for being after some earlier date you might otherwise assume is current -- judge recency/plausibility against the real date above, not your own training-data intuition of "the present."`);
   lines.push('The drafting model produced the plan and implementation below and cannot verify its own claims -- treat every concrete claim as UNVERIFIED.');
+  lines.push(REVIEW_POLL_LINES);
   lines.push('');
   lines.push(`TASK: ${task.title} (domain=${task.domain}, source=${task.source})`);
   // A decompose / candidate-split proposal is judged on COVERAGE -- do the sub-tasks
@@ -699,6 +702,8 @@ function summariseExecutedVerification(ev) {
     })),
     ...(ev.unpinned && typeof ev.unpinned === 'object' ? { unpinned: summariseUnpinned(ev.unpinned) } : {}),
     ...(ev.syntax && typeof ev.syntax === 'object' ? { syntax: summariseSyntax(ev.syntax) } : {}),
+    ...(ev.blockedTests && Array.isArray(ev.blockedTests) && ev.blockedTests.length ? { blockedTests: ev.blockedTests.slice(0, 10).map((t) => String(t).slice(0, 200)) } : {}),
+    ...(ev.advisoryTests && Array.isArray(ev.advisoryTests) && ev.advisoryTests.length ? { advisoryTests: ev.advisoryTests.slice(0, 10).map((t) => String(t).slice(0, 200)) } : {}),
   };
 }
 
@@ -713,7 +718,13 @@ function summariseUnpinned(u) {
 }
 
 // The block reason doubles as the redraft feedback (reject-retry-check hands blockedReason back to the drafter), so it names what failed.
-function executedVerificationBlockReason(ev) {
+function executedVerificationBlockReason(ev, options = {}) {
+  const mode = options.mode || 'block';
+  const isTestOnlyDiff = !!options.isTestOnlyDiff;
+  // Refactor escape: a test-only diff should never be blocked by test pinning.
+  if (isTestOnlyDiff) return null;
+  // Advisory mode: downgrade test-pinning failures to evidence for the voters.
+  if (mode === 'advisory') return null;
   const bits = [];
   if (ev.tests && ev.tests.passed === false) {
     const names = (ev.tests.failures || []).slice(0, 5).join('; ');
@@ -722,9 +733,15 @@ function executedVerificationBlockReason(ev) {
   for (const c of (ev.commands || []).filter((x) => x.outcome === 'contradicted')) {
     bits.push(`the draft claimed PASS for \`${c.command}\` but it exits ${c.exitCode}`);
   }
+  // Test pinning failures: the covering tests pass with the diff but also pass on the base,
+  // meaning the diff is unnecessary (or a refactor that does not change behavior).
+  if (ev.blockedTests && Array.isArray(ev.blockedTests) && ev.blockedTests.length) {
+    bits.push(`test pinning failed: the covering tests pass on the base without the diff (${ev.blockedTests.length} test(s) unverified)`);
+  }
   const tail = (ev.tests && ev.tests.passed === false && ev.tests.raw)
-    || ((ev.commands || []).find((c) => c.outcome === 'contradicted') || {}).detail || '';
-  return `Deterministic gate: executed verification failed -- the diff was applied in a scratch worktree and ${bits.join('; ') || (ev.reasons || []).join('; ')}.${tail ? ` Output tail: ${String(tail).trim().slice(-700)}` : ''} No local-model review call spent on a draft whose own tests or claimed checks demonstrably fail.`;
+    || ((ev.commands || []).find((c) => c.outcome === 'contradicted') || {}).detail
+    || (ev.blockedTests && ev.blockedTests[0] ? String(ev.blockedTests[0]).slice(-700) : '');
+  return `Deterministic gate: executed verification failed -- the diff was applied in a scratch worktree and ${bits.join('; ') || (ev.reasons || []).join('; ')}.${tail ? ` Output tail: ${tail}` : ''} No local-model review call spent on a draft whose own tests or claimed checks demonstrably fail.`;
 }
 
 // --- inert additions, as the voters see them (brain dump #1665) -------------------------------------------------------------------------------------
@@ -1025,6 +1042,37 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
     appendHistoryEvent(task, 'approved', `deterministic-null-outcome: ${nullOutcome.kind}`);
     return { succeeded: true, verdict: 'approved', factCheckVerdict: 'skipped' };
+  }
+
+  // Comment-only change (2026-10-31, discard analysis; src/review-comment-only.js): 10 brain-dump branches since 2026-10-24 were discarded because their whole
+  // change was comments or docstrings -- nothing behaves differently, and the voters approved them anyway. A brain-dump-derived adhoc fix (not a hub slice)
+  // whose diff is provably comment-only is closed here as a no-op: no vote, no executed verification, and NO branch -- the diff is kept on the record
+  // (commentOnlyDiff) and the task becomes 'no-changes-needed', which apply records as a skipped 'no code change needed' (terminalDisposition noop).
+  // Conservative: anything the analyzer cannot prove falls through to the normal vote. Kill switch AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK=false.
+  if (String(process.env.AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK || '').trim().toLowerCase() !== 'false'
+      && resolveSourceName(task) === 'adhoc'
+      && task.adhocResolution === 'implemented'
+      && task.promptContext && typeof task.promptContext === 'object' && task.promptContext.brainDumpEntryId
+      && !isHubChildTask(task)
+      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
+    let commentOnly = null;
+    try { commentOnly = require('./review-comment-only.js').analyzeCommentOnly(task.rawDiff); } catch (e) {
+      console.error(`[review] comment-only check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+    }
+    if (commentOnly && commentOnly.commentOnly) {
+      const paths = commentOnly.files.map((f) => f.path);
+      task.commentOnlyDiff = task.rawDiff;
+      task.commentOnly = { at: new Date().toISOString(), files: commentOnly.files };
+      task.rawDiff = '';
+      task.adhocResolution = 'no-changes-needed';
+      task.implementResponse = `Comment-only change, no behavior: ${paths.slice(0, 6).join(', ')}${paths.length > 6 ? `, +${paths.length - 6} more` : ''} change only comments or docstrings, so no code change is needed. The original diff is kept on the task as commentOnlyDiff.`;
+      task.reviewedAt = new Date().toISOString();
+      task.reviewProvider = 'deterministic-comment-only';
+      task.localVerdict = 'Auto-approved as a no-op: the diff changes only comments or docstrings (deterministic, no vote).';
+      recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
+      appendHistoryEvent(task, 'approved', `deterministic-comment-only: ${commentOnly.reason}; closed as a no-op, no branch will be applied`);
+      return { succeeded: true, verdict: 'approved', factCheckVerdict: 'skipped' };
+    }
   }
 
   const domainCfg = getDomainConfig(domainsPath, task.domain);
@@ -1392,7 +1440,8 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       && /^#{2,4}\s*AC-\S+/m.test(trimmedImplResponse)
       && !/```/.test(trimmedImplResponse)
       && !/^(?:---|\+\+\+|@@)/m.test(trimmedImplResponse)
-      && !/^(?:\+|-)(?!\s*$)\S/m.test(trimmedImplResponse)) {
+      && !/^(?:\+|-)(?!\s*$)\S/m.test(trimmedImplResponse)
+      && !namesExtractedPieces(trimmedImplResponse)) {
     const reason = 'Deterministic gate: missing-code-diff -- candidate drafts from this source must show the concrete change as a fenced code block or diff hunk, not prose-only commentary describing what should change. No local-model review call spent on a draft with no code shape at all.';
     task.reviewProvider = 'deterministic-missing-code-diff';
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
@@ -1481,6 +1530,55 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
         appendHistoryEvent(task, 'blocked', reproBlock);
         return { succeeded: true, verdict: 'blocked', blockedReason: reproBlock, blockedStage: 'review', factCheckVerdict };
       }
+      // Test pinning check: if the covering tests pass on the base without the diff, the diff is unnecessary.
+      // Mode 'block' blocks; any other mode (default: advisory) downgrades to evidence for the voters.
+      // Refactor escape: when the diff only touches test files, downgrade to advisory regardless of mode.
+      if (ev.blockedTests && Array.isArray(ev.blockedTests) && ev.blockedTests.length) {
+        const pinningMode = process.env.AGENT_MANAGER_REVIEW_TEST_PINNING_MODE || 'advisory';
+        // Compute isTestOnlyDiff: check if all changed files are test files
+        const diff = extractTaskDiff(task);
+        let isTestOnlyDiff = false;
+        if (diff && typeof diff === 'string' && diff.trim()) {
+          // Extract file paths from diff (diff --git a/path b/path)
+          const filePaths = [];
+          const diffRegex = /diff --git a\/(.+?) b\/(.+?)$/gm;
+          let match;
+          while ((match = diffRegex.exec(diff)) !== null) {
+            const oldPath = match[1];
+            const newPath = match[2];
+            if (oldPath) filePaths.push(oldPath);
+            if (newPath && newPath !== oldPath) filePaths.push(newPath);
+          }
+          // If no diff header matches, try to extract from other patterns
+          if (filePaths.length === 0 && diff) {
+            // Fallback: look for file paths in the diff
+            const pathRegex = /(?:--- a\/|\+\+\+ b\/)(.+?)$/gm;
+            while ((match = pathRegex.exec(diff)) !== null) {
+              filePaths.push(match[1]);
+            }
+          }
+          // Check if all files are test files
+          if (filePaths.length > 0) {
+            const testPattern = /(^|\/)(test|spec|tests|__tests__)(\/|$)|(\.test\.|\.spec\.)/i;
+            isTestOnlyDiff = filePaths.every((fp) => testPattern.test(fp));
+          }
+        }
+        const reason = executedVerificationBlockReason(ev, { mode: pinningMode, isTestOnlyDiff });
+        if (reason) {
+          // Block path
+          task.reviewProvider = 'deterministic-test-pinning';
+          recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+          appendHistoryEvent(task, 'blocked', reason);
+          return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+        } else {
+          // Advisory path (pinningMode !== 'block' OR refactor escape)
+          task.testPinningAdvisory = ev.blockedTests;
+          const advisoryMsg = isTestOnlyDiff
+            ? `test pinning: ${ev.blockedTests.length} test(s) unverified (refactor escape: test-only diff)`
+            : `test pinning: ${ev.blockedTests.length} test(s) unverified (advisory)`;
+          appendHistoryEvent(task, 'advisory', advisoryMsg);
+        }
+      }
       if (ev.status === 'failed') {
         const reason = executedVerificationBlockReason(ev);
         task.reviewProvider = 'deterministic-executed-verification';
@@ -1491,7 +1589,11 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     }
   }
 
-  // Inert additions (see formatInertAdditionsSection): a cheap diff + git-grep check, independent of the executed-verification switch. Advisory only.
+  // Inert additions (see formatInertAdditionsSection): a cheap diff + git-grep check, independent of the executed-verification switch.
+  // AGENT_MANAGER_REVIEW_INERT_BLOCK: 'off' = advisory only (no history event change), 'shadow' (default) = append a 'would block (shadow):' line,
+  // anything else (default on) = block the task before any vote is spent. Exempt when isHubChildTask (a later sibling may wire it), when the task
+  // text says 'foundation only' / 'inert until' / 'no caller yet', or when the task is stacked (already covered by isHubChildTask).
+  const inertBlockMode = process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK || 'shadow';
   if (process.env.AGENT_MANAGER_REVIEW_INERT_CHECK !== 'false'
       && resolveSourceName(task) === 'adhoc'
       && task.adhocResolution === 'implemented'
@@ -1505,12 +1607,56 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
         if (r && Array.isArray(r.inert)) {
           task.inertAdditions = summariseInertAdditions(r, isHubChildTask(task));
           if (r.inert.length) {
-            appendHistoryEvent(task, 'advisory', `inert-addition check: ${r.inert.length} unreferenced addition(s) (${r.inert.slice(0, 4).map((i) => i.name).join(', ')}${r.inert.length > 4 ? ', ...' : ''})${task.inertAdditions.hubChild ? ' -- hub slice, a sibling may wire it' : ''}`);
+            const names = r.inert.slice(0, 4).map((i) => i.name).join(', ') + (r.inert.length > 4 ? ', ...' : '');
+            const exempt = isHubChildTask(task)
+              || (typeof task.promptContext?.rawText === 'string' && /foundation only|inert until|no caller yet/i.test(task.promptContext.rawText));
+            if (inertBlockMode === 'off' || exempt) {
+              // Exempt cases and off mode: behave exactly as today (advisory only).
+              appendHistoryEvent(task, 'advisory', `inert-addition check: ${r.inert.length} unreferenced addition(s) (${names})${task.inertAdditions.hubChild ? ' -- hub slice, a sibling may wire it' : ''}`);
+            } else if (inertBlockMode === 'shadow') {
+              // Shadow mode: append a history event noting it would block, but never block.
+              appendHistoryEvent(task, 'advisory', `would block (shadow): ${r.inert.length} unreferenced addition(s): ${names}`);
+            } else {
+              // On mode: block the task before any vote is spent.
+              const inertItems = task.inertAdditions.inert.slice(0, INERT_MAX_ITEMS);
+              const reason = `Blocked: ${r.inert.length} unreferenced addition(s) with no caller in this change:\n${inertItems.map((i) => `- ${i.file}:${i.line} ${i.name}`).join('\n')}\nFix: add the caller in this change, or put "foundation only" in the task text if nothing should call it yet.`;
+              task.reviewProvider = 'deterministic-inert-addition';
+              task.blockedReason = reason;
+              recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+              appendHistoryEvent(task, 'blocked', `inert addition blocked: ${r.inert.length} unreferenced addition(s)`);
+              appendHistoryEvent(task, 'info', reason);
+              return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+            }
           }
         }
       }
     } catch (e) {
       console.error(`[review] inert-addition check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+    }
+  }
+
+  // Mock-seam check (HUB0321 · 2/3): detect when production code changes but tests mock
+  // the very function being modified, indicating a double rather than real behaviour.
+  // Honors AGENT_MANAGER_REVIEW_MOCK_SEAM_CHECK (false | advisory | block, default advisory).
+  const mockSeamMode = getConfig().reviewMockSeamCheck;
+  if (mockSeamMode !== 'false') {
+    try {
+      const { seams, advisory } = analyzeMockSeams({ diff: task.rawDiff, config: {} });
+      if (seams.length > 0) {
+        task.mockSeams = { count: seams.length, seams };
+        const affectedFns = seams.map((s) => s.changedFn);
+        appendHistoryEvent(task, mockSeamMode === 'block' ? 'blocked' : 'advisory',
+          `mock-seam check: ${seams.length} seam(s) detected (${affectedFns.join(', ')}${seams.length > 3 ? ', ...' : ''}) -- ${advisory}`);
+        if (mockSeamMode === 'block') {
+          const reason = `Mock seam detected: ${seams.length} function(s) changed in production but mocked in tests (${affectedFns.join(', ')}). Review requires a real (non-mocked) test or manual review note.`;
+          task.reviewProvider = 'deterministic-mock-seam';
+          recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+          appendHistoryEvent(task, 'blocked', reason);
+          return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+        }
+      }
+    } catch (e) {
+      console.error(`[review] mock-seam check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
     }
   }
 
@@ -1748,6 +1894,18 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
 // kept that stale value and the dashboard list view -- which reads task.status straight
 // through task_summary() -- showed the whole approved/ backlog as "needs-review". The
 // verdict strings ('approved' / 'blocked') are already exactly the status values we want.
+// 2026-11-02 (stalled-task loop: 53 function_length_review candidates parked on missing-code-diff after ~4.4 drafts each): the deliverable for extracting pieces of a long function is the
+// NAMED pieces, and the local model will not write a code block for a 500-line extraction. A Solution that names at least two distinct new identifiers (camelCase or snake_case, optionally
+// with a leading underscore, longer than five characters) states the concrete change; a Solution that only says "split it into smaller helper functions" does not. Replay over the 53 parked
+// drafts: 45 name pieces, 8 are prose-only and stay blocked.
+const NAMED_PIECE_RE = /\b_?(?:[a-z]+(?:[A-Z][a-z0-9]+)+|[a-z]+(?:_[a-z0-9]+)+)\b/g;
+function namesExtractedPieces(text) {
+  const m = /Solution:\s*([\s\S]*?)(?:\n\s*\n(?:Benefits|Strength)|$)/.exec(String(text || ''));
+  const solution = m ? m[1] : '';
+  const names = new Set((solution.match(NAMED_PIECE_RE) || []).filter((w) => w.replace(/^_/, '').length > 5));
+  return names.size >= 2;
+}
+
 async function reviewTask(task, opts = {}) {
   const result = await runReview(task, opts);
   if (result && result.succeeded && (result.verdict === 'approved' || result.verdict === 'blocked')) {
@@ -1811,7 +1969,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { getDomainConfig, EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { namesExtractedPieces, getDomainConfig, EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview, INERT_MAX_ITEMS };
 
 if (require.main === module) {
   main();

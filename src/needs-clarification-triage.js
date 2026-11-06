@@ -178,7 +178,7 @@ const { isForgePause } = require('./gpu-guard.js');
 const { formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
 const { classifyVote, clip } = require('./auto-confirm-review.js');
 const { hasResolutionSignal } = require('./staleness-auto-archive.js');
-const { checkCompletionClaimsInNote } = require('./fact-checker.js');
+const { checkCompletionClaimsInNote, preValidateCitedPaths } = require('./fact-checker.js');
 const { targetOversizedFile, oversizedFiles } = require('./file-length-flags-reader.js');
 const { classifyRequeue } = require('./requeue-attribution.js');
 const { buildGateFalsePositiveDraft } = require('./lib/gate-verdict.js');
@@ -953,6 +953,32 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     // Checked BEFORE the "already reviewed" skip -- see header. Only acts (and counts
     // toward `checked`) when decompLoop is set; otherwise falls through unchanged.
     if (decompLoop) {
+      // 2026-09-22: if the task cites a Files: path that doesn't exist in the repo,
+      // the decompose-loop premise is invalid (the file to decompose doesn't exist).
+      // Stamp it and leave in place instead of requeuing.
+      const citedFiles = Array.isArray(task.files) ? task.files : [];
+      if (citedFiles.length > 0) {
+        const allMissing = citedFiles.every((f) => !fs.existsSync(path.join(repoRoot, f)));
+        if (allMissing) {
+          summary.checked += 1;
+          const id0 = task.id || name.replace(/\\.json$/, '');
+          log(`${id0}: bucket E but Files: path nonexistent -> decompose-loop-premise-invalid`);
+          delete task.stalenessFlag;
+          delete task.decomposeBlockCount;
+          delete task.autoDecomposeCount;
+          task.ncTriageDecision = 'decompose-loop-premise-invalid';
+          task.ncTriageReviewedAt = new Date().toISOString();
+          appendHistoryEvent(task, 'nc-triage-reviewed',
+            `needs-clarification-triage: decompose-loop flag with nonexistent Files: path -- ncTriageDecision: decompose-loop-premise-invalid, left in place`);
+          try {
+            fs.writeFileSync(file, JSON.stringify(task, null, 2));
+          } catch (e) {
+            log(`${id0}: writeback failed: ${e.message}`);
+            summary.errors += 1;
+          }
+          continue;
+        }
+      }
       const id0 = task.id || name.replace(/\.json$/, '');
       // Surface the decompose design question to a human BEFORE the terminal action
       // below (requeue, or the cap-spent leave-for-human fall-through), so the original
@@ -1286,7 +1312,33 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       if (DRY_RUN) continue;
       for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
       resetStatusForFreshAdhocAttempt(task);
-      bumpBucketAttempts(task, 'A');
+                  // Decompose-loop premise guard (HUB0123): a decompose-loop task reaching this
+            // actual requeue path whose rawText cites paths that resolve nowhere in the
+            // repo will reproduce the same premise failure on a clean retry --
+            // preValidateCitedPaths is deterministic against the current tree. Stamp it
+            // visibly and leave it in place for a human instead of burning a bounded
+            // retry. STRICTLY gated on the decompose-loop staleness flag (checked after
+            // the bucket-E skip above, with bucket E itself untouched), so no other
+            // bucket's requeue path -- and no bucket-B archive path -- is affected.
+            if (task.stalenessFlag && task.stalenessFlag.reason === 'decompose-loop') {
+              const rawText = (task.promptContext && task.promptContext.rawText) || (task.rawText || '');
+              let pv = null;
+              try { pv = preValidateCitedPaths(rawText, repoRoot); }
+              catch (e) { log(`${id0}: preValidateCitedPaths threw: ${e.message} -- falling through to requeue`); pv = null; }
+              const premiseFailures = (pv && Array.isArray(pv.failures)) ? pv.failures : null;
+              if (premiseFailures && premiseFailures.length > 0) {
+                log(`${id0}: decompose-loop premise cites ${premiseFailures.length} unresolvable path(s) -- stamped decompose-loop-premise-invalid, NOT requeued`);
+                task.ncTriageReviewedAt = now;
+                task.ncTriageDecision = 'decompose-loop-premise-invalid';
+                appendHistoryEvent(task, 'advisory',
+                  'needs-clarification-triage: decompose-loop task premise cites unresolvable path(s) ('
+                  + premiseFailures.slice(0, 3).map((f) => String((f && (f.path || f.message || f.reason)) || f).slice(0, 120)).join('; ')
+                  + ') -- a blind requeue would reproduce the same premise failure, left for a human');
+                writeInPlace(file, task, summary);
+                continue;
+              }
+            }
+            bumpBucketAttempts(task, 'A');
       appendHistoryEvent(task, 'requeued',
         `needs-clarification-triage: degenerate "no prior context" draft (rawText intact) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
       try {

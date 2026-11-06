@@ -13,19 +13,31 @@ import subprocess
 
 job_types_bp = Blueprint("job-types-bp", __name__)
 
-@job_types_bp.route("/api/pipeline-map")
-def api_pipeline_map():
-    """Pipeline Map tab (2026-08-26, Grimmethy: "I want a live pipeline map for
-    architecture review... right now I don't have any way of visualizing the process").
-    Topology comes straight from src/task-sources.js's own registry via `--dump-topology`
-    (see that CLI mode's own header for why this, not another hand-maintained catalog like
-    TASK_SOURCE_CATALOG below) -- read fresh on every call, so it can never drift the way
-    the Job List tab's own hand-maintained lists already have (confirmed live via
-    queue-watchdog's drift-scan the same night: missing backlog_decomposition/
-    backlog_fulfillment/pipeline_health_audit/product_spec/ui_visibility_audit). Live counts
-    come straight from the real queue/ directories, correlated by each task's own recorded
-    `source` field -- never estimated, never cached across requests."""
-    from app import ENV_FILE_PATH, SRC_DIR, _pipeline_live_counts, queue_dir, read_env_file
+_TOPOLOGY_CACHE: dict = {"at": 0.0, "topology": []}
+_TOPOLOGY_STATE = {"error": None, "status": 200}
+_TOPOLOGY_TTL_S = 600.0          # the slow reconcile (swr_cache.py); the real trigger is _topology_key() changing
+
+
+def _topology_key():
+    """What `node src/task-sources.js --dump-topology` reads, as a cheap comparable value: the env file, the plugin manifest, the dashboard settings and the registry script (stat keys) and the
+    AGENT_MANAGER_* environment (which carries AGENT_MANAGER_REGISTER_PATH and the UI-set priority and allowlist overrides)."""
+    from app import ENV_FILE_PATH, PLUGINS_MANIFEST_PATH, SRC_DIR, read_env_file
+    from app_settings_helpers import DASHBOARD_SETTINGS_PATH
+
+    def stat_key(path):
+        try:
+            st = os.stat(path)
+            return (st.st_ino, st.st_size, st.st_mtime_ns)
+        except OSError:
+            return None
+    env = {**os.environ, **read_env_file(ENV_FILE_PATH)}
+    return (stat_key(ENV_FILE_PATH), stat_key(PLUGINS_MANIFEST_PATH), stat_key(DASHBOARD_SETTINGS_PATH), stat_key(SRC_DIR / "task-sources.js"),
+            hash(tuple(sorted((k, v) for k, v in env.items() if k.startswith("AGENT_MANAGER_")))))
+
+
+def _compute_topology():
+    """The topology list from `node src/task-sources.js --dump-topology`, or [] when it could not be had (the reason and HTTP status go in _TOPOLOGY_STATE for the route to report)."""
+    from app import ENV_FILE_PATH, SRC_DIR, read_env_file
     script_path = SRC_DIR / "task-sources.js"
     # Same env the pipeline loops themselves get (agent-manager.env on top of os.environ):
     # --dump-topology needs AGENT_MANAGER_REPO_ROOT to run at all, and
@@ -40,13 +52,41 @@ def api_pipeline_map():
             cwd=str(SRC_DIR), env=child_env,
         )
     except subprocess.TimeoutExpired:
-        return jsonify({"available": False, "reason": "task-sources.js --dump-topology timed out"}), 504
+        _TOPOLOGY_STATE.update(error="task-sources.js --dump-topology timed out", status=504)
+        return []
     if result.returncode != 0:
-        return jsonify({"available": False, "reason": (result.stderr or "task-sources.js exited non-zero").strip()[:500]})
+        _TOPOLOGY_STATE.update(error=(result.stderr or "task-sources.js exited non-zero").strip()[:500], status=200)
+        return []
     try:
         topology = json.loads(result.stdout)
     except json.JSONDecodeError:
-        return jsonify({"available": False, "reason": "task-sources.js --dump-topology returned non-JSON output"})
+        _TOPOLOGY_STATE.update(error="task-sources.js --dump-topology returned non-JSON output", status=200)
+        return []
+    if not isinstance(topology, list) or not topology:
+        _TOPOLOGY_STATE.update(error="task-sources.js --dump-topology returned no sources", status=200)
+        return []
+    return topology
+
+
+@job_types_bp.route("/api/pipeline-map")
+def api_pipeline_map():
+    """Pipeline Map tab (2026-08-26, Grimmethy: "I want a live pipeline map for
+    architecture review... right now I don't have any way of visualizing the process").
+    Topology comes straight from src/task-sources.js's own registry via `--dump-topology`
+    (see that CLI mode's own header for why this, not another hand-maintained catalog like
+    TASK_SOURCE_CATALOG below), so it can never drift the way the Job List tab's own
+    hand-maintained lists already have (confirmed live via queue-watchdog's drift-scan the
+    same night: missing backlog_decomposition/backlog_fulfillment/pipeline_health_audit/
+    product_spec/ui_visibility_audit). It used to be started on EVERY call (node, seconds on a busy disk); since 2026-11-04
+    it is cached by what it reads (_topology_key) and refreshed in the background when that changed (swr_cache.py), so a request never waits for node once a topology
+    exists. Live counts come straight from the real queue/ directories, correlated by each task's own recorded
+    `source` field -- never estimated, never cached across requests."""
+    from app import _pipeline_live_counts, queue_dir
+    import swr_cache
+    topology = swr_cache.cached_value(_TOPOLOGY_CACHE, "topology", _topology_key, _compute_topology, _TOPOLOGY_TTL_S)
+    if not topology:
+        return jsonify({"available": False, "reason": _TOPOLOGY_STATE["error"] or "the pipeline topology is not available"}), _TOPOLOGY_STATE["status"]
+    topology = [dict(source) for source in topology]      # the cached list is never handed out: the per-request counts below are merged into copies
 
     live_counts = _pipeline_live_counts(queue_dir())
     # turnsStats (2026-08-26, Grimmethy: "add turnsUsed recording... a data point we

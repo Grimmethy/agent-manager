@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 
 # The app.py helpers these views call (ENV_FILE_PATH, PACKAGE_ROOT, QUEUE_STATES, SRC_DIR, _archive_task_file, _call_discuss, _discuss_provider_args, _files_touched_for, _incoming_task_links, _outgoing_task_links, _record_manual_requeue, _repeated_blocker_match, _task_cost_summary, _task_input_summary, _work_log_for, get_active_grep_dirs, get_active_repo_root, get_pipeline_dir, instances_dir, logger, queue_dir, read_env_file, read_json_safe) are
 # imported lazily inside each view: app.py imports THIS module to register the
@@ -116,10 +117,11 @@ def api_task_archive(state, task_id):
     down an anchor for. 'awaiting-confirm' included the same day, same reasoning -- DENYING
     a delete-containing batch (the awaiting-confirm gate's own opposite of /confirm below)
     is exactly this action too: give up on it rather than let it apply."""
-    from app import _archive_task_file, _stamp_manual_archive, queue_dir
+    from app import _archive_task_file, _stamp_manual_archive
     if state not in ("blocked", "done", "needs-clarification", "awaiting-confirm"):
         abort(400, description="only a blocked, done, needs-clarification, or awaiting-confirm task can be archived")
-    qdir = queue_dir()
+    body = request.get_json(silent=True) or {}
+    qdir, _scope = _qdir_for_request(body)   # ?project=<repoRoot> archives in that registered project's queue (2026-11-02, cross-project workers)
     if not qdir:
         abort(404)
     src = qdir / state / f"{task_id}.json"
@@ -128,7 +130,6 @@ def api_task_archive(state, task_id):
     dest = qdir / "done" / "_archived_no_action" / src.name
     if dest.exists():
         abort(409, description=f"an archived copy of '{src.stem}' already exists")
-    body = request.get_json(silent=True) or {}
     # Record what this archive MEANS before moving it (see _stamp_manual_archive): without a disposition the task is
     # "unclassified" forever and silently blocks anything that dependsOn it.
     stamped = _stamp_manual_archive(src, state, body.get("reason"))
@@ -242,6 +243,109 @@ def api_hub_retire(hub_id):
     _stamp_and_archive(hub_file, "coordinating", "hub retired by a human via the dashboard" + (f" -- {reason}" if reason else "")
                        + (f"; retired {len(archived)} unfinished sub-task(s)" if archived else ""))
     return jsonify({"hub": hub_id, "archived": archived, "left": left})
+
+
+@task_bp.route("/api/hub/<hub_id>/waive-abandoned", methods=["POST"])
+def api_hub_waive_abandoned(hub_id):
+    """Set `abandonedPiecesWaived: true` on a coordinating hub (2026-11-05): the owner's explicit "merge it anyway" that _summarize_hub reads
+    (app_branch_helpers.py). An ABANDONED piece counts as finished for hub auto-completion but is not code that shipped, so a hub with one is never
+    readyToMerge; before this route nothing could set the flag. The hub worker uses it after it has either replaced the abandoned piece (the
+    replacement is a piece of the same hub and must still be built) or found the piece's work already on the base.
+
+    Body: {"reason": "<why>"} (required, recorded on the hub record and in its history); `?project=<repoRoot>` selects another registered project.
+    404 no such coordinating hub; 400 no reason; 409 the hub has no abandoned piece (nothing to waive). Idempotent: waiving twice answers 200 with
+    `alreadyWaived: true`. Returns {"hub", "waived": true, "abandoned": [piece ids], "alreadyWaived"?}."""
+    from app import read_json_safe, logger
+    body = request.get_json(silent=True) or {}
+    qdir, _scope = _qdir_for_request(body)
+    if not qdir:
+        abort(404)
+    hub_file = qdir / "coordinating" / f"{hub_id}.json"
+    hub = read_json_safe(hub_file)
+    if not isinstance(hub, dict):
+        abort(404, description=f"no coordinating hub '{hub_id}'")
+    reason = (body.get("reason") or "").strip()
+    if not reason:
+        abort(400, description="a reason is required")
+    abandoned = [st.get("id") for st in hub.get("subTasks") or [] if isinstance(st, dict) and st.get("status") == "abandoned"]
+    if not abandoned:
+        abort(409, description="the hub has no abandoned piece; nothing to waive")
+    if hub.get("abandonedPiecesWaived") is True:
+        return jsonify({"hub": hub_id, "waived": True, "abandoned": abandoned, "alreadyWaived": True})
+    now_iso = datetime.now(timezone.utc).isoformat()
+    hub["abandonedPiecesWaived"] = True
+    hub.setdefault("history", []).append({"stage": "abandoned-pieces-waived", "at": now_iso, "detail": f"abandoned piece(s) {', '.join(abandoned)} waived: {reason}"})
+    try:
+        hub_file.write_text(json.dumps(hub, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.error("Could not write the waiver on %s: %s", hub_file, exc)
+        abort(500, description=f"could not write the hub record: {exc}")
+    return jsonify({"hub": hub_id, "waived": True, "abandoned": abandoned})
+
+
+@task_bp.route("/api/hub/<hub_id>/pieces", methods=["POST"])
+def api_hub_add_piece(hub_id):
+    """Add a follow-up piece to a hub that is already coordinating (2026-10-31, HUB0295-05).
+
+    A hub's piece list is fixed when it is decomposed, and `_summarize_hub` computes readyToMerge from it, so a corrective piece filed by hand
+    never held the hub back: the hub read "ready to merge" without it. This appends the piece to the hub's `subTasks` (and writes its child
+    record on the hub's stacked chain); the coordinator sweep then renumbers the not-yet-started pieces. Single implementation: src/hub-add-piece.js,
+    run here as a subprocess exactly like /rereview, so the route and the CLI can never diverge.
+
+    `hub_id` is the hub RECORD id (the file name in queue/coordinating/, like /retire), not the HUBnnnn label. Body, a NEW piece:
+    {"title": "...", "rawText": "<self-contained piece text>", "files": ["path", ...]?, "dependsOn": ["id"]?, "reason": "why"?};
+    or ADOPT a child that already exists: {"adopt": "<child id>", "reason": "why"?}. `?project=<repoRoot>` selects another registered project.
+    Returns the CLI's JSON {ok, id, total, seq?, adopted?, ownerGate?}: 404 no such coordinating hub, 400 bad body, 409 refused (duplicate id, child in
+    another hub, file-decompose hub, several chains, switched off)."""
+    from app import ENV_FILE_PATH, PACKAGE_ROOT, read_env_file
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        abort(400, description="body must be a JSON object")
+    qdir, _scope = _qdir_for_request(body)
+    if not qdir:
+        abort(404)
+    adopt = body.get("adopt")
+    title = body.get("title")
+    raw_text = body.get("rawText")
+    if adopt is not None and not (isinstance(adopt, str) and adopt.strip()):
+        abort(400, description="adopt must be a non-empty child task id")
+    if not adopt and not (isinstance(title, str) and title.strip() and isinstance(raw_text, str) and raw_text.strip()):
+        abort(400, description="give a title and a rawText for a new piece, or adopt: <child id>")
+    script = PACKAGE_ROOT / "src" / "hub-add-piece.js"
+    args = ["node", str(script), hub_id, "--pipeline-dir", str(qdir.parent), "--who", "dashboard"]
+    reason = body.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        args += ["--reason", reason.strip()]
+    tmp_path = None
+    try:
+        if adopt:
+            args += ["--adopt", adopt.strip()]
+        else:
+            payload = {"rawText": raw_text}
+            if isinstance(body.get("files"), list):
+                payload["files"] = body["files"]
+            if isinstance(body.get("prerequisiteHubs"), list):
+                payload["prerequisiteHubs"] = body["prerequisiteHubs"]
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
+                json.dump(payload, fh)
+                tmp_path = fh.name
+            args += ["--title", title.strip(), "--prompt-context-file", tmp_path]
+            if isinstance(body.get("dependsOn"), list) and body["dependsOn"]:
+                args += ["--depends-on", ",".join(str(d) for d in body["dependsOn"])]
+        cp = subprocess.run(args, capture_output=True, text=True, timeout=60, env={**os.environ, **read_env_file(ENV_FILE_PATH)})
+        result = json.loads((cp.stdout or "{}").strip().splitlines()[-1])
+    except Exception as e:  # noqa: BLE001 -- surface a clean error, never a stack trace
+        abort(500, description=f"add-piece failed: {e}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    if not result.get("ok"):
+        status = 404 if str(result.get("error", "")).startswith("no coordinating hub") else 409
+        return jsonify(result), status
+    return jsonify(result)
 
 
 @task_bp.route("/api/task/<state>/<task_id>/rereview", methods=["POST"])
@@ -453,10 +557,10 @@ def api_task_requeue(state, task_id):
     archive pass moved there is just as "archived" and must be just as requeueable as one a
     human moved to _archived_no_action/ by hand; see done-archive.js's own header on the
     same "always reversible" promise this endpoint already exists to uphold."""
-    from app import _record_manual_requeue, _repeated_blocker_match, get_active_repo_root, logger, queue_dir, read_json_safe
+    from app import _record_manual_requeue, _repeated_blocker_match, get_active_repo_root, logger, read_json_safe
     if state not in ("blocked", "needs-clarification", "done", "archived"):
         abort(400, description="only a blocked, needs-clarification, done, or archived task can be requeued")
-    qdir = queue_dir()
+    qdir, scope = _qdir_for_request(request.get_json(silent=True) or {})   # ?project=<repoRoot>: that registered project's queue, repo and pipeline
     if not qdir:
         abort(404)
     if state == "archived":
@@ -529,7 +633,7 @@ def api_task_requeue(state, task_id):
             })
         elif applied_branch:
             from app import _invalidate_branch_cache, _run_git
-            repo_root = get_active_repo_root()
+            repo_root = scope["repoPath"] if scope else get_active_repo_root()
             repo_root = Path(repo_root) if repo_root else None
             if repo_root:
                 try:
@@ -545,7 +649,11 @@ def api_task_requeue(state, task_id):
                         "Non-fatal: could not delete superseded branch %r for requeued task %r: %s",
                         applied_branch, task_id, e,
                     )
-                _invalidate_branch_cache()
+                if scope:
+                    import branch_projects
+                    branch_projects.after_action(scope)
+                else:
+                    _invalidate_branch_cache()
             abandon_iso = datetime.now(timezone.utc).isoformat()
             abandon_detail = f"superseded by a manual requeue from {state}/; prior branch {applied_branch} deleted"
             data.setdefault("history", []).append({
@@ -613,7 +721,8 @@ def api_task_requeue(state, task_id):
         fresh["noDecompose"] = data["noDecompose"]
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
-    _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual")
+    _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual",
+                           pipeline_dir=scope["pipelineDir"] if scope else None)
     return jsonify({"id": task_id, "requeued": True})
 
 
