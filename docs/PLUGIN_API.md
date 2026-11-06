@@ -241,6 +241,24 @@ at is the one that just disappeared, `redirectFromGoneActiveTab()` runs the dash
 normal tab-switch transition (`switchToTab()`) to a safe fallback (`'project'` by default)
 instead of leaving them on a dead tab.
 
+### Keeping the tab current: announce
+
+The dashboard has no redraw timer (ADR-0024, "triggers, not polls"): a plugin tab is drawn when it is opened and again when its plugin says something changed. The party that changes
+the data announces it:
+
+```
+POST /api/plugins/<plugin name>/announce        ->  {"ok": true, "plugin": "<name>", "seq": 42}
+```
+
+`<plugin name>` is the `name` of the plugin's `plugins.json` entry (the same name as `pluginName` on its tab row). Call it from the plugin's server (or its tab script) after the data
+behind the tab changed, for example after a job finished or a record was written. Every open dashboard receives a `plugin-changed` event, and ONLY the open tab of that plugin calls its
+renderer again; every other tab ignores it. Notes:
+
+- An unknown plugin name answers 404 and publishes nothing; with `AGENT_MANAGER_EVENT_STREAM=off` the route answers 404 `{"enabled": false}`.
+- Announce when something CHANGED, not on a timer: a loop that announces every few seconds is the poll this mechanism replaces.
+- The tabs that keep their own state while open (PromptForge, AdForge and ScriptForge, in `SELF_RENDERING_TABS` of `static/js/live-updates.js`) are never redrawn by an announcement.
+- A plugin that never announces keeps working: its tab shows what it drew when it was opened (reload or switch away and back to redraw).
+
 ### End-to-end proof
 
 `test-fixtures/manifest-tab-example-plugin/` (`register.js` + `ui/example-tab.js`) is a

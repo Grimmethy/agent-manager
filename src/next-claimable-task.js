@@ -6,6 +6,7 @@ const path = require('path');
 const { HUB_TIER_PRIORITY, isHubTierTask, hubIdForTask } = require('./hub-priority.js');
 const { ROTATION_DEMOTED_PRIORITY, rotationDemoted, laneAvoided } = require('./premium-rotation.js');
 const { openQueueCache, readTaskCached } = require('./queue-cache.js');
+const { bandedPriority, readClaimBands } = require('./workflow-claim-order.js'); // AGENT_MANAGER_PRIORITY_MODE=group ranks by the authored group order; absent = the registered priority
 
 // Extracted from scripts/local-worker.sh's inline claim-ranking script (the 2026-08-22
 // priority+mtime fix) -- now one tested module instead of an untested `node -e` block in the
@@ -133,16 +134,17 @@ function rankPriorityOfTask(task, opts = {}) {
   if (hubTier) return task.premiumPriority ? -Infinity : HUB_TIER_PRIORITY;
   const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
   try {
+    const bands = readClaimBands(); // null unless AGENT_MANAGER_PRIORITY_MODE=group and the workflow file has groups
     // A derived_task carries domain:'adhoc' (so every draft/apply path treats it exactly like adhoc --
     // resolveSourceName() sends it there), but it must RANK at its own registered priority (48,
     // self-maintenance band), never adhoc's base 10 + BOT_ADHOC_PRIORITY_PENALTY. Look it up by its
     // literal source name.
     if (task.source === 'derived_task') {
       const dt = getRegisteredSource('derived_task');
-      return (dt && typeof dt.priority === 'number') ? dt.priority : Infinity;
+      return (dt && typeof dt.priority === 'number') ? bandedPriority('derived_task', dt.priority, bands) : Infinity;
     }
     const source = getRegisteredSource(resolveSourceName(task));
-    if (source && typeof source.priority === 'number') return effectivePriority(task, source.priority, resolveSourceName);
+    if (source && typeof source.priority === 'number') return effectivePriority(task, bandedPriority(source.name, source.priority, bands), resolveSourceName);
   } catch (_) { /* unresolvable -- Infinity */ }
   return Infinity;
 }

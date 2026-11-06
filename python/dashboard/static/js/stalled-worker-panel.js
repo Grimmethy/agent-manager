@@ -1,5 +1,5 @@
-// Stalled-task worker panel for the Workers tab (agent-manager-pipeline-ops). The worker is a CLI run by a user systemd timer, not a lane, so this panel is how it
-// shows up: mode, whether its timer is active, how long ago it last ran, this hour's token budget, how many tasks are stalled and in which buckets, today's
+// Stalled-task worker panel for the Workers tab (agent-manager-pipeline-ops). The worker is a CLI started by the watchdog trigger (no timer), not a lane, so this panel is how it
+// shows up: mode, the watchdog trigger state, how long ago it last ran, this hour's token budget, how many tasks are stalled and in which buckets, today's
 // decisions, the questions waiting for the owner, and the most recent decisions. A plain global <script> (no require/module.exports), loaded by index.html right after
 // cloud-spend-panel.js; workers-tab.js appends renderStalledWorkerSection(payload). `payload` is the GET /api/stalled-worker body (routes/stalled_worker.py). All
 // functions are pure string builders (no DOM, no fetch), so they are unit-testable in a bare vm context.
@@ -32,10 +32,24 @@ function stalledWorkerModeBadge(mode) {
   return '<span class="badge idle" title="No decision has been recorded yet">no runs yet</span>';
 }
 
-function stalledWorkerTimerBadge(active) {
-  if (active === true) return '<span class="badge ok" title="The user systemd timer stalled-tick.timer is running">timer on</span>';
-  if (active === false) return '<span class="badge warn" title="stalled-tick.timer is not running, so no new ticks happen">timer stopped</span>';
-  return '<span class="badge idle" title="The timer state could not be read">timer unknown</span>';
+// The watchdog trigger (no timer): `t` is payload.trigger {state: 'listening' | 'draining' | 'backlog' | 'idle', endedAgeS, stopped} or null when it has never run.
+// The watchdog calls the trigger about once a minute and it rewrites its heartbeat every time, so a heartbeat older than this means the watchdog or the plugin entry is broken.
+const stalledWorkerTriggerSilentS = 300;
+
+function stalledWorkerTriggerBadge(t) {
+  const ended = t && Number.isFinite(t.endedAgeS) ? ' The last drain ended ' + stalledWorkerAge(t.endedAgeS) + ' ago' + (t.stopped ? ' (' + stalledWorkerEsc(t.stopped) + ')' : '') + '.' : '';
+  const checked = t && Number.isFinite(t.checkedAgeS) ? ' Checked ' + stalledWorkerAge(t.checkedAgeS) + ' ago.' : '';
+  if (t && t.state === 'listening') return '<span class="badge ok" title="The worker is up and waiting: it reacts within seconds of a push or any change it watches.">listening</span>';
+  if (t && t.state === 'draining') return '<span class="badge ok" title="A drain is running: the watchdog saw new input and the worker is ticking through it.">draining</span>';
+  if (t && Number.isFinite(t.checkedAgeS) && t.checkedAgeS > stalledWorkerTriggerSilentS) return '<span class="badge warn" title="The watchdog has not called the trigger for ' + stalledWorkerAge(t.checkedAgeS) + '. It normally does about once a minute: check the watchdog and watchdogScripts on the plugins.json entry.">trigger silent</span>';
+  if (t && t.state === 'backlog') return '<span class="badge warn" title="The last drain stopped at its cap with work left; the next watchdog tick continues it.' + ended + checked + '">backlog</span>';
+  if (t && t.state === 'idle') return '<span class="badge ok" title="The watchdog trigger is armed: it starts a drain when the input changes.' + ended + checked + '">trigger on</span>';
+  return '<span class="badge warn" title="The watchdog trigger has not run yet. Check that watchdogScripts for this worker is set on its plugins.json entry.">no trigger yet</span>';
+}
+
+// "trigger checked 12s ago" for the meta line; empty when there is no heartbeat to show.
+function stalledWorkerTriggerCheckedText(t) {
+  return t && Number.isFinite(t.checkedAgeS) ? 'trigger checked ' + stalledWorkerAge(t.checkedAgeS) + ' ago' : '';
 }
 
 // The operator's on/off switch (the marker file the worker's tick checks first). `sw` is payload.switch: {disabled, disabledAt}.
@@ -49,7 +63,7 @@ function stalledWorkerSwitchButton(sw) {
   const off = !!(sw && sw.disabled === true);
   const title = off
     ? 'Switch the worker back on: it starts working again at its next tick (within a minute).'
-    : 'Switch the worker off: new ticks do nothing (a tick already running finishes). The timer keeps running; nothing is deleted.';
+    : 'Switch the worker off: new ticks do nothing (a tick already running finishes). The watchdog trigger keeps running; nothing is deleted.';
   return '<button type="button" class="secondary stalled-switch-btn" data-next-enabled="' + (off ? 'true' : 'false') + '" title="' + stalledWorkerEsc(title)
     + '" style="margin-top:4px">' + (off ? '\u23FB Turn on' : '\u23FB Turn off') + '</button>';
 }
@@ -116,19 +130,19 @@ function stalledWorkerRecentHtml(recent) {
   return '<div style="margin-top:8px"><strong>Worker history</strong>' + rows + '</div>';
 }
 
-// Same card as the lane workers: id on the left, badges + timer + Turn on/off stacked on the right, one meta line, click the card to open the history.
+// Same card as the lane workers: id on the left, badges + last tick + Turn on/off stacked on the right, one meta line, click the card to open the history.
 function buildStalledWorkerHtml(p) {
   if (!p || !p.configured) return '';
   const off = !!(p.switch && p.switch.disabled === true);
   const open = stalledWorkerExpanded === true;
   const age = stalledWorkerAge(p.lastTickAgeS);
   const head = '<div class="row"><span class="id">\u{1F9F9} stalled-worker</span><div class="badge-col">'
-    + (off ? stalledWorkerSwitchBadge(p.switch) : stalledWorkerModeBadge(p.mode)) + ' ' + stalledWorkerTimerBadge(p.timerActive)
+    + (off ? stalledWorkerSwitchBadge(p.switch) : stalledWorkerModeBadge(p.mode)) + ' ' + stalledWorkerTriggerBadge(p.trigger)
     + '<span class="state-timer">' + (age ? 'last tick ' + stalledWorkerEsc(age) + ' ago' : 'no tick recorded yet') + '</span>'
     + stalledWorkerSwitchButton(p.switch) + '</div></div>';
   const source = stalledWorkerSourceText(p);
   const meta = '<div class="meta">' + (source ? source + ' · ' : '') + stalledWorkerBudgetText(p) + ' · ' + stalledWorkerStalledText(p.stalled)
-    + ' · today: ' + stalledWorkerTodayText(p, 3) + '</div>';
+    + (stalledWorkerTriggerCheckedText(p.trigger) ? ' · ' + stalledWorkerTriggerCheckedText(p.trigger) : '') + ' · today: ' + stalledWorkerTodayText(p, 3) + '</div>';
   const toggle = '<div class="meta" style="margin-top:4px">' + (open ? '▾ Hide history' : '▸ Show history') + (p.decisions !== undefined ? ' (' + stalledWorkerInt(p.decisions) + ' decisions)' : '') + '</div>';
   const detail = open ? '<div class="worker-recent-tasks">' + stalledWorkerBucketsHtml(p.stalled)
     + '<div class="meta" style="margin-top:8px"><strong>Today</strong> ' + stalledWorkerTodayText(p) + '</div>' + stalledWorkerRecentHtml(p.recent) + '</div>' : '';
@@ -136,7 +150,7 @@ function buildStalledWorkerHtml(p) {
     + head + meta + stalledWorkerHoldsHtml(p.holds, open) + toggle + detail + '</div>';
 }
 
-// What renderWorkers() appends: nothing at all unless the worker has left any trace (ledger, index, running timer or a reachable gateway).
+// What renderWorkers() appends: nothing at all unless the worker has left any trace (ledger, index, trigger state or a reachable gateway).
 function renderStalledWorkerSection(payload) {
   return buildStalledWorkerHtml(payload);   // returns '' itself unless payload.configured
 }

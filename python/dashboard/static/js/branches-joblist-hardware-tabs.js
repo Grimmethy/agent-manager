@@ -5,9 +5,8 @@ let currentBranches = [];
 let currentHeldHubs = [];
 
 async function fetchHeldHubs() {
-  try { return await fetchJson('/api/git/held-hub-branches', { timeoutMs: 30000 }); } catch (e) { return []; }
+  try { return await fetchJson('/api/git/held-hub-branches?projects=all', { timeoutMs: 30000 }); } catch (e) { return []; }
 }
-let branchesPollTimer = null;
 
 function branchCardHtml(b) {
   // willConflict is a git merge-tree preview (app.py's _check_merge_conflict) -- a
@@ -75,6 +74,18 @@ function branchCardHtml(b) {
 // Wires one card's own click handlers -- called both after a full rebuild (every card)
 // and after appending a single new card during a background poll (just that one), so a
 // poll never has to re-wire cards that were already working.
+// What to tell the owner after a merge that SUCCEEDED but left something undone (the dashboard's own checkout could not be fast-forwarded,
+// or a record could not be stamped). '' when everything went through. The merge is on origin either way; never word it as a failure.
+function mergeNoticeText(result) {
+  const parts = [];
+  const sync = result && result.liveSync;
+  if (sync && sync.synced === false && sync.reason) parts.push(sync.reason);
+  for (const w of (result && Array.isArray(result.warnings)) ? result.warnings : []) {
+    if (w && !parts.includes(w)) parts.push(w);
+  }
+  return parts.length ? 'Merged, but not everything finished:\n\n' + parts.join('\n\n') : '';
+}
+
 function wireBranchCard(card) {
   card.onclick = (e) => {
     // Don't hijack the Merge/Discard buttons' own clicks -- each has its own handler
@@ -118,6 +129,8 @@ function wireBranchCard(card) {
         });
         const result = await resp.json();
         if (!resp.ok || !result.succeeded) throw new Error(result.reason || `HTTP ${resp.status}`);
+        const notice = mergeNoticeText(result);
+        if (notice) alert(notice);
         if (result.liveSync && result.liveSync.restartTriggered) {
           mergeBtn.textContent = 'Merged -- dashboard reloading...';
           // Werkzeug's reloader restart is near-instant but not synchronous with this
@@ -197,16 +210,8 @@ async function renderBranchesTab() {
 // started here instead of picked up by refresh()'s renderMain() dispatch.
 async function enterBranchesTab() {
   await renderBranchesTab();
-  if (branchesPollTimer) clearInterval(branchesPollTimer);
-  // 15s, not 5s: this route is already the expensive one (server-side git work scales
-  // with branch count, confirmed 9s+ with a modest 17 branches) -- polling it as often
-  // as the old blind 5s cycle did was a real part of why fetches piled up and the tab
-  // kept showing "timed out" instead of settling.
-  branchesPollTimer = setInterval(refreshBranchesTab, 15000);
-}
-
-function leaveBranchesTab() {
-  if (branchesPollTimer) { clearInterval(branchesPollTimer); branchesPollTimer = null; }
+  // No timer: this route is the expensive one (server-side git work scales with branch count), so the list is re-read when the server says it changed
+  // (branch-list-changed) and the server is asked to look when something that feeds the list happened (counts-changed, branches-changed; see live-updates.js).
 }
 
 // The actual fix for "the reset needs to stop happening": a background poll now only
@@ -217,11 +222,11 @@ function leaveBranchesTab() {
 // replacing it with an error banner. The full renderBranchesTab() (tab entry, and after
 // a deliberate merge/discard) is untouched and still shows a real error if IT fails --
 // there's nothing yet on screen worth preserving at that point.
-async function refreshBranchesTab() {
+async function refreshBranchesTab({ kick = false } = {}) {
   if (activeTab !== 'branches') return;
   let branches;
   try {
-    branches = await fetchBranchList();
+    branches = await fetchBranchList({ kick });
   } catch (e) {
     console.warn('[branches] background refresh failed (non-fatal, keeping current list):', e.message);
     return;
@@ -272,11 +277,9 @@ async function refreshBranchesTab() {
     }
   }
   currentBranches = branches;
-  refreshBranchVerdictFilterBar(main, branches);
   currentHeldHubs = await fetchHeldHubs();
-  const heldEl = main.querySelector('[data-held-hubs]');
-  if (heldEl) heldEl.outerHTML = heldHubsHtml(currentHeldHubs);
-  else main.insertAdjacentHTML('beforeend', heldHubsHtml(currentHeldHubs));
+  refreshBranchVerdictFilterBar(main, branches);       // the counts, including the hidden-hubs button
+  refreshHeldHubsPanel(main);
 }
 
 async function renderBranchDetailModal(b) {
@@ -1110,7 +1113,9 @@ async function unloadOllamaFromChip() {
   }
 }
 
-async function refreshCycle() {
+// The page's refresh, in the parts the live updates (live-updates.js) ask for one at a time. refreshCycle() below is all of them in order: the page-load refresh, the
+// action-triggered refreshes and the fallback poll when the event stream is unavailable.
+async function refreshSummary() {
   try {
     counts = await fetchJson('/api/summary');
     document.getElementById('pipeline-status').textContent = 'connected';
@@ -1118,36 +1123,63 @@ async function refreshCycle() {
   } catch (e) {
     document.getElementById('pipeline-status').textContent = 'disconnected';
   }
-  // Re-sync plugin-declared tabs every cycle (piece 5; Docs/hub-tasks-extraction-plan.md
-  // section 5) so a plugin toggled off/removed from elsewhere (another browser tab, a
-  // pipeline restart, a hand-edited plugins.json) drops its nav row promptly instead of
-  // only at next page load. If the row the user is currently looking at is the one that
-  // just vanished, redirectFromGoneActiveTab() runs the full leave/enter transition to a
-  // safe fallback tab itself (via switchToTab) -- in that case skip the render calls below,
-  // which would otherwise double-render on top of what the redirect already did.
+}
+
+// Re-sync plugin-declared tabs (piece 5; Docs/hub-tasks-extraction-plan.md section 5) so a plugin toggled off/removed from elsewhere drops its nav row promptly instead of
+// only at next page load. -> true when the tab the user was looking at vanished and redirectFromGoneActiveTab() already did the full leave/enter transition to a safe
+// fallback tab: the caller must then skip its own render calls, which would double-render on top of that.
+async function refreshPluginTabs() {
   await syncPluginTabs();
-  if (redirectFromGoneActiveTab()) return;
+  return redirectFromGoneActiveTab();
+}
+
+// Project and Brain Dump tabs manage their own rendering (enter*Tab/leave*Tab) so a user's in-progress folder browsing or a half-typed capture note isn't wiped out by a
+// generic redraw; promptforge / adforge / scriptforge are embedded iframes that a redraw would reload out from under the user's inputs; concepts, filed and branches lost
+// clicks to a mid-click rebuild (branches also has its own diffing refresh, refreshBranchesTab). The list is SELF_RENDERING_TABS in live-updates.js.
+async function refreshMain() {
+  if (!isSelfRenderingTab(activeTab)) await renderMain();
+}
+
+async function refreshCycle() {
+  await refreshSummary();
+  if (await refreshPluginTabs()) return;
   renderNav();
-  // Project and Brain Dump tabs manage their own rendering (enter*Tab/leave*Tab) so a
-  // user's in-progress folder browsing or a half-typed capture note isn't wiped out by
-  // this generic 5s cycle -- only the nav badge counts above still update while open.
-  // promptforge / adforge / scriptforge are embedded iframes -- re-running
-  // renderMain() every 5s would rebuild them and reload the app out from under the
-  // user's inputs, same reason project / brain-dump opt out here.
-  // concepts (2026-09-06): confirmed live -- a "View timeline" click could lose the
-  // race against this same 5s cycle rebuilding the tab's DOM via innerHTML mid-click,
-  // silently discarding the interaction with no error. Same class of bug Brain Dump's
-  // own opt-out already exists to prevent; re-entering the tab still re-fetches once.
-  // filed (2026-09-14): same reasoning as brain-dump's own opt-out just above -- a
-  // suppress/prioritize/delete click mid-flight (button disabled, awaiting its fetch)
-  // shouldn't get its DOM silently rebuilt out from under it by this 5s cycle.
-  // branches (2026-09-15): same class of bug again, plus its own wrinkle -- the route
-  // behind this tab is the slow one (server-side git work scales with branch count,
-  // 9s+ measured with just 17), so this blind 5s full-teardown cycle was firing a fresh
-  // request before the last one had even resolved, and replacing the whole list with a
-  // "timed out" error on every miss. enterBranchesTab()/leaveBranchesTab() now run
-  // their own 15s poll that diffs in new/removed branches instead of rebuilding.
-  if (!['project', 'brain-dump', 'filed', 'hygiene', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'].includes(activeTab)) await renderMain();
+  await refreshMain();
+}
+
+// What the event stream asked for (a plan from planForEvent), in the same order refreshCycle uses.
+async function applyLivePlan(plan) {
+  if (plan.summary) await refreshSummary();
+  if (plan.plugins && await refreshPluginTabs()) return;
+  if (plan.nav) renderNav();
+  if (plan.main) await refreshMain();
+  if (plan.branches && typeof refreshBranchesTab === 'function') await refreshBranchesTab({ kick: !!plan.kick });
+  if (plan.panels) await refreshActiveTabPanels();
+  if (plan.modal && typeof refreshTaskDetailModal === 'function') await refreshTaskDetailModal();
+}
+
+// The open self-rendering tab's own panel refreshers (it is never redrawn whole): the Project tab's pipeline and status panels, the Brain Dump tab's entry list (unforced: it skips an open edit or discussion), the Hygiene tab's inventory (quiet: no spinner; its own in-flight guard drops an overlapping load).
+async function refreshActiveTabPanels() {
+  if (activeTab === 'project' && typeof refreshPipelineStatus === 'function') {
+    await refreshPipelineStatus();
+    if (typeof refreshProjectStatus === 'function') await refreshProjectStatus();
+  } else if (activeTab === 'brain-dump' && typeof refreshBrainDumpEntries === 'function') {
+    await refreshBrainDumpEntries();
+  } else if (activeTab === 'hygiene' && typeof loadHygiene === 'function') {
+    await loadHygiene({ quiet: true });
+  }
+}
+
+function startPageLiveUpdates() {
+  return startLiveUpdates({
+    EventSource: typeof EventSource !== 'undefined' ? EventSource : null,
+    apply: (plan) => runRefreshGuarded(() => applyLivePlan(plan)),
+    poll: async () => { await refresh(); await refreshActiveTabPanels(); if (typeof refreshTaskDetailModal === 'function') await refreshTaskDetailModal(); },     // the closed-stream fallback also keeps the open tab's panels current
+    getTab: () => activeTab,
+    isPluginTab: (tab) => { const t = typeof findTabByKey === 'function' ? findTabByKey(tab) : null; return !!(t && t.pluginScript); },
+    pluginNameOf: (tab) => { const t = typeof findTabByKey === 'function' ? findTabByKey(tab) : null; return (t && t.pluginScript && typeof t.pluginName === 'string') ? t.pluginName : null; },
+    setStatus: (text) => { document.getElementById('pipeline-status').textContent = text; },
+  });
 }
 
 function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }

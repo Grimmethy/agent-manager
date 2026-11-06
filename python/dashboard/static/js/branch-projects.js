@@ -111,12 +111,12 @@ function branchConfirmWithProject(message, btn) {
 }
 
 // Same as fetchJson (core-ui.js) but also reads which projects the server is still scanning.
-async function fetchBranchList() {
+async function fetchBranchList({ kick = false } = {}) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 30000);
   let r;
   try {
-    r = await fetch(BRANCHES_URL, { signal: controller.signal });
+    r = await fetch(kick ? BRANCHES_URL + '&kick=1' : BRANCHES_URL, { signal: controller.signal });
   } catch (e) {
     if (e.name === 'AbortError') throw new Error(BRANCHES_URL + ' -> timed out after 30s');
     throw e;
