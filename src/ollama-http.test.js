@@ -361,3 +361,91 @@ test('postJson with deadlineMs that IS exceeded rejects with TIMEOUT', async () 
     }
   );
 });
+
+// Test 1: Premature close rejection -- server destroys socket before body completes
+// Note: Cannot assert PREMATURE_CLOSE because Node fires 'error' before 'close'
+// when destroying a socket, so the STREAM_ERROR or CONNECTION_ERROR paths always win.
+// This test asserts rejection (not a specific code) to verify postJson rejects rather
+// than hanging or crashing on premature socket close.
+test('premature close: server destroys socket before body completes → rejects', async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.write('{"partial":');
+        // Destroy socket before completing the response
+        res.destroy(new Error('simulated premature close'));
+      });
+    },
+    async (base) => {
+      try {
+        await postJson(`${base}/api/generate`, { a: 1 }, 5000);
+        assert.fail('expected reject on premature close');
+      } catch (e) {
+        // Node routes server-destroyed socket through STREAM_ERROR or CONNECTION_ERROR
+        assert.ok(
+          [OLLAMA_ERROR_CODES.STREAM_ERROR, OLLAMA_ERROR_CODES.CONNECTION_ERROR].includes(e.code),
+          `expected reject with STREAM_ERROR or CONNECTION_ERROR, got ${e.code}`,
+        );
+      }
+    }
+  );
+});
+
+// Test 2: Deadline expiry at 200ms with server delaying 1000ms
+test('deadline expiry at 200ms with server delaying 1000ms → rejects with TIMEOUT', async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      // Delay response by 1000ms (longer than 200ms deadline)
+      setTimeout(() => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      }, 1000);
+    },
+    async (base) => {
+      try {
+        await postJson(`${base}/api/generate`, { a: 1 }, 200);
+        assert.fail('expected reject on deadline expiry');
+      } catch (e) {
+        assert.equal(e.code, OLLAMA_ERROR_CODES.TIMEOUT);
+        assert.equal(e.deadlineMs, 200);
+      }
+    }
+  );
+});
+
+// Test 3: No-deadline unchanged behavior -- postJson without deadlineMs works normally
+test('no-deadline: postJson without deadlineMs completes normally', async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ result: 'ok' }));
+      });
+    },
+    async (base) => {
+      const result = await postJson(`${base}/api/generate`, { a: 1 });
+      assert.deepEqual(result, { result: 'ok' });
+    }
+  );
+});
+
+// Test 4: Happy-path regression -- with generous deadline, successful response resolves
+test('happy-path regression: with deadlineMs that is not exceeded resolves normally', async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'success' }));
+      });
+    },
+    async (base) => {
+      const result = await postJson(`${base}/api/generate`, { a: 1 }, 5000);
+      assert.deepEqual(result, { status: 'success' });
+    }
+  );
+});
