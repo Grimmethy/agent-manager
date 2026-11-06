@@ -115,6 +115,38 @@ class BuildImportGraphFileCacheTest(unittest.TestCase):
             graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
             self.assertNotIn("src/b.js", file_cache["files"], "a deleted file's stale cache entry must not linger forever")
 
+    def test_cache_hit_discovers_newly_added_target(self):
+        """AC-64 regression: a file added to the repo after the first build should be
+        linked on the next build even if the importing file's text didn't change.
+        Without the unresolved_specs re-resolution, the edge would be silently missing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "src").mkdir()
+            # a.js imports both b.js and c.js
+            (repo / "src" / "a.js").write_text("require('./b.js'); require('./c.js');\n")
+            (repo / "src" / "b.js").write_text("module.exports = {};\n")
+            # c.js NOT in file_set yet
+
+            file_cache = {}
+            graph = graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
+            # First build: only b.js in file_set, so only edge to b.js
+            self.assertTrue(graph.has_edge("src/a.js", "src/b.js"))
+            self.assertFalse(graph.has_edge("src/a.js", "src/c.js"))
+            # Cache entry for a.js should have unresolved_specs containing the spec for c.js
+            self.assertIn("unresolved_specs", file_cache["files"]["src/a.js"])
+            # The spec for c.js should be in unresolved_specs (exact format depends on regex)
+            unresolved = file_cache["files"]["src/a.js"]["unresolved_specs"]
+            self.assertTrue(any("c.js" in s for s in unresolved), f"unresolved_specs {unresolved} should contain c.js spec")
+
+            # Now add c.js (DO NOT touch a.js - keep its mtime/size unchanged)
+            (repo / "src" / "c.js").write_text("module.exports = {};\n")
+
+            # Second build: a.js unchanged (same mtime/size), so cache hit
+            graph = graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
+            # Now the edge to c.js should appear via re-resolution of unresolved_specs
+            self.assertTrue(graph.has_edge("src/a.js", "src/c.js"),
+                            "AC-64 fix: newly-added target should be discovered on cache hit")
+
 
 class ResolveZigImportTest(unittest.TestCase):
     """2026-08-25, Grimmethy: "If Zig is going to exist in our project we need to be able
