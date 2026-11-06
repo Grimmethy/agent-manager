@@ -66,6 +66,7 @@ const { parseClarificationOptions } = require('./agentic-draft-common.js');
 const { resolveGroundingRef, readFileAtRef, resolveAtRef } = require('./stacked-grounding.js');
 const { checkDraft, checkCitationsAgainstHarnessFiles } = require('./fact-checker.js');
 const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.js');
+const { checkConflict } = require('./conflict-check.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
 const { getScriptHandler } = require('./script-handler-registry.js');
@@ -93,6 +94,69 @@ const { canonicalizeEdits } = require('./lib/find-canonicalize.js');
 const { resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResearchBranch, runUiVisibilityFastpath } = require('./lib/draft-context.js');
 const { computePlanNumPredict, tryDeterministicScriptExtractEdit, tryDeterministicOnePassDecompose, tryDeterministicNodeModuleDecompose, tryDeterministicBlueprintDecompose, tryDeterministicLiteralEdit } = require('./lib/deterministic-extract.js');
 const { runCritiqueAndRevision, computeImplementBudget, callImplementModel } = require('./lib/implement-critique.js');
+
+// 2026-11-04, this task: conflict check runs before implement to catch file overlap with
+// other open branches EARLY (the dashboard's _check_conflicts only runs during review, too
+// late). If a conflict is detected, the draft is blocked with a needs-human-decision verdict
+// so a human can decide which branch to keep. This prevents the class of 13 branches that all
+// failed with "it conflicts with # other open branch(#)" because the check ran after work was
+// already done.
+async function preFlightConflictCheck(task, { pipelineDir, repoRoot }) {
+  if (!pipelineDir || !repoRoot) return null;
+  try {
+    const proposedFiles = task.promptContext?.proposeFiles || task.promptContext?.files || [];
+    if (!proposedFiles.length) return null;
+    
+    const openBranches = [];
+    const pendingDir = path.join(pipelineDir, 'queue', 'pending');
+    if (fs.existsSync(pendingDir)) {
+      const files = fs.readdirSync(pendingDir).filter(f => f.endsWith('.json'));
+      for (const file of files) {
+        if (file === `${task.id}.json`) continue; // Skip self
+        try {
+          const otherTask = JSON.parse(fs.readFileSync(path.join(pendingDir, file), 'utf8'));
+          if (otherTask.id?.startsWith('adhoc/triage-queue')) continue;
+          const match = otherTask.id?.match(/^agent\/(.+)$/);
+          if (match) {
+            const branch = match[1];
+            const r = await new Promise((resolve) => {
+              const { execFileSync } = require('child_process');
+              try {
+                const out = execFileSync('git', ['diff', '--name-only', 'origin/main', `origin/${branch}`], { cwd: repoRoot, encoding: 'utf8', env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, timeout: 30_000 });
+                resolve({ files: out.split('\n').map(l => l.trim()).filter(Boolean) });
+              } catch (e) {
+                resolve({ files: [] });
+              }
+            });
+            openBranches.push({ branch, files: r.files });
+          }
+        } catch (e) {
+          // Skip unreadable
+        }
+      }
+    }
+    
+    const conflicts = [];
+    for (const open of openBranches) {
+      const overlap = proposedFiles.filter(pf => open.files.includes(pf));
+      if (overlap.length) {
+        conflicts.push({ branch: open.branch, files: overlap });
+      }
+    }
+    
+    if (conflicts.length) {
+      return {
+        verdict: 'needs-human-decision',
+        reason: `it conflicts with ${conflicts.length} other open branch(es) that touch the same files (${conflicts.map(c => c.branch).join(', ')}); keep one`,
+        conflicts,
+      };
+    }
+  } catch (e) {
+    // Best-effort: a conflict check failure must never break the draft
+    console.error(`Conflict check failed: ${e.message}`);
+  }
+  return null;
+}
 
 // 2026-09-08, Grimmethy: "fix worker-1" -- see gpu-arbiter.js's own header for the
 // incident (worker-1's qwen2.5:3b starved into repeated hard OLLAMA_TIMEOUTs by
@@ -2093,6 +2157,63 @@ async function main() {
   } catch (e) {
     process.stdout.write(JSON.stringify({ succeeded: false, reason: `Could not read/parse task JSON: ${e.message}` }));
     return;
+  }
+
+  // 2026-11-04, this task: pre-flight conflict check. Run BEFORE draftTask to catch file
+  // overlap with other open branches EARLY. If a conflict is detected, block the draft with a
+  // needs-human-decision verdict so a human can decide which branch to keep. This prevents the
+  // class of 13 branches that all failed with "it conflicts with # other open branch(#)" because
+  // the check ran after work was already done.
+  const pipelineDir = path.dirname(path.dirname(taskPath)); // taskPath is <pipelineDir>/queue/<state>/<id>.json
+  const repoRoot = path.dirname(pipelineDir);
+  try {
+    const proposedFiles = task.promptContext?.proposeFiles || task.promptContext?.files || [];
+    if (proposedFiles.length) {
+      const openBranches = [];
+      const pendingDir = path.join(pipelineDir, 'queue', 'pending');
+      if (fs.existsSync(pendingDir)) {
+        const files = fs.readdirSync(pendingDir).filter(f => f.endsWith('.json'));
+        for (const file of files) {
+          if (file === `${task.id}.json`) continue; // Skip self
+          try {
+            const otherTask = JSON.parse(fs.readFileSync(path.join(pendingDir, file), 'utf8'));
+            if (otherTask.id?.startsWith('adhoc/triage-queue')) continue;
+            const match = otherTask.id?.match(/^agent\/(.+)$/);
+            if (match) {
+              const branch = match[1];
+              const { execFileSync } = require('child_process');
+              try {
+                const out = execFileSync('git', ['diff', '--name-only', 'origin/main', `origin/${branch}`], { cwd: repoRoot, encoding: 'utf8', env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, timeout: 30_000 });
+                openBranches.push({ branch, files: out.split('\n').map(l => l.trim()).filter(Boolean) });
+              } catch (e) {
+                // Skip branches that can't be checked
+              }
+            }
+          } catch (e) {
+            // Skip unreadable
+          }
+        }
+      }
+      
+      const conflicts = [];
+      for (const open of openBranches) {
+        const overlap = proposedFiles.filter(pf => open.files.includes(pf));
+        if (overlap.length) {
+          conflicts.push({ branch: open.branch, files: overlap });
+        }
+      }
+      
+      if (conflicts.length) {
+        const reason = `it conflicts with ${conflicts.length} other open branch(es) that touch the same files (${conflicts.map(c => c.branch).join(', ')}); keep one`;
+        task.needsHumanDecision = { verdict: 'needs-human-decision', reason, conflicts };
+        task.status = 'needs-clarification';
+        process.stdout.write(JSON.stringify({ succeeded: true, blocked: true, blockedReason: reason, blockedStage: 'pre-implement' }));
+        return;
+      }
+    }
+  } catch (e) {
+    // Best-effort: a conflict check failure must never break the draft
+    console.error(`Conflict check failed: ${e.message}`);
   }
 
   // Defense-in-depth (2026-09-07): scripts/local-worker.sh's own claim step already
