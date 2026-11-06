@@ -837,12 +837,14 @@ test('genericFallbackImplementPrompt RULE appears when prior verdict has "touche
   assert.match(prompt, /test changes/i);
 });
 
-test('genericFallbackImplementPrompt RULE does NOT appear when no prior "touches no test" verdict', () => {
+test('genericFallbackImplementPrompt RULE always appears (test requirement is now mandatory)', () => {
   const task = {
     promptContext: {}
   };
   const prompt = genericFallbackImplementPrompt(task, 'PLAN TEXT');
-  assert.doesNotMatch(prompt, /RULE:.*touches no test/i);
+  // The RULE about tests is now always included, not just on prior rejection
+  assert.match(prompt, /RULE:/);
+  assert.match(prompt, /test changes/i);
 });
 
 test('genericFallbackImplementPrompt RULE appears when prior rejection feedback mentions "touches no test"', () => {
@@ -854,7 +856,7 @@ test('genericFallbackImplementPrompt RULE appears when prior rejection feedback 
   assert.match(prompt, /touches no test/i);
 });
 
-test('genericFallbackImplementPrompt RULE does NOT appear for other prior verdict reasons', () => {
+test('genericFallbackImplementPrompt RULE always appears even with other prior verdict reasons', () => {
   const task = {
     promptContext: {
       priorVerdict: {
@@ -864,5 +866,7 @@ test('genericFallbackImplementPrompt RULE does NOT appear for other prior verdic
     }
   };
   const prompt = genericFallbackImplementPrompt(task, 'PLAN TEXT');
-  assert.doesNotMatch(prompt, /RULE:.*touches no test/i);
+  // The RULE about tests is now always included
+  assert.match(prompt, /RULE:/);
+  assert.match(prompt, /test changes/i);
 });
