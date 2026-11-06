@@ -245,6 +245,44 @@ def api_hub_retire(hub_id):
     return jsonify({"hub": hub_id, "archived": archived, "left": left})
 
 
+@task_bp.route("/api/hub/<hub_id>/waive-abandoned", methods=["POST"])
+def api_hub_waive_abandoned(hub_id):
+    """Set `abandonedPiecesWaived: true` on a coordinating hub (2026-11-05): the owner's explicit "merge it anyway" that _summarize_hub reads
+    (app_branch_helpers.py). An ABANDONED piece counts as finished for hub auto-completion but is not code that shipped, so a hub with one is never
+    readyToMerge; before this route nothing could set the flag. The hub worker uses it after it has either replaced the abandoned piece (the
+    replacement is a piece of the same hub and must still be built) or found the piece's work already on the base.
+
+    Body: {"reason": "<why>"} (required, recorded on the hub record and in its history); `?project=<repoRoot>` selects another registered project.
+    404 no such coordinating hub; 400 no reason; 409 the hub has no abandoned piece (nothing to waive). Idempotent: waiving twice answers 200 with
+    `alreadyWaived: true`. Returns {"hub", "waived": true, "abandoned": [piece ids], "alreadyWaived"?}."""
+    from app import read_json_safe, logger
+    body = request.get_json(silent=True) or {}
+    qdir, _scope = _qdir_for_request(body)
+    if not qdir:
+        abort(404)
+    hub_file = qdir / "coordinating" / f"{hub_id}.json"
+    hub = read_json_safe(hub_file)
+    if not isinstance(hub, dict):
+        abort(404, description=f"no coordinating hub '{hub_id}'")
+    reason = (body.get("reason") or "").strip()
+    if not reason:
+        abort(400, description="a reason is required")
+    abandoned = [st.get("id") for st in hub.get("subTasks") or [] if isinstance(st, dict) and st.get("status") == "abandoned"]
+    if not abandoned:
+        abort(409, description="the hub has no abandoned piece; nothing to waive")
+    if hub.get("abandonedPiecesWaived") is True:
+        return jsonify({"hub": hub_id, "waived": True, "abandoned": abandoned, "alreadyWaived": True})
+    now_iso = datetime.now(timezone.utc).isoformat()
+    hub["abandonedPiecesWaived"] = True
+    hub.setdefault("history", []).append({"stage": "abandoned-pieces-waived", "at": now_iso, "detail": f"abandoned piece(s) {', '.join(abandoned)} waived: {reason}"})
+    try:
+        hub_file.write_text(json.dumps(hub, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.error("Could not write the waiver on %s: %s", hub_file, exc)
+        abort(500, description=f"could not write the hub record: {exc}")
+    return jsonify({"hub": hub_id, "waived": True, "abandoned": abandoned})
+
+
 @task_bp.route("/api/hub/<hub_id>/pieces", methods=["POST"])
 def api_hub_add_piece(hub_id):
     """Add a follow-up piece to a hub that is already coordinating (2026-10-31, HUB0295-05).
