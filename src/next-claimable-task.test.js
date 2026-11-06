@@ -145,6 +145,20 @@ test('within a source-priority band, the higher-priority hub\'s child sorts firs
   assert.deepEqual(items, ['child-of-hub-low.json', 'child-of-hub-high.json', 'child-of-unranked.json']);
 });
 
+test('within one source-priority band the child of the hub with the fewest unbuilt pieces is claimed first, even when that hub is newer', () => {
+  const pendingDir = setupPending();
+  const coordDir = path.join(pendingDir, '..', 'coordinating');
+  fs.mkdirSync(coordDir, { recursive: true });
+  fs.writeFileSync(path.join(coordDir, 'hub-far.json'),
+    JSON.stringify({ id: 'hub-far', status: 'coordinating', createdAt: '2026-08-01T00:00:00Z', progress: { built: 1, total: 8 } }));
+  fs.writeFileSync(path.join(coordDir, 'hub-near.json'),
+    JSON.stringify({ id: 'hub-near', status: 'coordinating', createdAt: '2026-09-20T00:00:00Z', progress: { built: 5, total: 6 } }));
+  writeTask(pendingDir, 'child-of-far', { source: 'adhoc', parentHub: 'hub-far' });
+  writeTask(pendingDir, 'child-of-near', { source: 'adhoc', parentHub: 'hub-near' });
+  const items = pickClaimableTasks(pendingDir, 'worker-reasoning');
+  assert.deepEqual(items, ['child-of-near.json', 'child-of-far.json']);
+});
+
 test('a hub child sorts ahead of an unrelated task at the same source priority; a non-hub task keeps its place otherwise', () => {
   const pendingDir = setupPending();
   const coordDir = path.join(pendingDir, '..', 'coordinating');
