@@ -186,13 +186,91 @@ comfyui_lease_held() {
   [[ "$verdict" == "held" ]]
 }
 
+# A lane yielding to a GPU session (a Forge job, a tuning session) says so in its heartbeat instead of looking idle or stuck, and warms the model
+# up again when the session ends. The lease being held is the pause (comfyui_lease_held above, one tick at a time); these two helpers add the
+# visible state and the resume. The session evicted the pipeline's model from the card, so the first call after it would pay a full cold load
+# (ornith:35b measured 350-490 s from the HDD) against a 240-300 s call timeout and be counted as a failure. Warming first, with a long timeout
+# and a heartbeat every few seconds, takes that cost where it cannot fail a task. `warming` and `paused` are not `idle`, so lane-health.js (which
+# probes only idle lanes) leaves the lane alone during both.
+#   lane_note_gpu_pause <instance_id> <model> <started_at>   call in the yield branch
+#   lane_warm_after_pause <instance_id> <model> <started_at> call once the lease is clear; a no-op unless this process was paused
+lane_note_gpu_pause() {
+  LANE_WAS_PAUSED=true
+  write_heartbeat_file "$1" "paused" "${2:-}" "" "gpu-session" "${3:-}"
+}
+
+lane_warm_after_pause() {
+  [[ "${LANE_WAS_PAUSED:-false}" == "true" ]] || return 0
+  LANE_WAS_PAUSED=false
+  local id="$1" model="${2:-}" started_at="${3:-}"
+  [[ -n "$model" ]] || return 0
+  local timeout_s="${AGENT_MANAGER_WARMUP_TIMEOUT_S:-900}" beat_s="${AGENT_MANAGER_WARMUP_BEAT_S:-20}"
+  local url="${OLLAMA_URL:-http://localhost:11434}"
+  local capacity_js
+  capacity_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/gpu-capacity.js"
+  local payload
+  payload="$(node -e '
+    const { PINNED_NUM_CTX } = require(process.argv[2]);
+    const ctx = Number(process.env.AGENT_MANAGER_LANE_NUM_CTX) || PINNED_NUM_CTX;
+    console.log(JSON.stringify({ model: process.argv[1], prompt: "hi", stream: false, keep_alive: -1, options: { num_ctx: ctx } }));
+  ' "$model" "$capacity_js" 2>/dev/null)" || payload=""
+  [[ -n "$payload" ]] || return 0
+  printf '[%s] GPU session over -- warming %s before claiming anything (up to %ss)\n' "$id" "$model" "$timeout_s" >&2
+  write_heartbeat_file "$id" "warming" "$model" "" "model-warmup" "$started_at"
+  curl -s -m "$timeout_s" "${url}/api/generate" -d "$payload" -o /dev/null &
+  local curl_pid=$! waited=0
+  while kill -0 "$curl_pid" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+    if (( waited % beat_s == 0 )); then write_heartbeat_file "$id" "warming" "$model" "" "model-warmup" "$started_at"; fi
+  done
+  wait "$curl_pid" 2>/dev/null || true
+  printf '[%s] warm-up finished after %ss\n' "$id" "$waited" >&2
+  return 0
+}
+
 
 # Host-RAM headroom (2026-10-12 freeze: RAM + all swap exhausted by ComfyUI + the P40 VM +
-# Ollama's runner, kernel thrashed until power-cycled). mem-guard.js measures MemAvailable /
-# SwapFree, asks ComfyUI to unload if short, and exits 3 only when pressure remains. Any
-# other outcome (ok, node missing, the check itself crashing) fails open.
+# Ollama's runner, kernel thrashed until power-cycled; 2026-11-01: the same shape, found by disk stall rather than
+# by MemAvailable). Primary signal since 2026-11-02: the gpu-broker's classifier writes ok|tight|critical to
+# /dev/shm/agent-manager-mem-pressure.json on every kernel pressure event (and on its slow reconcile), so a lane reads one tiny file here
+# instead of launching `node mem-guard.js` on every tick. Fallback, exactly as before: when the marker is missing, unreadable, malformed or
+# older than AGENT_MANAGER_MEM_MARKER_MAX_AGE_S (default 330 s = the broker's 300 s reconcile + slack; the broker rewrites it at least that
+# often, so 120 s would make a healthy idle marker look stale), run mem-guard.js (MemAvailable / SwapFree, asks ComfyUI to unload, exit 3
+# only when pressure remains). AGENT_MANAGER_MEM_MARKER=off ignores the marker. Any other outcome fails open.
+# mem_marker_state -> prints ok|tight|critical and returns 0 when the marker is fresh and valid, returns 1 otherwise.
+mem_marker_state() {
+  [[ "${AGENT_MANAGER_MEM_MARKER:-on}" == "off" ]] && return 1
+  local f="${AGENT_MANAGER_MEM_PRESSURE_MARKER:-/dev/shm/agent-manager-mem-pressure.json}"
+  local max="${AGENT_MANAGER_MEM_MARKER_MAX_AGE_S:-330}"
+  [[ "$max" =~ ^[0-9]+$ ]] || max=330
+  local mtime now age state
+  mtime="$(stat -c %Y "$f" 2>/dev/null)" || return 1
+  now="${AGENT_MANAGER_MEM_MARKER_NOW:-$(date +%s)}"      # the override is a test seam: it fixes "now" so the age boundary can be tested exactly
+  age=$(( now - mtime ))
+  (( age >= 0 && age <= max )) || return 1
+  state="$(sed -n 's/.*"state": *"\(ok\|tight\|critical\)".*/\1/p' "$f" 2>/dev/null | head -n 1)"
+  [[ -n "$state" ]] || return 1
+  printf '%s\n' "$state"
+}
+
+# sweep_gate_skips <project <pipelineDir> | global-redo> -> exit 0 only when src/sweep-gate.js answers exactly `skip` (nothing the sweep reads has changed). Any other answer, a crash or a
+# missing script means run: the gate fails open, exactly as before it existed (ADR-0024).
+sweep_gate_skips() {
+  local answer
+  answer="$(node "${PACKAGE_SRC_DIR}/sweep-gate.js" "$@" 2>/dev/null)" || return 1
+  [[ "$answer" == "skip" ]]
+}
+
 # mem_pressure_high -> exit 0 if the lane should yield this tick, 1 otherwise.
 mem_pressure_high() {
+  local state
+  if state="$(mem_marker_state)"; then
+    case "$state" in
+      tight|critical) printf '[common] host memory pressure %s (broker marker)\n' "$state" >>"${LOG_FILE:-/dev/null}" 2>&1; return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
   node "${PACKAGE_SRC_DIR}/mem-guard.js" >>"${LOG_FILE:-/dev/null}" 2>&1
   [[ $? -eq 3 ]]
 }

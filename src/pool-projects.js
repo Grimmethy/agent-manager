@@ -58,9 +58,10 @@ function readProjects(projectsPath = PROJECTS_PATH) {
 function readState(file = statePath()) {
   try {
     const s = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!s || typeof s !== 'object') return { lastBorrowedAt: {}, emptyUntil: {} };
-    return { ...s, lastBorrowedAt: s.lastBorrowedAt && typeof s.lastBorrowedAt === 'object' ? s.lastBorrowedAt : {}, emptyUntil: s.emptyUntil && typeof s.emptyUntil === 'object' ? s.emptyUntil : {} };
-  } catch { return { lastBorrowedAt: {}, emptyUntil: {} }; }
+    if (!s || typeof s !== 'object') return { lastBorrowedAt: {}, emptyUntil: {}, emptySig: {}, emptyAt: {} };
+    const obj = (v) => (v && typeof v === 'object' ? v : {});
+    return { ...s, lastBorrowedAt: obj(s.lastBorrowedAt), emptyUntil: obj(s.emptyUntil), emptySig: obj(s.emptySig), emptyAt: obj(s.emptyAt) };
+  } catch { return { lastBorrowedAt: {}, emptyUntil: {}, emptySig: {}, emptyAt: {} }; }
 }
 
 // Records that a lane just borrowed from this project (drives the least-recently-borrowed ordering). Best-effort.
@@ -69,7 +70,12 @@ function markBorrowed(pipelineDir, { now = new Date(), file = statePath(), role 
     const state = readState(file);
     const key = roleKey(role, real(pipelineDir));
     state.lastBorrowedAt[key] = now.toISOString();
+    // A borrow that found WORK in a project whose queue signature had not changed since it was marked empty means the signature skip would have missed it
+    // (time-based eligibility, or a producer that did not touch a queue dir): count it, it is the health metric of the skip (ADR-0024 rule 6).
+    if (state.emptySig[key] && state.emptySig[key] === queueSignature(pipelineDir)) state.reconcileCorrections = (state.reconcileCorrections || 0) + 1;
     delete state.emptyUntil[key];
+    delete state.emptySig[key];
+    delete state.emptyAt[key];
     writeState(file, state);
   } catch { /* ordering is a nicety; never break a lane over it */ }
 }
@@ -81,10 +87,41 @@ function emptyBackoffMs() {
   return Number.isFinite(n) && n >= 0 ? n * 1000 : 5 * 60 * 1000;
 }
 
+// ADR-0024: once a project has been found empty it stays skipped while its queue has not CHANGED, not just for a flat 5 minutes. The signature is the
+// name + mtime of every direct sub-directory of <pipelineDir>/queue (a task file added, removed or renamed changes its directory's mtime; one stat each).
+// Over-sensitivity is the safe direction (a changed signature just means the old behaviour, a visit), so no directory is excluded. A counted reconcile
+// (AGENT_MANAGER_POOL_EMPTY_RECONCILE_SECS, default 1800, 0 turns the signature skip off) revisits a quiet project anyway to catch time-based eligibility.
+function reconcileMs() {
+  const n = Number(process.env.AGENT_MANAGER_POOL_EMPTY_RECONCILE_SECS);
+  return Number.isFinite(n) && n >= 0 ? n * 1000 : 30 * 60 * 1000;
+}
+
+function queueSignature(pipelineDir) {
+  try {
+    const qdir = path.join(pipelineDir, 'queue');
+    const parts = [];
+    for (const name of fs.readdirSync(qdir).sort()) {
+      try {
+        const st = fs.statSync(path.join(qdir, name));
+        if (st.isDirectory()) parts.push(`${name}:${Math.round(st.mtimeMs)}`);
+      } catch { /* vanished between readdir and stat: the next signature differs anyway */ }
+    }
+    return parts.join('|');
+  } catch { return ''; }
+}
+
+// Premium reach keeps the plain timer: a premium task can become claimable through ANOTHER project's queue (hub dependencies), which this signature cannot see.
+const usesSignature = (role) => !String(role || '').startsWith('premium');
+
 function markEmpty(pipelineDir, { now = new Date(), file = statePath(), ttlMs = emptyBackoffMs(), role = 'worker' } = {}) {
   try {
     const state = readState(file);
-    state.emptyUntil[roleKey(role, real(pipelineDir))] = new Date(now.getTime() + ttlMs).toISOString();
+    const key = roleKey(role, real(pipelineDir));
+    state.emptyUntil[key] = new Date(now.getTime() + ttlMs).toISOString();
+    if (usesSignature(role) && reconcileMs() > 0) {
+      state.emptySig[key] = queueSignature(pipelineDir);
+      state.emptyAt[key] = now.toISOString();
+    }
     writeState(file, state);
   } catch { /* best-effort */ }
 }
@@ -134,7 +171,15 @@ function orderByLastBorrowed(entries, state, key) {
   return [...entries].sort((a, b) => last(a) - last(b) || a.index - b.index).map(stripProject);
 }
 
-const backedOff = (state, key, pipe, now) => Date.parse(state.emptyUntil[roleKey(key, pipe)]) > now.getTime();
+const backedOff = (state, key, pipe, now) => {
+  const k = roleKey(key, pipe);
+  if (Date.parse(state.emptyUntil[k]) > now.getTime()) return true;               // the flat timer, as before
+  const sig = state.emptySig && state.emptySig[k];
+  if (!sig || !usesSignature(key)) return false;
+  const at = Date.parse(state.emptyAt[k]);
+  if (!Number.isFinite(at) || now.getTime() - at >= reconcileMs()) return false;   // reconcile: visit it again
+  return queueSignature(pipe) === sig;                                             // unchanged since it was found empty: still empty
+};
 
 // -> [{ label, repoRoot, pipelineDir, domainsPath, applyRepoRoot, grepDirs }] in borrow order (pool:true projects only).
 function poolProjects({ projectsPath = PROJECTS_PATH, active, stateFile = statePath(), now = new Date(), includeBackedOff = false, role = 'worker' } = {}) {

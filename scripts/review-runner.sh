@@ -43,6 +43,9 @@ trap 'printf "[review-%s] SIGTERM/SIGINT received -- exiting after current tick.
 
 HOME_LOGS="${HOME_LOGS:-$LOG_DIR}"                                                  # HOME_LOGS where we drop per-instance log files (so each daemon writes to its own file in a common folder rather than clobbering one another). Same idea as PowerShell's $env:LocalStatePath/log/$env:InstanceID pattern.
 LOG_FILE="${HOME_LOGS}/review-runner-${INSTANCE_ID}.log"          # per-instance log file — keeps reviewer status separate from worker (so operator can grep one without seeing other loops' output mixed in). Same pattern as PowerShell's `Start-Transcript -Path $jobLog` which each daemon script opens for its own status tracking.
+source "${SCRIPT_DIR}/wake-common.sh"   # wait_for_queue_change: the idle wait (ADR-0024 S3)
+LAST_WAKE=""; WAKE_RECONCILE_HITS=0; LAST_TICK_START=0; LAST_TICK_START_MS=0
+PACKAGE_SRC_DIR="${PACKAGE_SRC_DIR:-${SCRIPT_DIR}/../src}"
 
 mkdir -p "$HOME_LOGS" 2>/dev/null                                                      # ensure logs directory exists before writing to it; bash won't auto-create parent dirs on file write redirects (equivalent of PowerShell's `New-Item -ItemType Directory -Force $logDir` that always runs even if folder already exists — simpler one-liner than Test-Path check first).
 LOG_DIR="${LOG_DIR:-$HOME_LOGS}"                                                     # LOG_DIR for script-local use; same fallback pattern as other daemons.
@@ -161,7 +164,9 @@ borrow_premium_review_from_projects() {
   return 1
 }
 
-while :; do                                                                     # infinite iteration until script exits (or is SIGTERM'd by system). Bash doesn't have Python-style 'while True:' so uses ':' no-op as condition which always returns 0=success so loop body executes forever; same semantic effect of PowerShell's `$true` boolean we use above.
+while :; do
+  LAST_TICK_START="$(date +%s)"; LAST_TICK_START_MS="$(date +%s%3N)"                 # the idle wait measures its minimum gap from here and reports any review item that arrived after it (catch-up)
+  # infinite iteration until script exits (or is SIGTERM'd by system). Bash doesn't have Python-style 'while True:' so uses ':' no-op as condition which always returns 0=success so loop body executes forever; same semantic effect of PowerShell's `$true` boolean we use above.
   refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work.
   printf '[review-%s] tick: scanning queue/review/ for items to review...\n' "$INSTANCE_ID"    # status message echoing what the loop is doing — same info PowerShell logs via `Write-Verbose "Scanning $draftingPath..."`. Using printf not echo so format strings like '%d' don't get interpreted as %d literally (bash's echo sometimes enables escape sequences depending on shell; more portable via printf).
   write_heartbeat_file "$INSTANCE_ID" "idle" "${LOCAL_MODEL:-}" "" "" "$STARTED_AT"   # previously never called anywhere in this script -- the dashboard's Workers tab had no way to know this instance existed even while it was (uselessly) spinning at ~100% CPU.
@@ -174,10 +179,12 @@ while :; do                                                                     
   # the GPU for an image generation this tick.
   if comfyui_lease_held "${OLLAMA_URL:-http://localhost:11434}"; then
     printf '[review-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+    lane_note_gpu_pause "$INSTANCE_ID" "${LOCAL_MODEL:-}" "$STARTED_AT"   # heartbeat says "paused" (Workers tab) and remembers to warm the model up afterwards
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
     continue
   fi
+  lane_warm_after_pause "$INSTANCE_ID" "${LOCAL_MODEL:-}" "$STARTED_AT"   # no-op unless the lease was just released: reload the model before reviewing
 
   # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
   if mem_pressure_high; then
@@ -413,11 +420,16 @@ while :; do                                                                     
   if ! "$did_work"; then borrow_review_from_pool; fi
 
   if "$did_work"; then
+    if [[ "$LAST_WAKE" == "timeout" ]]; then
+      WAKE_RECONCILE_HITS=$((WAKE_RECONCILE_HITS + 1))
+      printf '[review-%s] wake reconcile: found work after a TIMEOUT wake (hit %s) -- a queue change was not announced in a watched directory.\n' "$INSTANCE_ID" "$WAKE_RECONCILE_HITS" >&2
+    fi
+    LAST_WAKE=""
     sleep 1
   else
     # Wait N seconds before next scan pass. THIS WAS PREVIOUSLY PLACED AFTER THE LOOP'S
     # CLOSING `done` (dead code, unreachable) -- the loop never paused between ticks and spun
     # at ~100% CPU continuously instead. Moved inside the loop body where it actually runs.
-    sleep "${ORC_TICK_SECS:-30}"
+    wait_for_queue_change review "$QUEUE_DIR"      # ADR-0024 S3: wake when an item is ADDED to queue/review of this or any registered project, else after the fallback
   fi
 done                                                                              # top-level infinite while-loop terminator — same structure each daemon script follows (infinite polling until SIGTERM / SIGINT interrupts) so all four loops behave consistently when user wants to stop them all at once via launch.sh.

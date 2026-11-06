@@ -35,6 +35,8 @@
 //   aged-out       -- a QUEUED task retired unworked because its subject went stale while it waited (a change_review of a commit older than
 //                     the source's recency window). Deliberately NOT `abandoned` ("work lost -- the one an audit must never miss"): nothing
 //                     was lost, it was retired on purpose. Stamped by expiry-sweep.js; the reconcile sweep only respects it.
+//   recorded -- a script-handled task (a lane whose work is a script, not a diff) finished and left its result on the record (task.scriptResult);
+//                     nothing to review or merge. Stamped by local-draft.js from a registered script handler (src/script-handler-registry.js).
 
 const { execFileSync } = require('child_process');
 const { detectDefaultBranch } = require('./git-runner.js');
@@ -43,7 +45,7 @@ const { classifyApplyOutcome } = require('./apply-outcome-classifiers.js');
 const { lastRemoval } = require('./branch-removal-ledger.js');
 
 const TERMINAL_STAGES = new Set([
-  'merged', 'applied-direct', 'filed', 'dismissed', 'noop', 'pending-merge', 'abandoned', 'superseded', 'aged-out',
+  'merged', 'applied-direct', 'filed', 'dismissed', 'noop', 'pending-merge', 'abandoned', 'superseded', 'aged-out', 'recorded',
 ]);
 
 // Terminal states the reconcile sweep must never re-open. `pending-merge` is deliberately

@@ -73,7 +73,8 @@ def task_summary(data: dict, filename: str) -> dict:
 _LANE_IDS_CACHE: dict = {"at": 0.0, "ids": []}
 
 
-_LANE_IDS_TTL_S = 60.0
+# The slow reconcile age of the lane caches (swr_cache.py): the cache is really invalidated by what lanes.js reads changing, this only bounds how long an unnoticed change can last.
+_LANE_IDS_TTL_S = 600.0
 
 
 _LANE_DEFS_CACHE: dict = {"at": 0.0, "lanes": []}

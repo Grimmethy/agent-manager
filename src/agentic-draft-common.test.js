@@ -864,6 +864,97 @@ test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error, zero
   });
 });
 
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error but report shows missing target -> reclassified to needs-clarification, NOT requeued', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'misdirected-target-1' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nThe requested branch "feature-x" does not exist in this repository. The task appears to be misdirected to the wrong repository -- the target code is absent from this checkout.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'read_file' }, { tool: 'grep_codebase' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.retryableDraftBlock, false, 'must NOT be requeued as infra retry');
+    assert.equal(task.infraErrorRetry, undefined, 'must NOT set infraErrorRetry');
+    assert.match(out.blockedReason, /target is missing or misdirected/);
+    assert.match(out.blockedReason, /feature-x/);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error with missing target signal "does not exist in any repo" -> reclassified', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'misdirected-target-2' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nI searched every repo I can access and the target code does not exist in any repo I can access. This task is misdirected to the wrong repository.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'read_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, true);
+    assert.match(out.blockedReason, /target is missing or misdirected/);
+    assert.match(out.blockedReason, /does not exist/);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error with genuine tool failure -> still requeued (existing behavior preserved)', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'infra-real-failure-1' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nThe worktree git index is locked -- every edit_file call fails with "unable to create .git/index.lock". Not a design question.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'read_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, undefined, 'must NOT be routed to needs-clarification');
+    assert.equal(task.retryableDraftBlock, true);
+    assert.equal(task.infraErrorBefore, true);
+    assert.equal(task.infraErrorRetry, true);
+    assert.match(out.blockedReason, /BLOCKER-TYPE: infra-error/);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error with missing target AND partial work -> still reclassified (missing target takes priority)', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'partial work landed\n');
+    const task = { id: 'misdirected-target-3' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nGot the first file done, then realized the requested branch does not exist in this repository. The task is misdirected to the wrong repository.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'read_file' }, { tool: 'edit_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.isAgenticContinuation, undefined, 'must NOT be treated as continuation');
+    assert.match(out.blockedReason, /target is missing or misdirected/);
+  });
+});
+
+test('detectMissingTargetReport: detects missing target signals', () => {
+  const { detectMissingTargetReport } = require('./agentic-draft-common.js');
+  assert.ok(detectMissingTargetReport('The requested branch "feature-x" does not exist in this repository'));
+  assert.ok(detectMissingTargetReport('The target code does not exist in any repo I can access'));
+  assert.ok(detectMissingTargetReport('This task is misdirected to the wrong repository'));
+  assert.ok(detectMissingTargetReport('The file absent from checkout was not found'));
+  assert.ok(detectMissingTargetReport('The repository does not contain the requested path'));
+  assert.ok(detectMissingTargetReport('No matching file in this repo for the target'));
+  assert.equal(detectMissingTargetReport('The worktree git index is locked'), null);
+  assert.equal(detectMissingTargetReport('Got ETIMEDOUT on every call'), null);
+  assert.equal(detectMissingTargetReport(''), null);
+  assert.equal(detectMissingTargetReport(null), null);
+});
+
 test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error WITH partial work landed -> continuation', () => {
   withRealRepo((wt) => {
     fs.writeFileSync(path.join(wt, 'a.txt'), 'partial work landed\n');
@@ -1298,4 +1389,52 @@ test('parseSubTaskProposals keeps a valid files array and drops an unusable one;
   assert.deepEqual(out[0].files, ['README.md', 'src/a.js']);
   assert.equal(out[1].files, undefined);
   assert.match(formatSubTaskProposalsForReview(out), /1\. a\n   x\n   Files: README\.md, src\/a\.js\n2\. b\n   y$/);
+});
+
+// 2026-11-02 stalled-task loop: the forced final turn produced NO text after edits landed (40 parked 'design-decision' tasks whose only question was the placeholder) ------
+test('resolveAgenticDraft: forcedSummary with EMPTY text + edits but no captured diff -> budget exhaustion block (decompose-eligible), not a human hold', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'oot-1' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: '', forcedSummary: true, turnsUsed: 35, toolCallLog: [{ tool: 'read_file' }, { tool: 'edit_file' }, { tool: 'edit_file' }] },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, undefined);
+    assert.equal(task.turnBudgetExhausted, true);
+    assert.equal(task.turnBudgetExhaustedBefore, true);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.notEqual(task.adhocResolution, 'needs-human-decision');
+    assert.match(out.blockedReason, /ran out of turns/);
+  });
+});
+
+test('resolveAgenticDraft: forcedSummary with EMPTY text + a partial diff -> continuation, then exhaustion once the cap is hit', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'partial work landed\n');
+    const res = { response: '', forcedSummary: true, turnsUsed: 35, toolCallLog: [{ tool: 'edit_file' }] };
+    const first = { id: 'oot-2' };
+    const out = resolveAgenticDraft(first, { result: res, worktreeDir: wt });
+    assert.match(out.blockedReason, /continuation 1\/2/);
+    assert.equal(first.isAgenticContinuation, true);
+    assert.match(first.priorPartialDiff, /a\.txt/);
+    const capped = { id: 'oot-3', agenticContinuationCount: 2 };
+    const out2 = resolveAgenticDraft(capped, { result: res, worktreeDir: wt });
+    assert.equal(out2.blocked, true);
+    assert.equal(capped.turnBudgetExhaustedBefore, true);
+    assert.equal(out2.needsClarification, undefined);
+  });
+});
+
+test('resolveAgenticDraft: forcedSummary with REAL text but no RESOLUTION line still goes to a human (only the empty-text case changed)', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'oot-4' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'I found two incompatible readings of the spec and cannot pick one.', forcedSummary: true, turnsUsed: 35, toolCallLog: [{ tool: 'edit_file' }] },
+      worktreeDir: wt,
+    });
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.adhocResolution, 'needs-human-decision');
+    assert.ok(!task.turnBudgetExhausted);
+  });
 });

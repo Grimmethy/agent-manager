@@ -385,6 +385,219 @@ test('false-test-count-claim: no test-count claim in the summary is never checke
   assert.equal(adhocDiffSubstanceProblem(t, editDiff('python/dashboard/app.py'), 'Implemented the endpoint.'), null);
 });
 
+// --- HUB0270 4/4: status-claim whole-suite phrase guard + 'added' strictness tests ----
+
+test('false-test-count-claim: status claim with a whole-suite phrase is NOT blocked (covers all 8 defined phrases)', () => {
+  // The 8 whole-suite run phrases defined by Subtask 2. Each must suppress the block
+  // when present in either the summary or the task rawText.
+  const WHOLE_SUITE_PHRASES = ['test/*.test.js', 'npm test', 'full suite', 'whole suite', 'all tests', 'node --test', 'unittest discover', 'pytest'];
+
+  // For phrases that work in a Python test-file context, use editWithTestDefs (edit);
+  // for phrases that work in a JS test-file context, use createDiff (create).
+  const cases = [
+    // phrase in summary, edit diff (status claim on existing file)
+    { phrase: 'npm test', summary: 'Added the test. All 42 tests pass (ran via npm test).', useEdit: true },
+    { phrase: 'full suite', summary: 'Added the test. All 42 tests pass in the full suite.', useEdit: true },
+    // phrase in rawText, edit diff
+    { phrase: 'all tests', summary: 'Added the test. All 42 tests pass.', rawTextExtra: ' Run all tests after the edit to confirm.', useEdit: true },
+    // phrase in summary, create diff (status claim on new file)
+    { phrase: 'node --test', summary: 'Added the test. All 15 tests pass (node --test).', useEdit: false },
+    { phrase: 'pytest', summary: 'Added the test. All 15 tests pass (pytest).', useEdit: false },
+    { phrase: 'test/*.test.js', summary: 'Added the test. All 15 tests pass (ran test/*.test.js).', useEdit: false },
+    { phrase: 'whole suite', summary: 'Added the test. All 15 tests pass across the whole suite.', useEdit: false },
+    { phrase: 'unittest discover', summary: 'Added the test. All 15 tests pass (unittest discover).', useEdit: false },
+  ];
+
+  for (const c of cases) {
+    const rawText = 'Add an edge-case test to python/dashboard/test_hardware_stats.py' + (c.rawTextExtra || '');
+    const t = adhoc(rawText);
+    const diff = c.useEdit
+      ? editWithTestDefs('python/dashboard/test_hardware_stats.py', 1)
+      : createDiff('src/foo.test.js');
+    const p = adhocDiffSubstanceProblem(t, diff, c.summary);
+    assert.equal(p, null, `phrase "${c.phrase}" should suppress the block`);
+  }
+});
+
+test('false-test-count-claim: status claim WITHOUT a whole-suite phrase IS blocked when N > M', () => {
+  // No whole-suite phrase present, so the status claim is treated as a diff-local count.
+  // "All 42 tests pass" when only 1 test is added -> must block.
+  // Note: status claims are only comparable against all-create diffs (the gate's rule),
+  // so we use createTestFileDiff here.
+  const t = adhoc('Add tests for the history collector in python/dashboard/test_hardware_stats.py.');
+  const p = adhocDiffSubstanceProblem(
+    t,
+    createTestFileDiff('python/dashboard/test_hardware_stats.py', 1),
+    'Implemented. All 42 tests pass.',
+  );
+  assert.equal(p.code, 'false-test-count-claim');
+  assert.match(p.reason, /claims 42 tests but the diff only adds 1/);
+});
+
+test('false-test-count-claim: "N tests added" claim ALWAYS blocks when N > M, even with a whole-suite phrase present', () => {
+  // The 'added' branch is unconditional on the whole-suite phrase list.
+  const t = adhoc('Add tests for the history collector in python/dashboard/test_hardware_stats.py.');
+  const p = adhocDiffSubstanceProblem(
+    t,
+    editWithTestDefs('python/dashboard/test_hardware_stats.py', 1),
+    'Implemented. 5 tests added (ran via npm test).',
+  );
+  assert.equal(p.code, 'false-test-count-claim');
+  assert.match(p.reason, /claims 5 tests but the diff only adds 1/);
+});
+
+test('false-test-count-claim: status claim with N <= M is NOT blocked', () => {
+  // Claim says 1 test passes, diff actually adds 3 test defs -> truthful, no block.
+  const t = adhoc('Add an edge-case test to python/dashboard/test_hardware_stats.py');
+  assert.equal(
+    adhocDiffSubstanceProblem(t, editWithTestDefs('python/dashboard/test_hardware_stats.py', 3), 'Added the test. All 1 tests pass.'),
+    null,
+  );
+});
+
+test('false-test-count-claim: applies() on the known-fixed-failures entry returns true for a matching questforge-style task', () => {
+  // The known-fixed-failures entry `false-test-count-claim-whole-suite` has an applies()
+  // function. We replicate the check-4 logic inline (as the entry does) to verify the
+  // entry's guard works correctly for a task that should be unblocked by the fix.
+  const WHOLE_SUITE_RUN_RE = /\b(?:test\/\*\.test\.js|npm test|full suite|whole suite|all tests|node --test|unittest discover|pytest)\b/i;
+  const ALL_N_TESTS_RE = /\ball\s+(\d+)\s+tests?\b/i;
+  const N_TESTS_CLAIM_RE = /\b(\d+)\s+tests?\s+(?:pass(?:es|ed|ing)?|added)\b/i;
+
+  const applies = (task) => {
+    const failureText = task.blockedReason || '';
+    if (!/summary claims \d+ tests but the diff only adds \d+ test definition/.test(failureText)) return false;
+    const summary = (task && task.promptContext && task.promptContext.body) || '';
+    const rawText = (task && task.promptContext && task.promptContext.rawText) || '';
+    const combined = `${summary}\n${rawText}`;
+    const all = ALL_N_TESTS_RE.exec(summary);
+    if (all) return !!WHOLE_SUITE_RUN_RE.test(combined);
+    const m = N_TESTS_CLAIM_RE.exec(summary);
+    if (!m) return false;
+    const kind = /added/i.test(m[0]) ? 'added' : 'status';
+    if (kind !== 'status') return false;
+    return !!WHOLE_SUITE_RUN_RE.test(combined);
+  };
+
+  // Case 1: A questforge-style task that was falsely blocked -- the fix should unblock it.
+  const matchingTask = {
+    blockedReason: 'summary claims 42 tests but the diff only adds 3 test definitions',
+    promptContext: {
+      body: 'Added the test. All 42 tests pass (ran via npm test).',
+      rawText: 'Add an edge-case test to python/dashboard/test_hardware_stats.py.',
+    },
+  };
+  assert.equal(applies(matchingTask), true, 'the entry should match a questforge-style task with a whole-suite phrase');
+
+  // Case 2: A normal status claim without a whole-suite phrase -- the fix does NOT apply.
+  const nonMatchingTask = {
+    blockedReason: 'summary claims 42 tests but the diff only adds 3 test definitions',
+    promptContext: {
+      body: 'Added the test. All 42 tests pass.',
+      rawText: 'Add an edge-case test to python/dashboard/test_hardware_stats.py.',
+    },
+  };
+  assert.equal(applies(nonMatchingTask), false, 'the entry should NOT match a task without a whole-suite phrase');
+
+  // Case 3: A non-matching failure class -- the entry should not apply.
+  const wrongClassTask = {
+    blockedReason: 'some other block reason',
+    promptContext: { body: '', rawText: '' },
+  };
+  assert.equal(applies(wrongClassTask), false, 'the entry should not match a different failure class');
+});
+
+test('mutation: removing "npm test" from the whole-suite phrase list causes the questforge case to block', () => {
+  // Replicate check-4 logic with a stripped WHOLE_SUITE_RUN_RE that lacks "npm test".
+  const STRIPPED_RE = /\b(?:test\/\*\.test\.js|full suite|whole suite|all tests|node --test|unittest discover|pytest)\b/i;
+  const ALL_N_TESTS_RE = /\ball\s+(\d+)\s+tests?\b/i;
+  const N_TESTS_CLAIM_RE = /\b(\d+)\s+tests?\s+(?:pass(?:es|ed|ing)?|added)\b/i;
+  // countAddedTestDefs is not exported; replicate it inline.
+  const countAddedTestDefs = (diff) => {
+    let n = 0;
+    for (const line of String(diff || '').split('\n')) {
+      if (!line.startsWith('+') || line.startsWith('+++')) continue;
+      if (/\bdef\s+test_\w+\s*\(/.test(line) || /\b(?:it|test)\(\s*['"`]/.test(line)) n++;
+    }
+    return n;
+  };
+
+  const replicateCheck4 = (rawText, summary, rawDiff) => {
+    const claimed = (() => {
+      const all = ALL_N_TESTS_RE.exec(summary);
+      if (all) return { count: Number(all[1]), kind: 'status' };
+      const m = N_TESTS_CLAIM_RE.exec(summary);
+      if (!m) return null;
+      return { count: Number(m[1]), kind: /added/i.test(m[0]) ? 'added' : 'status' };
+    })();
+    if (!claimed) return null;
+    const statusIsWholeSuite = claimed.kind === 'status' && (
+      STRIPPED_RE.test(summary) || STRIPPED_RE.test(rawText)
+    );
+    const files = parseChangedFiles(rawDiff);
+    const comparable = !statusIsWholeSuite && (
+      claimed.kind === 'added' || files.every((f) => f.kind === 'create')
+    );
+    if (!comparable) return null;
+    const actualTests = countAddedTestDefs(rawDiff);
+    if (actualTests < claimed.count) {
+      return { code: 'false-test-count-claim', reason: `summary claims ${claimed.count} tests but the diff only adds ${actualTests} test definitions` };
+    }
+    return null;
+  };
+
+  // The questforge case: status claim with "npm test" phrase on an ALL-CREATE diff,
+  // 1 test actually added. With the FULL regex this passes; with "npm test" removed it
+  // should now block.
+  const rawText = 'Add an edge-case test to python/dashboard/test_hardware_stats.py';
+  const summary = 'Added the test. All 42 tests pass (ran via npm test).';
+  const rawDiff = createTestFileDiff('python/dashboard/test_hardware_stats.py', 1);
+
+  const result = replicateCheck4(rawText, summary, rawDiff);
+  assert.ok(result !== null, 'with "npm test" removed from the phrase list, the questforge case must now block');
+  assert.equal(result.code, 'false-test-count-claim');
+});
+
+test('mutation: disabling the "added" branch causes the strict "N tests added" case to slip through', () => {
+  // Replicate check-4 logic WITHOUT the `kind === 'added'` branch -- only all-create diffs
+  // would be comparable. A status-claim-shaped "N tests added" on an edited file should no
+  // longer be caught.
+  const WHOLE_SUITE_RUN_RE = /\b(?:test\/\*\.test\.js|npm test|full suite|whole suite|all tests|node --test|unittest discover|pytest)\b/i;
+  const ALL_N_TESTS_RE = /\ball\s+(\d+)\s+tests?\b/i;
+  const N_TESTS_CLAIM_RE = /\b(\d+)\s+tests?\s+(?:pass(?:es|ed|ing)?|added)\b/i;
+
+  const replicateCheck4NoAdded = (rawText, summary, rawDiff) => {
+    const claimed = (() => {
+      const all = ALL_N_TESTS_RE.exec(summary);
+      if (all) return { count: Number(all[1]), kind: 'status' };
+      const m = N_TESTS_CLAIM_RE.exec(summary);
+      if (!m) return null;
+      return { count: Number(m[1]), kind: /added/i.test(m[0]) ? 'added' : 'status' };
+    })();
+    if (!claimed) return null;
+    const statusIsWholeSuite = claimed.kind === 'status' && (
+      WHOLE_SUITE_RUN_RE.test(summary) || WHOLE_SUITE_RUN_RE.test(rawText)
+    );
+    const files = parseChangedFiles(rawDiff);
+    // The "added" branch is REMOVED: only all-create diffs are comparable.
+    const comparable = !statusIsWholeSuite && files.every((f) => f.kind === 'create');
+    if (!comparable) return null;
+    const actualTests = countAddedTestDefs(rawDiff);
+    if (actualTests < claimed.count) {
+      return { code: 'false-test-count-claim', reason: `summary claims ${claimed.count} tests but the diff only adds ${actualTests} test definitions` };
+    }
+    return null;
+  };
+
+  // The strict case: "5 tests added" on an EDITED file (not all creates).
+  // With the real code this blocks; without the "added" branch it should slip through.
+  const rawText = 'Add tests for the history collector in python/dashboard/test_hardware_stats.py.';
+  const summary = 'Implemented. 5 tests added.';
+  const rawDiff = editWithTestDefs('python/dashboard/test_hardware_stats.py', 1);
+
+  const result = replicateCheck4NoAdded(rawText, summary, rawDiff);
+  assert.equal(result, null, 'without the "added" branch, the strict "N tests added" claim on an edited file must slip through');
+});
+
 test('false-file-creation-claim: summary claims a file the diff never creates', () => {
   const t = adhoc('Add a new task source in src/task-sources.js.');
   const p = adhocDiffSubstanceProblem(t, editDiff('src/task-sources.js'), 'Implemented. This creates the file `src/new-source.js` with the handler.');
@@ -814,4 +1027,61 @@ test('extractDeclaredTargets: a file named as the deliverable or created in the 
   assert.ok(extractDeclaredTargets(t, '3. Create the deliverable as a single plain-text file at `notes/b.txt` (create the directory if needed).').includes('notes/b.txt'), 'plan "create ... file at" sentence');
   assert.ok(extractDeclaredTargets(t, plan).includes('scratch/extra.txt'));
   assert.ok(!extractDeclaredTargets(adhoc('Read src/a.js for context. Do not create src/b.js.'), '').some((p) => /src\/[ab]\.js/.test(p)), 'cited or prohibited files are not targets');
+});
+
+// 2026-11-02 stalled-task loop: a document-writing task whose descriptive sentences cite code (HUB0125 1/2, HUB0002 2/2) --------------------------------------
+const AUDIT_TASK = 'Create docs/audit-batch-write-bypass-2026-10-02.md. It must contain a markdown table with the exact columns file, function, write target, verdict, with a row for src/product-spec-to-hub.js / fileHub() (verdict CONFIRMED bypass). Include an explicit sentence stating the single-task throttle in task-sources.js does not cover batch fan-out.';
+
+test('docs-only: a task that creates one document and only CITES code in descriptive sentences is not blocked for a docs-only diff', () => {
+  const t = adhoc(AUDIT_TASK);
+  assert.equal(adhocDiffSubstanceProblem(t, createDiff('docs/audit-batch-write-bypass-2026-10-02.md')), null);
+});
+
+test('docs-only: the same task still blocks when the diff creates a different document than the one declared', () => {
+  const t = adhoc(AUDIT_TASK);
+  assert.equal(adhocDiffSubstanceProblem(t, createDiff('docs/something-else.md')).code, 'docs-only');
+});
+
+test('docs-only: a created-document task that also asks, in an imperative sentence, to change code in src/a.js still blocks a docs-only diff', () => {
+  const t = adhoc(`${AUDIT_TASK} Rename the helper in src/a.js.`);
+  assert.equal(adhocDiffSubstanceProblem(t, createDiff('docs/audit-batch-write-bypass-2026-10-02.md')).code, 'docs-only');
+});
+
+test('docs-only: a created-document task whose declared targets include a code file is not exempted', () => {
+  const t = adhoc(`${AUDIT_TASK}\nFiles: docs/audit-batch-write-bypass-2026-10-02.md, src/product-spec-to-hub.js`);
+  assert.equal(adhocDiffSubstanceProblem(t, createDiff('docs/audit-batch-write-bypass-2026-10-02.md')).code, 'docs-only');
+});
+
+// HUB0340 4/4: comprehensive test coverage for docs-only gate acceptance criteria
+test('docs-only gate AC1: README-only task with README-only diff passes', () => {
+  const t = adhoc('Update the README to clarify the installation prerequisites for the Python runtime.');
+  const p = adhocDiffSubstanceProblem(t, editDiff('README.md'));
+  assert.equal(p, null, 'a task asking only to update README with a README-only diff must pass');
+});
+
+test('docs-only gate AC2: runbook-only task with runbook-only diff passes', () => {
+  const t = adhoc('Update the runbook under docs/runbook.md to document the new retry policy.');
+  const p = adhocDiffSubstanceProblem(t, editDiff('docs/runbook.md'));
+  assert.equal(p, null, 'a task asking only to update a runbook with a runbook-only diff must pass');
+});
+
+test('docs-only gate AC3: code-change task with docs-only diff is rejected', () => {
+  const t = adhoc('Implement the new task source in src/task-sources.js to support the GitHub integration.');
+  const p = adhocDiffSubstanceProblem(t, createDiff('docs/adr/0042-task-source.md'));
+  assert.equal(p.code, 'docs-only', 'a code task with only a docs diff must be rejected with docs-only');
+  assert.match(p.retryFeedback, /only created\/edited documentation/);
+});
+
+test('docs-only gate AC4: mixed code+docs task with docs-only diff is rejected', () => {
+  const t = adhoc('Implement the new endpoint in src/api/routes.js and write an ADR in docs/adr/ explaining the design.');
+  const p = adhocDiffSubstanceProblem(t, createDiff('docs/adr/0043-endpoint-design.md'));
+  assert.equal(p.code, 'docs-only', 'a mixed task with only a docs diff must be rejected with docs-only');
+  assert.match(p.retryFeedback, /only created\/edited documentation/);
+});
+
+test('docs-only gate AC5: code+docs in same sentence with docs-only diff is rejected', () => {
+  const t = adhoc('Implement the new helper in src/utils.js and document it in the API reference.');
+  const p = adhocDiffSubstanceProblem(t, createDiff('docs/api-reference.md'));
+  assert.equal(p.code, 'docs-only', 'a task mentioning both code and docs in the same sentence with only a docs diff must be rejected');
+  assert.match(p.retryFeedback, /only created\/edited documentation/);
 });

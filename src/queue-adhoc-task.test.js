@@ -271,3 +271,197 @@ test('queueAdhocTask omits generatedForRepoRoot when not provided', () => {
   );
   assert.equal('generatedForRepoRoot' in record, false);
 });
+
+test('queueAdhocTask records premium provenance only when premium is requested: the given label, "cli" when none is given', () => {
+  const dir = tmpPipeline();
+  const domainsPath = path.join(dir, 'task-domains.json');
+  const mk = (extra) => queueAdhocTask({ title: 'Prov ' + Math.random().toString(36).slice(2, 6), promptContext: { rawText: 'x', raisedFrom: 'chat' }, ...extra }, { pipelineDir: dir, domainsPath }).record;
+
+  const labelled = mk({ premiumPriority: true, premiumSetBy: 'chat-queue' });
+  assert.equal(labelled.premiumSetBy, 'chat-queue');
+  assert.ok(Number.isFinite(Date.parse(labelled.premiumSetAt)));
+
+  const unlabelled = mk({ premiumPriority: true });
+  assert.equal(unlabelled.premiumSetBy, 'cli');
+
+  const plain = mk({});
+  assert.equal('premiumSetBy' in plain, false);
+  assert.equal('premiumSetAt' in plain, false);
+  const labelOnly = mk({ premiumSetBy: 'chat-queue' });
+  assert.equal('premiumSetBy' in labelOnly, false, 'a label without premiumPriority must not create provenance');
+});
+
+// --- stacked target (2026-11-04, Needs-Work repair loop piece 2): a repair task rides on an existing agent/* branch ---
+
+const { normalizeStacked, stackedFromArgs } = require('./queue-adhoc-task.js');
+const { prepareApplyBranch } = require('./apply-branch-prep-route.js');
+
+const HUB_BRANCH = 'agent/decompose-adhoc-some-hub-1793475827469';
+function queueWith(extra) {
+  const dir = tmpPipeline();
+  return queueAdhocTask(
+    { title: 'Repair a hub piece', promptContext: { rawText: 'fix it', raisedFrom: 'needs-work worker' }, ...extra },
+    { pipelineDir: dir, domainsPath: path.join(dir, 'task-domains.json') },
+  );
+}
+
+test('a valid stacked target is written on the record with exactly the three keys apply reads, and on disk', () => {
+  const { record, filePath } = queueWith({ stacked: { branch: HUB_BRANCH, seq: 4, total: 6 } });
+  assert.deepEqual(record.stacked, { branch: HUB_BRANCH, seq: 4, total: 6 });
+  assert.deepEqual(JSON.parse(fs.readFileSync(filePath, 'utf8')).stacked, { branch: HUB_BRANCH, seq: 4, total: 6 });
+});
+
+test('no stacked argument (or null) writes no stacked key at all: an ordinary task is unchanged', () => {
+  assert.equal('stacked' in queueWith({}).record, false);
+  assert.equal('stacked' in queueWith({ stacked: null }).record, false);
+  assert.equal('stacked' in queueWith({ stacked: undefined }).record, false);
+});
+
+test('a stacked target that is refused throws, names the problem, and writes no file', () => {
+  const bad = [
+    [{ branch: 'master', seq: 2, total: 2 }, /stacked\.branch/, 'main/master'],
+    [{ branch: 'main', seq: 2, total: 2 }, /stacked\.branch/, 'main'],
+    [{ branch: 'feat/x', seq: 2, total: 2 }, /stacked\.branch/, 'not an agent branch'],
+    [{ branch: '', seq: 2, total: 2 }, /stacked\.branch/, 'empty'],
+    [{ branch: 'agent/', seq: 2, total: 2 }, /stacked\.branch/, 'agent/ alone'],
+    [{ branch: 'agent/has space', seq: 2, total: 2 }, /stacked\.branch/, 'whitespace'],
+    [{ branch: 'agent/a..b', seq: 2, total: 2 }, /stacked\.branch/, 'dot dot'],
+    [{ branch: 7, seq: 2, total: 2 }, /stacked\.branch/, 'branch not a string'],
+    [{ branch: HUB_BRANCH, seq: 1, total: 1 }, /stacked\.seq/, 'seq 1 recreates the branch'],
+    [{ branch: HUB_BRANCH, seq: 0, total: 2 }, /stacked\.seq/, 'seq 0'],
+    [{ branch: HUB_BRANCH, seq: 2.5, total: 3 }, /stacked\.seq/, 'seq fractional'],
+    [{ branch: HUB_BRANCH, seq: '2', total: 2 }, /stacked\.seq/, 'seq a string'],
+    [{ branch: HUB_BRANCH, seq: 3, total: 2 }, /stacked\.total/, 'total below seq'],
+    [{ branch: HUB_BRANCH, seq: 2, total: '2' }, /stacked\.total/, 'total a string'],
+    [{ branch: HUB_BRANCH, seq: 2, total: 2, extra: 1 }, /unknown key/, 'extra key'],
+    [[HUB_BRANCH, 2, 2], /must be an object/, 'array'],
+    ['agent/x', /must be an object/, 'a bare string'],
+  ];
+  for (const [stacked, re, why] of bad) {
+    const dir = tmpPipeline();
+    assert.throws(() => queueAdhocTask(
+      { title: 'Repair', promptContext: { rawText: 'x' }, stacked },
+      { pipelineDir: dir, domainsPath: path.join(dir, 'task-domains.json') },
+    ), re, why);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')), false, `${why}: nothing is written on a refusal`);
+  }
+});
+
+test('normalizeStacked returns a fresh object with only the three keys and accepts seq == total', () => {
+  const input = { branch: HUB_BRANCH, seq: 2, total: 2 };
+  const out = normalizeStacked(input);
+  assert.deepEqual(out, input);
+  assert.notEqual(out, input);
+});
+
+test('stackedFromArgs: only a branch defaults to seq 2 and total = seq; all three flags are used; none gives undefined', () => {
+  assert.deepEqual(stackedFromArgs({ '--stacked-branch': HUB_BRANCH }), { branch: HUB_BRANCH, seq: 2, total: 2 });
+  assert.deepEqual(stackedFromArgs({ '--stacked-branch': HUB_BRANCH, '--stacked-seq': '5' }), { branch: HUB_BRANCH, seq: 5, total: 5 });
+  assert.deepEqual(stackedFromArgs({ '--stacked-branch': HUB_BRANCH, '--stacked-seq': '3', '--stacked-total': '7' }), { branch: HUB_BRANCH, seq: 3, total: 7 });
+  assert.equal(stackedFromArgs({}), undefined);
+  assert.throws(() => stackedFromArgs({ '--stacked-seq': '3' }), /need --stacked-branch/);
+  assert.throws(() => stackedFromArgs({ '--stacked-total': '3' }), /need --stacked-branch/);
+});
+
+function runCli(args, dir) {
+  const promptContextFile = path.join(dir, 'ctx.json');
+  fs.writeFileSync(promptContextFile, JSON.stringify({ rawText: 'repair it' }));
+  return require('child_process').spawnSync('node', [
+    path.join(__dirname, 'queue-adhoc-task.js'), '--title', 'CLI repair', '--prompt-context-file', promptContextFile, ...args,
+  ], { env: { ...process.env, AGENT_MANAGER_REPO_ROOT: dir, AGENT_MANAGER_PIPELINE_DIR: dir }, encoding: 'utf8' });
+}
+const cliRecord = (dir) => {
+  const files = fs.readdirSync(path.join(dir, 'queue', 'adhoc'));
+  assert.equal(files.length, 1);
+  return JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', files[0]), 'utf8'));
+};
+
+test('CLI: --stacked-branch alone writes stacked {branch, 2, 2}; all three flags write what was given', () => {
+  const a = tmpPipeline();
+  assert.equal(runCli(['--stacked-branch', HUB_BRANCH], a).status, 0);
+  assert.deepEqual(cliRecord(a).stacked, { branch: HUB_BRANCH, seq: 2, total: 2 });
+  const b = tmpPipeline();
+  assert.equal(runCli(['--stacked-branch', HUB_BRANCH, '--stacked-seq', '4', '--stacked-total', '6'], b).status, 0);
+  assert.deepEqual(cliRecord(b).stacked, { branch: HUB_BRANCH, seq: 4, total: 6 });
+});
+
+test('CLI: without any stacked flag the record has no stacked key', () => {
+  const dir = tmpPipeline();
+  assert.equal(runCli([], dir).status, 0);
+  assert.equal('stacked' in cliRecord(dir), false);
+});
+
+test('CLI: --stacked-seq without --stacked-branch exits 1 with a message and writes nothing', () => {
+  const dir = tmpPipeline();
+  const r = runCli(['--stacked-seq', '3'], dir);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /need --stacked-branch/);
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')), false);
+});
+
+test('CLI: a refused target (main) exits 1 and writes nothing', () => {
+  const dir = tmpPipeline();
+  const r = runCli(['--stacked-branch', 'master'], dir);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /stacked\.branch/);
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')), false);
+});
+
+test('CLI --scratch path carries the stacked target too', () => {
+  const live = tmpPipeline();
+  fs.writeFileSync(path.join(live, 'task-domains.json'), JSON.stringify({ default: {}, adhoc: {} }));   // the scratch path forces domain 'adhoc'
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-scratch-'));
+  fs.writeFileSync(path.join(live, 'ctx.json'), JSON.stringify({ rawText: 'x' }));
+  const r = require('child_process').spawnSync('node', [
+    path.join(__dirname, 'queue-adhoc-task.js'), '--title', 'Scratch repair', '--prompt-context-file', path.join(live, 'ctx.json'),
+    '--scratch', scratch, '--repo-root', live, '--stacked-branch', HUB_BRANCH, '--stacked-seq', '3',
+  ], { env: { ...process.env, AGENT_MANAGER_REPO_ROOT: live, AGENT_MANAGER_PIPELINE_DIR: live, AGENT_MANAGER_DOMAINS_PATH: path.join(live, 'task-domains.json') }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(cliRecord(scratch).stacked, { branch: HUB_BRANCH, seq: 3, total: 3 });
+  assert.equal(fs.existsSync(path.join(live, 'queue', 'adhoc')), false, 'the live pipeline dir is untouched');
+});
+
+test('contract with apply: a record queued with a stacked target makes prepareApplyBranch ride on that branch (prepareStackedBranch only, never reset, delete or create)', () => {
+  const calls = [];
+  const rec = (name) => (...args) => { calls.push([name, ...args]); };
+  const gitRunner = {
+    resetToMain: rec('resetToMain'), deleteBranch: rec('deleteBranch'), createBranch: rec('createBranch'),
+    remoteHasUnmergedWork: () => false, prepareStackedBranch: rec('prepareStackedBranch'),
+  };
+  const { record } = queueWith({ stacked: { branch: HUB_BRANCH, seq: 2, total: 2 } });
+  const out = prepareApplyBranch(record, { gitRunner, commitsDirectlyToMain: false });
+  assert.equal(out.branchName, HUB_BRANCH);
+  assert.deepEqual(calls, [['prepareStackedBranch', HUB_BRANCH]]);
+});
+
+// An empty or missing value after a --stacked-* flag must be REFUSED, never dropped: dropping it files an ordinary task off main (an empty shell variable did exactly that).
+test('CLI: --stacked-branch with an empty value exits 1 and writes nothing (not an ordinary task)', () => {
+  const dir = tmpPipeline();
+  const r = runCli(['--stacked-branch', ''], dir);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /stacked\.branch/);
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')), false);
+});
+
+test('CLI: --stacked-branch as the last argument (no value at all) exits 1 and writes nothing', () => {
+  const dir = tmpPipeline();
+  const r = runCli(['--stacked-branch'], dir);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /stacked\.branch/);
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')), false);
+});
+
+test('CLI: an empty --stacked-seq or --stacked-total value is refused, not replaced by the default', () => {
+  for (const flags of [['--stacked-seq', ''], ['--stacked-total', '']]) {
+    const dir = tmpPipeline();
+    const r = runCli(['--stacked-branch', HUB_BRANCH, ...flags], dir);
+    assert.equal(r.status, 1, `${flags[0]}: exit status`);
+    assert.match(r.stderr, /stacked\.(seq|total)/, `${flags[0]}: message names the field`);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')), false, `${flags[0]}: nothing written`);
+  }
+});
+
+test('stackedFromArgs: an empty branch value is passed on (and so refused), not treated as absent', () => {
+  assert.deepEqual(stackedFromArgs({ '--stacked-branch': '' }), { branch: '', seq: 2, total: 2 });
+  assert.throws(() => normalizeStacked(stackedFromArgs({ '--stacked-branch': '' })), /stacked\.branch/);
+});

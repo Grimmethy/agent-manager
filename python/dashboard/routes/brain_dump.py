@@ -1,4 +1,5 @@
 import json
+import subprocess
 from datetime import datetime, timezone
 
 from flask import Blueprint, abort, jsonify, request
@@ -211,6 +212,24 @@ def api_brain_dump_delete(entry_id):
     return jsonify({"deleted": entry_id})
 
 
+def _suspect_reasons(entry):
+    """Reasons the pre-queue target check calls this entry suspect, or [] (HUB0274-08). Runs scripts/check-brain-dump-targets.js with a 5 second timeout;
+    ANY problem (no node, timeout, bad output) returns [] so the check can never stop the owner from queueing an entry."""
+    try:
+        from app import PACKAGE_ROOT
+        cp = subprocess.run(
+            ["node", str(PACKAGE_ROOT / "scripts" / "check-brain-dump-targets.js")],
+            input=json.dumps({"id": entry.get("id"), "rawText": entry.get("rawText"), "raisedBy": entry.get("raisedBy")}),
+            capture_output=True, text=True, timeout=5, cwd=str(PACKAGE_ROOT),
+        )
+        result = json.loads((cp.stdout or "").strip().splitlines()[-1])
+        if result.get("verdict") == "suspect":
+            return [str(r) for r in (result.get("reasons") or [])] or ["the target check flagged this entry"]
+    except Exception:  # noqa: BLE001 -- fail open
+        pass
+    return []
+
+
 @brain_dump_bp.route("/api/brain-dump/<entry_id>/prioritize", methods=["POST"])
 def api_brain_dump_prioritize(entry_id):
     """'Process this now' button: injects the entry straight into queue/adhoc/, the SAME
@@ -235,6 +254,13 @@ def api_brain_dump_prioritize(entry_id):
     # existing queuedTaskId instead of minting a second one.
     if entry.get("status") == "actioned" and entry.get("queuedTaskId"):
         return jsonify(entry)
+
+    # HUB0274-08: warn before queueing an entry the target check calls suspect (every cited path missing, retired archive/ code, a hub sequencing
+    # note). The owner can still queue it: send {"force": true} (or set entry.targetCheckOverride). Fails open on any error in the check.
+    if (request.get_json(silent=True) or {}).get("force") is not True and entry.get("targetCheckOverride") is not True:
+        reasons = _suspect_reasons(entry)
+        if reasons:
+            abort(409, description="Process now was not run: " + "; ".join(reasons) + ' -- send {"force": true} to queue it anyway')
 
     pipeline_dir = get_pipeline_dir()
     if not pipeline_dir:

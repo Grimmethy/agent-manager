@@ -524,6 +524,8 @@ test('buildWriteToolHandlers.queue_reviewed_task writes a real adhoc task and re
     assert.equal(record.promptContext.rawText, 'AC-57 is clean, no conflicts -- add the re-admission path in src/decompose.js.');
     assert.equal(record.promptContext.raisedFrom, 'chat');
     assert.equal(record.premiumPriority, true, 'every task Chat queues is something a human is actively watching it work on right now');
+    assert.equal(record.premiumSetBy, 'chat-queue', 'provenance shown in the task modal');
+    assert.ok(Number.isFinite(Date.parse(record.premiumSetAt)), 'premiumSetAt is an ISO timestamp');
     assert.match(result.message, /premium priority/);
   });
 });
@@ -601,11 +603,13 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
 // all for Chat, queue_reviewed_task is the only way to make a real change), not a
 // prompt-level "please prefer queuing" ask.
 
-test('CHAT_TOOLS declares exactly the thirteen chat-safe tools -- no write_file/edit_file', () => {
+test('CHAT_TOOLS declares exactly the nineteen chat-safe tools (thirteen plus the six read-only GitHub tools) -- no write_file/edit_file', () => {
   withFixtureRepo((mod) => {
     const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
     assert.deepEqual(names, [
-      'answer_task_clarification', 'chat_status', 'check_branch', 'list_projects', 'list_unverified_branches', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
+      'answer_task_clarification', 'chat_status', 'check_branch',
+      'github_list_contents', 'github_read_file', 'github_recent_commits', 'github_repo_overview', 'github_search_code', 'github_search_repos',
+      'list_projects', 'list_unverified_branches', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
       'record_branch_verdict', 'requeue_blocked_task', 'resolve_task_clarification', 'run_bash', 'withdraw_task',
     ]);
   });
@@ -708,8 +712,9 @@ test('chat_status handler reports the union of TOOLS + CHAT_TOOLS (not just TOOL
     assert.ok(toolNames.includes('queue_reviewed_task'), 'must include queue_reviewed_task from CHAT_TOOLS');
     // Must include chat_status itself
     assert.ok(toolNames.includes('chat_status'), 'must include chat_status');
-    // Total: 6 (TOOLS) + 13 (CHAT_TOOLS) = 19
-    assert.equal(result.tools.length, 19, 'must report all 19 tools (6 shared + 13 chat)');
+    assert.ok(toolNames.includes('github_search_repos'), 'must include the GitHub tools registered in CHAT_TOOLS');
+    // Total: 6 (TOOLS) + 19 (CHAT_TOOLS: 13 + 6 read-only GitHub tools) = 25
+    assert.equal(result.tools.length, 25, 'must report all 25 tools (6 shared + 19 chat)');
   });
 });
 

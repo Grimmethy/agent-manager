@@ -15,6 +15,12 @@ source "${SCRIPT_DIR}/lib/start-singleton-bg.sh"
 
 readonly INSTANCE_ID="${1:-watchdog}"    # same naming as PowerShell's $env:InstanceID per-daemon.
 
+# Snapshot file path: parsed from --snapshot-file CLI flag or QUEUE_SNAPSHOT_FILE env var.
+# Default pattern: /dev/shm/agent-manager-queue-tick-<instanceId>.json where <instanceId>
+# comes from AGENT_MANAGER_INSTANCE_ID. Each script independently parses the flag/env and
+# forwards the path to its Node.js entry point.
+SNAPSHOT_FILE="${QUEUE_SNAPSHOT_FILE:-}"
+
 # Refuse to start if a live process already holds this instanceId -- see local-worker.sh's
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
 # Applies to the watchdog's OWN identity here -- distinct from (and unrelated to) the
@@ -247,15 +253,33 @@ while :; do
     # one redraft against current main, with a main-moved priorVerdict naming the conflicting files and telling the drafter to check first whether the change
     # already landed. Never touches hub children, stacked tasks, shared branches, human-prioritised tasks, or rivals that conflict only with each other.
     # AGENT_MANAGER_CONFLICT_READMIT=off|dry-run|on (default dry-run). See branch-conflict-readmit-sweep.js.
-    conflict_readmit_result="$(node "${PACKAGE_SRC_DIR}/branch-conflict-readmit-sweep.js" 2>>"${HOME_LOGS}/branch-conflict-readmit-sweep.log")"
+    # Gated (2026-11-03, ADR-0024): runs only when the project's done/, verdict file or remote refs changed, a sweep is waiting for its second sighting, or the 30 minute safety net is due.
+    if sweep_gate_skips project "$PIPELINE_DIR"; then conflict_readmit_result="skipped: nothing changed"
+    else conflict_readmit_result="$(node "${PACKAGE_SRC_DIR}/branch-conflict-readmit-sweep.js" 2>>"${HOME_LOGS}/branch-conflict-readmit-sweep.log")"; fi
     printf '[watchdog] branch-conflict-readmit-sweep: %s\n' "$conflict_readmit_result" >&2
 
     # Branch-defect re-admission (2026-10-24): the paired sweep for a defect verdict. A single-task agent/* branch whose task carries a CURRENT chat/manual
     # needs-work verdict (priorVerdict.sha == the branch head, seen on two runs >= 10 min apart) gets ONE redraft with the reviewer's reasons; a second
     # needs-work after that is left for a human. Same exclusions as the conflict sweep (hub children, stacked, shared branches, human-prioritised tasks).
-    # AGENT_MANAGER_DEFECT_READMIT=off|dry-run|on (default dry-run). See branch-defect-readmit-sweep.js.
-    defect_readmit_result="$(node "${PACKAGE_SRC_DIR}/branch-defect-readmit-sweep.js" 2>>"${HOME_LOGS}/branch-defect-readmit-sweep.log")"
+    # AGENT_MANAGER_DEFECT_READMIT=off|dry-run|on (default dry-run). See branch-defect-readmit-sweep.js (chat, manual and worker needs-work verdicts count).
+    if sweep_gate_skips project "$PIPELINE_DIR"; then defect_readmit_result="skipped: nothing changed"
+    else defect_readmit_result="$(node "${PACKAGE_SRC_DIR}/branch-defect-readmit-sweep.js" 2>>"${HOME_LOGS}/branch-defect-readmit-sweep.log")"; fi
     printf '[watchdog] branch-defect-readmit-sweep: %s\n' "$defect_readmit_result" >&2
+
+    # Redo supersession (2026-10-30): when a redo task (promptContext.redoOf) has merged, record a discard verdict on the Unmerged Branches card of the task it replaced,
+    # so the old needs-work branch does not sit in the pool until a human notices. Records only; the owner's Discard click deletes the branch.
+    # AGENT_MANAGER_REDO_SUPERSEDE=off|dry-run|on (default on). See redo-supersede-sweep.js.
+    # Global (it reads every registered project's done/), so it runs ONCE per tick here, behind its own gate, and not again for each pool project below.
+    if sweep_gate_skips global-redo; then redo_supersede_result="skipped: nothing changed"
+    else redo_supersede_result="$(node "${PACKAGE_SRC_DIR}/redo-supersede-sweep.js" 2>>"${HOME_LOGS}/redo-supersede-sweep.log")"; fi
+    printf '[watchdog] redo-supersede-sweep: %s\n' "$redo_supersede_result" >&2
+
+    # Brain-dump reconcile (HUB0226): closes a brain-dump entry when a task that names it has merged or been superseded. Why a poll and not an event: tasks reach
+    # done/ from the dashboard merge route (python), apply-task (node) and sweeps, so there is no single writer to announce; the one signal all of them leave is the
+    # mtime of queue/done (plus the brain dump file's own mtime). Idle cost: two stat calls and this node start; reconcile only runs when one moved, and a 6 hour
+    # full run counts what the mtimes missed. AGENT_MANAGER_BRAIN_DUMP_RECONCILE=off|dry-run|on (default dry-run). See brain-dump-reconcile-sweep.js.
+    brain_dump_reconcile_result="$(node "${PACKAGE_SRC_DIR}/brain-dump-reconcile-sweep.js" 2>>"${HOME_LOGS}/brain-dump-reconcile-sweep.log")"
+    printf '[watchdog] brain-dump-reconcile-sweep: %s\n' "$brain_dump_reconcile_result" >&2
 
     # Expiry sweep (2026-09-24, change_review flood): retires a QUEUED task whose subject went stale while it waited, for any source that
     # declares an `expiry` hook on its registration (change_review: a review of a commit older than its recency window). Source-agnostic --
@@ -476,6 +500,11 @@ while :; do
       start_singleton_bg "$PROACTIVE_LOCK" "${HOME_LOGS}/proactive-file-decompose-sweep.log" node "${_hygiene_src}/proactive-file-decompose-sweep.js"
     fi
 
+    # Plugin watchdog scripts (2026-11-02, ADR-0024 interim clock hook): every enabled plugins.json entry that declares "watchdogScripts" gets those scripts run
+    # once per tick, with a timeout and failure isolation, so a new plugin trigger needs no hardcoded block here. See scripts/run-plugin-watchdog-scripts.sh.
+    # AGENT_MANAGER_PLUGIN_WATCHDOG_SCRIPTS=off disables.
+    HOME_LOGS="$HOME_LOGS" PACKAGE_SRC_DIR="$PACKAGE_SRC_DIR" bash "${SCRIPT_DIR}/run-plugin-watchdog-scripts.sh"
+
     # merged-work-sweep (2026-09-18): wires verify-merged-work.js -- built 2026-09-16,
     # never previously called from anywhere -- into a periodic pass. Cheaply pre-filters
     # queue/done/ tasks claiming terminalDisposition:'merged' down to the ones whose
@@ -486,6 +515,15 @@ while :; do
     # ever, not every tick) -- cheap to run on every watchdog tick like the sweep above.
     merged_work_result="$(node "${PACKAGE_SRC_DIR}/merged-work-sweep.js" 2>>"${HOME_LOGS}/merged-work-sweep.log")"
     printf '[watchdog] merged-work-sweep: %s\n' "$merged_work_result" >&2
+
+    # Queue snapshot tick: rebuild the shared /dev/shm snapshot so other daemons can read
+    # it via readQueueSnapshot() (which honors QUEUE_SNAPSHOT_FILE). Skipped when no
+    # snapshot file path was configured (--snapshot-file CLI flag or QUEUE_SNAPSHOT_FILE
+    # env var), since the default tmpfs path is only useful when a consumer expects it.
+    if [[ -n "$SNAPSHOT_FILE" ]]; then
+      snapshot_result="$(QUEUE_SNAPSHOT_FILE="$SNAPSHOT_FILE" node "${PACKAGE_SRC_DIR}/queue-cache.js" buildQueueSnapshot "${AGENT_MANAGER_REPO_ROOT}" 2>>"${HOME_LOGS}/queue-snapshot.log")"
+      printf '[watchdog] queue-snapshot: %s\n' "$snapshot_result" >&2
+    fi
 
     # Drift-scan (Brain Dump #83: "Reasoning tasks aren't represented in the job list...
     # make sure task visibility is a consistent part of the pipeline"). drift-scan.js
@@ -549,6 +587,27 @@ while :; do
         rm -f "$GRAPH_BUILD_LOCK"
       ) &
       echo $! > "$GRAPH_BUILD_LOCK"
+    fi
+
+    # Pool sweep (2026-10-30, HUB0295): runs branch-defect-readmit-sweep.js and branch-conflict-readmit-sweep.js for each pool project, but only for a project whose inputs changed
+    # (src/sweep-gate.js; fails open; AGENT_MANAGER_SWEEP_GATE=off restores every-tick runs). redo-supersede-sweep.js is global and runs once per tick above. Kill switch AGENT_MANAGER_SWEEP_POOL=false.
+    AGENT_MANAGER_SWEEP_POOL=${AGENT_MANAGER_SWEEP_POOL:=true}
+    if [[ "${AGENT_MANAGER_SWEEP_POOL}" == "true" ]]; then
+      while IFS= read -r _pipe; do
+        [[ -n "$_pipe" ]] || continue
+        if sweep_gate_skips project "$_pipe"; then continue; fi
+        _env_args="$(node "${PACKAGE_SRC_DIR}/pool-projects.js" --env-args "$_pipe" apply 2>/dev/null)" || true
+        if [[ -z "$_env_args" ]]; then
+          printf '[watchdog] skipping pool project %s -- no env args returned\n' "$_pipe" >&2
+          continue
+        fi
+        for _sweep in branch-defect-readmit-sweep.js branch-conflict-readmit-sweep.js; do
+          _sweep_output="$(env $_env_args node "${PACKAGE_SRC_DIR}/${_sweep}" 2>/dev/null)" || true
+          echo "$_sweep_output" | grep -E '^(checked|observed|requeued|superseded)' | while IFS= read -r _line; do
+            printf '[watchdog] %s %s %s\n' "$_pipe" "$_sweep" "$_line" >&2
+          done
+        done
+      done < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --all 2>/dev/null)
     fi
 
     # Idle-pool borrowing (docs/idle-pool-borrowing.md, step 4): housekeeping for the pool projects lanes borrow work from -- retries, hub

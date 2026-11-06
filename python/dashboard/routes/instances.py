@@ -16,9 +16,48 @@ import sys
 
 instances_bp = Blueprint("instances-bp", __name__)
 
+
+def lane_fields_for(instance_id, lane_defs):
+    """Return the three lane-metadata keys that every /api/instances entry should carry.
+
+    Pure function: no I/O, no Flask, no import of app.  Used both by the route
+    (after a single call to worker_lane_defs() per request) and by tests.
+
+    provider:  "cloud" when lane.provider == "cloud" or lane.cloud is True;
+               "script" when lane.provider == "script" or lane.script is True;
+               otherwise "local".
+    taskClasses:  lane.taskClasses when it is a list, else None.
+    tierB:  lane.tier when it is a number, else None.
+
+    An instance_id with no matching lane (reviewers, watchdog, apply-loop,
+    unknown ids) and an empty lane_defs list both yield three Nones -- the
+    route never guesses when it has no lane definition to consult.
+    """
+    lane = None
+    if lane_defs:
+        for l in lane_defs:
+            if isinstance(l, dict) and l.get("id") == instance_id:
+                lane = l
+                break
+    if lane is None:
+        return {"provider": None, "taskClasses": None, "tierB": None}
+    provider = "local"
+    if lane.get("provider") == "cloud" or lane.get("cloud") is True:
+        provider = "cloud"
+    elif lane.get("provider") == "script" or lane.get("script") is True:
+        provider = "script"
+    task_classes = lane.get("taskClasses") if isinstance(lane.get("taskClasses"), list) else None
+    tier = lane.get("tier")
+    tier_b = tier if isinstance(tier, (int, float)) and not isinstance(tier, bool) else None
+    return {"provider": provider, "taskClasses": task_classes, "tierB": tier_b}
+
+
 @instances_bp.route("/api/instances")
 def api_instances():
-    from app import OTHER_STALE_SECONDS, WORKING_STALE_SECONDS, _expected_instance_ids, instances_dir, parse_hb_timestamp, read_json_safe
+    from app import (
+        OTHER_STALE_SECONDS, WORKING_STALE_SECONDS, _expected_instance_ids,
+        instances_dir, parse_hb_timestamp, read_json_safe, worker_lane_defs,
+    )
     results = []
     seen_ids = set()
     inst_dir = instances_dir()
@@ -94,6 +133,14 @@ def api_instances():
         if is_switchable(r.get("instanceId")):
             r["switchable"] = True
             r["disabled"] = r["instanceId"] in off
+    # Lane metadata (HUB0325 · 1/6): one call per request, cached for a few seconds
+    # by worker_lane_defs() -- no new subprocess per poll.
+    try:
+        lane_defs = worker_lane_defs()
+    except Exception:
+        lane_defs = []
+    for r in results:
+        r.update(lane_fields_for(r.get("instanceId"), lane_defs))
     results.sort(key=lambda r: r.get("instanceId") or "")
     return jsonify(results)
 

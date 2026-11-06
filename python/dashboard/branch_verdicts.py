@@ -2,7 +2,7 @@
 
 Why this exists: in the 2026-09-25 review, of 37 unmerged branches 4 were already on master under a
 different SHA, 30+ were redundant agent/triage-queue-rescued-* snapshots, and only ~7 needed a real
-decision -- and none of that was visible in the app. A verdict (merge / needs-work / discard) is recorded
+decision -- and none of that was visible in the app. A verdict (merge / needs-work / hold / discard) is recorded
 per branch AND head SHA, so a verdict for an older commit reads back as stale instead of vouching for code
 nobody looked at.
 
@@ -23,8 +23,13 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-VERDICTS = ("merge", "needs-work", "discard")
-SOURCES = ("deterministic", "chat", "manual")
+# "hold" (2026-10-31): a sound piece that cannot merge yet (its hub is unfinished, or a sibling must merge first). It is NOT needs-work: nothing in it is
+# defective, so it is never fed to a redraft (apply_prior_verdict) and never counted as a defect. It is also never merge-ready.
+VERDICTS = ("merge", "needs-work", "hold", "discard")
+# "worker" (2026-11-02): the branch-verifier worker (agent-manager-pipeline-ops). Automated like "deterministic", but it ran the touched tests, so it ranks between the two:
+# it replaces a deterministic verdict, never a chat/manual one (a human verdict wins), and a deterministic check never replaces it.
+SOURCES = ("deterministic", "chat", "manual", "worker")
+HUMAN_SOURCES = ("chat", "manual")
 STORE_NAME = "branch-verdicts.json"
 ROLLING_BRANCH = "agent/triage-queue"
 STALE_NOTE = "verdict is for an older commit"
@@ -87,6 +92,17 @@ def validate_verdict_body(verdict, reasons, source):
     return None
 
 
+def _emit_verdict_event(queue_dir, branch, sha, verdict, source):
+    """Announce a recorded verdict in the queue-events journal (ADR-0024: the writer announces, the sweeps react). Best-effort: a journal problem must never break
+    recording a verdict, so everything is caught and logged. AGENT_MANAGER_QUEUE_EVENTS=off makes the writer skip it."""
+    try:
+        from queue_events import append_event
+        pipeline_dir = os.path.dirname(os.path.abspath(str(queue_dir)))
+        append_event(pipeline_dir, {"type": "verdict_recorded", "branch": branch, "sha": sha, "verdict": verdict, "source": source, "taskId": None})
+    except Exception as exc:  # noqa: BLE001 -- never let the journal break a verdict
+        logger.warning("queue-events: verdict_recorded not journaled for %s: %s", branch, exc)
+
+
 def record_verdict(queue_dir, branch, sha, verdict, reasons, source):
     """Persist a verdict for (branch, sha). Returns (record, written).
 
@@ -103,12 +119,15 @@ def record_verdict(queue_dir, branch, sha, verdict, reasons, source):
     existing = per_branch.get(sha)
     if existing and source == "deterministic" and existing.get("source") != "deterministic":
         return existing, False
+    if existing and source == "worker" and existing.get("source") in HUMAN_SOURCES:
+        return existing, False
     record = {"verdict": verdict, "reasons": list(reasons), "source": source, "verifiedAt": _now_iso()}
     per_branch[sha] = record
     if len(per_branch) > _KEEP_SHAS:
         for old in sorted(per_branch, key=lambda s: per_branch[s].get("verifiedAt", ""))[:-_KEEP_SHAS]:
             del per_branch[old]
     save_verdicts(queue_dir, verdicts)
+    _emit_verdict_event(queue_dir, branch, sha, verdict, source)
     return record, True
 
 
@@ -217,9 +236,9 @@ def _check_conflicts(run_git, repo_root, main_branch, branch):
     if ok:
         return None
     files = sorted(set(_CONFLICT_RE.findall(out)))
-    if not files and "CONFLICT" not in out:
-        return None  # the check itself failed (not a real conflict) -- never report that as one
-    return ("needs-work", ["conflicts with " + main_branch + " on: " + (", ".join(files) if files else "unknown files")])
+    if not files:
+        return None  # no actual conflict markers found -- the check itself failed (not a real conflict) -- never report that as one
+    return ("needs-work", ["conflicts with " + main_branch + " on: " + (", ".join(files))])
 
 
 def run_deterministic_checks(repo_root, main_branch, branch, run_git, extra_reasons=()):
@@ -294,11 +313,11 @@ _PRIOR_VERDICT_REASON_CHARS = 1500
 def apply_prior_verdict(rec, branch, verdict, reasons, source, sha=None):
     """Mutates a TASK record's promptContext.priorVerdict from a recorded verdict; returns True if it changed.
 
-    chat/manual + needs-work sets it (latest wins); chat/manual + merge clears it (the redraft was accepted);
+    chat/manual/worker + needs-work sets it (latest wins); chat/manual/worker + merge clears it (the redraft was accepted);
     every other combination -- deterministic checks, discard (its reasons are about redundancy, not a defect in
-    the change) -- leaves it alone. Never called for a hub record. A record whose promptContext is not a dict
+    the change), hold (nothing to redraft: the piece is waiting, not defective) -- leaves it alone. Never called for a hub record. A record whose promptContext is not a dict
     is skipped rather than overwritten."""
-    if source not in ("chat", "manual"):
+    if source not in HUMAN_SOURCES + ("worker",):
         return False
     ctx = rec.get("promptContext")
     if not isinstance(ctx, dict):

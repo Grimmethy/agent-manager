@@ -122,6 +122,23 @@ test('runDueProbes: a cloud lane is never probed (no tokens/s to judge, and each
   assert.equal(H.laneDegraded(dir, 'worker-cloud'), false, 'a cloud lane with no samples is never degraded');
 });
 
+test('runDueProbes: a script lane is never probed (it has no model); GPU lanes still are', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-health-script-'));
+  const now = Date.now();
+  const hb = (id) => fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ status: 'idle', lastHeartbeat: new Date(now).toISOString() }));
+  hb('worker-tuner'); hb('worker-rx580');
+  const lanes = [
+    { id: 'worker-tuner', script: true, provider: 'script', model: 'script', env: { OLLAMA_URL: 'http://127.0.0.1:7449' } },
+    { id: 'worker-rx580', model: 'small:8b', env: { OLLAMA_URL: 'http://g:11434' } },
+  ];
+  const probed = [];
+  const probe = async (a) => { probed.push(a.url); return { ok: true, tps: 20, totalMs: 500, error: null }; };
+  const out = await H.runDueProbes({ lanes, instancesDir: dir, pipelineDir: dir, env: {}, now, probe });
+  assert.deepEqual(probed, ['http://g:11434']);
+  assert.deepEqual(out.map((r) => r.lane), ['worker-rx580']);
+  assert.equal(H.laneDegraded(dir, 'worker-tuner'), false);
+});
+
 // --- 2026-10-27: a dashboard model override must be what the probe judges, and a model swap must not read as a dead lane ------------------------------
 function laneFixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-health-swap-'));
