@@ -16,7 +16,11 @@ import threading
 import time
 
 _lock = threading.Lock()
-_state = {"cache": {}, "thread": None}  # cache: real repo root -> {"at": epoch, "branches": [...], "error": str|None}
+_state = {"cache": {}, "thread": None}  # cache: real repo root -> {"at": epoch, "branches": [...], "error": str|None, "hubKey": str|None}
+
+# Per-directory (inode, size, mtime_ns) cache for hub_state_key. Bounded to avoid unbounded growth.
+_hub_state_cache = {}  # pipeline_dir -> {"key": str, "files": {relpath: (inode, size, mtime_ns)}, "at": epoch}
+_HUB_STATE_CACHE_MAX = 500
 
 
 def _ttl_seconds():
@@ -26,6 +30,87 @@ def _ttl_seconds():
         return max(30.0, float(os.environ.get("AGENT_MANAGER_BRANCH_OTHER_PROJECTS_TTL_SECONDS", "1800")))
     except ValueError:
         return 1800.0
+
+
+def hub_state_key(pipeline_dir):
+    """Deterministic key over the hub state files in a pipeline directory.
+
+    Reads every queue/coordinating/*.json file and hashes (filename, inode, size, mtime_ns)
+    for each. Returns a hex string. Two pipelines with identical hub state produce the same
+    key; any change to any coordinating file changes the key.
+
+    Pure function -- no side effects, no I/O caching of its own. Callers should wrap with
+    _hub_state_with_cache for the per-file (inode, size, mtime_ns) short-circuit.
+    """
+    import hashlib
+    coord_dir = os.path.join(pipeline_dir, "queue", "coordinating")
+    if not os.path.isdir(coord_dir):
+        return ""
+    entries = []
+    for name in sorted(os.listdir(coord_dir)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(coord_dir, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        entries.append((name, st.st_ino, st.st_size, st.st_mtime_ns))
+    h = hashlib.sha256()
+    for entry in entries:
+        h.update(str(entry).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _hub_state_with_cache(pipeline_dir):
+    """hub_state_key with per-directory (inode, size, mtime_ns) caching.
+
+    Skips the stat+hash work entirely when every file's (inode, size, mtime_ns) matches
+    the cached values. Bounded to 500 entries to prevent unbounded growth across many
+    registered projects.
+    """
+    cached = _hub_state_cache.get(pipeline_dir)
+    if cached is not None:
+        # Quick directory-level check first: if the directory itself hasn't changed,
+        # and every file still matches, return the cached key.
+        files_match = True
+        coord_dir = os.path.join(pipeline_dir, "queue", "coordinating")
+        if os.path.isdir(coord_dir):
+            for name, (c_ino, c_size, c_mtime) in cached["files"].items():
+                fpath = os.path.join(coord_dir, name)
+                try:
+                    st = os.stat(fpath)
+                except OSError:
+                    files_match = False
+                    break
+                if (st.st_ino, st.st_size, st.st_mtime_ns) != (c_ino, c_size, c_mtime):
+                    files_match = False
+                    break
+        else:
+            files_match = False
+        if files_match:
+            return cached["key"]
+
+    key = hub_state_key(pipeline_dir)
+    # Re-stat to capture current file metadata for the cache.
+    coord_dir = os.path.join(pipeline_dir, "queue", "coordinating")
+    file_meta = {}
+    if os.path.isdir(coord_dir):
+        for name in sorted(os.listdir(coord_dir)):
+            if not name.endswith(".json"):
+                continue
+            fpath = os.path.join(coord_dir, name)
+            try:
+                st = os.stat(fpath)
+                file_meta[name] = (st.st_ino, st.st_size, st.st_mtime_ns)
+            except OSError:
+                continue
+    # Evict oldest entries if over capacity.
+    if len(_hub_state_cache) >= _HUB_STATE_CACHE_MAX:
+        oldest_key = min(_hub_state_cache, key=lambda k: _hub_state_cache[k]["at"])
+        del _hub_state_cache[oldest_key]
+    _hub_state_cache[pipeline_dir] = {"key": key, "files": file_meta, "at": time.time()}
+    return key
 
 
 def registered_projects(active_root):
@@ -68,11 +153,17 @@ def expire_all():
 
 def _refresh_stale(projects):
     """Background thread body: recompute each stale project in turn. A failure stamps the entry anyway (keeping any previous list) so a broken repo is retried at the
-    next TTL, not on every request."""
+    next TTL, not on every request.
+
+    Stores the current hubKey in the cache entry before recomputing so that other_project_branches
+    can detect phase changes (hub state file changes) and trigger a refresh even within the TTL.
+    """
     import app
     try:
         for p in projects:
             err = None
+            # Capture hubKey BEFORE recomputing branches -- this is the "before" snapshot.
+            hub_key_before = _hub_state_with_cache(p["pipelineDir"])
             try:
                 branches = app._list_unmerged_branches_uncached(force_fetch=True, repo_root=p["repoRoot"], pipeline_dir=p["pipelineDir"])
             except Exception as e:  # noqa: BLE001 -- one broken repo must not stop the others
@@ -83,7 +174,12 @@ def _refresh_stale(projects):
             import event_stream
             with _lock:
                 previous = _state["cache"].get(p["repoRoot"]) or {}
-                _state["cache"][p["repoRoot"]] = {"at": time.time(), "branches": branches, "error": err}
+                _state["cache"][p["repoRoot"]] = {
+                    "at": time.time(),
+                    "branches": branches,
+                    "error": err,
+                    "hubKey": hub_key_before,
+                }
             if event_stream.digest(branches) != event_stream.digest(previous.get("branches")):
                 event_stream.announce("branch-list-changed", project=p["repoRoot"])
     finally:
@@ -92,12 +188,35 @@ def _refresh_stale(projects):
 
 
 def other_project_branches(active_root):
-    """({project tag -> branches}, pending labels). Never blocks on git: returns the cache and starts the refresh thread for anything stale."""
+    """({project tag -> branches}, pending labels). Never blocks on git: returns the cache and starts the refresh thread for anything stale.
+
+    A project is stale when:
+      Rule 1 (TTL): time since last refresh >= ttl_seconds()
+      Rule 2 (phase change): hubKey differs from cached value AND >= 30 s since last refresh
+
+    Rule 2 lets us react to hub state file changes (coordinating/*.json) without waiting for the
+    full TTL, but the 30 s floor prevents thrashing when a hub is being rapidly updated.
+    """
     others = [p for p in registered_projects(active_root) if not p["active"]]
     ttl, now = _ttl_seconds(), time.time()
     with _lock:
         cache = dict(_state["cache"])
-        stale = [p for p in others if now - (cache.get(p["repoRoot"]) or {}).get("at", 0.0) >= ttl]
+        stale = []
+        for p in others:
+            entry = cache.get(p["repoRoot"])
+            if entry is None:
+                stale.append(p)
+                continue
+            last_at = entry.get("at", 0.0)
+            # Rule 1: TTL expired.
+            if now - last_at >= ttl:
+                stale.append(p)
+                continue
+            # Rule 2: hubKey changed AND 30 s floor passed.
+            cached_hub_key = entry.get("hubKey")
+            current_hub_key = _hub_state_with_cache(p["pipelineDir"])
+            if cached_hub_key != current_hub_key and now - last_at >= 30.0:
+                stale.append(p)
         if stale and _state["thread"] is None:
             t = threading.Thread(target=_refresh_stale, args=(stale,), name="branch-projects-refresh", daemon=True)
             _state["thread"] = t
