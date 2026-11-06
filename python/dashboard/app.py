@@ -2482,16 +2482,32 @@ def branch_list_refreshing():
 
 def list_held_hub_groups(include_other_projects=False):
     """Hubs whose built children are pushed but not listed yet (see partition_held_hub_branches). include_other_projects adds the groups the background
-    refresh found in every other registered project, each tagged with its `project` ({label, repoRoot}); a project not scanned yet contributes nothing."""
+    refresh found in every other registered project, each tagged with its `project` ({label, repoRoot}); a project not scanned yet contributes nothing.
+    Every returned group carries a `computedAt` ISO UTC string derived from the cache entry's `at` timestamp (the active project uses `_branch_cache["at"]`,
+    other projects use the cache entry timestamp from `other_project_branches`)."""
     list_unmerged_branches(force=False)
+    if include_other_projects:
+        import branch_projects  # lazy, same as the listing route
+        # Ensure other projects' caches are up to date before reading held_other,
+        # so each returned group can carry the `at` of the cache entry that produced it.
+        branch_projects.other_project_branches(get_active_repo_root())
     with _branch_cache_lock:
         groups = list(_branch_cache.get("held") or [])
         others = dict(_branch_cache.get("held_other") or {})
+        at = _branch_cache.get("at", 0)
+    # Stamp computedAt on the active project's held groups using the cache timestamp.
+    if at:
+        groups = [{**g, "computedAt": datetime.fromtimestamp(at, tz=timezone.utc).isoformat()} for g in groups]
     if include_other_projects and others:
-        import branch_projects  # lazy, same as the listing route
+        cache = branch_projects._state["cache"]
         for p in branch_projects.registered_projects(get_active_repo_root()):
             if not p["active"]:
-                groups.extend({**g, "project": branch_projects.project_tag(p)} for g in others.get(str(p["repoRoot"]), []))
+                repo_root = str(p["repoRoot"])
+                cache_entry = cache.get(repo_root)
+                ts = cache_entry.get("at", 0) if cache_entry else 0
+                if ts:
+                    computed_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                    groups.extend({**g, "project": branch_projects.project_tag(p), "computedAt": computed_at} for g in others.get(repo_root, []))
     return groups
 
 
