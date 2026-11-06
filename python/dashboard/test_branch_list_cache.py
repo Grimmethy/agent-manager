@@ -91,7 +91,7 @@ class StaleWhileRevalidate(CacheCase):
         self.fill(OLD, age=app._BRANCH_CACHE_TTL_SECONDS + 10)
         with mock.patch.object(app, "_list_unmerged_branches_uncached", return_value=NEW) as rec:
             self.assertEqual(app.list_unmerged_branches(force=True), NEW)
-        rec.assert_called_once_with(force_fetch=True)
+        rec.assert_called_once_with(force_fetch=True, fetch_timeout=app._ACTION_FETCH_TIMEOUT_SECONDS)
         self.assertIsNone(app._branch_fetch_state.get("thread"))
 
     def test_a_refresh_that_raises_keeps_the_old_list_and_a_later_call_can_refresh_again(self):

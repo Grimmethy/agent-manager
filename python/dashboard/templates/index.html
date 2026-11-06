@@ -155,9 +155,41 @@
   .worker-card .row { display: flex; justify-content: space-between; align-items: center; }
   .worker-card .id { font-weight: 600; }
   .worker-model-select { margin-left: 12px; margin-right: auto; font-size: 12px; max-width: 220px; }
+  .worker-model-fixed { margin: 0 auto 0 12px; }
   .worker-card .meta { color: var(--muted); font-size: 12px; margin-top: 8px; }
   .worker-card.clickable { cursor: pointer; }
   .worker-card.worker-off { opacity: .65; }
+  /* Workers Graph view (workflow-graph-view.js): edges under absolutely positioned node cards inside ONE scroll box, so the page itself never scrolls sideways. */
+  .wf-toggle { display: inline-flex; gap: 4px; }
+  .wf-view-btn.active { border-color: var(--accent, #58a6ff); color: var(--accent, #58a6ff); }
+  .wf-bar { margin-bottom: 12px; }
+  .wf-warn-line { margin: 0 0 8px; }
+  .wf-surface { overflow: auto; max-width: 100%; max-height: 70vh; border: 1px solid var(--border); border-radius: 8px; background: var(--bg, transparent); }
+  .wf-canvas { position: relative; }
+  .wf-edges { position: absolute; left: 0; top: 0; pointer-events: none; }
+  .wf-edge { stroke: var(--muted, #8b949e); stroke-width: 1.5; }
+  .wf-arrowhead { fill: var(--muted, #8b949e); }
+  .wf-node { position: absolute; box-sizing: border-box; margin: 0; padding: 8px 12px; overflow: hidden; }
+  .wf-node .row { align-items: flex-start; gap: 8px; }
+  .wf-node .badge-col { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+  .wf-status-line { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+  .wf-node .wf-task { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wf-node .worker-switch-btn { margin-top: 0 !important; white-space: nowrap; }
+  .wf-node .id { overflow-wrap: anywhere; }
+  .wf-node .meta { margin-top: 4px; }
+  .wf-selected { border-color: var(--accent, #58a6ff); }
+  .wf-detail { margin-top: 12px; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+  .wf-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 8px 0; font-size: 12px; }
+  .wf-facts dt { color: var(--muted); }
+  .wf-facts dd { margin: 0; overflow-wrap: anywhere; }
+  .wf-group-box { position: absolute; box-sizing: border-box; border: 1px dashed var(--border-strong, var(--border)); border-radius: 8px; pointer-events: none; }
+  .wf-group-toggle { pointer-events: auto; margin: 4px; padding: 4px 8px; font-size: 12px; }
+  .wf-group-node { border-style: dashed; }
+  .wf-controls { margin: 8px 0; }
+  .wf-control-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .wf-control-row .worker-model-select, .wf-control-row .worker-model-fixed { margin: 0; }
+  .wf-apply-note { margin: 0 0 8px; }
+  .wf-warnings { margin: 8px 0 0; padding-left: 16px; font-size: 12px; color: var(--muted); }
   .recent-tasks-list { list-style: none; padding: 0; margin: 8px 0 0; }
   .recent-tasks-list li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-top: 1px solid var(--border); }
   .recent-tasks-list li:first-child { border-top: none; }
@@ -385,10 +417,21 @@
 <script src="/static/js/nav-sections.js"></script>
 <script src="/static/js/queue-tab.js"></script>
 <script src="/static/js/plugins-tab.js"></script>
+<script src="/static/js/worker-task-picker.js"></script>
+<script src="/static/js/worker-model-select.js"></script>
+<script src="/static/js/worker-status-helpers.js"></script>
 <script src="/static/js/workers-tab.js"></script>
 <script src="/static/js/worker-switch-ui.js"></script>
+<script src="/static/js/workflow-layout.js"></script>
+<script src="/static/js/workflow-groups.js"></script>
+<script src="/static/js/workflow-node-panel.js"></script>
+<script src="/static/js/workflow-graph-view.js"></script>
 <script src="/static/js/cloud-spend-panel.js"></script>
 <script src="/static/js/stalled-worker-panel.js"></script>
+<script src="/static/js/verifier-worker-panel.js"></script>
+<script src="/static/js/needswork-worker-panel.js"></script>
+<script src="/static/js/context-worker-panel.js"></script>
+<script src="/static/js/pipeline-ops-workers-panel.js"></script>
 <script src="/static/js/sidebar-and-claude-panels.js"></script>
 <script src="{{ url_for('static', filename='js/analytics-and-discovery.js') }}"></script>
 <script src="/static/js/models-tab.js"></script>
@@ -403,6 +446,7 @@
 <script src="/static/js/brain-dump-chips.js"></script>
 <script src="/static/js/brain-dump-and-second-brain.js"></script>
 <script src="/static/js/hygiene-tab.js"></script>
+<script src="/static/js/live-updates.js"></script>
 <script>
 // CORE_TABS is the hardcoded tab-bar row set. TABS (core-ui.js) starts as a copy of it and
 // folds in any plugin-declared `tab` on top (Docs/hub-tasks-extraction-plan.md section 5,
@@ -447,7 +491,7 @@ let counts = {};
 
 // Project tab state -- kept separate from the generic 5s poll-and-rerender cycle used by
 // every other tab, since re-rendering over a user's in-progress folder navigation every
-// 5s would be a bad experience. See renderProject()/enterProjectTab()/leaveProjectTab().
+// 5s would be a bad experience. See renderProject()/enterProjectTab(); its panels refresh on events (pipeline-state-changed, project-build-changed), not on a timer.
 let projectPath = localStorage.getItem('agentManagerProjectPath') || '';
 // Last activeRepoRoot value seen from the server (see enterProjectTab's sync below).
 // Starts equal to projectPath so the very first sync is a no-op when they already agree --
@@ -494,7 +538,6 @@ let projectHistory = [];
 // capture note and reset the second-brain folder browser back to its root every tick.
 let brainDumpBrowsePath = localStorage.getItem('agentManagerBrainDumpBrowsePath') || '';
 let brainDumpSelectedFile = null;
-let brainDumpEntriesInterval = null;
 // '' (Unprocessed, /api/brain-dump's own default) | 'actioned' (Processed) | 'all' --
 // mirrors the ?status= values api_brain_dump() (app.py) already accepts; not persisted
 // to localStorage, same as queueSourceFilter's per-tab-visit reset (queue-source-filter).
@@ -651,6 +694,8 @@ let completedTasksObserver = null;
 // Ticks every second independent of the 5s /api/instances poll, so "stale for" reads as a
 // live counter instead of jumping in 5s increments. Computed purely from lastHeartbeat +
 // staleThresholdSeconds (both already on each instance) -- no extra fetch needed.
+// ADR-0024: allowed because it is display-only (it rewrites two text nodes from the clock; it never fetches or redraws).
+// static/js/no-timer-redraws.test.js fails if this ticker starts to fetch or redraw, or if any other timer is added.
 setInterval(updateStaleTimers, 1000);
 
 // Sort state lives outside the function so it survives the 5s poll re-rendering the
@@ -896,11 +941,12 @@ const SUBTASK_STATUS_META = {
 // While a task is mid-pass (drafting or review), the pipeline now flushes each new
 // Pipeline History checkpoint to the task file as it happens (task-history.js's persist
 // hook -- 2026-08-31, Grimmethy: "Anything that I can observe is good"). The modal is a
-// one-shot fetch, so poll while it's open and a live task is showing, re-rendering only
+// one-shot fetch, so while it's open and a live task is showing it WATCHES the task (taskDetailWatch) and
+// re-reads it when the pipeline announces a change (refreshTaskDetailModal, driven by live-updates.js), re-rendering only
 // when something actually changed. task-anywhere follows the task across the
 // drafting->review->approved->done moves, so the modal keeps tracking it without a manual
-// reopen; a terminal state stops the poll.
-let taskDetailPoll = null;
+// reopen; a terminal state stops the watch. There is no timer.
+let taskDetailWatch = null;
 const TASK_DETAIL_LIVE_STATES = new Set(['drafting', 'review', 'coordinating']);
 // Sources whose real deliverable is a prose report in implementResponse (advisoryProse),
 // not a diff -- the task modal promotes it to the top under "Root-Cause Report".
@@ -1191,7 +1237,7 @@ document.getElementById('main').addEventListener('click', (e) => {
 // already folds in any plugin-declared tab before the first paint.
 refresh();  // always -- populates counts + renders nav regardless of which tab is active
 if (activeTab === 'project') enterProjectTab();
-setInterval(refresh, 5000);
+startPageLiveUpdates();   // the event stream (live-updates.js); the old 5 s refresh only runs if the stream is unavailable
 mountPersistentSidebarPlugins();
 
 // The graph iframe's CSS box resizes correctly on window resize (flex:1 fills whatever

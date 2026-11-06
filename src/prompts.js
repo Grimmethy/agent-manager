@@ -2,6 +2,7 @@
 
 const { GIT_OWNERSHIP_RULE } = require('./lib/git-ownership.js');
 const { candidateSplitToHubEnabled } = require('./lib/candidate-split-route.js');
+const { PLAN_LINES: POLL_PLAN_LINES, IMPLEMENT_LINES: POLL_IMPLEMENT_LINES } = require('./lib/poll-avoidance-lines.js');
 
 const path = require('path');
 
@@ -315,6 +316,7 @@ function adhocPlanPrompt(task) {
     ...skipPathDirective(task, 'plan'),
     'Write a numbered, actionable PLAN.',
     GIT_OWNERSHIP_RULE,
+    POLL_PLAN_LINES,
     'IMPORTANT: This promptContext\'s shape is NOT standardized. Treat anything not explicitly stated in it as unknown — do not assume a field exists just because a similar-sounding one appeared in another kind of task.',
     ...statedAcceptanceBlock(task),
     '',
@@ -1572,6 +1574,8 @@ function adhocImplementPrompt(task, planText) {
     '',
     ...skipPathDirective(task, 'implement'),
     ...fixedLiteralsBlock(task),
+    POLL_IMPLEMENT_LINES,
+    '',
     groupBJsonInstructions,
   ].join('\n');
 }
@@ -1588,14 +1592,52 @@ function genericFallbackPlanPrompt(task) {
 }
 
 function genericFallbackImplementPrompt(task, planText) {
-  return [
+  const blocks = [
     'Earlier you wrote this PLAN:',
     '',
     planText,
     '',
     'Now write ONLY the concrete next step described by step 1 of that plan -- keep it small ' +
       'and specific, not the whole plan at once.',
-  ].join('\n');
+  ];
+  
+  // Always include the test requirement: every code change must include corresponding tests.
+  // This is the shared cause of the "touches no test" class of needs-work branches -- the
+  // prompt previously only added this rule after a prior rejection, so the first attempt never
+  // got the instruction and agents routinely produced code-only changes that the automatic
+  // check (review-verify.js) flags as needs-work.
+  blocks.push('');
+  blocks.push('RULE: Every code change must include corresponding test changes. When editing, creating, or deleting source files, you MUST also update or create tests to verify the change works correctly.');
+  
+  // Add a stronger reminder if there's a prior "touches no test" verdict or rejection
+  const hasTouchesNoTestHistory = hasPriorTouchesNoTest(task);
+  if (hasTouchesNoTestHistory) {
+    blocks.push('');
+    blocks.push('NOTE: Your previous attempt was rejected because it "touches no test". You MUST include tests with this revision.');
+  }
+  
+  return blocks.join('\n');
+}
+
+function hasPriorTouchesNoTest(task) {
+  // Check for prior verdict with "touches no test" reason
+  if (task && task.promptContext && task.promptContext.priorVerdict) {
+    const pv = task.promptContext.priorVerdict;
+    if (pv.verdict === 'needs-work' && Array.isArray(pv.reasons)) {
+      return pv.reasons.some(reason => 
+        typeof reason === 'string' && reason.toLowerCase().includes('touches no test')
+      );
+    }
+  }
+  
+  // Check for prior rejection feedback mentioning "touches no test"
+  if (task && Array.isArray(task.priorRejectionFeedback)) {
+    return task.priorRejectionFeedback.some(feedback =>
+      typeof feedback === 'string' && feedback.toLowerCase().includes('touches no test')
+    );
+  }
+  
+  return false;
 }
 
 // ---- Wire this package's 6 built-in sources' prompt builders into the registry ----
@@ -1767,6 +1809,7 @@ module.exports = {
   productSpecOutlinePlanPrompt, productSpecOutlineImplementPrompt,
   productSpecSectionPlanPrompt, productSpecSectionImplementPrompt,
   projectSearchPlanPrompt, projectSearchImplementPrompt,
+  genericFallbackImplementPrompt,
 };
 
 if (require.main === module) {

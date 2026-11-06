@@ -818,3 +818,55 @@ test('deep_dive and arch_import prompts for agent-manager keep the agent-manager
   assert.match(archImportPlanPrompt(aiTask('agent-manager')), /agent-manager's own codebase/);
   assert.match(archImportImplementPrompt(aiTask('agent-manager'), 'PLAN'), /agent-manager's OWN repo/);
 });
+
+// 2026-11-03 needs-work-branches-keep-failing-the-same-way: genericFallbackImplementPrompt RULE about tests
+const { genericFallbackImplementPrompt } = require('./prompts.js');
+
+test('genericFallbackImplementPrompt RULE appears when prior verdict has "touches no test" reason', () => {
+  const task = {
+    promptContext: {
+      priorVerdict: {
+        verdict: 'needs-work',
+        reasons: ['touches no test: the branch changes code but does not include test changes']
+      }
+    }
+  };
+  const prompt = genericFallbackImplementPrompt(task, 'PLAN TEXT');
+  assert.match(prompt, /RULE:/);
+  assert.match(prompt, /touches no test/i);
+  assert.match(prompt, /test changes/i);
+});
+
+test('genericFallbackImplementPrompt RULE always appears (test requirement is now mandatory)', () => {
+  const task = {
+    promptContext: {}
+  };
+  const prompt = genericFallbackImplementPrompt(task, 'PLAN TEXT');
+  // The RULE about tests is now always included, not just on prior rejection
+  assert.match(prompt, /RULE:/);
+  assert.match(prompt, /test changes/i);
+});
+
+test('genericFallbackImplementPrompt RULE appears when prior rejection feedback mentions "touches no test"', () => {
+  const task = {
+    priorRejectionFeedback: ['This attempt touches no test and was rejected.']
+  };
+  const prompt = genericFallbackImplementPrompt(task, 'PLAN TEXT');
+  assert.match(prompt, /RULE:/);
+  assert.match(prompt, /touches no test/i);
+});
+
+test('genericFallbackImplementPrompt RULE always appears even with other prior verdict reasons', () => {
+  const task = {
+    promptContext: {
+      priorVerdict: {
+        verdict: 'needs-work',
+        reasons: ['wrong approach', 'missed the acceptance criteria']
+      }
+    }
+  };
+  const prompt = genericFallbackImplementPrompt(task, 'PLAN TEXT');
+  // The RULE about tests is now always included
+  assert.match(prompt, /RULE:/);
+  assert.match(prompt, /test changes/i);
+});

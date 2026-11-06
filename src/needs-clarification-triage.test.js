@@ -558,6 +558,40 @@ test('bucket E: DRY_RUN=1 reports but does not move the file', async () => {
   } finally { delete process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN; }
 });
 
+test('decompose-loop flag, Files: path nonexistent -> ncTriageDecision: decompose-loop-premise-invalid, left in place', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tdecomp-nonexist', {
+    stalenessFlag: { reason: 'decompose-loop' },
+    files: ['python/dashboard/app.py'],
+    promptContext: { rawText: 'Decompose python/dashboard/app.py -- it is too large to split in one pass.' },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.checked, 1);
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tdecomp-nonexist.json')));
+  const t = read(at(dir, 'needs-clarification', 'tdecomp-nonexist.json'));
+  assert.equal(t.ncTriageDecision, 'decompose-loop-premise-invalid');
+  assert.ok(t.history.some((h) => /decompose-loop-premise-invalid/.test(h.detail || '')));
+});
+
+test('decompose-loop flag, Files: path exists -> requeued to adhoc/ (bucket E)', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(path.join(dir, 'python', 'dashboard'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'python', 'dashboard', 'app.py'), '// dummy');
+  held(dir, baseTask('tdecomp-exist', {
+    stalenessFlag: { reason: 'decompose-loop' },
+    files: ['python/dashboard/app.py'],
+    promptContext: { rawText: 'Decompose python/dashboard/app.py -- it is too large to split in one pass.' },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.checked, 1);
+  assert.equal(s.requeued, 1);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tdecomp-exist.json')));
+  assert.ok(exists(at(dir, 'adhoc', 'tdecomp-exist.json')));
+  const moved = read(at(dir, 'adhoc', 'tdecomp-exist.json'));
+  assert.equal(moved.ncTriageBucketAttempts.E, 1);
+});
+
 // Real corpus text, 2026-09-07: adhoc-extract-29-functions-to-analytics-and-discovery-js
 // wrote a complete extraction script, ran out of turn/context budget before running it,
 // and explicitly disclaimed any design uncertainty -- but sailed past CREATE_TASK_RE into

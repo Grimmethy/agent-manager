@@ -49,6 +49,15 @@ class Endpoint(unittest.TestCase):
         self.assertEqual((body["verdict"], body["stale"], body["headSha"]), ("merge", False, "sha-A"))
         self.assertEqual(bv.get_verdict(self.q, "agent/t1", "sha-A")["verdict"], "merge")
 
+    def test_worker_source_is_accepted_through_the_endpoint_but_a_human_verdict_for_the_same_head_is_kept(self):
+        r = self.post({"verdict": "needs-work", "reasons": ["Automated check: 1 touched test fails"], "source": "worker"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(bv.get_verdict(self.q, "agent/t1", "sha-A")["source"], "worker")
+        self.post({"verdict": "merge", "reasons": ["I read it"], "source": "manual"})
+        self.post({"verdict": "needs-work", "reasons": ["Automated check again"], "source": "worker"})
+        got = bv.get_verdict(self.q, "agent/t1", "sha-A")
+        self.assertEqual((got["verdict"], got["source"]), ("merge", "manual"))
+
     def test_unknown_verdict_is_400(self):
         self.assertEqual(self.post({"verdict": "ship-it", "reasons": [], "source": "manual"}).status_code, 400)
 

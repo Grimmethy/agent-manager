@@ -181,6 +181,53 @@ test('an exception inside verification is inconclusive and still cleans up', () 
   assert.equal(f.calls.cleanup, 1);
 });
 
+// --- checkTestPinning tests --------------------------------------------------------------------------------
+const { checkTestPinning } = require('./review-verify.js');
+
+test('checkTestPinning: test-only diff with tests passing on base returns tests-passing-on-base', () => {
+  const result = checkTestPinning({
+    srcFiles: [],
+    testFiles: ['src/a.test.js'],
+    testsPassedOnBase: true,
+    testsFailedOnBase: false,
+    rawDiff: 'diff --git a/src/a.test.js b/src/a.test.js',
+  });
+  assert.equal(result, 'tests-passing-on-base');
+});
+
+test('checkTestPinning: test-only diff with tests failing on base returns tests-failing-on-base', () => {
+  const result = checkTestPinning({
+    srcFiles: [],
+    testFiles: ['src/a.test.js'],
+    testsPassedOnBase: false,
+    testsFailedOnBase: true,
+    rawDiff: 'diff --git a/src/a.test.js b/src/a.test.js',
+  });
+  assert.equal(result, 'tests-failing-on-base');
+});
+
+test('checkTestPinning: diff with refactor in header returns header-with-keyword', () => {
+  const result = checkTestPinning({
+    srcFiles: ['src/a.js'],
+    testFiles: ['src/a.test.js'],
+    testsPassedOnBase: true,
+    testsFailedOnBase: false,
+    rawDiff: 'refactor: clean up a.js',
+  });
+  assert.equal(result, 'header-with-keyword');
+});
+
+test('checkTestPinning: diff with production changes and tests passing on base returns tests-passing-on-base', () => {
+  const result = checkTestPinning({
+    srcFiles: ['src/a.js'],
+    testFiles: ['src/a.test.js'],
+    testsPassedOnBase: true,
+    testsFailedOnBase: false,
+    rawDiff: 'diff --git a/src/a.js b/src/a.js',
+  });
+  assert.equal(result, 'tests-passing-on-base');
+});
+
 // --- real integration: real git worktree + real bwrap sandbox ------------------------------------------
 const HAVE_BWRAP = wrapWithSandbox('true', [], { workDir: '/tmp', readOnlyBinds: [], writableBinds: [], env: {} }).available;
 
