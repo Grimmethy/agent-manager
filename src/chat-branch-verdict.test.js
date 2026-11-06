@@ -299,3 +299,109 @@ test('the refusal reads cleanly when a red entry has no summary and when several
   assert.equal(text.ok, false);
   assert.match(text.error, /ran no tests \(no reason given\)/);
 });
+
+// --- read-back verification: after a successful POST, re-fetch and compare ---
+
+// A fake dashboard that can return different rows for different GET calls (for read-back tests).
+function fakeDashboardWithReadBack({ rows = [row()], post = { status: 200, json: { succeeded: true, written: true, headSha: SHA, verdict: 'merge' } }, listStatus = 200, reFetchRows = null, reFetchError = null } = {}) {
+  const calls = [];
+  let getCallCount = 0;
+  const request = async (method, url, body) => {
+    calls.push({ method, url, body });
+    if (method === 'GET') {
+      getCallCount += 1;
+      if (getCallCount === 1) {
+        // Initial listing
+        if (listStatus !== 200) return { status: listStatus, json: null };
+        return { status: 200, json: rows };
+      }
+      // Re-fetch after POST
+      if (reFetchError) throw reFetchError;
+      if (reFetchRows === undefined) return { status: 200, json: rows }; // default: same rows
+      return { status: 200, json: reFetchRows };
+    }
+    if (post instanceof Error) throw post;
+    return post;
+  };
+  return { request, calls };
+}
+
+test('record_branch_verdict: verified true when the read-back matches', async () => {
+  const listedRow = row({ verdict: 'merge', headSha: SHA });
+  const d = fakeDashboardWithReadBack({ rows: [listedRow], reFetchRows: [listedRow] });
+  const out = await recordBranchVerdictTool({ branch: 'agent/one', sha: SHA, verdict: 'merge', reasons: ['x'] }, { request: d.request, ...withCheck() });
+  assert.equal(out.ok, true);
+  assert.equal(out.verified, true);
+  assert.equal(out.shownVerdict, 'merge');
+  assert.equal(out.shownSha, SHA);
+  assert.match(out.message, /recorded and read back/i);
+  assert.equal(d.calls.filter((c) => c.method === 'GET').length, 2); // initial + re-fetch
+});
+
+test('record_branch_verdict: verified false when the verdict does not match', async () => {
+  const listedRow = row({ verdict: 'squash', headSha: SHA });
+  const d = fakeDashboardWithReadBack({ rows: [listedRow], reFetchRows: [listedRow] });
+  const out = await recordBranchVerdictTool({ branch: 'agent/one', sha: SHA, verdict: 'merge', reasons: ['x'] }, { request: d.request, ...withCheck() });
+  assert.equal(out.ok, true);
+  assert.equal(out.verified, false);
+  assert.equal(out.shownVerdict, 'squash');
+  assert.match(out.message, /does not show it yet/);
+});
+
+test('record_branch_verdict: verified false when the sha does not match', async () => {
+  // Initial listing must match the passed sha (else the head-moved guard fires before POST).
+  // The read-back returns a different headSha to trigger the mismatch.
+  const initialRow = row({ verdict: 'merge', headSha: SHA });
+  const reFetchRow = row({ verdict: 'merge', headSha: 'b'.repeat(40) });
+  const d = fakeDashboardWithReadBack({ rows: [initialRow], reFetchRows: [reFetchRow] });
+  const out = await recordBranchVerdictTool({ branch: 'agent/one', sha: SHA, verdict: 'merge', reasons: ['x'] }, { request: d.request, ...withCheck() });
+  assert.equal(out.ok, true);
+  assert.equal(out.verified, false);
+  assert.equal(out.shownSha, 'b'.repeat(40));
+  assert.match(out.message, /does not show it yet/);
+});
+
+test('record_branch_verdict: verified false when the listing throws after a successful POST', async () => {
+  const d = fakeDashboardWithReadBack({ reFetchError: new Error('ECONNRESET') });
+  const out = await recordBranchVerdictTool({ branch: 'agent/one', sha: SHA, verdict: 'merge', reasons: ['x'] }, { request: d.request, ...withCheck() });
+  assert.equal(out.ok, true);
+  assert.equal(out.verified, false);
+  assert.match(out.message, /does not show it yet/);
+  assert.match(out.message, /ECONNRESET/);
+});
+
+test('record_branch_verdict: verified false when the branch is no longer on the listing after a successful POST', async () => {
+  const d = fakeDashboardWithReadBack({ reFetchRows: [] });
+  const out = await recordBranchVerdictTool({ branch: 'agent/one', sha: SHA, verdict: 'merge', reasons: ['x'] }, { request: d.request, ...withCheck() });
+  assert.equal(out.ok, true);
+  assert.equal(out.verified, false);
+  assert.match(out.message, /does not show it yet/);
+});
+
+test('record_branch_verdict: pending path skips the read-back and reports pending', async () => {
+  const d = fakeDashboardWithReadBack({ post: { status: 200, json: { succeeded: true, pending: true, headSha: SHA } } });
+  const out = await recordBranchVerdictTool({ branch: 'agent/one', sha: SHA, verdict: 'needs-work', reasons: ['x'] }, { request: d.request });
+  assert.equal(out.ok, true);
+  assert.equal(out.pending, true);
+  assert.equal(out.verified, false);
+  assert.match(out.message, /pending/i);
+  assert.equal(d.calls.filter((c) => c.method === 'GET').length, 1); // only initial, no re-fetch
+});
+
+test('record_branch_verdict: 409 and refusal paths are unchanged (no read-back attempted)', async () => {
+  const moved = fakeDashboardWithReadBack({ post: { status: 409, json: { succeeded: false, reason: 'verdict is for an older commit; the branch head has moved', headSha: 'd'.repeat(40) } } });
+  const a = await recordBranchVerdictTool({ branch: 'agent/one', sha: SHA, verdict: 'merge', reasons: ['x'] }, { request: moved.request, ...withCheck() });
+  assert.equal(a.ok, false);
+  assert.equal(a.status, 409);
+  assert.match(a.error, /branch head has moved/);
+  assert.equal(a.headSha, 'd'.repeat(40));
+  assert.equal(moved.calls.filter((c) => c.method === 'GET').length, 1); // only initial, no re-fetch
+});
+
+test('record_branch_verdict: refusal path is unchanged (no read-back attempted)', async () => {
+  const html404 = fakeDashboardWithReadBack({ post: { status: 404, json: null } });
+  const b = await recordBranchVerdictTool({ branch: 'agent/one', sha: SHA, verdict: 'merge', reasons: ['x'] }, { request: html404.request, ...withCheck() });
+  assert.match(b.error, /HTTP 404/);
+  assert.equal(b.ok, false);
+  assert.equal(html404.calls.filter((c) => c.method === 'GET').length, 1); // only initial, no re-fetch
+});
