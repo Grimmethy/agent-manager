@@ -543,68 +543,24 @@ function checkFailsOnBase({ worktreeDir, rawDiff, suites, run, d, deadline, py, 
 // Uses parseModifiedHunks to extract hunks, unapplyDiff to revert production changes, and runs the suites on the reverted tree.
 const TEST_PINNING_MIN_REMAINING_MS = 20000;
 
-function checkTestPinning({ worktreeDir, rawDiff, suites, run, d, deadline, py, repoRoot, isRefactor }) {
-  const skip = (reason) => ({ ran: false, reason });
-  const parts = splitDiffFiles(rawDiff);
-  const testParts = parts.filter((p) => isTestFile(p.file));
-  const prodParts = parts.filter((p) => !isTestFile(p.file));
-  if (!testParts.length) return skip('the diff adds no test');
-  if (!prodParts.length) return skip('the diff has no production change to revert');
-  if (deadline - Date.now() < TEST_PINNING_MIN_REMAINING_MS) return skip('not enough review budget left');
-  
-  // Build patch of production changes to revert
-  const prodPatch = prodParts.map((p) => p.text).join('');
-  const reverted = d.unapplyDiff(worktreeDir, prodPatch);
-  if (!reverted || !reverted.applied) return skip(`could not revert production changes (${String((reverted && reverted.reason) || 'unknown').slice(0, 120)})`);
-  
-  let result;
-  try {
-    const exec = (bin, args, timeoutMs, cwd) => run({ worktreeDir, bin, args, timeoutMs: Math.min(timeoutMs, deadline - Date.now()), pythonBin: py, mainRepoRoot: repoRoot, ...(cwd ? { cwd } : {}) });
-    
-    // Check that reverted code still parses
-    for (const p of prodParts) {
-      if (p.isDeleted || !/\.py|[cm]?js$/i.test(p.file)) continue;
-      const syn = p.file.endsWith('.py') ? exec('python', ['-m', 'py_compile', p.file], COMMAND_TIMEOUT_MS) : exec('node', ['--check', p.file], COMMAND_TIMEOUT_MS);
-      if (!syn || !syn.ran || syn.timedOut || syn.exitCode !== 0) { result = skip(`${p.file} does not parse with production changes reverted`); break; }
-    }
-    
-    if (!result) {
-      // Run test suites on reverted code
-      const touched = new Set(testParts.map((p) => p.file));
-      const runnable = (suites || []).map((s) => ({ s, files: s.files.filter((f) => touched.has(f)) })).filter((x) => x.files.length);
-      
-      if (!runnable.length) {
-        result = skip('no runner for the tests the diff touches');
-      } else {
-        let allPass = true;
-        const passedFiles = [];
-        for (const { s, files } of runnable) {
-          for (const file of files) {
-            const r = exec(s.bin, s.buildArgs([file]), TEST_TIMEOUT_MS, s.cwd);
-            if (!r || !r.ran || r.timedOut) { result = skip(`test ${file} could not run on reverted tree`); allPass = false; break; }
-            if (r.exitCode !== 0) { allPass = false; break; }
-            passedFiles.push(file);
-          }
-          if (!allPass) break;
-        }
-        
-        if (!result && allPass) {
-          // Tests pass on base - they're not pinned to the production change
-          result = {
-            ran: true,
-            blockedTests: isRefactor ? undefined : passedFiles,
-            advisoryTests: isRefactor ? passedFiles : undefined,
-          };
-        } else if (!result) {
-          result = { ran: true, blockedTests: [], advisoryTests: [] };
-        }
-      }
-    }
-  } finally {
-    const back = d.applyDiff(worktreeDir, prodPatch);
-    if (!back || !back.applied) return null;
+function checkTestPinning({ srcFiles, testFiles, testsPassedOnBase, testsFailedOnBase, rawDiff }) {
+  // Check for refactor keywords in the rawDiff header (first 5 lines, case-insensitive)
+  const header = String(rawDiff || '').split('\n').slice(0, 5).join('\n');
+  if (/refactor/i.test(header)) {
+    return 'header-with-keyword';
   }
-  return result;
+  
+  // If only test files changed (srcFiles is empty)
+  if (!srcFiles || srcFiles.length === 0) {
+    if (testsPassedOnBase) return 'tests-passing-on-base';
+    if (testsFailedOnBase) return 'tests-failing-on-base';
+    return 'unknown';
+  }
+  
+  // If both src and test files present
+  if (testsPassedOnBase) return 'tests-passing-on-base';
+  if (testsFailedOnBase) return 'tests-failing-on-base';
+  return 'unknown';
 }
 
 // Two evidence tiers for the covering tests. PRIMARY = the test files the diff itself changes plus the co-located test of each changed
