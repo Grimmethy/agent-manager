@@ -718,7 +718,13 @@ function summariseUnpinned(u) {
 }
 
 // The block reason doubles as the redraft feedback (reject-retry-check hands blockedReason back to the drafter), so it names what failed.
-function executedVerificationBlockReason(ev) {
+function executedVerificationBlockReason(ev, options = {}) {
+  const mode = options.mode || 'block';
+  const isTestOnlyDiff = !!options.isTestOnlyDiff;
+  // Refactor escape: a test-only diff should never be blocked by test pinning.
+  if (isTestOnlyDiff) return null;
+  // Advisory mode: downgrade test-pinning failures to evidence for the voters.
+  if (mode === 'advisory') return null;
   const bits = [];
   if (ev.tests && ev.tests.passed === false) {
     const names = (ev.tests.failures || []).slice(0, 5).join('; ');
@@ -1526,18 +1532,51 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       }
       // Test pinning check: if the covering tests pass on the base without the diff, the diff is unnecessary.
       // Mode 'block' blocks; any other mode (default: advisory) downgrades to evidence for the voters.
+      // Refactor escape: when the diff only touches test files, downgrade to advisory regardless of mode.
       if (ev.blockedTests && Array.isArray(ev.blockedTests) && ev.blockedTests.length) {
         const pinningMode = process.env.AGENT_MANAGER_REVIEW_TEST_PINNING_MODE || 'advisory';
-        if (pinningMode === 'block') {
-          const reason = `Deterministic gate: test pinning failed -- the covering tests pass on the base (${ev.blockedTests.length} test(s) unverified), so the diff is unnecessary. Either the diff does not change behavior, or it is a refactor that should not be merged until the tests are pinned to the new behavior.`;
+        // Compute isTestOnlyDiff: check if all changed files are test files
+        const diff = extractTaskDiff(task);
+        let isTestOnlyDiff = false;
+        if (diff && typeof diff === 'string' && diff.trim()) {
+          // Extract file paths from diff (diff --git a/path b/path)
+          const filePaths = [];
+          const diffRegex = /diff --git a\/(.+?) b\/(.+?)$/gm;
+          let match;
+          while ((match = diffRegex.exec(diff)) !== null) {
+            const oldPath = match[1];
+            const newPath = match[2];
+            if (oldPath) filePaths.push(oldPath);
+            if (newPath && newPath !== oldPath) filePaths.push(newPath);
+          }
+          // If no diff header matches, try to extract from other patterns
+          if (filePaths.length === 0 && diff) {
+            // Fallback: look for file paths in the diff
+            const pathRegex = /(?:--- a\/|\+\+\+ b\/)(.+?)$/gm;
+            while ((match = pathRegex.exec(diff)) !== null) {
+              filePaths.push(match[1]);
+            }
+          }
+          // Check if all files are test files
+          if (filePaths.length > 0) {
+            const testPattern = /(^|\/)(test|spec|tests|__tests__)(\/|$)|(\.test\.|\.spec\.)/i;
+            isTestOnlyDiff = filePaths.every((fp) => testPattern.test(fp));
+          }
+        }
+        const reason = executedVerificationBlockReason(ev, { mode: pinningMode, isTestOnlyDiff });
+        if (reason) {
+          // Block path
           task.reviewProvider = 'deterministic-test-pinning';
           recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
           appendHistoryEvent(task, 'blocked', reason);
           return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
         } else {
-          // Advisory: add to the evidence set for the voters
+          // Advisory path (pinningMode !== 'block' OR refactor escape)
           task.testPinningAdvisory = ev.blockedTests;
-          appendHistoryEvent(task, 'advisory', `test pinning: ${ev.blockedTests.length} test(s) unverified (advisory, not blocking)`);
+          const advisoryMsg = isTestOnlyDiff
+            ? `test pinning: ${ev.blockedTests.length} test(s) unverified (refactor escape: test-only diff)`
+            : `test pinning: ${ev.blockedTests.length} test(s) unverified (advisory)`;
+          appendHistoryEvent(task, 'advisory', advisoryMsg);
         }
       }
       if (ev.status === 'failed') {
