@@ -179,6 +179,21 @@ const { resolveKeepAlive, NEVER_EXPIRE } = require('./keep-alive.js');
 const { ensureResident } = require('./model-resident.js');
 const KEEP_ALIVE = resolveKeepAlive(process.env.LOCAL_KEEP_ALIVE, process.env.ORNITH_KEEP_ALIVE);
 
+// 2026-11-07 (owner: never unload, never swap a model). Ollama restarts its runner -- a full reload of the 21 GB model -- whenever a request's num_ctx
+// differs from the loaded one. Three checks sent a small hardcoded 8192 (candidate-premise-check, deep-dive-grounding-check, plan-critique) and
+// each use cost two reloads. A caller-supplied numCtx that is not the pipeline's pinned value is therefore ignored here, once-per-(source, value)
+// warning; AGENT_MANAGER_ALLOW_CALLER_NUM_CTX=1 restores caller control (A/B eval work that really wants another context).
+const warnedNumCtx = new Set();
+function pinNumCtx(callerNumCtx, pinned, source) {
+  if (!callerNumCtx || callerNumCtx === pinned || process.env.AGENT_MANAGER_ALLOW_CALLER_NUM_CTX === '1') return callerNumCtx || pinned;
+  const key = `${source || 'none'}|${callerNumCtx}`;
+  if (!warnedNumCtx.has(key)) {
+    warnedNumCtx.add(key);
+    console.warn(`[local-client] ignoring numCtx=${callerNumCtx} from source=${source || 'none'}: a different context restarts the model runner; using ${pinned}`);
+  }
+  return pinned;
+}
+
 function detectDegenerate(text, { allowEmpty = false, doneReason, isDraft = false } = {}) {
   // 2026-09-05, Grimmethy: root-caused a whole cluster of blocked pipeline_forensics_fix
   // tasks (AC-4/6/8/20) whose PLAN pass came back non-empty, real-looking, non-degenerate
@@ -339,7 +354,7 @@ async function callOnce({ prompt, images, think = true, temperature = 0.4, numCt
     }
   }
 
-  const resolvedNumCtx = numCtx || gpuCapacity.resolveNumCtx({ estimatedTokens: promptTokens, numPredict });
+  const resolvedNumCtx = pinNumCtx(numCtx, gpuCapacity.resolveNumCtx({ estimatedTokens: promptTokens, numPredict }), source);
 
   const options = { num_ctx: resolvedNumCtx, num_predict: numPredict, temperature };
   if (repeatPenalty) options.repeat_penalty = repeatPenalty;
