@@ -433,6 +433,27 @@ test('maxPerRow is ignored for the left-to-right layout and for anything but a w
   });
 });
 
+test("a wrapped layer starts a new row where the group changes, so a row never mixes two groups", () => {
+  const ids = ['a1', 'a2', 'a3', 'b1', 'b2', 'b3', 'c1'];
+  const nodes = ids.map((id) => ({ id, parent: id[0] === 'c' ? null : 'group:' + id[0] }));
+  const groups = [{ id: 'group:a', label: 'A', children: ['a1', 'a2', 'a3'], collapsed: false }, { id: 'group:b', label: 'B', children: ['b1', 'b2', 'b3'], collapsed: false }];
+  const r = layoutGraph({ nodes, edges: [], groups }, { direction: 'down', maxPerRow: 2 });
+  const rowsOf = {};
+  ids.forEach((id) => { (rowsOf[r.positions[id].y] = rowsOf[r.positions[id].y] || []).push(id); });
+  const rows = Object.keys(rowsOf).map(Number).sort((x, y) => x - y).map((y) => rowsOf[y].sort());
+  assert.deepEqual(rows, [['a1', 'a2'], ['a3'], ['b1', 'b2'], ['b3'], ['c1']], 'rows of A, A, B, B, then the ungrouped one');
+  assert.equal(new Set(Object.values(r.positions).map((p) => p.y)).size, 5);
+});
+
+test("without groups a wrapped layer fills rows exactly as before, and a group that fits stays on one row", () => {
+  const ids = ['x1', 'x2', 'x3', 'x4', 'x5'];
+  const plain = layoutGraph({ nodes: ids.map((id) => ({ id })), edges: [] }, { direction: 'down', maxPerRow: 2 });
+  assert.deepEqual([...new Set(ids.map((id) => plain.positions[id].y))].sort((a, b) => a - b), [0, STEP_Y, STEP_Y * 2]);
+  const nodes = ids.map((id) => ({ id, parent: 'group:g' }));
+  const one = layoutGraph({ nodes, edges: [], groups: [{ id: 'group:g', label: 'G', children: ids, collapsed: false }] }, { direction: 'down', maxPerRow: 5 });
+  assert.equal(new Set(ids.map((id) => one.positions[id].y)).size, 1, 'one group, five per row, one row');
+});
+
 test("wrapped rows stay multiples of 4, never overlap, and a cycle still terminates", () => {
   const g = wide(9);
   g.edges.push(E(['lane', 's00'])[0]);
