@@ -210,11 +210,7 @@ const LOW_CONFIDENCE_GROUNDING_NOTE = '[LOW-CONFIDENCE GROUNDING: no reliable an
 //   REJECTED   -> { archiveReason }                      (snippet nowhere; the lifecycle
 //                files the candidate straight to done/_archived_no_action/ and moves on)
 function validateCitationBeforeFiling(ctx) {
-  // Always-on: the gate's own early returns (no files, no Snippet) short-circuit safely
-  // for sources that don't carry a Snippet field. Keeping the gate off for "most" sources
-  // via a hardcoded allowlist would require every plugin registration to opt in (ADR-0022
-  // Stage A pattern), but the plugin repo is read-only and the gate is cheap -- just drop
-  // the source-name check entirely. Core no longer names plugin-owned task sources here.
+  // Gate is safe for all sources via early returns; source-name check removed per ADR-0022.
   const section = ctx && ctx.section;
   const listed = ((ctx && ctx.files) || []).filter((p) => typeof p === 'string' && p.length);
   if (!listed.length) return null; // no cited path to validate against
