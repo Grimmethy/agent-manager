@@ -315,26 +315,6 @@ function wfToggleSources(loopId, main) {
   wfDraw(main);
 }
 
-// Scale every card's canvas to fit its body (never above 1, never below WF_MIN_SCALE; below that the body scrolls). The wrapper takes the scaled size so the scroll area matches what is drawn.
-function wfFitCards(main) {
-  main.querySelectorAll('.wf-card').forEach((card) => {
-    const body = card.querySelector('.wf-card-body');
-    const wrap = card.querySelector('.wf-scale');
-    const canvas = card.querySelector('.wf-canvas');
-    if (!body || !wrap || !canvas) return;
-    const w = Number(canvas.dataset.w);
-    const h = Number(canvas.dataset.h);
-    const cs = typeof getComputedStyle === 'function' ? getComputedStyle(body) : null;
-    const pad = (a, b) => (cs ? (parseFloat(cs[a]) || 0) + (parseFloat(cs[b]) || 0) : 0);
-    const s = fitScaleForCard(w, h, body.clientWidth - pad('paddingLeft', 'paddingRight'), body.clientHeight - pad('paddingTop', 'paddingBottom'), WF_MIN_SCALE);
-    canvas.style.transformOrigin = '0 0';
-    canvas.style.transform = s < 1 ? 'scale(' + s + ')' : '';
-    wrap.style.width = Math.ceil(w * s) + 'px';
-    wrap.style.height = Math.ceil(h * s) + 'px';
-    card.dataset.scale = String(s);
-  });
-}
-
 if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
   window.addEventListener('resize', () => {
     const main = typeof document !== 'undefined' ? document.getElementById('main') : null;

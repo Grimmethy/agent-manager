@@ -6,6 +6,8 @@
 // The 'claims' edges join almost every source to almost every lane, so connected components would give one big blob; a lane is the unit that reads as a loop.
 
 const WF_MIN_SCALE = 0.5;
+// The narrowest a loop card gets on a wide screen: wide enough for its head (lane title, Show/Hide sources button, 'n of m').
+const WF_CARD_MIN_W = 300;
 
 function wfIsLaneNode(node, reviewTargets) {
   return !!node && node.kind === 'loop' && typeof node.id === 'string' && !reviewTargets.has(node.id) && !node.id.startsWith('reviewer');
@@ -73,4 +75,13 @@ function fitScaleForCard(contentW, contentH, viewW, viewH, minScale) {
   return fitScale(contentW, contentH, viewW, contentH, floor);
 }
 
-if (typeof module !== 'undefined') module.exports = { WF_MIN_SCALE, splitIntoLoops, fitScale, fitScaleForCard };
+// The width of a loop card on a wide screen: the drawing's width plus `extra` (body padding, borders, a scrollbar allowance), never below minW (default WF_CARD_MIN_W)
+// and never above rowW (the row the cards sit in). A missing or non-finite rowW means no upper limit; a bad canvasW or extra counts as 0; never NaN.
+function cardWidthFor(canvasW, rowW, extra, minW) {
+  const pos = (n) => Number.isFinite(n) && n > 0;
+  const min = pos(minW) ? minW : WF_CARD_MIN_W;
+  const want = Math.max(min, (pos(canvasW) ? Math.ceil(canvasW) : 0) + (Number.isFinite(extra) && extra > 0 ? extra : 0));
+  return pos(rowW) ? Math.min(want, Math.floor(rowW)) : want;
+}
+
+if (typeof module !== 'undefined') module.exports = { WF_MIN_SCALE, WF_CARD_MIN_W, splitIntoLoops, fitScale, fitScaleForCard, cardWidthFor };
