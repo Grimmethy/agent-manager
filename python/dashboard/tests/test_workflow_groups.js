@@ -461,3 +461,89 @@ test("groupBoxes with direction 'down' draws one box per row, counted from the t
   assert.deepEqual(cols[0], { id: 'group:a', label: 'A', x: -12, y: -40, w: 296, h: 310, part: 0 });
   assert.deepEqual(groupBoxes(graph, positions, size, 12, 'sideways'), cols);
 });
+
+// ---- collapseLoopSources (graph readability pass 2): a big loop's sources become one group card ----
+const srcN = (i) => node('source:s' + String(i).padStart(2, '0'), 'source', null, { counts: { pending: i % 3, drafting: 1 } });
+const bigLoop = (n, groups) => {
+  const sources = Array.from({ length: n }, (_, i) => srcN(i));
+  return {
+    id: 'worker-1', label: 'ornith:35b',
+    graph: {
+      nodes: [...sources, node('worker-1', 'loop', 'working'), node('reviewer', 'loop', 'idle'), node('service:apply-loop', 'service')],
+      edges: [...sources.map((s) => edge(s.id, 'worker-1', 'claims')), edge('worker-1', 'reviewer', 'reviews'), edge('reviewer', 'service:apply-loop', 'applies')],
+      groups: groups || [], warnings: [],
+    },
+  };
+};
+
+test('more than six sources become ONE group card with the summed counts and re-pointed edges', () => {
+  const r = v.collapseLoopSources(bigLoop(7), 6, false);
+  assert.equal(r.collapsed, true);
+  assert.equal(r.collapsible, true);
+  assert.equal(r.count, 7);
+  assert.equal(r.groupId, 'group:sources:worker-1');
+  assert.deepEqual(plain(r.graph.nodes.map((n) => n.id).sort()), ['group:sources:worker-1', 'reviewer', 'service:apply-loop', 'worker-1']);
+  const g = r.graph.nodes.find((n) => n.id === 'group:sources:worker-1');
+  assert.equal(g.kind, 'group');
+  assert.equal(g.label, '7 sources');
+  assert.equal(g.memberCount, 7);
+  assert.equal(g.counts.drafting, 7);
+  assert.equal(g.counts.pending, [0, 1, 2, 0, 1, 2, 0].reduce((a, b) => a + b, 0));
+  const claims = r.graph.edges.filter((e) => e.kind === 'claims');
+  assert.deepEqual(plain(claims.map((e) => [e.from, e.to])), [['group:sources:worker-1', 'worker-1']], 'seven edges became one');
+  assert.equal(r.graph.edges.length, 3);
+});
+
+test('six sources or fewer are left exactly as they are', () => {
+  const loop = bigLoop(6);
+  const r = v.collapseLoopSources(loop, 6, false);
+  assert.equal(r.collapsed, false);
+  assert.equal(r.collapsible, false);
+  assert.equal(r.count, 6);
+  assert.equal(r.graph, loop.graph, 'the same graph object comes back');
+  assert.equal(v.collapseLoopSources(bigLoop(0), 6, false).count, 0);
+});
+
+test('expanded keeps every source, and the loop stays collapsible so the card can offer Hide', () => {
+  const loop = bigLoop(9);
+  const r = v.collapseLoopSources(loop, 6, true);
+  assert.equal(r.collapsed, false);
+  assert.equal(r.collapsible, true);
+  assert.equal(r.graph, loop.graph);
+  assert.equal(r.count, 9);
+  assert.equal(r.groupId, null);
+});
+
+test('authored groups lose the collapsed sources and are dropped when nothing else is left in them', () => {
+  const loop = bigLoop(8, [
+    grp('group:intake', Array.from({ length: 8 }, (_, i) => 'source:s' + String(i).padStart(2, '0'))),
+    grp('group:mixed', ['source:s00', 'worker-1', 'reviewer']),
+    grp('group:gpu', ['worker-1']),
+  ]);
+  const r = v.collapseLoopSources(loop, 6, false);
+  const ids = plain(r.graph.groups.map((x) => x.id));
+  assert.deepEqual(ids, ['group:mixed', 'group:gpu'], 'the all-source group is gone; the sources group is a node now, not a box');
+  assert.ok(r.graph.nodes.some((n) => n.id === 'group:sources:worker-1' && n.kind === 'group'));
+  assert.deepEqual(plain(r.graph.groups.find((x) => x.id === 'group:mixed').children), ['worker-1', 'reviewer']);
+});
+
+test('collapseLoopSources does not mutate its input and a bad max falls back to six', () => {
+  const loop = bigLoop(8, [grp('group:intake', ['source:s00', 'source:s01'])]);
+  const copy = JSON.parse(JSON.stringify(loop));
+  v.collapseLoopSources(loop, 6, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(loop)), copy);
+  [0, -1, 1.5, NaN, undefined, null, 'x'].forEach((bad) => {
+    assert.equal(v.collapseLoopSources(bigLoop(7), bad, false).collapsed, true, String(bad));
+    assert.equal(v.collapseLoopSources(bigLoop(6), bad, false).collapsed, false, String(bad));
+  });
+  assert.equal(v.collapseLoopSources(bigLoop(3), 2, false).collapsed, true, 'a smaller max is honoured');
+});
+
+test('collapseLoopSources never throws on garbage', () => {
+  [null, undefined, {}, { graph: null }, { graph: { nodes: 'x' } }, { id: 'a', graph: { nodes: [null, 3, { id: 7 }] } }].forEach((x) => {
+    const r = v.collapseLoopSources(x, 6, false);
+    assert.equal(r.collapsed, false);
+    assert.equal(r.collapsible, false);
+  });
+  assert.equal(v.collapseLoopSources({ id: 'a', graph: { nodes: [null, 3, { id: 7 }, { id: 'source:x', kind: 'source' }], edges: [] } }, 6, false).count, 1);
+});

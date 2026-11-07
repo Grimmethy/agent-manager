@@ -62,6 +62,28 @@ async function phoneChecks(browser, url, check) {
     check(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), 'the phone page does not scroll sideways');
     check(await page.evaluate(() => [...document.querySelectorAll('.wf-card')].every((c) => Number(c.dataset.scale) >= 0.5 && Number(c.dataset.scale) <= 1)), 'every card is scaled between 0.5 and 1');
     check(await page.evaluate(() => [...document.querySelectorAll('.wf-card-body')].every((b) => b.scrollWidth <= b.clientWidth + 1)), 'no card scrolls sideways inside itself');
+    // Readability pass 2: a big loop shows its sources as ONE group card, with a Show/Hide button; titles tell the lanes apart; a group header is drawn once.
+    check(await page.evaluate(() => [...document.querySelectorAll('.wf-card')].every((c) => c.querySelectorAll('.wf-node').length <= 12)), 'no card starts as a wall of nodes (a big loop is collapsed)');
+    check(await page.evaluate(() => [...document.querySelectorAll('.wf-card')].every((c) => { const t = [...c.querySelectorAll('.wf-node .id')].map((e) => e.textContent); return new Set(t).size === t.length; })), 'no two nodes on a card have the same title (worker and reviewer are told apart)');
+    const bigId = await page.evaluate(() => { const b = document.querySelector('.wf-sources-toggle'); return b ? b.dataset.loopId : null; });
+    if (bigId) {
+      const card = page.locator('.wf-card[data-loop-id="' + bigId + '"]');
+      const before = await card.locator('.wf-node').count();
+      const label = (await card.locator('.wf-sources-toggle').textContent()).trim();
+      check(/^Show \d+ sources$/.test(label), 'the big loop offers "' + label + '"');
+      check(await card.evaluate((c) => Number(c.dataset.scale) >= 0.6), 'the collapsed big loop is drawn at a readable size');
+      await card.locator('.wf-sources-toggle').click();
+      await page.waitForTimeout(600);
+      const after = await page.locator('.wf-card[data-loop-id="' + bigId + '"] .wf-node').count();
+      check(after > before + 6, 'Show sources reveals the sources (' + before + ' to ' + after + ' nodes)');
+      check((await page.locator('.wf-card[data-loop-id="' + bigId + '"] .wf-sources-toggle').textContent()).trim() === 'Hide sources', 'the button now says Hide sources');
+      check(await page.evaluate(() => [...document.querySelectorAll('.wf-card')].every((c) => { const ids = [...c.querySelectorAll('.wf-group-toggle')].map((b) => b.dataset.groupId); return new Set(ids).size === ids.length; })), 'a group header is drawn once, not on every row');
+      await page.locator('.wf-card[data-loop-id="' + bigId + '"] .wf-sources-toggle').click();
+      await page.waitForTimeout(600);
+      check((await page.locator('.wf-card[data-loop-id="' + bigId + '"] .wf-node').count()) === before, 'Hide sources collapses it again');
+    } else {
+      check(false, 'no loop card has a Show sources button (the scratch data should have a loop with more than 6 sources)');
+    }
     if (cards > 1) {
       await page.evaluate(() => { const row = document.getElementById('wf-surface'); row.scrollTo({ left: row.querySelectorAll('.wf-card')[1].offsetLeft - row.offsetLeft + 40, behavior: 'instant' }); });
       await page.waitForTimeout(900);

@@ -130,3 +130,27 @@ test('fitScale gives 1 for a bad size and the default minimum for a bad minimum'
   assert.equal(fitScale(4000, 4000, 400, 400, NaN), 0.5);
   assert.equal(fitScale(4000, 4000, 400, 400, -1), 0.5);
 });
+
+// ---- fitScaleForCard (graph readability pass 2): width-only scale when the card scrolls vertically anyway ----
+const { fitScaleForCard } = require(path.join(__dirname, '..', 'static', 'js', 'workflow-loops.js'));
+
+test('fitScaleForCard fits the whole loop while that stays above the minimum', () => {
+  assert.equal(fitScaleForCard(272, 560, 330, 470), fitScale(272, 560, 330, 470));
+  assert.equal(fitScaleForCard(272, 560, 330, 470).toFixed(3), '0.839');
+  assert.equal(fitScaleForCard(100, 100, 500, 500), 1);
+});
+
+test('a loop too tall for the minimum scales by width only, so a tall column stays readable', () => {
+  assert.equal(fitScale(272, 4160, 330, 600), 0.5, 'the old rule shrank it to the floor');
+  assert.equal(fitScaleForCard(272, 4160, 330, 600), 1);
+  assert.equal(fitScaleForCard(272, 4160, 200, 600).toFixed(3), '0.735');
+  assert.equal(fitScaleForCard(800, 4000, 400, 600), 0.5, 'width needs the floor too');
+  assert.equal(fitScaleForCard(2000, 4000, 400, 600), 0.5, 'never below the minimum');
+});
+
+test('fitScaleForCard honours a custom minimum and gives 1 for bad sizes', () => {
+  assert.equal(fitScaleForCard(272, 4160, 100, 600, 0.25).toFixed(4), '0.3676');
+  assert.equal(fitScaleForCard(272, 4160, 330, 600, 0.9), 1);
+  [[NaN, 100, 100, 100], [100, 0, 100, 100], [100, 100, -1, 100], [100, 100, 100, undefined]].forEach((a) => assert.equal(fitScaleForCard(...a), 1));
+  assert.equal(fitScaleForCard(4000, 4000, 400, 400, NaN), 0.5);
+});

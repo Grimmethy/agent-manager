@@ -64,4 +64,13 @@ function fitScale(contentW, contentH, viewW, viewH, minScale) {
   return Math.min(1, Math.max(Math.min(1, viewW / contentW, viewH / contentH), floor));
 }
 
-if (typeof module !== 'undefined') module.exports = { WF_MIN_SCALE, splitIntoLoops, fitScale };
+// The scale a loop card uses. fitScale (the whole loop in view) while that stays above the minimum; when the loop is too tall for that, the card scrolls vertically
+// anyway, so it is scaled by WIDTH only (min(1, viewW / contentW), never below the minimum) instead of being shrunk to the floor: a tall single column stays readable.
+function fitScaleForCard(contentW, contentH, viewW, viewH, minScale) {
+  const floor = Number.isFinite(minScale) && minScale > 0 ? minScale : WF_MIN_SCALE;
+  const whole = fitScale(contentW, contentH, viewW, viewH, floor);
+  if (whole > floor + 1e-9) return whole;
+  return fitScale(contentW, contentH, viewW, contentH, floor);
+}
+
+if (typeof module !== 'undefined') module.exports = { WF_MIN_SCALE, splitIntoLoops, fitScale, fitScaleForCard };

@@ -2,7 +2,7 @@
  *
  * layoutGraph(graph, opts) -> { positions: {id: {x, y}}, width, height, edges: [{id, points, back}] }
  * opts: nodeW, nodeH, gapX, gapY (numbers) and direction ('down' lays the layers out top to bottom; any other value is the left-to-right layout),
- * and for 'down' maxPerRow (a whole number of 1 or more: a layer with more nodes wraps into several rows; anything else means no limit).
+ * and for 'down' maxPerRow (a whole number of 1 or more: a layer with more nodes wraps into several rows, which never mix two groups; anything else means no limit).
  *
  * Only node.id and edge.id/from/to are read, so it works on the WorkflowGraph
  * contract and on any smaller object. It never throws: a bad input gives the
@@ -248,7 +248,16 @@
       if (down && o.maxPerRow > 0) {
         drawRows = [];
         rows.forEach(function (row) {
-          for (var from = 0; from < row.length; from += o.maxPerRow) drawRows.push(row.slice(from, from + o.maxPerRow));
+          // A wrapped row never mixes two groups: a new row starts where the (outermost) group changes, so every group is its own block and its box covers only its members.
+          var runs = [];
+          row.forEach(function (id) {
+            var last = runs[runs.length - 1];
+            if (last && last.key === keys[id]) last.ids.push(id);
+            else runs.push({ key: keys[id], ids: [id] });
+          });
+          runs.forEach(function (run) {
+            for (var from = 0; from < run.ids.length; from += o.maxPerRow) drawRows.push(run.ids.slice(from, from + o.maxPerRow));
+          });
           if (!row.length) drawRows.push(row);
         });
       }

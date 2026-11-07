@@ -11,7 +11,7 @@ const vm = require('vm');
 const JS = path.join(__dirname, '..', 'static', 'js');
 const ctx = vm.createContext({ console });
 ctx.window = ctx; // in a browser window is the global object, which is how workflow-layout.js publishes layoutGraph
-for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'workflow-layout.js', 'workflow-loops.js', 'workflow-drag.js', 'workflow-graph-view.js']) {
+for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'workflow-layout.js', 'workflow-loops.js', 'workflow-drag.js', 'workflow-groups.js', 'workflow-graph-view.js']) {
   vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
 }
 const v = ctx;
@@ -400,8 +400,9 @@ test('a layer with many sources wraps into columns that fit the screen, so a car
     g.edges.push({ id: id + '->worker-1:claims', from: id, to: 'worker-1', kind: 'claims', label: null });
   }
   const sizeOf = (html) => { const m = /class="wf-canvas" data-w="(\d+)" data-h="(\d+)"/.exec(cardsOf(html)[0]); return { w: Number(m[1]), h: Number(m[2]) }; };
-  const one = sizeOf(v.buildCardsHtml(g, { storage: null, maxPerRow: 1 }));
-  const four = sizeOf(v.buildCardsHtml(g, { storage: null, maxPerRow: 4 }));
+  const open = { 'worker-1': true }; // this is about the expanded layout: a big loop is collapsed by default
+  const one = sizeOf(v.buildCardsHtml(g, { storage: null, maxPerRow: 1, expandedSources: open }));
+  const four = sizeOf(v.buildCardsHtml(g, { storage: null, maxPerRow: 4, expandedSources: open }));
   assert.equal(one.w, 272, 'a phone gets one column');
   assert.ok(four.w <= 4 * 336, 'a desktop gets at most four');
   assert.ok(one.h > four.h, 'fewer columns make the card taller, not wider');
@@ -415,4 +416,90 @@ test('the column count follows the screen width: 1 on a phone, more on wider scr
   assert.equal(at(3000), 4);
   assert.equal(at(100), 1);
   assert.equal(v.wfMaxPerRow(), 4, 'no window width known gives the cap');
+});
+
+// ---- graph readability pass 2: collapsed sources, one header per group, lane titles ----
+const srcNode = (i) => ({ ...source, id: 'source:big' + String(i).padStart(2, '0'), label: 'big' + i, counts: { pending: 1, drafting: 0 } });
+const bigGraph = (n, extra) => {
+  const g = cardGraph();
+  const added = Array.from({ length: n }, (_, i) => srcNode(i));
+  g.nodes.push(...added);
+  g.edges.push(...added.map((s) => ({ id: s.id + '->worker-1:claims', from: s.id, to: 'worker-1', kind: 'claims', label: null })));
+  return Object.assign(g, extra || {});
+};
+const cardNodeIds = (card) => [...card.matchAll(/data-node-id="([^"]+)"/g)].map((m) => m[1]);
+
+test('a loop with more than six sources shows ONE group card and a Show N sources button; small loops have no button', () => {
+  const cards = cardsOf(v.buildCardsHtml(bigGraph(12), { storage: null, maxPerRow: 1 }));
+  const ids = cardNodeIds(cards[0]);
+  assert.ok(ids.includes('group:sources:worker-1'));
+  assert.ok(!ids.some((id) => id.startsWith('source:big')), 'no individual big source is drawn');
+  assert.match(cards[0], /<button type="button" class="secondary wf-sources-toggle" data-loop-id="worker-1" aria-expanded="false">Show 13 sources<\/button>/, '12 added plus the shared source of the base graph');
+  assert.match(cards[0], /<span class="id">13 sources<\/span>/);
+  assert.doesNotMatch(cards[1], /wf-sources-toggle/);
+  assert.ok(ids.length < 8, 'the card is a short chain, not a wall of nodes');
+});
+
+test('expanding shows every source again with a Hide sources button; the choice is per loop', () => {
+  const html = v.buildCardsHtml(bigGraph(12), { storage: null, maxPerRow: 1, expandedSources: { 'worker-1': true } });
+  const cards = cardsOf(html);
+  assert.ok(cardNodeIds(cards[0]).filter((id) => id.startsWith('source:big')).length === 12);
+  assert.match(cards[0], /aria-expanded="true">Hide sources<\/button>/);
+  assert.doesNotMatch(cards[0], /group:sources:worker-1/);
+  const other = v.buildCardsHtml(bigGraph(12), { storage: null, maxPerRow: 1, expandedSources: { 'worker-2': true } });
+  assert.match(cardsOf(other)[0], /Show 13 sources/, 'expanding another loop does not expand this one');
+});
+
+test('the collapsed card keeps the edge from the sources card to the worker, and its edge points are finite', () => {
+  const card = cardsOf(v.buildCardsHtml(bigGraph(12), { storage: null, maxPerRow: 1 }))[0];
+  assert.match(card, /data-edge-id="group:sources:worker-1-&gt;worker-1:claims" d="M[^"]+L[^"]+"/);
+  assert.doesNotMatch(card, /NaN|undefined/);
+});
+
+test('a group drawn as one box per row gets its header button on the first box only', () => {
+  const g = bigGraph(8, { groups: [{ id: 'group:intake', label: 'Intake', children: Array.from({ length: 8 }, (_, i) => 'source:big' + String(i).padStart(2, '0')), collapsed: false }] });
+  g.nodes.forEach((n) => { if (n.id.startsWith('source:big')) n.parent = 'group:intake'; });
+  const card = cardsOf(v.buildCardsHtml(g, { storage: null, maxPerRow: 2, expandedSources: { 'worker-1': true } }))[0];
+  const boxes = (card.match(/class="wf-group-box"/g) || []).length;
+  const headers = (card.match(/class="secondary wf-group-toggle"/g) || []).length;
+  assert.ok(boxes >= 3, 'eight sources in rows of two make several boxes (' + boxes + ')');
+  assert.equal(headers, 1, 'one header for the group');
+  assert.match(card, /▾ Intake/);
+});
+
+test('a card with groups leaves room between rows for the group header; a card without groups keeps the normal gap', () => {
+  const tops = (html, ids) => ids.map((id) => topOf(cardsOf(html)[0], id));
+  const base = bigGraph(8);
+  const ids = ['source:big00', 'source:big01'];
+  const open = { storage: null, maxPerRow: 1, expandedSources: { 'worker-1': true } };
+  const plainTops = tops(v.buildCardsHtml(base, open), ids);
+  const gap0 = plainTops[1] - plainTops[0];
+  const withGroups = bigGraph(8, { groups: [{ id: 'group:intake', label: 'Intake', children: ['source:big00', 'source:big01', 'source:big02'], collapsed: false }] });
+  withGroups.nodes.forEach((n) => { if (['source:big00', 'source:big01', 'source:big02'].includes(n.id)) n.parent = 'group:intake'; });
+  const groupTops = tops(v.buildCardsHtml(withGroups, open), ids);
+  assert.ok(groupTops[1] - groupTops[0] >= gap0 + 40, 'rows are further apart by about a header (' + gap0 + ' vs ' + (groupTops[1] - groupTops[0]) + ')');
+});
+
+test('card titles show the lane id first and the label after it; Services keeps its name', () => {
+  assert.equal(v.wfCardTitle({ id: 'worker-3090', label: 'ornith:35b' }), 'worker-3090 · ornith:35b');
+  assert.equal(v.wfCardTitle({ id: 'worker-1', label: 'worker-1' }), 'worker-1');
+  assert.equal(v.wfCardTitle({ id: 'worker-1' }), 'worker-1');
+  assert.equal(v.wfCardTitle({ id: 'services', label: 'Services' }), 'Services');
+  assert.equal(v.wfCardTitle(null), '');
+  const g = cardGraph();
+  g.nodes.find((n) => n.id === 'worker-1').label = 'ornith:35b';
+  const html = v.buildCardsHtml(g, { storage: null });
+  assert.match(html, /<span class="id">worker-1 · ornith:35b<\/span>/);
+});
+
+test('a loop node whose label is only its model name shows its node id; an authored label is kept', () => {
+  const plain = loop({ id: 'worker-3090', label: 'ornith:35b', model: model({ name: 'ornith:35b' }) });
+  assert.match(v.buildNodeHtml(plain, false), /<span class="id">worker-3090<\/span>/);
+  assert.match(v.buildNodeHtml(plain, false), /ornith:35b/, 'the model is still in the meta line');
+  const authored = loop({ id: 'worker-3090', label: 'Big GPU', model: model({ name: 'ornith:35b' }) });
+  assert.match(v.buildNodeHtml(authored, false), /<span class="id">Big GPU<\/span>/);
+  const same = loop({ id: 'worker-1', label: 'worker-1' });
+  assert.match(v.buildNodeHtml(same, false), /<span class="id">worker-1<\/span>/);
+  const src = { ...source, label: 'ornith:35b', model: model({ name: 'ornith:35b' }) };
+  assert.match(v.buildNodeHtml(src, false), /<span class="id">ornith:35b<\/span>/, 'only loop nodes are retitled');
 });
