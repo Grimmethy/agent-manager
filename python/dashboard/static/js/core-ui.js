@@ -561,14 +561,16 @@ function renderNavRail(nav) {
 function renderNav() {
   const nav = document.getElementById('nav');
   nav.innerHTML = '';
-  const wide = !isNarrowScreen() && typeof buildNavSections === 'function';
+  const sectioned = typeof buildNavSections === 'function';
+  const wide = !isNarrowScreen() && sectioned;
   const rail = wide && navRailCollapsed();
   nav.className = rail ? 'nav-rail' : '';
-  if (wide) {
-    nav.appendChild(renderNavTop(rail));
+  if (sectioned) {
+    // Same sections, fold chevrons and icons on a phone as on a desktop (owner 2026-11-07); only the collapse button and the icon rail stay wide-only.
+    if (wide) nav.appendChild(renderNavTop(rail));
     if (rail) renderNavRail(nav); else renderNavSections(nav);
   } else {
-    // Phone layout (or nav-sections.js missing): the flat strip with the old Forges / Job Status groups.
+    // nav-sections.js missing: the flat strip with the old Forges / Job Status groups.
     for (const tab of navOrder(TABS, isNarrowScreen())) {
       if (tab.group) {
         const expanded = isGroupExpanded(tab.group);

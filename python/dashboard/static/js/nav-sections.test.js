@@ -222,11 +222,22 @@ test('renderNav hands the finished nav to the notch on both layouts', () => {
   }
 });
 
-test('the phone layout keeps the flat strip: no section headers, the old groups', () => {
+test('the phone layout shows the same sections as the wide one, without the collapse button or the rail', () => {
+  const wide = makeEnv(); wide.ctx.renderNav();
   const env = makeEnv({ narrow: true });
   env.ctx.renderNav();
-  assert.equal(env.appended.filter((e) => /nav-sh|nav-div/.test(e.className)).length, 0);
-  assert.match(env.text(env.appended[0]), /Forges/);
+  const heads = (e) => e.appended.filter((x) => x.className === 'nav-sh').map((h) => e.text(h));
+  assert.deepEqual(heads(env), heads(wide));
+  assert.equal(env.appended.filter((e) => e.className === 'nav-div').length, 6);
+  assert.equal(topOf(env), undefined, 'no collapse button on a phone');
+  assert.equal(env.nav.className, '');
+});
+
+test('a phone ignores a stored collapsed-rail choice (the rail is wide-only)', () => {
+  const env = makeEnv({ narrow: true, stored: { agentManagerNavRail: 'collapsed' } });
+  env.ctx.renderNav();
+  assert.equal(env.nav.className, '');
+  assert.ok(env.appended.some((e) => e.className === 'nav-sh'));
 });
 
 // --- collapse button and icon rail ---

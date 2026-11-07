@@ -380,9 +380,8 @@
     header { flex-wrap: wrap; padding: 10px 14px; gap: 8px 12px; }
     header .pipeline-dir { flex-basis: 100%; }
     .layout { flex-direction: column; }
-    nav { width: 100%; height: auto; position: static; overflow-y: visible; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); display: flex; overflow-x: auto; padding: 6px 8px; -webkit-overflow-scrolling: touch; }
-    nav button { width: auto; white-space: nowrap; padding: 8px 12px; }
-    nav button.active { border-left: none; border-bottom: 3px solid var(--accent); }
+    /* The grouped sidebar (sections, icons, fold chevrons) is the phone nav too: a vertical list on top, capped at 40vh and scrolling inside itself. */
+    nav { width: 100%; height: auto; max-height: 40vh; max-height: 40dvh; position: static; overflow-y: auto; overflow-x: hidden; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); padding: 6px 0; -webkit-overflow-scrolling: touch; }
     .nav-notch { display: none; }
     main { padding: 12px; overflow-x: auto; }
     table { min-width: 560px; }
