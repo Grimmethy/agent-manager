@@ -1,6 +1,7 @@
-/* Pure layered left-to-right layout for the Workers workflow graph (phase A, piece W-A3).
+/* Pure layered layout for the Workers workflow graph (phase A, piece W-A3): left-to-right by default, top-to-bottom with opts.direction 'down'.
  *
  * layoutGraph(graph, opts) -> { positions: {id: {x, y}}, width, height, edges: [{id, points, back}] }
+ * opts: nodeW, nodeH, gapX, gapY (numbers) and direction ('down' lays the layers out top to bottom; any other value is the left-to-right layout).
  *
  * Only node.id and edge.id/from/to are read, so it works on the WorkflowGraph
  * contract and on any smaller object. It never throws: a bad input gives the
@@ -23,6 +24,8 @@
       var v = o[k];
       out[k] = typeof v === 'number' && isFinite(v) && v >= 0 ? v : DEFAULTS[k];
     });
+    // Only the exact string 'down' lays the layers out top to bottom; anything else is the left-to-right layout.
+    out.direction = o.direction === 'down' ? 'down' : 'right';
     return out;
   }
 
@@ -162,6 +165,30 @@
     return pts.map(function (p) { return { x: up4(p.x), y: up4(p.y) }; });
   }
 
+  // Top-to-bottom ports: a forward edge leaves the bottom middle of the source and enters the top middle of the target.
+  // A back edge leaves the right side of the source, runs down the lane on the right of the canvas (rightLane) and re-enters the target from above.
+  function edgePointsDown(e, back, pos, o, rightLane) {
+    var s = pos[e.from];
+    var t = pos[e.to];
+    var scx = s.x + o.nodeW / 2;
+    var tcx = t.x + o.nodeW / 2;
+    var pts;
+    if (!back) {
+      pts = [{ x: scx, y: s.y + o.nodeH }, { x: tcx, y: t.y }];
+    } else {
+      var sy = s.y + o.nodeH / 2;
+      var topY = Math.max(0, t.y - up4(o.gapY / 2));
+      pts = [
+        { x: s.x + o.nodeW, y: sy },
+        { x: rightLane, y: sy },
+        { x: rightLane, y: topY },
+        { x: tcx, y: topY },
+        { x: tcx, y: t.y }
+      ];
+    }
+    return pts.map(function (p) { return { x: up4(p.x), y: up4(p.y) }; });
+  }
+
   // The OUTERMOST group of every node that sits in a group: start at node.parent and, while another group lists that group as a child, go up (a cycle stops the walk).
   // A parent that is not a group id of graph.groups counts as no group.
   function groupKeys(graph) {
@@ -210,21 +237,37 @@
       var keys = groupKeys(graph);
       var rows = orderLayers(clean.ids, forward, layer).map(function (row) { return regroupRow(row, keys); });
 
+      var down = o.direction === 'down';
       var positions = {};
       var right = 0;
       var bottom = 0;
       rows.forEach(function (row, l) {
         row.forEach(function (id, i) {
-          var x = up4(l * (o.nodeW + o.gapX));
-          var y = up4(i * (o.nodeH + o.gapY));
+          // 'right': layer -> column (x), row index -> y. 'down': layer -> y, row index -> x.
+          var x = down ? up4(i * (o.nodeW + o.gapX)) : up4(l * (o.nodeW + o.gapX));
+          var y = down ? up4(l * (o.nodeH + o.gapY)) : up4(i * (o.nodeH + o.gapY));
           positions[id] = { x: x, y: y };
           right = Math.max(right, x + up4(o.nodeW));
           bottom = Math.max(bottom, y + up4(o.nodeH));
         });
       });
 
-      var lane = bottom + up4(o.gapY / 2);
       var hasBack = clean.edges.some(function (e) { return backIds[e.id]; });
+      if (down) {
+        // The back-edge lane runs down the right of the canvas, so a cycle widens the result, not its height.
+        var rightLane = right + up4(o.gapX / 2);
+        var downEdges = clean.edges.map(function (e) {
+          var back = !!backIds[e.id];
+          return { id: e.id, points: edgePointsDown(e, back, positions, o, rightLane), back: back };
+        });
+        return {
+          positions: positions,
+          width: up4(hasBack ? rightLane + 4 : right),
+          height: up4(bottom),
+          edges: downEdges
+        };
+      }
+      var lane = bottom + up4(o.gapY / 2);
       var edges = clean.edges.map(function (e) {
         var back = !!backIds[e.id];
         return { id: e.id, points: edgePoints(e, back, positions, o, lane), back: back };

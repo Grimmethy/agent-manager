@@ -299,3 +299,103 @@ test('a group id that is a name on Object.prototype nests like any other', () =>
   });
   assert.deepEqual(order(nested, ['a', 'b', 'c', 'd']), ['a', 'c', 'd', 'b']);
 });
+
+// ---- direction 'down' (HUB0346 piece 1): layers run top to bottom ----
+const DOWN = { direction: 'down' };
+const byX = (r, ids) => ids.slice().sort((a, b) => r.positions[a].x - r.positions[b].x);
+
+test("direction 'down': a chain has strictly increasing y and one shared x", () => {
+  const r = layoutGraph({ nodes: N('a', 'b', 'c'), edges: E(['a', 'b'], ['b', 'c']) }, DOWN);
+  assert.deepEqual([r.positions.a.y, r.positions.b.y, r.positions.c.y], [0, STEP_Y, STEP_Y * 2]);
+  assert.deepEqual([r.positions.a.x, r.positions.b.x, r.positions.c.x], [0, 0, 0]);
+  assert.equal(r.width, 240);
+  assert.equal(r.height, STEP_Y * 2 + 96);
+});
+
+test("direction 'down': a source sits above its loop, above its reviewer, above the apply service", () => {
+  const r = layoutGraph({
+    nodes: N('service:apply-loop', 'reviewer', 'source:adhoc', 'worker-3090'),
+    edges: E(['source:adhoc', 'worker-3090'], ['worker-3090', 'reviewer'], ['reviewer', 'service:apply-loop']),
+  }, DOWN);
+  const y = (id) => r.positions[id].y;
+  assert.ok(y('source:adhoc') < y('worker-3090'));
+  assert.ok(y('worker-3090') < y('reviewer'));
+  assert.ok(y('reviewer') < y('service:apply-loop'));
+});
+
+test("direction 'down': a fan-out puts the children in one layer, side by side by id", () => {
+  const r = layoutGraph({ nodes: N('a', 'z', 'm', 'b'), edges: E(['a', 'b'], ['a', 'm'], ['a', 'z']) }, DOWN);
+  assert.equal(r.positions.b.y, STEP_Y);
+  assert.equal(r.positions.m.y, STEP_Y);
+  assert.equal(r.positions.z.y, STEP_Y);
+  assert.deepEqual([r.positions.b.x, r.positions.m.x, r.positions.z.x], [0, STEP_X, STEP_X * 2]);
+});
+
+test("direction 'down': an edge runs from the bottom middle of the source to the top middle of the target", () => {
+  const r = layoutGraph({ nodes: N('a', 'b'), edges: E(['a', 'b']) }, DOWN);
+  const pts = r.edges[0].points;
+  assert.deepEqual(pts[0], { x: 120, y: 96 });
+  assert.deepEqual(pts[pts.length - 1], { x: 120, y: STEP_Y });
+});
+
+test("direction 'down': a cycle marks exactly one back edge that leaves the right side and widens the result", () => {
+  const r = layoutGraph({ nodes: N('a', 'b'), edges: E(['a', 'b'], ['b', 'a']) }, DOWN);
+  const backs = r.edges.filter((e) => e.back);
+  assert.equal(backs.length, 1);
+  const pts = backs[0].points;
+  const b = r.positions[backs[0].id.split('->')[0]];
+  assert.deepEqual(pts[0], { x: b.x + 240, y: b.y + 48 });
+  const lane = pts[1].x;
+  assert.ok(lane > 240, 'the lane is right of the nodes');
+  assert.ok(lane < r.width, 'the lane is inside the canvas');
+  assert.equal(r.height, STEP_Y + 96, 'a cycle does not add height');
+  r.edges.forEach((e) => e.points.forEach((p) => assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y))));
+});
+
+test("direction 'down': a self loop terminates and has no NaN", () => {
+  const r = layoutGraph({ nodes: N('a'), edges: E(['a', 'a']) }, DOWN);
+  assert.equal(r.edges.length, 1);
+  assert.equal(r.edges[0].back, true);
+  r.edges[0].points.forEach((p) => assert.ok(Number.isFinite(p.x) && p.x >= 0 && Number.isFinite(p.y) && p.y >= 0));
+});
+
+test("direction 'down': every coordinate, width and height is a multiple of 4, even with odd options", () => {
+  const r = layoutGraph({ nodes: N('a', 'b', 'c', 'd'), edges: E(['a', 'b'], ['a', 'c'], ['c', 'd'], ['d', 'a']) }, { direction: 'down', nodeW: 101, nodeH: 57, gapX: 13, gapY: 9 });
+  const all = [r.width, r.height];
+  Object.values(r.positions).forEach((p) => all.push(p.x, p.y));
+  r.edges.forEach((e) => e.points.forEach((p) => all.push(p.x, p.y)));
+  all.forEach((n) => assert.equal(n % 4, 0, `${n} is a multiple of 4`));
+});
+
+test("direction 'down': two calls are deepEqual and the input is not mutated", () => {
+  const g = { nodes: N('a', 'b', 'c'), edges: E(['a', 'b'], ['a', 'c'], ['c', 'a']) };
+  const copy = JSON.parse(JSON.stringify(g));
+  assert.deepEqual(layoutGraph(g, DOWN), layoutGraph(g, DOWN));
+  assert.deepEqual(g, copy);
+});
+
+test("direction 'down': is not the left-to-right layout", () => {
+  const g = { nodes: N('a', 'b', 'c'), edges: E(['a', 'b'], ['b', 'c']) };
+  assert.notDeepEqual(layoutGraph(g, DOWN).positions, layoutGraph(g).positions);
+});
+
+test('any direction other than the exact string down is the left-to-right layout', () => {
+  const g = { nodes: N('a', 'z', 'm', 'b'), edges: E(['a', 'b'], ['a', 'm'], ['a', 'z'], ['z', 'a']) };
+  const old = layoutGraph(g);
+  [undefined, null, 'right', 'sideways', 'DOWN', ' down', 5, true, {}].forEach((direction) => {
+    assert.deepEqual(layoutGraph(g, { direction }), old, `direction ${String(direction)}`);
+  });
+  assert.deepEqual(layoutGraph(g, { direction: 'right', gapX: 100 }), layoutGraph(g, { gapX: 100 }));
+});
+
+test("direction 'down': the members of a group stay adjacent in their layer", () => {
+  const plain = layoutGraph({ nodes: N('a', 'b', 'c'), edges: [] }, DOWN);
+  assert.deepEqual(byX(plain, ['a', 'b', 'c']), ['a', 'b', 'c']);
+  const r = layoutGraph({ nodes: [P('a', 'group:g'), P('b', null), P('c', 'group:g')], edges: [], groups: [G('group:g', 'a', 'c')] }, DOWN);
+  assert.deepEqual(byX(r, ['a', 'b', 'c']), ['a', 'c', 'b']);
+  assert.deepEqual([r.positions.a.x, r.positions.c.x, r.positions.b.x], [0, STEP_X, STEP_X * 2]);
+});
+
+test("direction 'down': empty and garbage input give the empty result", () => {
+  [null, undefined, {}, { nodes: [] }, 'x'].forEach((g) => assert.deepEqual(layoutGraph(g, DOWN), { positions: {}, width: 0, height: 0, edges: [] }));
+});
