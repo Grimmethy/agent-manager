@@ -742,6 +742,9 @@ class BranchListAnnouncements(Base):
 class BranchListKick(Base):
     def setUp(self):
         super().setUp()
+        import branch_kick
+        branch_kick.reset()                     # each test starts with an open kick window
+        self.addCleanup(branch_kick.reset)
         self.client = app.app.test_client()
 
     def _get(self, query):
@@ -762,6 +765,16 @@ class BranchListKick(Base):
         r, inv, lst, exp = self._get("?kick=1")
         inv.assert_called_once_with(refetch=True)
         exp.assert_not_called()
+
+    def test_kicks_close_together_start_one_refresh_not_one_each(self):
+        import branch_projects as bp
+        with mock.patch.object(app, "_invalidate_branch_cache") as inv, mock.patch.object(app, "list_unmerged_branches", return_value=[]), \
+                mock.patch.object(bp, "expire_all") as exp, mock.patch.object(bp, "combined_branches", return_value=([], [])), \
+                mock.patch.dict(__import__("os").environ, {"AGENT_MANAGER_BRANCH_KICK_MIN_SECONDS": "3600"}):
+            codes = [self.client.get("/api/git/unmerged-branches?projects=all&kick=1").status_code for _ in range(5)]
+        self.assertEqual(codes, [200] * 5)                       # every request is still answered from the cache
+        inv.assert_called_once_with(refetch=True)
+        exp.assert_called_once_with()
 
     def test_without_a_kick_nothing_is_invalidated(self):
         for q in ("?projects=all", "?projects=all&kick=0", ""):
