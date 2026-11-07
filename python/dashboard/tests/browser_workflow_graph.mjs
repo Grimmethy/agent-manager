@@ -168,6 +168,19 @@ async function main() {
     // A node that sits on several loop cards (the apply service, a shared source) is marked on every one of them, so one or more.
     check((await page.locator('.wf-node.wf-selected[data-node-id="' + selectedId + '"]').count()) >= 1, 'the selection is still there after two poll cycles');
 
+    // Card width: on a wide screen each card is only as wide as its drawing needs, so several sit side by side and wrap (a phone keeps one card per screen, checked below).
+    const dk = await page.evaluate(() => {
+      const row = document.getElementById('wf-surface');
+      const cards = [...row.querySelectorAll('.wf-card')];
+      const rr = row.getBoundingClientRect();
+      const first = cards[0].getBoundingClientRect();
+      return { rowW: rr.width, widths: cards.map((c) => c.getBoundingClientRect().width), onFirstRow: cards.filter((c) => Math.abs(c.getBoundingClientRect().top - first.top) < 4).length, total: cards.length, rowScrollsX: row.scrollWidth > row.clientWidth + 1, inside: cards.every((c) => { const r = c.getBoundingClientRect(); return r.left >= rr.left - 1 && r.right <= rr.right + 1; }) };
+    });
+    check(dk.onFirstRow >= Math.min(3, dk.total), 'several cards are visible side by side on a desktop (' + dk.onFirstRow + ' on the first row, ' + dk.total + ' in all)');
+    check(!dk.rowScrollsX && dk.inside, 'the desktop card row does not scroll sideways and every card sits inside it');
+    check(Math.min(...dk.widths) < dk.rowW / 2, 'a lane card is much narrower than the row (' + Math.round(Math.min(...dk.widths)) + ' of ' + Math.round(dk.rowW) + ' px)');
+    check(Math.min(...dk.widths) >= 299, 'no card is narrower than its minimum');
+
     await page.screenshot({ path: screenshot });
     console.log('screenshot: ' + screenshot);
 

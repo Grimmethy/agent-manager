@@ -11,7 +11,7 @@ const vm = require('vm');
 const JS = path.join(__dirname, '..', 'static', 'js');
 const ctx = vm.createContext({ console });
 ctx.window = ctx; // in a browser window is the global object, which is how workflow-layout.js publishes layoutGraph
-for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'workflow-layout.js', 'workflow-loops.js', 'workflow-drag.js', 'workflow-groups.js', 'workflow-graph-view.js']) {
+for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'workflow-layout.js', 'workflow-loops.js', 'workflow-drag.js', 'workflow-groups.js', 'workflow-card-fit.js', 'workflow-graph-view.js']) {
   vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
 }
 const v = ctx;
@@ -502,4 +502,56 @@ test('a loop node whose label is only its model name shows its node id; an autho
   assert.match(v.buildNodeHtml(same, false), /<span class="id">worker-1<\/span>/);
   const src = { ...source, label: 'ornith:35b', model: model({ name: 'ornith:35b' }) };
   assert.match(v.buildNodeHtml(src, false), /<span class="id">ornith:35b<\/span>/, 'only loop nodes are retitled');
+});
+
+// ---- card width pass: wide screens size each card to its drawing and wrap; a phone keeps the swipe row ----
+const indexHtml = () => fs.readFileSync(path.join(__dirname, '..', 'templates', 'index.html'), 'utf8');
+const phoneBlock = (html) => { const i = html.indexOf('@media (max-width: 700px)'); const j = html.indexOf('\n  }\n', i); return i < 0 ? '' : html.slice(i, j + 5); };
+
+test('wide screens: the card row wraps, a card is as wide as its content, and its height is its content up to 78 percent of the window', () => {
+  const html = indexHtml();
+  assert.match(html, /\.wf-cards \{ display: flex; flex-wrap: wrap; align-items: flex-start; gap: 12px;/);
+  assert.match(html, /\.wf-card \{ flex: 0 0 auto; box-sizing: border-box; max-width: 100%; max-height: 78vh;/);
+  const before = html.slice(0, html.indexOf('@media (max-width: 700px)'));
+  assert.doesNotMatch(before.slice(before.indexOf('.wf-cards {')), /scroll-snap-type/, 'no snapping outside the phone media query');
+});
+
+test('a phone (700 px or narrower) keeps one card per screen in a swipe row, exactly as before', () => {
+  const block = phoneBlock(indexHtml());
+  assert.ok(block.length > 0, 'the media query exists');
+  assert.match(block, /\.wf-cards \{ flex-wrap: nowrap; overflow-x: auto; scroll-snap-type: x mandatory;/);
+  assert.match(block, /\.wf-card \{ flex: 0 0 100%; scroll-snap-align: center; scroll-snap-stop: always; height: 78vh; height: 78dvh; max-height: none; \}/);
+});
+
+test('index.html loads workflow-card-fit.js after the loops helpers and before the view', () => {
+  const index = indexHtml();
+  const at = (f) => index.indexOf('/static/js/' + f);
+  assert.ok(at('workflow-loops.js') > 0 && at('workflow-loops.js') < at('workflow-card-fit.js'));
+  assert.ok(at('workflow-card-fit.js') < at('workflow-graph-view.js'));
+  assert.ok(fs.readFileSync(path.join(__dirname, '..', 'static', 'js', 'workflow-graph-view.js'), 'utf8').split('\n').length < 500, 'the view file stays under 500 lines');
+});
+
+test('wfIsNarrow follows the 700 px breakpoint', () => {
+  const at = (w) => { const saved = ctx.innerWidth; ctx.innerWidth = w; const r = ctx.wfIsNarrow(); ctx.innerWidth = saved; return r; };
+  assert.equal(at(390), true);
+  assert.equal(at(700), true, '700 px is still a phone');
+  assert.equal(at(701), false);
+  assert.equal(at(1440), false);
+  assert.equal(ctx.wfIsNarrow(), false, 'no window width known counts as wide');
+});
+
+test('wfIsNarrow asks the browser with the 700 px media query when matchMedia exists, and trusts its answer', () => {
+  const seen = [];
+  ctx.matchMedia = (q) => { seen.push(q); return { matches: true }; };
+  try {
+    assert.equal(ctx.wfIsNarrow(), true);
+    assert.deepEqual([...seen], ['(max-width: 700px)']);
+    ctx.matchMedia = () => ({ matches: false });
+    assert.equal(ctx.wfIsNarrow(), false, 'a wide answer from the browser wins over window.innerWidth');
+    ctx.innerWidth = 390;
+    assert.equal(ctx.wfIsNarrow(), false, 'matchMedia is the authority when the browser has it');
+  } finally {
+    delete ctx.matchMedia;
+    delete ctx.innerWidth;
+  }
 });

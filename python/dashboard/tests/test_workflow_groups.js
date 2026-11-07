@@ -16,7 +16,7 @@ const ESC_ATTR = "function escapeAttr(s) { return String(s).replace(/\"/g, '&quo
 const ctx = vm.createContext({ console });
 ctx.window = ctx;
 vm.runInContext(ESC_HTML + '\n' + ESC_ATTR + "\nfunction hubTag(hub) { return 'H:' + hub.label; }", ctx);
-for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'worker-model-select.js', 'worker-task-picker.js', 'workflow-layout.js', 'workflow-groups.js', 'workflow-node-panel.js', 'workflow-graph-view.js']) {
+for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'worker-model-select.js', 'worker-task-picker.js', 'workflow-layout.js', 'workflow-groups.js', 'workflow-node-panel.js', 'workflow-card-fit.js', 'workflow-graph-view.js']) {
   vm.runInContext(read(f), ctx, { filename: f });
 }
 const v = ctx;
@@ -294,7 +294,7 @@ test('index.html loads workflow-groups.js directly before workflow-node-panel.js
   const b = html.indexOf('/static/js/workflow-node-panel.js');
   assert.ok(a > 0 && a < b);
   assert.equal(html.slice(a, b).split('<script').length, 2);
-  for (const f of ['workflow-groups.js', 'workflow-graph-view.js']) assert.ok(read(f).split('\n').length < 500, f);
+  for (const f of ['workflow-groups.js', 'workflow-card-fit.js', 'workflow-graph-view.js']) assert.ok(read(f).split('\n').length < 500, f);
 });
 
 // ---- edge cases found by mutation checks ----

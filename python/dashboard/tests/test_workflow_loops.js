@@ -154,3 +154,40 @@ test('fitScaleForCard honours a custom minimum and gives 1 for bad sizes', () =>
   [[NaN, 100, 100, 100], [100, 0, 100, 100], [100, 100, -1, 100], [100, 100, 100, undefined]].forEach((a) => assert.equal(fitScaleForCard(...a), 1));
   assert.equal(fitScaleForCard(4000, 4000, 400, 400, NaN), 0.5);
 });
+
+// ---- cardWidthFor (card width pass): a loop card is as wide as its drawing needs on a wide screen ----
+const { cardWidthFor, WF_CARD_MIN_W } = require(path.join(__dirname, '..', 'static', 'js', 'workflow-loops.js'));
+
+test('a card is the drawing width plus its extras, between the minimum and the row', () => {
+  assert.equal(WF_CARD_MIN_W, 300);
+  assert.equal(cardWidthFor(272, 1080, 40), 312, 'a 272 px column in a 1080 px row is 312 px, not 1080');
+  assert.equal(cardWidthFor(608, 1080, 40), 648);
+  assert.equal(cardWidthFor(100, 1080, 40), 300, 'a tiny drawing still gets the minimum');
+  assert.equal(cardWidthFor(2000, 1080, 40), 1080, 'never wider than the row');
+  assert.equal(cardWidthFor(1040, 1080, 40), 1080, 'exactly the row');
+});
+
+test('a fractional drawing width is rounded up and a fractional row is rounded down', () => {
+  assert.equal(cardWidthFor(271.2, 1080, 40), 312);
+  assert.equal(cardWidthFor(2000, 1080.7, 40), 1080);
+});
+
+test('a row narrower than the minimum wins, so a card never overflows its row', () => {
+  assert.equal(cardWidthFor(272, 250, 40), 250);
+  assert.equal(cardWidthFor(100, 299, 40), 299);
+});
+
+test('a missing row means no upper limit; a custom minimum is honoured', () => {
+  [undefined, null, 0, -5, NaN, Infinity, '1080'].forEach((row) => assert.equal(cardWidthFor(2000, row, 40), 2040, String(row)));
+  assert.equal(cardWidthFor(100, 1080, 40, 150), 150);
+  assert.equal(cardWidthFor(100, 1080, 40, 0), 300, 'a bad minimum falls back to the default');
+  assert.equal(cardWidthFor(100, 1080, 40, NaN), 300);
+});
+
+test('a bad drawing width or extra counts as zero, and the answer is never NaN', () => {
+  [NaN, undefined, null, -10, Infinity, 'x'].forEach((cw) => assert.equal(cardWidthFor(cw, 1080, 40), 300, String(cw)));
+  [NaN, undefined, null, -10, '40'].forEach((ex) => assert.equal(cardWidthFor(272, 1080, ex), 300, String(ex)));
+  assert.equal(cardWidthFor(272, 1080), 300, 'no extra at all: 272 is below the minimum');
+  assert.equal(cardWidthFor(400, 1080), 400);
+  [[], [1], [NaN, NaN, NaN, NaN], [1e9, 1e9, 1e9, 1e9]].forEach((a) => assert.ok(Number.isFinite(cardWidthFor(...a))));
+});

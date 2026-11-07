@@ -167,8 +167,13 @@
   .wf-surface { overflow: auto; max-width: 100%; max-height: 70vh; border: 1px solid var(--border); border-radius: 8px; background: var(--bg, transparent); }
   .wf-canvas { position: relative; }
   /* One card per loop (workflow-loops.js, HUB0346 piece 2): a swipe row, one loop per screen width; each canvas is scaled to fit its card body (minimum 0.5, then the body scrolls). */
-  .wf-cards { display: flex; overflow-x: auto; max-width: 100%; scroll-snap-type: x mandatory; gap: 12px; -webkit-overflow-scrolling: touch; }
-  .wf-card { flex: 0 0 100%; box-sizing: border-box; scroll-snap-align: center; scroll-snap-stop: always; height: 78vh; height: 78dvh; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 8px; background: var(--bg, transparent); overflow: hidden; }
+  .wf-cards { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 12px; max-width: 100%; }
+  .wf-card { flex: 0 0 auto; box-sizing: border-box; max-width: 100%; max-height: 78vh; max-height: 78dvh; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 8px; background: var(--bg, transparent); overflow: hidden; }
+  /* A phone (700 px or narrower): one loop per screen width in a swipe row, as before; wider screens size each card to its drawing (wfFitCards sets the width) and wrap them. */
+  @media (max-width: 700px) {
+    .wf-cards { flex-wrap: nowrap; overflow-x: auto; scroll-snap-type: x mandatory; -webkit-overflow-scrolling: touch; }
+    .wf-card { flex: 0 0 100%; scroll-snap-align: center; scroll-snap-stop: always; height: 78vh; height: 78dvh; max-height: none; }
+  }
   .wf-card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
   .wf-card-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 8px; }
   .wf-scale { position: relative; }
@@ -434,6 +439,7 @@
 <script src="/static/js/worker-switch-ui.js"></script>
 <script src="/static/js/workflow-layout.js"></script>
 <script src="/static/js/workflow-loops.js"></script>
+<script src="/static/js/workflow-card-fit.js"></script>
 <script src="/static/js/workflow-drag.js"></script>
 <script src="/static/js/workflow-groups.js"></script>
 <script src="/static/js/workflow-node-panel.js"></script>
