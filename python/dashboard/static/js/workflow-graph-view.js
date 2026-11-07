@@ -2,7 +2,7 @@
 // A plain global <script> loaded by index.html after worker-switch-ui.js, worker-status-helpers.js and workflow-layout.js, and before the inline script.
 // The builders are pure string functions (no DOM) so `node --test` can load them in a bare vm context; the DOM wiring at the bottom is small.
 // Uses these globals from the other scripts: fmtAge, statusBadgeClass, statusLabel (worker-status-helpers.js), buildWorkerSwitchHtml and
-// wireWorkerSwitchButtons (worker-switch-ui.js), layoutGraph (workflow-layout.js), renderRunLogList and renderWorkers (workers-tab.js), fetchJson and
+// wireWorkerSwitchButtons (worker-switch-ui.js), layoutGraph (workflow-layout.js), splitIntoLoops, fitScale and WF_MIN_SCALE (workflow-loops.js), renderRunLogList and renderWorkers (workers-tab.js), fetchJson and
 // renderStaleCheck (core-ui.js).
 
 function wfEsc(value) {
@@ -154,6 +154,47 @@ function buildGraphHtml(graph, layout, state) {
     + (selected ? ((typeof buildNodePanelHtml === 'function' && buildNodePanelHtml(selected, g.warnings, state && state.tasks, g.priorityOrder, g.priorityCompare, g.groups)) || buildDetailHtml(selected, g.warnings)) : '');
 }
 
+// ---- one card per loop (HUB0346 piece 2) ----
+// Each loop (see splitIntoLoops in workflow-loops.js) is its own full-height card laid out top to bottom; the cards sit in one horizontal scroll-snap row,
+// so on a phone one swipe moves to the next loop. The row keeps the id wf-surface, which the poll and the scroll restore already use.
+const WF_CARD_OPTS = Object.assign({}, WF_LAYOUT_OPTS, { direction: 'down' });
+
+// One card: a head with the loop name and "n of m", and a body holding the loop drawn as a canvas. The canvas is scaled to fit by wfFitCards (DOM) after it is in the page.
+// Every card repeats the same arrow marker definition (same id, same shape), so the shared id is harmless.
+function buildCardHtml(loop, index, total, state) {
+  const g = (loop && loop.graph) || { nodes: [], edges: [], groups: [] };
+  const lay = layoutGraph(g, WF_CARD_OPTS);
+  const selectedId = state && state.selectedId;
+  const byEdge = {};
+  (lay.edges || []).forEach((le) => { byEdge[le.id] = le; });
+  const boxes = typeof groupBoxes === 'function' ? groupBoxes(g, lay.positions, { w: WF_LAYOUT_OPTS.nodeW, h: WF_LAYOUT_OPTS.nodeH }, 12, 'down') : [];
+  const dx = Math.max(0, ...boxes.map((b) => -b.x));
+  const dy = Math.max(0, ...boxes.map((b) => -b.y));
+  const width = Math.max(lay.width + dx, ...boxes.map((b) => b.x + dx + b.w));
+  const height = Math.max(lay.height + dy, ...boxes.map((b) => b.y + dy + b.h));
+  const shift = (pts) => (dx || dy ? (pts || []).map((pt) => ({ x: pt.x + dx, y: pt.y + dy })) : pts);
+  const boxHtml = boxes.map((b) => '<div class="wf-group-box" data-group-id="' + wfEsc(b.id) + '" style="left:' + wfEsc(b.x + dx) + 'px;top:' + wfEsc(b.y + dy) + 'px;width:' + wfEsc(b.w) + 'px;height:' + wfEsc(b.h) + 'px">'
+    + '<button type="button" class="secondary wf-group-toggle" data-group-id="' + wfEsc(b.id) + '" aria-expanded="true" title="Collapse this group">▾ ' + wfEsc(b.label) + '</button></div>').join('');
+  const paths = (g.edges || []).filter((e) => byEdge[e.id]).map((e) => buildEdgeSvg({ id: e.id, kind: e.kind, back: byEdge[e.id].back }, shift(byEdge[e.id].points))).join('');
+  const nodes = (g.nodes || []).filter((n) => lay.positions[n.id]).map((n) => buildNodeHtml(n, n.id === selectedId, { x: lay.positions[n.id].x + dx, y: lay.positions[n.id].y + dy })).join('');
+  return '<section class="wf-card" data-loop-id="' + wfEsc(loop && loop.id) + '">'
+    + '<header class="wf-card-head"><span class="id">' + wfEsc(loop && loop.label) + '</span><span class="meta wf-card-count">' + wfEsc(index + 1) + ' of ' + wfEsc(total) + '</span></header>'
+    + '<div class="wf-card-body"><div class="wf-scale"><div class="wf-canvas" data-w="' + wfEsc(width) + '" data-h="' + wfEsc(height) + '" style="width:' + wfEsc(width) + 'px;height:' + wfEsc(height) + 'px">' + boxHtml
+    + '<svg class="wf-edges" width="' + wfEsc(width) + '" height="' + wfEsc(height) + '" aria-hidden="true"><defs><marker id="wf-arrow" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="8" markerHeight="8" orient="auto">'
+    + '<path d="M0 0 L8 4 L0 8 z" class="wf-arrowhead"/></marker></defs>' + paths + '</svg>' + nodes + '</div></div></div></section>';
+}
+
+// The whole Graph view as a row of loop cards: toggle bar, warning line, the swipe row, then the detail panel of the selected node. state = { selectedId, tasks }.
+function buildCardsHtml(graph, state) {
+  const g = graph || { nodes: [], edges: [], warnings: [] };
+  const loops = typeof splitIntoLoops === 'function' ? splitIntoLoops(g) : [];
+  const selected = (g.nodes || []).find((n) => n.id === (state && state.selectedId));
+  const warn = (g.warnings || []).length ? '<div class="meta wf-warn-line" title="' + wfEsc(g.warnings.join('\n')) + '">' + wfEsc(g.warnings.length) + ' warning(s) while building this graph: hover for details</div>' : '';
+  return '<div class="worker-filter-bar wf-bar">' + workersViewToggleHtml('graph') + '</div>' + warn
+    + '<div class="wf-cards" id="wf-surface">' + loops.map((l, i) => buildCardHtml(l, i, loops.length, state)).join('') + '</div>'
+    + (selected ? ((typeof buildNodePanelHtml === 'function' && buildNodePanelHtml(selected, g.warnings, state && state.tasks, g.priorityOrder, g.priorityCompare, g.groups)) || buildDetailHtml(selected, g.warnings)) : '');
+}
+
 // What the poll compares: ids and the values the cards show. stateAgeSeconds is left out on purpose, it changes every poll.
 function graphSignature(graph) {
   const nodes = (graph && graph.nodes) || [];
@@ -224,13 +265,42 @@ function wfToggleGroup(groupId, main) {
   wfDraw(main);
 }
 
+// Scale every card's canvas to fit its body (never above 1, never below WF_MIN_SCALE; below that the body scrolls). The wrapper takes the scaled size so the scroll area matches what is drawn.
+function wfFitCards(main) {
+  main.querySelectorAll('.wf-card').forEach((card) => {
+    const body = card.querySelector('.wf-card-body');
+    const wrap = card.querySelector('.wf-scale');
+    const canvas = card.querySelector('.wf-canvas');
+    if (!body || !wrap || !canvas) return;
+    const w = Number(canvas.dataset.w);
+    const h = Number(canvas.dataset.h);
+    const s = fitScale(w, h, body.clientWidth, body.clientHeight, WF_MIN_SCALE);
+    canvas.style.transformOrigin = '0 0';
+    canvas.style.transform = s < 1 ? 'scale(' + s + ')' : '';
+    wrap.style.width = Math.ceil(w * s) + 'px';
+    wrap.style.height = Math.ceil(h * s) + 'px';
+    card.dataset.scale = String(s);
+  });
+}
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  window.addEventListener('resize', () => {
+    const main = typeof document !== 'undefined' ? document.getElementById('main') : null;
+    if (main && main.querySelector('.wf-card')) wfFitCards(main);
+  });
+}
+
 function wfDraw(main) {
   const old = main.querySelector('#wf-surface');
   const scroll = old ? { left: old.scrollLeft, top: old.scrollTop } : null;
+  const bodyTops = {}; // each card scrolls on its own when it is below the minimum scale
+  main.querySelectorAll('.wf-card').forEach((c) => { const b = c.querySelector('.wf-card-body'); if (b) bodyTops[c.dataset.loopId] = b.scrollTop; });
   const shown = typeof collapseGraph === 'function' ? collapseGraph(wfState.graph, effectiveCollapsed(wfState.graph, wfState.toggles)) : wfState.graph;
   wfState.shown = shown;
   if (wfState.selectedId && !(shown.nodes || []).some((n) => n.id === wfState.selectedId)) { wfState.selectedId = null; wfState.tasks = null; } // hidden inside a collapsed group
-  main.innerHTML = buildGraphHtml(shown, layoutGraph(shown, WF_LAYOUT_OPTS), wfState);
+  main.innerHTML = typeof splitIntoLoops === 'function' ? buildCardsHtml(shown, wfState) : buildGraphHtml(shown, layoutGraph(shown, WF_LAYOUT_OPTS), wfState);
+  wfFitCards(main);
+  main.querySelectorAll('.wf-card').forEach((c) => { const b = c.querySelector('.wf-card-body'); if (b && bodyTops[c.dataset.loopId]) b.scrollTop = bodyTops[c.dataset.loopId]; });
   const surface = main.querySelector('#wf-surface');
   if (surface && scroll) { surface.scrollLeft = scroll.left; surface.scrollTop = scroll.top; }
   wireWorkersViewToggle(main);
@@ -279,4 +349,4 @@ async function renderGraphView(main, isPoll) {
   wfDraw(main);
 }
 
-if (typeof module !== 'undefined') module.exports = { wfEsc, workersViewMode, setWorkersView, workersViewToggleHtml, buildNodeHtml, buildEdgeSvg, buildDetailHtml, buildGraphHtml, graphSignature, graphNeedsRedraw };
+if (typeof module !== 'undefined') module.exports = { wfEsc, workersViewMode, setWorkersView, workersViewToggleHtml, buildNodeHtml, buildEdgeSvg, buildDetailHtml, buildGraphHtml, buildCardHtml, buildCardsHtml, graphSignature, graphNeedsRedraw };

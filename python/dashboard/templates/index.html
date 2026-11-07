@@ -166,6 +166,12 @@
   .wf-warn-line { margin: 0 0 8px; }
   .wf-surface { overflow: auto; max-width: 100%; max-height: 70vh; border: 1px solid var(--border); border-radius: 8px; background: var(--bg, transparent); }
   .wf-canvas { position: relative; }
+  /* One card per loop (workflow-loops.js, HUB0346 piece 2): a swipe row, one loop per screen width; each canvas is scaled to fit its card body (minimum 0.5, then the body scrolls). */
+  .wf-cards { display: flex; overflow-x: auto; max-width: 100%; scroll-snap-type: x mandatory; gap: 12px; -webkit-overflow-scrolling: touch; }
+  .wf-card { flex: 0 0 100%; box-sizing: border-box; scroll-snap-align: center; scroll-snap-stop: always; height: 78vh; height: 78dvh; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 8px; background: var(--bg, transparent); overflow: hidden; }
+  .wf-card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  .wf-card-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 8px; }
+  .wf-scale { position: relative; }
   .wf-edges { position: absolute; left: 0; top: 0; pointer-events: none; }
   .wf-edge { stroke: var(--muted, #8b949e); stroke-width: 1.5; }
   .wf-arrowhead { fill: var(--muted, #8b949e); }
@@ -423,6 +429,7 @@
 <script src="/static/js/workers-tab.js"></script>
 <script src="/static/js/worker-switch-ui.js"></script>
 <script src="/static/js/workflow-layout.js"></script>
+<script src="/static/js/workflow-loops.js"></script>
 <script src="/static/js/workflow-groups.js"></script>
 <script src="/static/js/workflow-node-panel.js"></script>
 <script src="/static/js/workflow-graph-view.js"></script>

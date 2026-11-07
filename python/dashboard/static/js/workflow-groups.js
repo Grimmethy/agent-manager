@@ -106,13 +106,25 @@ function collapseGraph(graph, collapsedIds) {
 // One box per COLUMN of every EXPANDED group of the (collapsed) graph: the laid-out members that share an x position are boxed together (x, y, w, h in canvas pixels, `pad` around them, a header strip on top), so a box
 // never spans the gap between two columns. { id, label, x, y, w, h, part }: `part` counts the group's boxes from the left, 0 first. positions = { id: { x, y } } from layoutGraph, size = { w, h } of a node card.
 // A group none of whose members is laid out gets no box. x and y can be negative (a group at the edge of the layout): the view shifts the whole canvas by that amount.
-function groupBoxes(graph, positions, size, pad) {
+// direction 'down' (the top-to-bottom layout, where a layer is a ROW): one box per ROW instead, members that share a y position boxed together, `part` counted from the top. Any other value is the column behaviour above.
+function groupBoxes(graph, positions, size, pad, direction) {
   try {
     const groups = graph.groups;
     const p = Number.isFinite(pad) ? pad : 12;
     const out = [];
+    const down = direction === 'down';
     groups.forEach((g) => {
       const ids = groupMembers(groups, g.id).filter((id) => positions && positions[id]);
+      if (down) {
+        const rows = Array.from(new Set(ids.map((id) => positions[id].y))).sort((a, b) => a - b);
+        rows.forEach((ry, part) => {
+          const xs = ids.filter((id) => positions[id].y === ry).map((id) => positions[id].x);
+          const x = Math.min(...xs) - p;
+          const y = ry - p - WF_GROUP_HEADER;
+          out.push({ id: g.id, label: g.label || g.id, x, y, w: Math.max(...xs) + size.w + p - x, h: size.h + 2 * p + WF_GROUP_HEADER, part });
+        });
+        return;
+      }
       const columns = Array.from(new Set(ids.map((id) => positions[id].x))).sort((a, b) => a - b);
       columns.forEach((cx, part) => {
         const ys = ids.filter((id) => positions[id].x === cx).map((id) => positions[id].y);

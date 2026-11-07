@@ -11,7 +11,7 @@ const vm = require('vm');
 const JS = path.join(__dirname, '..', 'static', 'js');
 const ctx = vm.createContext({ console });
 ctx.window = ctx; // in a browser window is the global object, which is how workflow-layout.js publishes layoutGraph
-for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'workflow-layout.js', 'workflow-graph-view.js']) {
+for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'workflow-layout.js', 'workflow-loops.js', 'workflow-graph-view.js']) {
   vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
 }
 const v = ctx;
@@ -258,4 +258,85 @@ test('a poll with nothing changed does not redraw; a changed status does; a stal
   ctx.renderStaleCheck = () => () => true;
   await v.renderGraphView(main, false);
   assert.equal(main.writes, first + 2, 'a render that went stale during the fetch writes nothing');
+});
+
+// ---- one card per loop (HUB0346 piece 2) ----
+const cardGraph = () => ({
+  nodes: [
+    { ...source, id: 'source:shared', label: 'shared' }, { ...source, id: 'source:solo', label: 'solo' },
+    loop({ id: 'worker-1', label: 'worker-1' }), loop({ id: 'worker-2', label: 'worker-2', runtime: rt({ instanceId: 'worker-2' }) }),
+    { ...loop({ id: 'reviewer', label: 'reviewer' }), runtime: rt({ instanceId: 'reviewer', switchable: false }) },
+    { id: 'service:apply-loop', kind: 'service', label: 'apply-loop', parent: null, runtime: null, model: null, work: null, counts: null },
+    { id: 'service:watchdog', kind: 'service', label: 'watchdog', parent: null, runtime: null, model: null, work: null, counts: null },
+  ],
+  edges: [
+    { id: 'source:shared->worker-1:claims', from: 'source:shared', to: 'worker-1', kind: 'claims', label: null },
+    { id: 'source:shared->worker-2:claims', from: 'source:shared', to: 'worker-2', kind: 'claims', label: null },
+    { id: 'source:solo->worker-2:claims', from: 'source:solo', to: 'worker-2', kind: 'claims', label: null },
+    { id: 'worker-1->reviewer:reviews', from: 'worker-1', to: 'reviewer', kind: 'reviews', label: null },
+    { id: 'worker-2->reviewer:reviews', from: 'worker-2', to: 'reviewer', kind: 'reviews', label: null },
+    { id: 'reviewer->service:apply-loop:applies', from: 'reviewer', to: 'service:apply-loop', kind: 'applies', label: null },
+  ],
+  groups: [], warnings: [],
+});
+const cardsOf = (html) => html.split('<section class="wf-card"').slice(1);
+const topOf = (card, id) => Number(new RegExp('data-node-id="' + id + '"[^>]*style="left:\\d+px;top:(\\d+)px').exec(card)[1]);
+
+test('the cards view is one swipe row with one card per lane plus a services card', () => {
+  const html = v.buildCardsHtml(cardGraph(), {});
+  assert.match(html, /<div class="wf-cards" id="wf-surface">/);
+  const cards = cardsOf(html);
+  assert.equal(cards.length, 3);
+  assert.deepEqual(cards.map((c) => /data-loop-id="([^"]+)"/.exec(c)[1]), ['worker-1', 'worker-2', 'services']);
+  assert.match(cards[0], /1 of 3/);
+  assert.match(cards[2], /3 of 3/);
+  assert.match(html, /wf-view-btn/, 'the Cards | Graph toggle stays');
+});
+
+test('inside a card the source is above the lane, above the reviewer, above the apply service', () => {
+  const card = cardsOf(v.buildCardsHtml(cardGraph(), {}))[0];
+  assert.ok(topOf(card, 'source:shared') < topOf(card, 'worker-1'));
+  assert.ok(topOf(card, 'worker-1') < topOf(card, 'reviewer'));
+  assert.ok(topOf(card, 'reviewer') < topOf(card, 'service:apply-loop'));
+});
+
+test('each card carries the size of its canvas so the page can scale it to fit', () => {
+  cardsOf(v.buildCardsHtml(cardGraph(), {})).forEach((c) => {
+    const m = /class="wf-canvas" data-w="(\d+)" data-h="(\d+)" style="width:(\d+)px;height:(\d+)px"/.exec(c);
+    assert.ok(m, 'canvas with size');
+    assert.equal(m[1], m[3]);
+    assert.equal(m[2], m[4]);
+    assert.ok(Number(m[1]) > 0 && Number(m[2]) > 0);
+  });
+});
+
+test('a node that sits on several cards is marked selected on every one of them', () => {
+  const html = v.buildCardsHtml(cardGraph(), { selectedId: 'source:shared' });
+  const marked = cardsOf(html).filter((c) => /wf-node wf-selected" data-node-id="source:shared"/.test(c) || /wf-selected[^"]*" data-node-id="source:shared"/.test(c));
+  assert.equal(marked.length, 2);
+  assert.match(html, /wf-detail|wf-node-panel|id="wf-detail"/, 'the detail panel of the selected node follows the row');
+});
+
+test('the cards view survives empty or null input and still draws the bar', () => {
+  [null, undefined, {}, { nodes: [], edges: [] }].forEach((g) => {
+    const html = v.buildCardsHtml(g, {});
+    assert.match(html, /id="wf-surface"/);
+    assert.equal(cardsOf(html).length, 0);
+  });
+});
+
+test('the single-canvas builder is unchanged: buildGraphHtml still draws one surface', () => {
+  const g = cardGraph();
+  const html = v.buildGraphHtml(g, v.layoutGraph(g, v.WF_LAYOUT_OPTS), {});
+  assert.match(html, /class="wf-surface" id="wf-surface"/);
+  assert.equal(cardsOf(html).length, 0);
+});
+
+test('index.html wiring: the card row snaps horizontally and workflow-loops.js loads between the layout and the view', () => {
+  const index = fs.readFileSync(path.join(__dirname, '..', 'templates', 'index.html'), 'utf8');
+  assert.match(index, /\.wf-cards \{[^}]*scroll-snap-type: x mandatory/);
+  assert.match(index, /\.wf-card \{[^}]*flex: 0 0 100%/);
+  const at = (f) => index.indexOf('/static/js/' + f);
+  assert.ok(at('workflow-layout.js') > 0 && at('workflow-layout.js') < at('workflow-loops.js'));
+  assert.ok(at('workflow-loops.js') < at('workflow-graph-view.js'));
 });
