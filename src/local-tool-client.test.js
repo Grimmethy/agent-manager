@@ -927,7 +927,7 @@ function withMockedChat(scriptedTurns, fn, { killSwitch = null, localCallRespons
     postJsonStream: async () => { throw new Error('streaming path not exercised in this test'); },
   });
   stub('./single-flight-lock.js', { withLock: (_dir, f) => f() });
-  stub('./local-client.js', { call: async () => ({ response: localCallResponse }), KEEP_ALIVE: '30m' });
+  stub('./local-client.js', { call: async () => ({ response: localCallResponse }), KEEP_ALIVE: '8760h' });
   try {
     const mod = require('./local-tool-client.js');
     return fn(mod, dir, { sentBodies });
@@ -980,7 +980,7 @@ test('every /api/chat turn carries keep_alive (the exported local-client KEEP_AL
     await mod.runPlanWithTools({ prompt: 'go' });
     assert.ok(sentBodies.length >= 2, 'both turns hit /api/chat');
     for (const body of sentBodies) {
-      assert.equal(body.keep_alive, '30m', 'keep_alive is sent on every turn, not just the first');
+      assert.equal(body.keep_alive, '8760h', 'keep_alive is sent on every turn, not just the first');
       assert.equal(body.options.num_ctx, require('./gpu-capacity.js').PINNED_NUM_CTX);
     }
   });
@@ -1772,7 +1772,7 @@ function withMockedStreamingChat(turnsOfLines, fn) {
     },
   });
   stub('./single-flight-lock.js', { withLock: (_dir, f) => f() });
-  stub('./local-client.js', { call: async () => ({ response: 'fallback' }), KEEP_ALIVE: '30m' });
+  stub('./local-client.js', { call: async () => ({ response: 'fallback' }), KEEP_ALIVE: '8760h' });
   try {
     const mod = require('./local-tool-client.js');
     return fn(mod, dir);
