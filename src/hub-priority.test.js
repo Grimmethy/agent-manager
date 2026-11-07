@@ -53,7 +53,7 @@ test('readHubOrderKey reads hubPriority + createdAt from a live coordinating rec
   const dir = makePipeline();
   writeHub(dir, { id: 'hub-1', hubPriority: 7, createdAt: '2026-09-09T00:00:00Z' });
   const key = readHubOrderKey(dir, 'hub-1');
-  assert.deepEqual(key, { found: true, rank: 7, createdAt: '2026-09-09T00:00:00Z' });
+  assert.deepEqual(key, { found: true, rank: 7, createdAt: '2026-09-09T00:00:00Z', remaining: null });
 });
 
 test('readHubOrderKey treats a hub with no hubPriority as unranked (rank = UNRANKED_HUB_PRIORITY)', () => {
@@ -87,13 +87,36 @@ test('hubOrderKeyForTask flags isHubChild only when a live hub backs the link', 
   writeHub(dir, { id: 'hub-live', hubPriority: 2, createdAt: '2026-09-08T00:00:00Z' });
 
   const live = hubOrderKeyForTask(dir, { parentHub: 'hub-live' });
-  assert.deepEqual(live, { isHubChild: true, rank: 2, createdAt: '2026-09-08T00:00:00Z' });
+  assert.deepEqual(live, { isHubChild: true, rank: 2, createdAt: '2026-09-08T00:00:00Z', remaining: null });
 
   const orphan = hubOrderKeyForTask(dir, { promptContext: { decomposedFrom: 'hub-gone' } });
   assert.equal(orphan.isHubChild, false);
 
   const nohub = hubOrderKeyForTask(dir, { id: 'plain-task' });
   assert.equal(nohub.isHubChild, false);
+});
+
+test('readHubOrderKey reports the unbuilt pieces (progress.total - progress.built), null when the record does not say', () => {
+  const dir = makePipeline();
+  writeHub(dir, { id: 'hub-a', createdAt: '2026-09-09T00:00:00Z', progress: { done: 1, built: 5, total: 7 } });
+  writeHub(dir, { id: 'hub-b', createdAt: '2026-09-09T00:00:00Z', progress: { built: 9, total: 7 } });
+  writeHub(dir, { id: 'hub-c', createdAt: '2026-09-09T00:00:00Z', progress: { built: 'x', total: 7 } });
+  assert.equal(readHubOrderKey(dir, 'hub-a').remaining, 2);
+  assert.equal(readHubOrderKey(dir, 'hub-b').remaining, 0, 'never negative');
+  assert.equal(readHubOrderKey(dir, 'hub-c').remaining, null);
+});
+
+test('compareHubKeys: at equal rank the hub with fewer unbuilt pieces comes first, before createdAt; an unknown count sorts last; an explicit rank still wins', () => {
+  const R = UNRANKED_HUB_PRIORITY;
+  const nearDone = { rank: R, createdAt: '2026-09-09T00:00:00Z', remaining: 1 };
+  const farOlder = { rank: R, createdAt: '2026-01-01T00:00:00Z', remaining: 6 };
+  const unknownOlder = { rank: R, createdAt: '2026-01-01T00:00:00Z', remaining: null };
+  assert.ok(compareHubKeys(nearDone, farOlder) < 0, 'fewer unbuilt pieces beats an older hub');
+  assert.ok(compareHubKeys(farOlder, nearDone) > 0);
+  assert.ok(compareHubKeys(nearDone, unknownOlder) < 0, 'an unknown count sorts after a known one');
+  const sameCountOlder = { rank: R, createdAt: '2026-01-01T00:00:00Z', remaining: 1 };
+  assert.ok(compareHubKeys(sameCountOlder, nearDone) < 0, 'equal counts fall back to the older hub');
+  assert.ok(compareHubKeys({ rank: 1, createdAt: '2026-09-09T00:00:00Z', remaining: 9 }, nearDone) < 0, 'an explicit hubPriority still wins');
 });
 
 test('compareHubKeys: explicit priority ascending, then createdAt ascending, missing createdAt last', () => {

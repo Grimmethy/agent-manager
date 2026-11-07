@@ -91,7 +91,7 @@ class StaleWhileRevalidate(CacheCase):
         self.fill(OLD, age=app._BRANCH_CACHE_TTL_SECONDS + 10)
         with mock.patch.object(app, "_list_unmerged_branches_uncached", return_value=NEW) as rec:
             self.assertEqual(app.list_unmerged_branches(force=True), NEW)
-        rec.assert_called_once_with(force_fetch=True)
+        rec.assert_called_once_with(force_fetch=True, fetch_timeout=app._ACTION_FETCH_TIMEOUT_SECONDS)
         self.assertIsNone(app._branch_fetch_state.get("thread"))
 
     def test_a_refresh_that_raises_keeps_the_old_list_and_a_later_call_can_refresh_again(self):
@@ -158,7 +158,7 @@ class Routes(CacheCase):
         with mock.patch.object(app, "list_unmerged_branches", wraps=app.list_unmerged_branches) as spy, \
                 mock.patch.object(app, "_list_unmerged_branches_uncached") as rec:
             resp = self.client.get("/api/git/unmerged-branches")
-        spy.assert_called_once_with(force=False)
+        spy.assert_called_once_with(force=False, stale_ok=True)   # the listing endpoint never recomputes inside the request
         rec.assert_not_called()
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json(), OLD)

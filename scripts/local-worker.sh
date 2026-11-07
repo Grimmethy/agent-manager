@@ -204,6 +204,8 @@ process_drafting_file() {
   # queue/needs-clarification/ instead of review/, same "nothing here for an automatic
   # reviewer to verify" reasoning local-draft.js's own comment documents.
   draft_needs_clarification="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.needsClarification?"true":"false")}catch(e){console.log("false")}')"
+  # recorded (2026-11-02): a script-handled source (src/script-handler-registry.js) finished its work and left the result on the task; nothing for a reviewer to verify.
+  draft_recorded="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.recorded?"true":"false")}catch(e){console.log("false")}')"
 
   if [[ "$draft_succeeded" == "true" && "$draft_blocked" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/blocked" >/dev/null 2>&1
@@ -213,6 +215,10 @@ process_drafting_file() {
     mkdir -p "${QUEUE_DIR}/needs-clarification" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/needs-clarification/${name}"
     printf '[worker-%s] %s needs a human decision -- moved to needs-clarification/\n' "$INSTANCE_ID" "$task_id" >&2
+  elif [[ "$draft_succeeded" == "true" && "$draft_recorded" == "true" ]]; then
+    mkdir -p "${QUEUE_DIR}/done" >/dev/null 2>&1
+    mv -n "$wpath" "${QUEUE_DIR}/done/${name}"
+    printf '[worker-%s] recorded %s -- script handler finished, no review needed: moved to done/\n' "$INSTANCE_ID" "$task_id" >&2
   elif [[ "$draft_succeeded" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/review" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/review/${name}"
@@ -488,6 +494,10 @@ fi
 CONSECUTIVE_INFRA_FAILURES=0
 SWITCHED_OFF_TICKS=0                                                     # consecutive ticks this worker has been switched off by the operator (worker_switched_off); only used to print one line on each transition
 ENDPOINT_DOWN_TICKS=0                                                    # consecutive ticks the lane's Ollama endpoint did not answer (see the circuit breaker in the main loop)
+LAST_WAKE=""                                                            # how the last idle wait ended: event | timeout | sleep (see wait_for_queue_change)
+WAKE_RECONCILE_HITS=0                                                    # timeout wakes that then found work: a producer changed state without announcing it in a queue directory (ADR-0024 rule 6)
+LAST_TICK_START=0                                                        # epoch seconds when the current tick began (the minimum gap between idle ticks is measured from it)
+LAST_TICK_START_MS=0                                                     # the same moment in ms: the waiter reports any queue entry that arrived after it (catch-up)
 
 # Borrow a tick from another suite project (docs/idle-pool-borrowing.md). Called only when this lane's OWN project had nothing to do this tick.
 # Walks the pool in least-recently-borrowed order; the first project that yields work ends the walk. A borrowed tick does exactly ONE item (its
@@ -517,6 +527,8 @@ borrow_from_pool() {
   done
   return 0
 }
+
+source "${SCRIPT_DIR}/wake-common.sh"                                        # wait_for_queue_change (the idle wait; ADR-0024 S3), shared with review-runner.sh and apply-loop.sh
 
 # The pause at the end of a tick, shared by the normal tick and a tick that ended on a premium borrow (it reads did_work and
 # TICK_HAD_INFRA_FAILURE and maintains CONSECUTIVE_INFRA_FAILURES, exactly as when it was inline at the bottom of the loop).
@@ -548,10 +560,15 @@ end_of_tick_pause() {
     sleep "${backoff_secs}.$(printf '%03d' "$jitter_ms")"
   elif "$did_work"; then
     CONSECUTIVE_INFRA_FAILURES=0
+    if [[ "$LAST_WAKE" == "timeout" ]]; then
+      WAKE_RECONCILE_HITS=$((WAKE_RECONCILE_HITS + 1))
+      printf '[worker-%s] wake reconcile: found work after a TIMEOUT wake (hit %s) -- a queue change was not announced in a watched directory.\n' "$INSTANCE_ID" "$WAKE_RECONCILE_HITS" >&2
+    fi
+    LAST_WAKE=""
     sleep 1
   else
     CONSECUTIVE_INFRA_FAILURES=0
-    sleep "${ORC_TICK_SECS:-60}"                                                   # wait between polls (default: 60s) — same delay PowerShell uses via its `Start-Sleep -Seconds $env:TICK_INTERVAL` inside main daemon loop body (we read from ORC_TICK_SECS env var so user can customize per-instance without editing the script; bash ${VAR:-default} form is exactly that kind of fallback assignment which matches what PowerShell's `$interval = if ($null -ne $env:INTERVAL) { $env:INTERVAL } else { 60}` does for same purpose.
+    wait_for_queue_change
   fi
 }
 
@@ -588,6 +605,7 @@ borrow_premium_from_projects() {
 }
 
 while :; do                                                                     # `while :; do` is bash idiom for 'true/forever' loop — equivalent of PowerShell's `while ($true)` syntax we're matching here. Bash doesn't have boolean literals natively so ':' (the POSIX-no-op command that always returns 0=success) serves as the true condition in loops like this one; identical semantic meaning in practice to while-true block we use elsewhere.
+  LAST_TICK_START="$(date +%s)"; LAST_TICK_START_MS="$(date +%s%3N)"
   did_work=false                                                                 # tracks whether this tick actually processed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment). Reset fresh every tick.
   TICK_HAD_INFRA_FAILURE=false                                                   # set by process_drafting_file (a global, not a subshell -- it's called directly) when this tick's draft call failed on an apparent infra outage. Drives the backoff decision below, separate from did_work.
 

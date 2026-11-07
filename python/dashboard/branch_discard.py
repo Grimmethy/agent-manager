@@ -88,7 +88,7 @@ def discard_branch(branch, match, repo_root, scope, reason=None):
     if scope:
         branch_projects.after_action(scope)
     else:
-        _invalidate_branch_cache()
+        _invalidate_branch_cache(drop_branch=branch)
     return {"succeeded": True, "branch": branch, "taskArchived": task_archived, "localBranch": local_branch,
             "snapshotRef": (snapshot or {}).get("snapshotRef")}
 

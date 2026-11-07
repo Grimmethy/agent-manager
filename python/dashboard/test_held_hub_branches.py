@@ -15,6 +15,17 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 import app  # noqa: E402
+
+
+def _reset_cache():
+    """A fresh dashboard: no cached list at all (an invalidated cache keeps its last list for the stale-while-revalidate listing, see app.list_unmerged_branches)."""
+    t = app._branch_fetch_state.get("thread")
+    if t is not None:
+        t.join(5)
+    with app._branch_cache_lock:
+        app._branch_cache.update({"at": 0.0, "branches": []})
+        app._branch_cache.pop("filled", None)
+        app._branch_fetch_state["refreshing"] = False
 from test_hub_sibling_conflict import make_repo_with_conflicting_siblings  # noqa: E402
 
 
@@ -114,12 +125,12 @@ class TestHeldHubEndToEnd(unittest.TestCase):
     """Real bare origin + clone, real routes: the hub's second piece decides whether the first piece's pushed branch is listed."""
 
     def setUp(self):
-        app._invalidate_branch_cache()
+        _reset_cache()
         self._sync = mock.patch.object(app, "_sync_live_checkout", return_value={"synced": False})
         self._sync.start()
 
     def tearDown(self):
-        app._invalidate_branch_cache()
+        _reset_cache()
         self._sync.stop()
 
     def _set_hub(self, repo, task_a, task_b, b_status, b_phase):
@@ -131,7 +142,7 @@ class TestHeldHubEndToEnd(unittest.TestCase):
             {"id": task_b, "title": "B", "status": b_status, "phase": b_phase},
         ]
         hub_path.write_text(json.dumps(hub))
-        app._invalidate_branch_cache()
+        _reset_cache()
 
     def test_branches_are_held_until_the_second_piece_is_built_then_listed_together(self):
         repo, _bare, task_a, task_b = make_repo_with_conflicting_siblings()
@@ -194,12 +205,12 @@ class TestFalseConflictDetection(unittest.TestCase):
     """Verify that held hub branches do not show false conflicts."""
 
     def setUp(self):
-        app._invalidate_branch_cache()
+        _reset_cache()
         self._sync = mock.patch.object(app, "_sync_live_checkout", return_value={"synced": False})
         self._sync.start()
 
     def tearDown(self):
-        app._invalidate_branch_cache()
+        _reset_cache()
         self._sync.stop()
 
     def _set_hub(self, repo, task_a, task_b, b_status, b_phase):
@@ -211,7 +222,7 @@ class TestFalseConflictDetection(unittest.TestCase):
             {"id": task_b, "title": "B", "status": b_status, "phase": b_phase},
         ]
         hub_path.write_text(json.dumps(hub))
-        app._invalidate_branch_cache()
+        _reset_cache()
 
     def test_held_branch_no_false_conflict_with_master(self):
         """Held hub branches should not show willConflict=True for master."""

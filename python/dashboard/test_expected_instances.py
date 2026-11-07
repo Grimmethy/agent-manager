@@ -24,6 +24,11 @@ class ExpectedInstancesTest(unittest.TestCase):
         app._LANE_DEFS_CACHE.update(at=0.0, lanes=[])
         self.addCleanup(lambda: app._LANE_IDS_CACHE.update(at=0.0, ids=[]))
         self.addCleanup(lambda: app._LANE_DEFS_CACHE.update(at=0.0, lanes=[]))
+        # The lane caches refresh in the background once they hold a value (swr_cache.py); run that refresh inline so a test never races a thread.
+        import swr_cache
+        p = mock.patch.object(swr_cache, "run_background", lambda fn: fn())
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_expected_ids_are_lanes_plus_reviewer_and_watchdog(self):
         with mock.patch.object(app, "worker_lane_ids", return_value=["worker-3090", "worker-p40"]):

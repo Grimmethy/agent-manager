@@ -18,6 +18,7 @@ const { findTaskAnywhere, QUEUE_STATES } = require('./task-anywhere.js');
 const { lineMatches } = require('./text-match.js');
 const { getConfig } = require('./config.js');
 const { postJson, postJsonStream } = require('./ollama-http.js');
+const { ensureResident } = require('./model-resident.js');
 const gpuGuard = require('./gpu-guard.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
@@ -438,7 +439,7 @@ const CHAT_TOOLS = [
     type: 'function',
     function: {
       name: 'record_branch_verdict',
-      description: 'Record your verdict on ONE verified unmerged branch so its card changes colour in the Unmerged Branches tab (merge = green, needs-work = yellow, discard = red). It records the verdict only: it never merges, discards or edits anything. Allowed verdicts are exactly merge, needs-work, discard (HOLD and unverified do not exist; use needs-work for a branch that is not ready). The reasons must be specific evidence of what you actually ran or read and what it showed; never write a check you did not run (for example "no conflicts" or "tests pass") and say plainly which checks you could not run. sha must be the headSha from list_unverified_branches; if the head moved the call is refused. Call check_branch for the branch first and base your reasons on its result: a merge verdict needs a current check of this exact head that ran the covering tests green (a branch that changes only documentation is exempt); needs-work and discard never need one.',
+      description: 'Record your verdict on ONE verified unmerged branch so its card changes colour in the Unmerged Branches tab (merge = green, needs-work = yellow, discard = red). It records the verdict only: it never merges, discards or edits anything. Allowed verdicts are exactly merge, needs-work, discard (HOLD and unverified do not exist; use needs-work for a branch that is not ready). The reasons must be specific evidence of what you actually ran or read and what it showed; never write a check you did not run (for example "no conflicts" or "tests pass") and say plainly which checks you could not run. sha must be the headSha from list_unverified_branches; if the head moved the call is refused. Call check_branch for the branch first and base your reasons on its result: a merge verdict needs a current check of this exact head that ran the covering tests green (a branch that changes only documentation is exempt); needs-work and discard never need one. Relay the tool response exactly: the "message" field is what the model should say to the operator. Do not claim the verdict is recorded when the message says "does not show it yet" or "pending" — those mean the card has not been updated. If the message says "read the tab before saying it is recorded", tell the operator to check the Unmerged Branches tab to confirm. Only say "recorded" when the message says "read back" or "verified".',
       parameters: {
         type: 'object',
         properties: {
@@ -1070,6 +1071,8 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
       // callers treat it as a pause (local-draft.js, local-worker.sh), not a failure. The Chat panel (forgePause false) is an explicit user action.
       if (forgePause && gpuGuard.forgePauseEnabled() && gpuGuard.leaseHeldFor(OLLAMA_URL)) throw new gpuGuard.ForgePauseError();
       try {
+        // Residency gate before the GPU turn lock, so a slow cold load never happens while holding it (src/model-resident.js).
+        await ensureResident({ url: OLLAMA_URL, model: MODEL, numCtx: CHAT_OPTIONS.num_ctx, instancesDir });
         const turnRes = await turnLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }));
         if (isEmptyCompletion(turnRes.message)) {
           // Audit-only (brain-dump 1891): record the blank sample (done_reason, thinking size) before it is resampled.

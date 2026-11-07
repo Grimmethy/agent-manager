@@ -25,6 +25,8 @@ plugin. `grep -rn "require(.*hygiene\|require.*agent-manager-hygiene" src/` must
 | **`capability-ledger.js`**, **`lanes.js`** | `readScorecard`, `buildScorecard`, `annotateVariants`; `getLanes`, `laneById`; CLI `node src/lanes.js --json` | Task-atomization hook 3: the documented read surface for measurement. `lanes.js --json` lists every lane's `id, gpu, model, tier, numCtx, numBatch, slow, local, preempt, taskClasses, reserve, endpoint` (no launch env). The scorecard rows are `{ source, model, tier, lanes, n, ok, okRate, lower, p50WallMs, p95WallMs, tpsP50, failStreak, outcomes }`. |
 | `config.js` | `getConfig`, `resolveGraphPath` | the plugin passes `getConfig` into each module's `register(deps)`. It never calls `ensureRegistered` — core does. |
 | `task-sources.js` | `taskIdExistsInQueue`, `taskPriority` | `taskIdExistsInQueue` is a general queue primitive; `taskPriority` reads the priority-override map. Injected via `register(deps)`. `nextCandidateFulfillmentTask` / `windowFetchedFileContent` are still re-exported here for back-compat but the SDK path below is canonical. |
+| `script-handler-registry.js` | `registerScriptHandler(sourceName, fn)`, `getScriptHandler(sourceName)` | A task source whose work is a script, not a model-drafted diff (2026-11-02, the llm-tuner tuning lane). `fn(task, ctx)` is async and returns `{outcome, summary, detail?}`. `draftTask()` runs it before any model call; the task finishes with `terminalDisposition: 'recorded'` and moves straight to `queue/done/`. A throw fails the draft through the normal failure accounting. Pair it with a `script` lane (`docs/agents/lanes.md`, "Script-handled sources"). A duplicate registration throws. |
+| `lib/task-priority.js` | `taskPriority(source, default)` | The same function `task-sources.js` re-exports (a test asserts they are identical), so a plugin may import either. |
 | **`sdk/candidate-fulfillment.js`** | `nextCandidateFulfillmentTask`, `windowFetchedFileContent`, plus all of `candidate-docs.js` re-exported | **SDK helpers (ADR-0022 Stage D).** The candidate-fulfillment lifecycle in one module: read an `### AC-NNN` doc, pick the oldest actionable Strong candidate, ground it in real windowed file content. Core ships and documents this but registers nothing with it — `backlog_fulfillment` and the plugin's `arch_review` / `*_fix` are all consumers. `windowFetchedFileContent` returns `{ text, confidence, anchorCount, usedSnippetFuzzyMatch }` (not a bare string, since 2026-09-05's context-trim fix) — `confidence` is `'strong'`/`'weak'`/`'none'` depending on how reliable the anchor was, and a `'weak'`/`'none'` result has a `[LOW-CONFIDENCE GROUNDING]` note prepended to `text` for the model. `usedSnippetFuzzyMatch` tells a caller whether the candidate's frozen `Snippet:` field still matches current file content — the staleness signal `context-trim-sweep.js` re-checks on every retry. Also lower-level grounding helpers (`findFuzzyMatch`, `windowAroundIndex`, `snippetFromSection`, `quotedSymbolsFromSection`, `MAX_FETCHED_FILE_CHARS`, `MAX_ARCH_REVIEW_TASK_CHARS`) for a plugin's own grounding tests. |
 | `candidate-docs.js` | `applyArchDiscoveryCandidates`, `parseArchDiscoveryCandidates`, `nextAvailableCandidateId`, `isEffectivelyEmptyResponse` | AC-NNN candidate-doc *write* primitives, shared with core `backlog_decomposition`. `apply-group-a.js` and `sdk/candidate-fulfillment.js` both re-export them. |
 | `apply-group-a.js` | `applyVerdictOnly` | shared with core `staleness_audit` — a plain prose verdict is a documented no-op at apply. |
@@ -239,6 +241,24 @@ at is the one that just disappeared, `redirectFromGoneActiveTab()` runs the dash
 normal tab-switch transition (`switchToTab()`) to a safe fallback (`'project'` by default)
 instead of leaving them on a dead tab.
 
+### Keeping the tab current: announce
+
+The dashboard has no redraw timer (ADR-0024, "triggers, not polls"): a plugin tab is drawn when it is opened and again when its plugin says something changed. The party that changes
+the data announces it:
+
+```
+POST /api/plugins/<plugin name>/announce        ->  {"ok": true, "plugin": "<name>", "seq": 42}
+```
+
+`<plugin name>` is the `name` of the plugin's `plugins.json` entry (the same name as `pluginName` on its tab row). Call it from the plugin's server (or its tab script) after the data
+behind the tab changed, for example after a job finished or a record was written. Every open dashboard receives a `plugin-changed` event, and ONLY the open tab of that plugin calls its
+renderer again; every other tab ignores it. Notes:
+
+- An unknown plugin name answers 404 and publishes nothing; with `AGENT_MANAGER_EVENT_STREAM=off` the route answers 404 `{"enabled": false}`.
+- Announce when something CHANGED, not on a timer: a loop that announces every few seconds is the poll this mechanism replaces.
+- The tabs that keep their own state while open (PromptForge, AdForge and ScriptForge, in `SELF_RENDERING_TABS` of `static/js/live-updates.js`) are never redrawn by an announcement.
+- A plugin that never announces keeps working: its tab shows what it drew when it was opened (reload or switch away and back to redraw).
+
 ### End-to-end proof
 
 `test-fixtures/manifest-tab-example-plugin/` (`register.js` + `ui/example-tab.js`) is a
@@ -258,6 +278,19 @@ server-slotted plugin (`slot`/`url`, e.g. the Hardware tab's plugins) cannot yet
 existing hardcoded tab (Hub Tasks, or the PromptForge/AdForge/ScriptForge iframe
 companions) onto this mechanism is separate follow-up work, tracked in
 `Docs/hub-tasks-extraction-plan.md`.
+
+## Watchdog scripts (optional)
+
+A plugin that needs "check something cheap every tick, act only on a change" declares it in its `plugins.json` entry instead of starting a timer of its own (ADR-0024: the watchdog is the single clock):
+
+```json
+{ "name": "uiforge", "registerPath": "/path/uiforge/register.js", "enabled": true, "watchdogScripts": ["harness/watchdog-trigger.js"] }
+```
+
+- `src/plugin-watchdog-scripts.js` lists the scripts of every ENABLED entry. Each path must be relative to the plugin root (the directory of `registerPath`), contain no `..`, and end in `.js`; anything else is skipped with a reason on stderr, never thrown. Extra manifest fields survive both the JS reader and the dashboard's plugin toggle, which rewrites whole entries.
+- `scripts/run-plugin-watchdog-scripts.sh`, called from `scripts/queue-watcher.sh` once per tick, runs each script with `timeout` (`AGENT_MANAGER_PLUGIN_WATCHDOG_TIMEOUT_SECS`, default 20), sends its stderr to `<HOME_LOGS>/watchdog-plugin-<plugin>.log`, logs its FIRST stdout line as `[watchdog] <plugin>:<script>: <line>`, and logs a failure or timeout once without stopping the tick or the scripts after it. `AGENT_MANAGER_PLUGIN_WATCHDOG_SCRIPTS=off` disables it. With no plugin declaring scripts a tick pays one extra node start (about 40 ms measured).
+- A script must do ONE cheap edge check (compare a stored sha or file stats) and return fast. Anything slow starts a detached, lock-protected singleton (`scripts/lib/start-singleton-bg.sh`), the way the proactive decompose sweep does.
+- This is an interim hook. The event that would make a script unnecessary is the queue-events journal (ADR-0024 S1, not built yet); a script should count every change it finds without an event so that gap stays measurable.
 
 ## Reserving a GPU and showing the job (optional)
 

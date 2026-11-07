@@ -394,8 +394,15 @@ def api_pipeline_stop():
 @pipeline_1_more_bp.route("/api/git/unmerged-branches")
 def api_git_unmerged_branches():
     # Served from the cache (stale-while-revalidate, see app.list_unmerged_branches): the forced full recompute took ~37 s under load, past the tab's 30 s timeout.
-    from app import _branch_cache, _branch_cache_lock, list_unmerged_branches
-    branches = list_unmerged_branches(force=False)
+    from app import _branch_cache, _branch_cache_lock, _invalidate_branch_cache, branch_list_refreshing, list_unmerged_branches
+    if request.args.get("kick") == "1":
+        # The page was told that something that feeds the list happened (a task finished, a verdict, a merge): start the background refresh NOW instead of waiting for the
+        # TTL, and still answer from the last good list. The refresh announces branch-list-changed when it finds a difference, and the page reads the list again.
+        _invalidate_branch_cache(refetch=True)
+        if request.args.get("projects") == "all":
+            import branch_projects
+            branch_projects.expire_all()
+    branches = list_unmerged_branches(force=False, stale_ok=True)   # never recomputes inside the request: last good list now, refresh in the background
     with _branch_cache_lock:
         filled = _branch_cache["at"]
     pending = []
@@ -408,10 +415,11 @@ def api_git_unmerged_branches():
     resp = jsonify(branches)
     resp.headers["X-Branch-Cache-Age"] = str(max(0, int(time.time() - filled))) if filled else "0"
     resp.headers["X-Branch-Projects-Pending"] = ",".join(pending)
+    resp.headers["X-Branch-Refreshing"] = "1" if branch_list_refreshing() else "0"
     # The tab polls this every 15 s and the ~140 KB list is almost always unchanged: tag it so an unchanged list is answered with a body-less 304 (the browser revalidates by itself
     # under no-cache). The pending header is part of the tag because the tab reads it (branchProjectsPending); the cache-age header changes every call and is left out.
     resp.headers["Cache-Control"] = "no-cache"
-    resp.set_etag(hashlib.sha256(resp.get_data() + b"\0" + resp.headers["X-Branch-Projects-Pending"].encode()).hexdigest())
+    resp.set_etag(hashlib.sha256(resp.get_data() + b"\0" + resp.headers["X-Branch-Projects-Pending"].encode() + b"\0" + resp.headers["X-Branch-Refreshing"].encode()).hexdigest())
     return resp.make_conditional(request)
 
 
@@ -527,7 +535,7 @@ def _validate_and_authorize_merge(repo_root, branch, force, scope=None):
     Returns the context dict the later helpers consume: {"match", "main_branch", "repo_root"}.
     Raises LookupError if the branch is not in a fresh list, PermissionError (the endpoint
     answers 409) if a gate blocks and the caller did not force."""
-    from app import list_unmerged_branches
+    from app import _branch_cache_lock, _branch_fetch_state, list_unmerged_branches
 
     # Never trust a caller-supplied branch string as a raw git ref beyond what THIS
     # process already enumerated itself -- re-derive the current list (cheap: cached
@@ -536,8 +544,11 @@ def _validate_and_authorize_merge(repo_root, branch, force, scope=None):
     if scope:
         import branch_projects
         branches = branch_projects.refresh_branches(scope)  # another project: gate on ITS list as it is right now
+        fetched_at = time.time()  # refresh_branches raises when its fetch fails, so reaching here means it fetched
     else:
         branches = list_unmerged_branches(force=True)
+        with _branch_cache_lock:
+            fetched_at = _branch_fetch_state["at"]  # set only by a fetch that finished: a timed-out fetch leaves the old time and the merge fetches again
     match = next((b for b in branches if b["branch"] == branch), None)
     if not match:
         raise LookupError(f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
@@ -577,7 +588,7 @@ def _validate_and_authorize_merge(repo_root, branch, force, scope=None):
             '{"force": true} only if you have verified the branch is actually complete.'
         )
 
-    return {"match": match, "main_branch": match["mainBranch"], "repo_root": repo_root, "scope": scope}
+    return {"match": match, "main_branch": match["mainBranch"], "repo_root": repo_root, "scope": scope, "fetchedAt": fetched_at}
 
 
 def _merge_conflict_error(match, main_branch, merge_err):
@@ -646,7 +657,9 @@ def _execute_git_merge(context):
     except RuntimeError as exc:
         raise MergeLockBusy(str(exc)) from exc
     try:
-        _run_git(["fetch", "origin"], repo_root)
+        from app import _ACTION_FETCH_REUSE_SECONDS, _ACTION_FETCH_TIMEOUT_SECONDS
+        if time.time() - (context.get("fetchedAt") or 0) > _ACTION_FETCH_REUSE_SECONDS:  # the check just before this fetched already: do not pay for a second one under the lock
+            _run_git(["fetch", "origin"], repo_root, timeout=_ACTION_FETCH_TIMEOUT_SECONDS)
         # Brain-dump #1740: what this merged branch held (commits + candidate headings + the verdict on its card), recorded with the merged row
         # below. No ref is pinned -- the commits land on the main branch. Best-effort: never stops the merge.
         snapshot = {}
@@ -698,8 +711,39 @@ def _apply_post_merge_side_effects(context):
         if os.path.realpath(str(scope["repoPath"])) != os.path.realpath(str(PACKAGE_ROOT)):
             return {"skipped": "not the dashboard's own repo"}
         return _sync_live_checkout(context["main_branch"])
-    _invalidate_branch_cache()
+    _invalidate_branch_cache(drop_branch=(context.get("match") or {}).get("branch"))
     return _sync_live_checkout(context["main_branch"])
+
+
+def _emit_branch_merged(qdir, branch, task_id):
+    """Announce a merge in the queue-events journal (ADR-0024). Best-effort and silent on failure: the merge already happened and must not be reported as failed
+    because of the journal. AGENT_MANAGER_QUEUE_EVENTS=off makes the writer skip it."""
+    try:
+        from queue_events import append_event
+        append_event(os.path.dirname(os.path.abspath(str(qdir))), {"type": "branch_merged", "branch": branch, "taskId": task_id})
+    except Exception as exc:  # noqa: BLE001 -- never let the journal break a merge
+        import logging
+        logging.getLogger(__name__).warning("queue-events: branch_merged not journaled for %s: %s", branch, exc)
+
+
+def _guarded_post_merge_step(step, warnings, action):
+    """Run one step that happens AFTER a merge landed on origin. A git timeout, a git failure or a write error is
+    appended to `warnings` as a plain sentence and None is returned; it never propagates (the merge is done, a 500 would
+    tell the owner it failed). Returns the step's own result otherwise."""
+    from app import logger
+
+    try:
+        result = action()
+    except subprocess.TimeoutExpired as exc:
+        reason = f"Git did not answer in time while {step} (took longer than {exc.timeout:g} s; the machine is busy). The merge itself is on origin."
+        logger.warning("Post-merge step timed out (non-fatal): %s", reason)
+    except (RuntimeError, OSError) as exc:
+        reason = f"Problem while {step}: {exc}. The merge itself is on origin."
+        logger.warning("Post-merge step failed (non-fatal): %s", reason, exc_info=True)
+    else:
+        return result
+    warnings.append(reason)
+    return None
 
 
 def _record_merge_in_task_file(branch, main_branch, qdir=None):
@@ -748,6 +792,7 @@ def _record_merge_in_task_file(branch, main_branch, qdir=None):
                 except OSError as exc:
                     logger.error("Failed to persist merge-state for branch %r to %s: %s", branch, candidate, exc)
                     raise
+                _emit_branch_merged(qdir, branch, task_id)    # announced only after the merge-state write succeeded
             break
 
 
@@ -789,6 +834,15 @@ def _record_merge_in_task_log(repo_root, branch, main_branch, qdir=None):
         logger.warning("Non-fatal: could not record merge disposition in task-logs/%s.json: %s", task_id, exc)
 
 
+def _git_busy_response(step, exc, changed):
+    """A git command outlasted its limit because the host is busy: a retryable 503 that says what happened, never a bare 500. A timeout while checking changed nothing; one
+    during the merge may have stopped anywhere, so that message sends the caller to the branch list before another try."""
+    cmd = " ".join(exc.cmd[:3]) if isinstance(exc.cmd, (list, tuple)) else str(exc.cmd)
+    after = "The merge may or may not have completed: look at the branch list before trying again." if changed else "Nothing was changed: try again in a minute."
+    return jsonify({"succeeded": False, "retryable": True,
+                    "reason": f"Git did not answer in time while {step} (`{cmd}` took longer than {exc.timeout:g} s; the machine is busy). {after}"}), 503
+
+
 @pipeline_1_more_bp.route("/api/git/branches/<path:branch>/merge", methods=["POST"])
 def api_git_merge_branch(branch):
     from app import get_active_repo_root
@@ -813,18 +867,27 @@ def api_git_merge_branch(branch):
         abort(404, description=str(e))
     except PermissionError as e:
         return jsonify({"succeeded": False, "reason": str(e)}), 409
+    except subprocess.TimeoutExpired as e:
+        return _git_busy_response("checking the branch", e, changed=False)
 
     try:
         _execute_git_merge(context)
     except MergeLockBusy:
         abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
+    except subprocess.TimeoutExpired as e:
+        return _git_busy_response("merging the branch", e, changed=True)
     except RuntimeError as e:
         return jsonify({"succeeded": False, "reason": str(e)}), 500
 
-    live_sync = _apply_post_merge_side_effects(context)
+    # The merge is already on origin here, so nothing below may turn the response into a failure: each step is guarded on its own, a
+    # failure becomes a warning, and the later steps still run (the task record must be stamped even when the live-checkout sync was too slow).
+    warnings = []
     qdir = scope["qdir"] if scope else None
-    _record_merge_in_task_file(branch, context["main_branch"], qdir)
-    _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir)
+    live_sync = _guarded_post_merge_step("syncing the dashboard checkout", warnings, lambda: _apply_post_merge_side_effects(context))
+    if live_sync is None:
+        live_sync = {"synced": False, "reason": warnings[-1]}
+    _guarded_post_merge_step("stamping the task record", warnings, lambda: _record_merge_in_task_file(branch, context["main_branch"], qdir))
+    _guarded_post_merge_step("closing the task log", warnings, lambda: _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir))
 
     # Check which plugins are behind after merge (if the merged repo is a plugin's repo).
     # Mirrors the pattern in routes/plugins.py: iterate manifest, call behind_checkout,
@@ -849,6 +912,7 @@ def api_git_merge_branch(branch):
         "branch": branch,
         "mainBranch": context["main_branch"],
         "liveSync": live_sync,
+        "warnings": warnings,
         "restartNeeded": restart_needed,
     })
 

@@ -501,10 +501,33 @@ const PLACEHOLDER_RE = /placeholder|example\.(?:com|org|net)|\bTODO\b|\bFIXME\b|
 // `+` and leading whitespace, same as before) so this still can't match a kwarg
 // (`func(NAME=value)`) or a dict entry (`"key": NAME`) -- the identifier must be the
 // first real token on the line, same discipline as the original keyword-only version.
-const NEW_DECLARATION_RE = /^\+\s*(?:(?:const|let|var)\s+)?([A-Z][A-Z0-9]*_[A-Z0-9_]+)\s*=(?!=)/gm;
+// 2026-11-02 (stalled-task loop: intakereel annotated module constants such as `RULES: dict[str, bool] = {`, a deploy script's `readonly NAME=` / `export NAME=`): the
+// declaration also counts with a Python type annotation between the name and the `=` (`[^=\n]` keeps a `==` comparison and a dict entry out) and with the shell
+// keywords export / readonly / local / declare [-flags] (and `export const`) in front. The identifier must still be the first real token on the added line.
+const NEW_DECLARATION_RE = /^\+\s*(?:(?:export|const|let|var|readonly|local|declare(?:\s+-[a-zA-Z]+)?)\s+)*([A-Z][A-Z0-9]*_[A-Z0-9_]+)(?:\s*:\s*[^=\n]+?)?\s*=(?!=)/gm;
 
 function extractNewlyDeclaredIdentifiers(text) {
   return new Set([...text.matchAll(NEW_DECLARATION_RE)].map((m) => m[1]));
+}
+
+// 2026-11-02 (deploy-kit systemd template, premium, parked three times): a name the language or the OS defines is never a repo fact, so no grounding can contain it:
+// bash built-ins (BASH_SOURCE, BASH_REMATCH ...), socket constants (AF_INET, AF_INET6, AF_UNIX, SOCK_STREAM ...), NODE_ENV and the React test flag.
+// Exact names and three narrow families only; a made-up config key is still checked.
+const PLATFORM_CONSTANTS = new Set(['NODE_ENV', 'IS_REACT_ACT_ENVIRONMENT']);
+const PLATFORM_CONSTANT_RE = /^(?:BASH_[A-Z]+|AF_[A-Z0-9]+|SOCK_[A-Z]+)$/;
+function isPlatformConstant(name) {
+  return PLATFORM_CONSTANTS.has(name) || PLATFORM_CONSTANT_RE.test(name);
+}
+
+// A template placeholder an ADDED line wraps in @...@ (systemd/sed unit templates: `--backup-to=@BACKUP_TO@`) is substituted at install time: the draft defines it by writing it.
+const TEMPLATE_PLACEHOLDER_RE = /@([A-Z][A-Z0-9]*_[A-Z0-9_]+)@/g;
+function extractTemplatePlaceholders(text) {
+  const out = new Set();
+  for (const line of String(text || '').split('\n')) {
+    if (!line.startsWith('+') || line.startsWith('+++')) continue;
+    for (const m of line.matchAll(TEMPLATE_PLACEHOLDER_RE)) out.add(m[1]);
+  }
+  return out;
 }
 
 // 2026-10-18, root-caused live (brain-dump 1890's review, this pipeline): a draft that adds an env switch -- read as
@@ -735,6 +758,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   const envReads = extractEnvReadIdentifiers(draftText);
   const testFixtureFields = fieldsOnlyInAddedTestFiles(draftText);
   const echoMarkers = extractEchoMarkers(draftText);
+  const templatePlaceholders = extractTemplatePlaceholders(draftText);
 
   const urls = [...new Set(scannableText.match(URL_RE) || [])];
   for (const raw of urls) {
@@ -754,6 +778,8 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
     if (envReads.has(field)) continue;
     if (testFixtureFields.has(field)) continue;
     if (echoMarkers.has(field)) continue;
+    if (templatePlaceholders.has(field)) continue;
+    if (isPlatformConstant(field)) continue;
     if (sourceText.includes(field)) continue;
     if (existsLiterallyInRepo(field, repoRoot, ref)) continue;
     flags.push({ type: 'ungrounded-field', detail: field });

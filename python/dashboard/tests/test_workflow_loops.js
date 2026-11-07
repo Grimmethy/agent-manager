@@ -1,0 +1,156 @@
+// Node tests for the pure loop helpers of the Workers workflow graph (HUB0346 piece 2): splitIntoLoops and fitScale.
+// Run: node --test python/dashboard/tests/test_workflow_loops.js
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+
+const { splitIntoLoops, fitScale, WF_MIN_SCALE } = require(path.join(__dirname, '..', 'static', 'js', 'workflow-loops.js'));
+
+const node = (id, kind, extra) => ({ id, kind, label: id, parent: null, ...extra });
+const edge = (from, to, kind) => ({ id: `${from}->${to}:${kind}`, from, to, kind, label: null });
+const ids = (card) => card.graph.nodes.map((n) => n.id).sort();
+
+const GRAPH = () => ({
+  nodes: [
+    node('source:a', 'source'), node('source:b', 'source'), node('source:c', 'source'), node('source:orphan', 'source'),
+    node('worker-1', 'loop'), node('worker-2', 'loop'), node('reviewer', 'loop'),
+    node('service:apply-loop', 'service'), node('service:watchdog', 'service'), node('stage:plan', 'stage'),
+  ],
+  edges: [
+    edge('source:a', 'worker-1', 'claims'), edge('source:b', 'worker-1', 'claims'), edge('source:b', 'worker-2', 'claims'), edge('source:c', 'worker-2', 'claims'),
+    edge('worker-1', 'reviewer', 'reviews'), edge('worker-2', 'reviewer', 'reviews'), edge('reviewer', 'service:apply-loop', 'applies'),
+    edge('service:watchdog', 'stage:plan', 'triggers'),
+  ],
+  groups: [], warnings: ['w'],
+});
+
+test('one card per lane in id order, then a services card', () => {
+  const cards = splitIntoLoops(GRAPH());
+  assert.deepEqual(cards.map((c) => c.id), ['worker-1', 'worker-2', 'services']);
+  assert.deepEqual(cards.map((c) => c.label), ['worker-1', 'worker-2', 'Services']);
+});
+
+test('a lane card holds the sources that claim for it, the lane, its reviewer and the apply service', () => {
+  const [one, two] = splitIntoLoops(GRAPH());
+  assert.deepEqual(ids(one), ['reviewer', 'service:apply-loop', 'source:a', 'source:b', 'worker-1']);
+  assert.deepEqual(ids(two), ['reviewer', 'service:apply-loop', 'source:b', 'source:c', 'worker-2']);
+});
+
+test('a node can sit on several cards, and a card keeps only the edges between its own nodes', () => {
+  const [one, two] = splitIntoLoops(GRAPH());
+  assert.ok(one.graph.nodes.some((n) => n.id === 'source:b') && two.graph.nodes.some((n) => n.id === 'source:b'));
+  assert.deepEqual(one.graph.edges.map((e) => e.id).sort(), [
+    'reviewer->service:apply-loop:applies', 'source:a->worker-1:claims', 'source:b->worker-1:claims', 'worker-1->reviewer:reviews',
+  ]);
+  assert.ok(!one.graph.edges.some((e) => e.to === 'worker-2'));
+});
+
+test('everything on no lane card lands on the services card, and the card is left out when there is nothing', () => {
+  const cards = splitIntoLoops(GRAPH());
+  assert.deepEqual(ids(cards[2]), ['service:watchdog', 'source:orphan', 'stage:plan']);
+  assert.deepEqual(cards[2].graph.edges.map((e) => e.id), ['service:watchdog->stage:plan:triggers']);
+  const g = GRAPH();
+  g.nodes = g.nodes.filter((n) => !['source:orphan', 'service:watchdog', 'stage:plan'].includes(n.id));
+  g.edges = g.edges.filter((e) => e.kind !== 'triggers');
+  assert.deepEqual(splitIntoLoops(g).map((c) => c.id), ['worker-1', 'worker-2']);
+});
+
+test('a reviewer reached by a reviews edge is not a lane and brings its own apply edge', () => {
+  const g = {
+    nodes: [node('worker-9', 'loop'), node('reviewer-9', 'loop'), node('service:apply-loop', 'service')],
+    edges: [edge('worker-9', 'reviewer-9', 'reviews'), edge('reviewer-9', 'service:apply-loop', 'applies')],
+  };
+  const cards = splitIntoLoops(g);
+  assert.deepEqual(cards.map((c) => c.id), ['worker-9']);
+  assert.deepEqual(ids(cards[0]), ['reviewer-9', 'service:apply-loop', 'worker-9']);
+});
+
+test('a lane without a reviews edge falls back to the node called reviewer when there is one', () => {
+  const g = {
+    nodes: [node('worker-1', 'loop'), node('reviewer', 'loop'), node('service:apply-loop', 'service')],
+    edges: [edge('reviewer', 'service:apply-loop', 'applies')],
+  };
+  assert.deepEqual(ids(splitIntoLoops(g)[0]), ['reviewer', 'service:apply-loop', 'worker-1']);
+  const none = { nodes: [node('worker-1', 'loop')], edges: [] };
+  assert.deepEqual(ids(splitIntoLoops(none)[0]), ['worker-1']);
+});
+
+test('only loop nodes are lanes: a service or a collapsed group named like a worker is not', () => {
+  const g = { nodes: [node('worker-x', 'service'), node('group:g', 'group'), node('worker-1', 'loop')], edges: [] };
+  const cards = splitIntoLoops(g);
+  assert.deepEqual(cards.map((c) => c.id), ['worker-1', 'services']);
+  assert.deepEqual(ids(cards[1]), ['group:g', 'worker-x']);
+});
+
+test('a graph with no lane at all is one services card', () => {
+  const g = { nodes: [node('source:a', 'source'), node('stage:plan', 'stage')], edges: [edge('source:a', 'stage:plan', 'produces')] };
+  const cards = splitIntoLoops(g);
+  assert.deepEqual(cards.map((c) => c.id), ['services']);
+  assert.equal(cards[0].graph.edges.length, 1);
+});
+
+test('groups follow their members: a card keeps the groups that have a member on it', () => {
+  const g = GRAPH();
+  g.groups = [{ id: 'group:one', label: 'One', children: ['source:a'], collapsed: false }, { id: 'group:two', label: 'Two', children: ['source:c'], collapsed: false }];
+  const [one, two] = splitIntoLoops(g);
+  assert.deepEqual(one.graph.groups.map((x) => x.id), ['group:one']);
+  assert.deepEqual(two.graph.groups.map((x) => x.id), ['group:two']);
+});
+
+test('empty and garbage input give an empty list and never throw', () => {
+  [null, undefined, 5, 'x', {}, { nodes: 'x' }, { nodes: [] }].forEach((g) => assert.deepEqual(splitIntoLoops(g), []));
+  assert.doesNotThrow(() => splitIntoLoops({ nodes: [null, 3, { id: 7 }, { id: 'worker-1', kind: 'loop' }], edges: [null, { from: 1 }, 'x'] }));
+  assert.deepEqual(splitIntoLoops({ nodes: [null, 3, { id: 7 }, { id: 'worker-1', kind: 'loop' }], edges: [null] }).map((c) => c.id), ['worker-1']);
+});
+
+test('the input is not mutated and two calls give the same answer', () => {
+  const g = GRAPH();
+  const copy = JSON.parse(JSON.stringify(g));
+  assert.deepEqual(splitIntoLoops(g), splitIntoLoops(g));
+  assert.deepEqual(g, copy);
+});
+
+test('fitScale shrinks to fit, never above 1', () => {
+  assert.equal(fitScale(1000, 2000, 500, 1000), 0.5);
+  assert.equal(fitScale(100, 100, 500, 500), 1);
+  assert.equal(fitScale(800, 400, 400, 1000), 0.5);
+  assert.equal(fitScale(1000, 500, 800, 350, 0.1), 0.7);
+});
+
+test('fitScale never goes below the minimum, so a big loop scrolls instead of shrinking to nothing', () => {
+  assert.equal(WF_MIN_SCALE, 0.5);
+  assert.equal(fitScale(4000, 4000, 400, 400), 0.5);
+  assert.equal(fitScale(4000, 4000, 400, 400, 0.25), 0.25);
+  assert.equal(fitScale(4000, 4000, 400, 400, 5), 1, 'a minimum above 1 still caps at 1');
+});
+
+test('fitScale gives 1 for a bad size and the default minimum for a bad minimum', () => {
+  [[NaN, 100, 100, 100], [0, 100, 100, 100], [100, -5, 100, 100], [100, 100, undefined, 100], [100, 100, 100, Infinity]].forEach((a) => assert.equal(fitScale(...a), 1));
+  assert.equal(fitScale(4000, 4000, 400, 400, NaN), 0.5);
+  assert.equal(fitScale(4000, 4000, 400, 400, -1), 0.5);
+});
+
+// ---- fitScaleForCard (graph readability pass 2): width-only scale when the card scrolls vertically anyway ----
+const { fitScaleForCard } = require(path.join(__dirname, '..', 'static', 'js', 'workflow-loops.js'));
+
+test('fitScaleForCard fits the whole loop while that stays above the minimum', () => {
+  assert.equal(fitScaleForCard(272, 560, 330, 470), fitScale(272, 560, 330, 470));
+  assert.equal(fitScaleForCard(272, 560, 330, 470).toFixed(3), '0.839');
+  assert.equal(fitScaleForCard(100, 100, 500, 500), 1);
+});
+
+test('a loop too tall for the minimum scales by width only, so a tall column stays readable', () => {
+  assert.equal(fitScale(272, 4160, 330, 600), 0.5, 'the old rule shrank it to the floor');
+  assert.equal(fitScaleForCard(272, 4160, 330, 600), 1);
+  assert.equal(fitScaleForCard(272, 4160, 200, 600).toFixed(3), '0.735');
+  assert.equal(fitScaleForCard(800, 4000, 400, 600), 0.5, 'width needs the floor too');
+  assert.equal(fitScaleForCard(2000, 4000, 400, 600), 0.5, 'never below the minimum');
+});
+
+test('fitScaleForCard honours a custom minimum and gives 1 for bad sizes', () => {
+  assert.equal(fitScaleForCard(272, 4160, 100, 600, 0.25).toFixed(4), '0.3676');
+  assert.equal(fitScaleForCard(272, 4160, 330, 600, 0.9), 1);
+  [[NaN, 100, 100, 100], [100, 0, 100, 100], [100, 100, -1, 100], [100, 100, 100, undefined]].forEach((a) => assert.equal(fitScaleForCard(...a), 1));
+  assert.equal(fitScaleForCard(4000, 4000, 400, 400, NaN), 0.5);
+});

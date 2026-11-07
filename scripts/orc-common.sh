@@ -54,6 +54,31 @@ PACKAGE_SRC_DIR="${SCRIPT_DIR}/../src"
 TEMP_DIR="${TEMP_DIR:-${TMPDIR:-/tmp}}"
 mkdir -p "$QUEUE_DIR" "$INSTANCES_DIR" "$TEMP_DIR" 2>/dev/null
 
+# Snapshot file path: parsed from --snapshot-file CLI flag or QUEUE_SNAPSHOT_FILE env var.
+# Default pattern: /dev/shm/agent-manager-queue-tick-<instanceId>.json where <instanceId>
+# comes from AGENT_MANAGER_INSTANCE_ID. Each script independently parses the flag/env and
+# forwards the path to its Node.js entry point.
+SNAPSHOT_FILE="${QUEUE_SNAPSHOT_FILE:-}"
+if [[ -z "$SNAPSHOT_FILE" ]]; then
+  # Parse --snapshot-file flag from command line (if any)
+  _found_flag=false
+  for _arg in "$@"; do
+    if [[ "$_found_flag" == true ]]; then
+      SNAPSHOT_FILE="$_arg"
+      break
+    elif [[ "$_arg" == "--snapshot-file" ]]; then
+      _found_flag=true
+    elif [[ "$_arg" == --snapshot-file=* ]]; then
+      SNAPSHOT_FILE="${_arg#--snapshot-file=}"
+      break
+    fi
+  done
+fi
+if [[ -z "$SNAPSHOT_FILE" ]]; then
+  INSTANCE_ID="${AGENT_MANAGER_INSTANCE_ID:-unknown}"
+  SNAPSHOT_FILE="/dev/shm/agent-manager-queue-tick-${INSTANCE_ID}.json"
+fi
+
 # agent-manager-common.sh's functions (write_heartbeat_file, write_task_json, etc.) require
 # PACKAGE_SRC_DIR/PIPELINE_DIR/TEMP_DIR/INSTANCES_DIR to already be set -- source it last,
 # once, here, so every daemon that sources orc-common.sh gets them for free instead of each

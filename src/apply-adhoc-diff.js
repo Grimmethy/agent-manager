@@ -28,7 +28,8 @@ const { validProposalFiles } = require('./proposal-files.js');
 const { targetHintForFailure } = require('./apply-target-hint.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
-const GIT_TIMEOUT_MS = 60_000;
+const { gitTimeoutMs } = require('./lib/git-timeout.js');
+const GIT_TIMEOUT_MS = gitTimeoutMs();   // AGENT_MANAGER_GIT_TIMEOUT_MS overrides the 60 s default
 
 function slugify(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -309,6 +310,38 @@ function buildDecomposedPlan(task, pipelineDir) {
   };
 }
 
+// A git path as written in a patch header: plain, or C-style quoted ("w\303\251ird.txt") when it holds a quote, a backslash, a control character or a non-ASCII byte.
+function unquoteGitPath(raw) {
+  const text = String(raw || '').replace(/\r$/, '');
+  if (!(text.startsWith('"') && text.endsWith('"') && text.length >= 2)) return text;
+  const bytes = [];
+  const body = text.slice(1, -1);
+  const escapes = { a: 7, b: 8, f: 12, n: 10, r: 13, t: 9, v: 11, '\\': 92, '"': 34 };
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i];
+    if (ch !== '\\') { for (const b of Buffer.from(ch, 'utf8')) bytes.push(b); continue; }
+    const octal = /^[0-3][0-7]{2}/.exec(body.slice(i + 1, i + 4));
+    if (octal) { bytes.push(parseInt(octal[0], 8)); i += 3; continue; }
+    const next = body[i + 1];
+    if (next in escapes) { bytes.push(escapes[next]); i += 1; continue; }
+    bytes.push(92);
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+// The OLD path of every rename in a unified diff (its `rename from <path>` header lines), in patch order, each once. `git apply --numstat` lists a rename under its NEW
+// name only, and plain `git apply` really deletes the old file, so staging only the numstat names left the deletion out of the commit (2026-11-04, HUB0321: a moved test
+// file stayed behind on the branch). `copy from` is not a source: the old path survives a copy.
+function renameSources(rawDiff) {
+  const out = [];
+  for (const line of String(rawDiff || '').split('\n')) {
+    if (!line.startsWith('rename from ')) continue;
+    const p = unquoteGitPath(line.slice('rename from '.length));
+    if (p && !out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
 function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
   if (task && task.adhocResolution === 'decompose') {
     return buildDecomposedPlan(task, pipelineDir);
@@ -319,7 +352,15 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
     const reason = task && task.adhocResolution === 'no-changes-needed'
       ? `no code change needed: ${(task.implementResponse || '').slice(0, 300)}`
       : 'adhoc agentic draft produced no diff';
-    return { skipped: true, reason };
+    // HUB0306 1/2: flag the caller (applyTask) so a stacked hub child with no diff
+    // can be blocked from succeeding instead of silently marked done. NOT set for
+    // `no-changes-needed` (that is an explicit model call, not a no-diff artifact) and
+    // NOT set for decompose parents (handled earlier, returns a coordinator plan).
+    const artifact = { skipped: true, reason };
+    if (task && task.adhocResolution !== 'no-changes-needed') {
+      artifact.emptyDiff = true;
+    }
+    return artifact;
   }
 
   const patchPath = path.join(os.tmpdir(), `adhoc-apply-${task.id}-${process.pid}.patch`);
@@ -339,6 +380,8 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
     if (files.length === 0) {
       throw new Error('git apply --numstat reported no files touched by this diff');
     }
+    // A rename also touches its old path (the apply deletes it): stage it too, and restore it if the apply fails.
+    files.push(...renameSources(rawDiff));
 
     // --recount: confirmed live 2026-08-18 -- a real, otherwise-valid diff from
     // adhoc-agentic-draft.js's agentic capture (`git diff` against an isolated worktree)
@@ -436,4 +479,4 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
   }
 }
 
-module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask, slugify, BRAIN_DUMP_DISPOSITION_RE };
+module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask, slugify, BRAIN_DUMP_DISPOSITION_RE, renameSources, unquoteGitPath };
