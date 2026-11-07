@@ -18,6 +18,7 @@ const { findTaskAnywhere, QUEUE_STATES } = require('./task-anywhere.js');
 const { lineMatches } = require('./text-match.js');
 const { getConfig } = require('./config.js');
 const { postJson, postJsonStream } = require('./ollama-http.js');
+const { ensureResident } = require('./model-resident.js');
 const gpuGuard = require('./gpu-guard.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
@@ -1070,6 +1071,8 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
       // callers treat it as a pause (local-draft.js, local-worker.sh), not a failure. The Chat panel (forgePause false) is an explicit user action.
       if (forgePause && gpuGuard.forgePauseEnabled() && gpuGuard.leaseHeldFor(OLLAMA_URL)) throw new gpuGuard.ForgePauseError();
       try {
+        // Residency gate before the GPU turn lock, so a slow cold load never happens while holding it (src/model-resident.js).
+        await ensureResident({ url: OLLAMA_URL, model: MODEL, numCtx: CHAT_OPTIONS.num_ctx, instancesDir });
         const turnRes = await turnLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }));
         if (isEmptyCompletion(turnRes.message)) {
           // Audit-only (brain-dump 1891): record the blank sample (done_reason, thinking size) before it is resampled.
