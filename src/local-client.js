@@ -174,7 +174,9 @@ const MODEL = process.env.LOCAL_MODEL;
 // path sent none at all and inherited Ollama's 5-minute default, so a single agentic turn
 // that outran 5 min (model reasoning + a 240s run_bash + the GPU lock held elsewhere in
 // between) paid a full cold reload (~114s observed) on the next turn.
-const KEEP_ALIVE = process.env.LOCAL_KEEP_ALIVE || process.env.ORNITH_KEEP_ALIVE || '30m';
+// 2026-11-06 (owner: never unload, never swap): the default is no longer '30m' and a shorter override is ignored; see src/keep-alive.js.
+const { resolveKeepAlive, NEVER_EXPIRE } = require('./keep-alive.js');
+const KEEP_ALIVE = resolveKeepAlive(process.env.LOCAL_KEEP_ALIVE, process.env.ORNITH_KEEP_ALIVE);
 
 function detectDegenerate(text, { allowEmpty = false, doneReason, isDraft = false } = {}) {
   // 2026-09-05, Grimmethy: root-caused a whole cluster of blocked pipeline_forensics_fix
@@ -788,7 +790,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, CALLER_RECORDED_STAGES, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, maxNumPredictThatFits, capNumPredictToFit, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
+module.exports = { call, callOnce, CALLER_RECORDED_STAGES, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, NEVER_EXPIRE, maxNumPredictThatFits, capNumPredictToFit, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,
