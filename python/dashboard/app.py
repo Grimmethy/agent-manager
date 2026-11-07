@@ -42,6 +42,7 @@ from werkzeug.exceptions import HTTPException
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import event_stream  # noqa: E402
 import branch_git_memo  # noqa: E402
+import hub_index  # noqa: E402
 import graph_build  # noqa: E402
 from app_proactive_sweep import proactive_sweep_argv, proactive_sweep_lock_path  # noqa: E402
 from response_compression import compress_response  # noqa: E402
@@ -2142,6 +2143,9 @@ def _hub_for_branch(qdir, branch, commit_task_ids):
     in its subTasks. Returns a _summarize_hub dict or None."""
     if not qdir:
         return None
+    if hub_index.enabled():
+        hit = hub_index.lookup(qdir, branch, list(commit_task_ids or []), read_json_safe)
+        return _summarize_hub(hit[0], hit[1]) if hit else None
     task_set = set(commit_task_ids or [])
     seen = []
     coord = qdir / "coordinating"
