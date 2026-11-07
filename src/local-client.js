@@ -176,6 +176,7 @@ const MODEL = process.env.LOCAL_MODEL;
 // between) paid a full cold reload (~114s observed) on the next turn.
 // 2026-11-06 (owner: never unload, never swap): the default is no longer '30m' and a shorter override is ignored; see src/keep-alive.js.
 const { resolveKeepAlive, NEVER_EXPIRE } = require('./keep-alive.js');
+const { ensureResident } = require('./model-resident.js');
 const KEEP_ALIVE = resolveKeepAlive(process.env.LOCAL_KEEP_ALIVE, process.env.ORNITH_KEEP_ALIVE);
 
 function detectDegenerate(text, { allowEmpty = false, doneReason, isDraft = false } = {}) {
@@ -367,6 +368,9 @@ async function callOnce({ prompt, images, think = true, temperature = 0.4, numCt
   // here.
   const instancesDir = resolveInstancesDir();
   const lockModel = model || MODEL;
+  // Residency gate (2026-11-06, owner: never time out a model load, never swap): make sure the model is resident at this call's num_ctx BEFORE the
+  // request clock starts; see src/model-resident.js. Skipped with no pipeline env (bare test requires), never throws.
+  await ensureResident({ url: OLLAMA_URL, model: lockModel, numCtx: resolvedNumCtx, instancesDir });
   const lockPath = instancesDir ? inflightLock.acquire(instancesDir, lockModel, process.env.AGENT_MANAGER_INSTANCE_ID) : null;
   const resolvedTimeoutMs = timeoutMs || resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model: lockModel });
   // Stable per-worker-lane session id (not per-call) so TokenFold sees these as a
