@@ -11,7 +11,7 @@ const vm = require('vm');
 const JS = path.join(__dirname, '..', 'static', 'js');
 const ctx = vm.createContext({ console });
 ctx.window = ctx; // in a browser window is the global object, which is how workflow-layout.js publishes layoutGraph
-for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'workflow-layout.js', 'workflow-loops.js', 'workflow-graph-view.js']) {
+for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'workflow-layout.js', 'workflow-loops.js', 'workflow-drag.js', 'workflow-graph-view.js']) {
   vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
 }
 const v = ctx;
@@ -339,4 +339,80 @@ test('index.html wiring: the card row snaps horizontally and workflow-loops.js l
   const at = (f) => index.indexOf('/static/js/' + f);
   assert.ok(at('workflow-layout.js') > 0 && at('workflow-layout.js') < at('workflow-loops.js'));
   assert.ok(at('workflow-loops.js') < at('workflow-graph-view.js'));
+});
+
+// ---- dragged positions (HUB0346 piece 3) ----
+const memStore = (obj) => { const m = { ...(obj || {}) }; return { getItem: (k) => (k in m ? m[k] : null), setItem: (k, val) => { m[k] = String(val); }, raw: m }; };
+const nodeBox = (card, id) => {
+  const m = new RegExp('data-node-id="' + id + '"[^>]*style="left:(\\d+)px;top:(\\d+)px').exec(card);
+  return { x: Number(m[1]), y: Number(m[2]) };
+};
+
+test('a saved position replaces the laid-out one on that card only', () => {
+  const store = memStore({ workersGraphPositions: JSON.stringify({ 'worker-1': { 'source:shared': { x: 600, y: 400 } } }) });
+  const cards = cardsOf(v.buildCardsHtml(cardGraph(), { storage: store }));
+  assert.deepEqual(nodeBox(cards[0], 'source:shared'), { x: 600, y: 400 });
+  assert.notDeepEqual(nodeBox(cards[1], 'source:shared'), { x: 600, y: 400 }, 'the same node on the next card was not moved');
+});
+
+test('without saved positions the cards are exactly what they were', () => {
+  const plain = v.buildCardsHtml(cardGraph(), { storage: memStore() });
+  assert.equal(plain, v.buildCardsHtml(cardGraph(), { storage: null }));
+  assert.equal(plain, v.buildCardsHtml(cardGraph(), { storage: memStore({ workersGraphPositions: 'garbage' }) }));
+});
+
+test('a saved position of a node that is no longer on the card is ignored', () => {
+  const store = memStore({ workersGraphPositions: JSON.stringify({ 'worker-1': { 'source:retired': { x: 900, y: 900 } } }) });
+  assert.equal(v.buildCardsHtml(cardGraph(), { storage: store }), v.buildCardsHtml(cardGraph(), { storage: memStore() }));
+});
+
+test('an edge with a moved end is re-pointed and the canvas grows to hold the moved node', () => {
+  const base = cardsOf(v.buildCardsHtml(cardGraph(), { storage: memStore() }))[0];
+  const store = memStore({ workersGraphPositions: JSON.stringify({ 'worker-1': { 'worker-1': { x: 1200, y: 900 } } }) });
+  const card = cardsOf(v.buildCardsHtml(cardGraph(), { storage: store }))[0];
+  const dOf = (c, id) => new RegExp('data-edge-id="' + id.replace('>', '&gt;') + '" d="([^"]+)"').exec(c)[1]; // the view escapes > in attributes
+  assert.notEqual(dOf(card, 'source:shared->worker-1:claims'), dOf(base, 'source:shared->worker-1:claims'));
+  assert.equal(dOf(card, 'reviewer->service:apply-loop:applies'), dOf(base, 'reviewer->service:apply-loop:applies'), 'an edge between two unmoved nodes keeps its route');
+  const size = (c) => { const m = /class="wf-canvas" data-w="(\d+)" data-h="(\d+)"/.exec(c); return { w: Number(m[1]), h: Number(m[2]) }; };
+  assert.ok(size(card).w >= 1200 + 272);
+  assert.ok(size(card).h >= 900 + 128);
+});
+
+test('the card bar has a Reset layout button and the stored view helper falls back to no storage', () => {
+  assert.match(v.buildCardsHtml(cardGraph(), {}), /<button type="button" class="secondary wf-reset-btn"[^>]*>Reset layout<\/button>/);
+  assert.equal(v.wfStore({ storage: null }), null);
+  const m = memStore();
+  assert.equal(v.wfStore({ storage: m }), m);
+});
+
+test('index.html wiring: workflow-drag.js loads before the view, and nodes in a card are draggable by touch', () => {
+  const index = fs.readFileSync(path.join(__dirname, '..', 'templates', 'index.html'), 'utf8');
+  const at = (f) => index.indexOf('/static/js/' + f);
+  assert.ok(at('workflow-drag.js') > 0 && at('workflow-drag.js') < at('workflow-graph-view.js'));
+  assert.match(index, /\.wf-card \.wf-node \{[^}]*touch-action: none/);
+});
+
+test('a layer with many sources wraps into columns that fit the screen, so a card is not one very wide row', () => {
+  const g = cardGraph();
+  for (let i = 0; i < 12; i++) {
+    const id = 'source:bulk' + String(i).padStart(2, '0');
+    g.nodes.push({ ...source, id, label: id });
+    g.edges.push({ id: id + '->worker-1:claims', from: id, to: 'worker-1', kind: 'claims', label: null });
+  }
+  const sizeOf = (html) => { const m = /class="wf-canvas" data-w="(\d+)" data-h="(\d+)"/.exec(cardsOf(html)[0]); return { w: Number(m[1]), h: Number(m[2]) }; };
+  const one = sizeOf(v.buildCardsHtml(g, { storage: null, maxPerRow: 1 }));
+  const four = sizeOf(v.buildCardsHtml(g, { storage: null, maxPerRow: 4 }));
+  assert.equal(one.w, 272, 'a phone gets one column');
+  assert.ok(four.w <= 4 * 336, 'a desktop gets at most four');
+  assert.ok(one.h > four.h, 'fewer columns make the card taller, not wider');
+});
+
+test('the column count follows the screen width: 1 on a phone, more on wider screens, never above 4', () => {
+  const at = (w) => { const saved = ctx.innerWidth; ctx.innerWidth = w; const n = v.wfMaxPerRow(); ctx.innerWidth = saved; return n; };
+  assert.equal(at(390), 1);
+  assert.equal(at(768), 2);
+  assert.equal(at(1366), 3);
+  assert.equal(at(3000), 4);
+  assert.equal(at(100), 1);
+  assert.equal(v.wfMaxPerRow(), 4, 'no window width known gives the cap');
 });

@@ -399,3 +399,47 @@ test("direction 'down': the members of a group stay adjacent in their layer", ()
 test("direction 'down': empty and garbage input give the empty result", () => {
   [null, undefined, {}, { nodes: [] }, 'x'].forEach((g) => assert.deepEqual(layoutGraph(g, DOWN), { positions: {}, width: 0, height: 0, edges: [] }));
 });
+
+// ---- maxPerRow (HUB0346 piece 3): a layer with many nodes wraps into rows in the top-to-bottom layout ----
+const wide = (n) => ({ nodes: N('lane', ...Array.from({ length: n }, (_, i) => `s${String(i).padStart(2, '0')}`)), edges: E(...Array.from({ length: n }, (_, i) => [`s${String(i).padStart(2, '0')}`, 'lane'])) });
+
+test("direction 'down' with maxPerRow wraps a wide layer into rows of at most that many nodes", () => {
+  const r = layoutGraph(wide(7), { direction: 'down', maxPerRow: 3 });
+  const ys = [...new Set(Object.keys(r.positions).filter((id) => id !== 'lane').map((id) => r.positions[id].y))].sort((a, b) => a - b);
+  assert.deepEqual(ys, [0, STEP_Y, STEP_Y * 2], '7 sources in rows of 3, 3 and 1');
+  assert.equal(Object.values(r.positions).filter((p) => p.y === 0).length, 3);
+  assert.equal(r.width, 240 + 2 * STEP_X, 'the canvas is three columns wide, not seven');
+  assert.equal(r.positions.lane.y, STEP_Y * 3, 'the lane stays below every wrapped row');
+});
+
+test('wrapped rows keep the id order left to right and then top to bottom', () => {
+  const r = layoutGraph(wide(5), { direction: 'down', maxPerRow: 2 });
+  assert.deepEqual(['s00', 's01', 's02', 's03', 's04'].map((id) => [r.positions[id].x / STEP_X, r.positions[id].y / STEP_Y]), [[0, 0], [1, 0], [0, 1], [1, 1], [0, 2]]);
+});
+
+test('maxPerRow of 1 makes a single column and a layer that already fits is untouched', () => {
+  const one = layoutGraph(wide(4), { direction: 'down', maxPerRow: 1 });
+  assert.equal(one.width, 240);
+  assert.equal(one.height, STEP_Y * 4 + 96);
+  const g = { nodes: N('a', 'b'), edges: E(['a', 'b']) };
+  assert.deepEqual(layoutGraph(g, { direction: 'down', maxPerRow: 5 }), layoutGraph(g, DOWN));
+});
+
+test('maxPerRow is ignored for the left-to-right layout and for anything but a whole number of 1 or more', () => {
+  const g = wide(6);
+  assert.deepEqual(layoutGraph(g, { maxPerRow: 2 }), layoutGraph(g));
+  [0, -1, 1.5, NaN, Infinity, '2', null, undefined, {}, true].forEach((maxPerRow) => {
+    assert.deepEqual(layoutGraph(g, { direction: 'down', maxPerRow }), layoutGraph(g, DOWN), String(maxPerRow));
+  });
+});
+
+test("wrapped rows stay multiples of 4, never overlap, and a cycle still terminates", () => {
+  const g = wide(9);
+  g.edges.push(E(['lane', 's00'])[0]);
+  const r = layoutGraph(g, { direction: 'down', maxPerRow: 4, nodeW: 101, nodeH: 57, gapX: 13, gapY: 9 });
+  const seen = new Set();
+  Object.values(r.positions).forEach((p) => { assert.equal(p.x % 4, 0); assert.equal(p.y % 4, 0); seen.add(p.x + ',' + p.y); });
+  assert.equal(seen.size, Object.keys(r.positions).length, 'no two nodes share a slot');
+  assert.equal(r.edges.filter((e) => e.back).length, 1);
+  r.edges.forEach((e) => e.points.forEach((p) => assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y))));
+});

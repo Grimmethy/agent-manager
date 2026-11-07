@@ -1,7 +1,8 @@
 /* Pure layered layout for the Workers workflow graph (phase A, piece W-A3): left-to-right by default, top-to-bottom with opts.direction 'down'.
  *
  * layoutGraph(graph, opts) -> { positions: {id: {x, y}}, width, height, edges: [{id, points, back}] }
- * opts: nodeW, nodeH, gapX, gapY (numbers) and direction ('down' lays the layers out top to bottom; any other value is the left-to-right layout).
+ * opts: nodeW, nodeH, gapX, gapY (numbers) and direction ('down' lays the layers out top to bottom; any other value is the left-to-right layout),
+ * and for 'down' maxPerRow (a whole number of 1 or more: a layer with more nodes wraps into several rows; anything else means no limit).
  *
  * Only node.id and edge.id/from/to are read, so it works on the WorkflowGraph
  * contract and on any smaller object. It never throws: a bad input gives the
@@ -26,6 +27,8 @@
     });
     // Only the exact string 'down' lays the layers out top to bottom; anything else is the left-to-right layout.
     out.direction = o.direction === 'down' ? 'down' : 'right';
+    // maxPerRow (top-to-bottom only): a layer with more nodes than this wraps into several rows, so a layer of 26 sources is a block, not one very wide row. 0 means no limit.
+    out.maxPerRow = typeof o.maxPerRow === 'number' && Number.isInteger(o.maxPerRow) && o.maxPerRow >= 1 ? o.maxPerRow : 0;
     return out;
   }
 
@@ -241,7 +244,15 @@
       var positions = {};
       var right = 0;
       var bottom = 0;
-      rows.forEach(function (row, l) {
+      var drawRows = rows;
+      if (down && o.maxPerRow > 0) {
+        drawRows = [];
+        rows.forEach(function (row) {
+          for (var from = 0; from < row.length; from += o.maxPerRow) drawRows.push(row.slice(from, from + o.maxPerRow));
+          if (!row.length) drawRows.push(row);
+        });
+      }
+      drawRows.forEach(function (row, l) {
         row.forEach(function (id, i) {
           // 'right': layer -> column (x), row index -> y. 'down': layer -> y, row index -> x.
           var x = down ? up4(i * (o.nodeW + o.gapX)) : up4(l * (o.nodeW + o.gapX));
