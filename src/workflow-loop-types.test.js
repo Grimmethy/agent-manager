@@ -127,3 +127,57 @@ test('a reviewer lane with no reviews edge pointing at it is still a reviewer (b
   assert.deepEqual(node(g, 'stage:review').models.map((m) => m.lane), ['reviewer', 'reviewer-p40']);
   assert.ok(!node(g, 'stage:implement').models.some((m) => /^reviewer/.test(m.lane)));
 });
+
+// ---- the authored registry (src/workflow-loop-types.json) ----
+const REGISTRY = require('./workflow-loop-types.json');
+// The watchdog trigger nodes of the live graph (2026-11-07).
+const LIVE_TRIGGERS = ['agent-manager-context-ops:impact-trigger', 'agent-manager-context-ops:map-trigger', 'agent-manager-context-ops:memory-trigger', 'agent-manager-pipeline-ops:checker-trigger',
+  'agent-manager-pipeline-ops:hub-trigger', 'agent-manager-pipeline-ops:merger-trigger', 'agent-manager-pipeline-ops:nw-trigger', 'agent-manager-pipeline-ops:scout-trigger',
+  'agent-manager-pipeline-ops:stalled-trigger', 'agent-manager-pipeline-ops:steward-trigger', 'agent-manager-pipeline-ops:verify-trigger', 'pf-loops:pfscraper-trigger', 'uiforge:watchdog-trigger'].map((t) => 'service:watchdog-script:' + t);
+
+test('registry: schema version, slug-shaped unique loop ids, names, and at least one step per loop', () => {
+  assert.equal(REGISTRY.schemaVersion, 1);
+  const ids = REGISTRY.loops.map((l) => l.id);
+  assert.equal(new Set(ids).size, ids.length);
+  for (const l of REGISTRY.loops) {
+    assert.match(l.id, /^loop:[a-z0-9-]+$/);
+    assert.ok(l.name && l.kind === 'worker' && l.gate, l.id);
+    assert.ok(l.steps.length >= 1, l.id);
+    const stepIds = l.steps.map((s) => s.id);
+    assert.equal(new Set(stepIds).size, stepIds.length, l.id + ' step ids unique');
+    for (const s of l.steps) {
+      assert.match(s.id, /^[a-z0-9-]+$/);
+      assert.ok(s.label && s.does, l.id + ':' + s.id);
+      assert.ok(['script', 'cloud', 'local'].includes(s.model.provider), l.id + ':' + s.id);
+      if (s.model.provider === 'cloud') assert.ok(s.model.name, 'a cloud step names its model');
+    }
+  }
+});
+
+test('registry: every watchdog trigger of the live graph belongs to exactly one loop, and every loop trigger exists', () => {
+  for (const t of LIVE_TRIGGERS) assert.equal(REGISTRY.loops.filter((l) => l.trigger === t).length, 1, t);
+  for (const l of REGISTRY.loops) assert.ok(LIVE_TRIGGERS.includes(l.trigger), l.id + ' trigger ' + l.trigger);
+});
+
+test('registry: only the stalled worker and the PF scraper builder call a model (cloud Sonnet); every other step is a script', () => {
+  const cloudSteps = REGISTRY.loops.flatMap((l) => l.steps.filter((s) => s.model.provider !== 'script').map((s) => `${l.id}:${s.id}:${s.model.provider}:${s.model.name}`));
+  assert.deepEqual(cloudSteps, ['loop:stalled:classify:cloud:claude-sonnet-5-5', 'loop:stalled:draft:cloud:claude-sonnet-5-5', 'loop:pfscraper:decide:cloud:claude-sonnet-5-5']);
+});
+
+test('registry on the live-shaped graph: every loop becomes a step chain with a trigger service, uiconf keeps its script lane', () => {
+  const graph = liveGraph();
+  for (const t of LIVE_TRIGGERS) graph.nodes.push({ id: t, kind: 'service', label: t, parent: null, runtime: null, model: null, work: null, counts: null });
+  const g = addLoopTypes(graph, REGISTRY);
+  assert.deepEqual(g.loops.map((l) => l.id).slice(0, 2), ['loop:pipeline', 'loop:stalled']);
+  for (const l of REGISTRY.loops) {
+    const built = g.loops.find((x) => x.id === l.id);
+    assert.equal(built.steps.length, l.steps.length, l.id);
+    assert.equal(built.services.length, 1, l.id + ' has its trigger');
+  }
+  assert.equal(g.loops.filter((l) => l.id === 'loop:uiconf').length, 1, 'the registry entry replaces the script-lane loop');
+  assert.equal(node(g, 'step:uiconf:apply').models[0].lane, 'worker-uiconf');
+  assert.equal(node(g, 'step:stalled:classify').size.label, 'cloud sonnet');
+  assert.equal(node(g, 'step:stalled:snapshot').size.scale, 0.8);
+  assert.ok(g.loops.some((l) => l.id === 'loop:tuner'), 'the tuner script lane still gets its derived loop');
+  assert.deepEqual(g.warnings, []);
+});

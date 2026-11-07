@@ -280,7 +280,7 @@ test('stage nodes and produces edges exist', () => {
   const g = buildWorkflowGraph({ lanes: [], instances: [], topology: [], models: { overrides: {}, ollamaModels: [], claudeModels: [] }, now: FIXED_NOW });
   const stages = g.nodes.filter(n => n.kind === 'stage').map(n => n.id).sort();
   assert.deepEqual(stages, ['stage:apply', 'stage:implement', 'stage:orient', 'stage:plan', 'stage:review']);
-  const produces = g.edges.filter(e => e.kind === 'produces');
+  const produces = g.edges.filter(e => e.kind === 'produces' && e.from.startsWith('stage:'));   // the loop-type step chains add their own produces edges
   assert.equal(produces.length, 4);
   // The chain orient -> plan -> implement -> review -> apply must all be present
   const chain = ['orient', 'plan', 'implement', 'review', 'apply'];

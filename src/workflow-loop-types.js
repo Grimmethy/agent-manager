@@ -116,7 +116,7 @@ function buildLoops(graph, registry) {
 
     const nodes = srcNodes.map((n) => updated.get(n.id) || n).concat(newNodes.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)));
     const edgeIds = new Set(srcEdges.map((e) => e.id));
-    const edges = srcEdges.concat(newEdges.filter((e) => !edgeIds.has(e.id) && edgeIds.add(e.id)));
+    const edges = srcEdges.concat(newEdges.filter((e) => !edgeIds.has(e.id) && edgeIds.add(e.id))).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     return { loops, nodes, edges, warnings };
   } catch (e) {
     return { loops: [], nodes: graph && Array.isArray(graph.nodes) ? graph.nodes : [], edges: graph && Array.isArray(graph.edges) ? graph.edges : [], warnings: ['loop types: ' + String(e && e.message).slice(0, 120)] };
