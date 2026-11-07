@@ -424,3 +424,27 @@ test('page wiring: index.html loads nav-sections.js, styles headers and the fadi
   assert.match(html, /nav \{ width: 232px;/);
   assert.match(html, /@media \(prefers-reduced-motion: reduce\) \{ \.nav-chev \{ transition: none; \} \}/);
 });
+
+test('page wiring: on a phone the nav is ONE sideways row (flex row, no wrap, sections and tabs inline, thin vertical divider)', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', '..', 'templates', 'index.html'), 'utf8');
+  const start = html.indexOf('@media (max-width: 860px)');
+  assert.ok(start > 0, 'the phone media query exists');
+  const block = html.slice(start, html.indexOf('</style>', start));
+  const nav = (block.match(/\n\s*nav \{([^}]*)\}/) || [])[1] || '';
+  assert.match(nav, /display:\s*flex/);
+  assert.match(nav, /flex-direction:\s*row/);
+  assert.match(nav, /overflow-x:\s*auto/);
+  assert.doesNotMatch(nav, /max-height/, 'no vertical cap: the row is one line');
+  assert.match(block, /nav button[^{]*\{[^}]*white-space:\s*nowrap/);
+  assert.match(block, /nav \.nav-div \{[^}]*width:\s*1px/);
+});
+
+test('renderNav keeps the sideways scroll position of the phone row when a section is folded or opened', () => {
+  const env = makeEnv({ narrow: true });
+  // like a real element: emptying it resets the scroll position to the start
+  let scroll = 240;
+  Object.defineProperty(env.nav, 'scrollLeft', { get: () => scroll, set: (v) => { scroll = v; } });
+  Object.defineProperty(env.nav, 'innerHTML', { get: () => '', set: () => { scroll = 0; } });
+  env.ctx.renderNav();
+  assert.equal(scroll, 240);
+});
