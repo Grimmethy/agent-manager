@@ -701,7 +701,21 @@ while :; do                                                                     
   # A premium-only borrowed tick seeds only when this project's adhoc/ or derived/ holds premium work (task-selection.js then generates it
   # first), so borrowing a premium tick never generates regular work in another project.
   if ! "$PREMIUM_ONLY" || node "${PACKAGE_SRC_DIR}/pool-projects.js" --has-premium "$PIPELINE_DIR" worker-seed 2>>"$LOG_FILE"; then
-    node "${PACKAGE_SRC_DIR}/task-sources.js" >>"$LOG_FILE" 2>&1 || true
+    # Several lanes tick on one project and each one walked the whole generation ladder (a node start with its module load, about 0.14 CPU-s, plus three git probes of the
+    # candidate docs) a few seconds after the last: 13 runs in 75 s for ONE idle lane, ~100 child processes a minute (CPU analysis 2026-11-07). A run that another lane (or this one)
+    # finished for the same pipeline within AGENT_MANAGER_TASK_SOURCES_DEDUPE_SECS (default 5, 0 = off) has nothing new to find, so this tick skips it. The stamp is a file holding the
+    # epoch of the last run, read with builtins only (no fork); a missing or unreadable stamp runs it, so the worst case is today's behaviour.
+    ts_window="${AGENT_MANAGER_TASK_SOURCES_DEDUPE_SECS:-5}"
+    ts_stamp="${AGENT_MANAGER_STATE_DIR:-$HOME/.local/state/agent-manager}/task-sources-stamps/${PIPELINE_DIR//\//_}"
+    ts_now=0 ts_last=0
+    printf -v ts_now '%(%s)T' -1
+    [[ "$ts_window" =~ ^[0-9]+$ ]] || ts_window=5
+    if (( ts_window > 0 )) && [[ -r "$ts_stamp" ]]; then read -r ts_last < "$ts_stamp" 2>/dev/null || ts_last=0; fi
+    [[ "$ts_last" =~ ^[0-9]+$ ]] || ts_last=0
+    if (( ts_window == 0 || ts_now - ts_last >= ts_window )); then
+      if (( ts_window > 0 )); then mkdir -p "${ts_stamp%/*}" 2>/dev/null && printf '%s\n' "$ts_now" > "$ts_stamp" 2>/dev/null; fi
+      node "${PACKAGE_SRC_DIR}/task-sources.js" >>"$LOG_FILE" 2>&1 || true
+    fi
   fi
 
   # Resume any task already sitting in THIS instance's own drafting/ folder before claiming
