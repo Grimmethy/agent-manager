@@ -380,8 +380,12 @@
     header { flex-wrap: wrap; padding: 10px 14px; gap: 8px 12px; }
     header .pipeline-dir { flex-basis: 100%; }
     .layout { flex-direction: column; }
-    /* The grouped sidebar (sections, icons, fold chevrons) is the phone nav too: a vertical list on top, capped at 40vh and scrolling inside itself. */
-    nav { width: 100%; height: auto; max-height: 40vh; max-height: 40dvh; position: static; overflow-y: auto; overflow-x: hidden; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); padding: 6px 0; -webkit-overflow-scrolling: touch; }
+    /* The grouped sidebar (sections, icons, fold chevrons) is the phone nav too, as ONE horizontal row: a section chip, its tabs right after it when the section is open (a tap opens or folds it in place), a thin divider between sections; the row scrolls sideways inside itself. */
+    nav { width: 100%; height: auto; position: static; display: flex; flex-direction: row; align-items: center; overflow-x: auto; overflow-y: hidden; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); padding: 6px 8px; -webkit-overflow-scrolling: touch; }
+    nav button, nav button.nav-sh, nav button.nav-sub-sh { flex: none; width: auto; white-space: nowrap; padding: 8px 12px; }
+    nav button.active { border-left: none; border-bottom: 3px solid var(--accent); }
+    nav button { gap: 6px; }
+    nav .nav-div { flex: none; width: 1px; height: 20px; margin: 0 6px; background: var(--border-strong); }
     .nav-notch { display: none; }
     main { padding: 12px; overflow-x: auto; }
     table { min-width: 560px; }

@@ -560,6 +560,7 @@ function renderNavRail(nav) {
 
 function renderNav() {
   const nav = document.getElementById('nav');
+  const scrollLeft = nav.scrollLeft || 0;   // the phone nav is one sideways-scrolling row: folding a section must not jump it back to the start
   nav.innerHTML = '';
   const sectioned = typeof buildNavSections === 'function';
   const wide = !isNarrowScreen() && sectioned;
@@ -589,6 +590,7 @@ function renderNav() {
       }
     }
   }
+  if (scrollLeft && isNarrowScreen()) nav.scrollLeft = scrollLeft;
   if (typeof navNotchUpdate === 'function') navNotchUpdate(nav);
 }
 
