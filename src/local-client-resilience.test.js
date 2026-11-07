@@ -449,7 +449,7 @@ test('majorityVote() stops calling once 2 of 3 votes already agree -- the 3rd ca
 // no way to actually reach a vote, since majorityVote is the only caller of call() review
 // uses. Proves the override actually reaches the real HTTP request body, not just that the
 // param is accepted without erroring.
-test('majorityVote() forwards model/numCtx/numPredict overrides into the real request body', async () => {
+test('majorityVote() forwards model/numPredict overrides into the real request body but never a numCtx other than the pinned one (a different context restarts the runner)', async () => {
   let capturedBody = null;
   await withServer(
     (req, res) => {
@@ -469,7 +469,7 @@ test('majorityVote() forwards model/numCtx/numPredict overrides into the real re
         model: 'qwen2.5:3b', numCtx: 8192, numPredict: 400,
       });
       assert.equal(capturedBody.model, 'qwen2.5:3b', 'must override the module-level LOCAL_MODEL default');
-      assert.equal(capturedBody.options.num_ctx, 8192, 'must override PINNED_NUM_CTX');
+      assert.equal(capturedBody.options.num_ctx, require('./gpu-capacity.js').PINNED_NUM_CTX, 'a caller numCtx is replaced by PINNED_NUM_CTX (owner rule 2026-11-07: never swap the model)');
       assert.equal(capturedBody.options.num_predict, 400);
     }
   );
