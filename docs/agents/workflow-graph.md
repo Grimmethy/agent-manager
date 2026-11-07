@@ -57,7 +57,9 @@ and the graph is still returned. If the builder itself breaks the route answers 
 
 - `src/workflow-graph.js`: the pure builder (`buildWorkflowGraph`) and its `--stdin` CLI. Tests: `node --test src/workflow-graph.test.js`.
 - `python/dashboard/routes/workflow_graph.py`: the route. Tests: `python -m unittest test_workflow_graph_route` from `python/dashboard`.
-- `python/dashboard/static/js/workflow-layout.js`: the pure layered layout (`layoutGraph`). Tests: `node --test python/dashboard/tests/test_workflow_layout.js`.
+- `python/dashboard/static/js/workflow-layout.js`: the pure layered layout (`layoutGraph`, left to right, or top to bottom with `direction: 'down'`). Tests: `node --test python/dashboard/tests/test_workflow_layout.js`.
+- `python/dashboard/static/js/workflow-loops.js`: `splitIntoLoops` (one card per lane) and `fitScale`. Tests: `node --test python/dashboard/tests/test_workflow_loops.js`.
+- `python/dashboard/static/js/workflow-drag.js`: the pure drag helpers (threshold, move, saved positions, straight edges). Tests: `node --test python/dashboard/tests/test_workflow_drag.js`.
 - `python/dashboard/static/js/worker-status-helpers.js`: the status helpers shared with the cards. Tests: `node --test python/dashboard/tests/test_worker_status_helpers.js`.
 - `python/dashboard/static/js/workflow-graph-view.js`: the Graph view and the toggle. Tests: `node --test python/dashboard/tests/test_workflow_graph_view.js`.
 - `python/dashboard/tests/browser_workflow_graph.mjs`: the repeatable real-browser check, below.
@@ -99,7 +101,7 @@ every worker node even when a worker's heartbeat says it cannot be assigned task
 
 ## Known limits
 
-- Edges are **derived** routing, not authored; a node cannot be moved or connected by hand.
+- Edges are **derived** routing, not authored; a node can be **moved by hand** (remembered in this browser, see "What HUB0346 added") but not connected by hand.
 - Changes to the lane registry (`lanes.json`) still need a pipeline restart: lane env is frozen at launch. Only the per-worker **model override**
   (the model control of a card or of a node panel, `/api/worker-models`) applies on the next tick.
 - The layout is a simple layered one (longest path, one ordering pass): with 20+ sources the left column is tall and edges cross. It is a first picture,
@@ -233,6 +235,20 @@ The owner chose a third meaning, the order of the groups the owner authors in th
 - `src/next-claimable-task.js` was already over 500 lines (546 now); the change is two added and two changed lines.
 
 **Still not built.** A one-day comparison tally of how often the two orders would have chosen differently, and choosing loops by the compute available and the kind of work (see "Next phases").
+
+## What HUB0346 added (vertical loop cards and dragging)
+
+The Graph view used to be one canvas that ran left to right and was unreadable with about 26 sources. It is now **one card per loop, laid out top to bottom, in a row you swipe**.
+
+- **A loop is a lane.** `splitIntoLoops` (`workflow-loops.js`) gives one card per non-reviewer loop node (sorted by id): the sources that can claim for it (`claims` edges) at the top, the lane, its reviewer (its `reviews` target, else the node called `reviewer`) and `service:apply-loop` at the bottom. A source or the apply service can appear on several cards, and selecting one marks it on every card. A last **Services** card holds everything on no lane (stages, watchdog, watchdog scripts, a source no lane claims). Connected components were not used: the `claims` edges join almost every source to almost every lane, so they would give one blob.
+- **Top to bottom.** `layoutGraph(graph, { direction: 'down' })`: layers are rows, edges leave the bottom middle of a node and enter the top middle of the next, a back edge runs down a lane on the right. `maxPerRow` wraps a layer with many nodes into several rows (the view passes 1 column on a phone, up to 4 on a desktop, from the window width, and lays the cards out again when the window crosses a breakpoint). Group boxes (`groupBoxes(..., 'down')`) are drawn per row.
+- **Swipe cards.** The row is `.wf-cards` (`scroll-snap-type: x mandatory`), each `.wf-card` is one screen width and 78 % of the screen height. Each card's canvas is scaled by `fitScale` to fit its body, **never below 0.5** (`WF_MIN_SCALE`); a loop too big for that scrolls inside its card (the owner chose "shrink to fit, then scroll" on 2026-11-06). The row keeps the id `wf-surface`, so the 5 s poll, the selection and the scroll restore work as before; each card body's scroll position is restored too.
+- **Dragging.** Any node can be dragged with mouse or touch (Pointer Events; the approach is Drawflow's: remember the pointer and the node on press, add the pointer delta divided by the zoom on move, update the node's edges). A press that moves 5 px or less is a click and still selects; buttons inside a node still work; the 5 s poll waits while a node is being dragged. While dragging only that node's edges are re-pointed, as straight lines. The position is saved per loop card and node id in `localStorage` under `workersGraphPositions` (`{ "<loop id>": { "<node id>": { x, y } } }`, unscaled canvas pixels) and applied on every redraw; an id that is no longer on the card is ignored. **Reset layout** (in the bar) forgets the positions of the loops shown.
+- **Touch.** A node has `touch-action: none` so a finger can drag it without the row scrolling. The consequence: on a phone, swipe from the card head or from empty space, not from a node. A long-press-to-drag rule would lift that and is not built.
+
+**Checked in a real browser (2026-11-07, scratch dashboard on 7499, Chrome, a 390 x 844 frame).** Six cards for six loops, the page does not scroll sideways, a part-way swipe snapped onto the next card exactly, the 26-source loop is one narrow column that scrolls vertically inside its card, a real mouse drag moved a node by exactly the pointer delta without selecting it, the position was still there after a reload and after two poll cycles, a plain click selected, Reset layout restored the layout, and the console showed no errors. `python/dashboard/tests/browser_workflow_graph.mjs` now has the same phone checks for Playwright; it needs a Playwright install (`PLAYWRIGHT_DIR`) and was not run for this change, the checks above were done through Chrome by hand.
+
+**Known limits.** After a node is moved its edges are straight lines and can cross other nodes. Saved positions are absolute: after the column count changes (a phone turned sideways) they can overlap other nodes until Reset layout. Group boxes follow the layout, not a dragged node. A wrapped layer sends many edges to one node below it, which pass behind the nodes in between.
 
 ## Next phases (not built)
 

@@ -445,3 +445,19 @@ test('groupBoxes: a group without a label is boxed under its id', () => {
   const boxes = v.groupBoxes(g, { 'worker-a': { x: 0, y: 0 } }, { w: 272, h: 128 }, 12);
   assert.deepEqual(plain(boxes.map((b) => b.label)), ['group:nolabel', 'group:nolabel2']);
 });
+
+test("groupBoxes with direction 'down' draws one box per row, counted from the top; the default stays one box per column", () => {
+  const { groupBoxes } = require(path.join(__dirname, '..', 'static', 'js', 'workflow-groups.js'));
+  const graph = { groups: [{ id: 'group:a', label: 'A', children: ['x', 'y', 'z'] }] };
+  const positions = { x: { x: 0, y: 0 }, y: { x: 300, y: 0 }, z: { x: 0, y: 130 } };
+  const size = { w: 272, h: 128 };
+  const down = groupBoxes(graph, positions, size, 12, 'down');
+  assert.equal(down.length, 2);
+  assert.deepEqual(down.map((b) => b.part), [0, 1]);
+  assert.deepEqual(down[0], { id: 'group:a', label: 'A', x: -12, y: -40, w: 596, h: 180, part: 0 });
+  assert.deepEqual(down[1], { id: 'group:a', label: 'A', x: -12, y: 90, w: 296, h: 180, part: 1 });
+  const cols = groupBoxes(graph, positions, size, 12);
+  assert.equal(cols.length, 2);
+  assert.deepEqual(cols[0], { id: 'group:a', label: 'A', x: -12, y: -40, w: 296, h: 310, part: 0 });
+  assert.deepEqual(groupBoxes(graph, positions, size, 12, 'sideways'), cols);
+});

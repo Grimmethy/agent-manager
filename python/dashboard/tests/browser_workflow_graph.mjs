@@ -36,6 +36,68 @@ function loadPlaywright(dir) {
   throw new Error('no playwright or playwright-core found under PLAYWRIGHT_DIR=' + dir);
 }
 
+// Phone-size checks (HUB0346): at 390x844 the Graph view is a row of swipeable loop cards, a node can be dragged, and where it was left is still there after a reload.
+// Reads and moves nodes only; it never presses a Turn on / Turn off button (a drag starts on the node title, away from the buttons).
+async function phoneChecks(browser, url, check) {
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  const open = async () => {
+    await page.goto(url + '/', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1500);
+    await page.locator('text=/^\\s*Workers\\s*$/').first().click();
+    await page.waitForTimeout(2500);
+    await page.locator('.wf-view-btn[data-view="graph"]').click();
+    await page.waitForSelector('.wf-card', { timeout: 30000 });
+    await page.waitForTimeout(1000);
+  };
+  try {
+    await open();
+    await page.evaluate(() => localStorage.removeItem('workersGraphPositions'));
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await open();
+    const cards = await page.locator('.wf-card').count();
+    check(cards >= 1, 'the phone view shows one card per loop (' + cards + ')');
+    check(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), 'the phone page does not scroll sideways');
+    check(await page.evaluate(() => [...document.querySelectorAll('.wf-card')].every((c) => Number(c.dataset.scale) >= 0.5 && Number(c.dataset.scale) <= 1)), 'every card is scaled between 0.5 and 1');
+    check(await page.evaluate(() => [...document.querySelectorAll('.wf-card-body')].every((b) => b.scrollWidth <= b.clientWidth + 1)), 'no card scrolls sideways inside itself');
+    if (cards > 1) {
+      await page.evaluate(() => { const row = document.getElementById('wf-surface'); row.scrollTo({ left: row.querySelectorAll('.wf-card')[1].offsetLeft - row.offsetLeft + 40, behavior: 'instant' }); });
+      await page.waitForTimeout(900);
+      const off = await page.evaluate(() => { const row = document.getElementById('wf-surface'); return Math.abs(row.querySelectorAll('.wf-card')[1].getBoundingClientRect().left - row.getBoundingClientRect().left); });
+      check(off <= 2, 'a swipe settles on the next card (' + Math.round(off) + ' px off)');
+      await page.evaluate(() => { const row = document.getElementById('wf-surface'); row.scrollTo({ left: 0, behavior: 'instant' }); });
+      await page.waitForTimeout(500);
+    }
+    const node = page.locator('.wf-card').first().locator('.wf-node').first();
+    const id = await node.getAttribute('data-node-id');
+    await node.scrollIntoViewIfNeeded(); // the first node in the page can sit far down a tall card, out of reach of the mouse
+    const before = await node.evaluate((el) => [el.offsetLeft, el.offsetTop]);
+    const box = await node.boundingBox();
+    await page.mouse.move(box.x + 24, box.y + 14);
+    await page.mouse.down();
+    await page.mouse.move(box.x + 24 + 30, box.y + 14 + 40, { steps: 6 });
+    await page.mouse.up();
+    await page.waitForTimeout(400);
+    const after = await page.locator('.wf-card').first().locator('.wf-node[data-node-id="' + id + '"]').evaluate((el) => [el.offsetLeft, el.offsetTop]);
+    check(after[0] !== before[0] || after[1] !== before[1], 'dragging a node moves it (' + id + ')');
+    check((await page.locator('.wf-node.wf-selected').count()) === 0, 'a drag does not select the node');
+    check(await page.evaluate(() => !!localStorage.getItem('workersGraphPositions')), 'the position is saved');
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await open();
+    const again = await page.locator('.wf-card').first().locator('.wf-node[data-node-id="' + id + '"]').evaluate((el) => [el.offsetLeft, el.offsetTop]);
+    check(again[0] === after[0] && again[1] === after[1], 'the dragged position is still there after a reload');
+    await page.locator('.wf-reset-btn').click();
+    await page.waitForTimeout(600);
+    const reset = await page.locator('.wf-card').first().locator('.wf-node[data-node-id="' + id + '"]').evaluate((el) => [el.offsetLeft, el.offsetTop]);
+    check(reset[0] === before[0] && reset[1] === before[1], 'Reset layout puts the node back');
+    check(errors.length === 0, 'no page errors on the phone view' + (errors.length ? ': ' + errors.join(' | ') : ''));
+  } finally {
+    await context.close();
+  }
+}
+
 async function main() {
   const url = (process.env.DASHBOARD_URL || 'http://127.0.0.1:7499').replace(/\/+$/, '');
   if (dashboardPort(url) === LIVE_PORT) {
@@ -81,7 +143,8 @@ async function main() {
     check((await page.locator('#wf-detail').count()) === 1, 'clicking a node opens its detail panel (' + selectedId + ')');
 
     await page.waitForTimeout(POLL_WAIT_MS);
-    check((await page.locator('.wf-node.wf-selected[data-node-id="' + selectedId + '"]').count()) === 1, 'the selection is still there after two poll cycles');
+    // A node that sits on several loop cards (the apply service, a shared source) is marked on every one of them, so one or more.
+    check((await page.locator('.wf-node.wf-selected[data-node-id="' + selectedId + '"]').count()) >= 1, 'the selection is still there after two poll cycles');
 
     await page.screenshot({ path: screenshot });
     console.log('screenshot: ' + screenshot);
@@ -90,6 +153,7 @@ async function main() {
     await page.waitForSelector('.worker-card[data-instance-id]', { timeout: 30000 });
     const cards = await page.locator('.worker-card[data-instance-id]').count(); // instance cards only: the stalled-worker panel is a card without an instance id
     check(cards === ids.length, 'the Cards view shows one card per instance (' + cards + ' of ' + ids.length + ')');
+    await phoneChecks(browser, url, check);
     check(pageErrors.length === 0, 'no page errors' + (pageErrors.length ? ': ' + pageErrors.join(' | ') : ''));
   } finally {
     await browser.close();
