@@ -633,3 +633,8 @@ test('index.html loads workflow-step-card.js after workflow-card-fit.js and befo
   assert.match(index, /\.wf-model-row \{/);
   assert.match(index, /\.wf-size-large \{/);
 });
+
+test('a press on a model row never starts a node drag (pointer capture would send the click to the node and the row could not open its lane)', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'static', 'js', 'workflow-graph-view.js'), 'utf8');
+  assert.match(src, /ev\.target\.closest\('button, select, input, a, \.wf-model-lane'\)/);
+});

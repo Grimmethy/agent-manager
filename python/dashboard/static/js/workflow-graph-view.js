@@ -360,7 +360,7 @@ function wfWireDrag(main) {
     Object.keys(els).forEach((id) => {
       const el = els[id];
       el.addEventListener('pointerdown', (ev) => {
-        if (ev.button > 0 || (ev.target && ev.target.closest && ev.target.closest('button, select, input, a'))) return;
+        if (ev.button > 0 || (ev.target && ev.target.closest && ev.target.closest('button, select, input, a, .wf-model-lane'))) return;
         delete el.dataset.justDragged;
         const scale = Number(card.dataset.scale) || 1;
         const start = { px: ev.clientX, py: ev.clientY, x: el.offsetLeft, y: el.offsetTop };
