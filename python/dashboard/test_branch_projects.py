@@ -140,6 +140,37 @@ class ProjectsCase(unittest.TestCase):
         self.assertEqual(branch_projects.find_other_project_branch(self.roots["beta"], "agent/nope"), (None, None))
         self.assertEqual(branch_projects.find_other_project_branch(str(self.tmp / "elsewhere"), "agent/b1"), (None, None))
 
+    def test_held_hub_groups_tags_active_project_when_include_other_projects(self):
+        """list_held_hub_groups(include_other_projects=True) must tag the active
+        project's own groups too -- the Hub worker drops untagged ones as
+        'project undefined is not registered'. Default (no projects=all) must stay
+        unchanged.
+        """
+        active_held = [row("agent/a1"), row("agent/a2")]
+        other_held = [row("agent/b1")]
+        with mock.patch.object(app, "list_unmerged_branches"), \
+             mock.patch.object(app, "get_active_repo_root", return_value=self.roots["alpha"]), \
+             mock.patch.dict(app._branch_cache, {"held": active_held, "held_other": {self.roots["beta"]: other_held}, "at": 0, "branches": [], "filled": True, "digest": None, "refreshing": False, "thread": None, "at_": 0}, clear=True):
+            groups = app.list_held_hub_groups(include_other_projects=True)
+        self.assertEqual(len(groups), 3)
+        for g in groups:
+            self.assertIn("project", g, "every group must carry a project field")
+            self.assertIn("label", g["project"])
+            self.assertIn("repoRoot", g["project"])
+        active_groups = [g for g in groups if g["project"]["label"] == "alpha"]
+        other_groups = [g for g in groups if g["project"]["label"] == "beta"]
+        self.assertEqual(len(active_groups), 2)
+        self.assertEqual(len(other_groups), 1)
+        self.assertEqual(active_groups[0]["project"]["repoRoot"], self.roots["alpha"])
+        self.assertEqual(other_groups[0]["project"]["repoRoot"], self.roots["beta"])
+        # Default path: no tagging, no project field added
+        with mock.patch.object(app, "list_unmerged_branches"), \
+             mock.patch.dict(app._branch_cache, {"held": active_held, "held_other": {}, "at": 0, "branches": [], "filled": True, "digest": None, "refreshing": False, "thread": None, "at_": 0}, clear=True):
+            default_groups = app.list_held_hub_groups()
+        self.assertEqual(len(default_groups), 2)
+        for g in default_groups:
+            self.assertNotIn("project", g)
+
 
 if __name__ == "__main__":
     unittest.main()
