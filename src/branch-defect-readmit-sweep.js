@@ -92,6 +92,24 @@ function defectVerdict(task) {
   return Array.isArray(pv.reasons) && pv.reasons.some((r) => typeof r === 'string' && r.trim()) ? pv : null;
 }
 
+// The dashboard stamps a needs-work verdict onto the owning task only when the verdict is newly written AND the task file is already in done/ (python/dashboard/branch_verdicts.py
+// write_task_log). The verifier worker's verdict arrives seconds after the apply, before the record reaches done/, and the same verdict is never re-posted, so the stamp is lost and the task
+// looked clean for ever (2026-11-07: six questforge branches sat 19-87 h "delegated to this sweep", which never saw them). The verdict itself is in queue/branch-verdicts.json, keyed by branch
+// and head sha: when the task has no usable stamp, the verdict recorded for the branch's CURRENT head is used, under the same rules as a stamped one (needs-work from chat, manual or worker,
+// not main-moved, at least one reason), and is stamped onto the task when the task is requeued so the redraft prompt carries the reviewer's reasons.
+const STORE_FILE = 'branch-verdicts.json';
+const DEFECT_SOURCES = ['chat', 'manual', 'worker'];
+function storeDefectVerdict(store, branch, sha) {
+  const x = store && typeof store === 'object' && store[branch] && typeof store[branch] === 'object' ? store[branch][sha] : null;
+  if (!x || typeof x !== 'object' || x.verdict !== 'needs-work' || x.kind === 'main-moved' || !DEFECT_SOURCES.includes(x.source)) return null;
+  const reasons = (Array.isArray(x.reasons) ? x.reasons : []).filter((r) => typeof r === 'string' && r.trim()).slice(0, 8).map((r) => r.slice(0, 1500));
+  if (!reasons.length) return null;
+  return { verdict: 'needs-work', reasons, sha, at: String(x.verifiedAt || x.at || ''), source: x.source, branch };
+}
+// Does the store hold a defect verdict from an accepted source for this branch at any head? (A cheap local filter before git is asked for the head.)
+const storeMentionsDefect = (store, branch) => !!store && typeof store === 'object' && !!store[branch] && typeof store[branch] === 'object'
+  && Object.values(store[branch]).some((x) => x && x.verdict === 'needs-work' && x.kind !== 'main-moved' && DEFECT_SOURCES.includes(x.source));
+
 // How many times this task was already sent back by this sweep.
 function countReadmits(task) {
   return (Array.isArray(task && task.history) ? task.history : []).filter((e) => e && e.stage === READMIT_STAGE).length;
@@ -102,7 +120,7 @@ async function sweepBranchDefects({
   pipelineDir, repoRoot, mainBranch = 'main', now = Date.now(), dryRun = false,
   git = defaultGit, requeue = requeueBlockedTask, fetch = true, modeOverride = null, env = process.env, fsImpl = fs,
 } = {}) {
-  const summary = { mode: modeOverride || mode(), checked: 0, observed: [], settling: [], stale: [], requeued: [], exhausted: [], errors: 0, journal: { events: journalOn(env), fullScan: false, eventRun: false, idle: false, corrections: 0 } };
+  const summary = { mode: modeOverride || mode(), checked: 0, observed: [], settling: [], stale: [], requeued: [], exhausted: [], fromStore: [], errors: 0, journal: { events: journalOn(env), fullScan: false, eventRun: false, idle: false, corrections: 0 } };
   if (summary.mode === 'off' || !pipelineDir || !repoRoot) return summary;
   const live = summary.mode === 'on' && !dryRun;
   const queueDir = path.join(pipelineDir, 'queue');
@@ -177,6 +195,7 @@ async function sweepBranchDefects({
 
   // Pre-pass (2026-11-03, pool rescan): the cheap local filters first, one read per task. The slow `git fetch` is only worth paying for when a task is left that git has to
   // answer for; with 41 pool projects and no candidate in most of them, a fetch before the filters cost a fetch per project per tick for nothing.
+  const store = readJson(path.join(queueDir, STORE_FILE), fsImpl) || {};
   const candidates = [];
   for (const name of names) {
     const filePath = path.join(doneDir, name);
@@ -184,6 +203,8 @@ async function sweepBranchDefects({
     if (!eligibleTask(task, { allowHumanPrioritised: true })) continue;   // the trigger is a human verdict (defectVerdict below)
     const pv = defectVerdict(task);
     if (!pv) {
+      const branchOfTask = appliedBranch(task);
+      if (branchOfTask && storeMentionsDefect(store, branchOfTask)) { candidates.push({ name, filePath, task, pv: null, branch: branchOfTask }); continue; }   // the stamp was lost: the store has the verdict
       const at = eventAt.get(name.replace(/\.json$/, ''));
       if (at && now - Date.parse(at) < STAMP_GRACE_MS) holdCommit = true;   // the dashboard stamps priorVerdict just after it records the verdict: read this event again
       continue;
@@ -199,7 +220,8 @@ async function sweepBranchDefects({
   }
   if (fetch) git(repoRoot, ['fetch', '-q', 'origin']);
 
-  for (const { name, filePath, task, pv, branch } of candidates) {
+  for (const { name, filePath, task, pv: stamped, branch } of candidates) {
+    let pv = stamped;
     try {
       const head = git(repoRoot, ['rev-parse', '--verify', `origin/${branch}`]);
       if (head.code !== 0) continue;                       // branch gone: reconcile's business, not ours
@@ -209,6 +231,11 @@ async function sweepBranchDefects({
       const shared = liveSiblingsOnBranch({ pipelineDir, branch, selfId: task.id, ...(summary.journal.events ? { snapshot: getSnapshot() } : {}) });
       if (shared.error || shared.siblings.length) continue;
 
+      if (!pv) {                                           // no stamp on the task: the verdict recorded for the branch's current head, if any
+        pv = storeDefectVerdict(store, branch, sha);
+        if (!pv) continue;
+        summary.fromStore.push({ id: task.id, branch });
+      }
       summary.checked += 1;
       if (pv.sha !== sha) { summary.stale.push({ id: task.id, branch }); continue; }   // the verdict is for an older commit
       if (countReadmits(task) >= MAX_READMITS) { summary.exhausted.push({ id: task.id, branch }); continue; }
@@ -228,6 +255,8 @@ async function sweepBranchDefects({
       if (!live) { summary.requeued.push({ ...entry, dryRun: true }); continue; }
 
       const first = String(pv.reasons.find((r) => typeof r === 'string' && r.trim()) || '').trim().slice(0, REASON_CHARS);
+      if (!task.promptContext || typeof task.promptContext !== 'object') continue;       // nowhere to carry the reasons: leave it
+      task.promptContext.priorVerdict = pv;                                               // a verdict found in the store is stamped now; a stamped one is written back unchanged
       task.history = Array.isArray(task.history) ? task.history : [];
       task.history.push({ stage: READMIT_STAGE, at: nowIso, detail: `${branch} had a needs-work verdict (${first}); requeued once for a redraft with the reviewer's reasons` });
       writeJson(filePath, task);
@@ -252,7 +281,7 @@ async function sweepBranchDefects({
   return summary;
 }
 
-module.exports = { sweepBranchDefects, defectVerdict, countReadmits, SETTLE_MS, MAX_READMITS, STATE_FILE, READMIT_STAGE };
+module.exports = { sweepBranchDefects, defectVerdict, storeDefectVerdict, countReadmits, SETTLE_MS, MAX_READMITS, STATE_FILE, READMIT_STAGE };
 
 if (require.main === module) {
   const { getConfig } = require('./config.js');

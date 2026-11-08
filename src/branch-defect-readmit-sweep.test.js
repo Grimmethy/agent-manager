@@ -490,3 +490,136 @@ test('journal mode: a run with no candidate still stamps the scan and consumes i
   assert.equal(third.journal.idle, true);
   assert.deepEqual(g.calls, [], 'no git call, so no fetch, in any of the three runs');
 });
+
+// ---- the verdict store as a fallback (2026-11-07): a task whose priorVerdict stamp was lost still gets its redraft ----
+
+const putStore = (w, branch, bySha) => fs.writeFileSync(path.join(w.pipelineDir, 'queue', 'branch-verdicts.json'), JSON.stringify({ [branch]: bySha }));
+const storeEntry = (over = {}) => ({ verdict: 'needs-work', source: 'worker', reasons: ['Automated check: it changes code but touches no test.'], verifiedAt: '2026-11-04T08:56:54Z', ...over });
+function unstampedWorld(entryOver = null, shaOf = (w) => w.head('agent/t1')) {
+  const w = makeWorld();
+  w.commitOnBranch('agent/t1', 'a.txt', 'one\nTWO\nthree\n');
+  putTask(w.pipelineDir, 't1', 'agent/t1', null);
+  if (entryOver !== undefined && entryOver !== null) putStore(w, 'agent/t1', { [shaOf(w)]: storeEntry(entryOver) });
+  return w;
+}
+async function settledRun(w, extra = {}) {
+  const { calls, requeue } = recorder();
+  const t0 = Date.now();
+  const s1 = await run(w, t0, { requeue, ...extra });
+  const s3 = await run(w, t0 + SETTLE_MS + 1000, { requeue, ...extra });
+  return { s1, s3, calls };
+}
+
+test('store fallback: a task with no stamp is redrafted from the verdict recorded for the current head, and the reasons are stamped onto the task', async () => {
+  const w = unstampedWorld({});
+  const first = await run(w, Date.now(), { requeue: async () => ({ ok: true }) });
+  assert.equal(readState(w.pipelineDir)['agent/t1'].verdictAt, '2026-11-04T08:56:54Z', 'the settle state keys on the time of the verdict in the store');
+  assert.equal(first.observed.length, 1);
+  const w2 = unstampedWorld({});
+  const { s1, s3, calls } = await settledRun(w2);
+  assert.equal(s1.observed.length, 1);
+  assert.deepEqual(s1.fromStore, [{ id: 't1', branch: 'agent/t1' }]);
+  assert.equal(s3.requeued.length, 1); assert.equal(calls.length, 1);
+  const pv = readTask(w2.pipelineDir, 't1').promptContext.priorVerdict;
+  assert.equal(pv.verdict, 'needs-work'); assert.equal(pv.source, 'worker'); assert.equal(pv.sha, w2.head('agent/t1')); assert.equal(pv.branch, 'agent/t1');
+  assert.match(pv.reasons[0], /touches no test/);
+  assert.match(priorVerdictBlock(readTask(w2.pipelineDir, 't1')), /touches no test/, 'the redraft prompt carries the reasons');
+  assert.ok(readTask(w2.pipelineDir, 't1').history.some((h) => h.stage === READMIT_STAGE));
+});
+
+test('store fallback: chat and manual verdicts count too', async () => {
+  for (const source of ['chat', 'manual']) {
+    const w = unstampedWorld({ source });
+    const { s3 } = await settledRun(w);
+    assert.equal(s3.requeued.length, 1, source);
+  }
+});
+
+test('store fallback: nothing happens for a verdict that is not a current defect verdict', async () => {
+  const cases = {
+    'older head': (w) => putStore(w, 'agent/t1', { [`${'0'.repeat(40)}`]: storeEntry() }),
+    'merge verdict': (w) => putStore(w, 'agent/t1', { [w.head('agent/t1')]: storeEntry({ verdict: 'merge' }) }),
+    'hold verdict': (w) => putStore(w, 'agent/t1', { [w.head('agent/t1')]: storeEntry({ verdict: 'hold' }) }),
+    'deterministic source': (w) => putStore(w, 'agent/t1', { [w.head('agent/t1')]: storeEntry({ source: 'deterministic' }) }),
+    'main-moved kind': (w) => putStore(w, 'agent/t1', { [w.head('agent/t1')]: storeEntry({ kind: 'main-moved' }) }),
+    'no reasons': (w) => putStore(w, 'agent/t1', { [w.head('agent/t1')]: storeEntry({ reasons: [] }) }),
+    'blank reasons': (w) => putStore(w, 'agent/t1', { [w.head('agent/t1')]: storeEntry({ reasons: ['  ', 5] }) }),
+    'another branch': (w) => putStore(w, 'agent/other', { [w.head('agent/t1')]: storeEntry() }),
+    'garbled store': (w) => fs.writeFileSync(path.join(w.pipelineDir, 'queue', 'branch-verdicts.json'), '{not json'),
+    'no store': () => {},
+  };
+  for (const [why, setup] of Object.entries(cases)) {
+    const w = unstampedWorld(null);
+    setup(w);
+    const { s1, s3, calls } = await settledRun(w);
+    assert.equal(calls.length, 0, why); assert.equal(s1.observed.length, 0, why); assert.equal(s3.fromStore.length, 0, why);
+    assert.equal(readTask(w.pipelineDir, 't1').promptContext.priorVerdict, undefined, why);
+  }
+});
+
+test('store fallback: only the verdict for the CURRENT head counts, whatever an older head had', async () => {
+  const old = '1'.repeat(40);
+  const cases = {
+    'merge now': { verdict: 'merge' }, 'hold now': { verdict: 'hold' }, 'discard now': { verdict: 'discard' },
+    'deterministic now': { source: 'deterministic' }, 'main-moved now': { kind: 'main-moved' }, 'no reasons now': { reasons: [] },
+  };
+  for (const [why, over] of Object.entries(cases)) {
+    const w = unstampedWorld(null);
+    putStore(w, 'agent/t1', { [old]: storeEntry(), [w.head('agent/t1')]: storeEntry(over) });      // the older head qualifies, so the task is looked at; the current head does not
+    const { s3, calls } = await settledRun(w);
+    assert.equal(calls.length, 0, why); assert.equal(s3.fromStore.length, 0, why);
+  }
+});
+
+test('store fallback: a store that holds no defect verdict for the branch costs no git call', async () => {
+  const w = unstampedWorld(null);
+  putStore(w, 'agent/t1', { [w.head('agent/t1')]: storeEntry({ verdict: 'merge' }), [`${'2'.repeat(40)}`]: storeEntry({ source: 'deterministic' }) });
+  const gitCalls = [];
+  const counting = (repo, args) => { gitCalls.push(args[0]); return { code: 0, out: '' }; };
+  await settledRun(w, { git: counting });
+  assert.deepEqual(gitCalls, []);
+});
+
+test('store fallback: a task whose promptContext is not an object is skipped quietly, without an error', async () => {
+  const w = unstampedWorld({});
+  const t = readTask(w.pipelineDir, 't1'); t.promptContext = 'plain text'; fs.writeFileSync(path.join(w.pipelineDir, 'queue', 'done', 't1.json'), JSON.stringify(t));
+  const { s3, calls } = await settledRun(w);
+  assert.equal(calls.length, 0); assert.equal(s3.errors, 0);
+});
+
+test('store fallback: a task WITH a stamp uses the stamp, not the store', async () => {
+  const w = defectWorld();
+  putStore(w, 'agent/t1', { [w.head('agent/t1')]: storeEntry({ reasons: ['STORE REASON'] }) });
+  const { s1, s3, calls } = await settledRun(w);
+  assert.deepEqual(s1.fromStore, []); assert.equal(s3.requeued.length, 1); assert.equal(calls.length, 1);
+  assert.match(readTask(w.pipelineDir, 't1').promptContext.priorVerdict.reasons[0], /does not do what it says/);
+});
+
+test('store fallback: a dry run records what it saw and changes no task', async () => {
+  const w = unstampedWorld({});
+  const before = fs.readFileSync(path.join(w.pipelineDir, 'queue', 'done', 't1.json'), 'utf8');
+  const { s1, s3, calls } = await settledRun(w, { modeOverride: 'dry-run' });
+  assert.equal(s1.fromStore.length, 1); assert.equal(s3.requeued.length, 1); assert.equal(s3.requeued[0].dryRun, true); assert.equal(calls.length, 0);
+  assert.equal(fs.readFileSync(path.join(w.pipelineDir, 'queue', 'done', 't1.json'), 'utf8'), before);
+});
+
+test('store fallback: a task whose promptContext is not an object is left alone, and an already re-admitted task is exhausted', async () => {
+  const w = unstampedWorld({});
+  const t = readTask(w.pipelineDir, 't1'); t.promptContext = 'plain text'; fs.writeFileSync(path.join(w.pipelineDir, 'queue', 'done', 't1.json'), JSON.stringify(t));
+  const { calls } = await settledRun(w);
+  assert.equal(calls.length, 0);
+  const w2 = unstampedWorld({});
+  const t2 = readTask(w2.pipelineDir, 't1'); t2.history.push({ stage: READMIT_STAGE, at: 'x', detail: 'once' }); fs.writeFileSync(path.join(w2.pipelineDir, 'queue', 'done', 't1.json'), JSON.stringify(t2));
+  const r = await settledRun(w2, { env: OFF });
+  assert.equal(r.calls.length, 0); assert.equal(r.s3.exhausted.length, 1);
+});
+
+test('storeDefectVerdict: the shape a stamped verdict has, nothing for anything else', () => {
+  const { storeDefectVerdict } = require('./branch-defect-readmit-sweep.js');
+  const store = { b: { s1: storeEntry({ reasons: ['x'.repeat(2000), 'second'] }) } };
+  const pv = storeDefectVerdict(store, 'b', 's1');
+  assert.deepEqual(Object.keys(pv).sort(), ['at', 'branch', 'reasons', 'sha', 'source', 'verdict']);
+  assert.equal(pv.reasons[0].length, 1500); assert.equal(pv.at, '2026-11-04T08:56:54Z');
+  assert.equal(storeDefectVerdict(store, 'b', 's2'), null); assert.equal(storeDefectVerdict(null, 'b', 's1'), null); assert.equal(storeDefectVerdict(store, 'zz', 's1'), null);
+  assert.equal(defectVerdict({ promptContext: { priorVerdict: pv } }) !== null, true, 'and the sweep accepts it as a stamped verdict');
+});
