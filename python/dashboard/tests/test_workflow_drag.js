@@ -140,3 +140,10 @@ test('edgeBetween runs bottom middle to top middle, and flips when the target si
   assert.doesNotThrow(() => d.edgeBetween(null, undefined, null));
   d.edgeBetween(null, undefined, null).forEach((p) => assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y)));
 });
+
+test('edgeBetween: a target of another size is anchored on its own middle and bottom', () => {
+  const d2 = require(path.join(__dirname, '..', 'static', 'js', 'workflow-drag.js'));
+  assert.deepEqual(d2.edgeBetween({ x: 0, y: 0 }, { x: 300, y: 200 }, { w: 272, h: 128 }, { w: 100, h: 60 }), [{ x: 136, y: 128 }, { x: 350, y: 200 }]);
+  assert.deepEqual(d2.edgeBetween({ x: 0, y: 400 }, { x: 0, y: 0 }, { w: 272, h: 128 }, { w: 100, h: 60 }), [{ x: 136, y: 400 }, { x: 50, y: 60 }]);
+  assert.deepEqual(d2.edgeBetween({ x: 0, y: 0 }, { x: 300, y: 200 }, { w: 272, h: 128 }), d2.edgeBetween({ x: 0, y: 0 }, { x: 300, y: 200 }, { w: 272, h: 128 }, { w: 272, h: 128 }), 'no target size means the same size');
+});

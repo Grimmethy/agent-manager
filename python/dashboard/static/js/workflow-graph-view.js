@@ -68,7 +68,7 @@ function wfModelHtml(model) {
 }
 
 // One graph node as a card. pos = {x, y} and size = {w, h} place it inside the canvas; both optional.
-function buildNodeHtml(node, selected, pos, size) {
+function buildNodeHtml(node, selected, pos, size, lanes) {
   const n = node || {};
   const runtime = n.runtime || null;
   const off = runtime && runtime.switchable === true && runtime.disabled ? ' worker-off' : '';
@@ -77,12 +77,18 @@ function buildNodeHtml(node, selected, pos, size) {
   const title = n.kind === 'loop' && n.model && n.label === n.model.name ? n.id : (n.label || n.id);
   const timer = runtime && runtime.stateAgeSeconds != null ? '<span class="state-timer">in this state ' + wfEsc(fmtAge(runtime.stateAgeSeconds)) + '</span>' : '';
   const sw = runtime ? buildWorkerSwitchHtml(runtime) : ''; // '' unless runtime.switchable === true
+  const stepCard = typeof wfIsStepNode === 'function' && wfIsStepNode(n); // a step shows its models and is sized by the smallest one (workflow-step-card.js)
   const meta = [];
-  if (n.kind && n.kind !== 'loop') meta.push('<span class="wf-kind">' + wfEsc(n.kind) + '</span>');
+  if (n.kind && n.kind !== 'loop' && !stepCard) meta.push('<span class="wf-kind">' + wfEsc(n.kind) + '</span>');
   if (n.kind === 'group') meta.push('<span class="wf-members">' + wfEsc(n.memberCount) + ' member(s)</span>');
   if (n.model) meta.push(wfModelHtml(n.model));
   if (n.counts) meta.push(wfCountsHtml(n.counts));
   const task = runtime && runtime.currentTaskId ? '<div class="meta wf-task">' + wfEsc(runtime.currentTaskId) + (runtime.currentPass ? ' · ' + wfEsc(runtime.currentPass) : '') + '</div>' : '';
+  if (stepCard) {
+    return '<div class="worker-card clickable wf-node wf-step' + (selected ? ' wf-selected' : '') + '" data-node-id="' + wfEsc(n.id) + '"' + place + ' title="' + wfEsc(n.id) + '">'
+      + '<div class="row"><span class="id">' + wfEsc(title) + '</span>' + (n.counts ? '<span class="badge-col">' + wfCountsHtml(n.counts) + '</span>' : '') + '</div>'
+      + '<div class="wf-models">' + wfStepModelsHtml(n, lanes) + '</div></div>';
+  }
   return '<div class="worker-card clickable wf-node' + (n.kind === 'group' ? ' wf-group-node' : '') + (selected ? ' wf-selected' : '') + off + '" data-node-id="' + wfEsc(n.id) + '"' + (n.kind === 'group' ? ' data-group="1"' : '') + place + '>'
     + '<div class="row"><span class="id">' + wfEsc(title) + '</span>'
     + '<span class="badge-col"><span class="wf-status-line">' + wfStatusBadge(runtime) + timer + '</span>' + sw + '</span></div>'
@@ -180,6 +186,7 @@ function wfStore(state) {
 // The card title: the lane id first, then the label when it is a different thing ('worker-3090 · ornith:35b'); the Services card keeps its own name.
 function wfCardTitle(loop) {
   if (!loop) return '';
+  if (loop.byType) return String(loop.label || loop.id); // a loop type is named by the loop itself, never by a lane
   if (loop.id === 'services') return String(loop.label || loop.id);
   return String(loop.id) + (loop.label && loop.label !== loop.id ? ' · ' + loop.label : '');
 }
@@ -195,9 +202,12 @@ function buildCardHtml(loop, index, total, state) {
   const g = view.graph || { nodes: [], edges: [], groups: [] };
   // A card with groups needs room between rows for a group header (WF_GROUP_HEADER) plus the box padding, or the header sits on the nodes above it.
   const rowGap = (g.groups || []).length ? WF_LAYOUT_OPTS.gapY + WF_GROUP_HEADER + 16 : WF_LAYOUT_OPTS.gapY;
-  const lay = layoutGraph(g, Object.assign({}, WF_CARD_OPTS, { gapY: rowGap, maxPerRow: state && state.maxPerRow ? state.maxPerRow : wfMaxPerRow() }));
+  const nodeSizes = {};
+  (g.nodes || []).forEach((n) => { if (typeof wfIsStepNode === 'function' && wfIsStepNode(n)) nodeSizes[n.id] = wfStepBox(n, { w: WF_LAYOUT_OPTS.nodeW, h: WF_LAYOUT_OPTS.nodeH }); });
+  const lay = layoutGraph(g, Object.assign({}, WF_CARD_OPTS, { gapY: rowGap, nodeSizes, maxPerRow: state && state.maxPerRow ? state.maxPerRow : wfMaxPerRow() }));
   const selectedId = state && state.selectedId;
   const nodeSize = { w: WF_LAYOUT_OPTS.nodeW, h: WF_LAYOUT_OPTS.nodeH };
+  const sizeOf = (id) => (lay.sizes && lay.sizes[id]) || nodeSize; // a step card has its own box
   // Where the owner left nodes by hand (workflow-drag.js) wins over the layout; an id that is no longer on this card is ignored.
   const saved = typeof loadOffsets === 'function' ? loadOffsets(wfStore(state), loop && loop.id) : {};
   const pos = typeof applyOffsets === 'function' ? applyOffsets(lay.positions, saved, (g.nodes || []).map((n) => n.id)) : lay.positions;
@@ -208,16 +218,16 @@ function buildCardHtml(loop, index, total, state) {
   const dx = Math.max(0, ...boxes.map((b) => -b.x));
   const dy = Math.max(0, ...boxes.map((b) => -b.y));
   const movedIds = Object.keys(pos).filter(moved);
-  const width = Math.max(lay.width + dx, ...boxes.map((b) => b.x + dx + b.w), ...movedIds.map((id) => pos[id].x + dx + nodeSize.w));
-  const height = Math.max(lay.height + dy, ...boxes.map((b) => b.y + dy + b.h), ...movedIds.map((id) => pos[id].y + dy + nodeSize.h));
+  const width = Math.max(lay.width + dx, ...boxes.map((b) => b.x + dx + b.w), ...movedIds.map((id) => pos[id].x + dx + sizeOf(id).w));
+  const height = Math.max(lay.height + dy, ...boxes.map((b) => b.y + dy + b.h), ...movedIds.map((id) => pos[id].y + dy + sizeOf(id).h));
   const shift = (pts) => (dx || dy ? (pts || []).map((pt) => ({ x: pt.x + dx, y: pt.y + dy })) : pts);
   // A group drawn as one box per row gets its header button on the first box only, so headers do not pile up over the nodes above them.
   const boxHtml = boxes.map((b) => '<div class="wf-group-box" data-group-id="' + wfEsc(b.id) + '" style="left:' + wfEsc(b.x + dx) + 'px;top:' + wfEsc(b.y + dy) + 'px;width:' + wfEsc(b.w) + 'px;height:' + wfEsc(b.h) + 'px">'
     + (b.part === 0 ? '<button type="button" class="secondary wf-group-toggle" data-group-id="' + wfEsc(b.id) + '" aria-expanded="true" title="Collapse this group">▾ ' + wfEsc(b.label) + '</button>' : '') + '</div>').join('');
   // An edge with a hand-moved end is a straight line between the two cards as they now sit; the others keep the layout's route.
-  const edgePts = (e) => (moved(e.from) || moved(e.to) ? edgeBetween(pos[e.from], pos[e.to], nodeSize) : byEdge[e.id].points);
+  const edgePts = (e) => (moved(e.from) || moved(e.to) ? edgeBetween(pos[e.from], pos[e.to], sizeOf(e.from), sizeOf(e.to)) : byEdge[e.id].points);
   const paths = (g.edges || []).filter((e) => byEdge[e.id]).map((e) => buildEdgeSvg({ id: e.id, kind: e.kind, back: byEdge[e.id].back }, shift(edgePts(e)))).join('');
-  const nodes = (g.nodes || []).filter((n) => pos[n.id]).map((n) => buildNodeHtml(n, n.id === selectedId, { x: pos[n.id].x + dx, y: pos[n.id].y + dy })).join('');
+  const nodes = (g.nodes || []).filter((n) => pos[n.id]).map((n) => buildNodeHtml(n, n.id === selectedId, { x: pos[n.id].x + dx, y: pos[n.id].y + dy }, sizeOf(n.id), loop && loop.lanes)).join('');
   return '<section class="wf-card" data-loop-id="' + wfEsc(loop && loop.id) + '">'
     + '<header class="wf-card-head"><span class="id">' + wfEsc(wfCardTitle(loop)) + '</span>'
     + (view.collapsible ? '<button type="button" class="secondary wf-sources-toggle" data-loop-id="' + wfEsc(loop && loop.id) + '" aria-expanded="' + (view.collapsed ? 'false' : 'true') + '">' + (view.collapsed ? 'Show ' + wfEsc(view.count) + ' sources' : 'Hide sources') + '</button>' : '')
@@ -245,8 +255,8 @@ function graphSignature(graph) {
   return JSON.stringify([nodes.map((n) => {
     const r = n.runtime || {};
     const c = n.counts || {};
-    return [n.id, r.status, r.stale, r.disabled, r.currentTaskId, r.currentPass, c.pending, c.drafting, n.model && n.model.name, n.model && n.model.overridden];
-  }), ((graph && graph.edges) || []).map((e) => e.id), (graph && graph.warnings) || [], ((graph && graph.groups) || []).map((g) => [g.id, g.label, g.children, g.collapsed])]);
+    return [n.id, r.status, r.stale, r.disabled, r.currentTaskId, r.currentPass, c.pending, c.drafting, n.model && n.model.name, n.model && n.model.overridden, n.models && n.models.map((m) => [m.name, m.lane])];
+  }), (graph && graph.loops || []).map((l) => [l.id, l.name, l.steps]), ((graph && graph.edges) || []).map((e) => e.id), (graph && graph.warnings) || [], ((graph && graph.groups) || []).map((g) => [g.id, g.label, g.children, g.collapsed])]);
 }
 
 // A poll redraws only when a visible value changed or nothing is drawn yet (the stored signature starts as null, which never equals a real one); a selected node and the scroll position are left alone otherwise.
@@ -330,7 +340,6 @@ function wfWireDrag(main) {
   if (typeof movedPastThreshold !== 'function' || typeof splitIntoLoops !== 'function') return;
   const loopsById = {};
   splitIntoLoops(wfState.shown || wfState.graph).forEach((l) => { loopsById[l.id] = l; });
-  const size = { w: WF_LAYOUT_OPTS.nodeW, h: WF_LAYOUT_OPTS.nodeH };
   main.querySelectorAll('.wf-card').forEach((card) => {
     const loop0 = loopsById[card.dataset.loopId];
     if (!loop0) return;
@@ -345,7 +354,7 @@ function wfWireDrag(main) {
         const a = els[e.from];
         const b = els[e.to];
         const path = paths[e.id];
-        if (a && b && path) path.setAttribute('d', wfPathData(edgeBetween({ x: a.offsetLeft, y: a.offsetTop }, { x: b.offsetLeft, y: b.offsetTop }, size)));
+        if (a && b && path) path.setAttribute('d', wfPathData(edgeBetween({ x: a.offsetLeft, y: a.offsetTop }, { x: b.offsetLeft, y: b.offsetTop }, { w: a.offsetWidth, h: a.offsetHeight }, { w: b.offsetWidth, h: b.offsetHeight })));
       });
     };
     Object.keys(els).forEach((id) => {
@@ -420,6 +429,9 @@ function wfDraw(main) {
   wireWorkerSwitchButtons(main);
   if (typeof wireNodePanel === 'function') wireNodePanel(main, {});
   if (typeof isTaskPinNode === 'function') wfLoadTasks(main);
+  main.querySelectorAll('.wf-model-lane').forEach((row) => { // a model row opens the panel of the lane behind it
+    row.onclick = (e) => { e.stopPropagation(); wfState.selectedId = wfState.selectedId === row.dataset.lane ? null : row.dataset.lane; wfDraw(main); };
+  });
   main.querySelectorAll('.wf-node').forEach((el) => {
     el.onclick = () => {
       if (el.dataset.justDragged === '1') { delete el.dataset.justDragged; return; } // the click that ends a drag is not a selection
