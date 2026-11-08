@@ -2510,9 +2510,21 @@ def list_held_hub_groups(include_other_projects=False):
     with _branch_cache_lock:
         groups = list(_branch_cache.get("held") or [])
         others = dict(_branch_cache.get("held_other") or {})
-    if include_other_projects and others:
+    if include_other_projects:
         import branch_projects  # lazy, same as the listing route
-        for p in branch_projects.registered_projects(get_active_repo_root()):
+        active_repo = get_active_repo_root()
+        # Tag the active project's own groups with its project label/repoRoot -- the
+        # Hub worker (src/hub-index.js buildIndex) requires h.project.repoRoot and drops
+        # untagged groups as "project undefined is not registered". Other projects'
+        # groups are tagged below.
+        if active_repo:
+            active_tag = branch_projects.project_tag(next(
+                (p for p in branch_projects.registered_projects(active_repo) if p["active"]),
+                None,
+            ))
+            if active_tag:
+                groups = [{**g, "project": active_tag} for g in groups]
+        for p in branch_projects.registered_projects(active_repo):
             if not p["active"]:
                 groups.extend({**g, "project": branch_projects.project_tag(p)} for g in others.get(str(p["repoRoot"]), []))
     return groups
