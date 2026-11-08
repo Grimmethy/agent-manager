@@ -41,6 +41,8 @@ from werkzeug.exceptions import HTTPException
 # this whole project's no-build-step, run-from-source philosophy.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import event_stream  # noqa: E402
+import branch_git_memo  # noqa: E402
+import hub_index  # noqa: E402
 import graph_build  # noqa: E402
 from app_proactive_sweep import proactive_sweep_argv, proactive_sweep_lock_path  # noqa: E402
 from response_compression import compress_response  # noqa: E402
@@ -193,6 +195,7 @@ from app_branch_helpers import (  # noqa: F401
     _summarize_hub,
     _summarize_task_record,
     branch_task_ids,
+    branch_trailer_ids,
     partition_held_hub_branches,
 )
 
@@ -2140,6 +2143,9 @@ def _hub_for_branch(qdir, branch, commit_task_ids):
     in its subTasks. Returns a _summarize_hub dict or None."""
     if not qdir:
         return None
+    if hub_index.enabled():
+        hit = hub_index.lookup(qdir, branch, list(commit_task_ids or []), read_json_safe)
+        return _summarize_hub(hit[0], hit[1]) if hit else None
     task_set = set(commit_task_ids or [])
     seen = []
     coord = qdir / "coordinating"
@@ -2266,6 +2272,10 @@ def _triage_candidate_count(repo_root, main_branch, full_ref, subject, label):
 
 
 def _branch_content_already_on_main(repo_root, main_branch, full_ref):
+    return _branch_content_state(repo_root, main_branch, full_ref) is True
+
+
+def _branch_content_state(repo_root, main_branch, full_ref):
     """True when every file this branch changed (vs. where it forked from main) is byte-identical on origin/<main>: there is nothing left to merge.
 
     Why (2026-09-21): a SQUASH merge writes a new commit on main and leaves the branch's own commits unmerged by ancestry, so `rev-list main..branch` stayed >0 and
@@ -2284,7 +2294,7 @@ def _branch_content_already_on_main(repo_root, main_branch, full_ref):
         differing = _run_git(["diff", "--name-only", "-z", f"origin/{main_branch}", full_ref, "--", *changed], repo_root)
         return not any(differing.split("\0"))
     except (RuntimeError, subprocess.SubprocessError, OSError):
-        return False
+        return None      # git failed: the answer is False for the listing (the branch stays), but it is not final, so a memo must not keep it
 
 
 def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_dir=None, fetch_timeout=30):
@@ -2312,23 +2322,29 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
     qdir = (pipeline_dir / "queue") if pipeline_dir else None
 
     raw = _run_git(
-        ["for-each-ref", "--format=%(refname:short)%09%(committerdate:iso-strict)%09%(subject)", "refs/remotes/origin/agent/"],
+        ["for-each-ref", "--format=%(refname:short)%09%(objectname)%09%(committerdate:iso-strict)%09%(subject)", "refs/remotes/origin/agent/"],
         repo_root,
     )
+    # The per-branch git facts below depend only on the branch head and the base head: branch_git_memo keeps them while neither moved. An unreadable base sha bypasses the memo.
+    try:
+        base_sha = _run_git(["rev-parse", "--verify", "--quiet", f"origin/{main_branch}"], repo_root).strip()
+    except (RuntimeError, subprocess.SubprocessError, OSError):
+        base_sha = ""
+    memo = branch_git_memo.get
     branches = []
     for line in raw.splitlines():
         if not line.strip():
             continue
         parts = line.split("\t")
-        if len(parts) != 3:
+        if len(parts) != 4:
             continue
-        full_ref, pushed_at, subject = parts
+        full_ref, head_sha, pushed_at, subject = parts
         branch = full_ref.removeprefix("origin/")
         task_id = branch.removeprefix("agent/")
 
         try:
-            ahead_raw = _run_git(["rev-list", "--count", f"origin/{main_branch}..{full_ref}"], repo_root)
-            ahead = int(ahead_raw.strip() or "0")
+            ahead = memo(repo_root, base_sha, head_sha, "ahead",
+                         lambda: int(_run_git(["rev-list", "--count", f"origin/{main_branch}..{full_ref}"], repo_root).strip() or "0"))
         except (RuntimeError, ValueError) as exc:
             logger.warning("Skipping branch %s: failed to compute ahead-count (%s: %s)", full_ref, type(exc).__name__, exc)
             continue
@@ -2336,21 +2352,25 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
             # Already fully merged (e.g. landed by hand, or a stale ref pending prune on
             # the remote) -- nothing for a human to act on, would just be clutter here.
             continue
-        if _branch_content_already_on_main(repo_root, main_branch, full_ref):
+        if memo(repo_root, base_sha, head_sha, "squashed", lambda: _branch_content_state(repo_root, main_branch, full_ref), final=lambda v: v is not None) is True:
             # Landed by SQUASH (or an identical hand-applied change): the commits are "ahead" by ancestry but there is nothing left to merge.
             continue
 
         try:
-            behind_raw = _run_git(["rev-list", "--count", f"{full_ref}..origin/{main_branch}"], repo_root)
-            behind = int(behind_raw.strip() or "0")
+            behind = memo(repo_root, base_sha, head_sha, "behind",
+                          lambda: int(_run_git(["rev-list", "--count", f"{full_ref}..origin/{main_branch}"], repo_root).strip() or "0"))
         except (RuntimeError, ValueError):
             behind = None
 
-        conflict = _check_merge_conflict(repo_root, main_branch, branch)
+        conflict = memo(repo_root, base_sha, head_sha, "conflict", lambda: _check_merge_conflict(repo_root, main_branch, branch), final=lambda v: v.get("checked") is True)
 
         label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
         candidate_count = _triage_candidate_count(repo_root, main_branch, full_ref, subject, label)
-        hub = get_hub_data_provider().hub_for_branch(qdir, branch, branch_task_ids(_run_git, repo_root, main_branch, full_ref, task_id))
+        try:
+            trailers = memo(repo_root, base_sha, head_sha, "trailers", lambda: branch_trailer_ids(_run_git, repo_root, main_branch, full_ref))
+        except (RuntimeError, subprocess.SubprocessError, OSError):
+            trailers = []
+        hub = get_hub_data_provider().hub_for_branch(qdir, branch, list(dict.fromkeys([task_id, *trailers])))
         branches.append({
             "branch": branch,
             "taskId": task_id,
@@ -2374,6 +2394,9 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
             "hub": hub,
         })
 
+    delta = branch_git_memo.take_delta()
+    if delta["misses"]:
+        print(f"[branches] git memo for {repo_root}: {delta['hits']} hit(s), {delta['misses']} miss(es)", file=sys.stderr)
     branches, held = partition_held_hub_branches(branches)
     with _branch_cache_lock:
         if other:

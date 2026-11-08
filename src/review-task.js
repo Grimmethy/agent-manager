@@ -42,6 +42,7 @@
 const fs = require('fs');
 const { sharedInstancesDir } = require('./instances-dir.js');
 const { REVIEW_LINES: REVIEW_POLL_LINES } = require('./lib/poll-avoidance-lines.js');
+const { REVIEW_LINES: REVIEW_IO_LINES } = require('./lib/io-avoidance-lines.js');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig, ensureRegistered } = require('./config.js');
@@ -477,6 +478,7 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   lines.push(`The real current date is ${new Date().toISOString().slice(0, 10)}. Do not assume any earlier date is "now," and do not reject a cited source, URL, or claimed date merely for being after some earlier date you might otherwise assume is current -- judge recency/plausibility against the real date above, not your own training-data intuition of "the present."`);
   lines.push('The drafting model produced the plan and implementation below and cannot verify its own claims -- treat every concrete claim as UNVERIFIED.');
   lines.push(REVIEW_POLL_LINES);
+  lines.push(REVIEW_IO_LINES);
   lines.push('');
   lines.push(`TASK: ${task.title} (domain=${task.domain}, source=${task.source})`);
   // A decompose / candidate-split proposal is judged on COVERAGE -- do the sub-tasks

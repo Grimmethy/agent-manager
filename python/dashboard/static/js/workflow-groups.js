@@ -6,6 +6,8 @@
 // Worst first. A status that is not in the list ranks between working and idle; no status at all reads as idle.
 const WF_STATUS_WORST_FIRST = ['error', 'stale', 'paused', 'warming', 'queued', 'working', 'idle', 'offline', 'disabled'];
 const WF_GROUP_HEADER = 28;
+// A loop card with more sources than this shows them as ONE group card (see collapseLoopSources).
+const WF_MAX_SOURCES = 6;
 
 function worstStatus(statuses) {
   const list = Array.isArray(statuses) ? statuses.filter((s) => typeof s === 'string' && s) : [];
@@ -103,16 +105,56 @@ function collapseGraph(graph, collapsedIds) {
   }
 }
 
+// For one loop card (loop = { id, label, graph } from splitIntoLoops): when it has more than `max` source nodes and `expanded` is not true, a copy of its graph where
+// the sources are ONE group node (id 'group:sources:<loop id>', label 'N sources', the summed counts, the edges of its members pointed at it), built with collapseGraph.
+// Authored groups lose the sources from their children and are dropped when nothing else is left, so no empty or duplicate box is drawn around the collapsed card.
+// -> { graph, count, collapsed, collapsible, groupId }: count = how many sources the loop has, collapsible = count > max (the card shows a Show/Hide button),
+// collapsed = the returned graph is the collapsed one. Never throws; a loop with `max` sources or fewer comes back untouched.
+function collapseLoopSources(loop, max, expanded) {
+  const untouched = (count) => ({ graph: loop && loop.graph, count, collapsed: false, collapsible: false, groupId: null });
+  try {
+    const g = loop && loop.graph;
+    if (!g || !Array.isArray(g.nodes)) return untouched(0);
+    const limit = Number.isInteger(max) && max >= 1 ? max : WF_MAX_SOURCES;
+    const sources = g.nodes.filter((n) => n && n.kind === 'source' && typeof n.id === 'string');
+    const count = sources.length;
+    if (count <= limit) return untouched(count);
+    if (expanded === true) return { graph: g, count, collapsed: false, collapsible: true, groupId: null };
+    const groupId = 'group:sources:' + String(loop.id);
+    const ids = new Set(sources.map((n) => n.id));
+    const authored = (Array.isArray(g.groups) ? g.groups : [])
+      .filter((gr) => gr && typeof gr.id === 'string' && Array.isArray(gr.children))
+      .map((gr) => ({ ...gr, children: gr.children.filter((c) => !ids.has(c)) }))
+      .filter((gr) => gr.children.length > 0);
+    const withGroup = { ...g, groups: [...authored, { id: groupId, label: count + ' sources', children: sources.map((n) => n.id), collapsed: true }] };
+    return { graph: collapseGraph(withGroup, new Set([groupId])), count, collapsed: true, collapsible: true, groupId };
+  } catch (e) {
+    return untouched(0);
+  }
+}
+
 // One box per COLUMN of every EXPANDED group of the (collapsed) graph: the laid-out members that share an x position are boxed together (x, y, w, h in canvas pixels, `pad` around them, a header strip on top), so a box
 // never spans the gap between two columns. { id, label, x, y, w, h, part }: `part` counts the group's boxes from the left, 0 first. positions = { id: { x, y } } from layoutGraph, size = { w, h } of a node card.
 // A group none of whose members is laid out gets no box. x and y can be negative (a group at the edge of the layout): the view shifts the whole canvas by that amount.
-function groupBoxes(graph, positions, size, pad) {
+// direction 'down' (the top-to-bottom layout, where a layer is a ROW): one box per ROW instead, members that share a y position boxed together, `part` counted from the top. Any other value is the column behaviour above.
+function groupBoxes(graph, positions, size, pad, direction) {
   try {
     const groups = graph.groups;
     const p = Number.isFinite(pad) ? pad : 12;
     const out = [];
+    const down = direction === 'down';
     groups.forEach((g) => {
       const ids = groupMembers(groups, g.id).filter((id) => positions && positions[id]);
+      if (down) {
+        const rows = Array.from(new Set(ids.map((id) => positions[id].y))).sort((a, b) => a - b);
+        rows.forEach((ry, part) => {
+          const xs = ids.filter((id) => positions[id].y === ry).map((id) => positions[id].x);
+          const x = Math.min(...xs) - p;
+          const y = ry - p - WF_GROUP_HEADER;
+          out.push({ id: g.id, label: g.label || g.id, x, y, w: Math.max(...xs) + size.w + p - x, h: size.h + 2 * p + WF_GROUP_HEADER, part });
+        });
+        return;
+      }
       const columns = Array.from(new Set(ids.map((id) => positions[id].x))).sort((a, b) => a - b);
       columns.forEach((cx, part) => {
         const ys = ids.filter((id) => positions[id].x === cx).map((id) => positions[id].y);
@@ -127,4 +169,4 @@ function groupBoxes(graph, positions, size, pad) {
   }
 }
 
-if (typeof module !== 'undefined') module.exports = { WF_STATUS_WORST_FIRST, worstStatus, effectiveCollapsed, groupMembers, collapseGraph, groupBoxes };
+if (typeof module !== 'undefined') module.exports = { WF_STATUS_WORST_FIRST, WF_MAX_SOURCES, worstStatus, effectiveCollapsed, groupMembers, collapseGraph, collapseLoopSources, groupBoxes };

@@ -222,11 +222,22 @@ test('renderNav hands the finished nav to the notch on both layouts', () => {
   }
 });
 
-test('the phone layout keeps the flat strip: no section headers, the old groups', () => {
+test('the phone layout shows the same sections as the wide one, without the collapse button or the rail', () => {
+  const wide = makeEnv(); wide.ctx.renderNav();
   const env = makeEnv({ narrow: true });
   env.ctx.renderNav();
-  assert.equal(env.appended.filter((e) => /nav-sh|nav-div/.test(e.className)).length, 0);
-  assert.match(env.text(env.appended[0]), /Forges/);
+  const heads = (e) => e.appended.filter((x) => x.className === 'nav-sh').map((h) => e.text(h));
+  assert.deepEqual(heads(env), heads(wide));
+  assert.equal(env.appended.filter((e) => e.className === 'nav-div').length, 6);
+  assert.equal(topOf(env), undefined, 'no collapse button on a phone');
+  assert.equal(env.nav.className, '');
+});
+
+test('a phone ignores a stored collapsed-rail choice (the rail is wide-only)', () => {
+  const env = makeEnv({ narrow: true, stored: { agentManagerNavRail: 'collapsed' } });
+  env.ctx.renderNav();
+  assert.equal(env.nav.className, '');
+  assert.ok(env.appended.some((e) => e.className === 'nav-sh'));
 });
 
 // --- collapse button and icon rail ---
@@ -412,4 +423,28 @@ test('page wiring: index.html loads nav-sections.js, styles headers and the fadi
   assert.match(html, /nav button\.nav-sh \{[^}]*text-transform: uppercase;/);
   assert.match(html, /nav \{ width: 232px;/);
   assert.match(html, /@media \(prefers-reduced-motion: reduce\) \{ \.nav-chev \{ transition: none; \} \}/);
+});
+
+test('page wiring: on a phone the nav is ONE sideways row (flex row, no wrap, sections and tabs inline, thin vertical divider)', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', '..', 'templates', 'index.html'), 'utf8');
+  const start = html.indexOf('@media (max-width: 860px)');
+  assert.ok(start > 0, 'the phone media query exists');
+  const block = html.slice(start, html.indexOf('</style>', start));
+  const nav = (block.match(/\n\s*nav \{([^}]*)\}/) || [])[1] || '';
+  assert.match(nav, /display:\s*flex/);
+  assert.match(nav, /flex-direction:\s*row/);
+  assert.match(nav, /overflow-x:\s*auto/);
+  assert.doesNotMatch(nav, /max-height/, 'no vertical cap: the row is one line');
+  assert.match(block, /nav button[^{]*\{[^}]*white-space:\s*nowrap/);
+  assert.match(block, /nav \.nav-div \{[^}]*width:\s*1px/);
+});
+
+test('renderNav keeps the sideways scroll position of the phone row when a section is folded or opened', () => {
+  const env = makeEnv({ narrow: true });
+  // like a real element: emptying it resets the scroll position to the start
+  let scroll = 240;
+  Object.defineProperty(env.nav, 'scrollLeft', { get: () => scroll, set: (v) => { scroll = v; } });
+  Object.defineProperty(env.nav, 'innerHTML', { get: () => '', set: () => { scroll = 0; } });
+  env.ctx.renderNav();
+  assert.equal(scroll, 240);
 });

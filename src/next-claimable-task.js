@@ -275,7 +275,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     const hubOrder = (registered && registered.hubOrder) || DEFAULT_HUB_ORDER;
     const oc = task ? hubOrder.orderCandidate(pipelineDir, task, hubKeyCache) : null;
     const hk = oc ? oc.hubKey : { isHubChild: false };
-    const hubKey = hk.isHubChild ? { rank: hk.rank, createdAt: hk.createdAt } : noHubKey;
+    const hubKey = hk.isHubChild ? { rank: hk.rank, createdAt: hk.createdAt, remaining: hk.remaining } : noHubKey;
     const hubTier = !!(oc && oc.isHubWork);
     const rankedPriority = rankPriorityOfTask(task, { hubTier });
     // A premium task that keeps getting blocked rotates behind fresh premium work, but still ahead of the hub tier and everything else.
