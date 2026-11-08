@@ -134,14 +134,25 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
 
   const checked = checkFilePaths(targets.join(', '), repoRoot, extraRoots);
   
-  // 2026-11-08: categorize targets by type
+  // 2026-11-08: categorize targets by type, using resolvedPath when available
   const createPaths = [];
   const modifyPaths = [];
   for (const entry of checked) {
+    // Use resolvedPath if the file was found at a different location
+    let effectivePath = entry.claimedPath;
+    if (entry.resolvedPath) {
+      // Strip repoRoot prefix to get relative path
+      const normalizedRepoRoot = repoRoot.replace(/\\/g, '/').replace(/\/$/, '');
+      const normalizedResolved = entry.resolvedPath.replace(/\\/g, '/');
+      if (normalizedResolved.startsWith(normalizedRepoRoot + '/')) {
+        effectivePath = normalizedResolved.slice(normalizedRepoRoot.length + 1);
+      }
+    }
+    
     if (explicitTypes.get(entry.claimedPath) === 'create') {
-      createPaths.push(entry.claimedPath);
+      createPaths.push(effectivePath);
     } else {
-      modifyPaths.push(entry.claimedPath);
+      modifyPaths.push(effectivePath);
     }
   }
   
@@ -158,7 +169,27 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
 
   if (missing.length === 0) return { blocked: false, targetSummary: { create: createPaths, modify: modifyPaths } };
 
-  const paths = missing.map((entry) => entry.claimedPath);
+  // 2026-11-08: for missing files, check if they were resolved to a different location
+  const resolvedMissing = missing.map((entry) => {
+    if (entry.resolvedPath) {
+      // Strip repoRoot prefix to get relative path
+      const normalizedRepoRoot = repoRoot.replace(/\\/g, '/').replace(/\/$/, '');
+      const normalizedResolved = entry.resolvedPath.replace(/\\/g, '/');
+      let resolvedRelative = entry.resolvedPath;
+      if (normalizedResolved.startsWith(normalizedRepoRoot + '/')) {
+        resolvedRelative = normalizedResolved.slice(normalizedRepoRoot.length + 1);
+      }
+      return { ...entry, effectivePath: resolvedRelative, wasResolved: true };
+    }
+    return { ...entry, effectivePath: entry.claimedPath, wasResolved: false };
+  });
+  
+  // If all missing files were resolved, treat as not blocked
+  if (resolvedMissing.every((e) => e.wasResolved)) {
+    return { blocked: false, targetSummary: { create: createPaths, modify: modifyPaths } };
+  }
+
+  const paths = resolvedMissing.map((entry) => entry.effectivePath);
   
   // 2026-11-08: include actionable feedback suggesting to mark as create target
   const feedback = ' -- mark as a create target (e.g. "create `' + paths[0] + '`)") or correct the path';
