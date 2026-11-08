@@ -13,7 +13,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
-const { healGeneratedDirt } = require('./lib/apply-clone-dirt.js');
+const { healGeneratedDirt, checkApplyCloneCleanliness } = require('./lib/apply-clone-dirt.js');
 
 const GIT_ENV = {
   ...process.env,
@@ -348,10 +348,8 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
       const healed = healGeneratedDirt(run);
       if (healed.restored.length) console.error(`[git-runner] restored ${healed.restored.length} generated file(s) in ${repoRoot}: ${healed.restored.slice(0, 5).join(', ')}`);
       else if (healed.wouldRestore.length) console.error(`[git-runner] (dry-run) would restore ${healed.wouldRestore.length} generated file(s) in ${repoRoot}: ${healed.wouldRestore.slice(0, 5).join(', ')}`);
-      const lines = run(['status', '--porcelain', '--untracked-files=no']).split('\n').filter(Boolean);
-      if (!lines.length) return;
-      const files = lines.map((l) => l.slice(3)).slice(0, 8).join(', ');
-      throw new Error(`${DIRTY_CLONE_ERROR_PREFIX} (uncommitted tracked changes: ${files}) -- refusing to switch branches; this is a git-state problem, not a draft problem. Find what wrote to ${repoRoot} and clean it.`);
+      const { clean, dirtyPaths, reason } = checkApplyCloneCleanliness();
+      if (!clean) throw new Error(reason);
     },
     createBranch: (name) => run(['checkout', '-b', name]),
     checkoutMain: () => run(['checkout', mainBranch]),
