@@ -280,7 +280,7 @@ test('stage nodes and produces edges exist', () => {
   const g = buildWorkflowGraph({ lanes: [], instances: [], topology: [], models: { overrides: {}, ollamaModels: [], claudeModels: [] }, now: FIXED_NOW });
   const stages = g.nodes.filter(n => n.kind === 'stage').map(n => n.id).sort();
   assert.deepEqual(stages, ['stage:apply', 'stage:implement', 'stage:orient', 'stage:plan', 'stage:review']);
-  const produces = g.edges.filter(e => e.kind === 'produces');
+  const produces = g.edges.filter(e => e.kind === 'produces' && e.from.startsWith('stage:'));   // the loop-type step chains add their own produces edges
   assert.equal(produces.length, 4);
   // The chain orient -> plan -> implement -> review -> apply must all be present
   const chain = ['orient', 'plan', 'implement', 'review', 'apply'];
@@ -440,7 +440,7 @@ test('priorityOrder is an empty list without topology entries, and the output ke
   assert.deepEqual(buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: [] }).priorityOrder, []);
   const g = buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: 'x' });
   assert.deepEqual(g.priorityOrder, []);
-  assert.deepEqual(Object.keys(g).sort(), ['edges', 'generatedAt', 'groups', 'nodes', 'priorityCompare', 'priorityOrder', 'schemaVersion', 'warnings']);
+  assert.deepEqual(Object.keys(g).sort(), ['edges', 'generatedAt', 'groups', 'loops', 'nodes', 'priorityCompare', 'priorityOrder', 'schemaVersion', 'warnings']);
 });
 
 test('priorityOrder survives the workflow overlay and the watchdog script nodes unchanged', () => {
@@ -513,4 +513,20 @@ test('priorityCompare is computed from the graph after the overlay: a source gro
   const g = buildWorkflowGraph({ ...OVERLAY_INPUT(), topology: TOPOLOGY_3, workflow: GROUPED });
   assert.equal(g.nodes.find((n) => n.id === 'source:late').parent, 'group:first');
   assert.equal(g.priorityCompare.find((e) => e.name === 'late').group, 'group:first');
+});
+
+test('the built graph carries loops: the task pipeline with models and a size on every step', () => {
+  const g = buildWorkflowGraph(OVERLAY_INPUT());
+  assert.ok(Array.isArray(g.loops) && g.loops.length >= 1);
+  const pipe = g.loops.find((l) => l.id === 'loop:pipeline');
+  assert.equal(pipe.name, 'Task pipeline');
+  for (const id of pipe.steps) {
+    const step = g.nodes.find((n) => n.id === id);
+    assert.equal(step.loop, 'loop:pipeline', id);
+    assert.ok(Array.isArray(step.models), id);
+    if (step.models.length) assert.ok(step.size && typeof step.size.scale === 'number', id);
+    else assert.equal(step.size, null, id + ': a step with no model has no size');
+  }
+  assert.ok(g.nodes.find((n) => n.id === 'stage:implement').models.length >= 1);
+  assert.equal(g.nodes.find((n) => n.id === 'stage:apply').size.tier, 'script');
 });

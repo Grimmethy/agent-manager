@@ -16,7 +16,7 @@ const ESC_ATTR = "function escapeAttr(s) { return String(s).replace(/\"/g, '&quo
 const ctx = vm.createContext({ console });
 ctx.window = ctx;
 vm.runInContext(ESC_HTML + '\n' + ESC_ATTR + "\nfunction hubTag(hub) { return 'H:' + hub.label; }", ctx);
-for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'worker-model-select.js', 'worker-task-picker.js', 'workflow-layout.js', 'workflow-node-panel.js', 'workflow-card-fit.js', 'workflow-graph-view.js']) {
+for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'worker-model-select.js', 'worker-task-picker.js', 'workflow-layout.js', 'workflow-node-panel.js', 'workflow-card-fit.js', 'workflow-step-card.js', 'workflow-graph-view.js']) {
   vm.runInContext(read(f), ctx, { filename: f });
 }
 const v = ctx;

@@ -28,6 +28,25 @@ export function nodeIdForInstance(instanceId) {
   return instanceId === 'watchdog' || instanceId === 'apply-loop' ? 'service:' + instanceId : instanceId;
 }
 
+// Loops by type (HUB0348): which graph ids a drawn page must account for. In the by-type view the lane nodes are model rows (data-lane) and the watchdog service itself is
+// shown only as each loop's trigger, so an instance counts as shown when its node OR a model row for it is on the page; the watchdog is exempt in that view.
+export function instanceIsShown(instanceId, nodeIds, laneIds, typed) {
+  const id = nodeIdForInstance(instanceId);
+  if (nodeIds.includes(id) || laneIds.includes(id)) return true;
+  return typed && instanceId === 'watchdog';
+}
+
+// The loop-type checks as plain data, so they can be tested without a browser: titles = the card titles in page order, loops = graph.loops of the API.
+export function loopTitleProblems(titles, loops) {
+  const problems = [];
+  const names = (loops || []).map((l) => l.name);
+  if (!titles.length) problems.push('no card is drawn');
+  if (JSON.stringify(titles) !== JSON.stringify(names)) problems.push('the card titles are not the loop names in order');
+  if (titles.some((t) => /worker-|reviewer|rx580|p40|3090/i.test(t) && !names.includes(t))) problems.push('a card is titled by a lane or GPU');
+  if (titles[0] !== 'Task pipeline') problems.push('the first card is not the Task pipeline');
+  return problems;
+}
+
 function loadPlaywright(dir) {
   const req = createRequire(path.join(path.resolve(dir), 'noop.js'));
   for (const name of ['playwright', 'playwright-core']) {
@@ -81,9 +100,9 @@ async function phoneChecks(browser, url, check) {
       await page.locator('.wf-card[data-loop-id="' + bigId + '"] .wf-sources-toggle').click();
       await page.waitForTimeout(600);
       check((await page.locator('.wf-card[data-loop-id="' + bigId + '"] .wf-node').count()) === before, 'Hide sources collapses it again');
-    } else {
+    } else if (!(await page.locator('.wf-card[data-loop-id^="loop:"]').count())) {
       check(false, 'no loop card has a Show sources button (the scratch data should have a loop with more than 6 sources)');
-    }
+    } // a by-type view draws no sources: nothing to expand
     if (cards > 1) {
       await page.evaluate(() => { const row = document.getElementById('wf-surface'); row.scrollTo({ left: row.querySelectorAll('.wf-card')[1].offsetLeft - row.offsetLeft + 40, behavior: 'instant' }); });
       await page.waitForTimeout(900);
@@ -152,15 +171,17 @@ async function main() {
     await page.locator('.wf-view-btn[data-view="graph"]').click();
     await page.waitForSelector('.wf-node', { timeout: 30000 }); // the first /api/workflow-graph call runs several node processes
     const missing = [];
+    const typed = (await page.locator('.wf-card[data-loop-id^="loop:"]').count()) > 0;
+    const drawn = await page.evaluate(() => ({ nodes: [...document.querySelectorAll('.wf-node')].map((e) => e.dataset.nodeId), lanes: [...document.querySelectorAll('[data-lane]')].map((e) => e.dataset.lane) }));
     for (const id of ids) {
-      if ((await page.locator('.wf-node[data-node-id="' + nodeIdForInstance(id) + '"]').count()) === 0) missing.push(id);
+      if (!instanceIsShown(id, drawn.nodes, drawn.lanes, typed)) missing.push(id);
     }
-    check(missing.length === 0, 'the graph has a node for every instance' + (missing.length ? ' (missing: ' + missing.join(', ') + ')' : ''));
+    check(missing.length === 0, 'the graph shows every instance, as a node or a model row' + (missing.length ? ' (missing: ' + missing.join(', ') + ')' : ''));
     check(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), 'the page does not scroll sideways');
 
     const node = page.locator('.wf-node').first();
     const selectedId = await node.getAttribute('data-node-id');
-    await node.click();
+    await node.locator('.id').first().click(); // the title: the middle of a step card is a model row, which opens its lane instead
     await page.waitForTimeout(1000);
     check((await page.locator('#wf-detail').count()) === 1, 'clicking a node opens its detail panel (' + selectedId + ')');
 
@@ -180,6 +201,38 @@ async function main() {
     check(!dk.rowScrollsX && dk.inside, 'the desktop card row does not scroll sideways and every card sits inside it');
     check(Math.min(...dk.widths) < dk.rowW / 2, 'a lane card is much narrower than the row (' + Math.round(Math.min(...dk.widths)) + ' of ' + Math.round(dk.rowW) + ' px)');
     check(Math.min(...dk.widths) >= 299, 'no card is narrower than its minimum');
+
+    // Loops by type: cards are named by the loop, steps list their models and are sized by the smallest one, a model row opens its lane.
+    const api = await (await fetch(url + '/api/workflow-graph')).json();
+    if (Array.isArray(api.loops) && api.loops.length) {
+      const titles = await page.evaluate(() => [...document.querySelectorAll('.wf-card-head .id')].map((e) => e.textContent));
+      const bad = loopTitleProblems(titles, api.loops);
+      check(bad.length === 0, 'every card is named by its loop (' + titles.length + ' cards, first: ' + titles[0] + ')' + (bad.length ? ': ' + bad.join('; ') : ''));
+      const implement = await page.evaluate(() => [...document.querySelectorAll('.wf-node[data-node-id="stage:implement"] [data-lane]')].map((e) => e.dataset.lane).sort());
+      const expected = (api.nodes.find((n) => n.id === 'stage:implement').models || []).map((m) => m.lane).filter(Boolean).sort();
+      check(implement.length > 0 && JSON.stringify(implement) === JSON.stringify(expected), 'the Implement step lists the models of every working lane (' + implement.length + ' rows)');
+      check(await page.evaluate(() => [...document.querySelectorAll('.wf-step')].every((s) => s.querySelector('.wf-model-row'))), 'every step card shows at least one model row');
+      check(await page.evaluate(() => [...document.querySelectorAll('.wf-model-row')].every((r) => r.querySelector('.wf-provider') && (r.querySelector('.wf-size') || r.querySelector('.wf-provider-script')))), 'every model row has a provider badge and a size badge (a script needs only its badge)');
+      const withScale = api.nodes.filter((n) => Array.isArray(n.models) && n.size && n.size.scale);
+      const lo = withScale.reduce((a, b) => (b.size.scale < a.size.scale ? b : a), withScale[0]);
+      const hi = withScale.reduce((a, b) => (b.size.scale > a.size.scale ? b : a), withScale[0]);
+      if (lo && hi && hi.size.scale > lo.size.scale) {
+        const w = (id) => page.evaluate((i) => { const e = document.querySelector('.wf-node[data-node-id="' + i + '"]'); return e ? e.offsetWidth : 0; }, id);
+        const [wl, wh] = [await w(lo.id), await w(hi.id)];
+        check(wl > 0 && wh > wl, 'a step for a bigger model is drawn bigger (' + hi.id + ' ' + wh + ' px at scale ' + hi.size.scale + ' > ' + lo.id + ' ' + wl + ' px at scale ' + lo.size.scale + ')');
+      } else {
+        console.log('note: every step has the same size scale in this data, the size comparison was not made');
+      }
+      const row = page.locator('.wf-model-lane').first();
+      if (await row.count()) {
+        const laneId = await row.getAttribute('data-lane');
+        await row.click();
+        await page.waitForTimeout(800);
+        check((await page.locator('#wf-detail').count()) === 1, 'clicking a model row opens the detail panel of its lane (' + laneId + ')');
+        await page.locator('.wf-model-lane[data-lane="' + laneId + '"]').first().click();
+        await page.waitForTimeout(500);
+      }
+    }
 
     await page.screenshot({ path: screenshot });
     console.log('screenshot: ' + screenshot);

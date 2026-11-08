@@ -95,14 +95,16 @@ function applyOffsets(positions, offsets, validIds) {
 
 // The straight line for an edge whose end(s) were moved by hand: from the bottom middle of the source to the top middle of the target, or, when the target's top is now
 // above the source's top (it was dragged above it), from the top middle of the source to the bottom middle of the target. Overlapping nodes keep the first form.
-// size = { w, h } of a node card.
-function edgeBetween(from, to, size) {
+// size = { w, h } of the source card; toSize = { w, h } of the target card (the same as size when left out: cards of one size).
+function edgeBetween(from, to, size, toSize) {
   const w = size && wfDragFinite(size.w) ? size.w : 0;
   const h = size && wfDragFinite(size.h) ? size.h : 0;
+  const tw = toSize && wfDragFinite(toSize.w) ? toSize.w : w;
+  const th = toSize && wfDragFinite(toSize.h) ? toSize.h : h;
   const a = from || { x: 0, y: 0 };
   const b = to || { x: 0, y: 0 };
-  if (b.y >= a.y) return [{ x: Math.round(a.x + w / 2), y: Math.round(a.y + h) }, { x: Math.round(b.x + w / 2), y: Math.round(b.y) }];
-  return [{ x: Math.round(a.x + w / 2), y: Math.round(a.y) }, { x: Math.round(b.x + w / 2), y: Math.round(b.y + h) }];
+  if (b.y >= a.y) return [{ x: Math.round(a.x + w / 2), y: Math.round(a.y + h) }, { x: Math.round(b.x + tw / 2), y: Math.round(b.y) }];
+  return [{ x: Math.round(a.x + w / 2), y: Math.round(a.y) }, { x: Math.round(b.x + tw / 2), y: Math.round(b.y + th) }];
 }
 
 if (typeof module !== 'undefined') module.exports = { WF_POSITIONS_KEY, DRAG_THRESHOLD_PX, movedPastThreshold, moveBy, loadOffsets, saveOffset, clearOffsets, applyOffsets, edgeBetween };

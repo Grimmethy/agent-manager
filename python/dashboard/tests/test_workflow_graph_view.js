@@ -11,7 +11,7 @@ const vm = require('vm');
 const JS = path.join(__dirname, '..', 'static', 'js');
 const ctx = vm.createContext({ console });
 ctx.window = ctx; // in a browser window is the global object, which is how workflow-layout.js publishes layoutGraph
-for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'workflow-layout.js', 'workflow-loops.js', 'workflow-drag.js', 'workflow-groups.js', 'workflow-card-fit.js', 'workflow-graph-view.js']) {
+for (const f of ['worker-status-helpers.js', 'worker-switch-ui.js', 'workflow-layout.js', 'workflow-loops.js', 'workflow-drag.js', 'workflow-groups.js', 'workflow-card-fit.js', 'workflow-step-card.js', 'workflow-graph-view.js']) {
   vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
 }
 const v = ctx;
@@ -554,4 +554,87 @@ test('wfIsNarrow asks the browser with the 700 px media query when matchMedia ex
     delete ctx.matchMedia;
     delete ctx.innerWidth;
   }
+});
+
+// ---- loops by type (piece 5) ----
+const stepModel = (name, provider, lane, label, scale, tier) => ({ name, provider, lane, size: { b: 8, tier: tier || 'small', label, scale, source: 'tag' } });
+const stepNode = (id, label, models, scale) => ({ id, kind: id.startsWith('stage:') ? 'stage' : 'step', label, parent: null, runtime: null, model: null, work: null, counts: null, models, size: { b: 8, tier: 'small', label: '?', scale, source: 'tag' } });
+const typedGraph = () => ({
+  nodes: [
+    stepNode('stage:implement', 'Implement', [stepModel('ornith:35b', 'local', 'worker-3090', '35B', 1.25, 'medium'), stepModel('qwen3-vl:8b-instruct', 'local', 'worker-rx580', '8B', 1.0)], 1.0),
+    stepNode('stage:review', 'Review', [stepModel('ornith:35b', 'local', 'reviewer', '35B', 1.25, 'medium')], 1.25),
+    stepNode('stage:apply', 'Apply', [stepModel('apply-loop', 'script', null, 'script', 0.8)], 0.8),
+    loop({ id: 'worker-3090', label: 'ornith:35b' }), loop({ id: 'worker-rx580', label: 'qwen3-vl:8b-instruct', runtime: rt({ status: 'idle' }) }), loop({ id: 'reviewer', label: 'ornith:35b' }),
+  ],
+  edges: [{ id: 'stage:implement->stage:review:produces', from: 'stage:implement', to: 'stage:review', kind: 'produces', label: null }, { id: 'stage:review->stage:apply:produces', from: 'stage:review', to: 'stage:apply', kind: 'produces', label: null }],
+  groups: [], warnings: [],
+  loops: [{ id: 'loop:pipeline', name: 'Task pipeline', kind: 'pipeline', steps: ['stage:implement', 'stage:review', 'stage:apply'], services: [] }],
+});
+const stepBoxOf = (html, id) => { const m = new RegExp('data-node-id="' + id + '"[^>]*style="left:(\\d+)px;top:(\\d+)px;width:(\\d+)px;height:(\\d+)px"').exec(html); return m ? { w: Number(m[3]), h: Number(m[4]) } : null; };
+
+test('a typed card is titled by the loop name only and shows the models of each step with size badges', () => {
+  const [card] = ctx.splitIntoLoops(typedGraph());
+  const html = v.buildCardHtml(card, 0, 1, { maxPerRow: 1, storage: null });
+  assert.match(html, /<span class="id">Task pipeline<\/span>/);
+  assert.doesNotMatch(html, /worker-3090 ·|worker-rx580 ·/);
+  assert.match(html, /data-lane="worker-3090"/);
+  assert.match(html, /data-lane="worker-rx580"/);
+  assert.match(html, /wf-size wf-size-small" title="model size">8B</);
+  assert.match(html, /wf-size wf-size-medium" title="model size">35B</);
+  assert.equal((html.match(/class="worker-card clickable wf-node wf-step/g) || []).length, 3, 'three step cards, no lane cards');
+  assert.doesNotMatch(html, /data-node-id="worker-/);
+});
+
+test('a step card is drawn bigger for a bigger model: Review (35B) is wider than Implement (8B), which is wider than Apply (script)', () => {
+  const [card] = ctx.splitIntoLoops(typedGraph());
+  const html = v.buildCardHtml(card, 0, 1, { maxPerRow: 1, storage: null });
+  const impl = stepBoxOf(html, 'stage:implement');
+  const review = stepBoxOf(html, 'stage:review');
+  const apply = stepBoxOf(html, 'stage:apply');
+  assert.ok(review.w > impl.w && impl.w > apply.w, JSON.stringify({ review, impl, apply }));
+  assert.deepEqual(impl, { w: 272, h: 128 });
+  assert.deepEqual(review, { w: 340, h: 160 });
+  assert.deepEqual(apply, { w: 220, h: 104 });
+});
+
+test('the lane status shows as a dot on the model row, from the lanes that ride along with the card', () => {
+  const [card] = ctx.splitIntoLoops(typedGraph());
+  const html = v.buildCardHtml(card, 0, 1, { maxPerRow: 1, storage: null });
+  assert.match(html, /wf-dot wf-dot-working" title="worker-3090: working"/);
+  assert.match(html, /wf-dot wf-dot-idle" title="worker-rx580: idle"/);
+});
+
+test('wfCardTitle: a typed card shows its label; a lane card still shows the lane id first', () => {
+  assert.equal(v.wfCardTitle({ id: 'loop:x', label: 'Stalled-task worker', byType: true }), 'Stalled-task worker');
+  assert.equal(v.wfCardTitle({ id: 'worker-3090', label: 'ornith:35b' }), 'worker-3090 · ornith:35b');
+});
+
+test('lane cards (no graph.loops) are unchanged: no step cards and no model rows', () => {
+  const html = v.buildCardsHtml({ nodes: [loop(), source], edges: [{ id: 'source:hygiene->worker-3090:claims', from: 'source:hygiene', to: 'worker-3090', kind: 'claims', label: null }], groups: [], warnings: [] }, { maxPerRow: 1, storage: null });
+  assert.doesNotMatch(html, /wf-step|wf-model-row/);
+  assert.match(html, /worker-3090/);
+});
+
+test('the poll signature changes when a step gains a model or a loop changes its steps', () => {
+  const a = typedGraph();
+  const b = typedGraph();
+  b.nodes[0].models.push(stepModel('x:1b', 'local', 'worker-x', '1B', 1.0));
+  const c = typedGraph();
+  c.loops[0].steps = ['stage:implement'];
+  assert.notEqual(v.graphSignature(a), v.graphSignature(b));
+  assert.notEqual(v.graphSignature(a), v.graphSignature(c));
+  assert.equal(v.graphSignature(a), v.graphSignature(typedGraph()));
+});
+
+test('index.html loads workflow-step-card.js after workflow-card-fit.js and before the view, and the step card styles exist', () => {
+  const index = indexHtml();
+  const at = (f) => index.indexOf('/static/js/' + f);
+  assert.ok(at('workflow-card-fit.js') > 0 && at('workflow-card-fit.js') < at('workflow-step-card.js') && at('workflow-step-card.js') < at('workflow-graph-view.js'));
+  assert.match(index, /\.wf-model-row \{/);
+  assert.match(index, /\.wf-size-large \{/);
+});
+
+test('a press on a model row never starts a node drag (pointer capture would send the click to the node and the row could not open its lane)', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'static', 'js', 'workflow-graph-view.js'), 'utf8');
+  assert.match(src, /ev\.target\.closest\('button, select, input, a, \.wf-model-lane'\)/);
 });

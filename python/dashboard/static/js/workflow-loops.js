@@ -13,6 +13,34 @@ function wfIsLaneNode(node, reviewTargets) {
   return !!node && node.kind === 'loop' && typeof node.id === 'string' && !reviewTargets.has(node.id) && !node.id.startsWith('reviewer');
 }
 
+// The cards of a graph that has loop types. A card holds the loop's steps and its services (a pipeline loop shows its apply service below the last step, a worker loop its trigger
+// above the first one, joined by an edge made here); the lanes behind the steps' models are NOT drawn, they ride along in card.lanes so a model row can show their status
+// and open their panel. A loop with no step node in the graph is skipped.
+function splitByLoopTypes(loops, byId, edges, warnings) {
+  const cards = [];
+  for (const loop of loops) {
+    if (!loop || typeof loop.id !== 'string' || !Array.isArray(loop.steps)) continue;
+    const steps = loop.steps.filter((id) => byId.has(id));
+    if (!steps.length) continue;
+    const services = (Array.isArray(loop.services) ? loop.services : []).filter((id) => byId.has(id));
+    const ids = new Set([...steps, ...services]);
+    const subEdges = edges.filter((e) => ids.has(e.from) && ids.has(e.to));
+    const seen = new Set(subEdges.map((e) => e.id));
+    services.forEach((svc) => {
+      const pipeline = loop.kind === 'pipeline';
+      const from = pipeline ? steps[steps.length - 1] : svc;
+      const to = pipeline ? svc : steps[0];
+      const kind = pipeline ? 'produces' : 'triggers';
+      const id = `${from}->${to}:${kind}`;
+      if (!seen.has(id)) { seen.add(id); subEdges.push({ id, from, to, kind, label: null }); }
+    });
+    const lanes = {};
+    steps.forEach((id) => (byId.get(id).models || []).forEach((m) => { if (m && m.lane && byId.has(m.lane)) lanes[m.lane] = byId.get(m.lane); }));
+    cards.push({ id: loop.id, label: String(loop.name || loop.id), byType: true, lanes, graph: { nodes: [...ids].map((id) => byId.get(id)), edges: subEdges, groups: [], warnings } });
+  }
+  return cards;
+}
+
 // splitIntoLoops(graph) -> [{ id, label, graph: { nodes, edges, groups, warnings } }]: one entry per lane (sorted by id), then a final 'services' entry
 // for every node that is on no lane card (omitted when there is none). A node may appear on several cards. Never throws, never mutates; bad input gives [].
 function splitIntoLoops(graph) {
@@ -34,6 +62,12 @@ function splitIntoLoops(graph) {
       const subGroups = groups.filter((g) => g && Array.isArray(g.children) && g.children.some((c) => members.has(c)));
       return { id, label, graph: { nodes: subNodes, edges: subEdges, groups: subGroups, warnings } };
     };
+
+    // By loop type (graph.loops, src/workflow-loop-types.js): one card per loop, named by the loop, holding its steps and its trigger or apply service.
+    if (Array.isArray(graph.loops) && graph.loops.length) {
+      const typed = splitByLoopTypes(graph.loops, byId, edges, warnings);
+      if (typed.length) return typed;
+    }
 
     const onALane = new Set();
     const cards = lanes.map((lane) => {
@@ -84,4 +118,4 @@ function cardWidthFor(canvasW, rowW, extra, minW) {
   return pos(rowW) ? Math.min(want, Math.floor(rowW)) : want;
 }
 
-if (typeof module !== 'undefined') module.exports = { WF_MIN_SCALE, WF_CARD_MIN_W, splitIntoLoops, fitScale, fitScaleForCard, cardWidthFor };
+if (typeof module !== 'undefined') module.exports = { WF_MIN_SCALE, WF_CARD_MIN_W, splitIntoLoops, splitByLoopTypes, fitScale, fitScaleForCard, cardWidthFor };

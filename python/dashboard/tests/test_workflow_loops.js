@@ -191,3 +191,60 @@ test('a bad drawing width or extra counts as zero, and the answer is never NaN',
   assert.equal(cardWidthFor(400, 1080), 400);
   [[], [1], [NaN, NaN, NaN, NaN], [1e9, 1e9, 1e9, 1e9]].forEach((a) => assert.ok(Number.isFinite(cardWidthFor(...a))));
 });
+
+// ---- loops by type (piece 5) ----
+const { splitByLoopTypes } = require(path.join(__dirname, '..', 'static', 'js', 'workflow-loops.js'));
+const step = (id, lanes) => node(id, 'step', { models: (lanes || []).map((l) => ({ name: 'm', provider: 'local', lane: l })) });
+const TYPED = () => ({
+  nodes: [node('stage:orient', 'stage', { models: [{ name: 'm', provider: 'local', lane: 'worker-1' }] }), node('stage:apply', 'stage', { models: [] }), node('service:apply-loop', 'service'),
+    node('step:stalled:gather', 'step', { models: [] }), node('step:stalled:judge', 'step', { models: [{ name: 'claude-sonnet-5-5', provider: 'cloud', lane: null }] }), node('service:watchdog-script:p:stalled-trigger', 'service'),
+    node('worker-1', 'loop'), node('worker-2', 'loop'), node('source:a', 'source')],
+  edges: [edge('stage:orient', 'stage:apply', 'produces'), edge('step:stalled:gather', 'step:stalled:judge', 'produces'), edge('worker-1', 'stage:orient', 'claims')],
+  groups: [], warnings: ['w'],
+  loops: [
+    { id: 'loop:pipeline', name: 'Task pipeline', kind: 'pipeline', steps: ['stage:orient', 'stage:apply'], services: ['service:apply-loop'] },
+    { id: 'loop:stalled', name: 'Stalled-task worker', kind: 'worker', steps: ['step:stalled:gather', 'step:stalled:judge'], services: ['service:watchdog-script:p:stalled-trigger'] },
+  ],
+});
+
+test('graph.loops: one card per loop, titled by the loop name, never by a lane', () => {
+  const cards = splitIntoLoops(TYPED());
+  assert.deepEqual(cards.map((c) => c.id), ['loop:pipeline', 'loop:stalled']);
+  assert.deepEqual(cards.map((c) => c.label), ['Task pipeline', 'Stalled-task worker']);
+  assert.ok(cards.every((c) => c.byType === true));
+  assert.ok(!cards.some((c) => /worker-|reviewer|services/.test(c.id + c.label.replace('Stalled-task worker', ''))));
+});
+
+test('a typed card holds the steps and the services, not the lanes behind the models, which ride along as card.lanes', () => {
+  const [pipe, stalled] = splitIntoLoops(TYPED());
+  assert.deepEqual(ids(pipe), ['service:apply-loop', 'stage:apply', 'stage:orient']);
+  assert.deepEqual(Object.keys(pipe.lanes), ['worker-1']);
+  assert.equal(pipe.lanes['worker-1'].id, 'worker-1');
+  assert.deepEqual(Object.keys(stalled.lanes), [], 'a cloud step with no lane has none');
+  assert.ok(!ids(pipe).includes('worker-1'));
+});
+
+test('services are joined by an edge made here: below the last step of the pipeline, above the first step of a worker loop', () => {
+  const [pipe, stalled] = splitIntoLoops(TYPED());
+  assert.ok(pipe.graph.edges.some((e) => e.from === 'stage:apply' && e.to === 'service:apply-loop' && e.kind === 'produces'));
+  assert.ok(stalled.graph.edges.some((e) => e.from === 'service:watchdog-script:p:stalled-trigger' && e.to === 'step:stalled:gather' && e.kind === 'triggers'));
+  assert.ok(stalled.graph.edges.some((e) => e.from === 'step:stalled:gather' && e.to === 'step:stalled:judge'), 'the step chain edge is kept');
+  assert.equal(new Set(pipe.graph.edges.map((e) => e.id)).size, pipe.graph.edges.length);
+});
+
+test('without graph.loops (or with an empty list, or loops with no step in the graph) the cards are the old lane cards', () => {
+  const old = splitIntoLoops(GRAPH()).map((c) => c.id);
+  for (const loops of [undefined, [], [{ id: 'loop:x', name: 'X', steps: ['nope'] }], [null, 5]]) {
+    const g = { ...GRAPH(), loops };
+    assert.deepEqual(splitIntoLoops(g).map((c) => c.id), old);
+  }
+});
+
+test('invalid loop entries are skipped and nothing throws; the input is not mutated', () => {
+  const g = TYPED();
+  g.loops.unshift(null, { id: 5 }, { id: 'loop:bad', name: 'B', steps: 'x' });
+  const before = JSON.stringify(g);
+  assert.deepEqual(splitIntoLoops(g).map((c) => c.id), ['loop:pipeline', 'loop:stalled']);
+  assert.equal(JSON.stringify(g), before);
+  assert.deepEqual(splitByLoopTypes([], new Map(), [], []), []);
+});

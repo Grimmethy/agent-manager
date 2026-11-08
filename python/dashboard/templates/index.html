@@ -181,6 +181,18 @@
   /* Draggable nodes (workflow-drag.js, HUB0346 piece 3). touch-action none is what lets a finger drag a node without the swipe row scrolling; swipe from the card head or from empty space to change card. */
   .wf-card .wf-node { cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
   .wf-card .wf-node.wf-dragging { cursor: grabbing; z-index: 5; box-shadow: 0 4px 14px rgba(0, 0, 0, .35); }
+  /* Step cards (workflow-step-card.js): one row per model with provider and size badges, a status dot for the lane behind it. The box size follows the smallest model of the step. */
+  .wf-step .wf-models { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
+  .wf-model-row { display: flex; align-items: center; gap: 6px; min-height: 22px; white-space: nowrap; overflow: hidden; }
+  .wf-model-row .wf-model { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .wf-model-lane { cursor: pointer; border-radius: 4px; }
+  .wf-model-lane:hover { background: var(--panel); }
+  .wf-size { font-variant-numeric: tabular-nums; }
+  .wf-size-large { border-color: var(--warn); }
+  .wf-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--muted); }
+  .wf-dot-working { background: var(--ok); }
+  .wf-dot-idle { background: var(--muted); }
+  .wf-dot-offline, .wf-dot-stale, .wf-dot-disabled { background: var(--bad, #f85149); }
   .wf-edges { position: absolute; left: 0; top: 0; pointer-events: none; }
   .wf-edge { stroke: var(--muted, #8b949e); stroke-width: 1.5; }
   .wf-arrowhead { fill: var(--muted, #8b949e); }
@@ -443,6 +455,7 @@
 <script src="/static/js/workflow-layout.js"></script>
 <script src="/static/js/workflow-loops.js"></script>
 <script src="/static/js/workflow-card-fit.js"></script>
+<script src="/static/js/workflow-step-card.js"></script>
 <script src="/static/js/workflow-drag.js"></script>
 <script src="/static/js/workflow-groups.js"></script>
 <script src="/static/js/workflow-node-panel.js"></script>
