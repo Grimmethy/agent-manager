@@ -86,3 +86,11 @@ test('each constant is used exactly once in prompts.js and review-task.js', () =
   assert.ok(prompts.lastIndexOf('IO_IMPLEMENT_LINES,') > prompts.indexOf('function adhocImplementPrompt'));
   assert.strictEqual(read('review-task.js').split('REVIEW_IO_LINES').length - 1, 2);   // the require and the one push
 });
+
+test('the prompt-line module has no unannotated model-reload cause (its one endpoint-naming line carries io-ok)', () => {
+  const { scanText } = require('./lib/io-churn-detector.js');
+  const text = require('node:fs').readFileSync(require('node:path').join(__dirname, 'lib', 'io-avoidance-lines.js'), 'utf8');
+  const findings = scanText({ language: 'js', path: 'src/lib/io-avoidance-lines.js', text });
+  assert.ok(findings.length >= 1, 'the module names the endpoints, so the scan must see them');
+  assert.deepStrictEqual(findings.filter((f) => !f.annotated), []);
+});

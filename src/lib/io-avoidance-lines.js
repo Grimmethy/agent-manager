@@ -8,6 +8,7 @@
 const IO_OK_TOKEN = 'io-ok:';
 
 // What the rule forbids, in one sentence, shared by all three prompts.
+// io-ok: prompt text that names the forbidden endpoints; it makes no request
 const WHAT_RELOADS_THE_MODEL = 'Anything that makes Ollama reload the resident model is forbidden: choosing a context size (num_ctx / numCtx), choosing a keep_alive (any value, including 0), unloading the model, or POSTing to /api/generate or /api/chat directly.';
 
 // For the model that plans a change.
