@@ -239,15 +239,6 @@ function postJsonStream(urlString, bodyObj, deadlineMs, extraHeaders, onLine) {
         resolve();
       });
       res.on('error', (e) => { clearDeadline(); reject(taggedError(e.message, OLLAMA_ERROR_CODES.STREAM_ERROR, { nodeCode: e.code })); });
-      // Detect premature socket close: if 'end' hasn't fired yet, the connection
-      // was closed before the full response body arrived. This catches cases where
-      // the server drops the connection mid-stream without sending an error event.
-      res.on('close', () => {
-        if (!endFired) {
-          clearDeadline();
-          reject(taggedError(OLLAMA_ERROR_CODES.PREMATURE_CLOSE, OLLAMA_ERROR_CODES.PREMATURE_CLOSE));
-        }
-      });
     });
     // Deadline timer: if deadlineMs is provided, reject with TIMEOUT after that duration
     if (typeof deadlineMs === 'number' && isFinite(deadlineMs)) {
