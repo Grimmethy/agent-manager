@@ -30,7 +30,7 @@
 // If the stream is unavailable (the server answers 404, EventSource gives up) the page falls back to the old 5 s full refresh until it is reloaded.
 
 const LIVE_STREAM_URL = '/api/stream';
-const LIVE_EVENTS = ['snapshot', 'counts-changed', 'workers-changed', 'branches-changed', 'plugins-changed', 'plugin-states-changed', 'plugin-changed', 'pipeline-state-changed', 'project-build-changed', 'brain-dump-changed', 'hygiene-changed', 'branch-list-changed', 'task-records-changed', 'memory-changed', 'worker-panels-changed', 'settings-changed', 'benchmark-changed', 'hardware-changed', 'tokenfold-changed', 'reports-changed', 'discovery-changed', 'project-changed'];
+const LIVE_EVENTS = ['snapshot', 'counts-changed', 'workers-changed', 'branches-changed', 'plugins-changed', 'plugin-states-changed', 'plugin-changed', 'pipeline-state-changed', 'project-build-changed', 'brain-dump-changed', 'hygiene-changed', 'branch-list-changed', 'task-records-changed', 'memory-changed', 'touchpoints-changed', 'worker-panels-changed', 'settings-changed', 'benchmark-changed', 'hardware-changed', 'tokenfold-changed', 'reports-changed', 'discovery-changed', 'project-changed'];
 const FALLBACK_POLL_MS = 5000;                  // the ONLY interval left: the full refresh while the stream is closed
 // Tabs that manage their own rendering and are never redrawn by a refresh (they keep a half-typed note, an iframe, an open folder, a click in flight).
 const SELF_RENDERING_TABS = ['project', 'brain-dump', 'filed', 'hygiene', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'];
@@ -52,7 +52,7 @@ const DISCOVERY_DRIVEN_TABS = ['deepdive', 'discovery'];              // discove
 // panels: the open self-rendering tab's OWN refresh (it keeps a half-typed field or an iframe, so it is never redrawn whole; page glue calls its panel refreshers)
 // kick: the Branches refresh also asks the server to start a background refresh of the branch list NOW (something that feeds the list happened); without it the page only re-reads the cached list
 // modal: refresh the open task-detail modal if it is watching a live task (the page glue does nothing when none is armed)
-const NO_PLAN = Object.freeze({ summary: false, plugins: false, nav: false, main: false, branches: false, panels: false, kick: false, modal: false });
+const NO_PLAN = Object.freeze({ summary: false, plugins: false, nav: false, main: false, branches: false, panels: false, kick: false, modal: false, touchpoints: false });
 const PANEL_TABS = ['project', 'brain-dump', 'hygiene'];                                          // self-rendering tabs that refresh their own panels: the Project tab (pipeline-state-changed, project-build-changed) the Brain Dump tab (brain-dump-changed) and the Hygiene tab (hygiene-changed, plus the queue's counts-changed and branches-changed, which its inventory joins)
 
 function isSelfRenderingTab(tab) { return SELF_RENDERING_TABS.includes(tab); }
@@ -121,6 +121,9 @@ function planForEvent(name, tab, isPluginTab, data, pluginNameOf) {
     case 'tokenfold-changed':
       plan.main = TOKENFOLD_DRIVEN_TABS.includes(tab);
       break;
+    case 'touchpoints-changed':                 // a requeue was recorded -> the header chip re-reads /api/stats/touchpoints-per-day
+      plan.touchpoints = true;
+      break;
     case 'reports-changed':
       plan.main = REPORTS_DRIVEN_TABS.includes(tab);
       break;
@@ -144,10 +147,10 @@ function planForEvent(name, tab, isPluginTab, data, pluginNameOf) {
 }
 
 function mergePlans(a, b) {
-  return { summary: a.summary || b.summary, plugins: a.plugins || b.plugins, nav: a.nav || b.nav, main: a.main || b.main, branches: a.branches || b.branches, panels: a.panels || b.panels, kick: a.kick || b.kick, modal: a.modal || b.modal };
+  return { summary: a.summary || b.summary, plugins: a.plugins || b.plugins, nav: a.nav || b.nav, main: a.main || b.main, branches: a.branches || b.branches, panels: a.panels || b.panels, kick: a.kick || b.kick, modal: a.modal || b.modal, touchpoints: a.touchpoints || b.touchpoints };
 }
 
-function isEmptyPlan(p) { return !(p.summary || p.plugins || p.nav || p.main || p.branches || p.panels || p.kick || p.modal); }
+function isEmptyPlan(p) { return !(p.summary || p.plugins || p.nav || p.main || p.branches || p.panels || p.kick || p.modal || p.touchpoints); }
 
 // deps: { EventSource, url?, apply(plan) -> Promise, poll() -> Promise (the old full refresh), getTab(), isPluginTab?(tab), setStatus?(text),
 //         pluginNameOf?(tab) -> the plugin that owns a plugin tab or null, setIntervalFn?, clearIntervalFn?, pollMs? }
