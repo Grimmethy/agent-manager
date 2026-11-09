@@ -213,9 +213,9 @@ this entire ladder in power: it changes no number the ladder reads.
 
 This repository already has a written exemplar of the discipline this proposal
 asks for — do the smallest, independently shippable piece first, prove it, then
-build on it: `Docs/gpu-broker-extraction-map.md`. Its `## 3. Pieces` section
+build on it: `docs/design-notes/gpu-broker-extraction-map.md`. Its `## 3. Pieces` section
 (lines 44–56) is a table with columns `# | Piece | Files | Test | Rollback | Needs`,
-and it opens with the G0 scaffold row (Docs/gpu-broker-extraction-map.md:57): a
+and it opens with the G0 scaffold row (docs/design-notes/gpu-broker-extraction-map.md:57): a
 piece that creates the container and a stub surface and changes nothing existing —
 structure only, no behavior.
 
@@ -297,7 +297,7 @@ What the first change deliberately does NOT include, and why:
 Two honesty notes, both verified against this repository in the session that
 authored this document:
 
-1. **`Docs/project-rotation-and-expiry-aging-findings.md` now exists in this
+1. **`docs/design-notes/project-rotation-and-expiry-aging-findings.md` now exists in this
    repository** — an earlier draft of this document recorded it as absent, and a
    later directory listing shows it in `Docs/`. It is a findings document, not a
    source Sections 1–10 rest on, but the new Section 15 does cite it, and its Q3
@@ -346,8 +346,8 @@ Every `path:line` this document relies on, verified in-session:
 | `src/agentic-draft-common.js:459` | `resolveDecomposeZero` — the zero-pieces split case, redraft-eligible | §6 |
 | `src/local-tool-task-tools.js:193` | Chat's `queue_reviewed_task` — passes the premium flag with `raisedFrom: 'chat'` | §5 |
 | `python/dashboard/routes/brain_dump.py:132` | `next_serial = max(...) + 1` — captured-note ordering | §5 |
-| `Docs/gpu-broker-extraction-map.md:53` | `## 3. Pieces` heading — the "smallest first, independently shippable" template | §6, §7 |
-| `Docs/gpu-broker-extraction-map.md:57` | G0 scaffold row — structure only, no behavior; the template this design mirrors | §6, §7 |
+| `docs/design-notes/gpu-broker-extraction-map.md:53` | `## 3. Pieces` heading — the "smallest first, independently shippable" template | §6, §7 |
+| `docs/design-notes/gpu-broker-extraction-map.md:57` | G0 scaffold row — structure only, no behavior; the template this design mirrors | §6, §7 |
 | (proposed; no repo file) | `initiativeId` — the new optional top-level field on a task record linking it to an initiative | §3, §7 |
 | `src/task-sources.js:578` | `nextAdhocTask` — the adhoc claim generator the hook design would sit beside | §13, §14 |
 | `src/task-sources.js:582` | `nextDerivedTask` — the derived-task claim generator over `queue/derived/` | §13 |
@@ -357,10 +357,10 @@ Every `path:line` this document relies on, verified in-session:
 | `src/hub-priority.js:65` | `readHubOrderKey` — hub ordering key read from `queue/coordinating/<id>.json` | §12 |
 | `src/hub-priority.js:169` | `hubHasUnmergedEarlierSibling` — the hub's "no earlier unmerged sibling" hold | §12, §18 |
 | `src/queue-adhoc-task.js:41` | `adhoc-${slugify(title)}-${Date.now()}` — the id shape a `filedTaskId` holds; not an idempotence key | §11, §14 |
-| `Docs/project-rotation-and-expiry-aging-findings.md:96` | Q3 heading — where an "attention clock" would live | §15, §16 |
-| `Docs/project-rotation-and-expiry-aging-findings.md:102` | `pool-state.json` row — "the closest thing to an attention clock today" | §15, §16, §18 |
-| `Docs/project-rotation-and-expiry-aging-findings.md:120` | Q4 heading — round-robin / time-slice scheduler recommendation on `pool-projects.js` | §15, §18 |
-| `Docs/gpu-broker-extraction-map.md:57-65` | G0–G7 pieces table (ids, Files, Needs; G5 carries `CHARACTERFORGE_ROOT`) | §11, §19 |
+| `docs/design-notes/project-rotation-and-expiry-aging-findings.md:96` | Q3 heading — where an "attention clock" would live | §15, §16 |
+| `docs/design-notes/project-rotation-and-expiry-aging-findings.md:102` | `pool-state.json` row — "the closest thing to an attention clock today" | §15, §16, §18 |
+| `docs/design-notes/project-rotation-and-expiry-aging-findings.md:120` | Q4 heading — round-robin / time-slice scheduler recommendation on `pool-projects.js` | §15, §18 |
+| `docs/design-notes/gpu-broker-extraction-map.md:57-65` | G0–G7 pieces table (ids, Files, Needs; G5 carries `CHARACTERFORGE_ROOT`) | §11, §19 |
 
 Caveat on line numbers: the hub sequencing internals (`hubHasUnmergedEarlierSibling`,
 `SIBLING_RESOLVED_STATUSES`) and the release-signal defaults
@@ -426,7 +426,7 @@ beside `queue/` — holding the goal and its pieces:
 Field rules (each grounded):
 
 - `id` — stable piece id, author-chosen (the G0–G7 convention of
-  `Docs/gpu-broker-extraction-map.md:57-65`). This is the authoritative key;
+  `docs/design-notes/gpu-broker-extraction-map.md:57-65`). This is the authoritative key;
   everything else points at it.
 - `title` — human-readable, and the string a hook would hand to
   `queueAdhocTask` (`src/queue-adhoc-task.js:31` — the filed id is
@@ -579,12 +579,12 @@ What a piece naming another repo requires of the scheduler:
 
 - The scheduler must be able to point the pipeline at that repo before filing.
   The standing recommendation exists in
-  `Docs/project-rotation-and-expiry-aging-findings.md:120` (Q4 — round-robin /
+  `docs/design-notes/project-rotation-and-expiry-aging-findings.md:120` (Q4 — round-robin /
   time-slice scheduling on `pool-projects.js`) — confirmed: that document now
   exists in this repository (Section 8, item 1, corrected), and this is its
   intended consumer.
 - An "attention clock" so a multi-repo goal doesn't starve: the Q3 row in the
-  same document at `Docs/project-rotation-and-expiry-aging-findings.md:96` (where
+  same document at `docs/design-notes/project-rotation-and-expiry-aging-findings.md:96` (where
   an attention clock would live) and `:102` (`pool-state.json` — the closest thing
   to an attention clock today).
 - Until rotation exists, the honest default for a cross-repo piece is: leave
@@ -614,7 +614,7 @@ initiative files. The full view, as a later step, is one row per initiative:
 - **Age by attention** — per-piece age since filing (task `createdAt`) and
   per-initiative age since `createdAt`; the attention-clock fields, when rotation
   lands, come from `pool-state.json` per
-  `Docs/project-rotation-and-expiry-aging-findings.md:102`.
+  `docs/design-notes/project-rotation-and-expiry-aging-findings.md:102`.
 
 Every field is read from live records — `initiatives/<slug>.json` plus the task
 files it names via `filedTaskId`. Nothing is computed and stored back into the
@@ -664,7 +664,7 @@ reference.
    into the wrong project's workers.
    **Default:** do not file. Leave `filedTaskId: null`, mark the piece blocked on
    `targetRepo`, and surface it on the dashboard (Section 16) until the scheduler
-   rotates per `Docs/project-rotation-and-expiry-aging-findings.md:120`.
+   rotates per `docs/design-notes/project-rotation-and-expiry-aging-findings.md:120`.
 
 2. **A dependency that merges as a no-op.** The dependency's task resolved with no
    code change, so it never "merges" in the plain sense, and a naive
@@ -708,7 +708,7 @@ reference.
 
 ## 19. Worked example: the GPU-broker extraction
 
-The goal from `Docs/gpu-broker-extraction-map.md` (section 3, lines 57–65 —
+The goal from `docs/design-notes/gpu-broker-extraction-map.md` (section 3, lines 57–65 —
 the G0–G7 table: ids, Files, Test, Rollback, Needs — confirmed read this
 session; G5 carried `CHARACTERFORGE_ROOT` in the 2026-10-15 map and was retired 2026-10-22) expressed as an initiative.
 
@@ -765,7 +765,7 @@ session; G5 carried `CHARACTERFORGE_ROOT` in the 2026-10-15 map and was retired 
 ```
 
 (Notes on the mapping: `targetRepo` values come from the table's Files column —
-`Docs/gpu-broker-extraction-map.md:57-65`; G5's `CHARACTERFORGE_ROOT` from the
+`docs/design-notes/gpu-broker-extraction-map.md:57-65`; G5's `CHARACTERFORGE_ROOT` from the
 same table's G5 row. `dependsOn` carries only piece ids — the table's G0
 "decision 1, 2" and G4 "decision 3" are OPEN DECISIONS, not pieces, so they do
 not appear in `dependsOn`; G4's needs G1 and G3 as pieces. G7's "G1-G4" is

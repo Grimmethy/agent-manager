@@ -1,6 +1,6 @@
 'use strict';
 
-// pool-projects.js -- which suite projects an idle lane may borrow work from (docs/idle-pool-borrowing.md).
+// pool-projects.js -- which suite projects an idle lane may borrow work from (docs/design-notes/idle-pool-borrowing.md).
 //
 // A registered project (projects.json) opts in with `"pool": true`. This module answers "given the ACTIVE project, which pool projects are
 // there, in what order, and what env makes one invocation run in that project's context". The loops that use it (worker lanes, reviewer, apply

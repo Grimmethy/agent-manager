@@ -1,7 +1,7 @@
 'use strict';
 
 // Shared oversized-file lookup (S4a of the hub-tasks extraction, 2026-09-24,
-// Docs/hub-tasks-extraction-plan.md section 3). Split out of decompose-loop-autoroute.js
+// docs/design-notes/hub-tasks-extraction-plan.md section 3). Split out of decompose-loop-autoroute.js
 // so it can move to agent-manager-hygiene with the rest of the file-decompose family
 // while these two pure, dependency-light helpers stay in core -- local-agentic-write-draft.js
 // and needs-clarification-triage.js (both hub KERNEL code that stays) need only these,

@@ -1,7 +1,7 @@
 # GPU-broker extraction map — PromptForge verification
 
 Date: 2026-10-22 · Playbook step 2 (read-only verification pass) · Companions: `gpu-broker-verification-core.md`, `gpu-broker-verification-videoforge.md`
-Map: `Docs/gpu-broker-extraction-map.md` (PR #561), sections 1, 3 (G1, G2, G4), 5. Code read (unmodified):
+Map: `docs/design-notes/gpu-broker-extraction-map.md` (PR #561), sections 1, 3 (G1, G2, G4), 5. Code read (unmodified):
 `/media/model-cache/github/promptforge-manual` at `2e5f9f3` — `server/core/{gpu_session,comfy_proc,comfy}.py`, `server/app.py`,
 `Docs/GPU_FAMILY_PROTOCOL.md`, `tests/test_{gpu_session,gpu_claim,foreign_lease}.py`; plus `kaggleforge/server/gpu_lease.py`.
 Executed: `.venv/bin/python -m unittest tests.test_gpu_session tests.test_gpu_claim tests.test_foreign_lease` → 44 tests, OK.

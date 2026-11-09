@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Per-project housekeeping for a BORROWED project (docs/idle-pool-borrowing.md, step 4). queue-watcher.sh runs its sweeps against the ACTIVE
+# Per-project housekeeping for a BORROWED project (docs/design-notes/idle-pool-borrowing.md, step 4). queue-watcher.sh runs its sweeps against the ACTIVE
 # project only; a project whose tasks lanes borrow also needs them, or a borrowed task that blocks is never retried, a borrowed hub is never
 # reconciled and a borrowed needs-clarification pile is never triaged. queue-watcher.sh runs this once per pool project (in the background, at most
 # every AGENT_MANAGER_POOL_SWEEP_INTERVAL_SECS, default 300) under that project's env (pool-projects.js --env-args).

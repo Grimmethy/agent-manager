@@ -4,7 +4,7 @@
 // priority markers, the "is this lane alive" checks.
 //
 // That state has always been <pipelineDir>/instances/. It must not follow a project context: when an idle lane borrows work from another suite
-// project (docs/idle-pool-borrowing.md) the borrowed invocation runs with that project's AGENT_MANAGER_PIPELINE_DIR, yet the lane is still ONE
+// project (docs/design-notes/idle-pool-borrowing.md) the borrowed invocation runs with that project's AGENT_MANAGER_PIPELINE_DIR, yet the lane is still ONE
 // lane on ONE GPU -- its heartbeat, and every lock it takes, must stay in its HOME instances dir or two projects' processes would not see each
 // other's locks and would hit one Ollama at once (the GPU-thrashing class already fixed once). AGENT_MANAGER_INSTANCES_DIR pins it.
 //

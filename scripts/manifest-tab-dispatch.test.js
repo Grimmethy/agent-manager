@@ -1,6 +1,6 @@
 'use strict';
 
-// Piece 4 of the manifest-driven dashboard tab (Docs/hub-tasks-extraction-plan.md section
+// Piece 4 of the manifest-driven dashboard tab (docs/design-notes/hub-tasks-extraction-plan.md section
 // 5): the renderer registry, script loader, and dispatch in python/dashboard/static/js/
 // core-ui.js. The plan calls this piece "the riskiest: it touches the paths every tab
 // uses" -- these tests exercise the actual failure modes that matter: a plugin script that

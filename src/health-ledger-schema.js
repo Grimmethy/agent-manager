@@ -14,7 +14,7 @@
 // object per line, append-only, keyed by `loop_id` so multiple loops (and later the meta-kog
 // plugin) share one file per day. Corrections are new rows, never rewrites.
 //
-// Reference: Docs/tuning-loops-design.md §2 (authoritative spec for the row shape and the
+// Reference: docs/design-notes/tuning-loops-design.md §2 (authoritative spec for the row shape and the
 // file-location contract).
 
 const fs = require('fs');

@@ -1,7 +1,7 @@
 # GPU-broker extraction map — VideoForge verification
 
 Date: 2026-10-16 · Playbook step 2 (read-only verification pass)
-Map: `Docs/gpu-broker-extraction-map.md` (PR #561) — sections 1, 3 (G2), 5.
+Map: `docs/design-notes/gpu-broker-extraction-map.md` (PR #561) — sections 1, 3 (G2), 5.
 Code read (unmodified): `/media/model-cache/github/videoforge` — `server/core/gpu.py`, `server/app.py`,
 `server/core/render.py`, `web/app.js`. All four files exist at those paths.
 

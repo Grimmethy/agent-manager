@@ -9,7 +9,7 @@
 // this and adhoc-decompose call -- stays in apply-adhoc-diff.js until S5.
 //
 // This is a narrower, scoped-down precursor to the fuller hub-intake hook
-// Docs/hub-tasks-extraction-plan.md section 3 describes and defers to S5 (which will also
+// docs/design-notes/hub-tasks-extraction-plan.md section 3 describes and defers to S5 (which will also
 // cover producer 1, adhoc decompose, and generalizes the shape beyond candidate splits).
 // Built now, ahead of that plan's original "don't build before S5 needs it" note, because
 // S4b turned out to need it to actually move producer 4's code out -- see that doc's S4b
