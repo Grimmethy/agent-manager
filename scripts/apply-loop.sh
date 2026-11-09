@@ -47,6 +47,28 @@ tick() {
     env "${env_args[@]}" AGENT_MANAGER_APPLY_PREMIUM_ONLY=true bash "${SCRIPT_DIR}/apply-task.sh" || true
     [[ -n "$active_pipe" ]] && node "${REPO_DIR}/src/pool-projects.js" --mark-premium "$pipe" apply "$active_pipe" >/dev/null 2>&1 || true
   done
+  # Hub reach (2026-10-30, HUB0354): a registered project holds hub work when one of its queue stages
+  # (outside coordinating/) contains a task whose hubSerial is set -- that task is a piece of some hub
+  # and a lane could claim it. hubProjects() lists such projects (same rules as premiumProjects: active
+  # excluded, backoff-aware, ordered least-recently-hub-borrowed under `hub-<role>` keys). Every hub
+  # borrow is written to the HOME project's pipeline history as 'hub-borrow'. AGENT_MANAGER_HUB_REACH=off
+  # disables entirely (default shadow). AGENT_MANAGER_HUB_ONLY_TICK: internal flag set to true during
+  # hub-borrow to filter claims to hub children only.
+  [[ "${AGENT_MANAGER_HUB_REACH:-shadow}" != "false" ]] || return 0
+  # Check if home has hub work first -- if so, take it (home wins the tie, same as premium)
+  if node "${REPO_DIR}/src/pool-projects.js" --has-hub "$active_pipe" apply "$INSTANCE_ID" 2>/dev/null; then
+    return 0
+  fi
+  mapfile -t pipes < <( { [[ -f "$ENV_FILE" ]] && { set -a; source "$ENV_FILE"; set +a; }; node "${REPO_DIR}/src/pool-projects.js" --hub-projects apply "$INSTANCE_ID" 2>/dev/null; } )
+  for pipe in "${pipes[@]}"; do
+    [[ -n "$pipe" && -z "${applied[$pipe]:-}" ]] || continue
+    env_args=()
+    mapfile -t env_args < <( { [[ -f "$ENV_FILE" ]] && { set -a; source "$ENV_FILE"; set +a; }; node "${REPO_DIR}/src/pool-projects.js" --env-args "$pipe" "${AGENT_MANAGER_INSTANCES_DIR:-${AGENT_MANAGER_PIPELINE_DIR:-}/instances}" 2>/dev/null; } )
+    (( ${#env_args[@]} > 0 )) || continue
+    printf '[apply-loop] applying HUB piece from %s\n' "$pipe"
+    env "${env_args[@]}" AGENT_MANAGER_HUB_ONLY_TICK=true bash "${SCRIPT_DIR}/apply-task.sh" || true
+    [[ -n "$active_pipe" ]] && node "${REPO_DIR}/src/pool-projects.js" --mark-hub "$pipe" apply "$active_pipe" >/dev/null 2>&1 || true
+  done
 }
 
 if [[ "${1:-}" == "--once" ]]; then tick; exit 0; fi
