@@ -211,4 +211,48 @@ function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine) {
   });
 }
 
-module.exports = { postJson, postJsonStream, OLLAMA_ERROR_CODES, taggedError };
+/**
+ * Non-throwing sibling of postJson: resolves with `{ status, headers, body }` for every
+ * response (200 or not), so callers can inspect the body/headers of non-200 responses
+ * (e.g. a cloud gateway's 429 carrying a token-budget payload and retry-after) instead of
+ * losing them to the generic HTTP_ERROR reject path. Connection/timeout errors still reject
+ * the promise -- those have no body to inspect. Body is parsed as JSON when Content-Type
+ * matches; raw string otherwise.
+ */
+function postJsonStatus(urlString, bodyObj, timeoutMs, extraHeaders) {
+  const url = new URL(urlString);
+  const payload = JSON.stringify(bodyObj);
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: url.hostname,
+      port: url.port || 80,
+      path: url.pathname,
+      method: 'POST',
+      headers: Object.assign(
+        { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+        extraHeaders || {}
+      ),
+      timeout: timeoutMs,
+      agent: false,
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        let parsed;
+        try {
+          parsed = JSON.parse(data);
+        } catch {
+          parsed = data;
+        }
+        resolve({ status: res.statusCode, headers: res.headers, body: parsed });
+      });
+      res.on('error', (e) => reject(taggedError(e.message, OLLAMA_ERROR_CODES.STREAM_ERROR, { nodeCode: e.code })));
+    });
+    req.on('timeout', () => { req.destroy(taggedError(`Ollama request timed out after ${timeoutMs}ms`, OLLAMA_ERROR_CODES.TIMEOUT, { timeoutMs })); });
+    req.on('error', (e) => reject(isAlreadyTagged(e) ? e : taggedError(e.message, OLLAMA_ERROR_CODES.CONNECTION_ERROR, { nodeCode: e.code })));
+    req.write(payload);
+    req.end();
+  });
+}
+
+module.exports = { postJson, postJsonStream, postJsonStatus, OLLAMA_ERROR_CODES, taggedError };

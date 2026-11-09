@@ -13,7 +13,7 @@ const fs = require('fs');
 const { sharedInstancesDir } = require('./instances-dir.js');
 const os = require('os');
 const path = require('path');
-const { postJson } = require('./ollama-http.js');
+const { postJson, postJsonStatus, taggedError, OLLAMA_ERROR_CODES } = require('./ollama-http.js');
 const inflightLock = require('./model-inflight-lock.js');
 const gpuCapacity = require('./gpu-capacity.js');
 const gpuGuard = require('./gpu-guard.js');
@@ -26,6 +26,23 @@ const { injectAmplificationInstruction, extractAmplificationRequests } = require
 const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+
+// 2026-11-12 (HUB0355 subtask 0): a cloud gateway (TokenFold / upstream LLM proxy) can
+// return HTTP 429 with a structured token-budget payload (tokenBudget: { perHour, used,
+// resetsInSec } or monthlyCap) AND a numeric retry-after header. Without a distinct error
+// class, every caller sees the same generic "Ollama HTTP 429" rejection and has no way to
+// tell "pause the lane until retry-after" apart from "fail the call". This class carries
+// the structured fields downstream consumers need (local-draft.js's isTokenBudgetPause,
+// scripts/local-worker.sh's pause-until-retry) without every caller reimplementing the
+// detection themselves.
+class TokenBudgetExhaustedError extends Error {
+  constructor({ resetsInSec, retryAfter }) {
+    super('token budget exhausted, pause until retry-after');
+    this.name = 'TokenBudgetExhaustedError';
+    this.resetsInSec = resetsInSec;
+    this.retryAfter = retryAfter;
+  }
+}
 
 // Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
 // unset, which would turn every caller of this module (including test files that require
@@ -297,16 +314,47 @@ function withoutThink(body) {
   void think;
   return rest;
 }
+// Detect a cloud gateway's structured token-budget 429 (TokenFold / upstream LLM proxy)
+// and convert it to a TokenBudgetExhaustedError. All three conditions must match:
+// (a) status === 429, (b) body has tokenBudget (object with resetsInSec) or monthlyCap,
+// (c) retry-after header is present and numeric. If (a) and (b) match but (c) does not,
+// the existing generic 429 path in the caller keeps its unchanged behavior.
+function detectTokenBudgetPause(resp) {
+  if (!resp || resp.status !== 429) return null;
+  const body = resp.body && typeof resp.body === 'object' ? resp.body : null;
+  const hasBudget = body && (body.tokenBudget || body.monthlyCap);
+  if (!hasBudget) return null;
+  const retryAfterRaw = resp.headers && resp.headers['retry-after'];
+  if (typeof retryAfterRaw !== 'string') return null;
+  const retryAfter = Number(retryAfterRaw);
+  if (!Number.isFinite(retryAfter) || retryAfter <= 0) return null;
+  const resetsInSec = body && body.tokenBudget && typeof body.tokenBudget.resetsInSec === 'number'
+    ? body.tokenBudget.resetsInSec
+    : retryAfter;
+  return { resetsInSec, retryAfter };
+}
+
 async function postGenerate({ url, body, timeoutMs, headers, post = postJson, unsupported = THINK_UNSUPPORTED }) {
   const key = `${url}|${body.model}`;
   const target = `${url}/api/generate`;
   const sent = (body.think && unsupported.has(key)) ? withoutThink(body) : body;
   try {
-    return await post(target, sent, timeoutMs, headers);
+    const resp = await post(target, sent, timeoutMs, headers);
+    if (resp && typeof resp === 'object' && resp.status !== undefined) {
+      // postJsonStatus path: inspect for structured token-budget 429 before the caller sees it
+      const budget = detectTokenBudgetPause(resp);
+      if (budget) throw new TokenBudgetExhaustedError(budget);
+      if (resp.status !== 200) {
+        throw taggedError(`Ollama HTTP ${resp.status}: ${String(resp.body || '').slice(0, 500)}`, OLLAMA_ERROR_CODES.HTTP_ERROR, { statusCode: resp.status });
+      }
+      return resp.body;
+    }
+    return resp;
   } catch (e) {
     if (sent.think && isThinkUnsupportedError(e)) {
       unsupported.add(key);
-      return post(target, withoutThink(sent), timeoutMs, headers);
+      const nextPost = post === postJson ? postJsonStatus : post;
+      return await nextPost(target, withoutThink(sent), timeoutMs, headers);
     }
     throw e;
   }
@@ -809,7 +857,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, CALLER_RECORDED_STAGES, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, NEVER_EXPIRE, maxNumPredictThatFits, capNumPredictToFit, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
+module.exports = { call, callOnce, CALLER_RECORDED_STAGES, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, NEVER_EXPIRE, maxNumPredictThatFits, capNumPredictToFit, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD, TokenBudgetExhaustedError };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,
