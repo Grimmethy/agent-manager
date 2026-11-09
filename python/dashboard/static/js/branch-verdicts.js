@@ -171,7 +171,7 @@ async function runDiscardAll(main) {
 // neither listed nor verified; the button shows how many there are and opens the panel below.
 function heldHubsToggleHtml(groups, open) {
   const n = Array.isArray(groups) ? groups.length : 0;
-  const label = `${open ? 'Hide hidden hubs' : 'Show hidden hubs'} (${n})`;
+  const label = `Hubs (${n})`;
   return `<button class="${open ? 'action' : 'secondary'}" data-held-hubs-toggle aria-pressed="${open ? 'true' : 'false'}"${n ? '' : ' disabled'} `
     + 'title="Hubs with unfinished pieces are not ready to merge: their branches are not listed here and are not verified until every piece is built">' + label + '</button>';
 }
@@ -198,7 +198,7 @@ function heldHubsHtml(groups, open = true) {
   const rows = [...byProject.entries()].sort((x, y) => x[0].localeCompare(y[0])).map(([label, gs]) => (label
     ? `<div class="meta" style="margin:8px 0 4px"><b>${_bvEscape(label)}</b> (${gs.length})</div>` : '') + gs.map(heldHubRowHtml).join('')).join('');
   return '<div data-held-hubs style="margin-top:16px;padding:8px 12px;border:1px dashed #888;border-radius:6px">'
-    + `<div class="meta"><b>Hidden hubs (${list.length})</b> -- pushed, but not listed (and not verified) until every piece of the hub is built</div>${rows}</div>`;
+    + `<div class="meta"><b>Hubs (${list.length})</b> -- pushed, but not listed (and not verified) until every piece of the hub is built</div>${rows}</div>`;
 }
 
 function renderBranchListInto(main, branches) {
