@@ -63,28 +63,28 @@ the exact `change_review` window value is UNCONFIRMED (hook in agent-manager-hyg
 **Who may borrow.** Worker/reviewer/apply loops of the ACTIVE project, when their own tick found nothing to do.
 Borrow targets are `projects.json` entries with `"pool": true`, deduped by realpath of `pipelineDir`, with
 missing repo/queue skipped and the active project excluded (CONFIRMED — src/pool-projects.js:92-131; design
-brief "Pool = the whole suite" at Docs/idle-pool-borrowing.md:12, 25). Kill switch
+brief "Pool = the whole suite" at docs/design-notes/idle-pool-borrowing.md:12, 25). Kill switch
 `AGENT_MANAGER_POOL_BORROW=false` (CONFIRMED — src/pool-projects.js:24-26 and
 scripts/local-worker.sh:491). Ordering is least-recently-borrowed-first, per role, from
 `~/.local/state/agent-manager/pool-state.json` (`lastBorrowedAt`, `emptyUntil`) (CONFIRMED —
 src/pool-projects.js:30, 58-63, 75-79, 118-119); a project found empty is backoff-skipped for
 `AGENT_MANAGER_POOL_EMPTY_BACKOFF_SECS` (default 300s, CONFIRMED — src/pool-projects.js:70-74,
-Docs/idle-pool-borrowing.md:50).
+docs/design-notes/idle-pool-borrowing.md:50).
 
 **Trigger.** Same-tick, no idle wait: the lane's own tick did no work and `borrow_from_pool` walks the pool in
 order, first project that yields work ends the walk (CONFIRMED — scripts/local-worker.sh:485-508, 775;
-Docs/idle-pool-borrowing.md:30).
+docs/design-notes/idle-pool-borrowing.md:30).
 
 **Cap.** A borrowed tick does exactly ONE item (worker and reviewer alike), then the lane re-checks HOME first;
 the one-item cap exists because a borrowed tick once drained a whole pending list and kept lanes off eligible
-work for 14-25 min (CONFIRMED — scripts/local-worker.sh:486, 604-606, 742; Docs/idle-pool-borrowing.md:30).
+work for 14-25 min (CONFIRMED — scripts/local-worker.sh:486, 604-606, 742; docs/design-notes/idle-pool-borrowing.md:30).
 
 **What it covers / does not cover.** Full lifecycle for borrowed work — draft, review, apply, watchdog
-housekeeping (CONFIRMED — Docs/idle-pool-borrowing.md:12, 31, 50; the apply loop borrows without waiting for
-idleness because applying is git work, Docs/idle-pool-borrowing.md:50). Machine-scoped sweeps (daemon
+housekeeping (CONFIRMED — docs/design-notes/idle-pool-borrowing.md:12, 31, 50; the apply loop borrows without waiting for
+idleness because applying is git work, docs/design-notes/idle-pool-borrowing.md:50). Machine-scoped sweeps (daemon
 supervision, uptime, Second Brain build, pipeline-health audit, drift scan) and the proactive file-decompose
 sweep stay on the active project only (CONFIRMED — scripts/pool-sweeps.sh:7-10 and
-Docs/idle-pool-borrowing.md:50-52 "As built"). No premium special-casing: `premiumPriority` appears in
+docs/design-notes/idle-pool-borrowing.md:50-52 "As built"). No premium special-casing: `premiumPriority` appears in
 task-level gates elsewhere (src/derived-gate.js:109, src/branch-conflict-readmit-sweep.js:75) but the borrow
 selection code reads no premium flag — a borrowed tick works whatever the borrowed project's own queue order
 serves (CONFIRMED by the absence of any premium reference in src/pool-projects.js and
@@ -93,7 +93,7 @@ invocation is computed fresh per call and pins `AGENT_MANAGER_INSTANCES_DIR` to 
 heartbeats and GPU locks stay shared; keys the project lacks are unset, not leaked (CONFIRMED —
 src/pool-projects.js:125-136).
 
-> **Superseded 2026-10-18 (premium handling only):** the sentence above, "No premium special-casing ... the 'premium first' behavior is UNCONFIRMED/absent", was true when written and no longer is. Premium reach now exists for workers, the reviewer and the apply loop: see "Premium reach" in `Docs/idle-pool-borrowing.md`. The rest of this finding is unchanged.
+> **Superseded 2026-10-18 (premium handling only):** the sentence above, "No premium special-casing ... the 'premium first' behavior is UNCONFIRMED/absent", was true when written and no longer is. Premium reach now exists for workers, the reviewer and the apply loop: see "Premium reach" in `docs/design-notes/idle-pool-borrowing.md`. The rest of this finding is unchanged.
 
 ## Q3. Where an "attention clock" would live
 
@@ -140,15 +140,15 @@ may take per time window.
 
 **Risks.**
 - GPU/RAM: heartbeats and GPU locks/tickets are shared via one `instances` dir, so model calls serialize on the
-  shared lock (CONFIRMED — src/pool-projects.js:125-131; Docs/idle-pool-borrowing.md:28-29) — but rotation must
+  shared lock (CONFIRMED — src/pool-projects.js:125-131; docs/design-notes/idle-pool-borrowing.md:28-29) — but rotation must
   not assume two projects can apply/draft in parallel on one GPU; slices should be time-boxed per lane, not
   parallelized.
 - Apply stage per project: the apply loop borrows without waiting for idleness (apply is git work, not GPU work;
-  CONFIRMED — Docs/idle-pool-borrowing.md:50), so a rotation handoff mid-apply must be safe; the one-item cap
+  CONFIRMED — docs/design-notes/idle-pool-borrowing.md:50), so a rotation handoff mid-apply must be safe; the one-item cap
   (scripts/local-worker.sh:486) already bounds in-flight work per slice.
 - Worker env frozen at launch: the lane daemon's own env is fixed when the daemon started; the design notes say
   switching the ACTIVE project restarts the lanes, leaving in-flight borrowed work in that project's
-  `drafting/<lane>/` for later (CONFIRMED — Docs/idle-pool-borrowing.md "Risks" section, item 2;
+  `drafting/<lane>/` for later (CONFIRMED — docs/design-notes/idle-pool-borrowing.md "Risks" section, item 2;
   scripts/local-worker.sh:9-16). Borrowed invocations are unaffected (env is recomputed per call —
   src/pool-projects.js:125-143), but any scheduler that changes the ACTIVE project mid-run inherits the
   restart-and-resume behavior and must not assume a live env switch.
@@ -157,7 +157,7 @@ may take per time window.
 
 Files read in full or by window: src/expiry-sweep.js (157 lines), src/pool-projects.js (172 lines),
 src/task-source-registry.js, src/config.js (windows at 160-194, 285-314), src/heartbeat.js (prior pass, 74
-lines), Docs/idle-pool-borrowing.md (53 lines), scripts/pool-sweeps.sh (named in task),
+lines), docs/design-notes/idle-pool-borrowing.md (53 lines), scripts/pool-sweeps.sh (named in task),
 scripts/local-worker.sh (windows), scripts/queue-watcher.sh (window 240-255).
 Searches: `findExpired` in src (7 hits), `poolProjects(` in src (11 hits), `premium` repo-wide (10 files),
 `expiry-sweep` in scripts (4 hits), `job-type-counters` in src/scripts (5 hits), `change_review|change-review`

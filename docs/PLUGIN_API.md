@@ -152,7 +152,7 @@ registerTaskSource('my_source', {
 
 A script-loaded plugin (`registerPath`, no server `url`) may declare its own row in the
 dashboard's tab bar instead of core hardcoding one for it. This is the manifest-driven
-dashboard tab (`Docs/hub-tasks-extraction-plan.md` section 5, built as six small pieces on
+dashboard tab (`docs/design-notes/hub-tasks-extraction-plan.md` section 5, built as six small pieces on
 `feat/manifest-tab-slot-schema`) — the precondition for moving a whole UI-owning subsystem
 such as Hub Tasks into its own plugin repo. A working example lives at
 `test-fixtures/manifest-tab-example-plugin/` (see "End-to-end proof" below).
@@ -277,7 +277,7 @@ Only a script-loaded plugin (`registerPath`, no server) can declare a tab today 
 server-slotted plugin (`slot`/`url`, e.g. the Hardware tab's plugins) cannot yet. Moving an
 existing hardcoded tab (Hub Tasks, or the PromptForge/AdForge/ScriptForge iframe
 companions) onto this mechanism is separate follow-up work, tracked in
-`Docs/hub-tasks-extraction-plan.md`.
+`docs/design-notes/hub-tasks-extraction-plan.md`.
 
 ## Watchdog scripts (optional)
 

@@ -1,6 +1,6 @@
 # Brain Dump in agent-manager: shape and extraction map
 
-Status: reference (brain dump) · Written 2026-09-20 from a code read of `master` at `97b4bee` · Companion: `Docs/hub-tasks-extraction-map.md`
+Status: reference (brain dump) · Written 2026-09-20 from a code read of `master` at `97b4bee` · Companion: `docs/design-notes/hub-tasks-extraction-map.md`
 (the same exercise for hub tasks) · Related: `docs/adr/0022-core-is-a-platform-plugins-define-the-work.md` (open question 1 is about
 `brain_dump_sort`), `docs/agents/codebase-map.md` rows "Brain Dump" and "Filed Findings".
 
