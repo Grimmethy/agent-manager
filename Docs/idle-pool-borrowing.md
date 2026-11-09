@@ -84,3 +84,62 @@ Requested by Grimmethy: "premium priority tasks happen regardless of what projec
 * **A premium task restricted to another lane** (`pinnedWorker`, `taskClasses`, `avoidLanes`) is invisible to the cheap detector; the borrowed tick then takes nothing and the project is backed off for that lane.
 * **Takes effect only after a pipeline restart**: lane daemons keep running the script they started with.
 * **Not yet seen live**: at the time of writing no registered project other than the active one held premium work, so the live path had been exercised only by the sandbox tests; the first real cross-project borrow will appear as a `premium-borrow` line in the history log.
+
+## Hub reach: a hub child's priority boost reaches across projects (decision 2026-11-08)
+
+A hub's children already get a priority tier inside one project: `next-claimable-task.js` sets `hubTier` on every task that is a piece of a coordinating hub, and the claim loop ranks hub-tier work ahead of ordinary work in the same source-priority band. Hub reach extends that boost across project boundaries the way premium reach does: when a lane's home project has no hub work for it, the lane may leave its home project and claim another project's claimable hub child. Built as five pieces (the worker step, the reviewer step, the apply pass, the foundation in `src/pool-projects.js`, and this section); the worker and reviewer steps landed 2026-10-30, the apply pass shortly after, the foundation a week earlier.
+
+### What it is and why
+
+Inside one project, a hub's children are ranked ahead of the source's ordinary work by `hubTier` in `src/next-claimable-task.js`. That tier is project-scoped: it only lifts tasks within the hub's own queue. Hub reach makes the lift cross-project, so a lane that owns no hub in its home project can still pick up a hub child in a sibling project, and a lane that owns a hub at home still takes home hub work first. The owner decision (2026-11-08) treats hub reach as a core change to the idle lane's priority ladder, not an edge case of premium reach, because the signal (`hubSerial` set on a task) and the state key (`hub-<role>`) are independent of premium, and the precedence rule is different (home hub outranks another project's hub, but a borrowed hub outranks home ordinary work).
+
+### Precedence (highest first)
+
+1. Home premium (decision 1 of idle-pool-borrowing; `AGENT_MANAGER_PREMIUM_REACH`).
+2. Another project's premium (premium reach; `premiumProjects()` in `src/pool-projects.js`).
+3. Home hub work (a piece of this lane's own hub; `hasHubWork()` in `src/pool-projects.js`).
+4. Another project's hub work (a hub-only borrowed tick; `AGENT_MANAGER_HUB_ONLY_TICK=true`, exactly one item; `hubProjects()` in `src/pool-projects.js`).
+5. Home ordinary work (the lane's regular claim path).
+6. Idle borrowing (`AGENT_MANAGER_POOL_BORROW`).
+
+Remote hub work outranks the home project's ORDINARY work but never its premium or its own hub work. A borrowed hub tick takes exactly one item and then the lane re-checks home first, the same rule that governs premium reach.
+
+### The switch
+
+`AGENT_MANAGER_HUB_REACH` accepts three values, independent of `AGENT_MANAGER_PREMIUM_REACH` and `AGENT_MANAGER_POOL_BORROW`:
+
+| Value | Behaviour |
+|---|---|
+| `shadow` (default) | Compute the borrow decision and log it (`'would-borrow <project> <task id>'` in the lane log and the HOME project's pipeline history) without actually borrowing. |
+| `on` | Borrow a hub child from another project when home has none. |
+| `false` | Disable hub reach entirely; the lane stays home. |
+
+The worker step (`scripts/local-worker.sh`) checks the switch before calling `borrow_hub_from_projects`; the reviewer step (`scripts/review-runner.sh`) checks it before `borrow_hub_review_from_projects`; the apply loop (`scripts/apply-loop.sh`) checks it before walking `hubProjects()`. The same `pool-projects.js --env-args` path that premium reach uses sets `AGENT_MANAGER_REPO_ROOT`, `_PIPELINE_DIR`, `_DOMAINS_PATH`, `_APPLY_REPO_ROOT`, `_GREP_DIRS` and the shared `AGENT_MANAGER_INSTANCES_DIR` for the borrowed invocation, so a piece drafted in another project is also reviewed and applied there.
+
+### Which roles get it
+
+Every idle lane:
+
+* **Worker** (`scripts/local-worker.sh`): `borrow_hub_from_projects()` walks `hubProjects({ role: 'worker', lane })` in least-recently-borrowed order, runs one `--once` tick under the borrowed project's env with `AGENT_MANAGER_HUB_ONLY_TICK=true`, and marks the borrow via `markHubBorrowed()` (or backs off an empty project via `markHubEmpty()`).
+* **Reviewer** (`scripts/review-runner.sh`): `borrow_hub_review_from_projects()` walks `hubProjects({ role: 'reviewer' })` the same way, runs one `--once` review tick with `AGENT_MANAGER_HUB_ONLY_TICK=true`, and marks the borrow the same way.
+* **Apply** (`scripts/apply-loop.sh`): after the pool pass and the premium pass, walks `hubProjects({ role: 'apply' })` and runs `apply-task.sh` under each borrowed project's env with `AGENT_MANAGER_HUB_ONLY_TICK=true`, marking each borrow.
+
+The stage directories each role scans for hub work are `hubStageDirs(role, lane)` in `src/pool-projects.js`: `['adhoc', 'derived', 'pending', ...drafting/<lane>...]` for worker, `['review']` for reviewer, `['approved']` for apply. The hub parent itself (in `coordinating/`) is never counted as hub work -- it has `subTasks` and is the orchestrator, not a piece to claim.
+
+### Fairness and limits
+
+* **Order:** least-recently-borrowed, under the `hub-<role>` state keys in `~/.local/state/agent-manager/pool-state.json` (distinct from the `premium-<role>` keys, so the two reach modes do not share backoff or ordering state). For a worker, the key is `hub-worker:<lane>` so a hub piece another lane may take is not this lane's backoff.
+* **One item per borrowed tick:** a hub-only borrowed tick claims exactly one hub child; the lane then re-checks home first before borrowing again.
+* **Unclaimable pieces do not count:** a piece a lane could not claim (e.g. restricted to another lane via `pinnedWorker`, `taskClasses`, `avoidLanes`) is invisible to `hasHubWork()` and does not enter the ordering.
+* **GPU rules still apply:** the Forge lease yield (`comfyui_lease_held`) and host RAM guard (`mem_pressure_high`) gate every borrowed tick the same way they gate home work; a hub borrow does not bypass them.
+* **No timer:** a borrowed hub tick is not time-boxed; it runs to completion like any other borrowed tick.
+* **Empty backoff:** a project that yielded nothing is backed off for `AGENT_MANAGER_POOL_EMPTY_BACKOFF_SECS` (default 300 s) via `markHubEmpty()`, the same TTL that idle borrowing uses.
+
+### How to read the shadow log
+
+Under `AGENT_MANAGER_HUB_REACH=shadow` every borrow decision leaves two traces:
+
+1. **The lane log** (`stderr` of the running daemon): a line like `'[worker-<id>] would-borrow <project> <task id>'` (or `'[review-<id>] would-borrow ...'` / `'[apply-loop] would-borrow ...'`) when the decision would borrow, and a matching line when it would not.
+2. **The HOME project's pipeline history** (`<homePipelineDir>/pipeline-history.json`): one `'hub-borrow'` event per decision, with `role`, `lane`, `project` (the borrowed project's label) and `pipelineDir`. This is the durable trail of every time a hub piece outside the active project was worked or would-have-been worked.
+
+To flip from shadow to `on` after reading a sample: set `AGENT_MANAGER_HUB_REACH=on` in the lane's environment (e.g. the launch script or the daemon's config) and restart. The first real cross-project borrow will appear as a `hub-borrow` event without the `would-` prefix.
