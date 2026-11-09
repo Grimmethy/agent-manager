@@ -19,6 +19,11 @@
 // ('premium-<role>' keys) from idle borrowing's. Every premium borrow is written to the HOME project's pipeline history ('premium-borrow').
 // AGENT_MANAGER_PREMIUM_REACH=false switches it off, independently of AGENT_MANAGER_POOL_BORROW.
 //
+// Hub reach (2026-10-30): a registered project holds hub work when one of its queue stages (outside coordinating/) contains a task whose
+// `hubSerial` is set -- that task is a piece of some hub and a lane could claim it. hubProjects() lists such projects (same rules as
+// premiumProjects: active excluded, backoff-aware, ordered least-recently-borrowed under `hub-<role>` keys). Every hub borrow is written to the
+// HOME project's pipeline history ('hub-borrow'). AGENT_MANAGER_HUB_REACH=off switches it off (default shadow).
+//
 // The env for a borrowed invocation sets the project's paths but PINS AGENT_MANAGER_INSTANCES_DIR to the lane's home instances dir
 // (src/instances-dir.js), so heartbeats and GPU locks stay shared. Keys a project does not define (APPLY_REPO_ROOT, GREP_DIRS) are UNSET, the
 // same rule the dashboard applies when it switches project, so the previous project's value can never leak into a borrowed one.
@@ -330,6 +335,101 @@ function premiumProjects({ role = 'worker', lane = null, projectsPath = PROJECTS
   return orderByLastBorrowed(out, state, key);
 }
 
+// Hub reach (2026-10-30, hub reach -- src/pool-projects.js header): a registered project holds hub work when one of its queue stages (outside
+// coordinating/) contains a task whose `hubSerial` is set -- that task is a piece of some hub and a lane could claim it. The hub parent itself
+// (in coordinating/) is NOT counted as hub work: it is the orchestrator, not work to be done. `hasHubWork` mirrors `hasPremium` in shape: iterate
+// the role's stages, read each .json, short-circuit on the first claimable hub piece. `hubProjects` mirrors `premiumProjects`: eligible entries
+// filtered by hasHubWork, ordered least-recently-borrowed under a `hub-<role>` state key. Every hub borrow is written to the HOME project's pipeline
+// history as 'hub-borrow'. AGENT_MANAGER_HUB_REACH=off switches it off (default shadow).
+
+// The queue stages a hub-reach tick may find work in: same as the worker / reviewer / apply stages (never coordinating/ -- that is the hub parent,
+// not a piece to claim). 'worker-seed' is excluded: a hub-only seed tick never claims pieces, only seeds.
+function hubStageDirs(role, lane) {
+  if (role === 'worker') return ['adhoc', 'derived', 'pending', ...(lane && LANE_RE.test(lane) ? [path.join('drafting', lane)] : [])];
+  if (role === 'reviewer') return ['review'];
+  if (role === 'apply') return ['approved'];
+  return [];
+}
+
+// True when a task in one of the role's stages has a `hubSerial` set (it is a piece of some hub) and a lane could claim it right now. Mirrors
+// `hasPremium` in shape: iterate stages, read .json files, short-circuit on the first match. Unreadable dirs and corrupt/partial files are skipped;
+// never throws. Each stage directory is read through the RAM cache (queue-cache.js). If the cache layer itself throws, that stage is read directly.
+// A hub piece is any task whose top-level `hubSerial` is a number -- that is the signal used everywhere else in the codebase (apply-adhoc-diff.js,
+// hub-apply-routing.js, apply-task.js) to mark a task as a member of a hub. The hub parent (in coordinating/) is excluded: it has `subTasks` and
+// is the orchestrator, not work to be done.
+function hasHubWork(pipelineDir, { role = 'worker', lane = null } = {}) {
+  if (!pipelineDir) return false;
+  for (const stage of hubStageDirs(role, lane)) {
+    const dir = path.join(pipelineDir, 'queue', stage);
+    let found = false;
+    try {
+      const cache = openQueueCache(dir);
+      found = stageHasHubPiece(pipelineDir, stage, dir, cache.names(), (full) => readTaskCached(cache, full));
+      cache.save();
+    } catch {
+      try {
+        const names = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+        found = stageHasHubPiece(pipelineDir, stage, dir, names, (full) => readTaskCached(null, full));
+      } catch { found = false; }
+    }
+    if (found) return true;
+  }
+  return false;
+}
+
+// Is there a task in `dir` (one stage directory) with a numeric `hubSerial` (it is a hub piece) that a lane could claim? `names` are its .json files
+// and `read` turns a full path into { task }: the cached reader normally, a direct read when the cache layer itself broke.
+function stageHasHubPiece(pipelineDir, stage, dir, names, read) {
+  for (const name of names) {
+    const { task } = read(path.join(dir, name));
+    if (!task || typeof task.hubSerial !== 'number') continue;
+    if (GATED_PREMIUM_STAGES.has(stage) && !premiumTaskClaimable(pipelineDir, task)) continue;
+    return true;
+  }
+  return false;
+}
+
+// State key for hub reach: per lane for a worker (a hub piece another lane may take is not this lane's backoff), per role otherwise. Distinct from
+// the premium keys so the two reach modes do not share backoff / ordering state.
+function hubRoleKey(role = 'worker', lane = null) {
+  return role === 'worker' && lane ? `hub-worker:${lane}` : `hub-${role}`;
+}
+
+// -> registered projects (active excluded) holding a hub piece for `role` (and `lane`), least-recently-hub-borrowed first.
+function hubProjects({ role = 'worker', lane = null, projectsPath = PROJECTS_PATH, active, stateFile = statePath(), now = new Date(), includeBackedOff = false } = {}) {
+  if (!hubReachEnabled()) return [];
+  const state = readState(stateFile);
+  const key = hubRoleKey(role, lane);
+  const out = eligibleEntries({ projectsPath, active, requirePool: false })
+    .filter((p) => includeBackedOff || !backedOff(state, key, p.pipe, now))
+    .filter((p) => hasHubWork(p.pipelineDir, { role, lane }));
+  return orderByLastBorrowed(out, state, key);
+}
+
+// AGENT_MANAGER_HUB_REACH env var: 'shadow' (default), 'on', 'off' (or 'false'). 'off' disables hub reach entirely; the rest enable it.
+function hubReachEnabled() {
+  const v = String(process.env.AGENT_MANAGER_HUB_REACH || 'shadow').trim().toLowerCase();
+  return v !== 'off' && v !== 'false';
+}
+
+// Records a hub borrow (order + clears its backoff) and writes one 'hub-borrow' event to the HOME project's pipeline history, the durable trail of
+// every time a hub piece outside the active project was worked. Best-effort.
+function markHubBorrowed(pipelineDir, { role = 'worker', lane = null, homePipelineDir = null, now = new Date(), file = statePath(), projectsPath = PROJECTS_PATH } = {}) {
+  markBorrowed(pipelineDir, { now, file, role: hubRoleKey(role, lane) });
+  if (!homePipelineDir) return;
+  try {
+    const entry = readProjects(projectsPath).find((e) => e && e.pipelineDir && real(e.pipelineDir) === real(pipelineDir));
+    require('./pipeline-history.js').logPipelineEvent(homePipelineDir, 'hub-borrow', {
+      role, lane: lane || null, project: (entry && entry.label) || path.basename(pipelineDir), pipelineDir,
+    });
+  } catch { /* best-effort audit trail */ }
+}
+
+// A hub borrow that took nothing backs that project off for this role/lane.
+function markHubEmpty(pipelineDir, { role = 'worker', lane = null, now = new Date(), file = statePath(), ttlMs = emptyBackoffMs() } = {}) {
+  markEmpty(pipelineDir, { now, file, ttlMs, role: hubRoleKey(role, lane) });
+}
+
 // Records a premium borrow (order + clears its backoff) and writes one 'premium-borrow' event to the HOME project's pipeline history, the
 // durable trail of every time a premium task outside the active project was worked. Best-effort.
 function markPremiumBorrowed(pipelineDir, { role = 'worker', lane = null, homePipelineDir = null, now = new Date(), file = statePath(), projectsPath = PROJECTS_PATH } = {}) {
@@ -373,6 +473,7 @@ function poolEnvArgs(project, homeInstancesDir) {
 module.exports = {
   enabled, poolProjects, poolEnvFor, poolEnvArgs, markBorrowed, markEmpty, readProjects, PROJECTS_PATH,
   registeredProjects, premiumReachEnabled, premiumStageDirs, hasPremium, premiumTaskClaimable, dependencyReleased, premiumProjects, markPremiumBorrowed, markPremiumEmpty,
+  hubReachEnabled, hubStageDirs, hasHubWork, hubProjects, hubRoleKey, markHubBorrowed, markHubEmpty,
 };
 
 if (require.main === module) {
@@ -408,8 +509,16 @@ if (require.main === module) {
     markPremiumBorrowed(a, { role: b || 'worker', homePipelineDir: c || null, lane: d || null });
   } else if (flag === '--mark-premium-empty') {
     markPremiumEmpty(a, { role: b || 'worker', lane: c || null });
+  } else if (flag === '--hub-projects') {
+    for (const p of hubProjects({ role: a || 'worker', lane: b || null })) console.log(p.pipelineDir);
+  } else if (flag === '--has-hub') {
+    process.exit(hasHubWork(a, { role: b || 'worker', lane: c || null }) ? 0 : 1);
+  } else if (flag === '--mark-hub') {
+    markHubBorrowed(a, { role: b || 'worker', homePipelineDir: c || null, lane: d || null });
+  } else if (flag === '--mark-hub-empty') {
+    markHubEmpty(a, { role: b || 'worker', lane: c || null });
   } else {
-    console.error('usage: pool-projects.js --list [role] | --labels [role] | --all | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir> [role] | --mark-empty <pipelineDir> [role] | --premium-projects <role> [lane] | --has-premium <pipelineDir> <role> [lane] | --mark-premium <pipelineDir> <role> <homePipelineDir> [lane] | --mark-premium-empty <pipelineDir> <role> [lane]');
+    console.error('usage: pool-projects.js --list [role] | --labels [role] | --all | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir> [role] | --mark-empty <pipelineDir> [role] | --premium-projects <role> [lane] | --has-premium <pipelineDir> <role> [lane] | --mark-premium <pipelineDir> <role> <homePipelineDir> [lane] | --mark-premium-empty <pipelineDir> <role> [lane] | --hub-projects <role> [lane] | --has-hub <pipelineDir> <role> [lane] | --mark-hub <pipelineDir> <role> <homePipelineDir> [lane] | --mark-hub-empty <pipelineDir> <role> [lane]');
     process.exit(2);
   }
 }
