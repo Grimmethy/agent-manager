@@ -416,6 +416,14 @@ async function draftAdhocBranch(task, {
   });
   appendTierWorkLog(task, { tier: 'local-agentic-write', turnsUsed: agenticResult.turnsUsed, toolCallLog: agenticResult.toolCallLog, finalMessage: agenticResult.response });
   if (!agenticResult.succeeded) {
+    // 2026-11-04 (HUB0317 · 1/3): GPU arbiter cancellation is transient -- the task
+    // should be retried when GPU is available, not treated as a hard failure. Block the
+    // task with this reason so stalled-task-worker.js can re-queue it, but do NOT return
+    // succeeded:false (which would increment the consecutive-failure counter and potentially
+    // hard-block the task).
+    if (agenticResult.reason === 'gpu-arbiter: cancelled while waiting') {
+      return { succeeded: true, blocked: true, blockedReason: agenticResult.reason };
+    }
     return { succeeded: false, reason: agenticResult.reason };
   }
   if (agenticResult.blocked) {
