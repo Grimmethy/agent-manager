@@ -106,6 +106,23 @@ class StalledTaskWorker {
     return resolvedPlan;
   }
 
+  // Bucket classification for blocked tasks. Returns an action describing what
+  // the stalled-task coordinator should do with the task.
+  //
+  //   { reason: 'gpu-arbiter: cancelled while waiting' } → { action: 're-queue', state: 'drafting' }
+  //   otherwise                                            → { action: 'noop' }
+  //
+  // The GPU arbiter cancellation reason is treated as transient: the underlying
+  // GPU may become available on a subsequent attempt, so the task is sent back
+  // to drafting rather than left permanently blocked.
+  classifyBlockedTask(task) {
+    if (!task || typeof task !== 'object') return { action: 'noop' };
+    if (task.blockedReason === 'gpu-arbiter: cancelled while waiting') {
+      return { action: 're-queue', state: 'drafting' };
+    }
+    return { action: 'noop' };
+  }
+
   // Detect plan truncation and generate retry prompt with modified conditions.
   retryPlan(plan, history) {
     if (!plan || typeof plan !== 'string') return null;
