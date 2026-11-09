@@ -13,8 +13,8 @@ const hub = (n, extra = {}) => ({ hubId: 'h' + n, title: `HUB000${n} · feature 
 const B = (verdict) => ({ branch: 'agent/x-' + verdict, verdict, stale: false, headSha: 's' });
 
 test('the button says how many hubs are hidden, and what a click does', () => {
-  assert.match(v.heldHubsToggleHtml([hub(1), hub(2), hub(3)], false), />Show hidden hubs \(3\)</);
-  assert.match(v.heldHubsToggleHtml([hub(1)], true), />Hide hidden hubs \(1\)</);
+  assert.match(v.heldHubsToggleHtml([hub(1), hub(2), hub(3)], false), />Hubs \(3\)</);
+  assert.match(v.heldHubsToggleHtml([hub(1)], true), />Hubs \(1\)</);
   assert.match(v.heldHubsToggleHtml([hub(1)], false), /aria-pressed="false"/);
   assert.match(v.heldHubsToggleHtml([hub(1)], true), /aria-pressed="true"/);
   assert.match(v.heldHubsToggleHtml([hub(1)], true), /class="action" data-held-hubs-toggle/);
@@ -22,7 +22,7 @@ test('the button says how many hubs are hidden, and what a click does', () => {
 });
 
 test('with nothing hidden the button still shows (0) but cannot be pressed; junk input counts as none', () => {
-  assert.match(v.heldHubsToggleHtml([], false), /data-held-hubs-toggle[^>]* disabled[^>]*>Show hidden hubs \(0\)</);
+  assert.match(v.heldHubsToggleHtml([], false), /data-held-hubs-toggle[^>]* disabled[^>]*>Hubs \(0\)</);
   assert.match(v.heldHubsToggleHtml(undefined, false), /\(0\)/);
   assert.match(v.heldHubsToggleHtml(null, true), /\(0\)/);
   assert.doesNotMatch(v.heldHubsToggleHtml([hub(1)], false), / disabled/);
@@ -34,8 +34,8 @@ test('the button has an explanation on hover', () => {
 
 test('the filter bar carries the button after the filters, with the count; the old two-argument call still works', () => {
   const html = v.branchVerdictFilterBarHtml([B('merge')], 'all', [hub(1), hub(2)], false);
-  assert.match(html, /Discard \(0\)<\/button><button class="secondary" data-held-hubs-toggle[^>]*>Show hidden hubs \(2\)</);
-  assert.match(v.branchVerdictFilterBarHtml([B('merge')], 'all'), /Show hidden hubs \(0\)/);
+  assert.match(html, /Discard \(0\)<\/button><button class="secondary" data-held-hubs-toggle[^>]*>Hubs \(2\)</);
+  assert.match(v.branchVerdictFilterBarHtml([B('merge')], 'all'), /Hubs \(0\)/);
   assert.equal((html.match(/margin-left:auto/g) || []).length, 0, 'the button is not pushed right');
 });
 
@@ -52,7 +52,7 @@ test('closed: the panel is only the placeholder, however many hubs are hidden', 
 
 test('open: one row per hub with progress, what it waits on and its branches; the count is in the title', () => {
   const html = v.heldHubsHtml([hub(1), hub(2)], true);
-  assert.match(html, /Hidden hubs \(2\)/);
+  assert.match(html, /<b>Hubs \(2\)<\/b>/);
   assert.match(html, /HUB0001 · feature 1: 1 of 3 built, 1 held, waiting on HUB0001-02/);
   assert.match(html, /HUB0002 · feature 2: 1 of 3 built/);
   assert.match(html, /decompose-feature-1-17/);
@@ -107,13 +107,13 @@ test('a click opens the panel, updates the button, and remembers the choice; a s
   p.elements.toggle.onclick();
   assert.equal(p.open(), true);
   assert.deepEqual(p.writes, [['branches-held-hubs-open', '1']]);
-  assert.match(p.elements.bar.outerHTML, /Hide hidden hubs \(2\)/);
-  assert.match(p.elements.panel.outerHTML, /Hidden hubs \(2\)/);
+  assert.match(p.elements.bar.outerHTML, /aria-pressed="true"[^>]*>Hubs \(2\)</);
+  assert.match(p.elements.panel.outerHTML, /<b>Hubs \(2\)<\/b>/);
   assert.match(p.elements.panel.outerHTML, /feature 1/);
   p.elements.toggle.onclick();
   assert.equal(p.open(), false);
   assert.deepEqual(p.writes[1], ['branches-held-hubs-open', '0']);
-  assert.match(p.elements.bar.outerHTML, /Show hidden hubs \(2\)/);
+  assert.match(p.elements.bar.outerHTML, /aria-pressed="false"[^>]*>Hubs \(2\)</);
   assert.equal(p.elements.panel.outerHTML, '<div data-held-hubs></div>');
 });
 
@@ -137,7 +137,7 @@ test('the panel is added at the end of the tab when it is not there yet', () => 
   vm.runInContext('refreshHeldHubsPanel(main)', p.ctx);
   assert.equal(p.main.inserted.length, 1);
   assert.equal(p.main.inserted[0][0], 'beforeend');
-  assert.match(p.main.inserted[0][1], /Hidden hubs \(2\)/);
+  assert.match(p.main.inserted[0][1], /<b>Hubs \(2\)<\/b>/);
 });
 
 test('the list render uses the open/closed choice for both the bar and the panel', () => {
@@ -145,11 +145,11 @@ test('the list render uses the open/closed choice for both the bar and the panel
   let written = '';
   Object.defineProperty(p.main, 'innerHTML', { set(x) { written = x; }, get() { return written; } });
   vm.runInContext('branchListWithProjectHeadersHtml = undefined; branchProjectsPendingHtml = undefined; branchListRefreshingHtml = undefined; branchCardHtml = (b) => "<card/>"; wireBranchCard = () => {}; renderBranchListInto(main, currentBranches)', p.ctx);
-  assert.match(written, /Show hidden hubs \(2\)/);
-  assert.doesNotMatch(written, /Hidden hubs \(2\)<\/b>/);
+  assert.match(written, /aria-pressed="false"[^>]*>Hubs \(2\)</);
+  assert.doesNotMatch(written, /<b>Hubs \(2\)<\/b>/);
   vm.runInContext('heldHubsOpen = true; renderBranchListInto(main, currentBranches)', p.ctx);
-  assert.match(written, /Hide hidden hubs \(2\)/);
-  assert.match(written, /Hidden hubs \(2\)<\/b> --/);
+  assert.match(written, /aria-pressed="true"[^>]*>Hubs \(2\)</);
+  assert.match(written, /<b>Hubs \(2\)<\/b> --/);
 });
 
 test('the tab asks for the hidden hubs of ALL projects, and refreshes the button count and the panel after each poll', () => {

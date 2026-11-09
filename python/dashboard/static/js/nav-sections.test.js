@@ -368,7 +368,7 @@ test('page wiring: index.html styles the collapse button, pill and the 72px rail
 });
 
 // --- line icons in the nav ---
-const EMOJI_TABS = () => LIVE().map((x) => (x.children ? x : { ...x, label: ({ branches: '🌿 Hubs', workers: '👷 Workers', adhoc: '📌 Adhoc Tasks', project: '📁 Project' })[x.key] || x.label }));
+const EMOJI_TABS = () => LIVE().map((x) => (x.children ? x : { ...x, label: ({ branches: '🌿 Unmerged Branches', workers: '👷 Workers', adhoc: '📌 Adhoc Tasks', project: '📁 Project' })[x.key] || x.label }));
 
 test('with the icon module, a tab button is the line icon plus the name without its emoji', () => {
   const env = makeEnv({ icons: true, tabs: EMOJI_TABS() });
@@ -376,7 +376,7 @@ test('with the icon module, a tab button is the line icon plus the name without 
   const tabs = env.appended.filter((e) => !/^nav-/.test(e.className));
   const branches = tabs[0];
   assert.match(branches.innerHTML, /^<span class="nav-tab-label"><svg class="nav-ic"/);
-  assert.match(branches.innerHTML, /<\/svg><span>Hubs<\/span><\/span>/);
+  assert.match(branches.innerHTML, /<\/svg><span>Unmerged Branches<\/span><\/span>/);
   assert.doesNotMatch(branches.innerHTML, /🌿/);
   assert.match(tabs[1].innerHTML, /<span>Workers<\/span>/);
   assert.equal(tabs.filter((b) => /nav-ic/.test(b.innerHTML)).length, 4);
@@ -397,7 +397,7 @@ test('a tab with no icon keeps its label exactly as it was, and so does everythi
   assert.match(labelled[1].innerHTML, /^<span>🧪 My Tab<\/span>/);
   const plain = makeEnv({ tabs: EMOJI_TABS() });
   plain.ctx.renderNav();
-  assert.match(plain.appended.filter((e) => !/^nav-/.test(e.className))[0].innerHTML, /^<span>🌿 Hubs<\/span>/);
+  assert.match(plain.appended.filter((e) => !/^nav-/.test(e.className))[0].innerHTML, /^<span>🌿 Unmerged Branches<\/span>/);
 });
 
 test('the rail draws 20px line icons for tabs and for folded sections, and falls back to glyphs and letters without them', () => {
