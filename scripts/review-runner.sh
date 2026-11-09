@@ -23,6 +23,13 @@ filter_premium_names() {
   node -e 'const fs=require("fs"),path=require("path"),d=process.argv[1];for(const n of fs.readFileSync(0,"utf8").split("\n")){if(!n)continue;try{if(JSON.parse(fs.readFileSync(path.join(d,n),"utf8")).premiumPriority===true)console.log(n)}catch(e){}}' "$1" 2>/dev/null
 }
 
+# Reads file names (one per line) on stdin and prints, in the same order, those in dir $1 whose task has a top-level hubSerial set (one of the
+# hub pieces drafted in another project that this reviewer is borrowing to review). One node process for the whole listing, same pattern as
+# filter_premium_names.
+filter_hub_names() {
+  node -e 'const fs=require("fs"),path=require("path"),d=process.argv[1];for(const n of fs.readFileSync(0,"utf8").split("\n")){if(!n)continue;try{const o=JSON.parse(fs.readFileSync(path.join(d,n),"utf8"));if(o.hubSerial!==undefined&&o.hubSerial!==null&&o.hubSerial!=="")console.log(n)}catch(e){}}' "$1" 2>/dev/null
+}
+
 # Refuse to start if a live process already holds this instanceId -- see local-worker.sh's
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
 "$ONCE" || check_instance_liveness "$INSTANCE_ID" || exit 1
@@ -164,6 +171,57 @@ borrow_premium_review_from_projects() {
   return 1
 }
 
+# Hub reach (2026-10-30, HUB0354): a registered project holds hub work when one of its queue stages (outside coordinating/) contains a task
+# whose hubSerial is set -- that task is a piece of some hub and a lane could claim it. When AGENT_MANAGER_HUB_REACH is "on" or "shadow",
+# check sibling projects for claimable hub children BEFORE the home tick. "shadow" borrows but still runs home tick; "on" borrows and skips
+# home tick; "false" disables entirely. AGENT_MANAGER_HUB_ONLY_TICK: internal flag set to true during hub-borrow to filter claims to hub children
+# only. Every hub borrow is a 'hub-borrow' event in the HOME pipeline history. Kill switch AGENT_MANAGER_HUB_REACH=false. Same shape as
+# local-worker.sh's borrow_hub_from_projects.
+borrow_hub_review_from_projects() {
+  [[ "${AGENT_MANAGER_HUB_REACH:-shadow}" != "false" ]] || return 1
+  local pipes=() env_args=() pipe rc
+  if node "${PACKAGE_SRC_DIR}/pool-projects.js" --has-hub "$PIPELINE_DIR" reviewer 2>>"$LOG_FILE"; then
+    return 1   # the home review/ holds a hub task: it wins the tie, the home scan reviews it
+  fi
+  mapfile -t pipes < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --hub-projects reviewer 2>>"$LOG_FILE")
+  for pipe in "${pipes[@]}"; do
+    [[ -n "$pipe" ]] || continue
+    env_args=()
+    mapfile -t env_args < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --env-args "$pipe" "$INSTANCES_DIR" 2>>"$LOG_FILE")
+    (( ${#env_args[@]} > 0 )) || continue
+    printf '[review-%s] home has no hub review -- borrowing a HUB review tick from %s\n' "$INSTANCE_ID" "$pipe"
+    rc=0
+    env "${env_args[@]}" AGENT_MANAGER_HUB_ONLY_TICK=true bash "${SCRIPT_DIR}/review-runner.sh" "$INSTANCE_ID" --once || rc=$?
+    if (( rc == 10 )); then
+      node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark-hub "$pipe" reviewer "$PIPELINE_DIR" >>"$LOG_FILE" 2>&1 || true
+      # Log hub-borrow event in HOME project history
+      node -e '
+        const fs = require("fs");
+        const path = require("path");
+        const historyFile = process.argv[1];
+        const pipe = process.argv[2];
+        const instanceId = process.argv[3];
+        try {
+          const dir = path.dirname(historyFile);
+          fs.mkdirSync(dir, { recursive: true });
+          const history = fs.existsSync(historyFile) ? JSON.parse(fs.readFileSync(historyFile, "utf8")) : [];
+          history.push({
+            stage: "hub-borrow",
+            at: new Date().toISOString(),
+            detail: "reviewer " + instanceId + " borrowed a hub review tick from " + pipe
+          });
+          fs.writeFileSync(historyFile, JSON.stringify(history, null, 2));
+        } catch (e) { /* best-effort */ }
+      ' "$PIPELINE_DIR/pipeline-history.json" "$pipe" "$INSTANCE_ID" >>"$LOG_FILE" 2>&1 || true
+      did_work=true
+      return 0
+    fi
+    if (( rc != 0 )); then printf '[review-%s] hub review tick from %s exited %s (treated as empty)\n' "$INSTANCE_ID" "$pipe" "$rc" >&2; fi
+    node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark-hub-empty "$pipe" reviewer >>"$LOG_FILE" 2>&1 || true
+  done
+  return 1
+}
+
 while :; do
   LAST_TICK_START="$(date +%s)"; LAST_TICK_START_MS="$(date +%s%3N)"                 # the idle wait measures its minimum gap from here and reports any review item that arrived after it (catch-up)
   # infinite iteration until script exits (or is SIGTERM'd by system). Bash doesn't have Python-style 'while True:' so uses ':' no-op as condition which always returns 0=success so loop body executes forever; same semantic effect of PowerShell's `$true` boolean we use above.
@@ -202,13 +260,19 @@ while :; do
 
   did_work=false                                                                 # tracks whether this tick actually reviewed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment).
 
+  # Hub reach: a sibling project's hub child goes before this reviewer's home REGULAR reviews (home hub still wins -- see the function).
+  # AGENT_MANAGER_HUB_REACH=shadow borrows but still runs home tick; =on borrows and skips home tick; =false disables entirely.
+  if ! "$ONCE" && borrow_hub_review_from_projects; then
+    [[ "${AGENT_MANAGER_HUB_REACH:-shadow}" == "on" ]] && continue   # "on" mode: skip home tick after borrowing
+  fi
+
   # Premium reach: another project's premium review goes before this reviewer's home REGULAR reviews (home premium still wins -- see the function).
   if ! "$ONCE" && borrow_premium_review_from_projects; then sleep 1; continue; fi
   items=()
   while IFS= read -r name; do
     [[ "$name" == *.json ]]                                                    || continue        # only process JSON files, same filter as local-worker.sh's own claim loop (and same class of bug fixed there: a bare `!` would silently skip every real task file).
     items+=("$name")
-  done < <(if "$PREMIUM_ONLY"; then ls -1tr "$review_dir" 2>/dev/null | filter_premium_names "$review_dir"; else ls -1tr "$review_dir" 2>/dev/null; fi)   # -t: sort by mtime; -r: reverse (oldest first) -- see this loop's own comment below for why lexical order was wrong.
+  done < <(if "$PREMIUM_ONLY"; then ls -1tr "$review_dir" 2>/dev/null | filter_premium_names "$review_dir"; elif [[ "${AGENT_MANAGER_HUB_ONLY_TICK:-}" == "true" ]]; then ls -1tr "$review_dir" 2>/dev/null | filter_hub_names "$review_dir"; else ls -1tr "$review_dir" 2>/dev/null; fi)   # -t: sort by mtime; -r: reverse (oldest first) -- see this loop's own comment below for why lexical order was wrong.
 
   # Iterate each item currently sitting in review/, oldest-first BY FILE MTIME (fixed
   # 2026-08-20, Grimmethy: "we need to build this sort of analysis into the daily report"
