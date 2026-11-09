@@ -1125,7 +1125,7 @@ async function refreshSummary() {
   }
 }
 
-// Re-sync plugin-declared tabs (piece 5; Docs/hub-tasks-extraction-plan.md section 5) so a plugin toggled off/removed from elsewhere drops its nav row promptly instead of
+// Re-sync plugin-declared tabs (piece 5; docs/design-notes/hub-tasks-extraction-plan.md section 5) so a plugin toggled off/removed from elsewhere drops its nav row promptly instead of
 // only at next page load. -> true when the tab the user was looking at vanished and redirectFromGoneActiveTab() already did the full leave/enter transition to a safe
 // fallback tab: the caller must then skip its own render calls, which would double-render on top of that.
 async function refreshPluginTabs() {

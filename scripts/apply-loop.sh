@@ -2,7 +2,7 @@
 # The apply loop launch.sh runs (it used to be an inline `while :; do bash apply-task.sh; sleep; done`): re-runs the single apply pass on a fixed
 # interval so approved tasks get picked up automatically.
 #
-# docs/idle-pool-borrowing.md: after the ACTIVE project's pass, it also runs the pass for every pool project that has approved tasks waiting,
+# docs/design-notes/idle-pool-borrowing.md: after the ACTIVE project's pass, it also runs the pass for every pool project that has approved tasks waiting,
 # under that project's env. Applying is not GPU work, so unlike drafting/reviewing it does not wait for the active project to be idle -- it is just
 # a short git pass per project, and apply-task.sh's own flock serialises it against a manual run. --once = one tick, then exit (tests).
 set -u

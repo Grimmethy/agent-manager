@@ -1,7 +1,7 @@
 'use strict';
 
 // Fixture plugin UI script for the manifest-driven dashboard tab (docs/PLUGIN_API.md,
-// "Dashboard tab" section; Docs/hub-tasks-extraction-plan.md section 5). This is a real,
+// "Dashboard tab" section; docs/design-notes/hub-tasks-extraction-plan.md section 5). This is a real,
 // working example of what a plugin's own ui/<script>.js does: call
 // registerPluginTabRenderer(key, renderFn) at load time, where key matches this plugin's
 // declared tab.key in its plugins.json entry, and renderFn writes into #main exactly like

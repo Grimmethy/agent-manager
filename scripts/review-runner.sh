@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # loc
 source "${SCRIPT_DIR}/orc-common.sh"                                                  # load shared env loader and config — required first step before any daemon logic since everything depends on AGENT_MANAGER_REPO_ROOT being set correctly (which the .env file provides).
 readonly INSTANCE_ID="${1:-review-0}"                                              # default instance id for this review-daemon; same convention as PowerShell's `$env:InstanceID -or 'default'` pattern so logs can be grouped per-review-job.
 export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so local-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
-# --once (docs/idle-pool-borrowing.md): ONE tick, exit 10 (reviewed something) / 0 (nothing) -- how an idle reviewer BORROWS a tick from another suite
+# --once (docs/design-notes/idle-pool-borrowing.md): ONE tick, exit 10 (reviewed something) / 0 (nothing) -- how an idle reviewer BORROWS a tick from another suite
 # project, run as a child of the reviewer daemon under that project's env (same contract as local-worker.sh --once).
 ONCE=false
 [[ "${2:-}" == "--once" ]] && ONCE=true
@@ -108,7 +108,7 @@ refresh_active_model() {
   export LOCAL_MODEL
 }
 
-# Borrow a tick from another suite project when this reviewer's own review/ queue is empty (docs/idle-pool-borrowing.md): same walk as
+# Borrow a tick from another suite project when this reviewer's own review/ queue is empty (docs/design-notes/idle-pool-borrowing.md): same walk as
 # local-worker.sh's borrow_from_pool, tracked under the 'reviewer' role so a project the WORKER found empty is still visible here.
 borrow_review_from_pool() {
   [[ "${AGENT_MANAGER_POOL_BORROW:-true}" != "false" ]] || return 0

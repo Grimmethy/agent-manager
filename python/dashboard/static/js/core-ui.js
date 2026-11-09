@@ -130,7 +130,7 @@ function severityForTab(tabKey, count) {
 // leave*Tab hook, updates activeTab, re-renders the nav, then runs the destination's own
 // enter*Tab hook (or the generic renderMain() for everything else). Both onclick handlers
 // in renderTabButton below use this, and so does redirectFromGoneActiveTab() (piece 5;
-// Docs/hub-tasks-extraction-plan.md section 5) -- the redirect needs the real leave/enter
+// docs/design-notes/hub-tasks-extraction-plan.md section 5) -- the redirect needs the real leave/enter
 // semantics, not just an activeTab assignment, so it reuses this instead of duplicating it.
 function switchToTab(key) {
   bumpRenderGeneration(); // any in-flight render for the tab being left is now stale
@@ -289,7 +289,7 @@ async function syncPluginTabs() {
 }
 
 // --- Manifest-driven dashboard tab: renderer registry, loader and dispatch (piece 4 of 6;
-// Docs/hub-tasks-extraction-plan.md section 5). This is the riskiest piece -- it sits on
+// docs/design-notes/hub-tasks-extraction-plan.md section 5). This is the riskiest piece -- it sits on
 // the path every tab click already runs -- so the contract is narrow and the failure mode
 // is contained: a plugin's ui/<script>.js is loaded as a plain classic <script> (same-origin,
 // piece 2's route) and is expected to call registerPluginTabRenderer(key, fn) at load time;

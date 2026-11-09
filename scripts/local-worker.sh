@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # loc
 readonly INSTANCE_ID="${1:-worker-0}"                                              # allow override via argv; default to 'worker-0' matching PowerShell's $env:INSTANCE_ID if undefined (same convention across all 4 daemons so operator can grep logs for specific loop instance).
 export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so local-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
 
-# --once (2026-09-20, docs/idle-pool-borrowing.md): ONE tick, then exit with 10 (did work), 11 (did work, infra-shaped failure) or 0 (found
+# --once (2026-09-20, docs/design-notes/idle-pool-borrowing.md): ONE tick, then exit with 10 (did work), 11 (did work, infra-shaped failure) or 0 (found
 # nothing). It is how an idle lane BORROWS a tick from another suite project: the lane's daemon runs this same script again as a child under
 # that project's env (scripts/../src/pool-projects.js --env-args), heartbeating into the lane's HOME instances dir. The child must not look like a
 # second daemon, so it skips the duplicate-instance check, the "starting" heartbeat and the startup reclaim, and it never sleeps or borrows.
@@ -499,7 +499,7 @@ WAKE_RECONCILE_HITS=0                                                    # timeo
 LAST_TICK_START=0                                                        # epoch seconds when the current tick began (the minimum gap between idle ticks is measured from it)
 LAST_TICK_START_MS=0                                                     # the same moment in ms: the waiter reports any queue entry that arrived after it (catch-up)
 
-# Borrow a tick from another suite project (docs/idle-pool-borrowing.md). Called only when this lane's OWN project had nothing to do this tick.
+# Borrow a tick from another suite project (docs/design-notes/idle-pool-borrowing.md). Called only when this lane's OWN project had nothing to do this tick.
 # Walks the pool in least-recently-borrowed order; the first project that yields work ends the walk. A borrowed tick does exactly ONE item (its
 # task runs to the end of the pass, so active-project work arriving meanwhile waits for that one task -- the other lane can take it), then the
 # lane re-checks its home project immediately -- no sleep beyond the loop's usual 1s after work -- before borrowing again. A project that had nothing is skipped for a few minutes
@@ -932,7 +932,7 @@ while :; do                                                                     
     if "$did_work"; then exit 10; fi
     exit 0
   fi
-  # Nothing to do in the home project this tick -> work another suite project NOW rather than idle (docs/idle-pool-borrowing.md).
+  # Nothing to do in the home project this tick -> work another suite project NOW rather than idle (docs/design-notes/idle-pool-borrowing.md).
   if ! "$did_work" && ! "$TICK_HAD_INFRA_FAILURE"; then borrow_from_pool; fi
 
   end_of_tick_pause

@@ -1,6 +1,6 @@
 'use strict';
 
-// Piece 5 of the manifest-driven dashboard tab (Docs/hub-tasks-extraction-plan.md section
+// Piece 5 of the manifest-driven dashboard tab (docs/design-notes/hub-tasks-extraction-plan.md section
 // 5): the enable/disable lifecycle's active-tab redirect in python/dashboard/static/js/
 // core-ui.js. switchToTab() is the shared transition renderTabButton's onclick handlers
 // use (extracted here so the redirect can reuse the real leave/enter semantics instead of

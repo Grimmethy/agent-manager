@@ -2,7 +2,7 @@
 
 Status: reference (brain dump) · Written 2026-09-20 from a code read of `master` at the commit below · Companion:
 `agent-manager-hygiene/docs/HUB_TASKS.md` (the plugin side) · Concept: `concept-hub-task-integration-549f09`
-([[hub-task-integration]]), spec `Docs/hub-task-independent-merge.md` (the *how it works* story; this file is the *where everything is*).
+([[hub-task-integration]]), spec `docs/design-notes/hub-task-independent-merge.md` (the *how it works* story; this file is the *where everything is*).
 
 **Why this exists.** Hub tasks (a task too big for one pass, replaced by a coordinator + ordered/independent pieces) grew across
 two repos and several sessions. Agent-manager owns the machinery; the hygiene plugin feeds it and reads its state. The goal is to
@@ -166,7 +166,7 @@ itself stays hardcoded in core, per that step's own recommendation).
 > (see above); this is the real, load-bearing correction: "the hub kernel" that moves is the reconciliation sweep and its private
 > helpers, not the filing primitive (`queueSubTasks`) core's own decompose branch calls into forever.
 
-> **UPDATE 2026-09-21:** the destination of the producers changed. The code-decomposition family (file-decompose and its builders, loop-autoroute, the proactive sweep, the move-determinism backfill) goes to **agent-manager-hygiene**, not the hub plugin; see `Docs/hub-tasks-extraction-plan.md` sections 3-4.
+> **UPDATE 2026-09-21:** the destination of the producers changed. The code-decomposition family (file-decompose and its builders, loop-autoroute, the proactive sweep, the move-determinism backfill) goes to **agent-manager-hygiene**, not the hub plugin; see `docs/design-notes/hub-tasks-extraction-plan.md` sections 3-4.
 
 **Seam B: producers (movable one by one).** File-decompose (with its deterministic builders and `script-extract.js`), product-spec,
 loop-autoroute, proactive sweep. Each already communicates only through request files + the hub/child record shapes above, so they
