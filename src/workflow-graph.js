@@ -22,6 +22,8 @@
 
 const { applyWorkflowConfig, addWatchdogScriptNodes } = require('./workflow-overlay.js');
 const { flatPriorityOrder, groupPriorityOrder } = require('./workflow-priority.js');
+const { addLoopTypes } = require('./workflow-loop-types.js');
+const LOOP_TYPES = require('./workflow-loop-types.json');
 
 const STAGE_NAMES = ['orient', 'plan', 'implement', 'review', 'apply'];
 const KIND_ORDER = { stage: 0, service: 1, loop: 2, source: 3 };
@@ -399,7 +401,8 @@ function buildWorkflowGraph(opts) {
   };
   // The plugin watchdog scripts become service nodes first, so the optional authored layer (workflow.json, validated by src/workflow-config.js: groups, parents, labels, authored edges) can label or group them.
   // Without either input the graph is returned as built.
-  const out = applyWorkflowConfig(addWatchdogScriptNodes(graph, watchdogScripts), workflow);
+  // Loop types (src/workflow-loop-types.js): graph.loops, models and size on every step. Added last so the authored layer cannot hide a step.
+  const out = addLoopTypes(applyWorkflowConfig(addWatchdogScriptNodes(graph, watchdogScripts), workflow), LOOP_TYPES);
   // The group order next to the flat order needs the groups and parents the overlay sets, so it is computed after it ([] when no source is in a group). It changes no claim order.
   return { ...out, priorityCompare: groupPriorityOrder(out, out.priorityOrder) };
 }

@@ -3,7 +3,7 @@
 // Sidebar sections: the ~45 nav tabs are grouped into a few collapsible sections (Work, Queue, Ideas, System, Forges, Knowledge, Business), the
 // Forges section into sub-groups, with a small label per section and a hairline divider between them (owner request 2026-11-02, layout from the
 // 'Sidebar UI' reel). This file is the pure part (no DOM, testable from Node): which tab goes in which section, which sections start open,
-// and what a closed section summarises. core-ui.js renderNavSections() draws it. The narrow (phone) layout keeps the flat strip.
+// and what a closed section summarises. core-ui.js renderNavSections() draws it. The phone layout draws the same sections (only the collapse button and the icon rail are wide-only).
 
 const NAV_SECTIONS = [
   { key: 'work', label: 'Work', defaultOpen: true, items: ['branches', 'workers', 'adhoc', 'project'] },

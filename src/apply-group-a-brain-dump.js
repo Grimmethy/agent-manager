@@ -21,6 +21,7 @@ const {
   deriveBelongsToProject,
   isInvestigationFinding,
 } = require('./brain-dump-sort-classify.js');
+const { processAmbiguousBrainDump } = require('./scoped-clarification.js');
 
 function readProjectRegistry() {
   const registryPath = process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH || path.join(__dirname, '..', 'projects.json');
@@ -448,9 +449,41 @@ function buildAdhocTaskForEntry(ctx, matchedProject) {
     adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
     adhocTask.needsClarification = { reason: 'no-match' };
   } else if (anchorResult.status === 'ambiguous') {
-    adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
-    adhocTask.needsClarification = { reason: 'ambiguous', candidates: anchorResult.candidates };
-    if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+    // 2026-11-04 (brain-dump tasks stalling as 'ambiguous'): attempt to scope the task
+    // or generate specific questions instead of leaving it stuck with a generic signature.
+    // The task file may not exist yet (first time through), so we pass null for taskFile.
+    const clarificationResult = processAmbiguousBrainDump(
+      rawText,
+      adhocTask.title,
+      brainDumpEntryId,
+      path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification'),
+      null
+    );
+
+    if (clarificationResult.action === 'scope') {
+      // Successfully scoped: write the scoped body and queue to adhoc/
+      adhocTask.title = clarificationResult.scopedTask.title;
+      adhocTask.promptContext.scopedBody = clarificationResult.scopedTask.body;
+      adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'adhoc');
+      if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+    } else if (clarificationResult.action === 'escalate') {
+      // Escalate: task is stale or was previously marked ambiguous
+      adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'blocked');
+      adhocTask.needsClarification = {
+        reason: 'stale-clarification',
+        escalationReason: clarificationResult.reason,
+        candidates: anchorResult.candidates
+      };
+    } else {
+      // Generate specific questions
+      adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
+      adhocTask.needsClarification = {
+        reason: 'clarification-required',
+        questions: clarificationResult.questions,
+        candidates: anchorResult.candidates
+      };
+      if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+    }
   }
   // 'greenfield': adhocTask left exactly as constructed above, queues normally with
   // no prefetchedPaths field at all -- there is nothing to prefetch from yet.

@@ -166,6 +166,33 @@
   .wf-warn-line { margin: 0 0 8px; }
   .wf-surface { overflow: auto; max-width: 100%; max-height: 70vh; border: 1px solid var(--border); border-radius: 8px; background: var(--bg, transparent); }
   .wf-canvas { position: relative; }
+  /* One card per loop (workflow-loops.js, HUB0346 piece 2): a swipe row, one loop per screen width; each canvas is scaled to fit its card body (minimum 0.5, then the body scrolls). */
+  .wf-cards { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 12px; max-width: 100%; }
+  .wf-card { flex: 0 0 auto; box-sizing: border-box; max-width: 100%; max-height: 78vh; max-height: 78dvh; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 8px; background: var(--bg, transparent); overflow: hidden; }
+  /* A phone (700 px or narrower): one loop per screen width in a swipe row, as before; wider screens size each card to its drawing (wfFitCards sets the width) and wrap them. */
+  @media (max-width: 700px) {
+    .wf-cards { flex-wrap: nowrap; overflow-x: auto; scroll-snap-type: x mandatory; -webkit-overflow-scrolling: touch; }
+    .wf-card { flex: 0 0 100%; scroll-snap-align: center; scroll-snap-stop: always; height: 78vh; height: 78dvh; max-height: none; }
+  }
+  .wf-card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  .wf-card-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 8px; }
+  .wf-scale { position: relative; }
+  .wf-card-head .wf-sources-toggle { margin: 0 8px 0 auto; padding: 2px 10px; font-size: 12px; }
+  /* Draggable nodes (workflow-drag.js, HUB0346 piece 3). touch-action none is what lets a finger drag a node without the swipe row scrolling; swipe from the card head or from empty space to change card. */
+  .wf-card .wf-node { cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
+  .wf-card .wf-node.wf-dragging { cursor: grabbing; z-index: 5; box-shadow: 0 4px 14px rgba(0, 0, 0, .35); }
+  /* Step cards (workflow-step-card.js): one row per model with provider and size badges, a status dot for the lane behind it. The box size follows the smallest model of the step. */
+  .wf-step .wf-models { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
+  .wf-model-row { display: flex; align-items: center; gap: 6px; min-height: 22px; white-space: nowrap; overflow: hidden; }
+  .wf-model-row .wf-model { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .wf-model-lane { cursor: pointer; border-radius: 4px; }
+  .wf-model-lane:hover { background: var(--panel); }
+  .wf-size { font-variant-numeric: tabular-nums; }
+  .wf-size-large { border-color: var(--warn); }
+  .wf-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--muted); }
+  .wf-dot-working { background: var(--ok); }
+  .wf-dot-idle { background: var(--muted); }
+  .wf-dot-offline, .wf-dot-stale, .wf-dot-disabled { background: var(--bad, #f85149); }
   .wf-edges { position: absolute; left: 0; top: 0; pointer-events: none; }
   .wf-edge { stroke: var(--muted, #8b949e); stroke-width: 1.5; }
   .wf-arrowhead { fill: var(--muted, #8b949e); }
@@ -365,9 +392,12 @@
     header { flex-wrap: wrap; padding: 10px 14px; gap: 8px 12px; }
     header .pipeline-dir { flex-basis: 100%; }
     .layout { flex-direction: column; }
-    nav { width: 100%; height: auto; position: static; overflow-y: visible; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); display: flex; overflow-x: auto; padding: 6px 8px; -webkit-overflow-scrolling: touch; }
-    nav button { width: auto; white-space: nowrap; padding: 8px 12px; }
+    /* The grouped sidebar (sections, icons, fold chevrons) is the phone nav too, as ONE horizontal row: a section chip, its tabs right after it when the section is open (a tap opens or folds it in place), a thin divider between sections; the row scrolls sideways inside itself. */
+    nav { width: 100%; height: auto; position: static; display: flex; flex-direction: row; align-items: center; overflow-x: auto; overflow-y: hidden; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); padding: 6px 8px; -webkit-overflow-scrolling: touch; }
+    nav button, nav button.nav-sh, nav button.nav-sub-sh { flex: none; width: auto; white-space: nowrap; padding: 8px 12px; }
     nav button.active { border-left: none; border-bottom: 3px solid var(--accent); }
+    nav button { gap: 6px; }
+    nav .nav-div { flex: none; width: 1px; height: 20px; margin: 0 6px; background: var(--border-strong); }
     .nav-notch { display: none; }
     main { padding: 12px; overflow-x: auto; }
     table { min-width: 560px; }
@@ -423,6 +453,10 @@
 <script src="/static/js/workers-tab.js"></script>
 <script src="/static/js/worker-switch-ui.js"></script>
 <script src="/static/js/workflow-layout.js"></script>
+<script src="/static/js/workflow-loops.js"></script>
+<script src="/static/js/workflow-card-fit.js"></script>
+<script src="/static/js/workflow-step-card.js"></script>
+<script src="/static/js/workflow-drag.js"></script>
 <script src="/static/js/workflow-groups.js"></script>
 <script src="/static/js/workflow-node-panel.js"></script>
 <script src="/static/js/workflow-graph-view.js"></script>

@@ -193,10 +193,58 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
   }
   function doResetToMain() {
     const stashBefore = stashTip();
+    let stashOk = false;
+    let stashFallback = null;
     try {
       run(['stash', 'push', '-u', '-m', `agent-manager auto-stash before reset ${new Date().toISOString()}`]);
+      stashOk = true;
     } catch (e) {
-      throw new Error(`auto-stash before resetToMain failed, reset aborted to avoid destroying work: ${e.message}`);
+      // 2026-11-05 (stalled-task fix): a timed-out stash used to abort the whole reset,
+      // leaving the task permanently blocked because the worktree could never be cleaned.
+      // Fallback: capture tracked changes as a patch, list untracked files, then force-clean
+      // the worktree so the reset can proceed. The patch + untracked list live in
+      // AGENT_MANAGER_STASH_BACKUP_DIR (or /tmp/agent-manager-stash-backup if unset) under a
+      // timestamped subdirectory, so they survive the reset and can be recovered manually.
+      const isTimeout = e && (e.code === 'ETIMEDOUT' || /timed out after \d+ms/i.test(e.message));
+      if (isTimeout) {
+        const recoveryDir = path.join(
+          process.env.AGENT_MANAGER_STASH_BACKUP_DIR || '/tmp/agent-manager-stash-backup',
+          `fallback-${Date.now()}`
+        );
+        fs.mkdirSync(recoveryDir, { recursive: true });
+        stashFallback = { recoveryDir, savedTracked: false, savedUntracked: [] };
+        try {
+          const tracked = run(['diff']);
+          const patchFile = path.join(recoveryDir, 'tracked-changes.patch');
+          fs.writeFileSync(patchFile, tracked);
+          stashFallback.savedTracked = true;
+        } catch (patchErr) {
+          console.error(`[git-runner] resetToMain fallback: could not capture tracked changes: ${patchErr.message}`);
+        }
+        try {
+          const untracked = run(['ls-files', '--others', '--exclude-standard']);
+          const untrackedFiles = untracked.trim() ? untracked.trim().split(/\n/) : [];
+          if (untrackedFiles.length) {
+            fs.writeFileSync(path.join(recoveryDir, 'untracked-files.txt'), untrackedFiles.join('\n') + '\n');
+            stashFallback.savedUntracked = untrackedFiles;
+          }
+        } catch (untrackedErr) {
+          console.error(`[git-runner] resetToMain fallback: could not list untracked files: ${untrackedErr.message}`);
+        }
+        // Force-clean the worktree so the reset can proceed. git reset --hard HEAD clears
+        // tracked changes without touching untracked; git clean -fd clears the rest. Both
+        // are worktree-only operations -- no history is rewritten.
+        try { run(['reset', '--hard', 'HEAD']); } catch { /* best-effort */ }
+        try { run(['clean', '-fd']); } catch { /* best-effort */ }
+        console.error(
+          `[git-runner] auto-stash timed out (${e.message}); fell back to patch+clean. ` +
+          `Tracked changes saved: ${stashFallback.savedTracked ? 'yes' : 'no'}. ` +
+          `Untracked files listed: ${stashFallback.savedUntracked.length}. ` +
+          `Recover with: git apply ${path.join(recoveryDir, 'tracked-changes.patch')} && cat ${path.join(recoveryDir, 'untracked-files.txt')}`
+        );
+      } else {
+        throw new Error(`auto-stash before resetToMain failed, reset aborted to avoid destroying work: ${e.message}`);
+      }
     }
     run(['checkout', mainBranch]);
     run(['fetch', 'origin', mainBranch]);
@@ -228,6 +276,15 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
       throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic reset`);
     }
     run(['reset', '--hard', remote]);
+    // 2026-11-05 (stalled-task fix): if we fell back from a timed-out stash, log where the
+    // work was saved so the task owner (or the next retry) knows how to recover it.
+    if (stashFallback) {
+      console.error(
+        `[git-runner] resetToMain completed with stash fallback. ` +
+        `Recover saved work: git apply ${path.join(stashFallback.recoveryDir, 'tracked-changes.patch')} 2>/dev/null; ` +
+        `cat ${path.join(stashFallback.recoveryDir, 'untracked-files.txt')}`
+      );
+    }
     // Pop the stash created above right back onto the now-reset tree (2026-09-14, fixing
     // the "never popped" hazard this function used to carry -- see the header comment on
     // the returned object below for the full incident history). Confirmed live: the

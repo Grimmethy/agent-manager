@@ -97,6 +97,48 @@ test('resetToMain auto-stashes an untracked file too (stash -u), then pops it ba
   assert.equal(git(['stash', 'list'], repoDir).trim(), '');
 });
 
+test('resetToMain: fallback on stash timeout preserves work and cleans worktree', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const fakeExec = (cmd, args, opts) => {
+    if (cmd === 'git' && args[0] === 'stash' && args[1] === 'push') {
+      const err = new Error('spawnSync git ETIMEDOUT');
+      err.code = 'ETIMEDOUT';
+      throw err;
+    }
+    return execFileSync('git', args, opts);
+  };
+  const runner = createRealGitRunner(repoDir, { exec: fakeExec });
+
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v1 + local edit\\n');
+  fs.writeFileSync(path.join(repoDir, 'untracked.txt'), 'new work\\n');
+
+  const logOutput = [];
+  const origError = console.error;
+  console.error = (...args) => logOutput.push(args.join(' '));
+  try {
+    runner.resetToMain();
+  } finally {
+    console.error = origError;
+  }
+
+  const backupDir = process.env.AGENT_MANAGER_STASH_BACKUP_DIR || '/tmp/agent-manager-stash-backup';
+  const fallbackDirs = fs.readdirSync(backupDir).filter(d => d.startsWith('fallback-'));
+  assert.ok(fallbackDirs.length > 0, 'a fallback directory was created');
+  const fallbackDir = path.join(backupDir, fallbackDirs[fallbackDirs.length - 1]);
+  assert.ok(fs.existsSync(path.join(fallbackDir, 'tracked-changes.patch')), 'tracked changes saved to patch');
+  assert.ok(fs.existsSync(path.join(fallbackDir, 'untracked-files.txt')), 'untracked files listed');
+  const trackedPatch = fs.readFileSync(path.join(fallbackDir, 'tracked-changes.patch'), 'utf8');
+  assert.ok(trackedPatch.includes('v1 + local edit'), 'patch contains the tracked edit');
+  const untrackedList = fs.readFileSync(path.join(fallbackDir, 'untracked-files.txt'), 'utf8');
+  assert.ok(untrackedList.includes('untracked.txt'), 'untracked list includes the file');
+
+  const status = git(['status', '--porcelain'], repoDir);
+  assert.equal(status.trim(), '', 'worktree is clean after fallback');
+
+  assert.ok(logOutput.some(l => /fell back to patch\+clean/.test(l)), 'fallback logged');
+  assert.ok(logOutput.some(l => /Recover saved work/.test(l)), 'recovery instructions logged');
+});
+
 // resetToMain: local-only COMMITS on mainBranch -----------------------------------------
 // 2026-08-27, root-caused live: unlike the uncommitted-edit case above (protected by the
 // auto-stash since the second 2026-07 incident), a real local COMMIT on mainBranch that

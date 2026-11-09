@@ -411,12 +411,17 @@ def partition_held_hub_branches(branches):
     return listed, list(groups.values())
 
 
+def branch_trailer_ids(run_git, repo_root, main_branch, full_ref):
+    """The `Task:` trailer ids on the branch's commits. Raises when git fails (so a caller that remembers the answer never stores a failure as "no trailers")."""
+    return _TASK_TRAILER_RE.findall(run_git(["log", f"origin/{main_branch}..{full_ref}", "--format=%b"], repo_root))
+
+
 def branch_task_ids(run_git, repo_root, main_branch, full_ref, task_id):
     """The branch name's own id plus the `Task:` trailer ids on its commits. The branch NAME is not the sub-task id for a hub child
     (agent/decompose-<hub> carries HUB0113-01-...), so the trailers are what let the listing find the owning hub -- the same join
     branch_verdicts.resolve_owner uses. Without them a hub child had no hub in the listing and could not be held."""
     try:
-        trailers = _TASK_TRAILER_RE.findall(run_git(["log", f"origin/{main_branch}..{full_ref}", "--format=%b"], repo_root))
+        trailers = branch_trailer_ids(run_git, repo_root, main_branch, full_ref)
     except (RuntimeError, subprocess.SubprocessError, OSError):
         trailers = []
     return list(dict.fromkeys([task_id, *trailers]))

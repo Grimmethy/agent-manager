@@ -398,10 +398,11 @@ def api_git_unmerged_branches():
     if request.args.get("kick") == "1":
         # The page was told that something that feeds the list happened (a task finished, a verdict, a merge): start the background refresh NOW instead of waiting for the
         # TTL, and still answer from the last good list. The refresh announces branch-list-changed when it finds a difference, and the page reads the list again.
-        _invalidate_branch_cache(refetch=True)
-        if request.args.get("projects") == "all":
-            import branch_projects
-            branch_projects.expire_all()
+        # At most one kick per window does the work (python/dashboard/branch_kick.py): the page sends one for every counts or branches event, ~6 a minute, and each used to restart the
+        # recompute of all 47 projects (a git fetch per repo and ~7 git processes a second). A kick inside the window is coalesced into one trailing honour, never dropped.
+        import branch_kick
+        import branch_projects
+        branch_kick.kick(lambda: _invalidate_branch_cache(refetch=True), branch_projects.expire_all if request.args.get("projects") == "all" else None)
     branches = list_unmerged_branches(force=False, stale_ok=True)   # never recomputes inside the request: last good list now, refresh in the background
     with _branch_cache_lock:
         filled = _branch_cache["at"]

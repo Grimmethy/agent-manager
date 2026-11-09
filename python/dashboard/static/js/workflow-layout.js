@@ -1,6 +1,11 @@
-/* Pure layered left-to-right layout for the Workers workflow graph (phase A, piece W-A3).
+/* Pure layered layout for the Workers workflow graph (phase A, piece W-A3): left-to-right by default, top-to-bottom with opts.direction 'down'.
  *
  * layoutGraph(graph, opts) -> { positions: {id: {x, y}}, width, height, edges: [{id, points, back}] }
+ * opts: nodeW, nodeH, gapX, gapY (numbers) and direction ('down' lays the layers out top to bottom; any other value is the left-to-right layout),
+ * and for 'down' maxPerRow (a whole number of 1 or more: a layer with more nodes wraps into several rows, which never mix two groups; anything else means no limit).
+ * opts.nodeSizes = { id: { w, h } } gives single nodes their own box (a size that is not a positive finite number on both sides is ignored, a node without an entry uses nodeW x nodeH):
+ * a layer is as tall (down) or as wide (right) as its biggest node, nodes in a layer follow each other with the gap, and edges anchor on each node's real box.
+ * The result also carries sizes: { id: { w, h } } for every placed node. Without nodeSizes the positions and edges are exactly what they were.
  *
  * Only node.id and edge.id/from/to are read, so it works on the WorkflowGraph
  * contract and on any smaller object. It never throws: a bad input gives the
@@ -23,6 +28,10 @@
       var v = o[k];
       out[k] = typeof v === 'number' && isFinite(v) && v >= 0 ? v : DEFAULTS[k];
     });
+    // Only the exact string 'down' lays the layers out top to bottom; anything else is the left-to-right layout.
+    out.direction = o.direction === 'down' ? 'down' : 'right';
+    // maxPerRow (top-to-bottom only): a layer with more nodes than this wraps into several rows, so a layer of 26 sources is a block, not one very wide row. 0 means no limit.
+    out.maxPerRow = typeof o.maxPerRow === 'number' && Number.isInteger(o.maxPerRow) && o.maxPerRow >= 1 ? o.maxPerRow : 0;
     return out;
   }
 
@@ -138,25 +147,53 @@
     return rows;
   }
 
-  function edgePoints(e, back, pos, o, bottom) {
+  function edgePoints(e, back, pos, o, bottom, sizes) {
     var s = pos[e.from];
     var t = pos[e.to];
-    var sy = s.y + o.nodeH / 2;
-    var ty = t.y + o.nodeH / 2;
+    var ss = sizes[e.from];
+    var ts = sizes[e.to];
+    var sy = s.y + ss.h / 2;
+    var ty = t.y + ts.h / 2;
     var pts;
     if (!back) {
-      pts = [{ x: s.x + o.nodeW, y: sy }, { x: t.x, y: ty }];
+      pts = [{ x: s.x + ss.w, y: sy }, { x: t.x, y: ty }];
     } else {
       var gx = up4(o.gapX / 2);
-      var rx = s.x + o.nodeW + gx;
+      var rx = s.x + ss.w + gx;
       var lx = Math.max(0, t.x - gx);
       pts = [
-        { x: s.x + o.nodeW, y: sy },
+        { x: s.x + ss.w, y: sy },
         { x: rx, y: sy },
         { x: rx, y: bottom },
         { x: lx, y: bottom },
         { x: lx, y: ty },
         { x: t.x, y: ty }
+      ];
+    }
+    return pts.map(function (p) { return { x: up4(p.x), y: up4(p.y) }; });
+  }
+
+  // Top-to-bottom ports: a forward edge leaves the bottom middle of the source and enters the top middle of the target.
+  // A back edge leaves the right side of the source, runs down the lane on the right of the canvas (rightLane) and re-enters the target from above.
+  function edgePointsDown(e, back, pos, o, rightLane, sizes) {
+    var s = pos[e.from];
+    var t = pos[e.to];
+    var ss = sizes[e.from];
+    var ts = sizes[e.to];
+    var scx = s.x + ss.w / 2;
+    var tcx = t.x + ts.w / 2;
+    var pts;
+    if (!back) {
+      pts = [{ x: scx, y: s.y + ss.h }, { x: tcx, y: t.y }];
+    } else {
+      var sy = s.y + ss.h / 2;
+      var topY = Math.max(0, t.y - up4(o.gapY / 2));
+      pts = [
+        { x: s.x + ss.w, y: sy },
+        { x: rightLane, y: sy },
+        { x: rightLane, y: topY },
+        { x: tcx, y: topY },
+        { x: tcx, y: t.y }
       ];
     }
     return pts.map(function (p) { return { x: up4(p.x), y: up4(p.y) }; });
@@ -199,41 +236,114 @@
     return out;
   }
 
+  // The box of every node: its own entry of opts.nodeSizes when that is a positive finite w and h (rounded up to a multiple of 4), else the default nodeW x nodeH.
+  // custom is true when at least one node got its own box.
+  function resolveSizes(ids, nodeSizes, o) {
+    var sizes = Object.create(null);
+    var custom = false;
+    var given = nodeSizes && typeof nodeSizes === 'object' ? nodeSizes : {};
+    ids.forEach(function (id) {
+      var v = Object.prototype.hasOwnProperty.call(given, id) ? given[id] : null;
+      var ok = v && typeof v.w === 'number' && typeof v.h === 'number' && isFinite(v.w) && isFinite(v.h) && v.w > 0 && v.h > 0;
+      if (ok) custom = true;
+      sizes[id] = ok ? { w: up4(v.w), h: up4(v.h) } : { w: o.nodeW, h: o.nodeH };
+    });
+    return { sizes: sizes, custom: custom };
+  }
+
   function layoutGraph(graph, opts) {
     try {
       var clean = cleanInput(graph);
       if (!clean.ids.length) return emptyResult();
       var o = resolveOpts(opts);
+      var resolved = resolveSizes(clean.ids, opts && opts.nodeSizes, o);
+      var sizes = resolved.sizes;
       var backIds = findBackEdges(clean.ids, clean.edges);
       var forward = clean.edges.filter(function (e) { return !backIds[e.id]; });
       var layer = assignLayers(clean.ids, forward);
       var keys = groupKeys(graph);
       var rows = orderLayers(clean.ids, forward, layer).map(function (row) { return regroupRow(row, keys); });
 
+      var down = o.direction === 'down';
       var positions = {};
       var right = 0;
       var bottom = 0;
-      rows.forEach(function (row, l) {
-        row.forEach(function (id, i) {
-          var x = up4(l * (o.nodeW + o.gapX));
-          var y = up4(i * (o.nodeH + o.gapY));
-          positions[id] = { x: x, y: y };
-          right = Math.max(right, x + up4(o.nodeW));
-          bottom = Math.max(bottom, y + up4(o.nodeH));
+      var drawRows = rows;
+      if (down && o.maxPerRow > 0) {
+        drawRows = [];
+        rows.forEach(function (row) {
+          // A wrapped row never mixes two groups: a new row starts where the (outermost) group changes, so every group is its own block and its box covers only its members.
+          var runs = [];
+          row.forEach(function (id) {
+            var last = runs[runs.length - 1];
+            if (last && last.key === keys[id]) last.ids.push(id);
+            else runs.push({ key: keys[id], ids: [id] });
+          });
+          runs.forEach(function (run) {
+            for (var from = 0; from < run.ids.length; from += o.maxPerRow) drawRows.push(run.ids.slice(from, from + o.maxPerRow));
+          });
+          if (!row.length) drawRows.push(row);
         });
+      }
+      // Without per-node sizes every cell is nodeW x nodeH and a node sits at index * (size + gap), exactly as before. With them a layer is as big as its biggest node and
+      // the next layer starts after it; nodes of one layer follow each other with the gap.
+      var layerStart = 0;
+      drawRows.forEach(function (row, l) {
+        var cursor = 0;
+        var layerExtent = 0;
+        row.forEach(function (id, i) {
+          var sz = sizes[id];
+          var x;
+          var y;
+          if (!resolved.custom) {
+            // 'right': layer -> column (x), row index -> y. 'down': layer -> y, row index -> x.
+            x = down ? up4(i * (o.nodeW + o.gapX)) : up4(l * (o.nodeW + o.gapX));
+            y = down ? up4(l * (o.nodeH + o.gapY)) : up4(i * (o.nodeH + o.gapY));
+          } else if (down) {
+            x = up4(cursor);
+            y = up4(layerStart);
+            cursor = x + sz.w + o.gapX;
+            layerExtent = Math.max(layerExtent, sz.h);
+          } else {
+            x = up4(layerStart);
+            y = up4(cursor);
+            cursor = y + sz.h + o.gapY;
+            layerExtent = Math.max(layerExtent, sz.w);
+          }
+          positions[id] = { x: x, y: y };
+          right = Math.max(right, x + up4(sz.w));
+          bottom = Math.max(bottom, y + up4(sz.h));
+        });
+        layerStart += layerExtent + (down ? o.gapY : o.gapX);
       });
 
-      var lane = bottom + up4(o.gapY / 2);
       var hasBack = clean.edges.some(function (e) { return backIds[e.id]; });
+      if (down) {
+        // The back-edge lane runs down the right of the canvas, so a cycle widens the result, not its height.
+        var rightLane = right + up4(o.gapX / 2);
+        var downEdges = clean.edges.map(function (e) {
+          var back = !!backIds[e.id];
+          return { id: e.id, points: edgePointsDown(e, back, positions, o, rightLane, sizes), back: back };
+        });
+        return {
+          positions: positions,
+          width: up4(hasBack ? rightLane + 4 : right),
+          height: up4(bottom),
+          edges: downEdges,
+          sizes: sizes
+        };
+      }
+      var lane = bottom + up4(o.gapY / 2);
       var edges = clean.edges.map(function (e) {
         var back = !!backIds[e.id];
-        return { id: e.id, points: edgePoints(e, back, positions, o, lane), back: back };
+        return { id: e.id, points: edgePoints(e, back, positions, o, lane, sizes), back: back };
       });
       return {
         positions: positions,
         width: up4(right),
         height: up4(hasBack ? lane + 4 : bottom),
-        edges: edges
+        edges: edges,
+        sizes: sizes
       };
     } catch (err) {
       return emptyResult();
