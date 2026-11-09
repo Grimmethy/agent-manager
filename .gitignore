@@ -4,6 +4,7 @@ agent-manager.env
 plugins.json
 lanes.json
 *.bak
+*.bak-*
 .venv
 .venv-broken-*/
 python/dashboard/project_cache/
