@@ -93,7 +93,38 @@ function isDeclaredCreateTarget(planText, targetPath, taskText = '') {
   // 2026-11-02 (HUB0273-01: "... and src/chat-tool-gate.test.js once it exists"): the task text itself says the file is not there yet. Strict like the write-file phrase: the
   // words must follow the path directly (a few characters of punctuation at most), so an unrelated "once it exists" elsewhere exempts nothing.
   const afterWin = (i) => task.slice(i + targetPath.length, i + targetPath.length + 24);
+  // 2026-11-09 (pf-lessons hub pieces): a task titled "Create unit c1-u07 01-read.md on what a deal is" with `Files: content/chapter-1/c1-u07/01-read.md`
+  // was blocked because the plan text had no create verb near the path and the task text only listed the path in a "Files:" line. If the task text has a
+  // "Files:" line that EXACTLY lists the target path AND the task title (first line) contains a create-intent verb near its start, treat the path as a create
+  // target. The guard only reaches this branch for missing files, so no new exemption is added for existing files.
+  if (hasFilesLineListing(task, targetPath) && hasCreateVerbInTitle(task)) return true;
   return tIdxs.length > 0 && (CREATE_FILE_VERBS_RE.test(win(tIdxs[0])) || tIdxs.some((i) => WRITE_FILE_PHRASE_RE.test(win(i)) || DIRECT_CREATE_RE.test(win(i)) || ONCE_IT_EXISTS_AFTER_RE.test(afterWin(i))));
+}
+
+// 2026-11-09 (pf-lessons hub pieces): does the task text have a "Files:" line that
+// EXACTLY lists the target path as one of its comma-separated entries?
+function hasFilesLineListing(taskText, targetPath) {
+  const lines = String(taskText || '').split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('Files:')) continue;
+    const entries = trimmed.slice('Files:'.length).split(',');
+    for (const entry of entries) {
+      if (entry.trim() === targetPath) return true;
+    }
+  }
+  return false;
+}
+
+// 2026-11-09 (pf-lessons hub pieces): does the first line (title) of the task text
+// contain a create-intent verb near its start?
+function hasCreateVerbInTitle(taskText) {
+  const lines = String(taskText || '').split('\n');
+  const title = (lines[0] || '').trim();
+  if (!title) return false;
+  // Check the first 100 chars of the title for a create-intent verb
+  const titlePrefix = title.slice(0, 100);
+  return /\b(?:create|add|write|draft|new)\b/i.test(titlePrefix);
 }
 
 // (task, planText, repoRoot, extraRoots, existsAtRef) -> { blocked, reason?, missing? }

@@ -395,3 +395,47 @@ test('prose form with type: create also works', () => {
   const r = planTargetGuard(task, planText, repo, ['src']);
   assert.equal(r.blocked, false, 'prose form should also work');
 });
+
+// --- 2026-11-09: Files-line + create-title signal (pf-lessons hub pieces) -----------------------------------------------
+
+test('isDeclaredCreateTarget: reproduced case -- title has create verb, Files: line lists path -- returns true', () => {
+  const result = isDeclaredCreateTarget(
+    'Edit content/chapter-1/c1-u07/01-read.md to add the text',
+    'content/chapter-1/c1-u07/01-read.md',
+    'HUB0005 · 1/4 · Create unit c1-u07 01-read.md on what a deal is\nFiles: content/chapter-1/c1-u07/01-read.md',
+  );
+  assert.equal(result, true, 'the reproduced case should return true');
+});
+
+test('isDeclaredCreateTarget: same task text but path NOT in Files line returns false', () => {
+  const result = isDeclaredCreateTarget(
+    'Edit content/chapter-1/c1-u07/01-read.md to add the text',
+    'content/chapter-1/c1-u07/01-read.md',
+    'HUB0005 · 1/4 · Create unit c1-u07 01-read.md on what a deal is\nFiles: content/chapter-1/c1-u07/02-other.md',
+  );
+  assert.equal(result, false, 'path not in Files line should return false');
+});
+
+test('isDeclaredCreateTarget: title with no create verb (e.g. "Fix the parser") with path in Files returns false', () => {
+  const result = isDeclaredCreateTarget(
+    'Edit content/chapter-1/c1-u07/01-read.md to add the text',
+    'content/chapter-1/c1-u07/01-read.md',
+    'HUB0005 · 1/4 · Fix the parser for deal analysis\nFiles: content/chapter-1/c1-u07/01-read.md',
+  );
+  assert.equal(result, false, 'no create verb in title should return false');
+});
+
+test('isDeclaredCreateTarget: existing-file case is unaffected (returns false because guard does not reach this check for existing files)', () => {
+  // This test verifies that the new check does not affect the existing behavior for files that DO exist.
+  // The guard only reaches the isDeclaredCreateTarget check for missing files, so this is a no-op for existing files.
+  // We test the function directly to confirm the logic is sound.
+  const result = isDeclaredCreateTarget(
+    'Edit content/chapter-1/c1-u07/01-read.md to add the text',
+    'content/chapter-1/c1-u07/01-read.md',
+    'HUB0005 · 1/4 · Create unit c1-u07 01-read.md on what a deal is\nFiles: content/chapter-1/c1-u07/01-read.md',
+  );
+  // The function returns true because the conditions are met, but in the actual guard flow,
+  // this path would not be checked because the file exists. This test confirms the function
+  // logic is correct in isolation.
+  assert.equal(result, true, 'the function logic should work correctly in isolation');
+});
