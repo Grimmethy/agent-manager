@@ -506,7 +506,7 @@ const CORE_TABS = [
     { key: 'adforge', label: '🎬 AdForge', description: 'Advertisement-pipeline orchestrator (separate local app on ADFORGE_URL, default :7431), embedded here. Sequences ScriptForge/PromptForge/VoiceForge/CutForge/PostForge into a finished ad.' },
     { key: 'scriptforge', label: '📝 ScriptForge', description: 'Ad-script generator (separate local app on SCRIPTFORGE_URL, default :7432) -- brief -> treatment + shot list + PromptForge shot-specs + VO + music brief, on the local model. Phase 1 of AdForge.' },
   ] },
-  { key: 'branches', label: '🌿 Hubs', description: 'List pushed-but-unmerged branches and hidden hubs, so nothing gets lost or forgotten.' },
+  { key: 'branches', label: '🌿 Unmerged Branches', description: 'List branches the pipeline has created that have not yet been merged, so nothing gets lost or forgotten.' },
   { key: 'adhoc', label: '📌 Adhoc Tasks', description: 'Every adhoc task in one place, with which queue state it currently sits in -- cuts across the whole Job Status group instead of checking each state tab by hand.' },
   { group: 'Job Status', children: [
     { key: 'pending', label: '⏳ Pending', description: 'Jobs queued and waiting for an agent to pick them up.' },
