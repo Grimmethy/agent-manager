@@ -20,6 +20,11 @@ if ! "$ONCE"; then export AGENT_MANAGER_DAEMON_PID="$$"; fi
 # resumes, seeds and claims premium tasks only, so it can never take (or generate) that project's regular work. Ignored without --once.
 PREMIUM_ONLY=false
 if "$ONCE" && [[ "${AGENT_MANAGER_PREMIUM_ONLY_TICK:-}" == "true" ]]; then PREMIUM_ONLY=true; fi
+# Hub reach (2026-10-24, HUB0354): shadow|on|false (default shadow). When "on" or "shadow", check sibling projects for claimable hub children
+# BEFORE the home tick. "shadow" borrows but still runs home tick; "on" borrows and skips home tick; "false" disables entirely.
+# AGENT_MANAGER_HUB_ONLY_TICK: internal flag set to true during hub-borrow to filter claims to hub children only.
+: "${AGENT_MANAGER_HUB_REACH:=shadow}"
+AGENT_MANAGER_HUB_ONLY_TICK=false
 # Exit 0 when the task file's top-level premiumPriority is true (same test as pool-projects.js hasPremium).
 is_premium_file() {
   node -e 'try{process.exit(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).premiumPriority===true?0:1)}catch(e){process.exit(1)}' "$1" 2>/dev/null
@@ -680,6 +685,43 @@ while :; do                                                                     
   # Confirmed live 2026-08-16: ComfyUI, not run in hours, left 23013/24576MB VRAM used --
   # every ornithCall this tick would have timed out at 240s with no indication why.
   node "${PACKAGE_SRC_DIR}/gpu-guard.js" >>"$LOG_FILE" 2>&1 || true
+
+  # Hub reach: check sibling projects for claimable hub children BEFORE the home tick (home work still wins if both exist).
+  # When AGENT_MANAGER_HUB_REACH is "shadow" or "on", scan for hub work; if found, borrow a tick with AGENT_MANAGER_HUB_ONLY_TICK=true
+  # to claim only hub children, then write a 'hub-borrow' event to HOME pipeline history. "on" skips home tick; "shadow" runs both.
+  if [[ "$AGENT_MANAGER_HUB_REACH" != "false" ]] && ! "$ONCE"; then
+    if node "${PACKAGE_SRC_DIR}/pool-projects.js" --has-hub-work worker "$INSTANCE_ID" 2>>"$LOG_FILE"; then
+      printf '[worker-%s] home has hub work to borrow -- claiming hub children only\n' "$INSTANCE_ID" >&2
+      AGENT_MANAGER_HUB_ONLY_TICK=true
+      hub_rc=0
+      env "${env_args[@]}" AGENT_MANAGER_HUB_ONLY_TICK=true bash "${SCRIPT_DIR}/local-worker.sh" "$INSTANCE_ID" --once || hub_rc=$?
+      if (( hub_rc == 10 || hub_rc == 11 )); then
+        # Write 'hub-borrow' event to HOME pipeline history
+        node -e '
+          const fs = require("fs");
+          const pd = process.env.AGENT_MANAGER_PIPELINE_DIR;
+          if (pd) {
+            const log = require("path").join(pd, "instances", "pipeline-history.log");
+            const event = JSON.stringify({
+              type: "hub-borrow",
+              role: "worker",
+              lane: process.env.AGENT_MANAGER_INSTANCE_ID,
+              project: process.argv[1],
+              timestamp: new Date().toISOString()
+            });
+            fs.appendFileSync(log, event + "\n");
+          }
+        ' "$pipe" >>"$LOG_FILE" 2>&1 || true
+        did_work=true
+        if (( hub_rc == 11 )); then TICK_HAD_INFRA_FAILURE=true; fi
+        if [[ "$AGENT_MANAGER_HUB_REACH" == "on" ]]; then
+          end_of_tick_pause
+          continue
+        fi
+      fi
+      AGENT_MANAGER_HUB_ONLY_TICK=false
+    fi
+  fi
 
   # Premium reach: another project's premium task goes before this lane's home REGULAR work (home premium still wins -- see the function).
   if ! "$ONCE" && borrow_premium_from_projects; then end_of_tick_pause; continue; fi
