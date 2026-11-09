@@ -5,6 +5,7 @@ Moved verbatim out of app.py (2026-10-01 breakdown). app.py re-exports every nam
 import os
 import re
 import subprocess
+from pathlib import Path
 
 
 def _detect_main_branch(repo_root):
@@ -44,8 +45,16 @@ def _check_merge_conflict(repo_root, main_branch, branch):
     check that silently says 'no conflict' on its own failure would be worse than no
     check at all.
     """
+    # Align with _merge_in_temp_worktree: if .gitattributes exists in the working tree
+    # (tracked or not), tell git merge-tree to use it so the preview is not sensitive
+    # to whether the file is versioned. Without -c core.attributesFile, merge-tree reads
+    # only from the object database and would silently ignore an untracked .gitattributes.
+    args = ["git", "merge-tree", "--write-tree", f"origin/{main_branch}", f"origin/{branch}"]
+    repo_attrs = Path(repo_root) / ".gitattributes"
+    if repo_attrs.is_file():
+        args.extend(["-c", f"core.attributesFile={repo_attrs.resolve()}"])
     result = subprocess.run(
-        ["git", "merge-tree", "--write-tree", f"origin/{main_branch}", f"origin/{branch}"],
+        args,
         cwd=str(repo_root), capture_output=True, text=True, timeout=30,
     )
     if result.returncode == 0:
