@@ -619,6 +619,17 @@ def _merge_in_temp_worktree(repo_root, main_branch, match):
     wt = os.path.join(tmp, "wt")
     try:
         _run_git(["worktree", "add", "--detach", wt, f"origin/{main_branch}"], repo_root)
+        # Align the worktree's merge behavior with the repo root: if .gitattributes
+        # exists in the repo root (tracked or not), copy it into the worktree's
+        # local git config so merge drivers activate the same way regardless of
+        # whether .gitattributes is versioned. Mirrors the pattern in
+        # scripts/setup-merge-drivers.sh which uses .git/info/attributes to avoid
+        # touching a consumer repo's tracked .gitattributes.
+        repo_attrs = Path(repo_root) / ".gitattributes"
+        if repo_attrs.is_file():
+            info_attrs = Path(wt) / ".git" / "info" / "attributes"
+            info_attrs.parent.mkdir(parents=True, exist_ok=True)
+            info_attrs.write_bytes(repo_attrs.read_bytes())
         try:
             _run_git(["merge", "--no-ff", f"origin/{match['branch']}", "-m", f"Merge {match['title']} (via dashboard)"], wt)
         except RuntimeError as merge_err:
