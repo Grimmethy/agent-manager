@@ -3252,6 +3252,7 @@ def _restart_pipeline():
 # --- Decomposed route blueprints (file-decompose) ---
 from routes.reports import reports_bp  # noqa: E402
 from routes.concepts import concepts_bp  # noqa: E402
+from routes.touchpoints import touchpoints_bp  # noqa: E402
 from routes.second_brain import second_brain_bp  # noqa: E402
 from routes.brain_dump import brain_dump_bp  # noqa: E402
 from routes.benchmark import benchmark_bp  # noqa: E402
@@ -3288,6 +3289,7 @@ from routes.event_stream import event_stream_bp  # noqa: E402
 app.register_blueprint(reports_bp)
 app.register_blueprint(event_stream_bp)
 app.register_blueprint(concepts_bp)
+app.register_blueprint(touchpoints_bp)
 app.register_blueprint(second_brain_bp)
 app.register_blueprint(brain_dump_bp)
 app.register_blueprint(benchmark_bp)
