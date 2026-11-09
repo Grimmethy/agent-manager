@@ -416,7 +416,7 @@ while :; do
     printf '[watchdog] product-spec-to-hub: %s\n' "$spec_hub_result" >&2
 
     # The file-decompose family (S4a of the hub-tasks extraction, 2026-09-24) moved to
-    # agent-manager-hygiene -- Docs/hub-tasks-extraction-plan.md. Resolved by NAME via
+    # agent-manager-hygiene -- docs/design-notes/hub-tasks-extraction-plan.md. Resolved by NAME via
     # resolve_plugin_root (S5a, 2026-09-25) so this keeps working regardless of how many
     # other plugins are also loaded or in what order; every invocation in this family is
     # skipped (not fatal) if the hygiene plugin isn't installed, same discipline as the
@@ -610,7 +610,7 @@ while :; do
       done < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --all 2>/dev/null)
     fi
 
-    # Idle-pool borrowing (docs/idle-pool-borrowing.md, step 4): housekeeping for the pool projects lanes borrow work from -- retries, hub
+    # Idle-pool borrowing (docs/design-notes/idle-pool-borrowing.md, step 4): housekeeping for the pool projects lanes borrow work from -- retries, hub
     # reconciliation, triage -- which the sweeps above only do for the ACTIVE project. Runs in the BACKGROUND (a pool project's sweeps take
     # tens of seconds and must never delay this tick's daemon supervision), one run at a time (flock), and each project is due at most every
     # AGENT_MANAGER_POOL_SWEEP_INTERVAL_SECS (pool-sweeps.sh). Kill switch AGENT_MANAGER_POOL_BORROW=false.
