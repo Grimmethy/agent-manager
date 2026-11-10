@@ -421,7 +421,7 @@ def _cached_verdict(kind, path, compute, seen):
     key = (kind, str(path), st.st_mtime_ns, st.st_size)
     seen.add(key)
     if key not in _verdict_cache:
-        _verdict_cache[key] = bool(compute(read_json_safe(path)))
+        _verdict_cache[key] = bool(compute(rec if isinstance(rec := read_json_safe(path), dict) else None))  # a stray list/string/null file is not a record
     return _verdict_cache[key]
 
 
