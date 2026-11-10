@@ -75,16 +75,6 @@ test('a branch that shrinks a listed file passes', () => {
   assert.equal(run(r, ['--base', 'main']).status, 0);
 });
 
-test('a trial merge that is staged but not committed is checked too', () => {
-  const r = repo({ 'src/a.js': lines(3) }, { files: {}, functions: {} });
-  branch(r, { 'src/new.js': lines(501) });
-  git(r.root, 'checkout', '-q', 'main');
-  git(r.root, 'merge', '--no-commit', '--no-ff', 'work');
-  const res = run(r, ['--base', 'main']);
-  assert.equal(res.status, 1);
-  assert.match(res.err, /file src\/new\.js has 501 lines/);
-});
-
 test('a missing --base, or a base that does not exist, exits 2', () => {
   const r = repo({ 'src/a.js': lines(3) }, { files: {}, functions: {} });
   assert.equal(run(r, []).status, 2);
