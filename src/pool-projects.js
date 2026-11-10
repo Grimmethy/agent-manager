@@ -420,6 +420,15 @@ function noteStalledReviews({ reason = 'unknown', homePipelineDir = null, projec
   return noted;
 }
 
+// Premium reviews under tight memory pressure (owner decision 2026-11-10: "premium reviews can run under tight pressure"). The reviewer daemon used to yield
+// its whole tick whenever the memory-pressure marker said tight or critical, so a premium review waited 77 minutes. Now a TIGHT marker (never critical) lets
+// the reviewer run when a premium review is waiting: premium items only, one per tick (scripts/review-runner.sh). Kill switch
+// AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT=false restores the old answer. Pure so it can be tested; the shell reaches it through --premium-under-pressure.
+function premiumMayRunUnderPressure({ state, hasPremiumReview, env = process.env } = {}) {
+  if (String((env || {}).AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT || '').toLowerCase() === 'false') return false;
+  return state === 'tight' && hasPremiumReview === true;
+}
+
 // -> { set: {KEY: value}, unset: [KEY] } for running ONE invocation in `project`'s context from a lane whose home instances dir is
 // `homeInstancesDir`.
 function poolEnvFor(project, homeInstancesDir) {
@@ -445,7 +454,7 @@ function poolEnvArgs(project, homeInstancesDir) {
 module.exports = {
   enabled, poolProjects, poolEnvFor, poolEnvArgs, markBorrowed, markEmpty, readProjects, PROJECTS_PATH,
   registeredProjects, premiumReachEnabled, premiumStageDirs, hasPremium, premiumTaskClaimable, dependencyReleased, premiumProjects, markPremiumBorrowed, markPremiumEmpty,
-  stalledReviews, noteStalledReviews, STALL_MIN_AGE_MS,
+  stalledReviews, noteStalledReviews, STALL_MIN_AGE_MS, premiumMayRunUnderPressure,
 };
 
 if (require.main === module) {
@@ -482,10 +491,14 @@ if (require.main === module) {
   } else if (flag === '--note-stalled-reviews') {
     // node src/pool-projects.js --note-stalled-reviews <homePipelineDir> [reason]   one review-stalled event + log line per record waiting 10+ min with no live claim
     noteStalledReviews({ homePipelineDir: a, reason: b || 'unknown', claimDir: process.env.AGENT_MANAGER_INSTANCES_DIR ? path.join(process.env.AGENT_MANAGER_INSTANCES_DIR, 'review-claims') : null });
+  } else if (flag === '--premium-under-pressure') {
+    // node src/pool-projects.js --premium-under-pressure <homePipelineDir> <state>   exit 0 when a premium review may run under that memory-pressure state
+    const waiting = hasPremium(a, { role: 'reviewer' }) || premiumProjects({ role: 'reviewer' }).length > 0;
+    process.exit(premiumMayRunUnderPressure({ state: b, hasPremiumReview: waiting }) ? 0 : 1);
   } else if (flag === '--mark-premium-empty') {
     markPremiumEmpty(a, { role: b || 'worker', lane: c || null });
   } else {
-    console.error('usage: pool-projects.js --list [role] | --labels [role] | --all | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir> [role] | --mark-empty <pipelineDir> [role] | --premium-projects <role> [lane] | --has-premium <pipelineDir> <role> [lane] | --mark-premium <pipelineDir> <role> <homePipelineDir> [lane] | --mark-premium-empty <pipelineDir> <role> [lane] | --note-stalled-reviews <homePipelineDir> [reason]');
+    console.error('usage: pool-projects.js --list [role] | --labels [role] | --all | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir> [role] | --mark-empty <pipelineDir> [role] | --premium-projects <role> [lane] | --has-premium <pipelineDir> <role> [lane] | --mark-premium <pipelineDir> <role> <homePipelineDir> [lane] | --mark-premium-empty <pipelineDir> <role> [lane] | --note-stalled-reviews <homePipelineDir> [reason] | --premium-under-pressure <homePipelineDir> <state>');
     process.exit(2);
   }
 }

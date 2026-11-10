@@ -617,3 +617,53 @@ test('the stalled-review note is independent of the premium-reach kill switch, w
     assert.equal(noteStalledReviews({ projectsPath: w.projectsPath, claimDir: w.claimDir, stateFile: w.stateFile, log: () => {}, reason: 'x' }).length, 1);
   } finally { if (saved === undefined) delete process.env.AGENT_MANAGER_PREMIUM_REACH; else process.env.AGENT_MANAGER_PREMIUM_REACH = saved; }
 });
+
+// ---- premium reviews under tight memory pressure (owner decision 2026-11-10; critical still yields) ----
+const { premiumMayRunUnderPressure } = require('./pool-projects.js');
+
+test('premiumMayRunUnderPressure: tight with a premium review waiting runs; tight without one yields; critical yields even with premium; ok is never changed', () => {
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: {} }), true);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: false, env: {} }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'critical', hasPremiumReview: true, env: {} }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'critical', hasPremiumReview: false, env: {} }), false);
+  // ok is not a pressure state: the shell never asks, and the function does not turn it into an override
+  assert.equal(premiumMayRunUnderPressure({ state: 'ok', hasPremiumReview: true, env: {} }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: undefined, hasPremiumReview: true, env: {} }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: 'yes', env: {} }), false, 'only a real true counts');
+});
+
+test('premiumMayRunUnderPressure: AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT=false restores the old answer (always yield); any other value keeps the new behaviour', () => {
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: 'false' } }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: 'FALSE' } }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: 'true' } }), true);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: '' } }), true);
+});
+
+test('--premium-under-pressure: exit 0 only for tight with a premium review in the home review/ or another registered project; critical, no premium and the kill switch exit 1', () => {
+  const w = stallWorld();
+  const cli = path.join(__dirname, 'pool-projects.js');
+  const env = (extra = {}) => ({ ...process.env, AGENT_MANAGER_PROJECTS_PATH: w.projectsPath, AGENT_MANAGER_POOL_STATE_PATH: w.stateFile, ...extra });
+  const code = (state, e) => { try { execFileSync('node', [cli, '--premium-under-pressure', w.home, state], { env: env(e), stdio: 'pipe' }); return 0; } catch (err) { return err.status; } };
+  assert.equal(code('tight'), 1, 'nothing waiting anywhere: yield');
+  w.put(w.other, 'p.json', { id: 'p', premiumPriority: true, status: 'needs-review' }, 1);
+  assert.equal(code('tight'), 0, 'a premium review waits in another registered project');
+  assert.equal(code('critical'), 1, 'critical still yields');
+  assert.equal(code('tight', { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: 'false' }), 1, 'kill switch');
+  w.put(w.home, 'h.json', { id: 'h', premiumPriority: true, status: 'needs-review' }, 1);
+  assert.equal(code('tight'), 0, 'a premium review waits in the home review/');
+});
+
+test('review-runner.sh asks premiumMayRunUnderPressure before it yields, limits the tick to premium items and reviews one item per tick, and still yields otherwise', () => {
+  const sh = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'review-runner.sh'), 'utf8');
+  const guard = sh.indexOf('if mem_pressure_high; then');
+  const ask = sh.indexOf('--premium-under-pressure "$PIPELINE_DIR" "$mem_state"');
+  const yieldMsg = sh.indexOf('yielding this tick -- host RAM pressure');
+  assert.ok(guard > 0 && ask > guard && yieldMsg > ask, 'the question is asked inside the pressure block, before the yield');
+  assert.match(sh, /TICK_PREMIUM_ONLY=true; UNDER_PRESSURE=true/);
+  assert.match(sh, /done < <\(if "\$TICK_PREMIUM_ONLY"; then ls -1tr/, 'the item list uses the per-tick premium-only flag');
+  assert.equal((sh.match(/(^|[\s;])PREMIUM_ONLY=/gm) || []).length, 2, 'PREMIUM_ONLY is assigned only at the top of the script (false, then true for a borrowed child), never inside the loop, so the per-tick copy cannot carry a stale value');
+  assert.match(sh, /tight memory pressure: reviewing premium item %s anyway/);
+  assert.match(sh, /if "\$ONCE" \|\| "\$UNDER_PRESSURE"; then break; fi/, 'one item per tick under pressure');
+  // the premium-only borrowed tick re-enters the same block, so it is allowed under tight pressure too; critical never reaches the review code
+  assert.match(sh, /if "\$ONCE" && \[\[ "\$\{AGENT_MANAGER_PREMIUM_ONLY_TICK:-\}" == "true" \]\]; then PREMIUM_ONLY=true; fi/);
+});

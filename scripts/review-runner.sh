@@ -195,12 +195,22 @@ while :; do
   lane_warm_after_pause "$INSTANCE_ID" "${LOCAL_MODEL:-}" "$STARTED_AT"   # no-op unless the lease was just released: reload the model before reviewing
 
   # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
+  # 2026-11-10 (owner: "premium reviews can run under tight pressure"): under a TIGHT marker (never critical) a waiting premium review is still reviewed --
+  # premium items only, one per tick. Kill switch AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT=false. src/pool-projects.js premiumMayRunUnderPressure.
+  # PREMIUM_ONLY is assigned only at the top of this script (once per process, from the borrowed-child env) and never inside this loop, so this per-tick copy
+  # cannot carry a value over from an earlier tick; only the pressure block below may raise it, and only for this tick.
+  TICK_PREMIUM_ONLY="$PREMIUM_ONLY"; UNDER_PRESSURE=false
   if mem_pressure_high; then
-    printf '[review-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
-    note_stalled_reviews "host memory pressure ($(mem_marker_state 2>/dev/null || echo tight)), so reviewers are yielding their ticks"
-    if "$ONCE"; then exit 0; fi
-    sleep "${ORC_TICK_SECS:-30}"
-    continue
+    mem_state="$(mem_marker_state 2>/dev/null || echo tight)"
+    if node "${PACKAGE_SRC_DIR}/pool-projects.js" --premium-under-pressure "$PIPELINE_DIR" "$mem_state" 2>>"$LOG_FILE"; then
+      TICK_PREMIUM_ONLY=true; UNDER_PRESSURE=true
+    else
+      printf '[review-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
+      note_stalled_reviews "host memory pressure ($mem_state), so reviewers are yielding their ticks"
+      if "$ONCE"; then exit 0; fi
+      sleep "${ORC_TICK_SECS:-30}"
+      continue
+    fi
   fi
 
   # GPU headroom check -- review's own majorityVote call spends real Ollama calls too
@@ -218,7 +228,7 @@ while :; do
   while IFS= read -r name; do
     [[ "$name" == *.json ]]                                                    || continue        # only process JSON files, same filter as local-worker.sh's own claim loop (and same class of bug fixed there: a bare `!` would silently skip every real task file).
     items+=("$name")
-  done < <(if "$PREMIUM_ONLY"; then ls -1tr "$review_dir" 2>/dev/null | filter_premium_names "$review_dir"; else ls -1tr "$review_dir" 2>/dev/null; fi)   # -t: sort by mtime; -r: reverse (oldest first) -- see this loop's own comment below for why lexical order was wrong.
+  done < <(if "$TICK_PREMIUM_ONLY"; then ls -1tr "$review_dir" 2>/dev/null | filter_premium_names "$review_dir"; else ls -1tr "$review_dir" 2>/dev/null; fi)   # -t: sort by mtime; -r: reverse (oldest first) -- see this loop's own comment below for why lexical order was wrong.
 
   # Iterate each item currently sitting in review/, oldest-first BY FILE MTIME (fixed
   # 2026-08-20, Grimmethy: "we need to build this sort of analysis into the daily report"
@@ -257,6 +267,7 @@ while :; do
     # old gate was real, immediately-reviewable local work sitting unreviewed for hours
     # any time Claude happened to be paused, confirmed live via a multi-hour
     # queue/review/ backlog with items unreviewed since 2026-08-25.
+    if "$UNDER_PRESSURE"; then printf '[review-%s] tight memory pressure: reviewing premium item %s anyway\n' "$INSTANCE_ID" "$name" >&2; fi
     printf '[review-%s] reviewing %s\n' "$INSTANCE_ID" "$name" >&2
     # "queued" until the single-flight lock is actually held, then "working" -- see
     # local-worker.sh's process_drafting_file for the full rationale (2026-08-19,
@@ -413,7 +424,7 @@ while :; do
     fi
     write_heartbeat_file "$INSTANCE_ID" "idle" "${LOCAL_MODEL:-}" "" "" "$STARTED_AT"
     did_work=true
-    if "$ONCE"; then break; fi   # a borrowed tick reviews ONE item, then the reviewer re-checks its home review/ before borrowing again
+    if "$ONCE" || "$UNDER_PRESSURE"; then break; fi   # under tight pressure: one premium item per tick. A borrowed tick reviews ONE item, then the reviewer re-checks its home review/ before borrowing again
   done
   release_current_claim                                                         # the last item of this tick is done too
 
