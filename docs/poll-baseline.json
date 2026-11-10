@@ -159,30 +159,6 @@
       "language": "js"
     },
     {
-      "signature": "9320899d8629750a1cbde430723892a2a2ed5030",
-      "path": "src/apply-runner.ps1",
-      "kind": "sleep-loop",
-      "language": "ps1"
-    },
-    {
-      "signature": "c704863289c1d32bed36a4ab858cd01d826d90b9",
-      "path": "src/apply-runner.ps1",
-      "kind": "sleep-loop",
-      "language": "ps1"
-    },
-    {
-      "signature": "ceff88b598f5c6906dca4e4f4d9dea121f31b2e1",
-      "path": "src/apply-runner.ps1",
-      "kind": "sleep-loop",
-      "language": "ps1"
-    },
-    {
-      "signature": "e745057740fecc0c7f8468373ccfa2f05e156b4e",
-      "path": "src/apply-runner.ps1",
-      "kind": "sleep-loop",
-      "language": "ps1"
-    },
-    {
       "signature": "60378d7dba035cd03e336c8eb7c3e22d10e8d26f",
       "path": "src/gpu-arbiter.js",
       "kind": "set-interval",
@@ -199,60 +175,6 @@
       "path": "src/gpu-arbiter.js",
       "kind": "set-interval",
       "language": "js"
-    },
-    {
-      "signature": "576fd2b76549c8d5bf1d9ed14dd86f92f31aa013",
-      "path": "src/local-worker.ps1",
-      "kind": "sleep-loop",
-      "language": "ps1"
-    },
-    {
-      "signature": "6c6665a6bff5a10562ff96269ee928e9c5c6e5ab",
-      "path": "src/local-worker.ps1",
-      "kind": "sleep-loop",
-      "language": "ps1"
-    },
-    {
-      "signature": "8f0a0d6047a2610293539289197f98f5df550400",
-      "path": "src/local-worker.ps1",
-      "kind": "sleep-loop",
-      "language": "ps1"
-    },
-    {
-      "signature": "5c76aba56a5a10603e0a37479355b371e68e4f93",
-      "path": "src/queue-watchdog.ps1",
-      "kind": "sleep-loop",
-      "language": "ps1"
-    },
-    {
-      "signature": "7d16f6023426b8df3da386a3ba0a072f1ae46939",
-      "path": "src/review-runner.ps1",
-      "kind": "sleep-loop",
-      "language": "ps1"
-    },
-    {
-      "signature": "a380b129f6934367f68847b2a066d090aff37285",
-      "path": "src/review-runner.ps1",
-      "kind": "sleep-loop",
-      "language": "ps1"
-    },
-    {
-      "signature": "a780e403a82ab95ee2da5f77e7e139779426b6ac",
-      "path": "src/review-runner.ps1",
-      "kind": "sleep-loop",
-      "language": "ps1"
-    },
-    {
-      "signature": "b73d20481edad40ee00b7272769d91b457b80240",
-      "path": "src/review-runner.ps1",
-      "kind": "sleep-loop",
-      "language": "ps1"
-    },
-    {
-      "signature": "dd92a35ca07e2fa937e0fc433617a507730dae98",
-      "path": "src/review-runner.ps1",
-      "kind": "sleep-loop",
-      "language": "ps1"
     }
   ]
 }

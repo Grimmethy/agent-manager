@@ -115,7 +115,7 @@ A plugin that ships a tab **must document its exact `plugins.json` entry in its 
 Known, deliberate exceptions:
 
 - **`src/arch-discovery-structcheck.js`** names `arch_discovery` / `arch_import` — it is
-  invoked by hardcoded path from `src/local-worker.ps1` (the Windows worker) and is
+  was invoked by hardcoded path from the retired Windows worker (`src/local-worker.ps1`, deleted) and is
   arch-specific by nature. Allowlisted in the guard test. Not reached on the Linux path.
 - **`python/dashboard/app.py`'s `SOURCE_DESCRIPTIONS` / `_SOURCE_TO_DOMAIN_KEY`** name every
   source, plugin ones included. This is the dashboard's server-side *display* catalog for a
