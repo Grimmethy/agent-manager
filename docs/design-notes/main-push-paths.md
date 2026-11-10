@@ -119,3 +119,16 @@ The gate (HUB0364 · 2/4) requires a READY record in `queue/branch-verdicts.json
 - **HUB0364 · 4/4** — Write enforcement tests for all paths.
 
 This document (HUB0364 · 1/4) is the design note that informs all three. The "what changes are needed" column above maps 1:1 to the enforcement edits HUB0364 · 3/4 will make.
+
+---
+
+## Amendment 2026-11-10: a worker merge verdict for a safe diff class
+
+Owner decision (option 2): the Python gate (`python/dashboard/main_push_rules.py`) accepts a `merge` verdict with source `worker` when ALL of these hold for the exact head sha, and refuses it otherwise. The Node policy (`src/lib/main-push-policy.js`) is unchanged: it guards the pipeline's own pushes of main, where no worker branch verdict applies.
+
+1. The first reason starts with `Merge-ready checker worker`, the text the checker worker (pipeline-ops `src/checker-execute.js`) writes. A verdict from any other worker, or a deterministic one, is refused as before.
+2. The gate re-derives the diff class itself (`python/dashboard/main_push_safe_class.py`, `git diff --name-status --no-renames <default branch>...<head sha>` and `--numstat`) with the rules of `classOf` in pipeline-ops `src/checker-evidence.js`, and the class is `docs-only`, `tests-only` or `new-files-only`. It never reads a class from the verdict.
+3. The branch adds or changes no path on the forbidden list (a copy of pipeline-ops `src/forbidden-paths.js`; a deletion is ignored).
+4. A diff that cannot be read is refused.
+
+A chat or manual `merge` is unchanged and costs no git call. Every pass on this rule appends a row with `outcome: "allowed-worker-class"`, the class and the file count to `queue/main-push-ledger.jsonl`, next to the existing `refused` rows. Widening the safe classes stays the owner's decision; if `classOf` or the forbidden list changes in pipeline-ops, the copies in `main_push_safe_class.py` must change with them.

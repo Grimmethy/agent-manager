@@ -9,6 +9,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from main_push_safe_class import read_diff_facts
 from main_push_rules import LEDGER_FILE, MainPushNotReady, assert_main_push_ready, not_ready_reason  # noqa: F401 -- re-exported for callers and tests
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,8 @@ def guard_merge_request(request):
             head_sha = _run_git(["rev-parse", f"origin/{branch}"], repo_root).strip()
         except (RuntimeError, OSError):
             return None  # no such branch (or no such repository): the route answers for itself
-        assert_main_push_ready(qdir, branch, head_sha, caller="dashboard-merge-early" if found.group("early") else "dashboard-merge", task_id=branch.removeprefix("agent/"))
+        assert_main_push_ready(qdir, branch, head_sha, caller="dashboard-merge-early" if found.group("early") else "dashboard-merge", task_id=branch.removeprefix("agent/"),
+                               diff_facts_loader=lambda: read_diff_facts(_run_git, repo_root, head_sha))
         return None
     except LookupError:
         return None  # an unknown project: the route answers 404 itself
