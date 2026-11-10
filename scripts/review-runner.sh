@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # loc
 source "${SCRIPT_DIR}/orc-common.sh"                                                  # load shared env loader and config — required first step before any daemon logic since everything depends on AGENT_MANAGER_REPO_ROOT being set correctly (which the .env file provides).
 readonly INSTANCE_ID="${1:-review-0}"                                              # default instance id for this review-daemon; same convention as PowerShell's `$env:InstanceID -or 'default'` pattern so logs can be grouped per-review-job.
 export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so local-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
-# --once (docs/idle-pool-borrowing.md): ONE tick, exit 10 (reviewed something) / 0 (nothing) -- how an idle reviewer BORROWS a tick from another suite
+# --once (docs/design-notes/idle-pool-borrowing.md): ONE tick, exit 10 (reviewed something) / 0 (nothing) -- how an idle reviewer BORROWS a tick from another suite
 # project, run as a child of the reviewer daemon under that project's env (same contract as local-worker.sh --once).
 ONCE=false
 [[ "${2:-}" == "--once" ]] && ONCE=true
@@ -108,7 +108,7 @@ refresh_active_model() {
   export LOCAL_MODEL
 }
 
-# Borrow a tick from another suite project when this reviewer's own review/ queue is empty (docs/idle-pool-borrowing.md): same walk as
+# Borrow a tick from another suite project when this reviewer's own review/ queue is empty (docs/design-notes/idle-pool-borrowing.md): same walk as
 # local-worker.sh's borrow_from_pool, tracked under the 'reviewer' role so a project the WORKER found empty is still visible here.
 borrow_review_from_pool() {
   [[ "${AGENT_MANAGER_POOL_BORROW:-true}" != "false" ]] || return 0
@@ -131,6 +131,13 @@ borrow_review_from_pool() {
     node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark-empty "$pipe" reviewer >>"$LOG_FILE" 2>&1 || true
   done
   return 0
+}
+
+# Stalled reviews (2026-11-10): a record that has waited 10+ minutes in ANY registered project's review/ with no live claim gets ONE 'review-stalled' history event
+# (and one log line per record per hour) naming why this reviewer is not reviewing it. Piggybacks on this tick -- no timer. src/pool-projects.js noteStalledReviews.
+note_stalled_reviews() {
+  local reason="$1"
+  AGENT_MANAGER_INSTANCES_DIR="$INSTANCES_DIR" node "${PACKAGE_SRC_DIR}/pool-projects.js" --note-stalled-reviews "$PIPELINE_DIR" "$reason" >>"$LOG_FILE" 2>&1 || true
 }
 
 # Premium reach (2026-10-18, Grimmethy: "premium priority tasks happen regardless of what project repo is currently selected (currently
@@ -179,6 +186,7 @@ while :; do
   # the GPU for an image generation this tick.
   if comfyui_lease_held "${OLLAMA_URL:-http://localhost:11434}"; then
     printf '[review-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+    note_stalled_reviews 'PromptForge holds the GPU (comfyui-lease), so reviewers are yielding'
     lane_note_gpu_pause "$INSTANCE_ID" "${LOCAL_MODEL:-}" "$STARTED_AT"   # heartbeat says "paused" (Workers tab) and remembers to warm the model up afterwards
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
@@ -189,6 +197,7 @@ while :; do
   # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
   if mem_pressure_high; then
     printf '[review-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
+    note_stalled_reviews "host memory pressure ($(mem_marker_state 2>/dev/null || echo tight)), so reviewers are yielding their ticks"
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
     continue
@@ -203,6 +212,7 @@ while :; do
   did_work=false                                                                 # tracks whether this tick actually reviewed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment).
 
   # Premium reach: another project's premium review goes before this reviewer's home REGULAR reviews (home premium still wins -- see the function).
+  if ! "$ONCE"; then note_stalled_reviews 'no live reviewer has claimed it yet'; fi
   if ! "$ONCE" && borrow_premium_review_from_projects; then sleep 1; continue; fi
   items=()
   while IFS= read -r name; do

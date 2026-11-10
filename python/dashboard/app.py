@@ -455,7 +455,7 @@ def record_project_registry_entry(repo_root: str, pipeline_dir: str, domains_pat
             "label": Path(normalized_root).name,
         }
         # applyRepoRoot is hand-set per project (see _start_pipeline) -- never let this
-        # upsert silently drop it. `pool` (docs/idle-pool-borrowing.md) is the same kind of
+        # upsert silently drop it. `pool` (docs/design-notes/idle-pool-borrowing.md) is the same kind of
         # hand-set opt-in: an idle lane may borrow work from this project; switching to the
         # project from the Project tab must not silently un-opt it.
         for k in ("applyRepoRoot", "grepDirs", "pool"):
@@ -2850,7 +2850,7 @@ def _resolve_plugin_root(name: str):
     return None
 
 
-# --- Manifest-driven dashboard tab (Docs/hub-tasks-extraction-plan.md section 5) --------
+# --- Manifest-driven dashboard tab (docs/design-notes/hub-tasks-extraction-plan.md section 5) --------
 # A plugins.json entry may declare a `tab` object so its own dashboard tab is served from
 # the plugin's repo instead of a hardcoded row in templates/index.html. `_validate_plugin_tab`
 # is the schema gate: callers (api_plugins_add today; the tab-bar merge and the plugin
@@ -3252,6 +3252,7 @@ def _restart_pipeline():
 # --- Decomposed route blueprints (file-decompose) ---
 from routes.reports import reports_bp  # noqa: E402
 from routes.concepts import concepts_bp  # noqa: E402
+from routes.touchpoints import touchpoints_bp  # noqa: E402
 from routes.second_brain import second_brain_bp  # noqa: E402
 from routes.brain_dump import brain_dump_bp  # noqa: E402
 from routes.benchmark import benchmark_bp  # noqa: E402
@@ -3288,6 +3289,7 @@ from routes.event_stream import event_stream_bp  # noqa: E402
 app.register_blueprint(reports_bp)
 app.register_blueprint(event_stream_bp)
 app.register_blueprint(concepts_bp)
+app.register_blueprint(touchpoints_bp)
 app.register_blueprint(second_brain_bp)
 app.register_blueprint(brain_dump_bp)
 app.register_blueprint(benchmark_bp)

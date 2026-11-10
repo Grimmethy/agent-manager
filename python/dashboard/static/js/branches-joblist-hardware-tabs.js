@@ -1125,7 +1125,7 @@ async function refreshSummary() {
   }
 }
 
-// Re-sync plugin-declared tabs (piece 5; Docs/hub-tasks-extraction-plan.md section 5) so a plugin toggled off/removed from elsewhere drops its nav row promptly instead of
+// Re-sync plugin-declared tabs (piece 5; docs/design-notes/hub-tasks-extraction-plan.md section 5) so a plugin toggled off/removed from elsewhere drops its nav row promptly instead of
 // only at next page load. -> true when the tab the user was looking at vanished and redirectFromGoneActiveTab() already did the full leave/enter transition to a safe
 // fallback tab: the caller must then skip its own render calls, which would double-render on top of that.
 async function refreshPluginTabs() {
@@ -1156,6 +1156,7 @@ async function applyLivePlan(plan) {
   if (plan.branches && typeof refreshBranchesTab === 'function') await refreshBranchesTab({ kick: !!plan.kick });
   if (plan.panels) await refreshActiveTabPanels();
   if (plan.modal && typeof refreshTaskDetailModal === 'function') await refreshTaskDetailModal();
+  if (plan.touchpoints && typeof refreshTouchpointsChip === 'function') await refreshTouchpointsChip();
 }
 
 // The open self-rendering tab's own panel refreshers (it is never redrawn whole): the Project tab's pipeline and status panels, the Brain Dump tab's entry list (unforced: it skips an open edit or discussion), the Hygiene tab's inventory (quiet: no spinner; its own in-flight guard drops an overlapping load).

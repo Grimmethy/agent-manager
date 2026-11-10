@@ -8,7 +8,7 @@ from the owner brief, external docs, or not yet present in code — verify befor
 ## 1. Three-way split (the design rests on this)
 
 - **(a) What matters** — goals/initiatives, each with a metric the work should move.
-  Brief says cite `Docs/initiative-record-design.md` if it exists; it does not
+  Brief says cite `docs/design-notes/initiative-record-design.md` if it exists; it does not
   (`ls Docs/` shows no such file) `[unconfirmed]`. Treat "an initiative = a named target
   metric + the work expected to move it" as the working definition.
 - **(b) What is READY** — tasks carry *readiness conditions*, not just a rank. Examples:
@@ -41,7 +41,7 @@ Claim chain, in order, for one lane reading `<queue>/pending/`:
 7. Adhoc generation path: `nextAdhocTask` (src/task-sources.js:578) re-applies ordering
    through the source's `hubOrder` hook (src/hub-priority.js `DEFAULT_HUB_ORDER`) `[confirmed]`.
 8. Idle-lane borrowing: an idle lane may pick up tasks from another suite project when the
-   active project has nothing (Docs/idle-pool-borrowing.md, built 2026-09-20, kill switch
+   active project has nothing (docs/design-notes/idle-pool-borrowing.md, built 2026-09-20, kill switch
    `AGENT_MANAGER_POOL_BORROW`) `[confirmed]`.
 
 Signals that already exist:
@@ -68,7 +68,7 @@ Formula (kept small and explainable):
   per source and only moves when a metric actually moves.
 - `cost_of_delay` — **attention age, not wall-clock age**: age accrues only while the task's
   project is the active/attended one; a dormant project's tasks do not accumulate age.
-  Brief says cite `Docs/project-rotation-and-expiry-aging-findings.md` if it exists; it does
+  Brief says cite `docs/design-notes/project-rotation-and-expiry-aging-findings.md` if it exists; it does
   not `[unconfirmed]` — the principle (dormant projects do not age) is owner-stated.
   Each factor is normalised 0.0–1.0 before its weight is applied (the Slurm multifactor
   form, Prior Art) and weights are plain integers in a config file.
@@ -88,11 +88,11 @@ Formula (kept small and explainable):
    `[confirmed]`; per-task VRAM demand vs lane headroom.
 2. Forge-vs-pipeline exclusivity + GPU broker: broker is planned as
    `agent-manager-gpu-broker`, port 7449
-   (Docs/gpu-broker-extraction-map.md:71) `[confirmed]`; scheduler consumes broker
+   (docs/design-notes/gpu-broker-extraction-map.md:71) `[confirmed]`; scheduler consumes broker
    decisions rather than re-implementing allocation `[unconfirmed]` until broker lands.
 3. P40 heat budget: owner-stated limit on sustained P40 work `[unconfirmed]` (no code).
 4. One active project vs rotation; apply stage is per-project (idle-pool borrowing only
-   fires when active project is empty, Docs/idle-pool-borrowing.md) `[confirmed]`.
+   fires when active project is empty, docs/design-notes/idle-pool-borrowing.md) `[confirmed]`.
 5. WIP limits: max in-flight tasks per project and per hub
    (hub siblings already sequenced, src/hub-priority.js `siblingHolds`) `[confirmed]`.
 6. Exclusion rules (pinnedWorker, lane preference) stay as they are
@@ -122,7 +122,7 @@ Shown on the dashboard as a "Scheduler Decisions" tab reading the log directory 
 ## 7. Self-improvement without runaway
 
 - **Daily planning cycle**: scheduler proposes a slate (from the health ledger, tuning
-  loops, initiatives). Brief says cite `Docs/tuning-loops-design.md` if it exists; it does
+  loops, initiatives). Brief says cite `docs/design-notes/tuning-loops-design.md` if it exists; it does
   not `[unconfirmed]`. Owner approves or edits the slate (open-multi-agent approval
   pattern: bound to a hash of what the reviewer saw, Prior Art).
 - **Outcome feedback**: after work lands, check whether the targeted metric moved; adjust
@@ -132,13 +132,13 @@ Shown on the dashboard as a "Scheduler Decisions" tab reading the log directory 
   approval; **SHADOW MODE FIRST** — for at least one full week the scheduler only logs what
   it *would* pick next to what the queue actually picked, with a weekly comparison report;
   per-feature kill switch falls back to today's queue (same shape as
-  `AGENT_MANAGER_POOL_BORROW`, Docs/idle-pool-borrowing.md `[confirmed]`); rate limit on
+  `AGENT_MANAGER_POOL_BORROW`, docs/design-notes/idle-pool-borrowing.md `[confirmed]`); rate limit on
   estimate changes; shadow mode is the only mode in P0–P4 (Section 9).
 
 ## 8. Repo + plugin plan
 
 - Repo: `agent-manager-scheduler`; plugin name `scheduler`. Port: next free **after**
-  StageForge 7444 **and** the planned gpu-broker (Docs/gpu-broker-extraction-map.md:71
+  StageForge 7444 **and** the planned gpu-broker (docs/design-notes/gpu-broker-extraction-map.md:71
   `[confirmed]`) — recommend reserving 7446 `[unconfirmed]` pending broker allocation.
 - Registers as a plugin the same way other plugins do: `config.ensureRegistered()`
   requires each enabled plugin's `register.js` (src/config.js:452 `[confirmed]`).

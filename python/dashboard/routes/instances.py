@@ -115,7 +115,7 @@ def api_instances():
     for r in results:
         if not r.get("currentTaskId"):
             continue
-        # Which project the task belongs to (a lane can be running a borrowed suite project's task; docs/idle-pool-borrowing.md), and
+        # Which project the task belongs to (a lane can be running a borrowed suite project's task; docs/design-notes/idle-pool-borrowing.md), and
         # its hub looked up in THAT project's queue, not the active one's.
         project, borrowed, task_qdir = _worker_project_info(r, active_label, qdir)
         r["projectLabel"] = project

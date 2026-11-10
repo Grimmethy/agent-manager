@@ -1,6 +1,6 @@
 'use strict';
 
-// pool-projects.js -- which suite projects an idle lane may borrow work from (docs/idle-pool-borrowing.md).
+// pool-projects.js -- which suite projects an idle lane may borrow work from (docs/design-notes/idle-pool-borrowing.md).
 //
 // A registered project (projects.json) opts in with `"pool": true`. This module answers "given the ACTIVE project, which pool projects are
 // there, in what order, and what env makes one invocation run in that project's context". The loops that use it (worker lanes, reviewer, apply
@@ -348,6 +348,78 @@ function markPremiumEmpty(pipelineDir, { role = 'worker', lane = null, now = new
   markEmpty(pipelineDir, { now, file, ttlMs, role: premiumRoleKey(role, lane) });
 }
 
+// ---- stalled reviews (2026-11-10) ----
+// A record can sit in some project's queue/review/ with nobody reviewing it: 2026-11-10 a premium pf-backend record waited 22+ minutes because every reviewer
+// daemon was yielding its tick to host memory pressure (the broker marker said tight/critical), and NOTHING said so. stalledReviews lists the records that have
+// waited at least `minAgeMs` (default 10 min) with no live review claim, in the home project and every registered one; noteStalledReviews writes ONE
+// 'review-stalled' history event on that record's project (with the reason the caller knows) and one log line per record per hour. It piggybacks on the reviewer
+// daemon's own tick (no timer of its own), never moves or edits a record, and never throws.
+const STALL_MIN_AGE_MS = 10 * 60 * 1000;
+const STALL_NOTE_EVERY_MS = 60 * 60 * 1000;
+
+function claimIsLive(claimDir, name) {
+  try {
+    const owner = fs.readFileSync(path.join(claimDir, `${name}.d`, 'owner'), 'utf8').trim().split(/\s+/)[0];
+    const pid = Number(owner);
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return !!(e && e.code === 'EPERM');   // the process exists but is not ours: still a live claim
+  }
+}
+
+function stalledReviews({ homePipelineDir = null, projectsPath = PROJECTS_PATH, claimDir = null, now = new Date(), minAgeMs = STALL_MIN_AGE_MS } = {}) {
+  const out = [];
+  try {
+    const projects = readProjects(projectsPath).filter((e) => e && e.pipelineDir).map((e) => ({ pipelineDir: e.pipelineDir, label: e.label || path.basename(e.pipelineDir) }));
+    if (homePipelineDir && !projects.some((e) => real(e.pipelineDir) === real(homePipelineDir))) projects.unshift({ pipelineDir: homePipelineDir, label: path.basename(homePipelineDir) });
+    const seen = new Set();
+    for (const proj of projects) {
+      const key = real(proj.pipelineDir);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const dir = path.join(proj.pipelineDir, 'queue', 'review');
+      let names = [];
+      try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { continue; }
+      for (const name of names) {
+        let ageMs;
+        try { ageMs = now.getTime() - fs.statSync(path.join(dir, name)).mtimeMs; } catch { continue; }
+        if (!(ageMs >= minAgeMs)) continue;
+        if (claimDir && claimIsLive(claimDir, name)) continue;
+        let premium = false;
+        try { premium = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')).premiumPriority === true; } catch { /* unreadable: still reported */ }
+        out.push({ pipelineDir: proj.pipelineDir, label: proj.label, file: name, ageMs: Math.round(ageMs), premium });
+      }
+    }
+  } catch { /* never throws */ }
+  return out;
+}
+
+function noteStalledReviews({ reason = 'unknown', homePipelineDir = null, projectsPath = PROJECTS_PATH, claimDir = null, stateFile = null, now = new Date(), minAgeMs = STALL_MIN_AGE_MS, noteEveryMs = STALL_NOTE_EVERY_MS, log = console.log } = {}) {
+  const noted = [];
+  try {
+    const file = stateFile || path.join(path.dirname(statePath()), 'stalled-reviews.json');
+    let state = {};
+    try { state = JSON.parse(fs.readFileSync(file, 'utf8')) || {}; } catch { state = {}; }
+    const stalled = stalledReviews({ homePipelineDir, projectsPath, claimDir, now, minAgeMs });
+    const live = new Set(stalled.map((r) => `${real(r.pipelineDir)}/${r.file}`));
+    for (const k of Object.keys(state)) if (!live.has(k)) delete state[k];   // a record that moved on is forgotten, so a later stall is noted again
+    for (const r of stalled) {
+      const key = `${real(r.pipelineDir)}/${r.file}`;
+      const last = Date.parse(state[key]);
+      if (Number.isFinite(last) && now.getTime() - last < noteEveryMs) continue;
+      state[key] = now.toISOString();
+      const minutes = Math.round(r.ageMs / 60000);
+      require('./pipeline-history.js').logPipelineEvent(r.pipelineDir, 'review-stalled', { file: r.file, ageMinutes: minutes, premium: r.premium, reason, project: r.label });
+      log(`[review-stalled] ${r.label}: ${r.file} has waited ${minutes} min for a review${r.premium ? ' (premium)' : ''}; reason: ${reason}`);
+      noted.push(r);
+    }
+    try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(state)); } catch { /* best-effort */ }
+  } catch { /* never throws */ }
+  return noted;
+}
+
 // -> { set: {KEY: value}, unset: [KEY] } for running ONE invocation in `project`'s context from a lane whose home instances dir is
 // `homeInstancesDir`.
 function poolEnvFor(project, homeInstancesDir) {
@@ -373,6 +445,7 @@ function poolEnvArgs(project, homeInstancesDir) {
 module.exports = {
   enabled, poolProjects, poolEnvFor, poolEnvArgs, markBorrowed, markEmpty, readProjects, PROJECTS_PATH,
   registeredProjects, premiumReachEnabled, premiumStageDirs, hasPremium, premiumTaskClaimable, dependencyReleased, premiumProjects, markPremiumBorrowed, markPremiumEmpty,
+  stalledReviews, noteStalledReviews, STALL_MIN_AGE_MS,
 };
 
 if (require.main === module) {
@@ -406,10 +479,13 @@ if (require.main === module) {
     process.exit(hasPremium(a, { role: b || 'worker', lane: c || null }) ? 0 : 1);
   } else if (flag === '--mark-premium') {
     markPremiumBorrowed(a, { role: b || 'worker', homePipelineDir: c || null, lane: d || null });
+  } else if (flag === '--note-stalled-reviews') {
+    // node src/pool-projects.js --note-stalled-reviews <homePipelineDir> [reason]   one review-stalled event + log line per record waiting 10+ min with no live claim
+    noteStalledReviews({ homePipelineDir: a, reason: b || 'unknown', claimDir: process.env.AGENT_MANAGER_INSTANCES_DIR ? path.join(process.env.AGENT_MANAGER_INSTANCES_DIR, 'review-claims') : null });
   } else if (flag === '--mark-premium-empty') {
     markPremiumEmpty(a, { role: b || 'worker', lane: c || null });
   } else {
-    console.error('usage: pool-projects.js --list [role] | --labels [role] | --all | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir> [role] | --mark-empty <pipelineDir> [role] | --premium-projects <role> [lane] | --has-premium <pipelineDir> <role> [lane] | --mark-premium <pipelineDir> <role> <homePipelineDir> [lane] | --mark-premium-empty <pipelineDir> <role> [lane]');
+    console.error('usage: pool-projects.js --list [role] | --labels [role] | --all | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir> [role] | --mark-empty <pipelineDir> [role] | --premium-projects <role> [lane] | --has-premium <pipelineDir> <role> [lane] | --mark-premium <pipelineDir> <role> <homePipelineDir> [lane] | --mark-premium-empty <pipelineDir> <role> [lane] | --note-stalled-reviews <homePipelineDir> [reason]');
     process.exit(2);
   }
 }

@@ -5,7 +5,7 @@ artifact is this file. Written 2026-10-15 for the owner's request to turn the by
 system management and streamlining of Agent Manager (across many Claude sessions) into a
 set of small, repeatable, passive tasks that run through the existing pipeline.
 
-**Grounding statement.** `Docs/tuning-loops-catalogue.md` does **not** exist
+**Grounding statement.** `docs/design-notes/tuning-loops-catalogue.md` does **not** exist
 (unconfirmed — verify: no such file in the working tree), so
 this doc grounds in the nine loops from the owner's 2026-10-15 memory-and-skim pass, and
 says so. Motivation scale from that pass: ~2,799 commits on `origin/master` since
@@ -196,8 +196,8 @@ The registration seam already exists and is proven by the out-of-tree
 
 ## 5. Relationship to the Initiative record
 
-`Docs/initiative-record-design.md` is itself design-doc-only (confirmed
-(Docs/initiative-record-design.md:9)). Under it:
+`docs/design-notes/initiative-record-design.md` is itself design-doc-only (confirmed
+(docs/design-notes/initiative-record-design.md:9)). Under it:
 
 - A loop **is a recurring initiative**: the initiative record names the durable goal
   ("keep the blocked bucket drained"), while each run of the loop files individual
@@ -271,7 +271,7 @@ The registration seam already exists and is proven by the out-of-tree
 | Hygiene plugin as task-source plugin | **confirmed (README.md:76, README.md:135)** |
 | `unmerged-branch-review.md` exists | **confirmed (docs/agents/unmerged-branch-review.md)** |
 | `incident-amplification` stage machinery | **confirmed (src/incident-amplification.js:34)** |
-| Initiative record design doc | **confirmed (Docs/initiative-record-design.md:9)** |
+| Initiative record design doc | **confirmed (docs/design-notes/initiative-record-design.md:9)** |
 | Memory note `project-agent-manager-code-health-analysis-2026-10-08` | **unconfirmed — verify** (not in repo; memory note only) |
 | `<pipelineDir>/health-ledger/` location | **unconfirmed — verify** (new proposal) |
 | Loop plugin repo / `register.js` files | **unconfirmed — verify** (new proposal) |

@@ -6,8 +6,8 @@
 > **record**: why it was done, the decisions, what was built when (section 3) and what the build taught us (section 6). Sections 1 and 2 describe the
 > code **before** the extraction (as read on 2026-10-15/22) and are kept as history, not as a description of today.
 
-Status: **built and live as of 2026-10-23 (G7a/b/c done; G3b and G4 open or probably retired, see section 3)**. Originally a map, **verified 2026-10-22** by three read-only passes (`Docs/gpu-broker-verification-core.md`, `-videoforge.md`, `-promptforge.md`); corrections are folded in below and marked **[2026-10-22]** · Written 2026-10-15 from `master` at `6db5a58a` (core), PromptForge `3ca798a`,
-VideoForge `master` · Companion docs: `Docs/hub-tasks-extraction-map.md`, `Docs/brain-dump-extraction-map.md`,
+Status: **built and live as of 2026-10-23 (G7a/b/c done; G3b and G4 open or probably retired, see section 3)**. Originally a map, **verified 2026-10-22** by three read-only passes (`docs/design-notes/gpu-broker-verification-core.md`, `-videoforge.md`, `-promptforge.md`); corrections are folded in below and marked **[2026-10-22]** · Written 2026-10-15 from `master` at `6db5a58a` (core), PromptForge `3ca798a`,
+VideoForge `master` · Companion docs: `docs/design-notes/hub-tasks-extraction-map.md`, `docs/design-notes/brain-dump-extraction-map.md`,
 `docs/agents/repo-extraction-playbook.md` (the process this follows).
 
 **Why this exists.** Who holds the GPU is decided in three places that don't share code. The Forge family gets the card through a lease that

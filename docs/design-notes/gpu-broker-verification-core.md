@@ -1,6 +1,6 @@
 # GPU broker verification — core (map §1/5 vs core code)
 
-Date: 2026-10-16 · Scope: `Docs/gpu-broker-extraction-map.md` section 1 ("what exists today") and section 5 (open questions),
+Date: 2026-10-16 · Scope: `docs/design-notes/gpu-broker-extraction-map.md` section 1 ("what exists today") and section 5 (open questions),
 verified line-by-line against this core checkout. Every row re-grepped on this date; tags: **CONFIRMED / WRONG / UNCONFIRMED**.
 
 ## Verification table

@@ -424,6 +424,7 @@
   <h1>agent-manager</h1>
   <span class="pipeline-dir" id="pipeline-status">loading...</span>
   <span id="memory-chip" hidden></span>
+  <span id="touchpoints-chip" hidden></span>
   <button class="action" id="global-brain-dump-btn" style="margin-left:auto" title="Capture a quick note to Brain Dump from any tab">+ Brain Dump</button>
 </header>
 <div class="layout" id="layout">
@@ -480,10 +481,11 @@
 <script src="/static/js/brain-dump-chips.js"></script>
 <script src="/static/js/brain-dump-and-second-brain.js"></script>
 <script src="/static/js/hygiene-tab.js"></script>
+<script src="/static/js/touchpoints-card.js"></script>
 <script src="/static/js/live-updates.js"></script>
 <script>
 // CORE_TABS is the hardcoded tab-bar row set. TABS (core-ui.js) starts as a copy of it and
-// folds in any plugin-declared `tab` on top (Docs/hub-tasks-extraction-plan.md section 5,
+// folds in any plugin-declared `tab` on top (docs/design-notes/hub-tasks-extraction-plan.md section 5,
 // piece 3) -- with no plugin declaring a tab, TABS === CORE_TABS in content and the
 // dashboard behaves exactly as before this feature existed.
 const CORE_TABS = [
