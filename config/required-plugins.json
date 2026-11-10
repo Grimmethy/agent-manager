@@ -1,0 +1,5 @@
+{
+  "requiredPlugins": [
+    { "name": "agent-manager-hub-tasks", "range": "^0.1.0", "entry": "register.js" }
+  ]
+}

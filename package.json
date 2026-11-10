@@ -17,5 +17,8 @@
     "test": "node scripts/with-test-tmp.js node --test src/*.test.js src/**/*.test.js scripts/*.test.js test/*.test.js *.test.js",
     "drift-scan": "node src/drift-scan.js",
     "task-log-reconcile": "node src/task-log-reconcile.js"
-  }
+  },
+  "verifierChecks": [
+    { "name": "size-ratchet", "cmd": ["node", "-e", "const f='scripts/size-ratchet-check.js';if(!require('fs').existsSync(f))process.exit(0);process.exit(require('child_process').spawnSync('node',[f,'--base','origin/master'],{stdio:'inherit'}).status)"] }
+  ]
 }

@@ -1,0 +1,5 @@
+# 2026-09-06 sweep-liveness incident
+
+Confirmed live 2026-09-06: a Chat investigation ran `ps aux | grep decompose`, found nothing, and concluded the decompose mechanism (and, by extension, the whole pipeline) was down — while `watchdog`'s own heartbeat was fresh and 5 other real worker/reviewer processes were actively running the entire time.
+
+A sweep script will *always* be absent from `ps aux` between ticks even when working perfectly, because it only exists as a process for the seconds its own tick takes to run. The correct liveness question for any sweep is never "is a process named after it running" — it's "is `instances/watchdog.json`'s `lastHeartbeat` fresh" (that one heartbeat covers every sweep watchdog owns) plus, if you need to know a specific sweep actually ran recently and what it did, its own log file under `~/.local/state/agent-manager/logs/` (e.g. `coordinator-sweep.log`, `decompose-loop-autoroute.log`) or the task-level evidence a sweep leaves behind (a `stalenessFlag`, an `advisory` history entry, a moved queue file).

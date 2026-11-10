@@ -100,6 +100,14 @@ start_bg() {
   printf '[launch] started %s (pid %s), logging to %s\n' "$name" "$!" "$logfile"
 }
 
+# --- required plugins (begin) ---
+# config/required-plugins.json lists the plugins Agent Manager cannot run without (src/required-plugins.js; docs/PLUGIN_API.md "Required plugins"). A missing or
+# out-of-range one is a LOUD failure, never skipped silently: the status goes to stdout like the rest of this script, the error to stderr, no pipeline daemon is started (the dashboard still is, so its status can show
+# what is wrong) and this script exits with the check's code (3 unmet, 2 unusable config) after everything else has run.
+_REQUIRED_PLUGINS_RC=0
+node "${REPO_DIR}/src/required-plugins.js" || _REQUIRED_PLUGINS_RC=$?
+# --- required plugins (end) ---
+
 # --- TokenFold (optional token-compression proxy, github.com same-owner tokenfold repo) ---
 # When a TokenFold checkout is present (default: a sibling of this repo) and not disabled
 # via AGENT_MANAGER_TOKENFOLD=false, start its proxy in front of Ollama and reroute
@@ -167,7 +175,9 @@ elif [[ "${AGENT_MANAGER_TOKENFOLD:-true}" != "false" ]]; then
   printf '[launch] No usable TokenFold source found (vendor/tokenfold missing?) -- running direct to Ollama.\n'
 fi
 
-if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; then
+if [[ "$_REQUIRED_PLUGINS_RC" -ne 0 ]]; then
+  printf '[launch] ERROR: required plugins are unmet (see above) -- the pipeline daemons are NOT started. Fix the plugin, then launch again.\n' >&2
+elif [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; then
   printf '[launch] Repo root: %s\n' "$AGENT_MANAGER_REPO_ROOT"
 
   # (2026-09-20: the small qwen2.5:3b utility model this comment describes is gone -- every call now uses this one model; the pre-warm
@@ -310,3 +320,4 @@ if [[ "${1:-}" == "--open-browser" ]]; then
 fi
 
 printf '[launch] done. Stop everything with: %s/stop.sh\n' "$SCRIPT_DIR"
+exit "$_REQUIRED_PLUGINS_RC"

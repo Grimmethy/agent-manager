@@ -3180,25 +3180,13 @@ def _launch_pipeline_subprocess(child_env: dict, raw_path: str, include_apply: b
         )
         return {"started": True, "repoRoot": raw_path}
 
-    creationflags = subprocess.CREATE_NEW_CONSOLE
-    scripts = [
-        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "local-worker.ps1"), "-InstanceId", "worker-1"], "Local Worker 1"),
-        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "review-runner.ps1")], "Local Review Runner"),
-        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "queue-watchdog.ps1")], "Queue Watchdog"),
-    ]
-    if include_apply:
-        scripts.insert(2, (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "apply-runner.ps1")], "Apply Runner"))
-
-    for args, _label in scripts:
-        subprocess.Popen(args, env=child_env, creationflags=creationflags, cwd=str(PACKAGE_ROOT))
-
-    return {"started": True, "repoRoot": raw_path, "includeApply": include_apply, "skipPush": skip_push}
+    return {"started": False, "reason": "Windows is no longer supported: the PowerShell loops were retired; run scripts/launch.sh on Linux."}
 
 
 def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict:
     """Writes the chosen path/toggles into agent-manager.env (creating the file if it
     doesn't exist yet) and spawns the relevant loops as real, visible console windows,
-    same as launch.bat's own `start powershell.exe -NoExit ...` pattern -- shared by
+    through scripts/launch.sh -- shared by
     /api/pipeline/start and _restart_pipeline()."""
     # Pre-flight (2026-10-15): report -- and snapshot to a patch file -- uncommitted TRACKED changes in the
     # repo being entered AND the one being left, before _build_pipeline_env overwrites the active repo

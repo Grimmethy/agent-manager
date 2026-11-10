@@ -118,8 +118,8 @@ def api_task_archive(state, task_id):
     a delete-containing batch (the awaiting-confirm gate's own opposite of /confirm below)
     is exactly this action too: give up on it rather than let it apply."""
     from app import _archive_task_file, _stamp_manual_archive
-    if state not in ("blocked", "done", "needs-clarification", "awaiting-confirm"):
-        abort(400, description="only a blocked, done, needs-clarification, or awaiting-confirm task can be archived")
+    if state not in ("blocked", "done", "needs-clarification", "awaiting-confirm", "adhoc", "pending"):
+        abort(400, description="only a blocked, done, needs-clarification, awaiting-confirm, adhoc or pending task can be archived")
     body = request.get_json(silent=True) or {}
     qdir, _scope = _qdir_for_request(body)   # ?project=<repoRoot> archives in that registered project's queue (2026-11-02, cross-project workers)
     if not qdir:
@@ -900,51 +900,16 @@ def api_task_mark_done_clarification(task_id):
 
 @task_bp.route("/api/task/approved/<task_id>/apply", methods=["POST"])
 def api_task_apply(task_id):
-    """Manual per-task apply (three-tier approval mode, 2026-07-26): the missing piece that
-    makes 'prompt'/'approve'-tier tasks actually usable one at a time, instead of only via
-    the all-or-nothing AGENT_MANAGER_INCLUDE_APPLY global toggle. Shells out to
-    apply-runner.ps1 -TaskId <id> (a one-shot invocation mode that bypasses the automatic
-    loop's approval-mode filtering entirely, since a human explicitly clicked Apply) and
-    waits for it to finish -- a real git branch/commit/push can take a while, hence the
-    generous timeout, and this is deliberately synchronous (no async job tracking) since
-    the dashboard button needs a direct success/failure answer to show the user."""
-    from app import ENV_FILE_PATH, PACKAGE_ROOT, SRC_DIR, get_active_repo_root, logger, queue_dir, read_env_file
+    """Manual per-task apply. It used to shell out to src/apply-runner.ps1 -TaskId <id> (a Windows one-shot mode); that script is retired and
+    scripts/apply-task.sh has no single-task mode (it applies every approved task), so this answers 501 and the apply loop (scripts/apply-loop.sh)
+    applies the task on its next tick. The task must still be in approved/."""
+    from app import queue_dir
     qdir = queue_dir()
     if not qdir:
         abort(404)
-    approved_path = qdir / "approved" / f"{task_id}.json"
-    if not approved_path.is_file():
+    if not (qdir / "approved" / f"{task_id}.json").is_file():
         abort(404, description=f"'{task_id}' not found in approved/")
-
-    repo_root = get_active_repo_root()
-    if not repo_root:
-        abort(400, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
-
-    env_overrides = read_env_file(ENV_FILE_PATH)
-    env_overrides["AGENT_MANAGER_REPO_ROOT"] = repo_root
-    child_env = {**os.environ, **env_overrides}
-
-    script_path = SRC_DIR / "apply-runner.ps1"
-    try:
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path), "-TaskId", task_id],
-            capture_output=True, text=True, timeout=300, env=child_env, cwd=str(PACKAGE_ROOT),
-        )
-    except subprocess.TimeoutExpired as e:
-        logger.error(
-            "apply-runner.ps1 -TaskId %s timed out (script: %s): %s: %s",
-            task_id, str(script_path), type(e).__name__, str(e),
-            exc_info=True,
-        )
-        raise
-
-    output_tail = (result.stdout or "")[-4000:]
-    if result.returncode == 2:
-        return jsonify({"id": task_id, "applied": False, "reason": f"'{task_id}' was not found in approved/ by apply-runner.ps1 (raced with the automatic loop?)"}), 404
-    if result.returncode != 0:
-        return jsonify({"id": task_id, "applied": False, "reason": "apply-runner.ps1 exited non-zero", "output": output_tail}), 500
-
-    return jsonify({"id": task_id, "applied": True, "output": output_tail})
+    return jsonify({"id": task_id, "applied": False, "reason": "manual per-task apply is retired with the Windows runner; the apply loop applies approved tasks on its next tick"}), 501
 
 
 @task_bp.route("/api/task/needs-clarification/<task_id>/discuss/latest", methods=["GET"])

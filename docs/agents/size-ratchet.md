@@ -64,6 +64,14 @@ With no flag the script keeps each listed entry only while it is still an offend
 `min(old cap, current lines)`, and rewrites the allowlist. It exits 1 and lists any offender
 that is not on the allowlist (it never adds one). Commit the changed JSON with your change.
 
+**Checking a branch before merge (fast).** The repo-wide test takes minutes, so no merge gate runs it by default. This command scans only the source files a branch changed and compares them with the allowlist, in seconds:
+
+```bash
+node scripts/size-ratchet-check.js --base origin/master
+```
+
+Run it in the branch's checkout or in a trial-merge worktree (a `git merge --no-commit` that is staged but not committed counts). It lists every violation, one per line, and exits 1 on any; exit 2 means a bad `--base` or no allowlist. It never writes the allowlist. Merge gates should run it on the trial merge.
+
 **Re-baselining on purpose (an owner decision, not a fix).**
 
 ```bash
@@ -75,6 +83,10 @@ added, and it can raise caps, so use it only to freeze a known tree, for example
 system is first introduced. Run it on the tree the merge will produce (the base branch with
 your branch merged in), not on a stale checkout: a file that grew on the base branch since
 your checkout would otherwise get a cap below its real size and the merged tree fails.
+
+## The branch verifier runs it
+
+`package.json` declares the check for the branch verifier in agent-manager-pipeline-ops (`verifierChecks`, see that repository's `docs/branch-verifier.md`), so a branch that grows a frozen file or function, or adds an over-limit one, is held by the verifier instead of reaching a merge check with a red ratchet test (2026-11-10: master's ratchet test went red because no stage ran it). The declared command runs `scripts/size-ratchet-check.js --base origin/master` in the branch-head worktree and scans only the files the branch changed. A branch cut before the script existed has no `scripts/size-ratchet-check.js`; the command then exits 0 instead of failing (otherwise every older branch would read as a new failure). The verifier re-runs a failing check on the base, so an offender already on the base reads as pre-existing, not new.
 
 ## Test hooks
 

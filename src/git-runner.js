@@ -12,7 +12,7 @@
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
+const { ungatedMainPushAllowed, assertMainWriteAllowed } = require('./lib/main-push-policy.js');
 const { healGeneratedDirt } = require('./lib/apply-clone-dirt.js');
 
 const GIT_ENV = {
@@ -129,6 +129,7 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
       throw e;
     }
   }
+  const pushMainGated = () => { assertMainWriteAllowed(run, mainBranch, 'git-runner:pushMain'); return pushBranch(mainBranch); };
   // True only when a diverged local branch adds NOTHING its remote counterpart lacks -- it is a duplicate of origin's content (typically the same commits under
   // different SHAs after the stale-main rebase rewrote one side), so a rescue branch would only be a stale snapshot of the rolling branch. Seen 2026-10-04/05 on
   // TaxHarvest: 12 rescue branches in ~6 h, every one a near-copy of agent/triage-queue. Two signals, either suffices: (a) `git cherry <remote> <name>` lists no '+'
@@ -254,7 +255,7 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
     if (originInLocal && !localInOrigin) {
       if (ungatedMainPushAllowed()) {
         try {
-          run(['push', 'origin', `${mainBranch}:${mainBranch}`]);
+          assertMainWriteAllowed(run, mainBranch, 'git-runner:resetToMain:fast-forward'); run(['push', 'origin', `${mainBranch}:${mainBranch}`]);
         } catch (e) {
           throw new Error(`resetToMain: local ${mainBranch} is ahead of origin but fast-forwarding it to origin failed (push rejected -- e.g. a protected branch or a race): ${e.message}`);
         }
@@ -532,7 +533,7 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
     pruneRetractedCandidates: () => require('./lib/prune-retracted-candidates.js').pruneRetractedCandidates({ repoRoot, git: run, mainRef: `origin/${mainBranch}` }),
     add: (files) => run(['add', ...files]),
     commit: (messageFilePath) => run(['commit', '-F', messageFilePath]),
-    push: (branchName) => pushBranch(branchName),
+    push: (branchName) => (branchName === mainBranch ? pushMainGated() : pushBranch(branchName)),
     // 2026-09-24: closes the specific gap that produced two real incidents (a human
     // manually rescuing agent/triage-queue by hand on 2026-09-23, then four more identical
     // blocks on 2026-09-24) -- an ordinary non-fast-forward push rejection (origin moved
@@ -567,12 +568,7 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
     // per-task branch isolation, and resetToMain()'s hard reset to origin/<mainBranch>
     // would otherwise silently destroy an un-pushed local commit on the very next apply
     // -- confirmed live 2026-08-16, see apply-task.js's own comment on this path.
-    pushMain: () => {
-      if (!ungatedMainPushAllowed()) {
-        throw new Error(`pushMain refused: pushing ${mainBranch} to origin without a human gate is disabled (set AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH=true to override). Push a branch and merge it via the dashboard/PR instead.`);
-      }
-      return pushBranch(mainBranch);
-    },
+    pushMain: pushMainGated,
   };
 }
 
