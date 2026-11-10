@@ -118,8 +118,8 @@ def api_task_archive(state, task_id):
     a delete-containing batch (the awaiting-confirm gate's own opposite of /confirm below)
     is exactly this action too: give up on it rather than let it apply."""
     from app import _archive_task_file, _stamp_manual_archive
-    if state not in ("blocked", "done", "needs-clarification", "awaiting-confirm"):
-        abort(400, description="only a blocked, done, needs-clarification, or awaiting-confirm task can be archived")
+    if state not in ("blocked", "done", "needs-clarification", "awaiting-confirm", "adhoc", "pending"):
+        abort(400, description="only a blocked, done, needs-clarification, awaiting-confirm, adhoc or pending task can be archived")
     body = request.get_json(silent=True) or {}
     qdir, _scope = _qdir_for_request(body)   # ?project=<repoRoot> archives in that registered project's queue (2026-11-02, cross-project workers)
     if not qdir:

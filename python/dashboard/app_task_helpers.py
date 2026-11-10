@@ -411,7 +411,7 @@ def _archive_task_file(qdir, src):
 
 
 # States whose archive means "we are giving up on this task" (as opposed to the Done tab's tidy-up of finished work).
-_GIVE_UP_ARCHIVE_STATES = ("blocked", "needs-clarification", "awaiting-confirm")
+_GIVE_UP_ARCHIVE_STATES = ("blocked", "needs-clarification", "awaiting-confirm", "adhoc", "pending")
 
 
 # Repeated-blocker guard (2026-08-24, pipeline hardening, Grimmethy: "no 'repeated
