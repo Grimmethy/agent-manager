@@ -123,3 +123,63 @@ test('without a configured pipeline directory the gate refuses and writes no led
     assert.throws(() => assertMainPushReady('main', SHA, { now: NOW }), (e) => e.code === 'MAIN_PUSH_NOT_READY');
   });
 });
+
+// ---- HUB0364 piece 4: an inventory of every place that writes to main. ------------------------------------------------------------------------------------
+// The gate only protects the writers it knows. This test freezes the list of code that can put a commit on the remote's main branch, so a NEW writer fails here
+// until someone gates it and adds it. Behaviour of each gated writer is tested elsewhere: src/git-runner-main-gate.test.js (the Node runner paths) and
+// python/dashboard/test_main_push_gate.py (the two dashboard merge routes, plus a real-git end-to-end merge). Writers in OTHER repositories (the hub-tasks
+// plugin's coordinator) are not scanned here.
+const REPO = path.resolve(__dirname, '..', '..');
+function sourceFiles(dir, exts) {
+  const out = [];
+  for (const entry of fs.readdirSync(path.join(REPO, dir), { withFileTypes: true })) {
+    const rel = path.join(dir, entry.name);
+    if (entry.isDirectory()) { if (!['node_modules', '.venv', 'static', 'templates'].includes(entry.name)) out.push(...sourceFiles(rel, exts)); continue; }
+    if (exts.some((e) => entry.name.endsWith(e)) && !/\.test\.js$|(^|\/)test_[^/]*\.py$/.test(rel)) out.push(rel);
+  }
+  return out;
+}
+function countMatches(files, regex) {
+  const found = {};
+  for (const rel of files) {
+    const n = (fs.readFileSync(path.join(REPO, rel), 'utf8').match(regex) || []).length;
+    if (n) found[rel] = n;
+  }
+  return found;
+}
+
+test('inventory: the only Node code that pushes the main branch is git-runner.js, behind the gate; other files reach main through runner.pushMain()', () => {
+  const nodeFiles = [...sourceFiles('src', ['.js']), ...sourceFiles('scripts', ['.js'])];
+  // a raw push of the main branch: pushBranch(mainBranch) or the fast-forward push inside resetToMain
+  assert.deepEqual(countMatches(nodeFiles, /\bpushBranch\(mainBranch\)|run\(\['push', 'origin', `\$\{mainBranch\}:\$\{mainBranch\}`\]\)/g), { 'src/git-runner.js': 2 });
+  // every raw push is preceded by the gate call in the same file (pushMain, the fast-forward push); push('<main>') is routed to pushMain
+  const runner = fs.readFileSync(path.join(REPO, 'src/git-runner.js'), 'utf8');
+  assert.equal((runner.match(/assertMainWriteAllowed\(run, mainBranch, '/g) || []).length, 2);
+  assert.match(runner, /branchName === mainBranch \? pushMainGated\(\) : pushBranch\(branchName\)/);
+  // callers of the gated pushMain
+  assert.deepEqual(countMatches(nodeFiles, /\.pushMain\(\)/g), { 'src/apply-task.js': 1, 'src/lib/apply-main-batch.js': 1 });
+});
+
+test('inventory: shell scripts never push the main branch themselves', () => {
+  const shell = sourceFiles('scripts', ['.sh']);
+  const offenders = {};
+  for (const rel of shell) {
+    const bad = fs.readFileSync(path.join(REPO, rel), 'utf8').split('\n').filter((l) => !/^\s*#/.test(l) && /\bgit\b[^\n]*\bpush\b[^\n]*\b(main|master|\$\{?MAIN[A-Z_]*\}?)\b/.test(l));
+    if (bad.length) offenders[rel] = bad.length;
+  }
+  assert.deepEqual(offenders, {});
+});
+
+test('inventory: the dashboard writes to main in exactly three places, all inside the two routes the gate hook covers', () => {
+  const py = sourceFiles('python', ['.py']);
+  assert.deepEqual(countMatches(py, /_run_git\(\["push", "origin", (?:f"HEAD:\{main_branch\}"|main_branch)\]/g), { 'python/dashboard/routes/pipeline_1_more.py': 3 });
+  const routes = fs.readFileSync(path.join(REPO, 'python/dashboard/routes/pipeline_1_more.py'), 'utf8');
+  // the helpers that hold those pushes are reachable only from the gated routes
+  assert.equal((routes.match(/_merge_in_temp_worktree\(/g) || []).length, 2);   // its definition and the one call in _execute_git_merge
+  assert.equal((routes.match(/_execute_git_merge\(/g) || []).length, 2);        // its definition and the one call in api_git_merge_branch
+  // and the hook's URL pattern names both routes
+  const hook = fs.readFileSync(path.join(REPO, 'python/dashboard/main_push_gate.py'), 'utf8');
+  assert.match(hook, /branches\/\(\?P<regular>\.\+\)\/merge\|held-hub-branches\/\(\?P<early>\.\+\)\/merge-early/);
+  assert.match(routes, /route\("\/api\/git\/branches\/<path:branch>\/merge", methods=\["POST"\]\)/);
+  assert.match(routes, /route\("\/api\/git\/held-hub-branches\/<path:branch>\/merge-early", methods=\["POST"\]\)/);
+});
