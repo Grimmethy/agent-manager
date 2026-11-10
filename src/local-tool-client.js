@@ -210,7 +210,7 @@ const WRITE_TOOLS = [
     type: 'function',
     function: {
       name: 'run_bash',
-      description: 'Run a shell command inside a filesystem sandbox. The working directory is the primary repo root; every accessible repo is mounted writable (use `git -C <abs path>` or `cd` for another repo). Use for read-only investigation (git log/diff/show/status, running tests) or anything the file tools cannot do directly. Refuses `git merge`/`git push` -- use queue_reviewed_task for those.',
+      description: 'Run a shell command inside a filesystem sandbox. Commands START in the primary repo root (your checkout): use relative paths and never begin a command with `cd <your checkout> &&`, it only wastes tokens. Every accessible repo is mounted writable (use `git -C <abs path>` or `cd` only to reach a DIFFERENT repo). Use for read-only investigation (git log/diff/show/status, running tests) or anything the file tools cannot do directly. Refuses `git merge`/`git push` -- use queue_reviewed_task for those.',
       parameters: {
         type: 'object',
         properties: {
@@ -944,6 +944,12 @@ const MAX_ROLLBACK_ATTEMPTS = 2;
 // RESOLUTION line. Env-overridable; clamped below maxTurns so it always leaves room to act.
 const ORIENT_TURN_LIMIT = Number(process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS) || 10;
 
+// End-of-budget warning (2026-11-10, ornith turn analysis): 30-34% of ornith agentic-write runs hit the
+// turn cap and were forced to summarize, 80% of them after already editing; their last turns were test
+// runs and re-reads. Once a `nudgeToEditEarly` run that HAS edited is within this many turns of maxTurns,
+// inject one message: stop exploring, run the one targeted test, give the final RESOLUTION. Env-overridable.
+const TURNS_LEFT_WARNING = Number(process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING) || 8;
+
 // 2026-09-05, Grimmethy: real Chat panel investigation (chat-1788639495-31ed485b) burned
 // ~12.4 minutes and 16 turns auditing branches / reading git-runner.js -- confirmed live
 // via model-stats.db (turns_used=16, latency_ms=744939) that roughly the back half of that
@@ -1209,14 +1215,52 @@ function capToolResultForHistory(result) {
   return text.slice(0, MAX_TOOL_RESULT_CHARS - note.length) + note;
 }
 
+// Garbled tool names (2026-11-10, ornith trajectories): about 60 calls arrived as a real tool name with its last
+// characters replaced by junk ('grep_codecode', 'grep_codeome', 'grep_codease', 'grep_code' for grep_codebase), each
+// costing a turn on 'unknown tool'. A name is repaired to a registered tool only when it is at least 8 characters,
+// shares its first 6 characters with that tool, is within edit distance 4, and no other candidate sharing those
+// 6 characters is within 2 of that distance; anything else keeps the existing unknown-tool error.
+function editDistance(a, b) {
+  const prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i += 1) {
+    let diag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const up = prev[j];
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diag = up;
+    }
+  }
+  return prev[b.length];
+}
+
+function resolveToolName(name, handlerNames) {
+  if (typeof name !== 'string' || name.length < 8 || name.length > 40) return null;
+  const scored = handlerNames
+    .filter((h) => h.slice(0, 6) === name.slice(0, 6))
+    .map((h) => ({ h, d: editDistance(name, h) }))
+    .sort((x, y) => x.d - y.d);
+  if (!scored.length || scored[0].d > 4) return null;
+  if (scored.length > 1 && scored[1].d - scored[0].d < 2) return null;
+  return scored[0].h;
+}
+
 async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, toolCallLog) {
   messages.push(assistantMessage);
   for (const toolCall of toolCalls) {
-    const name = toolCall.function && toolCall.function.name;
+    let name = toolCall.function && toolCall.function.name;
     const args = (toolCall.function && toolCall.function.arguments) || {};
-    const handler = toolHandlers[name];
-    let result;
+    let handler = toolHandlers[name];
+    let repairedFrom = null;
     if (!handler) {
+      const fixed = resolveToolName(name, Object.keys(toolHandlers));
+      if (fixed) { repairedFrom = name; name = fixed; handler = toolHandlers[name]; }
+    }
+    let result;
+    if (!handler && typeof name === 'string' && name.startsWith('RESOLUTION')) {
+      // The model put its final answer inside a tool call (seen 2026-11-10). Say what to do instead of listing tools.
+      result = { error: 'that is not a tool: a RESOLUTION line belongs in your final message, written as plain text, with no tool call.' };
+    } else if (!handler) {
       // 2026-09-22 (pipeline hardening, 2nd repro): the bare "unknown tool: X" gave the
       // model no way to self-correct -- a tier-3 run called one hallucinated name
       // (`list_files`), got back nothing but the rejection, then spent its remaining
@@ -1232,7 +1276,7 @@ async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messa
         result = { error: `tool ${name} failed: ${e.message}` };
       }
     }
-    toolCallLog.push({ tool: name, args, result });
+    toolCallLog.push({ tool: name, args, result, ...(repairedFrom ? { repairedFrom } : {}) });
     messages.push({ role: 'tool', content: capToolResultForHistory(result) }); // the full result stays in toolCallLog above
   }
 }
@@ -1392,6 +1436,10 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     try {
       for (const entry of buildToolOutcomeEntries(auditCtx(turn, 'loop'), calls)) {
         logToolLoopEvent(pipelineDir, 'tool-outcome', entry);
+      }
+      for (const c of calls) {
+        // Sizes and ids only, never the garbled text itself (same rule as every other audit line).
+        if (c && c.repairedFrom) logToolLoopEvent(pipelineDir, 'repaired-name', { ...auditCtx(turn, 'loop'), tool: c.tool, nameChars: String(c.repairedFrom).length });
       }
     } catch { /* best-effort -- see logToolLoopEvent */ }
   };
@@ -1595,6 +1643,8 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   // the soft one, if there is STILL no edit, one last message: edit now or conclude
   // needs-human-decision -- decompose is not an option for a leaf.
   let hardNudgeFired = false;
+  // End-of-budget warning above (TURNS_LEFT_WARNING) -- fired at most once.
+  let turnsLeftWarned = false;
   const editToolCallCount = () => toolCallLog.filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
 
   // 2026-09-05 (Chat panel "stalls after declaring a tool call", Grimmethy): a real,
@@ -1674,6 +1724,19 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       messages.push({
         role: 'user',
         content: `Final warning: ${turn} turns used and zero edits on a task that a prior decompose pass already confirmed is implementable in one pass. Your NEXT message MUST be an edit_file or write_file call, OR exactly "RESOLUTION: needs-human-decision" followed by the one concrete fact you are missing. RESOLUTION: decompose is not available for this task.`,
+      });
+      turnStartLengths[turnStartLengths.length - 1] = messages.length;
+    }
+
+    // End-of-budget warning: a run that has already edited and is nearly out of turns gets one message to
+    // stop exploring and finish. Only for nudgeToEditEarly callers (implement runs), never chat.
+    if (nudgeToEditEarly && !turnsLeftWarned && maxTurns > TURNS_LEFT_WARNING
+        && turn >= Math.max(orientTurnLimit, maxTurns - TURNS_LEFT_WARNING)
+        && turn < maxTurns - 1 && editToolCallCount() > 0) {
+      turnsLeftWarned = true;
+      messages.push({
+        role: 'user',
+        content: `Budget warning: ${maxTurns - turn} turns remain before this run is cut off. Stop exploring and re-reading files now. Run only the ONE targeted test that proves your change (not the whole suite), fix only what it shows, then finish with your final message carrying exactly one RESOLUTION: line (implemented / no-changes-needed / decompose / needs-human-decision).`,
       });
       turnStartLengths[turnStartLengths.length - 1] = messages.length;
     }
@@ -1822,7 +1885,7 @@ module.exports = {
   writeFileTool, editFileTool, runBashTool, WRITE_TOOLS, CHAT_TOOLS,
   buildToolHandlers, buildWriteToolHandlers, buildChatToolHandlers,
   readTaskTool, searchTasksTool, taskSummary, windowSectionText, boundWindow,
-  withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT,
+  withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT, resolveToolName, TURNS_LEFT_WARNING,
   capBashOutput, MAX_BASH_OUTPUT_CHARS,
   estimateMessagesTokens, estimateContextTokens, RESERVED_RESPONSE_TOKENS, logContextAudit,
   IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, P40_REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS,

@@ -26,6 +26,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { openQueueCache, readTaskCached } = require('./queue-cache.js');   // node built-ins only: safe to load from the bash-called CLI too
 const { unmetPrerequisiteHubs } = require('./hub-prerequisites.js');   // fs + path only: safe to load from the bash-called CLI
 
@@ -348,6 +349,102 @@ function markPremiumEmpty(pipelineDir, { role = 'worker', lane = null, now = new
   markEmpty(pipelineDir, { now, file, ttlMs, role: premiumRoleKey(role, lane) });
 }
 
+// ---- stalled reviews (2026-11-10) ----
+// A record can sit in some project's queue/review/ with nobody reviewing it: 2026-11-10 a premium pf-backend record waited 22+ minutes because every reviewer
+// daemon was yielding its tick to host memory pressure (the broker marker said tight/critical), and NOTHING said so. stalledReviews lists the records that have
+// waited at least `minAgeMs` (default 10 min) with no live review claim, in the home project and every registered one; noteStalledReviews writes ONE
+// 'review-stalled' history event on that record's project (with the reason the caller knows) and one log line per record per hour. It piggybacks on the reviewer
+// daemon's own tick (no timer of its own), never moves or edits a record, and never throws.
+const STALL_MIN_AGE_MS = 10 * 60 * 1000;
+const STALL_NOTE_EVERY_MS = 60 * 60 * 1000;
+
+function claimIsLive(claimDir, name) {
+  try {
+    const owner = fs.readFileSync(path.join(claimDir, `${name}.d`, 'owner'), 'utf8').trim().split(/\s+/)[0];
+    const pid = Number(owner);
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return !!(e && e.code === 'EPERM');   // the process exists but is not ours: still a live claim
+  }
+}
+
+function stalledReviews({ homePipelineDir = null, projectsPath = PROJECTS_PATH, claimDir = null, now = new Date(), minAgeMs = STALL_MIN_AGE_MS } = {}) {
+  const out = [];
+  try {
+    const projects = readProjects(projectsPath).filter((e) => e && e.pipelineDir).map((e) => ({ pipelineDir: e.pipelineDir, label: e.label || path.basename(e.pipelineDir) }));
+    if (homePipelineDir && !projects.some((e) => real(e.pipelineDir) === real(homePipelineDir))) projects.unshift({ pipelineDir: homePipelineDir, label: path.basename(homePipelineDir) });
+    const seen = new Set();
+    for (const proj of projects) {
+      const key = real(proj.pipelineDir);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const dir = path.join(proj.pipelineDir, 'queue', 'review');
+      let names = [];
+      try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { continue; }
+      for (const name of names) {
+        let ageMs;
+        try { ageMs = now.getTime() - fs.statSync(path.join(dir, name)).mtimeMs; } catch { continue; }
+        if (!(ageMs >= minAgeMs)) continue;
+        if (claimDir && claimIsLive(claimDir, name)) continue;
+        let premium = false;
+        try { premium = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')).premiumPriority === true; } catch { /* unreadable: still reported */ }
+        out.push({ pipelineDir: proj.pipelineDir, label: proj.label, file: name, ageMs: Math.round(ageMs), premium });
+      }
+    }
+  } catch { /* never throws */ }
+  return out;
+}
+
+function noteStalledReviews({ reason = 'unknown', homePipelineDir = null, projectsPath = PROJECTS_PATH, claimDir = null, stateFile = null, now = new Date(), minAgeMs = STALL_MIN_AGE_MS, noteEveryMs = STALL_NOTE_EVERY_MS, log = console.log } = {}) {
+  const noted = [];
+  try {
+    // The once-per-record-per-hour decision is a per-record CLAIM taken with an atomic mkdir in a stalled-reviews directory next to the state file (2026-11-10:
+    // two reviewer daemons ticking together both read the old JSON state and both wrote the event). A claim younger than noteEveryMs means another process
+    // already noted that record; an older one is replaced by renaming it away first (rename is atomic, so only one process wins the replacement).
+    const file = stateFile || path.join(path.dirname(statePath()), 'stalled-reviews.json');
+    const claims = path.join(path.dirname(file), 'stalled-reviews');
+    try { fs.mkdirSync(claims, { recursive: true }); } catch { /* the mkdir below fails and the record is skipped */ }
+    const stalled = stalledReviews({ homePipelineDir, projectsPath, claimDir, now, minAgeMs });
+    const claimName = (r) => crypto.createHash('sha1').update(`${real(r.pipelineDir)}/${r.file}`).digest('hex').slice(0, 24);
+    const live = new Set(stalled.map(claimName));
+    try {
+      for (const n of fs.readdirSync(claims)) if (!live.has(n) && !n.includes('.')) fs.rmSync(path.join(claims, n), { recursive: true, force: true });   // a record that moved on is forgotten, so a later stall is noted again
+    } catch { /* best-effort */ }
+    for (const r of stalled) {
+      const mine = path.join(claims, claimName(r));
+      let won = false;
+      try { fs.mkdirSync(mine); won = true; } catch (e) {
+        if (!e || e.code !== 'EEXIST') continue;
+        let ageMs = 0;
+        try { ageMs = now.getTime() - fs.statSync(mine).mtimeMs; } catch { continue; }
+        if (ageMs < noteEveryMs) continue;   // another process (or an earlier tick) noted it within the hour
+        const gone = `${mine}.old-${process.pid}-${Date.now()}`;
+        try { fs.renameSync(mine, gone); } catch { continue; }   // somebody else replaced it first
+        try { fs.rmSync(gone, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { fs.mkdirSync(mine); won = true; } catch { continue; }
+      }
+      if (!won) continue;
+      try { fs.utimesSync(mine, now, now); } catch { /* the claim still holds */ }
+      const minutes = Math.round(r.ageMs / 60000);
+      require('./pipeline-history.js').logPipelineEvent(r.pipelineDir, 'review-stalled', { file: r.file, ageMinutes: minutes, premium: r.premium, reason, project: r.label });
+      log(`[review-stalled] ${r.label}: ${r.file} has waited ${minutes} min for a review${r.premium ? ' (premium)' : ''}; reason: ${reason}`);
+      noted.push(r);
+    }
+  } catch { /* never throws */ }
+  return noted;
+}
+
+// Premium reviews under tight memory pressure (owner decision 2026-11-10: "premium reviews can run under tight pressure"). The reviewer daemon used to yield
+// its whole tick whenever the memory-pressure marker said tight or critical, so a premium review waited 77 minutes. Now a TIGHT marker (never critical) lets
+// the reviewer run when a premium review is waiting: premium items only, one per tick (scripts/review-runner.sh). Kill switch
+// AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT=false restores the old answer. Pure so it can be tested; the shell reaches it through --premium-under-pressure.
+function premiumMayRunUnderPressure({ state, hasPremiumReview, env = process.env } = {}) {
+  if (String((env || {}).AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT || '').toLowerCase() === 'false') return false;
+  return state === 'tight' && hasPremiumReview === true;
+}
+
 // -> { set: {KEY: value}, unset: [KEY] } for running ONE invocation in `project`'s context from a lane whose home instances dir is
 // `homeInstancesDir`.
 function poolEnvFor(project, homeInstancesDir) {
@@ -373,6 +470,7 @@ function poolEnvArgs(project, homeInstancesDir) {
 module.exports = {
   enabled, poolProjects, poolEnvFor, poolEnvArgs, markBorrowed, markEmpty, readProjects, PROJECTS_PATH,
   registeredProjects, premiumReachEnabled, premiumStageDirs, hasPremium, premiumTaskClaimable, dependencyReleased, premiumProjects, markPremiumBorrowed, markPremiumEmpty,
+  stalledReviews, noteStalledReviews, STALL_MIN_AGE_MS, premiumMayRunUnderPressure,
 };
 
 if (require.main === module) {
@@ -406,10 +504,17 @@ if (require.main === module) {
     process.exit(hasPremium(a, { role: b || 'worker', lane: c || null }) ? 0 : 1);
   } else if (flag === '--mark-premium') {
     markPremiumBorrowed(a, { role: b || 'worker', homePipelineDir: c || null, lane: d || null });
+  } else if (flag === '--note-stalled-reviews') {
+    // node src/pool-projects.js --note-stalled-reviews <homePipelineDir> [reason]   one review-stalled event + log line per record waiting 10+ min with no live claim
+    noteStalledReviews({ homePipelineDir: a, reason: b || 'unknown', claimDir: process.env.AGENT_MANAGER_INSTANCES_DIR ? path.join(process.env.AGENT_MANAGER_INSTANCES_DIR, 'review-claims') : null });
+  } else if (flag === '--premium-under-pressure') {
+    // node src/pool-projects.js --premium-under-pressure <homePipelineDir> <state>   exit 0 when a premium review may run under that memory-pressure state
+    const waiting = hasPremium(a, { role: 'reviewer' }) || premiumProjects({ role: 'reviewer' }).length > 0;
+    process.exit(premiumMayRunUnderPressure({ state: b, hasPremiumReview: waiting }) ? 0 : 1);
   } else if (flag === '--mark-premium-empty') {
     markPremiumEmpty(a, { role: b || 'worker', lane: c || null });
   } else {
-    console.error('usage: pool-projects.js --list [role] | --labels [role] | --all | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir> [role] | --mark-empty <pipelineDir> [role] | --premium-projects <role> [lane] | --has-premium <pipelineDir> <role> [lane] | --mark-premium <pipelineDir> <role> <homePipelineDir> [lane] | --mark-premium-empty <pipelineDir> <role> [lane]');
+    console.error('usage: pool-projects.js --list [role] | --labels [role] | --all | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir> [role] | --mark-empty <pipelineDir> [role] | --premium-projects <role> [lane] | --has-premium <pipelineDir> <role> [lane] | --mark-premium <pipelineDir> <role> <homePipelineDir> [lane] | --mark-premium-empty <pipelineDir> <role> [lane] | --note-stalled-reviews <homePipelineDir> [reason] | --premium-under-pressure <homePipelineDir> <state>');
     process.exit(2);
   }
 }
