@@ -210,7 +210,7 @@ const WRITE_TOOLS = [
     type: 'function',
     function: {
       name: 'run_bash',
-      description: 'Run a shell command inside a filesystem sandbox. The working directory is the primary repo root; every accessible repo is mounted writable (use `git -C <abs path>` or `cd` for another repo). Use for read-only investigation (git log/diff/show/status, running tests) or anything the file tools cannot do directly. Refuses `git merge`/`git push` -- use queue_reviewed_task for those.',
+      description: 'Run a shell command inside a filesystem sandbox. Commands START in the primary repo root (your checkout): use relative paths and never begin a command with `cd <your checkout> &&`, it only wastes tokens. Every accessible repo is mounted writable (use `git -C <abs path>` or `cd` only to reach a DIFFERENT repo). Use for read-only investigation (git log/diff/show/status, running tests) or anything the file tools cannot do directly. Refuses `git merge`/`git push` -- use queue_reviewed_task for those.',
       parameters: {
         type: 'object',
         properties: {

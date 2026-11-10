@@ -443,6 +443,27 @@ test('editFileTool errors, without editing, when "find" matches more than once',
   });
 });
 
+test('runBashTool starts in the primary root: pwd is the first root, even with a second root registered', () => {
+  withFixtureRepo((mod, dir) => {
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'run-bash-other-'));
+    const result = mod.runBashTool([dir, other], { command: 'pwd' });
+    if (result.error) {
+      assert.match(result.error, /sandbox \(bwrap\) is not available/);
+    } else {
+      assert.equal(result.stdout.trim(), fs.realpathSync(dir));
+    }
+  });
+});
+
+test('run_bash write-tool description tells the model it already starts in the checkout and not to cd to it', () => {
+  const mod = require('./local-tool-client.js');
+  const bash = mod.WRITE_TOOLS.find((t) => t.function.name === 'run_bash');
+  assert.ok(bash, 'run_bash is in WRITE_TOOLS');
+  assert.match(bash.function.description, /START in the primary repo root/);
+  assert.match(bash.function.description, /never begin a command with `cd /);
+  assert.match(bash.function.description, /`cd` only to reach a DIFFERENT repo/);
+});
+
 test('runBashTool runs a real command in the repo root and captures stdout', () => {
   withFixtureRepo((mod, dir) => {
     fs.writeFileSync(path.join(dir, 'marker.txt'), 'present\n');
