@@ -741,9 +741,11 @@ function executedVerificationBlockReason(ev, options = {}) {
   if (ev.blockedTests && Array.isArray(ev.blockedTests) && ev.blockedTests.length) {
     bits.push(`test pinning failed: the covering tests pass on the base without the diff (${ev.blockedTests.length} test(s) unverified)`);
   }
-  const tail = (ev.tests && ev.tests.passed === false && ev.tests.raw)
+  const rawTail = (ev.tests && ev.tests.passed === false && ev.tests.raw)
     || ((ev.commands || []).find((c) => c.outcome === 'contradicted') || {}).detail
     || (ev.blockedTests && ev.blockedTests[0] ? String(ev.blockedTests[0]).slice(-700) : '');
+  // Truncate the tail so the total reason stays under 1600 chars (the redraft feedback limit).
+  const tail = rawTail && rawTail.length > 800 ? `...${rawTail.slice(-800)}` : rawTail;
   return `Deterministic gate: executed verification failed -- the diff was applied in a scratch worktree and ${bits.join('; ') || (ev.reasons || []).join('; ')}.${tail ? ` Output tail: ${tail}` : ''} No local-model review call spent on a draft whose own tests or claimed checks demonstrably fail.`;
 }
 
