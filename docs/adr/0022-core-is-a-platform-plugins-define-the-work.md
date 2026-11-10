@@ -1,6 +1,6 @@
 # ADR-0022 — Core is a platform; plugins define the work
 
-**Status:** Accepted (roadmap — implementation staged, see below)
+**Status:** Accepted (stages B, C, D done; G mostly done; A partial; E, F, H not started. See ADR-0025 for the revised end state: kernel + required plugins)
 
 ## Context
 
@@ -29,7 +29,7 @@ That left a **half-extraction**. The definitions moved, the substrate did not:
   `apply-task.js`, `system-report.js`, `staleness-fastpath.js`, `task-source-registry.js`,
   `arch-discovery-structcheck.js`, and `python/dashboard/app.py`.
 - **`arch-discovery-structcheck.js`** (worker invokes by hardcoded path) and
-  **`python/build_graph.py`** (produces `arch_discovery`'s graph input).
+  **`python/graph_build.py`** (produces `arch_discovery`'s graph input).
 
 The result is the worst of both worlds: the cost of two repos and a boundary, without the
 benefit of a core small enough to reason about or a plugin free to evolve its own candidate
@@ -73,7 +73,7 @@ generically by core (they replace the per-source-name branches):
 | `reviewGuidance: string \| (task) => string` | `review-task.js` `if (task.source === …)` block | `review-task.js` verdict-prompt builder |
 | `draftHook: { harnessFetch?, skipImplementWhen?, structuralCheck?, … }` | `local-draft.js` arch_import branches; the hardcoded `arch-discovery-structcheck.js` call | `local-draft.js` draft flow |
 | `reportClass: 'benefit' \| 'filtering' \| …` | `system-report.js` `if (source === …)` | `system-report.js` |
-| `graphInputBuilder: <script path>` | `build_graph.py` hardcoded invocation | dashboard "Build Graph", `queue-watcher.sh --check-due` |
+| `graphInputBuilder: <script path>` | `python/graph_build.py` hardcoded invocation | dashboard "Build Graph", `queue-watcher.sh --check-due` |
 | `description`, `domain` | `app.py`'s `SOURCE_DESCRIPTIONS` / `_SOURCE_TO_DOMAIN_KEY` maps | `--dump-topology` → `/api/job-types` |
 
 New registry APIs:
@@ -131,7 +131,7 @@ Stage D.
 
 ### Stage F — Graph builder registration
 `graphInputBuilder` field names a script; the dashboard button and `queue-watcher.sh
---check-due` run whatever's registered. `build_graph.py` / `visualize_graph.py` move to the
+--check-due` run whatever's registered. `python/graph_build.py` / `visualize_graph.py` move to the
 hygiene plugin; the dashboard shells out via the registered path.
 `community-coverage.json` / `graph.json` paths stay config-driven. Independent — any time
 after A.
@@ -183,6 +183,6 @@ shared harness utility.
 3. `backlog_*` home (Stage E): fold into `agent-manager-hygiene`, its own `backlog` plugin,
    or the Stage-H project-dev plugin? It is product-backlog work, closer to
    project-development than code-hygiene.
-4. `build_graph.py` shipped from a Node plugin (Stage F): acceptable as a script the
-   dashboard shells out to, or should the graph builder be its own tiny service? Lean:
-   script is fine.
+4. `python/graph_build.py` shipped from a Node plugin (Stage F): acceptable as a script the
+    dashboard shells out to, or should the graph builder be its own tiny service? Lean:
+    script is fine.
