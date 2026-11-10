@@ -31,7 +31,7 @@ def _context():
 
 class TestPostMergeStepsAreGuarded(unittest.TestCase):
     def setUp(self):
-        self.client = app.app.test_client()
+        self.client = __import__("gate_test_support").client(self)
         self.calls = []
         mock.patch.object(app, "get_active_repo_root", return_value="/tmp/x").start()
         mock.patch.object(route, "_validate_and_authorize_merge", return_value=_context()).start()

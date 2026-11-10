@@ -81,7 +81,7 @@ class CrossProjectActions(unittest.TestCase):
             self._saved = dict(branch_projects._state)
             branch_projects._state.update({"cache": {}, "thread": None})
         self.addCleanup(self._restore)
-        self.client = app.app.test_client()
+        self.client = __import__("gate_test_support").client(self)
         self.other_root = os.path.realpath(self.other["repo"])
 
     def _restore(self):

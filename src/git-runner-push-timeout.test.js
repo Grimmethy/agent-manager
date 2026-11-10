@@ -129,13 +129,13 @@ test('pushMain gets the same check, for the main branch name, once the ungated m
   }
 });
 
-test('pushMain with the gate closed still refuses before any git call', () => {
+test('pushMain with the gate closed still refuses, and never reaches a push', () => {
   const saved = process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
   delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
   try {
     const w = runnerFor(() => '');
-    assert.throws(() => w.runner.pushMain(), /pushMain refused/);
-    assert.equal(w.calls.length, 0);
+    assert.throws(() => w.runner.pushMain(), /main write refused/);
+    assert.equal(w.calls.filter((c) => c[0] === 'push').length, 0);   // the gate reads the head (rev-parse) but writes nothing
   } finally {
     if (saved !== undefined) process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH = saved;
   }

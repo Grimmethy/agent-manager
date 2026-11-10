@@ -298,7 +298,7 @@ class TestRemovalSnapshot(unittest.TestCase):
 
     def setUp(self):
         app._invalidate_branch_cache()
-        self.client = app.app.test_client()
+        self.client = __import__("gate_test_support").client(self)
         # The real apply lock is ~/.local/state/agent-manager/locks/apply-task.lock, the SAME file the live apply-task.sh loop holds every tick.
         # An endpoint test that takes it for real gets a 409 whenever the live pipeline happens to be mid-apply (seen under load: the older
         # tests in this file are exposed to that flake). These tests are about the ledger row, not the lock, so they do not touch it.
