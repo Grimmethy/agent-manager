@@ -64,6 +64,14 @@ With no flag the script keeps each listed entry only while it is still an offend
 `min(old cap, current lines)`, and rewrites the allowlist. It exits 1 and lists any offender
 that is not on the allowlist (it never adds one). Commit the changed JSON with your change.
 
+**Checking a branch before merge (fast).** The repo-wide test takes minutes, so no merge gate runs it by default. This command scans only the source files a branch changed and compares them with the allowlist, in seconds:
+
+```bash
+node scripts/size-ratchet-check.js --base origin/master
+```
+
+Run it in the branch's checkout or in a trial-merge worktree (a `git merge --no-commit` that is staged but not committed counts). It lists every violation, one per line, and exits 1 on any; exit 2 means a bad `--base` or no allowlist. It never writes the allowlist. Merge gates should run it on the trial merge.
+
 **Re-baselining on purpose (an owner decision, not a fix).**
 
 ```bash
