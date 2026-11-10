@@ -354,6 +354,91 @@ test('integration: the sandbox contains the diff\'s own tests -- a test that wri
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+// --- real-git integration: stacked hub piece with default-branch merge --------------------------------
+// Scenario: a hub branch is cut from master, then develop (the default branch) moves forward
+// with a dependency file. The hub adds a test that imports that dependency -- it only passes
+// when the default branch is merged in. This exercises the full mergeDefault -> applyDiff -> run
+// pipeline against real git, not mocks.
+test('integration: a test passing only on the merged default tree is reported as passing', { skip: !HAVE_BWRAP }, () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-verify-merge-'));
+  try {
+    const origin = path.join(tmpDir, 'origin.git');
+    const work = path.join(tmpDir, 'work');
+    const git = (args, cwd) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+    // 1. Initialize bare repo with master as the working branch
+    git(['init', '--bare', '-b', 'master', origin], tmpDir);
+    git(['clone', origin, work], tmpDir);
+    git(['checkout', '-b', 'master'], work);
+    fs.mkdirSync(path.join(work, 'src'), { recursive: true });
+    // Initial commit: base file only
+    fs.writeFileSync(path.join(work, 'src', 'base.js'), 'module.exports = { version: 1 };\n');
+    git(['add', '-A'], work);
+    git(['commit', '-m', 'initial'], work);
+    git(['push', 'origin', 'master'], work);
+
+    // 2. Create develop branch from this point (will become the default branch)
+    git(['checkout', '-b', 'develop'], work);
+    git(['push', 'origin', 'develop'], work);
+
+    // 3. Cut hub branch from master (BEFORE develop gets the dependency)
+    git(['checkout', 'master'], work);
+    git(['checkout', '-b', 'hub-feature'], work);
+
+    // 4. On develop (default branch), add the dependency file
+    git(['checkout', 'develop'], work);
+    fs.writeFileSync(path.join(work, 'src', 'dependency.js'), 'module.exports = { help: () => 42 };\n');
+    git(['add', '-A'], work);
+    git(['commit', '-m', 'add dependency to develop'], work);
+    git(['push', 'origin', 'develop'], work);
+
+    // 5. On hub branch, add a test that imports the dependency (only works after merge)
+    git(['checkout', 'hub-feature'], work);
+    const hubTest = `const test = require('node:test'); const assert = require('node:assert/strict');\n` +
+      `const dep = require('./dependency');\n` +
+      `test('dependency is available', () => assert.equal(dep.help(), 42));\n`;
+    fs.writeFileSync(path.join(work, 'src', 'hub.test.js'), hubTest);
+    git(['add', '-A'], work);
+    const hubDiff = git(['diff', '--cached', '--full-index', '--binary'], work);
+    git(['reset', '-q'], work);
+    fs.rmSync(path.join(work, 'src', 'hub.test.js'));
+
+    // 6. Provide a real mergeDefault that uses git merge
+    const realMergeDefault = (repoRoot, worktreeDir, mainBranch, defaultBranch) => {
+      try {
+        execFileSync('git', ['fetch', 'origin', defaultBranch], { cwd: worktreeDir, stdio: 'pipe', encoding: 'utf8' });
+        execFileSync('git', ['merge', `origin/${defaultBranch}`, '--no-edit'], { cwd: worktreeDir, stdio: 'pipe', encoding: 'utf8' });
+        const mergedSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: worktreeDir, stdio: 'pipe', encoding: 'utf8' }).trim();
+        return { mergedSha, conflict: false };
+      } catch (e) {
+        // Check for conflicts
+        const status = execFileSync('git', ['status', '--porcelain'], { cwd: worktreeDir, stdio: 'pipe', encoding: 'utf8' });
+        const conflicting = status.split('\n').filter((l) => l.startsWith('UU')).map((l) => l.slice(3).trim());
+        return { conflictingFiles: conflicting };
+      }
+    };
+
+    // 7. Run verifyDiff with defaultBranch set
+    const r = verifyDiff({
+      taskId: 'int-merge-test',
+      rawDiff: hubDiff,
+      repoRoot: work,
+      mainBranch: 'master',
+      defaultBranch: 'develop',
+      deps: { mergeDefault: realMergeDefault },
+      acceptanceResults: AR('`node --test src/hub.test.js`'),
+    });
+
+    // The test should pass because the dependency is merged in
+    assert.equal(r.status, 'passed', JSON.stringify(r));
+    assert.equal(r.tests.passed, true);
+    assert.equal(r.commands[0].outcome, 'confirmed');
+    assert.ok(r.mergedDefaultSha, 'mergedDefaultSha should be set');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 // --- covering tests by changed symbol (python/dashboard has no <name>.test.js / test_<name>.py convention) ---------
 test('extractChangedSymbols reads added/removed declarations and the function named in a hunk header', () => {
   const diff = [
