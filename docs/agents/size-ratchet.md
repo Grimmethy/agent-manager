@@ -84,6 +84,10 @@ system is first introduced. Run it on the tree the merge will produce (the base 
 your branch merged in), not on a stale checkout: a file that grew on the base branch since
 your checkout would otherwise get a cap below its real size and the merged tree fails.
 
+## The branch verifier runs it
+
+`package.json` declares the check for the branch verifier in agent-manager-pipeline-ops (`verifierChecks`, see that repository's `docs/branch-verifier.md`), so a branch that grows a frozen file or function, or adds an over-limit one, is held by the verifier instead of reaching a merge check with a red ratchet test (2026-11-10: master's ratchet test went red because no stage ran it). The declared command runs `scripts/size-ratchet-check.js --base origin/master` in the branch-head worktree and scans only the files the branch changed. A branch cut before the script existed has no `scripts/size-ratchet-check.js`; the command then exits 0 instead of failing (otherwise every older branch would read as a new failure). The verifier re-runs a failing check on the base, so an offender already on the base reads as pre-existing, not new.
+
 ## Test hooks
 
 `AGENT_MANAGER_SIZE_RATCHET_ROOT` points the scan at another tree and
