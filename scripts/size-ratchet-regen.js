@@ -10,7 +10,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { findLongFiles, findLongFunctions } = require('../src/sdk/size-limits.js');
+const { findLongFiles, findLongFunctions, countLines } = require('../src/sdk/size-limits.js');
 
 const SOURCE_EXT = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.py']);
 const FILE_LIMIT = () => Number(process.env.AGENT_MANAGER_MAX_FILE_LINES) || 500;
@@ -19,16 +19,25 @@ const repoRoot = () => process.env.AGENT_MANAGER_SIZE_RATCHET_ROOT || path.resol
 const allowlistPath = () => process.env.AGENT_MANAGER_SIZE_RATCHET_ALLOWLIST || path.join(__dirname, '..', 'config', 'size-ratchet-allowlist.json');
 
 // -> { files: {path: lines}, functions: {"path::name": lines} } for everything currently over a limit, source files only.
-function scanOffenders(root, limits) {
+// `only` (optional): an array of repo-relative paths. When given, only those files are measured, which is exactly what the full scan would report for them (a file's
+// length and each function's length depend on that file alone); a path that is missing, unreadable, not a source extension or under a skipped directory is ignored.
+function scanOffenders(root, limits, only) {
   const maxFileLines = (limits && limits.maxFileLines) || FILE_LIMIT();
   const maxFunctionLines = (limits && limits.maxFunctionLines) || FUNCTION_LIMIT();
   const out = { files: {}, functions: {} };
-  for (const f of findLongFiles(root, { maxLines: maxFileLines })) {
-    if (SOURCE_EXT.has(path.extname(f.path).toLowerCase())) out.files[f.path] = f.lines;
+  const scoped = Array.isArray(only);
+  if (!scoped) {
+    for (const f of findLongFiles(root, { maxLines: maxFileLines })) {
+      if (SOURCE_EXT.has(path.extname(f.path).toLowerCase())) out.files[f.path] = f.lines;
+    }
   }
-  for (const rel of listSourceFiles(root)) {
+  for (const rel of scoped ? only.filter(isScannablePath) : listSourceFiles(root)) {
     let text;
     try { text = fs.readFileSync(path.join(root, rel), 'utf8'); } catch { continue; }
+    if (scoped) {
+      const lines = countLines(text);
+      if (lines > maxFileLines) out.files[rel] = lines;
+    }
     for (const fn of findLongFunctions(text, rel, { maxLines: maxFunctionLines })) {
       const key = `${rel}::${fn.name || '<anonymous>'}`;
       out.functions[key] = Math.max(out.functions[key] || 0, fn.lines);
@@ -38,6 +47,9 @@ function scanOffenders(root, limits) {
 }
 
 const WALK_SKIP = new Set(['node_modules', '.git', '.venv', '__pycache__', 'dist', 'build', '.next', '.turbo']);
+function isScannablePath(rel) {
+  return SOURCE_EXT.has(path.extname(rel).toLowerCase()) && !rel.split(/[\\/]/).some((seg) => WALK_SKIP.has(seg));
+}
 function listSourceFiles(root) {
   const found = [];
   (function walk(dir) {
