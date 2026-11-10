@@ -667,3 +667,39 @@ test('review-runner.sh asks premiumMayRunUnderPressure before it yields, limits 
   // the premium-only borrowed tick re-enters the same block, so it is allowed under tight pressure too; critical never reaches the review code
   assert.match(sh, /if "\$ONCE" && \[\[ "\$\{AGENT_MANAGER_PREMIUM_ONLY_TICK:-\}" == "true" \]\]; then PREMIUM_ONLY=true; fi/);
 });
+
+// ---- the once-per-hour stalled note is atomic across reviewer daemons (2026-11-10: two daemons ticking together wrote the same event twice) ----
+test('two reviewer processes noting the same stalled record at the same moment write exactly ONE review-stalled event', async () => {
+  const { execFile } = require('child_process');
+  const poolFile = path.join(__dirname, 'pool-projects.js');
+  const child = `
+    const [t, poolFile, projectsPath, claimDir, stateFile, home] = process.argv.slice(1);
+    const { noteStalledReviews } = require(poolFile);
+    while (Date.now() < Number(t)) { /* start together */ }
+    noteStalledReviews({ projectsPath, claimDir, stateFile, homePipelineDir: home, reason: 'race', log: () => {} });
+  `;
+  for (let trial = 0; trial < 4; trial++) {
+    const w = stallWorld();
+    w.put(w.other, 'p.json', { premiumPriority: true }, 30);
+    const t = String(Date.now() + 700);
+    const run = () => new Promise((resolve, reject) => execFile('node', ['-e', child, t, poolFile, w.projectsPath, w.claimDir, w.stateFile, w.home], { env: { ...process.env, AGENT_MANAGER_QUEUE_CACHE_DIR: CACHE_ROOT } }, (err) => (err ? reject(err) : resolve())));
+    await Promise.all([run(), run()]);
+    assert.equal(w.events(w.other).length, 1, `trial ${trial}: exactly one event for the one stalled record`);
+  }
+});
+
+test('the stalled note keeps one claim per record: a fresh claim blocks a second note, a claim older than the hour is replaced once, and claims of records that left review/ are removed', () => {
+  const w = stallWorld();
+  w.put(w.other, 'a.json', { premiumPriority: true }, 30);
+  w.put(w.other, 'b.json', {}, 30);
+  const base = { projectsPath: w.projectsPath, claimDir: w.claimDir, stateFile: w.stateFile, log: () => {} };
+  const claims = path.join(path.dirname(w.stateFile), 'stalled-reviews');
+  assert.equal(noteStalledReviews({ ...base, reason: '1' }).length, 2);
+  assert.equal(fs.readdirSync(claims).length, 2, 'one claim per stalled record');
+  assert.equal(noteStalledReviews({ ...base, reason: '2', now: new Date(Date.now() + 59 * 60000) }).length, 0, 'a claim under an hour old blocks a second note');
+  assert.equal(noteStalledReviews({ ...base, reason: '3', now: new Date(Date.now() + 61 * 60000) }).length, 2, 'older than the hour: replaced and noted again');
+  assert.equal(fs.readdirSync(claims).length, 2, 'replacing leaves no stray directory behind');
+  fs.rmSync(path.join(w.other, 'queue', 'review', 'b.json'));
+  noteStalledReviews({ ...base, reason: '4', now: new Date(Date.now() + 62 * 60000) });
+  assert.equal(fs.readdirSync(claims).length, 1, 'the claim of the record that left review/ is removed');
+});

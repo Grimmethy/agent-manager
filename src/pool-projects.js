@@ -26,6 +26,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { openQueueCache, readTaskCached } = require('./queue-cache.js');   // node built-ins only: safe to load from the bash-called CLI too
 const { unmetPrerequisiteHubs } = require('./hub-prerequisites.js');   // fs + path only: safe to load from the bash-called CLI
 
@@ -399,23 +400,38 @@ function stalledReviews({ homePipelineDir = null, projectsPath = PROJECTS_PATH, 
 function noteStalledReviews({ reason = 'unknown', homePipelineDir = null, projectsPath = PROJECTS_PATH, claimDir = null, stateFile = null, now = new Date(), minAgeMs = STALL_MIN_AGE_MS, noteEveryMs = STALL_NOTE_EVERY_MS, log = console.log } = {}) {
   const noted = [];
   try {
+    // The once-per-record-per-hour decision is a per-record CLAIM taken with an atomic mkdir in a stalled-reviews directory next to the state file (2026-11-10:
+    // two reviewer daemons ticking together both read the old JSON state and both wrote the event). A claim younger than noteEveryMs means another process
+    // already noted that record; an older one is replaced by renaming it away first (rename is atomic, so only one process wins the replacement).
     const file = stateFile || path.join(path.dirname(statePath()), 'stalled-reviews.json');
-    let state = {};
-    try { state = JSON.parse(fs.readFileSync(file, 'utf8')) || {}; } catch { state = {}; }
+    const claims = path.join(path.dirname(file), 'stalled-reviews');
+    try { fs.mkdirSync(claims, { recursive: true }); } catch { /* the mkdir below fails and the record is skipped */ }
     const stalled = stalledReviews({ homePipelineDir, projectsPath, claimDir, now, minAgeMs });
-    const live = new Set(stalled.map((r) => `${real(r.pipelineDir)}/${r.file}`));
-    for (const k of Object.keys(state)) if (!live.has(k)) delete state[k];   // a record that moved on is forgotten, so a later stall is noted again
+    const claimName = (r) => crypto.createHash('sha1').update(`${real(r.pipelineDir)}/${r.file}`).digest('hex').slice(0, 24);
+    const live = new Set(stalled.map(claimName));
+    try {
+      for (const n of fs.readdirSync(claims)) if (!live.has(n) && !n.includes('.')) fs.rmSync(path.join(claims, n), { recursive: true, force: true });   // a record that moved on is forgotten, so a later stall is noted again
+    } catch { /* best-effort */ }
     for (const r of stalled) {
-      const key = `${real(r.pipelineDir)}/${r.file}`;
-      const last = Date.parse(state[key]);
-      if (Number.isFinite(last) && now.getTime() - last < noteEveryMs) continue;
-      state[key] = now.toISOString();
+      const mine = path.join(claims, claimName(r));
+      let won = false;
+      try { fs.mkdirSync(mine); won = true; } catch (e) {
+        if (!e || e.code !== 'EEXIST') continue;
+        let ageMs = 0;
+        try { ageMs = now.getTime() - fs.statSync(mine).mtimeMs; } catch { continue; }
+        if (ageMs < noteEveryMs) continue;   // another process (or an earlier tick) noted it within the hour
+        const gone = `${mine}.old-${process.pid}-${Date.now()}`;
+        try { fs.renameSync(mine, gone); } catch { continue; }   // somebody else replaced it first
+        try { fs.rmSync(gone, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { fs.mkdirSync(mine); won = true; } catch { continue; }
+      }
+      if (!won) continue;
+      try { fs.utimesSync(mine, now, now); } catch { /* the claim still holds */ }
       const minutes = Math.round(r.ageMs / 60000);
       require('./pipeline-history.js').logPipelineEvent(r.pipelineDir, 'review-stalled', { file: r.file, ageMinutes: minutes, premium: r.premium, reason, project: r.label });
       log(`[review-stalled] ${r.label}: ${r.file} has waited ${minutes} min for a review${r.premium ? ' (premium)' : ''}; reason: ${reason}`);
       noted.push(r);
     }
-    try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(state)); } catch { /* best-effort */ }
   } catch { /* never throws */ }
   return noted;
 }
