@@ -133,6 +133,13 @@ borrow_review_from_pool() {
   return 0
 }
 
+# Stalled reviews (2026-11-10): a record that has waited 10+ minutes in ANY registered project's review/ with no live claim gets ONE 'review-stalled' history event
+# (and one log line per record per hour) naming why this reviewer is not reviewing it. Piggybacks on this tick -- no timer. src/pool-projects.js noteStalledReviews.
+note_stalled_reviews() {
+  local reason="$1"
+  AGENT_MANAGER_INSTANCES_DIR="$INSTANCES_DIR" node "${PACKAGE_SRC_DIR}/pool-projects.js" --note-stalled-reviews "$PIPELINE_DIR" "$reason" >>"$LOG_FILE" 2>&1 || true
+}
+
 # Premium reach (2026-10-18, Grimmethy: "premium priority tasks happen regardless of what project repo is currently selected (currently
 # selected repo still wins the tie)"). Called by the daemon BEFORE its home review scan: when the home review/ holds no premium task and
 # another registered project (pooled or not) does, run ONE premium-only --once review tick there (least-recently-premium-borrowed first) and
@@ -179,6 +186,7 @@ while :; do
   # the GPU for an image generation this tick.
   if comfyui_lease_held "${OLLAMA_URL:-http://localhost:11434}"; then
     printf '[review-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+    note_stalled_reviews 'PromptForge holds the GPU (comfyui-lease), so reviewers are yielding'
     lane_note_gpu_pause "$INSTANCE_ID" "${LOCAL_MODEL:-}" "$STARTED_AT"   # heartbeat says "paused" (Workers tab) and remembers to warm the model up afterwards
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
@@ -189,6 +197,7 @@ while :; do
   # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
   if mem_pressure_high; then
     printf '[review-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
+    note_stalled_reviews "host memory pressure ($(mem_marker_state 2>/dev/null || echo tight)), so reviewers are yielding their ticks"
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
     continue
@@ -203,6 +212,7 @@ while :; do
   did_work=false                                                                 # tracks whether this tick actually reviewed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment).
 
   # Premium reach: another project's premium review goes before this reviewer's home REGULAR reviews (home premium still wins -- see the function).
+  if ! "$ONCE"; then note_stalled_reviews 'no live reviewer has claimed it yet'; fi
   if ! "$ONCE" && borrow_premium_review_from_projects; then sleep 1; continue; fi
   items=()
   while IFS= read -r name; do
