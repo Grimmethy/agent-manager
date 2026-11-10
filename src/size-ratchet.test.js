@@ -10,22 +10,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { scanOffenders, allowlistPath, repoRoot } = require('../scripts/size-ratchet-regen.js');
+const { checkRatchet } = require('../scripts/size-ratchet-check.js');
 
 const LIMITS = { maxFileLines: 500, maxFunctionLines: 100 };
-
-// -> readable violations: offenders that are not on the allowlist, and listed offenders above their cap.
-function checkRatchet(current, allowlist) {
-  const problems = [];
-  for (const kind of ['files', 'functions']) {
-    const label = kind === 'files' ? 'file' : 'function';
-    for (const [key, lines] of Object.entries(current[kind])) {
-      const cap = (allowlist[kind] || {})[key];
-      if (cap === undefined) problems.push(`${label} ${key} has ${lines} lines and is not on the allowlist`);
-      else if (lines > cap) problems.push(`${label} ${key} grew to ${lines} lines (cap ${cap})`);
-    }
-  }
-  return problems;
-}
 
 function tempTree(files) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'size-ratchet-'));
