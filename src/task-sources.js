@@ -202,6 +202,21 @@ function isDependencySatisfied(pipelineDir, depId) {
     path.join(pipelineDir, 'queue', 'done', `${trimmed}.json`),
     path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${trimmed}.json`),
   ];
+  // Also look in queue/done/_archived/<YYYY-MM>/<depId>.json where the daily done-archive
+  // pass moves completed records. Without this the dependency gate never sees a predecessor
+  // that has been archived (2026-11-09: 12 adhoc tasks in queue/adhoc/ were stuck forever
+  // because their dependsOn predecessor had been moved into _archived/ by the daily pass).
+  // Newest month first so the most recent archive is tried before older ones.
+  const archivedDir = path.join(pipelineDir, 'queue', 'done', '_archived');
+  try {
+    const months = fs.readdirSync(archivedDir).filter((entry) => {
+      try { return fs.statSync(path.join(archivedDir, entry)).isDirectory(); } catch { return false; }
+    }).sort().reverse();
+    for (const month of months) {
+      const candidate = path.join(archivedDir, month, `${trimmed}.json`);
+      if (fs.existsSync(candidate)) candidates.push(candidate);
+    }
+  } catch { /* no _archived directory -- adds nothing, fail silently */ }
   for (const candidate of candidates) {
     try {
       const data = JSON.parse(fs.readFileSync(candidate, 'utf8'));
