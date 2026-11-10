@@ -124,6 +124,20 @@ Known, deliberate exceptions:
   topology-derived (extending `--dump-topology` with `description`/`domain` + a frozen
   fallback) is a self-contained dashboard refactor, tracked separately.
 
+## Required plugins
+
+Some plugins are separate repositories that Agent Manager cannot run without. `config/required-plugins.json` is the Kernel's list of them, and a missing or out-of-range one must fail loudly (the rule `scripts/queue-watcher.sh` already applies to `agent-manager-hub-tasks`), never be skipped silently:
+
+```json
+{ "requiredPlugins": [ { "name": "agent-manager-hub-tasks", "range": "^0.1.0", "entry": "register.js" } ] }
+```
+
+- `name` is the plugin's name in `plugins.json` (resolved by `src/resolve-plugin-root.js`, enabled entries only); `range` is a semver range the `version` in the plugin's own `package.json` must satisfy (the releases are a pinned set); `entry` is a file the plugin root must contain (default `register.js`).
+- Supported ranges: an exact version, `=`, `>`, `>=`, `<`, `<=`, `^`, `~`, x-ranges and `*`, joined by spaces (AND) or `||` (OR). Pre-release and build tags are ignored. Any other range is `INVALID_RANGE`, never a pass.
+- `src/required-plugins.js` exports `loadRequired`, `checkRequiredPlugins`, `assertRequiredPlugins` (throws `RequiredPluginError` carrying the readable text from `failureText`) and `satisfies`. Each result has a status: `ok`, `MISSING`, `NO_VERSION`, `OUT_OF_RANGE`, `INVALID_RANGE` or `NO_ENTRY`.
+- `node src/required-plugins.js [--config <file>] [--json]` is the same check as a command: it prints the status, writes the failure text to stderr and exits 3 when anything is unmet (2 when the config itself cannot be read, 0 when all are met). Startup scripts, the dashboard and the watchdog call it or the module.
+- The list is data. It names only the plugins that exist as separate repositories today; each extraction task adds its plugin (adhoc, draft, review, apply, merge, models) in the same change that creates the repository.
+
 ## Expiring queued work (optional)
 
 A source whose queued tasks go stale WHILE they wait (change_review: a review of a commit that has since aged past the source's recency window)
