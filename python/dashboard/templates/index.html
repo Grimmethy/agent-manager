@@ -44,6 +44,8 @@
   a { color: var(--link); }
   a:hover { text-decoration: underline; }
   header { padding: 14px 20px; border-bottom: 2px solid var(--border); display: flex; align-items: center; gap: 16px; }
+  #required-plugins-banner { padding: 8px 20px; background: rgba(224,87,92,.15); color: var(--bad); border-bottom: 2px solid var(--bad); overflow-wrap: anywhere; }
+  #required-plugins-banner[hidden] { display: none; }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .pipeline-dir { color: var(--muted); font-size: 12px; }
   .layout { display: flex; }
@@ -427,6 +429,7 @@
   <span id="touchpoints-chip" hidden></span>
   <button class="action" id="global-brain-dump-btn" style="margin-left:auto" title="Capture a quick note to Brain Dump from any tab">+ Brain Dump</button>
 </header>
+<div id="required-plugins-banner" role="alert" hidden></div>
 <div class="layout" id="layout">
   <nav id="nav"></nav>
   <main id="main"><div class="empty">Loading...</div></main>
@@ -462,6 +465,7 @@
 <script src="/static/js/workflow-node-panel.js"></script>
 <script src="/static/js/workflow-graph-view.js"></script>
 <script src="/static/js/cloud-spend-panel.js"></script>
+<script src="/static/js/required-plugins-banner.js"></script>
 <script src="/static/js/stalled-worker-panel.js"></script>
 <script src="/static/js/verifier-worker-panel.js"></script>
 <script src="/static/js/needswork-worker-panel.js"></script>
