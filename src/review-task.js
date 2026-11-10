@@ -461,6 +461,7 @@ function formatExecutedVerificationSection(ev) {
     out.push(`- Changed code NOT pinned by any test (${unpinned.hunks.length} of ${unpinned.checked} hunk(s) checked): ${evList(where, EV_MAX_ITEMS)}. The harness reverted each of these hunks on its own and every covering test still passed, so no test demonstrates that this code does what the draft claims. It may be a pure refactor, so this alone is not a reason to reject; but do not accept the draft's claims about the behavior of these lines as demonstrated, and check that its Acceptance block does not rest on them.`);
   }
   if (ev.status === 'inconclusive' && Array.isArray(ev.reasons) && ev.reasons.length) out.push(`- Why it is inconclusive: ${evList(ev.reasons.map((r) => String(r).slice(0, 200)), 2)}.`);
+  if (ev.mergedDefaultSha) out.push(`- The diff was also merged onto the default branch (${ev.mergedDefaultSha}) in the scratch worktree alongside the base branch -- the harness confirmed the diff applies and tests pass on a worktree that includes the default branch.`);
   out.push('How to use this: PASSED means ONLY that the listed tests passed and the listed commands exited 0 against the diff applied to its base. It says nothing about whether the diff does what the TASK asked, stays in scope, or meets every requirement -- keep judging those yourself. INCONCLUSIVE is neither a pass nor a failure: the harness could not decide, so judge the draft on the rest of the evidence and do not count it either way. Do not re-litigate a confirmed check or call its reported result fabricated, and do not reject a draft because a file IT CREATES is missing from the live repo -- that file is added by the diff.');
   return out.join('\n');
 }
@@ -1495,8 +1496,10 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       const verify = require('./review-repro.js').wantsRepro(task, { hubChild: isHubChildTask(task) }) ? (a) => verifyBase({ ...a, checkRepro: true }) : verifyBase;
       // A stacked hub sub-task builds on its shared branch, not on master -- verify against the same base the draft used.
       const baseBranch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
+      // Detect the repo's real default branch (e.g. "main" or "master") so the harness can merge it into the worktree and confirm the diff still applies against the default.
+      const defaultBranch = require('./git-runner.js').detectDefaultBranch(repoRoot);
       const budget = parseInt(process.env.AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS, 10);
-      ev = verify({ taskId: task.id, rawDiff: extractedDiff, acceptanceResults: task.acceptanceResults || [], repoRoot, mainBranch: baseBranch, budgetMs: budget > 0 ? budget : EXECUTED_VERIFY_BUDGET_MS, checkUnpinned: process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK !== 'false', pipelineDir, checkReplay: process.env.AGENT_MANAGER_REVIEW_GATE_REPLAY !== 'false' });
+      ev = verify({ taskId: task.id, rawDiff: extractedDiff, acceptanceResults: task.acceptanceResults || [], repoRoot, mainBranch: baseBranch, defaultBranch, budgetMs: budget > 0 ? budget : EXECUTED_VERIFY_BUDGET_MS, checkUnpinned: process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK !== 'false', pipelineDir, checkReplay: process.env.AGENT_MANAGER_REVIEW_GATE_REPLAY !== 'false' });
     } catch (e) {
       console.error(`[review] executed verification errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
     }
