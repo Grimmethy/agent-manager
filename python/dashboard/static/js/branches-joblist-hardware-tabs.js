@@ -1156,6 +1156,7 @@ async function applyLivePlan(plan) {
   if (plan.branches && typeof refreshBranchesTab === 'function') await refreshBranchesTab({ kick: !!plan.kick });
   if (plan.panels) await refreshActiveTabPanels();
   if (plan.modal && typeof refreshTaskDetailModal === 'function') await refreshTaskDetailModal();
+  if (plan.touchpoints && typeof refreshTouchpointsChip === 'function') await refreshTouchpointsChip();
 }
 
 // The open self-rendering tab's own panel refreshers (it is never redrawn whole): the Project tab's pipeline and status panels, the Brain Dump tab's entry list (unforced: it skips an open edit or discussion), the Hygiene tab's inventory (quiet: no spinner; its own in-flight guard drops an overlapping load).

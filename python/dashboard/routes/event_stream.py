@@ -27,6 +27,7 @@ def _providers():
             "plugin-states-changed": (_plugin_states, PLUGIN_STATES_INTERVAL_S),
             "pipeline-state-changed": (_pipeline_state, PIPELINE_STATE_INTERVAL_S),
             "brain-dump-changed": event_stream.dir_files_fact(lambda: [], _brain_dump_files),
+            "touchpoints-changed": event_stream.dir_files_fact(lambda: [], _touchpoint_files),
             "hygiene-changed": event_stream.dir_files_fact(_hygiene_specs),
             "task-records-changed": event_stream.dir_files_fact(_live_task_specs),
             "settings-changed": event_stream.dir_files_fact(lambda: [], _settings_files),
@@ -94,6 +95,13 @@ def _brain_dump_files():
     Whoever writes an entry (the tab, the chat, a pipeline sweep, a hand edit) replaces or grows the file, so its stat key moves and the open tab is told."""
     from app import brain_dump_path
     return [brain_dump_path()]
+
+
+def _touchpoint_files():
+    """The requeue-attribution database (and its write-ahead log) behind GET /api/stats/touchpoints-per-day: every recorded requeue moves one of their stat keys, so the header chip is told."""
+    from app import _requeue_attribution_db_path
+    db = _requeue_attribution_db_path()
+    return [db, str(db) + "-wal"] if db else []
 
 
 _TASK_JSON = re.compile(r"\.json$")
