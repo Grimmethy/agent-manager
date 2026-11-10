@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import branch_verdicts
+import main_push_safe_class
 
 logger = logging.getLogger(__name__)
 
@@ -40,15 +41,20 @@ def _parse_time(text):
     return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
 
 
-def not_ready_reason(store, branch, head_sha, now):
-    """Why this (branch, head sha) is not READY, or None when it is. `now` is a datetime."""
+def not_ready_reason(store, branch, head_sha, now, diff_facts_loader=None):
+    """Why this (branch, head sha) is not READY, or None when it is. `now` is a datetime. `diff_facts_loader` (optional, called only for the checker worker's own merge) returns the diff facts of main_push_safe_class.read_diff_facts: with it, a worker merge for a safe diff class is READY."""
     record = ((store or {}).get(branch) or {}).get(head_sha)
     if not isinstance(record, dict):
         return f"no verdict recorded for {branch} at {head_sha}"
     if record.get("verdict") != "merge":
         return f"the verdict for {branch} at {head_sha} is '{record.get('verdict')}', not 'merge'"
     if record.get("source") not in branch_verdicts.HUMAN_SOURCES:
-        return f"the merge verdict for {branch} at {head_sha} comes from '{record.get('source')}', not a human source (chat or manual)"
+        not_human = f"the merge verdict for {branch} at {head_sha} comes from '{record.get('source')}', not a human source (chat or manual)"
+        if not main_push_safe_class.worker_class_applies(record, diff_facts_loader):
+            return not_human
+        unsafe, _facts = main_push_safe_class.unsafe_reason(diff_facts_loader)
+        if unsafe:
+            return f"{not_human}; {unsafe}"
     at = _parse_time(record.get("verifiedAt"))
     if at is None:
         return f"the merge verdict for {branch} at {head_sha} has no valid verifiedAt timestamp"
@@ -71,16 +77,25 @@ def _append_ledger(queue_dir, entry):
         logger.warning("could not write the main-push ledger row for %s: %s", entry.get("branch"), exc)
 
 
-def assert_main_push_ready(queue_dir, branch, head_sha, caller=None, task_id=None, now=None):
-    """Raise MainPushNotReady unless `branch` at exactly `head_sha` has a READY record in `queue_dir`'s verdict store. Returns {"allowed": True, "bypass": bool}."""
+def assert_main_push_ready(queue_dir, branch, head_sha, caller=None, task_id=None, now=None, diff_facts_loader=None):
+    """Raise MainPushNotReady unless `branch` at exactly `head_sha` has a READY record in `queue_dir`'s verdict store. Returns {"allowed": True, "bypass": bool}, plus "viaClass" when a checker worker's merge passed on a safe diff class (one `allowed-worker-class` ledger row is written)."""
     if os.environ.get("AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH") == "true":
         logger.warning("AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH=true: allowing a main write for %s@%s without a READY record (caller: %s)", branch, head_sha, caller or "unknown")
         return {"allowed": True, "bypass": True}
     now = now or datetime.now(timezone.utc)
-    reason = "branch and headSha are both required" if not branch or not head_sha else not_ready_reason(branch_verdicts.load_verdicts(queue_dir), branch, head_sha, now)
+    seen = []  # the diff facts, when the loader was used: a pass with them is a worker merge cleared by its safe diff class
+
+    def loader():
+        seen.append(diff_facts_loader())
+        return seen[-1]
+
+    reason = "branch and headSha are both required" if not branch or not head_sha else not_ready_reason(branch_verdicts.load_verdicts(queue_dir), branch, head_sha, now, loader if diff_facts_loader else None)
+    stamp = now.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    if reason is None and seen:
+        _append_ledger(queue_dir, {"at": stamp, "outcome": "allowed-worker-class", "branch": branch, "headSha": head_sha, "caller": caller, "taskId": task_id, "class": seen[-1]["class"], "files": seen[-1]["files"]})
+        return {"allowed": True, "bypass": False, "viaClass": seen[-1]["class"]}
     if reason is None:
         return {"allowed": True, "bypass": False}
-    stamp = now.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     _append_ledger(queue_dir, {"at": stamp, "outcome": "refused", "branch": branch or None, "headSha": head_sha or None, "caller": caller, "taskId": task_id, "reason": reason})
     raise MainPushNotReady(
         f"main write refused: {reason}. A main write needs a READY record (a chat or manual merge verdict) for the exact head sha; "

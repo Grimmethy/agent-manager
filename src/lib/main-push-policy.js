@@ -34,6 +34,7 @@ function ungatedMainPushAllowed() {
 // Every refusal appends one line to <pipelineDir>/queue/main-push-ledger.jsonl (same append-only, best-effort shape as branch-removals.jsonl).
 // The only bypass is AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH=true, which warns on stderr and writes nothing.
 // Optional: AGENT_MANAGER_MAIN_PUSH_READY_MAX_AGE_HOURS (a positive number) refuses a record older than that; unset means no age limit.
+// A checker worker's `merge` for a docs-only, tests-only or new-files-only diff is accepted by the Python gate only (main_push_safe_class.py): this module guards the pipeline's own pushes of main, which no worker branch verdict covers.
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 const fs = require('fs');
 const path = require('path');
