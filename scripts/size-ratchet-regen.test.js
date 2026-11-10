@@ -1,109 +1,69 @@
 'use strict';
 
-const { describe, it } = require('node:test');
-const assert = require('node:assert');
+const test = require('node:test');
+const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
-const { execSync } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
+const { scanOffenders, lowerOnly } = require('./size-ratchet-regen.js');
 
-const REGEN_SCRIPT = path.join(__dirname, '..', 'scripts', 'size-ratchet-regen.js');
-const ALLOWLIST_PATH = path.join(__dirname, '..', 'config', 'size-ratchet-allowlist.json');
+const SCRIPT = path.join(__dirname, 'size-ratchet-regen.js');
+const LIMITS = { maxFileLines: 500, maxFunctionLines: 100 };
+const lines = (n) => 'const x = 1;\n'.repeat(n);
 
-describe('size-ratchet-regen.js', () => {
-  it('--init flag creates allowlist file', () => {
-    // Remove allowlist if it exists
-    if (fs.existsSync(ALLOWLIST_PATH)) {
-      fs.unlinkSync(ALLOWLIST_PATH);
-    }
-
-    // Run regen with --init
-    execSync(`node ${REGEN_SCRIPT} --init`, {
-      cwd: path.join(__dirname, '..'),
-      env: { ...process.env, AGENT_MANAGER_MAX_FILE_LINES: '500', AGENT_MANAGER_MAX_FUNCTION_LINES: '100' }
-    });
-
-    // Verify allowlist was created
-    assert.ok(fs.existsSync(ALLOWLIST_PATH), 'Allowlist file should exist after --init');
+function tree(files) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'size-regen-'));
+  for (const [rel, text] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), text);
+  }
+  return root;
+}
+function run(root, allowlist, args) {
+  const r = spawnSync(process.execPath, [SCRIPT, ...args], {
+    env: { ...process.env, AGENT_MANAGER_SIZE_RATCHET_ROOT: root, AGENT_MANAGER_SIZE_RATCHET_ALLOWLIST: allowlist, AGENT_MANAGER_MAX_FILE_LINES: '500', AGENT_MANAGER_MAX_FUNCTION_LINES: '100' },
+    encoding: 'utf8',
   });
+  return { status: r.status, stderr: r.stderr, data: fs.existsSync(allowlist) ? JSON.parse(fs.readFileSync(allowlist, 'utf8')) : null };
+}
 
-  it('Allowlist contains only files/functions below limits (LOWER-only semantics)', () => {
-    // Run regen with specific limits
-    execSync(`node ${REGEN_SCRIPT} --init`, {
-      cwd: path.join(__dirname, '..'),
-      env: { ...process.env, AGENT_MANAGER_MAX_FILE_LINES: '100', AGENT_MANAGER_MAX_FUNCTION_LINES: '50' }
-    });
+test('scanOffenders lists only files and functions OVER the limits, never compliant ones', () => {
+  const root = tree({ 'a.js': lines(501), 'b.js': lines(10), 'c.py': 'def big():\n' + '    x = 1\n'.repeat(150) });
+  const found = scanOffenders(root, LIMITS);
+  assert.deepEqual(found.files, { 'a.js': 501 });
+  assert.deepEqual(Object.keys(found.functions), ['c.py::big']);
+});
 
-    // Read allowlist
-    const allowlist = JSON.parse(fs.readFileSync(ALLOWLIST_PATH, 'utf-8'));
+test('--init writes the current offenders with their line counts as caps', () => {
+  const root = tree({ 'a.js': lines(501), 'b.js': lines(10) });
+  const out = path.join(root, 'allow.json');
+  const r = run(root, out, ['--init']);
+  assert.equal(r.status, 0);
+  assert.deepEqual(r.data, { files: { 'a.js': 501 }, functions: {} });
+});
 
-    // Verify all files are below 100 lines
-    for (const [filePath, lineCount] of Object.entries(allowlist.files)) {
-      assert.ok(lineCount < 100, `File ${filePath} has ${lineCount} lines, should be < 100`);
-    }
+test('regen without --init lowers a cap and drops an entry that is back under the limit', () => {
+  const root = tree({ 'a.js': lines(520), 'b.js': lines(300) });
+  const out = path.join(root, 'allow.json');
+  fs.writeFileSync(out, JSON.stringify({ files: { 'a.js': 560, 'b.js': 505 }, functions: {} }));
+  const r = run(root, out, []);
+  assert.equal(r.status, 0);
+  assert.deepEqual(r.data, { files: { 'a.js': 520 }, functions: {} });
+});
 
-    // Verify all functions are below 50 lines
-    for (const [funcKey, lineCount] of Object.entries(allowlist.functions)) {
-      assert.ok(lineCount < 50, `Function ${funcKey} has ${lineCount} lines, should be < 50`);
-    }
-  });
+test('regen never raises a cap and refuses an offender that is not listed', () => {
+  const root = tree({ 'a.js': lines(530), 'new.js': lines(501) });
+  const out = path.join(root, 'allow.json');
+  fs.writeFileSync(out, JSON.stringify({ files: { 'a.js': 510 }, functions: {} }));
+  const r = run(root, out, []);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /new\.js/);
+  assert.equal(r.data.files['a.js'], 510);
+});
 
-  it('Uses environment variables for defaults', () => {
-    // Run regen with custom env vars
-    execSync(`node ${REGEN_SCRIPT} --init`, {
-      cwd: path.join(__dirname, '..'),
-      env: { ...process.env, AGENT_MANAGER_MAX_FILE_LINES: '200', AGENT_MANAGER_MAX_FUNCTION_LINES: '75' }
-    });
-
-    // Verify allowlist was created (just check it exists and is valid JSON)
-    assert.ok(fs.existsSync(ALLOWLIST_PATH), 'Allowlist file should exist');
-    const allowlist = JSON.parse(fs.readFileSync(ALLOWLIST_PATH, 'utf-8'));
-    assert.ok(allowlist.files !== undefined, 'Allowlist should have files key');
-    assert.ok(allowlist.functions !== undefined, 'Allowlist should have functions key');
-  });
-
-  it('Generates valid JSON with correct structure (files and functions keys)', () => {
-    // Run regen
-    execSync(`node ${REGEN_SCRIPT} --init`, {
-      cwd: path.join(__dirname, '..'),
-      env: { ...process.env, AGENT_MANAGER_MAX_FILE_LINES: '500', AGENT_MANAGER_MAX_FUNCTION_LINES: '100' }
-    });
-
-    // Read and parse allowlist
-    const raw = fs.readFileSync(ALLOWLIST_PATH, 'utf-8');
-    const allowlist = JSON.parse(raw);
-
-    // Verify structure
-    assert.ok(typeof allowlist === 'object', 'Allowlist should be an object');
-    assert.ok(Array.isArray(Object.keys(allowlist)), 'Allowlist should be an object with keys');
-    assert.ok('files' in allowlist, 'Allowlist should have "files" key');
-    assert.ok('functions' in allowlist, 'Allowlist should have "functions" key');
-    assert.ok(typeof allowlist.files === 'object', 'files should be an object');
-    assert.ok(typeof allowlist.functions === 'object', 'functions should be an object');
-  });
-
-  it('Handles missing/empty directory gracefully', () => {
-    // Create a temp directory
-    const tmpDir = path.join(__dirname, '..', 'tmp-test-dir');
-    fs.mkdirSync(tmpDir, { recursive: true });
-
-    // temporarily change ALLOWLIST_PATH to point to a non-existent location
-    const originalAllowlistPath = ALLOWLIST_PATH;
-
-    try {
-      // Just verify the script can run without errors in a normal directory
-      const result = execSync(`node ${REGEN_SCRIPT} --init`, {
-        cwd: path.join(__dirname, '..'),
-        env: { ...process.env, AGENT_MANAGER_MAX_FILE_LINES: '500', AGENT_MANAGER_MAX_FUNCTION_LINES: '100' },
-        encoding: 'utf-8'
-      });
-
-      // Should not throw
-      assert.ok(typeof result === 'string' || result === undefined, 'Should return output or undefined');
-    } finally {
-      // Clean up
-      if (fs.existsSync(tmpDir)) {
-        fs.rmdirSync(tmpDir, { recursive: true });
-      }
-    }
-  });
+test('lowerOnly is pure: cap = min(old cap, current lines)', () => {
+  const { next, unlisted } = lowerOnly({ files: { 'a.js': 600 }, functions: {} }, { files: { 'a.js': 550 }, functions: { 'a.js::f': 120 } });
+  assert.deepEqual(next, { files: { 'a.js': 550 }, functions: {} });
+  assert.deepEqual(unlisted, ['function a.js::f (120 lines)']);
 });
