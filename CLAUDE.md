@@ -1,8 +1,9 @@
 # CLAUDE.md
 
 Repo-specific guidance for Claude Code working in `agent-manager`. This complements
-(does not replace) the `F:\GitHub\CLAUDE.md` architect-role instructions that apply
-across every project in `F:\GitHub`.
+(does not replace) the cross-project architect-role instructions that applied across every
+project under `/media/model-cache/github` (written as `F:\GitHub\CLAUDE.md` in the Windows era;
+that file is not present on this Linux host, so this file is the only repo-level guidance here).
 
 ## First principle: build the mechanism, don't hand-fix the instance
 

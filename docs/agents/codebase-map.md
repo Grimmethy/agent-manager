@@ -21,7 +21,7 @@ file in another repo is not backticked at all, because the test only knows this 
 A citation like `app.py:6276-6679` only promises the FILE exists and the feature was
 there as of when the row was written — the freshness test checks that mechanically on
 every run. It does **not** promise the line range or function name is still accurate;
-large files (`app.py` is 8000+ lines) drift. If a citation is stale when you find it, fix
+large files (`app.py` is about 3,400 lines, 3,429 on 2026-11-10) drift. If a citation is stale when you find it, fix
 the row rather than leaving it wrong for the next reader.
 
 **Anchors (optional).** A citation may end with `#symbol` naming the function or class it
