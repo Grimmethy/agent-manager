@@ -228,6 +228,53 @@ test('checkTestPinning: diff with production changes and tests passing on base r
   assert.equal(result, 'tests-passing-on-base');
 });
 
+// --- mergeDefault behavior tests --------------------------------------------------------------------------------
+test('verifyDiff calls mergeDefault once when defaultBranch differs from mainBranch', () => {
+  const calls = { count: 0, args: null };
+  const f = fakeDeps({
+    mergeDefault: (repoRoot, worktreeDir, mainBranch, defaultBranch) => {
+      calls.count += 1;
+      calls.args = [repoRoot, worktreeDir, mainBranch, defaultBranch];
+      return { mergedSha: 'abc123', conflict: false };
+    },
+  });
+  const r = verifyDiff({ ...base, defaultBranch: 'develop', deps: f.deps });
+  assert.equal(calls.count, 1, 'mergeDefault called exactly once');
+  assert.deepEqual(calls.args, ['/repo', worktreePaths('t1').worktreeDir, 'master', 'develop']);
+  assert.equal(r.mergedDefaultSha, 'abc123', 'mergedDefaultSha is set from merge result');
+});
+
+test('verifyDiff never calls mergeDefault when defaultBranch equals mainBranch or is undefined', () => {
+  const f1 = fakeDeps({ mergeDefault: () => { throw new Error('should not be called'); } });
+  verifyDiff({ ...base, defaultBranch: 'master', deps: f1.deps });
+
+  const f2 = fakeDeps({ mergeDefault: () => { throw new Error('should not be called'); } });
+  verifyDiff({ ...base, defaultBranch: undefined, deps: f2.deps });
+});
+
+test('verifyDiff returns inconclusive when mergeDefault reports conflicting files', () => {
+  const f = fakeDeps({
+    mergeDefault: () => ({ conflictingFiles: ['src/a.js', 'src/b.js'] }),
+  });
+  const r = verifyDiff({ ...base, defaultBranch: 'develop', deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.match(r.reasons[0], /conflicted/);
+  assert.match(r.reasons[0], /src\/a\.js/);
+  assert.match(r.reasons[0], /src\/b\.js/);
+});
+
+test('verifyDiff calls mergeDefault before applyDiff to use the merged tree', () => {
+  const order = [];
+  const f = fakeDeps({
+    mergeDefault: () => { order.push('mergeDefault'); return { mergedSha: 'abc123', conflict: false }; },
+    applyDiff: () => { order.push('applyDiff'); return { applied: true }; },
+  });
+  const r = verifyDiff({ ...base, defaultBranch: 'develop', deps: f.deps });
+  assert.deepEqual(order, ['mergeDefault', 'applyDiff'], 'mergeDefault runs before applyDiff');
+  assert.equal(r.mergedDefaultSha, 'abc123');
+  assert.equal(r.apply.applied, true);
+});
+
 // --- real integration: real git worktree + real bwrap sandbox ------------------------------------------
 const HAVE_BWRAP = wrapWithSandbox('true', [], { workDir: '/tmp', readOnlyBinds: [], writableBinds: [], env: {} }).available;
 
