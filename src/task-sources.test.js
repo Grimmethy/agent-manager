@@ -1502,6 +1502,91 @@ test('nextAdhocTask still correctly waits when the dependency is "pending-merge"
   assert.equal(nextAdhocTask(), null, 'pending-merge must still block -- unlike the no-code dispositions, real code is waiting to land');
 });
 
+// done-archive pass moves completed records into queue/done/_archived/<YYYY-MM>/<id>.json
+// (2026-11-09: 12 adhoc tasks were stuck forever because their dependsOn predecessor had
+// been archived and isDependencySatisfied() never looked there). These tests prove the
+// dependency gate now sees archived predecessors, and only the named dependency is released.
+function writeArchivedDoneFile(dir, yearMonth, id, contents) {
+  const archivedDir = path.join(dir, 'queue', 'done', '_archived', yearMonth);
+  fs.mkdirSync(archivedDir, { recursive: true });
+  fs.writeFileSync(path.join(archivedDir, `${id}.json`), JSON.stringify(contents));
+}
+
+test('nextAdhocTask claims a dependent whose dependency was archived into queue/done/_archived/<YYYY-MM>/ with mergedAt', () => {
+  const dir = makeAdhocFixtureRepo();
+  // Predecessor lives ONLY in the archive -- not in queue/done/ directly.
+  writeArchivedDoneFile(dir, '2026-09', 'adhoc-archived-prereq-1', {
+    id: 'adhoc-archived-prereq-1', title: 'archived prereq', mergedAt: '2026-09-15T00:00:00.000Z',
+  });
+  writeAdhocFile(dir, 'dependent.json', {
+    id: 'adhoc-archived-dependent-1',
+    title: 'Depends on an archived prereq that has mergedAt',
+    dependsOn: ['adhoc-archived-prereq-1'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task, 'archived predecessor with mergedAt must release the dependent');
+  assert.equal(task.id, 'adhoc-archived-dependent-1');
+});
+
+test('nextAdhocTask releases only the dependent that names an archived predecessor, not one that names an unrelated id', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeArchivedDoneFile(dir, '2026-10', 'adhoc-archived-prereq-2', {
+    id: 'adhoc-archived-prereq-2', title: 'archived prereq 2', mergedAt: '2026-10-01T00:00:00.000Z',
+  });
+  // Unrelated record in the same month directory -- proves we look up by id, not just scan the dir.
+  writeArchivedDoneFile(dir, '2026-10', 'adhoc-unrelated-record', {
+    id: 'adhoc-unrelated-record', title: 'unrelated', terminalDisposition: 'noop',
+  });
+  // Dependent that names the archived predecessor -- should be released.
+  writeAdhocFile(dir, 'named.json', {
+    id: 'adhoc-named-dependent',
+    title: 'Names the archived prereq',
+    dependsOn: ['adhoc-archived-prereq-2'],
+  });
+  // Dependent that names an id that exists nowhere -- should NOT be released.
+  writeAdhocFile(dir, 'unrelated-dep.json', {
+    id: 'adhoc-unrelated-dep',
+    title: 'Names an unrelated id',
+    dependsOn: ['adhoc-nonexistent-id'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task, 'at least one candidate must be claimable');
+  assert.equal(task.id, 'adhoc-named-dependent', 'only the dependent that names the archived predecessor is released');
+});
+
+test('nextAdhocTask still blocks when the dependency is absent everywhere including _archived/', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'blocked.json', {
+    id: 'adhoc-archived-blocked-1',
+    title: 'Depends on a missing id',
+    dependsOn: ['adhoc-never-existed-xyz'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null, 'a predecessor that does not exist anywhere must still block');
+});
+
+test('nextAdhocTask keeps a dependent blocked when the archived predecessor has no mergedAt and its work is not on main', () => {
+  const dir = makeAdhocFixtureRepo();
+  // Archived predecessor: status done but no mergedAt, no terminalDisposition, no stacked branch.
+  // Without the fail-closed check the dependent would be released -- it must NOT.
+  writeArchivedDoneFile(dir, '2026-11', 'adhoc-archived-no-merge', {
+    id: 'adhoc-archived-no-merge', title: 'archived prereq, never merged',
+  });
+  writeAdhocFile(dir, 'dependent.json', {
+    id: 'adhoc-archived-blocked-2',
+    title: 'Depends on an archived prereq with no merge signal',
+    dependsOn: ['adhoc-archived-no-merge'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null, 'archived predecessor with no mergedAt and no terminalDisposition must keep fail-closed behavior');
+});
+
 // Hub-aware draft sequencing (2026-09-18, pipeline hardening -- Grimmethy: "These hub
 // tasks are closely linked in reality, they should be closely linked in the code"). See
 // hub-priority.js's hubHasUnmergedEarlierSibling for the full incident: a 3-sub-task hub
