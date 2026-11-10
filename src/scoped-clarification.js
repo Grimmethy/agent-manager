@@ -217,19 +217,27 @@ function buildScopedTask(rawText, title, extractedInfo, brainDumpEntryId) {
   };
 }
 
+// The history is this module's own state, NOT a task record. A queue state directory is read by globbing *.json and expects task records: a list in queue/needs-clarification made
+// GET /api/summary answer 500 (2026-11-10, questforge). So when taskDir is the needs-clarification state directory the file lives one level up in queue/; any other directory keeps its own.
+function clarificationHistoryPath(taskDir) {
+  return path.basename(taskDir) === 'needs-clarification' ? path.join(path.dirname(taskDir), 'clarification-history.json') : path.join(taskDir, 'clarification-history.json');
+}
+
+// The history from the new location plus the legacy file inside taskDir (written before this change), so no attempt is forgotten. A missing or corrupt file counts as empty.
+function readClarificationHistory(taskDir) {
+  const history = [];
+  for (const file of new Set([path.join(taskDir, 'clarification-history.json'), clarificationHistoryPath(taskDir)])) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (Array.isArray(parsed)) history.push(...parsed);
+    } catch (err) { /* absent or corrupt: start fresh */ }
+  }
+  return history;
+}
+
 // Check clarification history to detect re-flagging
 function checkClarificationHistory(taskDir, brainDumpEntryId) {
-  const historyPath = path.join(taskDir, 'clarification-history.json');
-  let history = [];
-
-  try {
-    if (fs.existsSync(historyPath)) {
-      history = JSON.parse(fs.readFileSync(historyPath, 'utf8'));
-    }
-  } catch (err) {
-    // If history file is corrupted, start fresh
-    history = [];
-  }
+  const history = readClarificationHistory(taskDir);
 
   // Check if this task was previously clarified with the same signature
   const previousAttempts = history.filter(h => h.brainDumpEntryId === brainDumpEntryId);
@@ -253,16 +261,8 @@ function checkClarificationHistory(taskDir, brainDumpEntryId) {
 
 // Record clarification attempt in history
 function recordClarificationAttempt(taskDir, brainDumpEntryId, signature, questions) {
-  const historyPath = path.join(taskDir, 'clarification-history.json');
-  let history = [];
-
-  try {
-    if (fs.existsSync(historyPath)) {
-      history = JSON.parse(fs.readFileSync(historyPath, 'utf8'));
-    }
-  } catch (err) {
-    history = [];
-  }
+  const historyPath = clarificationHistoryPath(taskDir);
+  const history = readClarificationHistory(taskDir);
 
   history.push({
     brainDumpEntryId,
@@ -278,6 +278,8 @@ function recordClarificationAttempt(taskDir, brainDumpEntryId, signature, questi
     fs.mkdirSync(dir, { recursive: true });
   }
   fs.writeFileSync(historyPath, JSON.stringify(history, null, 2), 'utf8');
+  const legacy = path.join(taskDir, 'clarification-history.json');
+  if (legacy !== historyPath) { try { fs.unlinkSync(legacy); } catch (err) { /* none there */ } } // migrated: the state file leaves the queue state directory
 }
 
 // Check if task is stale (in needs-clarification for more than 7 days)
@@ -374,6 +376,7 @@ module.exports = {
   buildScopedTask,
   checkClarificationHistory,
   recordClarificationAttempt,
+  clarificationHistoryPath,
   checkStaleClarification,
   processAmbiguousBrainDump
 };

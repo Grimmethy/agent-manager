@@ -12,6 +12,7 @@ const {
   buildScopedTask,
   checkClarificationHistory,
   recordClarificationAttempt,
+  clarificationHistoryPath,
   checkStaleClarification,
   processAmbiguousBrainDump
 } = require('./scoped-clarification.js');
@@ -165,4 +166,55 @@ test('checkStaleClarification detects stale tasks', () => {
   const staleCheck = checkStaleClarification(taskFile, taskDir);
   assert.ok(staleCheck.isStale, 'should detect stale task');
   assert.ok(staleCheck.daysOld >= 10, 'should report correct days old');
+});
+
+// 2026-11-10: the history file is state, not a task record; inside the needs-clarification state directory it made GET /api/summary answer 500.
+function queueWithNeedsClarification() {
+  const queue = fs.mkdtempSync(path.join(os.tmpdir(), 'scoped-clar-queue-'));
+  const dir = path.join(queue, 'needs-clarification');
+  fs.mkdirSync(dir);
+  return { queue, dir };
+}
+
+test('history for the needs-clarification state directory is written one level up, never inside it', () => {
+  const { queue, dir } = queueWithNeedsClarification();
+  recordClarificationAttempt(dir, 'bd-h-1', 'ambiguous', ['Q?']);
+  assert.equal(clarificationHistoryPath(dir), path.join(queue, 'clarification-history.json'));
+  assert.deepEqual(fs.readdirSync(dir), [], 'nothing but task records may live in the state directory');
+  const saved = JSON.parse(fs.readFileSync(path.join(queue, 'clarification-history.json'), 'utf8'));
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].brainDumpEntryId, 'bd-h-1');
+});
+
+test('a legacy history file inside the state directory is read, merged into the new file and removed on the next write', () => {
+  const { queue, dir } = queueWithNeedsClarification();
+  const legacy = path.join(dir, 'clarification-history.json');
+  fs.writeFileSync(legacy, JSON.stringify([{ brainDumpEntryId: 'bd-old', timestamp: Date.now(), signature: 'ambiguous', questions: ['old?'], resolved: false }]));
+  const before = checkClarificationHistory(dir, 'bd-old');
+  assert.equal(before.shouldEscalate, true, 'the legacy attempt still counts');
+  recordClarificationAttempt(dir, 'bd-new', 'ambiguous', ['new?']);
+  assert.equal(fs.existsSync(legacy), false, 'the legacy file is gone');
+  const saved = JSON.parse(fs.readFileSync(path.join(queue, 'clarification-history.json'), 'utf8'));
+  assert.deepEqual(saved.map((h) => h.brainDumpEntryId), ['bd-old', 'bd-new']);
+  assert.deepEqual(fs.readdirSync(dir), []);
+});
+
+test('a directory with any other name keeps its own history file, and a corrupt or non-list file counts as empty', () => {
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'scoped-clar-other-'));
+  assert.equal(clarificationHistoryPath(other), path.join(other, 'clarification-history.json'));
+  fs.writeFileSync(path.join(other, 'clarification-history.json'), '{not json');
+  assert.equal(checkClarificationHistory(other, 'bd-x').shouldEscalate, false);
+  fs.writeFileSync(path.join(other, 'clarification-history.json'), '{"a":1}');
+  recordClarificationAttempt(other, 'bd-y', 'ambiguous', ['Q?']);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(other, 'clarification-history.json'), 'utf8')).length, 1);
+});
+
+test('history written for the needs-clarification directory is read back: the second attempt sees the first and the same signature escalates', () => {
+  const { dir } = queueWithNeedsClarification();
+  assert.equal(checkClarificationHistory(dir, 'bd-r-1').shouldEscalate, false);
+  recordClarificationAttempt(dir, 'bd-r-1', 'ambiguous', ['first?']);
+  assert.equal(checkClarificationHistory(dir, 'bd-r-1').shouldEscalate, true, 'the new location is read');
+  recordClarificationAttempt(dir, 'bd-r-2', 'ambiguous', ['second?']);
+  const saved = JSON.parse(fs.readFileSync(clarificationHistoryPath(dir), 'utf8'));
+  assert.deepEqual(saved.map((h) => h.brainDumpEntryId), ['bd-r-1', 'bd-r-2'], 'the second record keeps the first');
 });
