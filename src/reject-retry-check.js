@@ -800,6 +800,63 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         }
       }
 
+      // 2026-11-09 (task R12, confirmed live: a decompose parent with blockedStage
+      // 'review' sat in queue/blocked/ for 5 minutes after review rejected the plan,
+      // then was replaced by hand). The entry gate (line ~670) lets it in because
+      // isReviewRejection() returns true for blockedStage:'review', but classifyBlockedTask
+      // then classifies it as non-retryable (e.g. 'unreliable-grounding' because the
+      // sub-task proposals cite files that don't exist yet — they're PROPOSED, not real)
+      // and escalates it to needs-clarification instead of requeueing. A decompose plan
+      // rejection is genuinely a review rejection: the reviewer said "no" to the split,
+      // the next pass needs to know why (priorRejectionFeedback), and the parent should
+      // redraft. Treat it like any other genuine review rejection: same localRejectCount
+      // cap, same feedback path, same pending/ destination.
+      if (task.adhocResolution === 'decompose' && task.blockedStage === 'review' && Array.isArray(task.subTaskProposals) && task.subTaskProposals.length) {
+        // Bypass classifyBlockedTask for this shape -- it's a review rejection, not a
+        // fault-side classification. Carry the rejection reasons into priorRejectionFeedback
+        // so the next plan pass knows what to avoid.
+        const retryCount = Number(task.localRejectCount) || 0;
+        if (retryCount >= MAX_LOCAL_REJECT_RETRIES) {
+          // Exhaustion policy: same as any other genuine review rejection that burns
+          // its blind-redraft budget.
+          if (needsClarificationDir) {
+            const alreadyEscalated = alreadyEscalatedSinceLastReadmission(task);
+            if (!alreadyEscalated) {
+              task.needsClarification = {
+                reason: 'design-decision',
+                openQuestions: `The decompose plan was rejected by review ${MAX_LOCAL_REJECT_RETRIES + 1} times: ${[...new Set([...(Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : []), task.blockedReason].filter(Boolean))].join('; ')}. Decide whether to redraft, narrow the scope, or split differently.`,
+              };
+              appendHistoryEvent(task, 'needs-clarification', 'decompose parent exhausted retries -- escalated to human');
+              if (ghostRoot) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'reject-retry-check:decompose-exhausted', pipelineDir: ghostRoot });
+              fs.mkdirSync(needsClarificationDir, { recursive: true });
+              writeTaskAndUnlinkOld(instancesDir, task, path.join(needsClarificationDir, name), filePath);
+              summary.exhausted++;
+              continue;
+            }
+          }
+        }
+        const rejectionReasons = [];
+        if (task.blockedReason) rejectionReasons.push(String(task.blockedReason));
+        if (Array.isArray(task.priorRejectionFeedback)) {
+          for (const r of task.priorRejectionFeedback) {
+            if (r && !rejectionReasons.includes(r)) rejectionReasons.push(r);
+          }
+        }
+        if (rejectionReasons.length) {
+          task.priorRejectionFeedback = rejectionReasons;
+        }
+        task.localRejectCount = retryCount + 1;
+        task.blockedStage = 'queue';
+        task.blockedReason = '';
+        appendHistoryEvent(task, 'requeued', `decompose plan rejected (attempt ${task.localRejectCount}/${MAX_LOCAL_REJECT_RETRIES}) -- requeued for redraft`);
+        const destDir = pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
       // Unified fault-side escalation (src/blocked-task-classifiers.js), replacing what
       // were two separate bespoke checks (AC-13b's external-dependency skip, AC-8's
       // unreliable-grounding gate). Runs BEFORE the retry-cap check below and regardless
