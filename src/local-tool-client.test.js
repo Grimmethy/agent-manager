@@ -1643,6 +1643,48 @@ test('nudgeToEditEarly defaults off: a normal run gets no nudge', async () => {
   });
 });
 
+// --- End-of-budget warning (TURNS_LEFT_WARNING) ------------------------------------------
+
+async function runBudgetWarning({ withEdit, nudgeToEditEarly = true, maxTurns = 10, steps = 8 }) {
+  const prevO = process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
+  const prevW = process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING;
+  process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = '2';
+  process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING = '3';
+  try {
+    const explore = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+    const edit = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'x', replace: 'y' } } }] };
+    const finish = { role: 'assistant', content: 'RESOLUTION: implemented\ndid it' };
+    const script = [withEdit ? edit : explore, ...Array(steps).fill(explore), finish];
+    let count = 0;
+    await withMockedChat(script, async (mod, dir, { sentBodies }) => {
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+      await mod.runPlanWithTools({ prompt: 'go', maxTurns, nudgeToEditEarly, primaryRoot: dir });
+      const msgs = sentBodies[sentBodies.length - 1].messages;
+      count = msgs.filter((m) => m.role === 'user' && /Budget warning: \d+ turns remain/.test(m.content || '')).length;
+    });
+    return count;
+  } finally {
+    if (prevO === undefined) delete process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS; else process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = prevO;
+    if (prevW === undefined) delete process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING; else process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING = prevW;
+  }
+}
+
+test('turns-left warning: a run that has edited gets exactly one warning near the end of its budget', async () => {
+  assert.equal(await runBudgetWarning({ withEdit: true }), 1);
+});
+
+test('turns-left warning: no warning when the run made no edit (the early nudges cover that)', async () => {
+  assert.equal(await runBudgetWarning({ withEdit: false }), 0);
+});
+
+test('turns-left warning: no warning without nudgeToEditEarly (chat and other callers)', async () => {
+  assert.equal(await runBudgetWarning({ withEdit: true, nudgeToEditEarly: false }), 0);
+});
+
+test('turns-left warning: no warning when maxTurns is not greater than the window', async () => {
+  assert.equal(await runBudgetWarning({ withEdit: true, maxTurns: 3, steps: 1 }), 0);
+});
+
 test('leafMustEdit: a firmer "final warning" fires when a leaf still has not edited after the soft nudge', async () => {
   const prev = process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
   process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = '2';
