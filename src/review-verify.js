@@ -657,10 +657,12 @@ function checkChangedFilesSyntax({ worktreeDir, files, rawDiff, run, py, repoRoo
   return out;
 }
 
-function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, checkUnpinned = false, pipelineDir = null, checkReplay = false, checkRepro = false, deps = {} }) {
+function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, defaultBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, checkUnpinned = false, pipelineDir = null, checkReplay = false, checkRepro = false, deps = {} }) {
   const d = {
     prepare: prepareAdhocWorktree, applyDiff: applyPartialDiff, unapplyDiff: unapplyPartialDiff, cleanup: cleanupAdhocWorktree, run: runSandboxed,
-    relink: relinkExternalDependencies, provision: copyPackageNodeModules, resolvePy: resolvePython, findTests: findTestsWithSymbolFallback, replay: (args) => require('./gate-replay.js').replayGates(args), ...deps,
+    relink: relinkExternalDependencies, provision: copyPackageNodeModules, resolvePy: resolvePython, findTests: findTestsWithSymbolFallback, replay: (args) => require('./gate-replay.js').replayGates(args),
+    mergeDefault: defaultMergeDefault,
+    ...deps,
   };
   const result = { status: 'inconclusive', reasons: [], apply: null, tests: null, commands: [] };
   const inconclusive = (reason) => { result.reasons.push(reason); return result; };
@@ -673,6 +675,13 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     const prep = d.prepare(repoRoot, mainBranch, worktreeDir, branchName);
     prepared = true;
     if (!prep || !prep.ok) return inconclusive(`could not create a scratch worktree: ${(prep && prep.reason) || 'unknown'}`);
+    if (defaultBranch && defaultBranch !== mainBranch) {
+      const mergeResult = d.mergeDefault(repoRoot, worktreeDir, mainBranch, defaultBranch);
+      if (mergeResult.conflictingFiles && mergeResult.conflictingFiles.length) {
+        return inconclusive(`merge of origin/${defaultBranch} into ${mainBranch} in the scratch worktree conflicted: ${mergeResult.conflictingFiles.join(', ')}`);
+      }
+      if (mergeResult.mergedSha) result.mergedDefaultSha = mergeResult.mergedSha;
+    }
     d.relink(repoRoot, worktreeDir);
     const applied = d.applyDiff(worktreeDir, rawDiff);
     result.apply = { applied: !!applied.applied, reason: applied.reason || null };
@@ -947,6 +956,41 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     return inconclusive(`verification errored (${String((e && e.message) || e).slice(0, 200)})`);
   } finally {
     if (prepared) { try { d.cleanup(repoRoot, worktreeDir, branchName); } catch { /* best-effort */ } }
+  }
+}
+
+function defaultMergeDefault(repoRoot, worktreeDir, mainBranch, defaultBranch) {
+  const { execFileSync } = require('child_process');
+  const { gitTimeoutMs } = require('./lib/git-timeout.js');
+  const GIT_ENV = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: '0',
+    GCM_INTERACTIVE: 'never',
+  };
+  const timeout = gitTimeoutMs();
+  try {
+    execFileSync('git', ['merge', '--no-ff', `origin/${defaultBranch}`], {
+      cwd: worktreeDir,
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout,
+      env: GIT_ENV,
+    });
+    const shaResult = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: worktreeDir,
+      encoding: 'utf8',
+      stdio: 'pipe',
+    });
+    return { mergedSha: shaResult.trim(), conflict: false };
+  } catch (err) {
+    const stderr = String(err.stderr || err.message || '');
+    const lines = stderr.split('\n').filter((l) => l.includes('CONFLICT') || l.includes('both modified'));
+    const files = new Set();
+    for (const line of lines) {
+      const m = line.match(/(?:conflict:|both modified):\s*(.+)$/);
+      if (m) files.add(m[1].trim());
+    }
+    return { conflictingFiles: [...files] };
   }
 }
 
