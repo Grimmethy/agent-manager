@@ -944,6 +944,12 @@ const MAX_ROLLBACK_ATTEMPTS = 2;
 // RESOLUTION line. Env-overridable; clamped below maxTurns so it always leaves room to act.
 const ORIENT_TURN_LIMIT = Number(process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS) || 10;
 
+// End-of-budget warning (2026-11-10, ornith turn analysis): 30-34% of ornith agentic-write runs hit the
+// turn cap and were forced to summarize, 80% of them after already editing; their last turns were test
+// runs and re-reads. Once a `nudgeToEditEarly` run that HAS edited is within this many turns of maxTurns,
+// inject one message: stop exploring, run the one targeted test, give the final RESOLUTION. Env-overridable.
+const TURNS_LEFT_WARNING = Number(process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING) || 8;
+
 // 2026-09-05, Grimmethy: real Chat panel investigation (chat-1788639495-31ed485b) burned
 // ~12.4 minutes and 16 turns auditing branches / reading git-runner.js -- confirmed live
 // via model-stats.db (turns_used=16, latency_ms=744939) that roughly the back half of that
@@ -1595,6 +1601,8 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   // the soft one, if there is STILL no edit, one last message: edit now or conclude
   // needs-human-decision -- decompose is not an option for a leaf.
   let hardNudgeFired = false;
+  // End-of-budget warning above (TURNS_LEFT_WARNING) -- fired at most once.
+  let turnsLeftWarned = false;
   const editToolCallCount = () => toolCallLog.filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
 
   // 2026-09-05 (Chat panel "stalls after declaring a tool call", Grimmethy): a real,
@@ -1674,6 +1682,19 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       messages.push({
         role: 'user',
         content: `Final warning: ${turn} turns used and zero edits on a task that a prior decompose pass already confirmed is implementable in one pass. Your NEXT message MUST be an edit_file or write_file call, OR exactly "RESOLUTION: needs-human-decision" followed by the one concrete fact you are missing. RESOLUTION: decompose is not available for this task.`,
+      });
+      turnStartLengths[turnStartLengths.length - 1] = messages.length;
+    }
+
+    // End-of-budget warning: a run that has already edited and is nearly out of turns gets one message to
+    // stop exploring and finish. Only for nudgeToEditEarly callers (implement runs), never chat.
+    if (nudgeToEditEarly && !turnsLeftWarned && maxTurns > TURNS_LEFT_WARNING
+        && turn >= Math.max(orientTurnLimit, maxTurns - TURNS_LEFT_WARNING)
+        && turn < maxTurns - 1 && editToolCallCount() > 0) {
+      turnsLeftWarned = true;
+      messages.push({
+        role: 'user',
+        content: `Budget warning: ${maxTurns - turn} turns remain before this run is cut off. Stop exploring and re-reading files now. Run only the ONE targeted test that proves your change (not the whole suite), fix only what it shows, then finish with your final message carrying exactly one RESOLUTION: line (implemented / no-changes-needed / decompose / needs-human-decision).`,
       });
       turnStartLengths[turnStartLengths.length - 1] = messages.length;
     }
@@ -1822,7 +1843,7 @@ module.exports = {
   writeFileTool, editFileTool, runBashTool, WRITE_TOOLS, CHAT_TOOLS,
   buildToolHandlers, buildWriteToolHandlers, buildChatToolHandlers,
   readTaskTool, searchTasksTool, taskSummary, windowSectionText, boundWindow,
-  withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT,
+  withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT, TURNS_LEFT_WARNING,
   capBashOutput, MAX_BASH_OUTPUT_CHARS,
   estimateMessagesTokens, estimateContextTokens, RESERVED_RESPONSE_TOKENS, logContextAudit,
   IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, P40_REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS,
