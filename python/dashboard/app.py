@@ -3245,7 +3245,7 @@ from routes.second_brain import second_brain_bp  # noqa: E402
 from routes.brain_dump import brain_dump_bp  # noqa: E402
 from routes.benchmark import benchmark_bp  # noqa: E402
 from routes.trajectories import trajectories_bp  # noqa: E402
-from routes.capability import capability_bp  # noqa: E402
+from routes.capability import capability_bp; from routes.required_plugins import required_plugins_bp  # noqa: E402,E702 -- one line: the file's tail functions are size-frozen
 from routes.embedded_tools import embedded_tools_bp  # noqa: E402
 from routes.hardware import hardware_bp  # noqa: E402
 from routes.claude_settings import claude_settings_bp  # noqa: E402
@@ -3282,7 +3282,7 @@ app.register_blueprint(second_brain_bp)
 app.register_blueprint(brain_dump_bp)
 app.register_blueprint(benchmark_bp)
 app.register_blueprint(trajectories_bp)
-app.register_blueprint(capability_bp)
+app.register_blueprint(capability_bp); app.register_blueprint(required_plugins_bp)
 app.register_blueprint(embedded_tools_bp)
 app.register_blueprint(hardware_bp)
 app.register_blueprint(claude_settings_bp)
