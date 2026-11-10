@@ -262,12 +262,49 @@ sweep_gate_skips() {
   [[ "$answer" == "skip" ]]
 }
 
-# mem_pressure_high -> exit 0 if the lane should yield this tick, 1 otherwise.
+# mem_marker_num <key> -> prints a number from the marker's "numbers" block, or nothing when absent or not numeric (same file, freshness and spacing rules as mem_marker_state).
+mem_marker_num() {
+  local f="${AGENT_MANAGER_MEM_PRESSURE_MARKER:-/dev/shm/agent-manager-mem-pressure.json}"
+  sed -n "s/.*\"$1\": *\(-\?[0-9][0-9.]*\).*/\1/p" "$f" 2>/dev/null | head -n 1
+}
+
+# mem_tight_stalls -> exit 0 when a TIGHT marker shows real trouble and the lane should still yield; exit 1 when it is tight only on paper (swap nearly
+# full with plenty of RAM and no stall, observed 2026-11-10: every lane idle for hours with 5.4 GB available). Yield when memory stall some >=
+# AGENT_MANAGER_TIGHT_YIELD_MEM_SOME (5), io stall some >= AGENT_MANAGER_TIGHT_YIELD_IO_SOME (20), io stall full >= AGENT_MANAGER_TIGHT_YIELD_IO_FULL (5)
+# or available RAM < AGENT_MANAGER_TIGHT_YIELD_AVAILABLE_MB (2048). A number that is missing from the marker counts as stall (fail closed to the old behaviour).
+mem_tight_stalls() {
+  local key lim val
+  for key in mem_some io_some io_full available_mb; do
+    val="$(mem_marker_num "$key")"
+    [[ -n "$val" ]] || return 0
+    case "$key" in
+      mem_some) lim="${AGENT_MANAGER_TIGHT_YIELD_MEM_SOME:-5}" ;;
+      io_some) lim="${AGENT_MANAGER_TIGHT_YIELD_IO_SOME:-20}" ;;
+      io_full) lim="${AGENT_MANAGER_TIGHT_YIELD_IO_FULL:-5}" ;;
+      available_mb) lim="${AGENT_MANAGER_TIGHT_YIELD_AVAILABLE_MB:-2048}" ;;
+    esac
+    [[ "$lim" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+    if [[ "$key" == available_mb ]]; then
+      awk -v a="$val" -v b="$lim" 'BEGIN{exit !(a+0 < b+0)}' && return 0
+    else
+      awk -v a="$val" -v b="$lim" 'BEGIN{exit !(a+0 >= b+0)}' && return 0
+    fi
+  done
+  return 1
+}
+
+# mem_pressure_high -> exit 0 if the lane should yield this tick, 1 otherwise. Critical always yields; tight yields only while mem_tight_stalls says so.
+# The yield line carries the marker's reason and numbers, so a swap-only block is obvious from the worker log.
 mem_pressure_high() {
-  local state
+  local state reason
   if state="$(mem_marker_state)"; then
     case "$state" in
-      tight|critical) printf '[common] host memory pressure %s (broker marker)\n' "$state" >>"${LOG_FILE:-/dev/null}" 2>&1; return 0 ;;
+      critical|tight)
+        if [[ "$state" == tight ]] && ! mem_tight_stalls; then return 1; fi
+        reason="$(sed -n 's/.*"reason": *"\([^"]*\)".*/\1/p' "${AGENT_MANAGER_MEM_PRESSURE_MARKER:-/dev/shm/agent-manager-mem-pressure.json}" 2>/dev/null | head -n 1)"
+        printf '[common] host memory pressure %s (broker marker): %s; avail %s MB, mem some %s%%, io some %s%%, io full %s%%\n' "$state" "${reason:-no reason}" \
+          "$(mem_marker_num available_mb)" "$(mem_marker_num mem_some)" "$(mem_marker_num io_some)" "$(mem_marker_num io_full)" >>"${LOG_FILE:-/dev/null}" 2>&1
+        return 0 ;;
       *) return 1 ;;
     esac
   fi

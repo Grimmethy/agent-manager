@@ -144,3 +144,50 @@ test('both lanes still ask mem_pressure_high (the wiring this guards)', () => {
     assert.match(fs.readFileSync(path.join(__dirname, f), 'utf8'), /if mem_pressure_high; then/, f);
   }
 });
+
+// 2026-11-10: swap nearly full with 5.4 GB available and no stall left the marker at tight for hours and every lane idle with tasks waiting.
+const calm = (over = {}) => ({ available_mb: 5379, swap_free_mb: 101, swap_total_mb: 6143, mem_some: 0.0, mem_full: 0.0, io_some: 3.63, io_full: 3.23, ...over });
+const tightWith = (nums, reason = 'holding tight: swap low (101 MB free)') => marker('tight', { reason, numbers: calm(nums) });
+
+test('tight with plenty of RAM and no stall (the swap-only case): the lane keeps claiming, no node launch, no yield line', () => {
+  const w = world({ marker: tightWith({}) });
+  const r = w.run('mem_pressure_high');
+  assert.deepEqual([yields(r), r.launches.length], [false, 0]);
+  assert.equal(r.log, '');
+});
+
+test('tight yields as soon as any one stall number or the RAM floor is breached', () => {
+  for (const over of [{ mem_some: 5 }, { io_some: 20 }, { io_full: 5 }, { available_mb: 2047 }]) {
+    assert.equal(yields(world({ marker: tightWith(over) }).run('mem_pressure_high')), true, JSON.stringify(over));
+  }
+  for (const over of [{ mem_some: 4.9 }, { io_some: 19.9 }, { io_full: 4.9 }, { available_mb: 2048 }]) {
+    assert.equal(yields(world({ marker: tightWith(over) }).run('mem_pressure_high')), false, JSON.stringify(over));
+  }
+});
+
+test('critical always yields, even with calm numbers', () => {
+  assert.equal(yields(world({ marker: marker('critical', { numbers: calm() }) }).run('mem_pressure_high')), true);
+});
+
+test('a tight marker with missing, partial or non-numeric numbers still yields (fails closed to the old behaviour)', () => {
+  for (const numbers of [undefined, {}, { available_mb: 5379 }, { available_mb: 5379, mem_some: 0, io_some: 1 }, { available_mb: 'lots', mem_some: 0, io_some: 1, io_full: 1 }]) {
+    const m = marker('tight'); if (numbers === undefined) delete m.numbers; else m.numbers = numbers;
+    assert.equal(yields(world({ marker: m }).run('mem_pressure_high')), true, JSON.stringify(numbers));
+  }
+});
+
+test('the three stall limits and the RAM floor can be set from the environment; a bad value yields', () => {
+  assert.equal(yields(world({ marker: tightWith({ mem_some: 6 }), env: { AGENT_MANAGER_TIGHT_YIELD_MEM_SOME: '8' } }).run('mem_pressure_high')), false);
+  assert.equal(yields(world({ marker: tightWith({ io_some: 12 }), env: { AGENT_MANAGER_TIGHT_YIELD_IO_SOME: '10' } }).run('mem_pressure_high')), true);
+  assert.equal(yields(world({ marker: tightWith({ io_full: 6 }), env: { AGENT_MANAGER_TIGHT_YIELD_IO_FULL: '7' } }).run('mem_pressure_high')), false);
+  assert.equal(yields(world({ marker: tightWith({ available_mb: 3000 }), env: { AGENT_MANAGER_TIGHT_YIELD_AVAILABLE_MB: '4096' } }).run('mem_pressure_high')), true);
+  assert.equal(yields(world({ marker: tightWith({}), env: { AGENT_MANAGER_TIGHT_YIELD_IO_FULL: 'lots' } }).run('mem_pressure_high')), true);
+});
+
+test('the yield line carries the marker reason and the numbers', () => {
+  const r = world({ marker: tightWith({ io_full: 9.5, io_some: 11.25 }, 'holding tight: io stall full 9.5%') }).run('mem_pressure_high');
+  assert.equal(yields(r), true);
+  assert.match(r.log, /host memory pressure tight \(broker marker\): holding tight: io stall full 9\.5%; avail 5379 MB, mem some 0%, io some 11\.25%, io full 9\.5%/);
+  const c = world({ marker: marker('critical', { reason: 'io stall full 47.63%', numbers: calm({ io_full: 47.63 }) }) }).run('mem_pressure_high');
+  assert.match(c.log, /host memory pressure critical \(broker marker\): io stall full 47\.63%; avail 5379 MB/);
+});
