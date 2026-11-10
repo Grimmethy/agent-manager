@@ -133,7 +133,7 @@ class TestValidateRecordsAHonestFetchTime(unittest.TestCase):
 
 class TestTimeoutIsARetryable503(unittest.TestCase):
     def setUp(self):
-        self.client = app.app.test_client()
+        self.client = __import__("gate_test_support").client(self)
         self._p = [mock.patch.object(app, "get_active_repo_root", return_value="/tmp/x")]
         for p in self._p:
             p.start()

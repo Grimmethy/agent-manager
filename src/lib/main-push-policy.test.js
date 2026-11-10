@@ -104,3 +104,22 @@ test('any other value of the env var is not a bypass', () => {
   const dir = pipeline();
   withEnv({ AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH: '1' }, () => assert.throws(() => call(dir), (e) => e.code === 'MAIN_PUSH_NOT_READY'));
 });
+
+test('assertMainWriteAllowed reads the head through the runner, asks the gate with the caller, and refuses an unreadable head', () => {
+  const dir = pipeline({ main: { [SHA]: rec() } });
+  const calls = [];
+  withEnv({ AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH: undefined }, () => {
+    const { assertMainWriteAllowed } = require('./main-push-policy.js');
+    assert.deepEqual(assertMainWriteAllowed((args) => { calls.push(args); return `${SHA}\n`; }, 'main', 'caller-x', { pipelineDir: dir, now: NOW }), { allowed: true, bypass: false });
+    assert.deepEqual(calls, [['rev-parse', 'main']]);
+    assert.throws(() => assertMainWriteAllowed(() => { throw new Error('no such ref'); }, 'main', 'caller-y', { pipelineDir: dir, now: NOW }), /both required/);
+  });
+  assert.equal(ledger(dir).length, 1);
+  assert.equal(ledger(dir)[0].caller, 'caller-y');
+});
+
+test('without a configured pipeline directory the gate refuses and writes no ledger row instead of throwing a config error', () => {
+  withEnv({ AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH: undefined, AGENT_MANAGER_REPO_ROOT: undefined, AGENT_MANAGER_PIPELINE_DIR: undefined }, () => {
+    assert.throws(() => assertMainPushReady('main', SHA, { now: NOW }), (e) => e.code === 'MAIN_PUSH_NOT_READY');
+  });
+});

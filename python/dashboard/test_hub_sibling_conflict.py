@@ -99,7 +99,7 @@ class TestHubSiblingConflict(unittest.TestCase):
         _reset_cache()
         self._sync_patch = mock.patch.object(app, "_sync_live_checkout", return_value={"synced": False})
         self._sync_patch.start()
-        self.client = app.app.test_client()
+        self.client = __import__("gate_test_support").client(self)
 
     def tearDown(self):
         _reset_cache()

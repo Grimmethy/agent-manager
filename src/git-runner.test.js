@@ -192,7 +192,7 @@ test('gated default: resetToMain does NOT push a local-only commit to origin mai
 test('gated default: pushMain refuses outright', () => {
   delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
   const { repoDir } = makeRepoWithOrigin();
-  assert.throws(() => createRealGitRunner(repoDir).pushMain(), /pushMain refused/);
+  assert.throws(() => createRealGitRunner(repoDir).pushMain(), /main write refused/);
 });
 
 

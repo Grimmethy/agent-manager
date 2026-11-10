@@ -43,7 +43,7 @@ const LEDGER_FILE = 'main-push-ledger.jsonl';
 
 function pipelineDirOf(context) {
   if (context && context.pipelineDir) return context.pipelineDir;
-  return require('../config.js').getConfig().pipelineDir; // lazy: this module stays importable without loading config
+  try { return require('../config.js').getConfig().pipelineDir; } catch { return null; } // lazy: importable without config; no pipeline dir = no store, no ledger row
 }
 
 function appendLedger(pipelineDir, entry) {
@@ -83,13 +83,20 @@ function assertMainPushReady(branch, headSha, context = {}) {
   const pipelineDir = pipelineDirOf(context);
   const now = context.now || new Date();
   let store = {};
-  try { store = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'branch-verdicts.json'), 'utf8')); } catch { /* missing or unreadable store = no READY record */ }
+  if (pipelineDir) { try { store = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'branch-verdicts.json'), 'utf8')); } catch { /* missing or unreadable store = no READY record */ } }
   const reason = !branch || !headSha ? 'branch and headSha are both required' : notReadyReason(store, branch, headSha, now);
   if (!reason) return { allowed: true, bypass: false };
-  appendLedger(pipelineDir, { at: now.toISOString(), outcome: 'refused', branch: branch || null, headSha: headSha || null, caller: context.caller || null, taskId: context.taskId || null, reason });
+  if (pipelineDir) appendLedger(pipelineDir, { at: now.toISOString(), outcome: 'refused', branch: branch || null, headSha: headSha || null, caller: context.caller || null, taskId: context.taskId || null, reason });
   const err = new Error(`main write refused: ${reason}. A main write needs a READY record (a chat or manual merge verdict) for the exact head sha; set AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH=true only to bypass on purpose.`);
   err.code = 'MAIN_PUSH_NOT_READY';
   throw err;
 }
 
-module.exports = { TRIAGE_BRANCH, ungatedMainPushAllowed, assertMainPushReady };
+// For a git runner: read the current head sha of `mainBranch` through the runner's own `run(args)`, then assert. An unreadable head is refused by the gate.
+function assertMainWriteAllowed(run, mainBranch, caller, context = {}) {
+  let headSha = '';
+  try { headSha = String(run(['rev-parse', mainBranch])).trim(); } catch { /* refused below: the gate needs a sha */ }
+  return assertMainPushReady(mainBranch, headSha, { ...context, caller });
+}
+
+module.exports = { TRIAGE_BRANCH, ungatedMainPushAllowed, assertMainPushReady, assertMainWriteAllowed };
