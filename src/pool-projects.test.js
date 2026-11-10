@@ -531,3 +531,89 @@ test('if the cache layer itself breaks, hasPremium reads the stage directly and 
   assert.equal(hasPremium(path.join(os.tmpdir(), `no-such-pipeline-${process.pid}-${Date.now()}`), { role: 'worker' }), false);
 });
 
+
+// ---- stalled reviews: a record waiting in review/ with nobody reviewing it is made visible (2026-11-10) ----
+const { stalledReviews, noteStalledReviews } = require('./pool-projects.js');
+const HISTORY_FILE = path.join('instances', 'pipeline-history.log');
+
+function stallWorld() {
+  const fx = fixture([{ name: 'home' }, { name: 'other' }]);
+  const home = fx.list[0].pipelineDir; const other = fx.list[1].pipelineDir;
+  const put = (pipe, name, rec, ageMin) => {
+    const dir = path.join(pipe, 'queue', 'review'); fs.mkdirSync(dir, { recursive: true });
+    const f = path.join(dir, name); fs.writeFileSync(f, JSON.stringify(rec));
+    const t = new Date(Date.now() - ageMin * 60000); fs.utimesSync(f, t, t);
+  };
+  const claimDir = path.join(fx.root, 'claims'); fs.mkdirSync(claimDir, { recursive: true });
+  const events = (pipe) => { try { return fs.readFileSync(path.join(pipe, HISTORY_FILE), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+  return { ...fx, home, other, put, claimDir, events, stateFile: path.join(fx.root, 'stalled.json') };
+}
+
+test('stalledReviews lists records waiting 10+ minutes in the home and every registered project, flags premium, and skips young ones', () => {
+  const w = stallWorld();
+  w.put(w.other, 'old-premium.json', { premiumPriority: true }, 22);
+  w.put(w.other, 'old-regular.json', { title: 'x' }, 15);
+  w.put(w.other, 'young.json', { premiumPriority: true }, 3);
+  w.put(w.home, 'home-old.json', {}, 40);
+  const r = stalledReviews({ homePipelineDir: w.home, projectsPath: w.projectsPath, claimDir: w.claimDir });
+  assert.deepEqual(r.map((x) => [x.label, x.file, x.premium]).sort(), [['home', 'home-old.json', false], ['other', 'old-premium.json', true], ['other', 'old-regular.json', false]]);
+  assert.ok(r.every((x) => x.ageMs >= 10 * 60000));
+});
+
+test('stalledReviews skips a record a live reviewer has claimed but lists one whose claim owner is dead; a missing review dir or bad projects file never throws', () => {
+  const w = stallWorld();
+  w.put(w.other, 'claimed.json', {}, 30); w.put(w.other, 'abandoned.json', {}, 30);
+  fs.mkdirSync(path.join(w.claimDir, 'claimed.json.d')); fs.writeFileSync(path.join(w.claimDir, 'claimed.json.d', 'owner'), `${process.pid} reviewer\n`);
+  fs.mkdirSync(path.join(w.claimDir, 'abandoned.json.d')); fs.writeFileSync(path.join(w.claimDir, 'abandoned.json.d', 'owner'), '2147483646 reviewer\n');
+  assert.deepEqual(stalledReviews({ projectsPath: w.projectsPath, claimDir: w.claimDir }).map((x) => x.file), ['abandoned.json']);
+  assert.deepEqual(stalledReviews({ projectsPath: path.join(w.root, 'nope.json'), claimDir: w.claimDir }), []);
+  fs.writeFileSync(path.join(w.root, 'bad.json'), 'not json');
+  assert.deepEqual(stalledReviews({ projectsPath: path.join(w.root, 'bad.json') }), []);
+});
+
+test('noteStalledReviews writes ONE review-stalled event per stalled record on THAT record\'s project with the reason, then stays quiet for an hour', () => {
+  const w = stallWorld();
+  w.put(w.other, 'old-premium.json', { premiumPriority: true }, 22);
+  w.put(w.home, 'home-old.json', {}, 40);
+  const lines = [];
+  const base = { homePipelineDir: w.home, projectsPath: w.projectsPath, claimDir: w.claimDir, stateFile: w.stateFile, log: (m) => lines.push(m) };
+  const first = noteStalledReviews({ ...base, reason: 'host memory pressure (critical), so reviewers are yielding their ticks' });
+  assert.equal(first.length, 2);
+  const ev = w.events(w.other);
+  assert.equal(ev.length, 1);
+  assert.deepEqual([ev[0].type, ev[0].file, ev[0].premium, ev[0].project, ev[0].reason], ['review-stalled', 'old-premium.json', true, 'other', 'host memory pressure (critical), so reviewers are yielding their ticks']);
+  assert.ok(ev[0].ageMinutes >= 22);
+  assert.equal(w.events(w.home).length, 1);
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /^\[review-stalled\] (other|home): .* has waited \d+ min for a review.*; reason: host memory pressure/);
+  // the same records again within the hour: nothing new
+  assert.equal(noteStalledReviews({ ...base, reason: 'again' }).length, 0);
+  assert.equal(w.events(w.other).length, 1);
+  // an hour later the same still-stalled record is noted again
+  assert.equal(noteStalledReviews({ ...base, reason: 'later', now: new Date(Date.now() + 61 * 60000) }).length, 2);
+  assert.equal(w.events(w.other).length, 2);
+});
+
+test('noteStalledReviews forgets a record that left review/, so a later stall of the same file is noted again; it never moves or edits a record', () => {
+  const w = stallWorld();
+  w.put(w.other, 'r.json', { premiumPriority: true }, 30);
+  const before = fs.readFileSync(path.join(w.other, 'queue', 'review', 'r.json'), 'utf8');
+  const base = { projectsPath: w.projectsPath, claimDir: w.claimDir, stateFile: w.stateFile, log: () => {} };
+  assert.equal(noteStalledReviews({ ...base, reason: 'a' }).length, 1);
+  assert.equal(fs.readFileSync(path.join(w.other, 'queue', 'review', 'r.json'), 'utf8'), before);
+  fs.rmSync(path.join(w.other, 'queue', 'review', 'r.json'));
+  assert.equal(noteStalledReviews({ ...base, reason: 'b' }).length, 0);
+  w.put(w.other, 'r.json', { premiumPriority: true }, 30);
+  assert.equal(noteStalledReviews({ ...base, reason: 'c' }).length, 1);
+});
+
+test('the stalled-review note is independent of the premium-reach kill switch, which still turns reach off', () => {
+  const w = stallWorld();
+  w.put(w.other, 'p.json', { premiumPriority: true }, 30);
+  const saved = process.env.AGENT_MANAGER_PREMIUM_REACH;
+  process.env.AGENT_MANAGER_PREMIUM_REACH = 'false';
+  try {
+    assert.equal(require('./pool-projects.js').premiumReachEnabled(), false);
+    assert.equal(noteStalledReviews({ projectsPath: w.projectsPath, claimDir: w.claimDir, stateFile: w.stateFile, log: () => {}, reason: 'x' }).length, 1);
+  } finally { if (saved === undefined) delete process.env.AGENT_MANAGER_PREMIUM_REACH; else process.env.AGENT_MANAGER_PREMIUM_REACH = saved; }
+});
