@@ -1215,14 +1215,52 @@ function capToolResultForHistory(result) {
   return text.slice(0, MAX_TOOL_RESULT_CHARS - note.length) + note;
 }
 
+// Garbled tool names (2026-11-10, ornith trajectories): about 60 calls arrived as a real tool name with its last
+// characters replaced by junk ('grep_codecode', 'grep_codeome', 'grep_codease', 'grep_code' for grep_codebase), each
+// costing a turn on 'unknown tool'. A name is repaired to a registered tool only when it is at least 8 characters,
+// shares its first 6 characters with that tool, is within edit distance 4, and no other candidate sharing those
+// 6 characters is within 2 of that distance; anything else keeps the existing unknown-tool error.
+function editDistance(a, b) {
+  const prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i += 1) {
+    let diag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const up = prev[j];
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diag = up;
+    }
+  }
+  return prev[b.length];
+}
+
+function resolveToolName(name, handlerNames) {
+  if (typeof name !== 'string' || name.length < 8 || name.length > 40) return null;
+  const scored = handlerNames
+    .filter((h) => h.slice(0, 6) === name.slice(0, 6))
+    .map((h) => ({ h, d: editDistance(name, h) }))
+    .sort((x, y) => x.d - y.d);
+  if (!scored.length || scored[0].d > 4) return null;
+  if (scored.length > 1 && scored[1].d - scored[0].d < 2) return null;
+  return scored[0].h;
+}
+
 async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, toolCallLog) {
   messages.push(assistantMessage);
   for (const toolCall of toolCalls) {
-    const name = toolCall.function && toolCall.function.name;
+    let name = toolCall.function && toolCall.function.name;
     const args = (toolCall.function && toolCall.function.arguments) || {};
-    const handler = toolHandlers[name];
-    let result;
+    let handler = toolHandlers[name];
+    let repairedFrom = null;
     if (!handler) {
+      const fixed = resolveToolName(name, Object.keys(toolHandlers));
+      if (fixed) { repairedFrom = name; name = fixed; handler = toolHandlers[name]; }
+    }
+    let result;
+    if (!handler && typeof name === 'string' && name.startsWith('RESOLUTION')) {
+      // The model put its final answer inside a tool call (seen 2026-11-10). Say what to do instead of listing tools.
+      result = { error: 'that is not a tool: a RESOLUTION line belongs in your final message, written as plain text, with no tool call.' };
+    } else if (!handler) {
       // 2026-09-22 (pipeline hardening, 2nd repro): the bare "unknown tool: X" gave the
       // model no way to self-correct -- a tier-3 run called one hallucinated name
       // (`list_files`), got back nothing but the rejection, then spent its remaining
@@ -1238,7 +1276,7 @@ async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messa
         result = { error: `tool ${name} failed: ${e.message}` };
       }
     }
-    toolCallLog.push({ tool: name, args, result });
+    toolCallLog.push({ tool: name, args, result, ...(repairedFrom ? { repairedFrom } : {}) });
     messages.push({ role: 'tool', content: capToolResultForHistory(result) }); // the full result stays in toolCallLog above
   }
 }
@@ -1398,6 +1436,10 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     try {
       for (const entry of buildToolOutcomeEntries(auditCtx(turn, 'loop'), calls)) {
         logToolLoopEvent(pipelineDir, 'tool-outcome', entry);
+      }
+      for (const c of calls) {
+        // Sizes and ids only, never the garbled text itself (same rule as every other audit line).
+        if (c && c.repairedFrom) logToolLoopEvent(pipelineDir, 'repaired-name', { ...auditCtx(turn, 'loop'), tool: c.tool, nameChars: String(c.repairedFrom).length });
       }
     } catch { /* best-effort -- see logToolLoopEvent */ }
   };
@@ -1843,7 +1885,7 @@ module.exports = {
   writeFileTool, editFileTool, runBashTool, WRITE_TOOLS, CHAT_TOOLS,
   buildToolHandlers, buildWriteToolHandlers, buildChatToolHandlers,
   readTaskTool, searchTasksTool, taskSummary, windowSectionText, boundWindow,
-  withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT, TURNS_LEFT_WARNING,
+  withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT, resolveToolName, TURNS_LEFT_WARNING,
   capBashOutput, MAX_BASH_OUTPUT_CHARS,
   estimateMessagesTokens, estimateContextTokens, RESERVED_RESPONSE_TOKENS, logContextAudit,
   IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, P40_REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS,

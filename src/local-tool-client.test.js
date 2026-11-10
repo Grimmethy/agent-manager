@@ -2421,6 +2421,75 @@ test('tool-loop audit: AGENT_MANAGER_TOOL_LOOP_AUDIT=off writes no audit file an
   }
 });
 
+// --- garbled tool-name repair ---------------------------------------------------------------
+
+function toolCallTurn(name, args = { path: '.' }) {
+  return { role: 'assistant', content: '', tool_calls: [{ function: { name, arguments: args } }] };
+}
+
+async function runWithName(name) {
+  let toolMsg = null;
+  let audit = [];
+  await withMockedChat([toolCallTurn(name), { role: 'assistant', content: 'done' }], async (mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+    const r = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 5, primaryRoot: dir, taskId: 'repair-t' });
+    toolMsg = r.toolCallLog ? r.toolCallLog[0] : null;
+    audit = readAuditLines(dir).filter((e) => e.type === 'repaired-name');
+  });
+  return { toolMsg, audit };
+}
+
+test('tool-name repair: real garbled grep_codebase names from the ornith trajectories resolve to grep_codebase', async () => {
+  for (const bad of ['grep_codecode', 'grep_codeome', 'grep_codease', 'grep_codeuse', 'grep_codeise', 'grep_codeace', 'grep_code']) {
+    const { toolMsg, audit } = await runWithName(bad);
+    assert.ok(toolMsg, bad);
+    assert.equal(toolMsg.tool, 'grep_codebase', bad);
+    assert.equal(toolMsg.repairedFrom, bad);
+    assert.ok(!/unknown tool/.test(JSON.stringify(toolMsg.result)), `${bad}: ran the real tool`);
+    assert.equal(audit.length, 1, bad);
+    assert.equal(audit[0].tool, 'grep_codebase');
+    assert.equal(audit[0].nameChars, bad.length);
+    assert.ok(!Object.values(audit[0]).includes(bad), 'the garbled name itself is not logged');
+  }
+});
+
+test('tool-name repair: names that are not close to exactly one tool keep the unknown-tool error', async () => {
+  for (const bad of ['list_files', 'grep_code_codebase', 'frobnicate_everything', 'edit', 'x']) {
+    const { toolMsg, audit } = await runWithName(bad);
+    assert.ok(toolMsg, bad);
+    assert.equal(toolMsg.tool, bad, bad);
+    assert.match(toolMsg.result.error, /unknown tool/, bad);
+    assert.equal(audit.length, 0, bad);
+  }
+});
+
+test('tool-name repair: resolveToolName length and ambiguity guards (direct)', () => {
+  const { resolveToolName } = require('./local-tool-client.js');
+  const names = ['read_file', 'grep_codebase', 'edit_file', 'list_directory', 'run_bash'];
+  assert.equal(resolveToolName('grep_codecode', names), 'grep_codebase');
+  assert.equal(resolveToolName('grep_co', names), null, 'shorter than 8 characters is never repaired');
+  assert.equal(resolveToolName('edit_f', names), null, 'shorter than 8 characters is never repaired');
+  assert.equal(resolveToolName('read_file', names.filter((n) => n !== 'read_file')), null, 'one registered candidate away is a 6-char-prefix match only when close enough: read_file has no registered neighbour');
+  // two candidates sharing the first 6 characters, both close: ambiguous, no repair
+  assert.equal(resolveToolName('search_fileX', ['search_files', 'search_filer']), null);
+  assert.equal(resolveToolName('search_filesX', ['search_files', 'search_filexyz']), 'search_files', 'a clear winner (distance 1 vs 3) still repairs');
+  assert.equal(resolveToolName(undefined, names), null);
+  assert.equal(resolveToolName('x'.repeat(60), names), null);
+});
+
+test('tool-name repair: an exact tool name is untouched (no repairedFrom, no audit line)', async () => {
+  const { toolMsg, audit } = await runWithName('list_directory');
+  assert.equal(toolMsg.tool, 'list_directory');
+  assert.equal(toolMsg.repairedFrom, undefined);
+  assert.equal(audit.length, 0);
+});
+
+test('tool-name repair: a RESOLUTION line sent as a tool name gets an instruction, not a tool list', async () => {
+  const { toolMsg } = await runWithName('RESOLUTION: needs-human-decision\n</parameter=1');
+  assert.match(toolMsg.result.error, /belongs in your final message/);
+  assert.ok(!/Available tools/.test(toolMsg.result.error));
+});
+
 test('tool-loop audit: executeToolCalls keeps its 5-parameter declaration (outcomes are classified from toolCallLog in the loop instead)', () => {
   // executeToolCalls is module-private, so its arity is checked on the source declaration.
   const src = fs.readFileSync(path.join(__dirname, 'local-tool-client.js'), 'utf8');
