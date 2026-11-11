@@ -49,7 +49,7 @@ const { runPremiseCheckAsPostImplement } = require('./candidate-premise-check.js
 const { listHeldTasksFifo, deriveResolveIdentity, selfHealResolveDeadlock, buildResolveTask } = require('./lib/task-resolve.js');
 const { taskPriority } = require('./lib/task-priority.js');
 const { markPipelineHealthAuditChecked, markUiVisibilityAuditChecked, coverageEntryActiveLocal, markPipelineDebriefReported } = require('./lib/task-audit.js');
-const { nextProductSpecSectionTask, getNextTask } = require('./lib/task-selection.js');
+const { nextProductSpecSectionTask, getNextTask, setPreemptLoaders } = require('./lib/task-selection.js'); setPreemptLoaders({ nextAdhocTask, nextDerivedTask }); // registered here (hoisted declarations) so lib/task-selection.js need not require this file
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
