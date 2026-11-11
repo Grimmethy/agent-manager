@@ -114,10 +114,19 @@ gpu_broker_url() {
 # connection is refused, times out or the host is unreachable. A lane worker asks this once per tick (local-worker.sh) BEFORE it claims or resumes
 # anything: with the endpoint down every draft fails the same way, burns the task's retry rounds and parks it in blocked/ (2026-10-23: grimm hard-reset,
 # its Ollama stayed down for 12 h, 540 failed ticks, six tasks parked). Seconds: AGENT_MANAGER_ENDPOINT_PROBE_TIMEOUT_S (default 3).
+# An endpoint that answers is also asked about its token budget (src/gateway-budget.js, the cloud-providers gateway's /meter): exit 1 when that budget is
+# spent, so a cloud lane waits for the reset instead of failing a draft per tick (455 of them in the lane's log). It fails open: no /meter, no node, any
+# other answer is "reachable". AGENT_MANAGER_BUDGET_PROBE=off turns that part off.
 ollama_endpoint_reachable() {
   local url="${1:-http://localhost:11434}" code
   code="$(curl -s -m "${AGENT_MANAGER_ENDPOINT_PROBE_TIMEOUT_S:-3}" -o /dev/null -w '%{http_code}' "${url%/}/api/version" 2>/dev/null)" || true
-  [[ -n "$code" && "$code" != "000" ]]
+  [[ -n "$code" && "$code" != "000" ]] || return 1
+  [[ "${AGENT_MANAGER_BUDGET_PROBE:-on}" != "off" ]] || return 0
+  local budget_js budget_rc=0
+  budget_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/gateway-budget.js"
+  [[ -f "$budget_js" ]] || return 0
+  node "$budget_js" check "$url" >/dev/null 2>&1 || budget_rc=$?
+  [[ "$budget_rc" -ne 3 ]]
 }
 
 # ComfyUI GPU lease (2026-08-30, Grimmethy: "If I run a generation, prompt forge should
