@@ -3289,7 +3289,7 @@ if (require.main === module) {
     const throttled = alreadyPending && !hasAdhocWaiting && !hasResearchWaiting && !hasBrainDumpWaiting && !hasHeldClarificationWaiting;
     let blocked;
     if (alreadyPending) {
-      const { rankPriorityOfTask } = require('./next-claimable-task.js');
+      const { rankPriorityResolved: rankPriorityOfTask } = require('./rank-priority.js'); // the CLI block above has already run ensureRegistered(), so the leaf (no registry load) is enough
       const inFlightPriorities = inFlightFiles.map((f) => {
         try { return rankPriorityOfTask(JSON.parse(fs.readFileSync(f, 'utf8'))); } catch { return Infinity; }
       });
