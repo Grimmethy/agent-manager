@@ -54,19 +54,22 @@ test('mismatch: actual 2 vs expected 3 -> blocked verdict with both counts in th
   assert.match(gate.blockedReason, /expected 3/);
 });
 
-test('mismatch is reachable only BEFORE the model reviewer: gate precedes the vote dispatch in review-task.js', () => {
-  // The "model reviewer never called" invariant lives in review-task.js's control flow:
-  // the gate block returns a blocked verdict, and it is positioned textually before the
-  // resolvedMajorityVote({...}) dispatch. A textual ordering assertion is this repo's
-  // established convention for review-stage ordering guarantees.
+test('mismatch is reachable only BEFORE the model reviewer: the pre-vote checks (which hold the gate) precede the vote dispatch in review-task.js', () => {
+  // The "model reviewer never called" invariant lives in review-task.js's control flow: runReview calls runPreVoteChecks (review-prevote-checks.js, which holds
+  // the hit-count gate) and returns its blocked verdict, textually before the resolvedMajorityVote({...}) dispatch. A textual ordering assertion is this
+  // repo's established convention for review-stage ordering guarantees.
   const src = fs.readFileSync(path.join(__dirname, 'review-task.js'), 'utf8');
-  const gateIdx = src.indexOf('checkHitCountGate({ repoRoot: repoRootForCheck');
+  const preVoteIdx = src.indexOf('const preVoteBlock = runPreVoteChecks({');
   const voteIdx = src.indexOf('const voteResult = await resolvedMajorityVote({');
-  assert.ok(gateIdx > -1, 'hit-count gate call must exist in review-task.js');
+  assert.ok(preVoteIdx > -1, 'the pre-vote checks call must exist in review-task.js');
   assert.ok(voteIdx > -1, 'vote dispatch must exist in review-task.js');
-  assert.ok(gateIdx < voteIdx, 'gate must run before the model-reviewer dispatch');
-  // And the gate's mismatch path RETURNS from runReview -- no fall-through to the vote:
-  const gateBlock = src.slice(gateIdx, src.indexOf('await waitForLocalAvailability', gateIdx));
+  assert.ok(preVoteIdx < voteIdx, 'the pre-vote checks must run before the model-reviewer dispatch');
+  assert.match(src.slice(preVoteIdx, voteIdx), /if \(preVoteBlock\) return preVoteBlock;/);
+  // The gate itself lives in review-prevote-checks.js and its mismatch path RETURNS a blocked verdict -- no fall-through to the vote:
+  const gateSrc = fs.readFileSync(path.join(__dirname, 'review-prevote-checks.js'), 'utf8');
+  const gateIdx = gateSrc.indexOf('checkHitCountGate({ repoRoot: repoRootForCheck');
+  assert.ok(gateIdx > -1, 'hit-count gate call must exist in review-prevote-checks.js');
+  const gateBlock = gateSrc.slice(gateIdx, gateSrc.indexOf('return null;', gateIdx));
   assert.match(gateBlock, /verdict: 'blocked'/);
 });
 
