@@ -24,10 +24,6 @@
       "src/sdk/candidate-fulfillment.js",
       "src/task-sources.js",
       "src/workflow-priority.js"
-    ],
-    [
-      "src/fact-checker.js",
-      "src/task-anchor-files.js"
     ]
   ]
 }
