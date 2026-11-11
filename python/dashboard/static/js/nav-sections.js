@@ -13,7 +13,7 @@ const NAV_SECTIONS = [
     badgeKeys: ['pending', 'drafting', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm', 'coordinating'],
   },
   { key: 'ideas', label: 'Ideas', items: ['brain-dump', 'filed', 'concepts', 'discovery', 'deepdive', 'hygiene'], badgeKeys: ['brain-dump', 'filed'] },
-  { key: 'system', label: 'System', items: ['hardware', 'models', 'plugins', 'gpu-broker', 'reports', 'tokenfold'] },
+  { key: 'system', label: 'System', items: ['hardware', 'models', 'plugins', 'gpu-broker', 'triggers', 'reports', 'tokenfold'] },
   {
     key: 'forges', label: 'Forges',
     subgroups: [
