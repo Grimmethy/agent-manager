@@ -1,0 +1,33 @@
+{
+  "cycles": [
+    [
+      "src/apply-group-a-report-appenders.js",
+      "src/apply-group-a.js",
+      "src/brain-dump-resolution-check.js",
+      "src/candidate-premise-check.js",
+      "src/capability-debrief-bundle.js",
+      "src/capability-ledger.js",
+      "src/capability-routing.js",
+      "src/claude-client.js",
+      "src/dead-process-check.js",
+      "src/deep-dive-grounding-check.js",
+      "src/gpu-guard.js",
+      "src/lane-health.js",
+      "src/lanes.js",
+      "src/lib/task-audit.js",
+      "src/lib/task-selection.js",
+      "src/local-client.js",
+      "src/model-provider.js",
+      "src/next-claimable-task.js",
+      "src/pipeline-health-audit.js",
+      "src/premium-rotation.js",
+      "src/sdk/candidate-fulfillment.js",
+      "src/task-sources.js",
+      "src/workflow-priority.js"
+    ],
+    [
+      "src/fact-checker.js",
+      "src/task-anchor-files.js"
+    ]
+  ]
+}
