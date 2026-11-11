@@ -825,13 +825,12 @@ function checkFileLineCitations(draftText, sourceText, repoRoot = null, extraRoo
   // "could not check", which produces NO warning (a warning that fires on environment
   // hiccups would be noise).
   if (repoRoot) {
-    // Lazy require (NOT a top-level import): task-anchor-files.js requires
-    // ./fact-checker.js at its own top level (resolveAgainstRepoDetailed), so a top-level
-    // require here would be a circular load. Same in-function require convention
+    // Lazy require of a leaf module (./lib/backtick-identifiers.js has no imports; it used to be required from
+    // task-anchor-files.js, which requires this file, a cycle). Same in-function require convention
     // existsLiterallyInRepo uses for ./stacked-grounding.js above.
     let backtickIdentifiers;
     try {
-      ({ backtickIdentifiers } = require('./task-anchor-files.js'));
+      ({ backtickIdentifiers } = require('./lib/backtick-identifiers.js'));
     } catch {
       backtickIdentifiers = null; // could not load the helper -> fail-open, no warnings
     }
