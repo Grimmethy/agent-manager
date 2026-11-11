@@ -86,3 +86,13 @@ WantedBy=default.target
 ```
 
 Not enabled by any code. Opening the intake to the LAN, registering grimm and starting the heartbeat client are separate owner-approved steps.
+
+## Lending a task to a node
+
+Wok lends a task by posting its record to the node's own intake, `node src/node-intake-server.js`. It is a separate small server, **not** a dashboard route, so the lending secret can do one thing: put a task record in that machine's `queue/adhoc/`.
+
+- `POST /lend` with `Authorization: Bearer <lender token>` and JSON `{task: <record>, lease: {taskId, nodeId, expiresAt}}`. Reply `200 {ok: true, taskId}`. The record is written, stamped `leasedTo: <lease.nodeId>`, atomically into `<AGENT_MANAGER_PIPELINE_DIR>/queue/adhoc/<id>.json`; an existing file is never overwritten.
+- Errors: 400 for a body that is not JSON, is over 1 MB, lacks a task or lease object, has a task id that is not `[A-Za-z0-9._-]` of 1 to 200 characters, or a lease whose `taskId` is not the task's or whose `nodeId` is empty; 401 for a missing or wrong token; 403 when `AGENT_MANAGER_LENDER_ADDRESS` is set and the request comes from another address; 404 for any other path; 405 for any other method on `/lend`; 409 when that task id is already queued.
+- Settings: `AGENT_MANAGER_LENDER_TOKEN_FILE` (a file, mode 600, holding the lender token; never read from the environment; a missing or empty file makes the server exit 2), `AGENT_MANAGER_LENDER_ADDRESS` (the one address allowed to lend; unset means any address that holds the token), `AGENT_MANAGER_PIPELINE_DIR`, `AGENT_MANAGER_INTAKE_BIND` (default `127.0.0.1`) and `AGENT_MANAGER_INTAKE_PORT` (default 7472).
+
+Nothing starts this server by itself: the owner creates the token file on the node, sets the bind address to the node's LAN address and starts it. A worker on that node claims the lent task only because of `leasedTo` (see `src/node-affinity.js`).
