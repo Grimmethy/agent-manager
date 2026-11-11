@@ -12,6 +12,10 @@ test('every distinct backtick-quoted name, first-seen order, trailing () strippe
   assert.deepEqual(backtickIdentifiers('use `fooBar` and `doThing()` then `fooBar` and `a.b`'), ['fooBar', 'doThing', 'a.b']);
 });
 
+test('an identifier that starts with an underscore is extracted (the leading class is [A-Za-z_])', () => {
+  assert.deepEqual(backtickIdentifiers('rename `_private` and `__dunder__` but not `9lives`'), ['_private', '__dunder__']);
+});
+
 test('nothing in backticks gives []; non-identifier backtick text is ignored', () => {
   assert.deepEqual(backtickIdentifiers('fix the bug in foo.js'), []);
   assert.deepEqual(backtickIdentifiers('run `ls -la` and `1abc`'), []);
