@@ -3,7 +3,6 @@
     [
       "src/apply-group-a-report-appenders.js",
       "src/apply-group-a.js",
-      "src/brain-dump-resolution-check.js",
       "src/candidate-premise-check.js",
       "src/capability-debrief-bundle.js",
       "src/capability-ledger.js",
