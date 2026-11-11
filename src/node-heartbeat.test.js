@@ -12,7 +12,7 @@ const { createServer } = require('./node-registry-server.js');
 const { registerNode, loadNodes } = require('./node-registry.js');
 
 const T0 = Date.UTC(2026, 10, 11, 12, 0, 0);
-const TOKEN = 'abc123tokenvalue';
+const TOKEN = ['fixture', 'node', 'token', 'value'].join('-');
 
 function setup(extra = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'node-heartbeat-'));
