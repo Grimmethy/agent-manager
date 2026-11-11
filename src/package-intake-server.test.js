@@ -10,7 +10,7 @@ const { spawnSync } = require('node:child_process');
 const { createServer, refusal } = require('./package-intake-server.js');
 const { registerNode } = require('./node-registry.js');
 const { lendLease, leaseFor } = require('./lease-ledger.js');
-const { buildPackage } = require('./review-package.js');
+const { buildPackage, buildRecordPackage } = require('./review-package.js');
 
 const SHA = 'c'.repeat(40);
 const RECORD = { id: 'HUB1-05-x', title: 'T', rawDiff: 'diff', localVotes: [1], history: [2] };
@@ -177,4 +177,120 @@ test('createServer needs a pipeline dir, the program exits 2 without one, and re
   assert.match(r.stderr, /PIPELINE_DIR/);
   assert.equal(refusal(buildPackage({ record: RECORD, nodeId: 'grimm', branch: 'agent/x', sha: SHA })), '');
   assert.match(refusal({}), /version/);
+});
+
+const DRAFT = { id: 'HUB1-05-x', title: 'T', rawDiff: 'diff --git a b', implementResponse: 'did it', status: 'drafting', leasedTo: 'grimm', localVotes: [1], history: [{ stage: 'draft-done' }] };
+
+function seedOriginal(s, queue, extra = {}) {
+  const dir = path.join(s.env.AGENT_MANAGER_PIPELINE_DIR, 'queue', queue);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'HUB1-05-x.json');
+  fs.writeFileSync(file, JSON.stringify({ id: 'HUB1-05-x', title: 'T', leasedTo: 'grimm', ...extra }));
+  return file;
+}
+
+const reviewFile = (s) => path.join(s.env.AGENT_MANAGER_PIPELINE_DIR, 'queue', 'review', 'HUB1-05-x.json');
+
+for (const queue of ['pending', 'adhoc']) {
+  test(`a version 2 package replaces the leased original in queue/${queue}: the node's record lands in queue/review, the original is gone, the lease is returned`, async () => {
+    const s = setup();
+    lendLease('HUB1-05-x', 'grimm', { env: s.env });
+    const original = seedOriginal(s, queue);
+    const pkg = buildRecordPackage({ record: DRAFT, nodeId: 'grimm', now: Date.UTC(2026, 10, 11) });
+    const srv = await start(s);
+    try {
+      const r = await call(srv.port, { token: s.token, body: pkg });
+      assert.equal(r.status, 200);
+      assert.deepEqual(r.json, { ok: true, taskId: 'HUB1-05-x' });
+      assert.equal(fs.existsSync(original), false);
+      const draft = JSON.parse(fs.readFileSync(reviewFile(s), 'utf8'));
+      assert.equal(draft.status, 'needs-review');
+      assert.equal(draft.fromNode, 'grimm');
+      assert.equal('leasedTo' in draft, false);
+      assert.equal(draft.rawDiff, 'diff --git a b');
+      assert.equal(draft.implementResponse, 'did it');
+      assert.equal(draft.history.length, 1);
+      assert.equal(draft.history[0].stage, 'node-draft-received');
+      assert.equal(draft.history[0].detail, 'drafted on grimm');
+      assert.match(draft.history[0].at, /^\d{4}-\d\d-\d\dT/);
+      assert.deepEqual(JSON.parse(fs.readFileSync(stored(s), 'utf8')), pkg);
+      assert.equal(leaseFor('HUB1-05-x', s.env).state, 'returned');
+      assert.equal(s.notices.length, 1);
+      assert.doesNotMatch(s.notices[0].text, /undefined/);
+    } finally { await srv.close(); }
+  });
+}
+
+test('a version 2 package whose original is gone is a 409: nothing is stored or filed and the lease is still held', async () => {
+  const s = setup();
+  lendLease('HUB1-05-x', 'grimm', { env: s.env });
+  const srv = await start(s);
+  try {
+    const r = await call(srv.port, { token: s.token, body: buildRecordPackage({ record: DRAFT, nodeId: 'grimm' }) });
+    assert.equal(r.status, 409);
+    assert.match(r.json.error, /original/);
+    assert.equal(fs.existsSync(stored(s)), false);
+    assert.equal(fs.existsSync(reviewFile(s)), false);
+    assert.equal(leaseFor('HUB1-05-x', s.env).state, 'lent');
+    assert.equal(s.notices.length, 0);
+  } finally { await srv.close(); }
+});
+
+test('a version 2 package whose original file belongs to a different task id is a 409 and the file is left alone', async () => {
+  const s = setup();
+  lendLease('HUB1-05-x', 'grimm', { env: s.env });
+  const original = seedOriginal(s, 'pending', { id: 'HUB9-09-y' });
+  const srv = await start(s);
+  try {
+    assert.equal((await call(srv.port, { token: s.token, body: buildRecordPackage({ record: DRAFT, nodeId: 'grimm' }) })).status, 409);
+    assert.equal(fs.existsSync(original), true);
+    const broken = seedOriginal(s, 'adhoc');
+    fs.writeFileSync(broken, '{not json');
+    assert.equal((await call(srv.port, { token: s.token, body: buildRecordPackage({ record: DRAFT, nodeId: 'grimm' }) })).status, 409);
+    assert.equal(fs.existsSync(broken), true);
+  } finally { await srv.close(); }
+});
+
+test('a version 2 package from a node that does not hold the lease is a 409 and the original stays where it is', async () => {
+  const s = setup();
+  lendLease('HUB1-05-x', 'other', { env: s.env });
+  const original = seedOriginal(s, 'pending');
+  const srv = await start(s);
+  try {
+    assert.equal((await call(srv.port, { token: s.token, body: buildRecordPackage({ record: DRAFT, nodeId: 'grimm' }) })).status, 409);
+    assert.equal(fs.existsSync(original), true);
+    assert.equal(fs.existsSync(reviewFile(s)), false);
+  } finally { await srv.close(); }
+});
+
+test('a version 2 package without a diff is a 400 and a version 1 package still only stores and returns the lease, leaving queue/review alone', async () => {
+  const s = setup();
+  lendLease('HUB1-05-x', 'grimm', { env: s.env });
+  const original = seedOriginal(s, 'pending');
+  const srv = await start(s);
+  try {
+    const noDiff = buildRecordPackage({ record: { ...DRAFT, rawDiff: '' }, nodeId: 'grimm' });
+    assert.equal((await call(srv.port, { token: s.token, body: noDiff })).status, 400);
+    assert.equal(fs.existsSync(original), true);
+    const r = await call(srv.port, { token: s.token, body: s.pkg });
+    assert.equal(r.status, 200);
+    assert.equal(fs.existsSync(original), true);
+    assert.equal(fs.existsSync(reviewFile(s)), false);
+    assert.equal(leaseFor('HUB1-05-x', s.env).state, 'returned');
+    assert.match(s.notices[0].text, /agent\/x/);
+  } finally { await srv.close(); }
+});
+
+test('a hand-built version 2 package that still carries a lease stamp and a history keeps its history, gains the received entry and loses the stamp', async () => {
+  const s = setup();
+  lendLease('HUB1-05-x', 'grimm', { env: s.env });
+  seedOriginal(s, 'pending');
+  const pkg = { version: 2, kind: 'record', taskId: 'HUB1-05-x', nodeId: 'grimm', builtAt: 'x', record: { ...DRAFT, history: [{ stage: 'draft-done' }], leasedTo: 'grimm' } };
+  const srv = await start(s);
+  try {
+    assert.equal((await call(srv.port, { token: s.token, body: pkg })).status, 200);
+    const draft = JSON.parse(fs.readFileSync(reviewFile(s), 'utf8'));
+    assert.equal('leasedTo' in draft, false);
+    assert.deepEqual(draft.history.map((h) => h.stage), ['draft-done', 'node-draft-received']);
+  } finally { await srv.close(); }
 });
