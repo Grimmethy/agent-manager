@@ -1052,7 +1052,7 @@ async function renderMain() {
     else if (activeTab === 'discovery') await renderDiscoveryTab();
     else if (activeTab === 'branches') await renderBranchesTab();
     else if (activeTab === 'reports') await renderReportsTab();
-    else if (activeTab === 'tokenfold') await renderTokenfoldTab();
+    else if (activeTab === 'tokenfold') await renderTokenfoldTab(); else if (activeTab === 'triggers') await renderTriggersTab();
     else if (activeTab === 'promptforge') await renderPromptForgeTab();
     else if (activeTab === 'adforge') await renderAdForgeTab();
     else if (activeTab === 'scriptforge') await renderScriptForgeTab();

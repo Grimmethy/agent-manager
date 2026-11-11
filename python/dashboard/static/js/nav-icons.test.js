@@ -8,15 +8,15 @@ const icons = require('./nav-icons.js');
 const ns = require('./nav-sections.js');
 
 const LIVE_KEYS = [
-  'project', 'workers', 'hardware', 'models', 'joblist', 'plugins', 'deepdive', 'discovery', 'brain-dump', 'filed', 'hygiene', 'concepts', 'reports', 'tokenfold',
+  'project', 'workers', 'hardware', 'models', 'joblist', 'plugins', 'deepdive', 'discovery', 'brain-dump', 'filed', 'hygiene', 'concepts', 'reports', 'tokenfold', 'triggers',
   'promptforge', 'adforge', 'scriptforge', 'characterforge', 'postforge', 'cutforge', 'voiceforge', 'storyforge', 'videoforge', 'sceneforge', 'stageforge', 'sparforge',
   'kaggleforge', 'journalforge', 'gpu-broker', 'annieforge', 'recipeforge', 'intakereel', 'uiforge', 'branches', 'adhoc',
   'pending', 'drafting', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm', 'coordinating', 'done',
   'secondbrain', 'agent-manager-wiki', 'wikiforge-wiki', 'propertyforager-wiki', 'books', 'fsbo-callsheet', 'inventory', 'trade-calculator', 'mailroom',
 ];
 
-test('every one of the 53 live tabs has an icon, and the icon exists', () => {
-  assert.equal(LIVE_KEYS.length, 53);
+test('every one of the 54 live tabs has an icon, and the icon exists', () => {
+  assert.equal(LIVE_KEYS.length, 54);
   for (const key of LIVE_KEYS) {
     const name = icons.NAV_TAB_ICONS[key];
     assert.ok(name, `no icon for ${key}`);

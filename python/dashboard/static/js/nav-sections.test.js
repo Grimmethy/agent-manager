@@ -10,7 +10,7 @@ const ns = require('./nav-sections.js');
 const t = (key) => ({ key, label: key });
 const leaves = (keys) => keys.map(t);
 const KEYS = {
-  core: ['project', 'workers', 'hardware', 'models', 'joblist', 'plugins', 'deepdive', 'discovery', 'brain-dump', 'filed', 'hygiene', 'concepts', 'reports', 'tokenfold'],
+  core: ['project', 'workers', 'hardware', 'models', 'joblist', 'plugins', 'deepdive', 'discovery', 'brain-dump', 'filed', 'hygiene', 'concepts', 'reports', 'tokenfold', 'triggers'],
   forges: ['promptforge', 'adforge', 'scriptforge', 'characterforge', 'postforge', 'cutforge', 'voiceforge', 'storyforge', 'videoforge', 'sceneforge', 'stageforge', 'sparforge', 'kaggleforge', 'journalforge', 'gpu-broker', 'annieforge', 'recipeforge', 'intakereel', 'uiforge'],
   status: ['pending', 'drafting', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm', 'coordinating', 'done'],
   tail: ['secondbrain', 'agent-manager-wiki', 'wikiforge-wiki', 'propertyforager-wiki', 'books', 'fsbo-callsheet', 'inventory', 'trade-calculator', 'mailroom'],
@@ -41,7 +41,7 @@ test('Queue is the job list plus the nine statuses, Ideas / System / Knowledge /
   const by = Object.fromEntries(ns.buildNavSections(LIVE()).map((s) => [s.key, keysOf(s)]));
   assert.deepEqual(by.queue, ['joblist', ...KEYS.status]);
   assert.deepEqual(by.ideas, ['brain-dump', 'filed', 'concepts', 'discovery', 'deepdive', 'hygiene']);
-  assert.deepEqual(by.system, ['hardware', 'models', 'plugins', 'gpu-broker', 'reports', 'tokenfold']);
+  assert.deepEqual(by.system, ['hardware', 'models', 'plugins', 'gpu-broker', 'triggers', 'reports', 'tokenfold']);
   assert.deepEqual(by.knowledge, ['secondbrain', 'agent-manager-wiki', 'wikiforge-wiki', 'propertyforager-wiki']);
   assert.deepEqual(by.business, ['books', 'fsbo-callsheet', 'inventory', 'trade-calculator', 'mailroom']);
 });
@@ -268,7 +268,7 @@ test('rail entries: a divider between sections, icons for open ones, one button 
   assert.deepEqual(entries.filter((e) => e.type === 'tab').map((e) => e.tab.key), ['branches', 'workers', 'adhoc', 'project']);
   assert.deepEqual(entries.filter((e) => e.type === 'section').map((e) => e.section.key), ['queue', 'ideas', 'system', 'forges', 'knowledge', 'business']);
   const allOpen = ns.navRailEntries(sections, () => true);
-  assert.equal(allOpen.filter((e) => e.type === 'tab').length, 53);
+  assert.equal(allOpen.filter((e) => e.type === 'tab').length, 54);
   assert.equal(allOpen.filter((e) => e.type === 'section').length, 0);
   assert.deepEqual(ns.navRailEntries([], () => true), []);
 });

@@ -141,6 +141,7 @@ const NAV_TAB_ICONS = {
   "gpu-broker": "gauge",
   "reports": "clock",
   "tokenfold": "zap",
+  "triggers": "hourglass",
   "promptforge": "palette",
   "adforge": "clapperboard",
   "scriptforge": "file-text",
