@@ -22,6 +22,10 @@ A pause someone else set on the machine (the operator's, for example) is never o
 
 Logging is one line per state change (paused, resumed, backstop on or off, `ss` failing or working again, stuck, stopped), never one per pass.
 
+## The limits are per machine
+
+The defaults (`AGENT_MANAGER_SITE_MAX_LOAD` 3.0 and `AGENT_MANAGER_SITE_MIN_FREE_GB` 3) are meant for grimm: 4 cores and 15 GB of RAM, where an idle machine is well inside them. They are not meant for wok. Measured on wok on 2026-11-11 while this monitor was tested, the load average ran between 4 and 6 and `MemAvailable` between 1.7 and 2.9 GB, so on wok the backstop would pause the machine constantly. Set both variables to values that suit the machine the monitor runs on, and run the monitor on the machine whose site it protects (grimm), not on wok.
+
 ## Running it
 
 - `node src/site-traffic-monitor.js`: the loop (`AGENT_MANAGER_SITE_POLL_S`, default 10 seconds).
