@@ -110,7 +110,7 @@ function next() {
   } catch {
     return null;
   }
-  const { taskIdExistsInQueue } = require('./task-sources.js'); // lazy: task-sources.js requires this module
+  const { taskIdExistsInQueue } = require('./queue-presence.js'); // lazy like the other requires here; a leaf, so no cycle with task-sources.js
   const headByRoot = new Map();
   const headOf = (root) => {
     if (!headByRoot.has(root)) headByRoot.set(root, gitOut(['rev-parse', 'HEAD'], root));
