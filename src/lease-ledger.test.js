@@ -123,3 +123,24 @@ test('the CLI runs as a real process against a temp nodes directory', () => {
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'leases.json'), 'utf8')).t9.nodeId, 'grimm');
   assert.equal(spawnSync(process.execPath, [path.join(__dirname, 'lease-ledger.js')], { env: { ...process.env, ...env }, encoding: 'utf8' }).status, 2);
 });
+
+test('cancelLease deletes a lent lease and returns it; missing, returned and expired leases give null and nothing else changes', () => {
+  const { env } = tmp();
+  L.lendLease('a', 'grimm', { ttlMs: 1000, now: T0, env });
+  L.lendLease('b', 'grimm', { ttlMs: 1000, now: T0, env });
+  L.lendLease('c', 'grimm', { ttlMs: 1000, now: T0, env });
+  L.lendLease('keep', 'grimm', { ttlMs: 9000, now: T0, env });
+  L.returnLease('b', { now: T0, env });
+  L.expireLeases({ now: T0 + 1000, env });
+  const lent = L.leaseFor('keep', env);
+  assert.deepEqual(L.cancelLease('keep', { env }), lent);
+  assert.equal(L.leaseFor('keep', env), null, 'the lent lease is gone');
+  L.lendLease('d', 'grimm', { ttlMs: 9000, now: T0, env });
+  assert.equal(L.cancelLease('a', { env }), null, 'expired');
+  assert.equal(L.cancelLease('b', { env }), null, 'returned');
+  assert.equal(L.cancelLease('nope', { env }), null);
+  assert.equal(L.leaseFor('a', env).state, 'expired');
+  assert.equal(L.leaseFor('b', env).state, 'returned');
+  assert.equal(L.leaseFor('d', env).state, 'lent', 'other leases are untouched');
+  assert.ok(L.lendLease('keep', 'other', { now: T0, env }), 'a cancelled task can be lent again');
+});
