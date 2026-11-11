@@ -36,6 +36,39 @@ After every heartbeat the intake calls `sweepStale`, so a heartbeat from any nod
 
 `GET /api/nodes` (read-only) returns the list with each node's status, for the Workers tab and status pages.
 
+## Heartbeat client
+
+`node src/node-heartbeat.js` runs on every machine, wok included. One run builds the payload `{id, state: "up", load, freeRamGb, paused, at}` (free RAM is `MemAvailable` from `/proc/meminfo`, which counts reclaimable cache, falling back to `os.freemem()`), POSTs it to the intake and prints one JSON line.
+
+Settings (environment): `AGENT_MANAGER_NODE_ID`, `AGENT_MANAGER_NODE_URL` (the **intake** URL, for example `http://192.168.40.11:7471/heartbeat`, not the dashboard), `AGENT_MANAGER_NODE_TOKEN_FILE` (a file holding the node's token; the token is never read from the environment, never printed or logged, never in a repository), optional `AGENT_MANAGER_NODE_ADDRESS` and `AGENT_MANAGER_NODE_TIMEOUT_MS` (default 5000). Missing settings or an unreadable or empty token file exit 2 so a timer shows the unit as failed.
+
+The reply's `globalPause` is applied to this machine's markers: true sets a global pause with source `wok` and a 3 minute expiry that every heartbeat refreshes, so it ends by itself if wok stops answering; false clears the global pause only when its source is `wok`. A global pause set here by anyone else is never overwritten or cleared, and the node pause is never touched. A POST that cannot be made, a non-2xx answer or a reply that is not JSON changes nothing and still exits 0.
+
+Setting up a machine (the owner's steps, nothing here is automatic): register it on wok (`node src/node-registry.js register grimm --address <its LAN address> ...`), copy the printed token into a file on that machine that only its user can read (`chmod 600`), and run the heartbeat every minute with a systemd user timer (example, not enabled):
+
+```ini
+# ~/.config/systemd/user/am-node-heartbeat.service
+[Unit]
+Description=Agent Manager node heartbeat
+[Service]
+Type=oneshot
+Environment=AGENT_MANAGER_NODE_ID=grimm
+Environment=AGENT_MANAGER_NODE_URL=http://192.168.40.11:7471/heartbeat
+Environment=AGENT_MANAGER_NODE_TOKEN_FILE=%h/.config/agent-manager/node-token
+ExecStart=/usr/bin/node /path/to/agent-manager/src/node-heartbeat.js
+
+# ~/.config/systemd/user/am-node-heartbeat.timer
+[Unit]
+Description=Agent Manager node heartbeat, every minute
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+[Install]
+WantedBy=timers.target
+```
+
+Enable with `systemctl --user enable --now am-node-heartbeat.timer`.
+
 ## Running the intake (example, not installed)
 
 ```ini
