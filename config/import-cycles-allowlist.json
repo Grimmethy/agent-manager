@@ -6,7 +6,6 @@
       "src/candidate-premise-check.js",
       "src/capability-debrief-bundle.js",
       "src/capability-ledger.js",
-      "src/capability-routing.js",
       "src/claude-client.js",
       "src/dead-process-check.js",
       "src/deep-dive-grounding-check.js",
@@ -17,12 +16,10 @@
       "src/lib/task-selection.js",
       "src/local-client.js",
       "src/model-provider.js",
-      "src/next-claimable-task.js",
       "src/pipeline-health-audit.js",
       "src/premium-rotation.js",
       "src/sdk/candidate-fulfillment.js",
-      "src/task-sources.js",
-      "src/workflow-priority.js"
+      "src/task-sources.js"
     ]
   ]
 }
