@@ -15,6 +15,10 @@ import sys
 # pattern as routes/concepts.py, routes/second_brain.py, routes/reports.py.)
 
 instances_bp = Blueprint("instances-bp", __name__)
+from routes.pause import pause_bp  # noqa: E402  (machine pauses, nested here so app.py needs no change)
+instances_bp.register_blueprint(pause_bp)
+from routes.nodes import nodes_bp  # noqa: E402  (node registry list, nested here so app.py needs no change)
+instances_bp.register_blueprint(nodes_bp)
 
 
 def lane_fields_for(instance_id, lane_defs):
