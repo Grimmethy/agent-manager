@@ -8,6 +8,7 @@ const { ROTATION_DEMOTED_PRIORITY, rotationDemoted, laneAvoided } = require('./p
 const { openQueueCache, readTaskCached } = require('./queue-cache.js');
 const { bandedPriority, readClaimBands } = require('./workflow-claim-order.js'); // AGENT_MANAGER_PRIORITY_MODE=group ranks by the authored group order; absent = the registered priority
 const { effectivePriority, rankPriorityOfTask, loadSourceRegistry, readTaskSafe, BOT_ADHOC_PRIORITY_PENALTY } = require('./workflow-priority.js');
+const { claimableOnNode } = require('./node-affinity.js'); // multi-node: a task lent to another node (leasedTo) is never claimed here
 
 // Extracted from scripts/local-worker.sh's inline claim-ranking script (the 2026-08-22
 // priority+mtime fix) -- now one tested module instead of an untested `node -e` block in the
@@ -183,6 +184,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     const premium = !!(task && task.premiumPriority === true); // same test the shell side used to re-read every file for
     const pinnedWorker = task && task.pinnedWorker;
     if (pinnedWorker && pinnedWorker !== instanceId) continue; // pinned to another instance -- not a candidate for this one
+    if (!claimableOnNode(task, process.env.AGENT_MANAGER_NODE_ID)) continue; // leased to another node, or unleased and this worker is not on the ledger owner
     if (pinnedWorker === instanceId) {
       pinned.push({ name, mtimeMs, premium });
       continue;
