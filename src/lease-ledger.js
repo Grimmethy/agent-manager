@@ -60,6 +60,16 @@ function returnLease(taskId, { now = Date.now(), env = process.env } = {}) {
   return lease;
 }
 
+// Deletes a lease that is still 'lent' (a lend that failed before the node took the task) and returns it; null when there is none or it is not lent.
+function cancelLease(taskId, { env = process.env } = {}) {
+  const leases = load(env);
+  const lease = leases[taskId];
+  if (!lease || lease.state !== 'lent') return null;
+  delete leases[taskId];
+  save(leases, env);
+  return lease;
+}
+
 // Marks every 'lent' lease whose expiresAt has been reached as 'expired' and returns them (the caller puts those tasks back in the pool).
 function expireLeases({ now = Date.now(), env = process.env } = {}) {
   const leases = load(env);
@@ -102,4 +112,4 @@ function main(argv, env = process.env, out = (s) => process.stdout.write(`${s}\n
 
 if (require.main === module) process.exitCode = main(process.argv.slice(2));
 
-module.exports = { leasesFile, defaultTtlMs, lendLease, returnLease, expireLeases, leaseFor, listLeases, main, DEFAULT_TTL_MS };
+module.exports = { leasesFile, defaultTtlMs, lendLease, returnLease, cancelLease, expireLeases, leaseFor, listLeases, main, DEFAULT_TTL_MS };
