@@ -66,6 +66,7 @@ const { verifyDeterministicDraft } = require('./decompose-review-registry.js');
 const { EXECUTED_VERIFY_BUDGET_MS, EV_MAX_ITEMS, summariseSyntax, extractTaskDiff, summariseExecutedVerification, summariseUnpinned, executedVerificationBlockReason, isHubChildTask, GATE_REPLAY_MAX_ITEMS, summariseGateReplay, runExecutedVerificationStage } = require('./review-executed-verification.js');
 const { INERT_MAX_ITEMS, editsOfImplementResponse, summariseUndefinedRemoval, undefinedRemovalWhere, undefinedRemovalBlockReason, summariseInertAdditions, summariseSkipPaths, runAdvisoryChecks } = require('./review-advisory-checks.js');
 const { runEarlyGates } = require('./review-early-gates.js');
+const { getDomainConfig, logFactCheckAudit, prepareFactCheck } = require('./review-grounding.js');
 // script-extract.js stays in core (also required directly by scripts/extract-core-ui.js,
 // a standalone dev CLI that can't depend on an optional plugin) -- this require reaches
 // its registerDeterministicReview('script-extract', ...) side effect normally, same as any
@@ -93,44 +94,6 @@ function writeTaskJson(taskPath, task) {
   const tmp = `${taskPath}.tmp-${process.pid}`;
   fs.writeFileSync(tmp, JSON.stringify(task, null, 2));
   fs.renameSync(tmp, taskPath);
-}
-
-function getDomainConfig(domainsPath, domain) {
-  const domains = JSON.parse(fs.readFileSync(domainsPath, 'utf8'));
-  const cfg = domains[domain];
-  if (!cfg) {
-    // Self-heal: if the domain is a standard one (derived from task-source-registry.js),
-    // add it to the pipeline's task-domains.json and continue. This prevents tasks from
-    // being permanently blocked due to a missing key.
-    const { isStandardDomain, getDomainShape } = require('./task-domains-registry.js');
-    if (isStandardDomain(domain)) {
-      const shape = getDomainShape(domain);
-      domains[domain] = shape;
-      // Atomic write: write to tmp, then rename.
-      const tmp = `${domainsPath}.tmp-${process.pid}`;
-      fs.writeFileSync(tmp, JSON.stringify(domains, null, 2) + '\n');
-      fs.renameSync(tmp, domainsPath);
-      // Log the self-heal action.
-      try {
-        const { logPipelineEvent } = require('./pipeline-history.js');
-        logPipelineEvent(path.dirname(domainsPath), 'task-domain-self-heal', {
-          domain,
-          shape,
-          at: new Date().toISOString(),
-        });
-      } catch { /* pipeline-history may not be available in all contexts */ }
-      return shape;
-    }
-    // Genuinely unknown domain: block with a clear message naming the file to edit.
-    throw new Error(`Unknown task domain: ${domain} (valid: ${Object.keys(domains).join(', ')}) in ${domainsPath} -- add "${domain}" to ${domainsPath} or run scripts/ensure-task-domains.sh <that pipeline dir>`);
-  }
-  return cfg;
-}
-
-function getWorkDir(cfg, { repoRoot, secondBrainDir }) {
-  if (cfg.workDirKind === 'repoRoot' || cfg.workDirKind === 'taxharvestRoot') return repoRoot;
-  if (cfg.workDirKind === 'secondBrainDir') return secondBrainDir;
-  throw new Error(`Unknown workDirKind: ${cfg.workDirKind}`);
 }
 
 // Local-model review and worker draft calls share one local GPU/model slot -- stagger review's
@@ -186,28 +149,6 @@ function isAdvisoryProseSource(source) {
 }
 function isEffectivelyEmpty(trimmed) {
   return trimmed === '' || trimmed === '""' || trimmed === "''";
-}
-
-// 2026-09-08, Second Brain [[dspy-deterministic-prompt-tuning]] research applied: DSPy's
-// optimizer family compiles a signature against a real, labeled corpus of outcomes rather
-// than trusting a hand-tuned heuristic's own self-assessment. fact-checker.js's own header
-// comment calls the ungrounded-url/ungrounded-field gate "high-precision, almost never a
-// false positive" -- but this session's own investigation found 4 confirmed false
-// positives against that exact claim (a newly-declared constant, a real field outside the
-// diff's touched files, a field on an unchanged diff context line, a self-invented shell
-// echo marker), discovered only by manually grepping every historical hard-block and
-// hand-auditing each one -- there was no standing record of this gate's own real
-// true/false-positive rate at all. One NDJSON line per hard block (not just the terminal
-// verdict already in the task's own history) means a future audit is `grep`, not manual
-// archaeology across queue/done/ -- same discipline local-client.js's degenerate-audit.log
-// and local-tool-client.js's context-budget-audit.log already established for their own
-// gates. Best-effort: must never affect the real review outcome.
-// 2026-09-08: now a thin wrapper over pipeline-history.js's unified writer -- see that
-// file's own header for why the 4 separately-invented per-class log files (this one
-// included) were consolidated into one NDJSON stream discriminated by `type`, mirroring
-// dspy.settings.GLOBAL_HISTORY. Same call signature as before; no call site changed.
-function logFactCheckAudit(pipelineDir, entry) {
-  logPipelineEvent(pipelineDir, 'fact-check-block', entry);
 }
 
 // HUB0090 · 2/2 · review-time relocation-validation (sibling of HUB0091's draft-time
@@ -753,79 +694,9 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   const earlyResult = runEarlyGates({ task, recordModelOutcome, secondBrainDir, repoRoot });
   if (earlyResult) return earlyResult;
 
-  const domainCfg = getDomainConfig(domainsPath, task.domain);
-  const workDir = getWorkDir(domainCfg, { repoRoot, secondBrainDir });
-
-  // fact-check: deep_dive's real "repo root" for this purpose is the cloned external
-  // project (looked up by promptContext.projectSlug), not agent-manager's own repo --
-  // otherwise every referenced file reports as missing.
-  let repoRootForCheck = workDir;
-  if (task.source === 'deep_dive' && deepDiveCoveragePath && fs.existsSync(deepDiveCoveragePath)) {
-    try {
-      const ddCoverage = JSON.parse(fs.readFileSync(deepDiveCoveragePath, 'utf8'));
-      const ddProj = ddCoverage.projects && ddCoverage.projects[task.promptContext.projectSlug];
-      if (ddProj && ddProj.clonePath) repoRootForCheck = ddProj.clonePath;
-    } catch (e) { /* fall back to workDir */ }
-  }
-
-  const taskPathForGrounding = path.join(require('os').tmpdir(), `review-grounding-${task.id}.json`);
-  let groundingText = '';
-  try {
-    fs.writeFileSync(taskPathForGrounding, JSON.stringify(task));
-    groundingText = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPathForGrounding], { encoding: 'utf8' });
-  } catch (e) {
-    console.error(`[review-task] grounding-source generation failed for ${taskPathForGrounding}: ${e.stack || e.message || String(e)}`);
-    groundingText = '';
-  } finally {
-    try { fs.unlinkSync(taskPathForGrounding); } catch (e) { /* best-effort cleanup */ }
-  }
-
-  // Feed the consumer's configured code dirs (AGENT_MANAGER_GREP_DIRS) as extraRoots so
-  // resolveAgainstRepo can turn a bare `app.py` into `server/app.py` instead of reporting
-  // it "missing" -> "fabricated". Only meaningful when the fact-check runs against
-  // agent-manager's OWN repoRoot (the default); for a deep_dive external clone or the
-  // second-brain vault, these dirs don't apply and simply won't match -- harmless.
-  const factCheckExtraRoots = (repoRootForCheck === workDir)
-    ? (() => { try { return getConfig().grepAllowedDirs; } catch { return []; } })()
-    : [];
-  // 2026-09-08, root-caused live: a stacked task correctly citing a sibling's real,
-  // committed-but-unmerged value was hard-blocked as "cites a value that appears nowhere
-  // in its real grounding source" -- the grep ran against repoRootForCheck's plain working
-  // tree, never the shared stacked branch. resolveGroundingRef is null for any non-stacked
-  // task (the overwhelming majority) or when the deep_dive external-clone repoRootForCheck
-  // swap already happened above, so this only diverges for the exact stacked case.
-  const groundingRef = (repoRootForCheck === workDir) ? resolveGroundingRef(task, repoRootForCheck) : null;
-
-  // Pre-fact-check gate for sources registering preValidateCitedPaths -- project_search / arch_import (2026-09-08 brain-dump request):
-  // those two sources' drafts are plain prose citing specific files and line numbers as
-  // evidence for a claim, not a Group B diff -- checkDraft's own fabricated-path handling
-  // is tuned for a diff's claimed file targets, not "does this cited EVIDENCE actually
-  // exist." Cheaper and runs first: a draft that fails this never reaches the rest of the
-  // fact-checker or a review call at all. blockedReason is prefixed 'ungrounded draft:
-  // fabricated file path' so blocked-task-classifiers.js's hasFabricatedFilePath treats
-  // it as the same retryable:false category a real diff-side fabrication already is.
-  const preValidateSource = resolveSourceName(task);
-  const preValidateEntry = getRegisteredSource(preValidateSource);
-  // `preValidateCitedPaths: true` on the source's registration (project_search in core, arch_import in the hygiene plugin).
-  if (preValidateEntry && preValidateEntry.preValidateCitedPaths === true) {
-    const preValidation = preValidateCitedPaths(task.implementResponse || '', repoRootForCheck, factCheckExtraRoots);
-    if (!preValidation.valid) {
-      const reason = `ungrounded draft: fabricated file path -- pre-validation: ${preValidation.failures.join('; ')}`;
-      task.reviewProvider = 'deterministic-pre-validation';
-      logFactCheckAudit(pipelineDir, {
-        taskId: task.id, source: preValidateSource, reason,
-        flags: preValidation.failures.map((f) => ({ type: 'pre-validation', detail: f })),
-      });
-      recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-      appendHistoryEvent(task, 'blocked', reason);
-      return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict: 'skipped' };
-    }
-  }
-
-  const factCheck = checkDraft(task.implementResponse || '', repoRootForCheck, groundingText || undefined, factCheckExtraRoots, groundingRef);
-  // `imprecise-file-path` is informational (a real file cited with a sloppy prefix) --
-  // it must not by itself flip the verdict label to "flagged".
-  const factCheckVerdict = (factCheck.flags || []).some((f) => f.type !== 'imprecise-file-path') ? 'flagged' : 'pass';
+  const prepared = prepareFactCheck({ task, repoRoot, secondBrainDir, domainsPath, deepDiveCoveragePath, pipelineDir, recordModelOutcome });
+  if (prepared.early) return prepared.early;
+  const { factCheck, factCheckVerdict, repoRootForCheck, groundingText, factCheckExtraRoots, groundingRef } = prepared;
 
   // 2026-08-24 (pipeline hardening -- resurrects a real gap closed once already on
   // 2026-08-12 for the old Windows/PowerShell review-runner.ps1, never carried forward
