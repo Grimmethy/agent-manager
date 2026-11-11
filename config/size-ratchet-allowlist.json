@@ -65,7 +65,7 @@
     "src/prompts.test.js": 872,
     "src/reject-retry-check.js": 1138,
     "src/reject-retry-check.test.js": 1949,
-    "src/review-task.js": 756,
+    "src/review-task.js": 698,
     "src/review-task.test.js": 3335,
     "src/review-verify.js": 959,
     "src/review-verify.test.js": 1410,

@@ -59,12 +59,13 @@ const { unnamedChangedFiles } = require('./lib/draft-side-effects.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { getDecomposeProposalDetection } = require('./hub-review-detection.js');
 const { getSplitCoverageJudging } = require('./split-coverage-judging-route.js');
-const { EXECUTED_VERIFY_BUDGET_MS, EV_MAX_ITEMS, summariseSyntax, extractTaskDiff, summariseExecutedVerification, summariseUnpinned, executedVerificationBlockReason, isHubChildTask, GATE_REPLAY_MAX_ITEMS, summariseGateReplay, runExecutedVerificationStage } = require('./review-executed-verification.js');
-const { INERT_MAX_ITEMS, editsOfImplementResponse, summariseUndefinedRemoval, undefinedRemovalWhere, undefinedRemovalBlockReason, summariseInertAdditions, summariseSkipPaths, runAdvisoryChecks } = require('./review-advisory-checks.js');
+const { EXECUTED_VERIFY_BUDGET_MS, EV_MAX_ITEMS, summariseSyntax, extractTaskDiff, summariseExecutedVerification, summariseUnpinned, executedVerificationBlockReason, isHubChildTask, GATE_REPLAY_MAX_ITEMS, summariseGateReplay } = require('./review-executed-verification.js');
+const { INERT_MAX_ITEMS, editsOfImplementResponse, summariseUndefinedRemoval, undefinedRemovalWhere, undefinedRemovalBlockReason, summariseInertAdditions, summariseSkipPaths } = require('./review-advisory-checks.js');
 const { runEarlyGates } = require('./review-early-gates.js');
 const { getDomainConfig, prepareFactCheck } = require('./review-grounding.js');
 const { verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, NON_IMPL_PATTERNS, namesExtractedPieces } = require('./review-gate-helpers.js');
 const { runDeterministicGates } = require('./review-deterministic-gates.js');
+const { runPreVoteChecks } = require('./review-prevote-checks.js');
 // script-extract.js stays in core (also required directly by scripts/extract-core-ui.js,
 // a standalone dev CLI that can't depend on an optional plugin) -- this require reaches
 // its registerDeterministicReview('script-extract', ...) side effect normally, same as any
@@ -540,67 +541,8 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   if (gated.early) return gated.early;
   const { trimmedImplResponse } = gated;
 
-  // Edit-set syntax gate (lib/edit-set-syntax.js, 2026-10-08, TaxHarvest AC-271): the executed-verification block below runs only for adhoc drafts that carry
-  // a rawDiff, so a Group B draft (a JSON edit set -- arch_review / function_length_fix / observability_fix / change_review_fix ...) was never syntax-checked and
-  // an edit that split an import reached pending-merge. Replays the set against the repo and parses every created/edited file; a file that parsed before the
-  // edit and does not now is a deterministic block, same discipline as the gates above (no vote is spent). Coverage (checked / skipped with reasons) is
-  // stamped on task.editSetSyntax for the voters. Never throws; AGENT_MANAGER_EDIT_SYNTAX_GATE=advisory|off.
-  try {
-    const { usesGroupB } = require('./lib/apply-core.js');
-    const ess = require('./lib/edit-set-syntax.js');
-    const essMode = ess.syntaxGateMode();
-    if (essMode !== 'off' && usesGroupB(task) && trimmedImplResponse) {
-      let editItems = null;
-      try { const v = parseJsonMaybeFenced(trimmedImplResponse); editItems = v ? (Array.isArray(v) ? v : [v]) : null; } catch { editItems = null; }
-      if (editItems && editItems.some((i) => i && (i.mode === 'edit' || i.mode === 'create'))) {
-        const syn = ess.checkEditSetSyntax(editItems, repoRoot);
-        task.editSetSyntax = { at: new Date().toISOString(), checked: syn.checked, skipped: syn.skipped, failed: syn.failed.map((f) => f.file), preexisting: syn.preexisting };
-        if (syn.failed.length) {
-          const reason = `Deterministic gate: edit-set-syntax -- ${ess.syntaxFeedbackFor(syn.failed)}`.slice(0, 900);
-          if (essMode === 'advisory') {
-            appendHistoryEvent(task, 'advisory', reason.slice(0, 600));
-          } else {
-            task.reviewProvider = 'deterministic-edit-set-syntax';
-            recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-            appendHistoryEvent(task, 'blocked', reason);
-            return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-          }
-        }
-      }
-    }
-  } catch (e) {
-    console.error(`[review] edit-set syntax gate errored for ${task.id} (non-fatal, continuing): ${e && e.message}`);
-  }
-
-  const executedVerificationBlock = runExecutedVerificationStage({ task, repoRoot, pipelineDir, verifyDiffFn, recordModelOutcome, factCheckVerdict });
-  if (executedVerificationBlock) return executedVerificationBlock;
-
-  const advisoryBlock = runAdvisoryChecks({ task, repoRoot, factCheckVerdict, recordModelOutcome, findInertFn, findOverlapFn, findUndefinedFn, findSkipPathsFn });
-  if (advisoryBlock) return advisoryBlock;
-
-  // Deterministic hit-count gate (2026-09-13, pipeline-debrief Task 2 / Flag 2): when an
-  // acceptance criterion asserts a SPECIFIC grep hit count (`grep -n <symbol> <file>` ...
-  // "exactly N hits" / "returns N hits"), the count is mechanically determinable via
-  // `grep -c <symbol> <file>` -- block the draft with the actual count BEFORE any
-  // model-reviewer call, instead of spending a vote re-discovering the same systematic
-  // mismatch (the model repeats the symbol in comment + code). No-op when no criterion
-  // matches the pattern; never throws (a gate error falls through to the normal vote,
-  // same non-fatal discipline as the skip-path / policy-change checks above).
-  if (process.env.AGENT_MANAGER_HIT_COUNT_GATE !== 'false'
-      && Array.isArray(task.acceptanceCriteria) && task.acceptanceCriteria.length) {
-    try {
-      const { checkHitCountGate } = require('./hit-count-gate.js');
-      const gate = checkHitCountGate({ repoRoot: repoRootForCheck, criteria: task.acceptanceCriteria, rawDiff: task.rawDiff });
-      if (gate && gate.verdict === 'blocked') {
-        task.reviewProvider = 'deterministic-hit-count';
-        recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: gate.blockedReason });
-        appendHistoryEvent(task, 'blocked', gate.blockedReason);
-        return { succeeded: true, verdict: 'blocked', blockedReason: gate.blockedReason, blockedStage: 'review', factCheckVerdict };
-      }
-    } catch (e) {
-      console.error(`[review] hit-count gate errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
-    }
-  }
+  const preVoteBlock = runPreVoteChecks({ task, repoRoot, repoRootForCheck, pipelineDir, factCheckVerdict, recordModelOutcome, trimmedImplResponse, verifyDiffFn, findInertFn, findOverlapFn, findUndefinedFn, findSkipPathsFn });
+  if (preVoteBlock) return preVoteBlock;
 
   await waitForLocalAvailability(instancesDir);
 
