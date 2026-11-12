@@ -119,6 +119,12 @@ async function enterProjectTab() {
   await refreshProjectStatus();
 }
 
+// Detached plugin drains still alive after a stop (status.drains, from python/dashboard/drain_registry.py) keep the pipeline from reading as stopped: name them.
+function drainsNoteHtml(status) {
+  if (!Array.isArray(status.drains) || !status.drains.length) return '';
+  return `<div class="meta">Drains still running: ${status.drains.map((d) => escapeHtml(d.name)).join(', ')}. A stop ends them; the watchdog stops stragglers.</div>`;
+}
+
 async function refreshPipelineStatus() {
   const panel = document.getElementById('pipeline-panel');
   if (!panel) return;
@@ -146,7 +152,7 @@ async function refreshPipelineStatus() {
       <div class="row">
         <span>Pipeline daemons are running against <strong>${escapeHtml(status.activeRepoRoot || '?')}</strong>, but the health check isn't confirming (a worker may be blocked on the model lock). Use Stop / Force Stop to clear them.</span>
         <span class="badge idle">DAEMONS DETECTED</span>
-      </div>
+      </div>${drainsNoteHtml(status)}
     `;
   } else {
     stopRequested = false; // confirmed not running -- next click on the toggle starts fresh, not a stray "force stop"

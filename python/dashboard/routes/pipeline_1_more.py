@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import json
-import subprocess
+import subprocess, drain_registry   # drain_registry: the detached plugin drains (python/dashboard/drain_registry.py); edits here stay line-neutral, the functions below are size-ratcheted
 
 # The app.py helpers these views call (ENV_FILE_PATH, _COMMIT_LOG_FIELD_SEP, _COMMIT_LOG_RECORD_SEP, _TASK_TRAILER_RE, _acquire_apply_lock, _archive_task_file, _find_task_log_anywhere, _find_task_record_anywhere, _invalidate_branch_cache, _pipeline_running, _pipeline_stoppable, _release_apply_lock, _run_git, _start_pipeline, _stop_pipeline, _summarize_task_record, _sync_live_checkout, get_active_repo_root, get_hub_data_provider, get_pipeline_dir, list_unmerged_branches, logger, queue_dir, read_env_file, read_json_safe) are
 # imported lazily inside each view: app.py imports THIS module to register the
@@ -339,12 +339,12 @@ def api_pipeline_status():
     running = _pipeline_running()
     return jsonify({
         "activeRepoRoot": get_active_repo_root(),
-        "running": running,
+        "running": running, "drains": drain_registry.running_drains(),
         # "stoppable" is looser than "running": true whenever a real daemon process
         # exists, even if every heartbeat says otherwise. The frontend gates its Stop
         # control on (running || stoppable) so a wrong "running" can never hide the only
         # way to stop a live pipeline from the UI (2026-08-30 incident).
-        "stoppable": True if running else _pipeline_stoppable(),
+        "stoppable": True if running else (_pipeline_stoppable() or bool(drain_registry.running_drains())),
         # Which job types actually run is no longer a bundled "mode" -- see /api/job-types.
         # includeApply/skipPush are the two run-specific safety toggles that used to be
         # implied by mode; they're per-repoRoot and persisted the same way REPO_ROOT is.
@@ -388,7 +388,7 @@ def api_pipeline_stop():
     from app import _stop_pipeline
     body = request.get_json(silent=True) or {}
     force = bool(body.get("force", False))
-    return jsonify({"stopped": _stop_pipeline(force=force)})
+    return jsonify({"drains_stopped": [d["name"] for d in drain_registry.running_drains()], "stopped": _stop_pipeline(force=force)})   # drains first: stop.sh is about to end them
 
 
 @pipeline_1_more_bp.route("/api/git/unmerged-branches")
