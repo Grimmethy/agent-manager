@@ -23,6 +23,10 @@ LOG_DIR="${STATE_DIR}/logs"
 PID_DIR="${STATE_DIR}/pids"
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
+# A launch ends the stopped state: scripts/stop.sh leaves the pipeline-stopped marker, which detached plugin drains read to know the pipeline is stopped (they exit at the top of
+# a tick and the watchdog triggers start none while it exists). Removed before anything starts, so a started pipeline never reads as stopped.
+rm -f "${STATE_DIR}/pipeline-stopped"
+
 # Starting the pipeline by hand is an explicit "GPU work now" signal -- it stomps any
 # ComfyUI GPU lease PromptForge left behind (see comfyui_lease_held in
 # agent-manager-common.sh). An in-flight generation loses this round (gpu-guard.js will
