@@ -56,13 +56,14 @@ test('mismatch: actual 2 vs expected 3 -> blocked verdict with both counts in th
 
 test('mismatch is reachable only BEFORE the model reviewer: the pre-vote checks (which hold the gate) precede the vote dispatch in review-task.js', () => {
   // The "model reviewer never called" invariant lives in review-task.js's control flow: runReview calls runPreVoteChecks (review-prevote-checks.js, which holds
-  // the hit-count gate) and returns its blocked verdict, textually before the resolvedMajorityVote({...}) dispatch. A textual ordering assertion is this
-  // repo's established convention for review-stage ordering guarantees.
+  // the hit-count gate) and returns its blocked verdict, textually before the runVoteAndDecide({...}) dispatch (review-vote-decision.js holds the vote itself).
+  // A textual ordering assertion is this repo's established convention for review-stage ordering guarantees.
   const src = fs.readFileSync(path.join(__dirname, 'review-task.js'), 'utf8');
   const preVoteIdx = src.indexOf('const preVoteBlock = runPreVoteChecks({');
-  const voteIdx = src.indexOf('const voteResult = await resolvedMajorityVote({');
+  const voteIdx = src.indexOf('return runVoteAndDecide({');
   assert.ok(preVoteIdx > -1, 'the pre-vote checks call must exist in review-task.js');
   assert.ok(voteIdx > -1, 'vote dispatch must exist in review-task.js');
+  assert.match(fs.readFileSync(path.join(__dirname, 'review-vote-decision.js'), 'utf8'), /const voteResult = await resolvedMajorityVote\(\{/);
   assert.ok(preVoteIdx < voteIdx, 'the pre-vote checks must run before the model-reviewer dispatch');
   assert.match(src.slice(preVoteIdx, voteIdx), /if \(preVoteBlock\) return preVoteBlock;/);
   // The gate itself lives in review-prevote-checks.js and its mismatch path RETURNS a blocked verdict -- no fall-through to the vote:
