@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
-const { scrub, buildPackage, validatePackage, sendPackage, httpPost, PACKAGE_STRIP, SEND_TIMEOUT_MS } = require('./review-package.js');
+const { scrub, buildPackage, buildRecordPackage, validatePackage, sendPackage, httpPost, PACKAGE_STRIP, RECORD_PACKAGE_STRIP, SEND_TIMEOUT_MS } = require('./review-package.js');
 
 const SHA = 'a'.repeat(40);
 const T0 = Date.UTC(2026, 10, 11, 12, 0, 0);
@@ -44,7 +44,7 @@ test('validatePackage accepts a good package and gives a specific reason for eac
   const good = buildPackage({ record: RECORD, nodeId: 'grimm', branch: 'agent/x', sha: SHA, now: T0 });
   assert.deepEqual(validatePackage(good), { ok: true, reason: '' });
   const cases = [
-    [null, /object/], [[], /object/], [{ ...good, version: 2 }, /version/], [{ ...good, record: null }, /record/], [{ ...good, record: [] }, /record/],
+    [null, /object/], [[], /object/], [{ ...good, version: 3 }, /version/], [{ ...good, version: 0 }, /version/], [{ ...good, record: null }, /record/], [{ ...good, record: [] }, /record/],
     [{ ...good, taskId: 'other' }, /taskId/], [{ ...good, taskId: '' }, /taskId/], [{ ...good, taskId: 5, record: { id: 5 } }, /taskId/],
     [{ ...good, nodeId: '' }, /nodeId/], [{ ...good, nodeId: 7 }, /nodeId/],
     [{ ...good, sha: 'abc' }, /sha/], [{ ...good, sha: 'A'.repeat(40) }, /sha/], [{ ...good, sha: SHA + '0' }, /sha/], [{ ...good, sha: 5 }, /sha/],
@@ -116,4 +116,49 @@ test('the default transport really POSTs to a local server and reports its statu
   try {
     await assert.rejects(httpPost(`http://127.0.0.1:${slow.address().port}/`, {}, '{}', 150), /timeout/);
   } finally { await new Promise((r) => { slow.close(r); slow.closeAllConnections(); }); }
+});
+
+const DRAFT = { id: 'HUB2-01-x', title: 'T', rawDiff: 'diff --git a b', implementResponse: 'did it', leasedTo: 'grimm', localVotes: [{ verdict: 'APPROVE' }], history: [{ stage: 'x' }], apiToken: 't', nested: { password: 'p', keep: 1 } };
+
+test('buildRecordPackage has the version 2 contract shape, no branch or sha, and drops votes, history, leasedTo and secret keys at any depth', () => {
+  const pkg = buildRecordPackage({ record: DRAFT, nodeId: 'grimm', now: T0 });
+  assert.deepEqual(Object.keys(pkg), ['version', 'kind', 'taskId', 'nodeId', 'record', 'builtAt']);
+  assert.equal(pkg.version, 2);
+  assert.equal(pkg.kind, 'record');
+  assert.equal(pkg.taskId, 'HUB2-01-x');
+  assert.equal(pkg.builtAt, '2026-11-11T12:00:00.000Z');
+  assert.deepEqual(pkg.record, { id: 'HUB2-01-x', title: 'T', rawDiff: 'diff --git a b', implementResponse: 'did it', nested: { keep: 1 } });
+  assert.deepEqual(RECORD_PACKAGE_STRIP, ['localVotes', 'history', 'leasedTo']);
+  assert.equal(DRAFT.leasedTo, 'grimm');
+  assert.equal(DRAFT.localVotes.length, 1);
+});
+
+test('buildRecordPackage with no record gives a package that validatePackage refuses', () => {
+  const pkg = buildRecordPackage({ record: undefined, nodeId: 'grimm', now: T0 });
+  assert.equal(pkg.taskId, undefined);
+  assert.equal(validatePackage(pkg).ok, false);
+});
+
+test('validatePackage accepts a good version 2 package and gives a specific reason for each failure', () => {
+  const good = buildRecordPackage({ record: DRAFT, nodeId: 'grimm', now: T0 });
+  assert.deepEqual(validatePackage(good), { ok: true, reason: '' });
+  const cases = [
+    [{ ...good, kind: 'branch' }, /kind/], [{ ...good, kind: undefined }, /kind/],
+    [{ ...good, record: { ...good.record, rawDiff: '' } }, /rawDiff/], [{ ...good, record: { ...good.record, rawDiff: undefined } }, /rawDiff/], [{ ...good, record: { ...good.record, rawDiff: 5 } }, /rawDiff/],
+    [{ ...good, taskId: 'other' }, /taskId/], [{ ...good, nodeId: '' }, /nodeId/], [{ ...good, record: [] }, /record/], [{ ...good, record: null }, /record/],
+  ];
+  for (const [pkg, re] of cases) {
+    const r = validatePackage(pkg);
+    assert.equal(r.ok, false, JSON.stringify(pkg).slice(0, 60));
+    assert.match(r.reason, re);
+  }
+});
+
+test('a version 1 package still needs its sha and branch, and a version 2 package does not', () => {
+  const v1 = buildPackage({ record: RECORD, nodeId: 'grimm', branch: 'agent/x', sha: SHA, now: T0 });
+  assert.equal(validatePackage({ ...v1, sha: undefined }).ok, false);
+  assert.equal(validatePackage({ ...v1, branch: undefined }).ok, false);
+  const v2 = buildRecordPackage({ record: DRAFT, nodeId: 'grimm', now: T0 });
+  assert.equal('sha' in v2 || 'branch' in v2, false);
+  assert.equal(validatePackage(v2).ok, true);
 });

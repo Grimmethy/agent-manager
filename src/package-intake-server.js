@@ -5,10 +5,12 @@
 //
 //   POST /package   Authorization: Bearer <that node's token>, JSON = a review package (version 1, taskId, nodeId, branch, sha, record, builtAt)
 //                   -> 200 {ok: true, taskId}
+//                   A version 2 package (the drafted record, no branch) also REPLACES the leased original in queue/pending or queue/adhoc: the node's record
+//                   (leasedTo removed, fromNode set, status needs-review) is written to queue/review/ under the original file name and the original is deleted.
 //   400 bad or oversized (over 4 MB) body, a package that validatePackage refuses, or a task id that is not /^[A-Za-z0-9._-]{1,200}$/;
 //   401 missing or wrong token (the node id comes from the package; unknown and wrong give the same answer);
 //   403 the request does not come from the address the node was registered with; 404 any other path; 405 any other method on /package;
-//   409 the task has no lease, or its lease belongs to another node.
+//   409 the task has no lease, or its lease belongs to another node, or (version 2) there is no original record to replace (nothing is stored then).
 //
 // The package is written atomically to <AGENT_MANAGER_PIPELINE_DIR>/queue/node-packages/<taskId>.json (a resend replaces it), the lease is ended with
 // returnLease() (src/lease-ledger.js) and one summary-level notification (src/notify.js, key node-package:<taskId>) is sent; the notice is best effort.
@@ -19,7 +21,8 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const { verifyToken, loadNodes } = require('./node-registry.js');
-const { validatePackage } = require('./review-package.js');
+const { validatePackage, RECORD_PACKAGE_VERSION } = require('./review-package.js');
+const { findRecordFile } = require('./lend-task.js');
 const { leaseFor, returnLease } = require('./lease-ledger.js');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
 const { notify } = require('./notify.js');
@@ -63,6 +66,28 @@ function storePackage(pipelineDir, pkg) {
   writeJsonAtomicSync(path.join(dir, `${pkg.taskId}.json`), pkg);
 }
 
+// The leased original on wok (queue/pending or queue/adhoc, the file named after the task id), or null when it is missing or is not that task's record.
+function findOriginal(pipelineDir, taskId) {
+  const file = findRecordFile(pipelineDir, taskId);
+  if (!file) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8')).id === taskId ? file : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Files the node's drafted record in wok's queue/review/ under the original's file name, then removes the original (write first, so a crash never loses the task).
+function replaceWithDraft(pipelineDir, originalFile, pkg, atMs) {
+  const draft = { ...pkg.record, fromNode: pkg.nodeId, status: 'needs-review' };
+  delete draft.leasedTo;
+  draft.history = [...(Array.isArray(draft.history) ? draft.history : []), { stage: 'node-draft-received', at: new Date(atMs).toISOString(), detail: `drafted on ${pkg.nodeId}` }];
+  const dir = path.join(pipelineDir, 'queue', 'review');
+  fs.mkdirSync(dir, { recursive: true });
+  writeJsonAtomicSync(path.join(dir, path.basename(originalFile)), draft);
+  fs.unlinkSync(originalFile);
+}
+
 function createServer({ env = process.env, now = () => Date.now(), send: sendNotice = notify } = {}) {
   const pipelineDir = String(env.AGENT_MANAGER_PIPELINE_DIR || '').trim();
   if (!pipelineDir) throw new Error('AGENT_MANAGER_PIPELINE_DIR must be set');
@@ -89,10 +114,13 @@ function createServer({ env = process.env, now = () => Date.now(), send: sendNot
       const lease = leaseFor(pkg.taskId, env);
       if (!lease || lease.nodeId !== nodeId) return send(res, 409, { ok: false, error: 'no lease for this task on this node' });
 
+      const original = pkg.version === RECORD_PACKAGE_VERSION ? findOriginal(pipelineDir, pkg.taskId) : null;
+      if (pkg.version === RECORD_PACKAGE_VERSION && !original) return send(res, 409, { ok: false, error: 'no original record for this task' });
       storePackage(pipelineDir, pkg);
+      if (original) replaceWithDraft(pipelineDir, original, pkg, now());
       returnLease(pkg.taskId, { now: now(), env });
       try {
-        await sendNotice({ level: 'summary', key: `node-package:${pkg.taskId}`, title: `Node ${nodeId}: review package arrived`, text: `Task ${pkg.taskId} came back from ${nodeId} on ${pkg.branch}.` }, { env, now });
+        await sendNotice({ level: 'summary', key: `node-package:${pkg.taskId}`, title: `Node ${nodeId}: review package arrived`, text: pkg.branch ? `Task ${pkg.taskId} came back from ${nodeId} on ${pkg.branch}.` : `Task ${pkg.taskId} was drafted on ${nodeId} and is waiting in review.` }, { env, now });
       } catch (e) { /* the notice is best effort */ }
       return send(res, 200, { ok: true, taskId: pkg.taskId });
     } catch (e) {
@@ -114,4 +142,4 @@ if (require.main === module) {
   server.listen(port, host, () => process.stdout.write(`package intake listening on ${host}:${port}\n`));
 }
 
-module.exports = { createServer, refusal, storePackage, MAX_BODY_BYTES };
+module.exports = { createServer, refusal, storePackage, findOriginal, replaceWithDraft, MAX_BODY_BYTES };

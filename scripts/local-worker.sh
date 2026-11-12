@@ -219,6 +219,12 @@ process_drafting_file() {
     mkdir -p "${QUEUE_DIR}/done" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/done/${name}"
     printf '[worker-%s] recorded %s -- script handler finished, no review needed: moved to done/\n' "$INSTANCE_ID" "$task_id" >&2
+  elif [[ "$draft_succeeded" == "true" ]] && node "${PACKAGE_SRC_DIR}/node-outbox.js" is-node; then
+    # Multi-node (piece 7b): a worker on a NODE (AGENT_MANAGER_NODE_ID set and not wok) stops after the draft. The drafted record waits in queue/node-outbox/ for
+    # src/node-package-send.js to ship it to wok, whose own queue/review/ runs the ordinary review, apply, verifier and merge. A wok worker never takes this branch.
+    mkdir -p "${QUEUE_DIR}/node-outbox" >/dev/null 2>&1
+    mv -n "$wpath" "${QUEUE_DIR}/node-outbox/${name}"
+    printf '[worker-%s] draft complete on a node, ready to send to wok: %s\n' "$INSTANCE_ID" "$task_id" >&2
   elif [[ "$draft_succeeded" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/review" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/review/${name}"

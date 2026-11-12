@@ -10,20 +10,32 @@ How to run the two-machine Agent Manager (wok and grimm) without watching it. Th
 4. **The cloud lane stays off until the owner turns it on**, and while it is on it claims nothing once the gateway's hourly token budget is spent (`src/gateway-budget.js`; `cloud-lane.md`, "What went wrong on the lane, and the budget check").
 5. **Work is only claimed on its own node.** A task leased to grimm is never claimed on wok and the other way round (`src/node-affinity.js`).
 6. **Leases end.** A lease lasts 6 hours (`AGENT_MANAGER_LEASE_TTL_MS`). `node src/lend-task.js reclaim` expires due leases and takes the tasks back; it is run by the owner (nothing runs it on a schedule yet).
-7. **Packages never contain live client data.** A review package drops votes, history and any token, secret or password key (`src/review-package.js`); the work itself travels as a branch.
-8. **Merges and deploys stay with the verified flow.** A relayed branch is reviewed, verified and merged as any other. Nothing deploys to grimm by code.
+7. **Packages never contain live client data.** A record package drops votes, history, the lease stamp and any token, secret or password key (`src/review-package.js`); the work itself is the record's `rawDiff`.
+8. **Merges and deploys stay with the verified flow, and a node never merges, pushes or deploys.** A node's record lands in wok's `queue/review/` and is reviewed, applied, verified and merged as any other task; GitHub credentials never go on a node. Nothing deploys to grimm by code.
 9. **The owner hears about exceptions, plus one summary a day.** Urgent messages for a machine that went quiet or a pause that is stuck; one daily summary (`notifier.md`; the hourly timer in its "Daily summary timer" section is an example, not installed).
 10. **Tokens live in files** (mode 600), never in the environment, a repository or a log.
 
-## 2. The trial (the 80 percent bar)
+## 2. Setting up a node
+
+The owner's steps, in order. Nothing here starts by itself.
+
+1. **On the node:** `scripts/provision-node.sh <node-id> <pipeline-dir> <node-repo-dir>`. It refuses the id `wok`, an id that is not lowercase letters, digits and dashes (up to 31 characters, not starting with a dash) and a directory that is not an absolute path of plain characters. It creates `queue/{pending,adhoc,drafting,review,blocked,needs-clarification,done,node-outbox,node-sent}`, `task-domains.json`, a `lanes.json` holding only the cloud lane, **disabled**, and `node.env` (`AGENT_MANAGER_NODE_ID`, `AGENT_MANAGER_PIPELINE_DIR`, `AGENT_MANAGER_REPO_ROOT`, `AGENT_MANAGER_DOMAINS_PATH`). It never writes a token and starts nothing; running it again keeps what exists.
+2. **Register the node on wok and put the token files in place** (section 5 and `nodes.md`): `node src/node-registry.js register <node-id> --address <LAN address> ...`, then copy the printed token into a mode 600 file on the node.
+3. **Start the node's workers** with `node.env` in their environment (`set -a; source <pipeline-dir>/node.env; set +a`, then the ordinary `scripts/local-worker.sh <instance-id>`). A worker whose `AGENT_MANAGER_NODE_ID` is not `wok` claims only work leased to its node and files a finished draft in `queue/node-outbox/`. The cloud lane stays off until you set `enabled` to `true` in `lanes.json` (`cloud-lane.md`).
+4. **Send the outbox** by hand or from a timer you create: `node src/node-package-send.js --url <wok package intake url> --token-file <file> --node-id <node-id> --outbox <pipeline-dir>/queue/node-outbox`. It prints `{sent, failed, remaining}`; exit 3 means a record stayed in the outbox. Nothing runs it on a schedule.
+5. **On wok, start the package intake** with `AGENT_MANAGER_PIPELINE_DIR` set and `AGENT_MANAGER_PACKAGE_BIND` set to wok's LAN address (port 7473 unless `AGENT_MANAGER_PACKAGE_PORT` says otherwise): `node src/package-intake-server.js`. This opens a port on wok to the LAN, so it needs your OK, like the registry service.
+
+A node never merges, pushes or deploys: its output is a record that wok reviews.
+
+## 3. The trial (the 80 percent bar)
 
 Before the farm is scaled up, run a small batch of real tasks through one node and score it.
 
-1. Lend each task (`node src/lend-task.js lend <taskId> grimm --url <node intake /lend url> --token-file <file>`), let the node build it, and when its package arrives relay the branch (`node src/branch-relay-cli.js <taskId> --node-url <node repo url>`), then review and merge as usual.
+1. Lend each task (`node src/lend-task.js lend <taskId> grimm --url <node intake /lend url> --token-file <file>`), let the node draft it, send its outbox (`node src/node-package-send.js`, section 2), and when the record arrives in wok's `queue/review/` review and merge it as usual.
 2. Write one outcome per task into a JSON file: `[{"taskId": "...", "node": "grimm", "result": "merged"}]`, where `result` is `merged` (merged with no repair), `repaired` (merged after a repair), `failed` or `abandoned`.
 3. Score it: `node src/farm-trial.js <outcomes.json>`. It prints the counts per node and exits 0 when at least 80 percent were `merged`, 3 when not.
 
-## 3. The ramp (how many workers a node can take)
+## 4. The ramp (how many workers a node can take)
 
 Raise the number of workers on a node one at a time and measure after each step. `node src/farm-ramp.js` only prints a decision; the owner starts or stops the workers.
 
@@ -32,7 +44,7 @@ Raise the number of workers on a node one at a time and measure after each step.
 3. The decision: `raise` (no limit hit, go one worker higher), `hold` (at the cap), or `stop`. The limits are the site more than 20 percent slower than baseline, load average above 3.0, free RAM below 3 GB, or a rate limit from the cloud gateway (pass `--rate-limited`). On `stop` the cap is one below the worker count that broke a limit; keep it as the node's concurrency cap (`--cap` in `node src/node-registry.js register`).
 4. A value that cannot be measured (the site not answering, no `/proc/meminfo`) counts as a limit.
 
-## 4. LAN addresses
+## 5. LAN addresses
 
 Machine-to-machine traffic uses the wired LAN address, with the tailnet address as the fallback.
 
@@ -40,17 +52,18 @@ Machine-to-machine traffic uses the wired LAN address, with the tailnet address 
 2. Register the node with that address: `node src/node-registry.js register grimm --address <LAN address> ...` (see `nodes.md`).
 3. To see which address answers a service right now: `node src/node-address.js <LAN address> <tailnet address> <port>`. It prints `{address, via}` with `via` `lan`, `tailnet` or `null`, and exits 3 when neither answers (use `""` for an address you do not have).
 
-## 5. Morning checklist (two minutes)
+## 6. Morning checklist (two minutes)
 
 1. Was there an urgent message, or is the daily summary missing? A missing summary means the summary timer or the notifier is not running.
 2. `node src/worker-switch.js pause-status` on each machine: is a pause still set that you did not expect?
 3. `node src/lease-ledger.js list`: any lease still `lent` past its expiry? Run `node src/lend-task.js reclaim`.
-4. `ls <pipeline dir>/queue/node-packages`: any package that arrived and was not relayed? Relay it with `node src/branch-relay-cli.js`.
+4. `ls <pipeline dir>/queue/node-packages` and `ls <pipeline dir>/queue/review`: a record package that arrived is already filed in `queue/review/` by the intake and needs no relay; only an old version 1 branch package would still need `node src/branch-relay-cli.js`.
 5. On the Workers tab: are the cloud lane and grimm's workers in the state you left them?
+6. On the node: `ls <node pipeline dir>/queue/node-outbox`. Records still there were drafted and not sent; run `node src/node-package-send.js`.
 
-## 6. Not built yet
+## 7. Not built yet
 
 - A loop that applies a ramp decision to the workers: today the owner reads the decision and changes the workers.
-- A timer that runs `node src/lend-task.js reclaim`, a command that lends the next waiting task automatically, and a command that relays a package when it arrives.
+- A timer that runs `node src/lend-task.js reclaim`, a timer that runs `node src/node-package-send.js`, and a command that lends the next waiting task automatically.
 - Automatic scale-up after a passing trial; the trial score is read by the owner.
 - The cloud lane's Sonnet escalation, concurrency back-off and the unexplained liveness-probe 401s (see `cloud-lane.md`).
