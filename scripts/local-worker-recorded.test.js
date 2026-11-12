@@ -28,12 +28,15 @@ function run(draftResult) {
   mk('P', 'queue', 'drafting', 'worker-x');
   fs.writeFileSync(path.join(P, 'task-domains.json'), '{}');
   fs.writeFileSync(path.join(P, 'queue', 'drafting', 'worker-x', 't-1.json'), JSON.stringify({ id: 't-1', domain: 'default', source: 'trouble_log', title: 't', status: 'drafting', history: [] }));
+  // The worker yields while the host's memory marker says critical; a fresh 'ok' marker of this sandbox's own keeps the test independent of host load.
+  const marker = path.join(root, 'mem-marker.json');
+  fs.writeFileSync(marker, JSON.stringify({ state: 'ok', seq: 1, at: new Date().toISOString() }));
   const projectsPath = path.join(root, 'projects.json');
   fs.writeFileSync(projectsPath, JSON.stringify([{ repoRoot: path.join(root, 'repo'), pipelineDir: P, domainsPath: path.join(P, 'task-domains.json'), label: 'P' }]));
   const r = spawnSync('bash', [path.join(pkg, 'scripts', 'local-worker.sh'), 'worker-x', '--once'], {
     encoding: 'utf8', timeout: 120000,
     env: { ...process.env, HOME: path.join(root, 'home'), OLLAMA_URL: 'http://127.0.0.1:9', MODEL_URL: 'http://127.0.0.1:9', LOCAL_MODEL: 'x', AGENT_MANAGER_TASK_SOURCES: 'none-such',
-      AGENT_MANAGER_PROJECTS_PATH: projectsPath, AGENT_MANAGER_POOL_STATE_PATH: path.join(root, 'pool-state.json'), ORC_TICK_SECS: '2', AGENT_MANAGER_ENDPOINT_PROBE: 'off',
+      AGENT_MANAGER_PROJECTS_PATH: projectsPath, AGENT_MANAGER_POOL_STATE_PATH: path.join(root, 'pool-state.json'), ORC_TICK_SECS: '2', AGENT_MANAGER_ENDPOINT_PROBE: 'off', AGENT_MANAGER_MEM_PRESSURE_MARKER: marker,
       AGENT_MANAGER_REPO_ROOT: path.join(root, 'repo'), AGENT_MANAGER_PIPELINE_DIR: P, AGENT_MANAGER_DOMAINS_PATH: path.join(P, 'task-domains.json'),
       AGENT_MANAGER_INSTANCES_DIR: path.join(P, 'instances'), STUB_DRAFT_RESULT: JSON.stringify(draftResult) },
   });
