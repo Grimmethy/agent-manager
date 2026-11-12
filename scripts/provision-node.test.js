@@ -41,7 +41,7 @@ test('a first run creates the nine queue directories, the domains, one disabled 
   assert.deepEqual(lanes[0].taskClasses, ['adhoc']);
   assert.equal(lanes[0].preempt, 'never');
   assert.equal(read(path.join(t.pipe, 'node.env')), [
-    'AGENT_MANAGER_NODE_ID=grimm', `AGENT_MANAGER_PIPELINE_DIR=${t.pipe}`, `AGENT_MANAGER_REPO_ROOT=${t.repo}`, `AGENT_MANAGER_DOMAINS_PATH=${t.pipe}/task-domains.json`, '',
+    'AGENT_MANAGER_NODE_ID=grimm', `AGENT_MANAGER_PIPELINE_DIR=${t.pipe}`, `AGENT_MANAGER_REPO_ROOT=${t.repo}`, `AGENT_MANAGER_DOMAINS_PATH=${t.pipe}/task-domains.json`, `AGENT_MANAGER_LANES_PATH=${t.pipe}/lanes.json`, '',
   ].join('\n'));
   assert.deepEqual(fs.readdirSync(t.pipe).sort(), ['lanes.json', 'node.env', 'queue', 'task-domains.json']);
   assert.match(r.stdout, /Nothing was started/);

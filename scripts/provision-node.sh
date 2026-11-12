@@ -8,7 +8,7 @@
 #   <pipeline-dir>/queue/{pending,adhoc,drafting,review,blocked,needs-clarification,done,node-outbox,node-sent}
 #   <pipeline-dir>/task-domains.json  every standard domain (scripts/ensure-task-domains.sh: written when missing, missing domains added when present)
 #   <pipeline-dir>/lanes.json         ONE lane, the cloud lane of lanes.example.json, DISABLED; an existing lanes.json is never overwritten
-#   <pipeline-dir>/node.env           AGENT_MANAGER_NODE_ID, AGENT_MANAGER_PIPELINE_DIR, AGENT_MANAGER_REPO_ROOT, AGENT_MANAGER_DOMAINS_PATH (rewritten identically)
+#   <pipeline-dir>/node.env           AGENT_MANAGER_NODE_ID, AGENT_MANAGER_PIPELINE_DIR, AGENT_MANAGER_REPO_ROOT, AGENT_MANAGER_DOMAINS_PATH, AGENT_MANAGER_LANES_PATH (rewritten identically)
 # Exit 2 (nothing created) for a missing argument, an extra one, the id 'wok', an id that is not lowercase letters, digits and dashes (1 to 31 characters, not
 # starting with a dash, the rule of src/node-registry.js), or a directory that is not an absolute path of plain characters (node.env is sourced by shells).
 set -euo pipefail
@@ -46,8 +46,8 @@ else
   printf 'created %s (the cloud lane, disabled)\n' "$LANES"
 fi
 
-printf 'AGENT_MANAGER_NODE_ID=%s\nAGENT_MANAGER_PIPELINE_DIR=%s\nAGENT_MANAGER_REPO_ROOT=%s\nAGENT_MANAGER_DOMAINS_PATH=%s\n' \
-  "$NODE_ID" "$PIPELINE_DIR" "$REPO_DIR" "$PIPELINE_DIR/task-domains.json" > "$PIPELINE_DIR/node.env"
+printf 'AGENT_MANAGER_NODE_ID=%s\nAGENT_MANAGER_PIPELINE_DIR=%s\nAGENT_MANAGER_REPO_ROOT=%s\nAGENT_MANAGER_DOMAINS_PATH=%s\nAGENT_MANAGER_LANES_PATH=%s\n' \
+  "$NODE_ID" "$PIPELINE_DIR" "$REPO_DIR" "$PIPELINE_DIR/task-domains.json" "$LANES" > "$PIPELINE_DIR/node.env"
 printf 'wrote   %s\n' "$PIPELINE_DIR/node.env"
 
 [[ -d "$REPO_DIR" ]] || printf 'note: %s does not exist yet (the node repo is cloned separately)\n' "$REPO_DIR"
