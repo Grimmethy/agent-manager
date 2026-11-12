@@ -16,9 +16,10 @@ const BUSY_SS = `${IDLE_SS}ESTAB 0 0 192.168.40.83:8080 192.168.40.20:51234\n`;
 function setup(extra = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'site-monitor-'));
   const env = { HOME: '/nonexistent-home', AGENT_MANAGER_DISABLED_WORKERS_DIR: path.join(dir, 'switch'), ...extra };
-  const t = { env, clock: T0, ss: IDLE_SS, load: 0.5, meminfo: 'MemAvailable: 8388608 kB\n', logs: [], sent: [], ssError: null };
+  const t = { env, clock: T0, ss: IDLE_SS, load: 0.5, meminfo: 'MemAvailable: 8388608 kB\n', logs: [], sent: [], ssError: null, markerAt: null };
   const monitor = createMonitor({
     env,
+    markerMtime: () => t.markerAt,
     now: () => t.clock,
     runSs: async () => { if (t.ssError) throw new Error(t.ssError); return t.ss; },
     loadavg: () => [t.load, 0, 0],
@@ -75,10 +76,59 @@ test('a TIME-WAIT socket whose peer is this machine is not traffic, but a loopba
   assert.equal(countSiteSockets('ESTAB 0 0 [::1]:3002 [::1]:44000\n'), 1);
 });
 
+const TUNNEL_SS = `${IDLE_SS}ESTAB 0 0 127.0.0.1:8080 127.0.0.1:43604\nESTAB 0 0 [::ffff:127.0.0.1]:3002 [::ffff:127.0.0.1]:33958\n`;
+
+test('countSiteSockets can ignore loopback ESTAB sockets, and still counts the LAN ones and TIME-WAIT from elsewhere', () => {
+  assert.equal(countSiteSockets(TUNNEL_SS), 2);
+  assert.equal(countSiteSockets(TUNNEL_SS, { ignoreLoopbackEstab: true }), 0);
+  assert.equal(countSiteSockets(TUNNEL_SS, {}), 2);
+  assert.equal(countSiteSockets(`${TUNNEL_SS}ESTAB 0 0 192.168.40.83:8080 192.168.40.20:51234\n`, { ignoreLoopbackEstab: true }), 1);
+  assert.equal(countSiteSockets(`${TUNNEL_SS}TIME-WAIT 0 0 192.168.40.83:8080 192.168.40.20:51234\n`, { ignoreLoopbackEstab: true }), 1);
+});
+
+test('a fresh probe marker hides loopback ESTAB sockets for 12 seconds, no more, and never hides anyone else', async () => {
+  const t = setup();
+  t.ss = TUNNEL_SS;
+  t.markerAt = T0 - 11999;
+  assert.equal((await t.pass()).probeWindow, true);
+  assert.equal(t.marker(), null, 'no pause while the probe window covers the tunnel connection');
+  t.markerAt = T0 - 12000;
+  assert.equal((await t.pass()).probeWindow, true, '12 seconds old is still inside the window');
+  t.markerAt = T0 - 12001;
+  const r = await t.pass();
+  assert.equal(r.probeWindow, false);
+  assert.equal(r.sockets, 2);
+  assert.equal(t.marker().source, 'site-traffic', 'an old marker no longer hides anything');
+});
+
+test('the probe marker: absent, in the future, or a visitor from the LAN all leave the pause in place', async () => {
+  let t = setup();
+  t.ss = TUNNEL_SS;
+  t.markerAt = null;
+  assert.equal((await t.pass()).probeWindow, false);
+  assert.equal(t.marker().source, 'site-traffic');
+  t = setup();
+  t.ss = TUNNEL_SS;
+  t.markerAt = T0 + 5000;
+  assert.equal((await t.pass()).probeWindow, false, 'a marker dated well in the future is not trusted');
+  t = setup();
+  t.ss = `${TUNNEL_SS}ESTAB 0 0 192.168.40.83:8080 192.168.40.20:51234\n`;
+  t.markerAt = T0 - 1000;
+  const r = await t.pass();
+  assert.equal(r.probeWindow, true);
+  assert.equal(r.sockets, 1);
+  assert.equal(t.marker().source, 'site-traffic', 'a LAN visitor during the probe window still pauses');
+});
+
 test('config defaults and overrides', () => {
-  assert.deepEqual(config({}), { idleMin: 5, maxLoad: 3, minFreeGb: 3, pollS: 10, stuckHours: 6 });
+  assert.equal(config({ HOME: '/h' }).probeMarker, '/h/.local/state/agent-manager/site-probe-marker');
+  assert.equal(config({}).probeTtlS, 12);
+  assert.equal(config({ AGENT_MANAGER_SITE_PROBE_MARKER: '/x/m', AGENT_MANAGER_SITE_PROBE_TTL_S: '30' }).probeMarker, '/x/m');
+  assert.equal(config({ AGENT_MANAGER_SITE_PROBE_TTL_S: '30' }).probeTtlS, 30);
+  const { probeMarker, probeTtlS, ...rest } = config({});
+  assert.deepEqual(rest, { idleMin: 5, maxLoad: 3, minFreeGb: 3, pollS: 10, stuckHours: 6 });
   const c = config({ AGENT_MANAGER_SITE_IDLE_MIN: '2', AGENT_MANAGER_SITE_MAX_LOAD: '1.5', AGENT_MANAGER_SITE_MIN_FREE_GB: '4', AGENT_MANAGER_SITE_POLL_S: '30', AGENT_MANAGER_SITE_STUCK_HOURS: '1' });
-  assert.deepEqual(c, { idleMin: 2, maxLoad: 1.5, minFreeGb: 4, pollS: 30, stuckHours: 1 });
+  assert.deepEqual({ ...c, probeMarker: undefined, probeTtlS: undefined }, { idleMin: 2, maxLoad: 1.5, minFreeGb: 4, pollS: 30, stuckHours: 1, probeMarker: undefined, probeTtlS: undefined });
   assert.equal(config({ AGENT_MANAGER_SITE_IDLE_MIN: '0' }).idleMin, 5);
   assert.equal(config({ AGENT_MANAGER_SITE_MAX_LOAD: 'x' }).maxLoad, 3);
 });

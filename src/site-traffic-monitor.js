@@ -10,6 +10,12 @@
 // 127.0.0.1:8080) left one every minute, which kept the node paused for ever (6 h "stuck" alert, 2026-11-11). Loopback ESTABLISHED sockets still count, so a
 // request being served right now is seen wherever it comes from; only the minute-long afterglow of a loopback-only request is dropped.
 //
+// A known probe can announce itself: touching the marker file (AGENT_MANAGER_SITE_PROBE_MARKER, default ~/.local/state/agent-manager/site-probe-marker) makes the
+// monitor ignore ESTABLISHED sockets whose peer is this machine for AGENT_MANAGER_SITE_PROBE_TTL_S seconds (default 12) after the file's modification time. The
+// owner's uptime probe reaches the site through the cloudflared tunnel, which connects from 127.0.0.1 every 2 minutes, and kept the node paused for ever.
+// Only loopback ESTABLISHED sockets are ignored in that window; a visitor from the LAN or the tailnet still counts, and a marker nobody refreshes stops
+// mattering after the 12 seconds, so a dead probe cannot blind the monitor.
+//
 // Each pass (default every 10 seconds):
 //   traffic       setPause('node', {source: "site-traffic", reason: "site in use", ttlMin: 10}), refreshing the 10 minute expiry. A pause someone else set here (any
 //                 other source, for example the operator's) is left exactly as it is.
@@ -27,6 +33,7 @@
 
 const os = require('os');
 const fs = require('fs');
+const path = require('path');
 const { execFile } = require('child_process');
 const { setPause, clearPause, readPause } = require('./worker-switch.js');
 const { notify } = require('./notify.js');
@@ -48,6 +55,8 @@ function config(env = process.env) {
     minFreeGb: numberFrom(env.AGENT_MANAGER_SITE_MIN_FREE_GB, 3),
     pollS: numberFrom(env.AGENT_MANAGER_SITE_POLL_S, 10),
     stuckHours: numberFrom(env.AGENT_MANAGER_SITE_STUCK_HOURS, 6),
+    probeMarker: env.AGENT_MANAGER_SITE_PROBE_MARKER || path.join(env.HOME || os.homedir(), '.local', 'state', 'agent-manager', 'site-probe-marker'),
+    probeTtlS: numberFrom(env.AGENT_MANAGER_SITE_PROBE_TTL_S, 12),
   };
 }
 
@@ -59,7 +68,7 @@ function isLoopbackAddress(addr) {
 
 // Counts the ESTABLISHED sockets, and the TIME-WAIT sockets whose peer is not this machine, whose local port is a site port in the output of `ss -tanH`
 // (columns: state, recv-q, send-q, local, peer).
-function countSiteSockets(ssOutput) {
+function countSiteSockets(ssOutput, { ignoreLoopbackEstab = false } = {}) {
   let count = 0;
   for (const line of String(ssOutput || '').split('\n')) {
     const cols = line.trim().split(/\s+/);
@@ -67,6 +76,7 @@ function countSiteSockets(ssOutput) {
     const port = Number(cols[3].slice(cols[3].lastIndexOf(':') + 1));
     if (!SITE_PORTS.includes(port)) continue;
     if (cols[0] === 'TIME-WAIT' && isLoopbackAddress(cols[4])) continue;
+    if (ignoreLoopbackEstab && isLoopbackAddress(cols[4])) continue; // only ESTAB is left here: loopback TIME-WAIT was skipped above
     count += 1;
   }
   return count;
@@ -88,7 +98,11 @@ function runSsDefault() {
   });
 }
 
-function createMonitor({ env = process.env, now = () => Date.now(), runSs = runSsDefault, loadavg = os.loadavg, readMeminfo, freemem, send = notify, log = () => {}, hostname = os.hostname() } = {}) {
+function markerMtimeDefault(file) {
+  try { return fs.statSync(file).mtimeMs; } catch (e) { return null; }
+}
+
+function createMonitor({ env = process.env, markerMtime = markerMtimeDefault, now = () => Date.now(), runSs = runSsDefault, loadavg = os.loadavg, readMeminfo, freemem, send = notify, log = () => {}, hostname = os.hostname() } = {}) {
   const cfg = config(env);
   const state = { lastTrafficAt: null, pausedSince: null, stuckAlerted: false, ssFailing: false, backstopOn: false, paused: false };
   const pauseOpts = (source, reason) => ({ reason, source, ttlMin: PAUSE_TTL_MIN });
@@ -106,7 +120,10 @@ function createMonitor({ env = process.env, now = () => Date.now(), runSs = runS
     if (state.ssFailing) log('ss works again');
     state.ssFailing = false;
 
-    const sockets = countSiteSockets(out);
+    const mtime = markerMtime(cfg.probeMarker);
+    const markerAge = typeof mtime === 'number' ? at - mtime : Infinity;
+    const probeWindow = markerAge <= cfg.probeTtlS * 1000 && markerAge >= -2000;
+    const sockets = countSiteSockets(out, { ignoreLoopbackEstab: probeWindow });
     const load = Math.round(loadavg()[0] * 100) / 100;
     const freeGb = freeRamGb(readMeminfo, freemem);
     const overLimits = load > cfg.maxLoad || freeGb < cfg.minFreeGb;
@@ -160,7 +177,7 @@ function createMonitor({ env = process.env, now = () => Date.now(), runSs = runS
         await send({ level: 'urgent', key: `pause-stuck:${hostname}`, title: `${hostname} has been paused for more than ${cfg.stuckHours} hours`, text: `The node pause on ${hostname} (source ${current.source}) has not ended.` }, { env, now: () => at });
       }
     }
-    return { action, sockets, load, freeGb, paused: state.paused };
+    return { action, sockets, load, freeGb, paused: state.paused, probeWindow };
   }
 
   // A graceful stop clears the pause this monitor set, so a restart does not leave the machine paused until the expiry.
