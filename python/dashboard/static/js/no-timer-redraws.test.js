@@ -25,6 +25,7 @@ const ALLOWED = {
   'brain-dump-and-second-brain.js': { setInterval: 0, setTimeout: 2, why: 'a button label reset 1.2 s after a click: one-shot, display only' },
   'sidebar-and-claude-panels.js': { setInterval: 0, setTimeout: 1, why: 'a status text reset 2 s after an action: one-shot, display only' },
   'branches-joblist-hardware-tabs.js': { setInterval: 0, setTimeout: 1, why: 'one re-render 1.5 s after a merge that restarts the dashboard, waiting for the restart: one-shot, started by a user action' },
+  'forge-navigate.js': { setInterval: 0, setTimeout: 1, why: 'a 10 s give-up for the PromptForge frame to load after a forge-navigate message (the frame is waited for by its load event and a MutationObserver, not polled): one-shot, started by a user action, cleared on success' },
   'task-detail-modal.js': { setInterval: 0, setTimeout: 1, why: 'closes the modal 1.2 s after ending a discussion: one-shot, started by a user action' },
 };
 
