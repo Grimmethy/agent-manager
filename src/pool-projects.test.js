@@ -660,11 +660,11 @@ test('review-runner.sh asks premiumMayRunUnderPressure before it yields, limits 
   const yieldMsg = sh.indexOf('yielding this tick -- host RAM pressure');
   assert.ok(guard > 0 && ask > guard && yieldMsg > ask, 'the question is asked inside the pressure block, before the yield');
   assert.match(sh, /TICK_PREMIUM_ONLY=true; UNDER_PRESSURE=true/);
-  assert.match(sh, /done < <\(if "\$TICK_PREMIUM_ONLY"; then ls -1tr/, 'the item list uses the per-tick premium-only flag');
+  assert.match(sh, /elif "\$TICK_PREMIUM_ONLY"; then ls -1tr/, 'the item list uses the per-tick premium-only flag');
   assert.equal((sh.match(/(^|[\s;])PREMIUM_ONLY=/gm) || []).length, 2, 'PREMIUM_ONLY is assigned only at the top of the script (false, then true for a borrowed child), never inside the loop, so the per-tick copy cannot carry a stale value');
   assert.match(sh, /tight memory pressure: reviewing premium item %s anyway/);
   assert.match(sh, /if "\$ONCE" \|\| "\$UNDER_PRESSURE"; then break; fi/, 'one item per tick under pressure');
-  // the premium-only borrowed tick re-enters the same block, so it is allowed under tight pressure too; critical never reaches the review code
+  // the premium-only borrowed tick re-enters the same block, so it is allowed under tight pressure too; critical reaches the review code only through the node-draft exception (src/node-draft-pressure.test.js)
   assert.match(sh, /if "\$ONCE" && \[\[ "\$\{AGENT_MANAGER_PREMIUM_ONLY_TICK:-\}" == "true" \]\]; then PREMIUM_ONLY=true; fi/);
 });
 

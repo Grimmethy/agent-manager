@@ -22,6 +22,9 @@ if "$ONCE" && [[ "${AGENT_MANAGER_PREMIUM_ONLY_TICK:-}" == "true" ]]; then PREMI
 filter_premium_names() {
   node -e 'const fs=require("fs"),path=require("path"),d=process.argv[1];for(const n of fs.readFileSync(0,"utf8").split("\n")){if(!n)continue;try{if(JSON.parse(fs.readFileSync(path.join(d,n),"utf8")).premiumPriority===true)console.log(n)}catch(e){}}' "$1" 2>/dev/null
 }
+filter_node_draft_names() {
+  node -e 'const fs=require("fs"),path=require("path"),d=process.argv[1];for(const n of fs.readFileSync(0,"utf8").split("\n")){if(!n)continue;try{const t=JSON.parse(fs.readFileSync(path.join(d,n),"utf8"));if(typeof t.fromNode==="string"&&t.fromNode)console.log(n)}catch(e){}}' "$1" 2>/dev/null
+}
 
 # Refuse to start if a live process already holds this instanceId -- see local-worker.sh's
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
@@ -199,11 +202,15 @@ while :; do
   # premium items only, one per tick. Kill switch AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT=false. src/pool-projects.js premiumMayRunUnderPressure.
   # PREMIUM_ONLY is assigned only at the top of this script (once per process, from the borrowed-child env) and never inside this loop, so this per-tick copy
   # cannot carry a value over from an earlier tick; only the pressure block below may raise it, and only for this tick.
-  TICK_PREMIUM_ONLY="$PREMIUM_ONLY"; UNDER_PRESSURE=false
+  TICK_PREMIUM_ONLY="$PREMIUM_ONLY"; UNDER_PRESSURE=false; TICK_NODE_DRAFT_ONLY=false
   if mem_pressure_high; then
     mem_state="$(mem_marker_state 2>/dev/null || echo tight)"
     if node "${PACKAGE_SRC_DIR}/pool-projects.js" --premium-under-pressure "$PIPELINE_DIR" "$mem_state" 2>>"$LOG_FILE"; then
       TICK_PREMIUM_ONLY=true; UNDER_PRESSURE=true
+    elif [[ "$mem_state" == critical ]] && node "${PACKAGE_SRC_DIR}/node-draft-pressure.js" "$PIPELINE_DIR" "$mem_state" "$(mem_marker_num swap_free_mb)" "$(mem_marker_num available_mb)" "$(mem_marker_num mem_full)" "$(mem_marker_num io_full)" 2>>"$LOG_FILE"; then
+      # 2026-11-12: critical ONLY through the swap backstop (swap gone, >= 1 GB free, no real stall) and a draft from another machine is waiting: review it, one per tick.
+      # Kill switch AGENT_MANAGER_NODE_DRAFT_REVIEW_UNDER_SWAP_CRITICAL=false. src/node-draft-pressure.js.
+      TICK_NODE_DRAFT_ONLY=true; UNDER_PRESSURE=true
     else
       printf '[review-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
       note_stalled_reviews "host memory pressure ($mem_state), so reviewers are yielding their ticks"
@@ -228,7 +235,7 @@ while :; do
   while IFS= read -r name; do
     [[ "$name" == *.json ]]                                                    || continue        # only process JSON files, same filter as local-worker.sh's own claim loop (and same class of bug fixed there: a bare `!` would silently skip every real task file).
     items+=("$name")
-  done < <(if "$TICK_PREMIUM_ONLY"; then ls -1tr "$review_dir" 2>/dev/null | filter_premium_names "$review_dir"; else ls -1tr "$review_dir" 2>/dev/null; fi)   # -t: sort by mtime; -r: reverse (oldest first) -- see this loop's own comment below for why lexical order was wrong.
+  done < <(if "$TICK_NODE_DRAFT_ONLY"; then ls -1tr "$review_dir" 2>/dev/null | filter_node_draft_names "$review_dir"; elif "$TICK_PREMIUM_ONLY"; then ls -1tr "$review_dir" 2>/dev/null | filter_premium_names "$review_dir"; else ls -1tr "$review_dir" 2>/dev/null; fi)   # -t: sort by mtime; -r: reverse (oldest first) -- see this loop's own comment below for why lexical order was wrong.
 
   # Iterate each item currently sitting in review/, oldest-first BY FILE MTIME (fixed
   # 2026-08-20, Grimmethy: "we need to build this sort of analysis into the daily report"
@@ -267,7 +274,7 @@ while :; do
     # old gate was real, immediately-reviewable local work sitting unreviewed for hours
     # any time Claude happened to be paused, confirmed live via a multi-hour
     # queue/review/ backlog with items unreviewed since 2026-08-25.
-    if "$UNDER_PRESSURE"; then printf '[review-%s] tight memory pressure: reviewing premium item %s anyway\n' "$INSTANCE_ID" "$name" >&2; fi
+    if "$UNDER_PRESSURE"; then if "$TICK_NODE_DRAFT_ONLY"; then printf '[review-%s] swap-only critical memory pressure: reviewing node draft %s anyway\n' "$INSTANCE_ID" "$name" >&2; else printf '[review-%s] tight memory pressure: reviewing premium item %s anyway\n' "$INSTANCE_ID" "$name" >&2; fi; fi
     printf '[review-%s] reviewing %s\n' "$INSTANCE_ID" "$name" >&2
     # "queued" until the single-flight lock is actually held, then "working" -- see
     # local-worker.sh's process_drafting_file for the full rationale (2026-08-19,
