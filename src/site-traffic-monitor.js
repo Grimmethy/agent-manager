@@ -6,6 +6,9 @@
 // The signal: sockets in state ESTABLISHED or TIME-WAIT whose LOCAL port is 8080 (the pf-web front door), 3002 (the public backend it proxies to) or 3010 (the
 // admin port), read with `ss -tanH`. There is no request log to read: pf-web is a plain node server that logs nothing, and 0 such sockets is the measured idle
 // baseline (2026-11-11). TIME-WAIT keeps a request visible for about a minute after its connection closes, so short requests are not missed between passes.
+// A TIME-WAIT socket whose PEER is this machine itself (127.x or ::1) is not counted: the host's own once-a-minute health sampler (pf-health-sample.timer,
+// 127.0.0.1:8080) left one every minute, which kept the node paused for ever (6 h "stuck" alert, 2026-11-11). Loopback ESTABLISHED sockets still count, so a
+// request being served right now is seen wherever it comes from; only the minute-long afterglow of a loopback-only request is dropped.
 //
 // Each pass (default every 10 seconds):
 //   traffic       setPause('node', {source: "site-traffic", reason: "site in use", ttlMin: 10}), refreshing the 10 minute expiry. A pause someone else set here (any
@@ -48,14 +51,23 @@ function config(env = process.env) {
   };
 }
 
-// Counts the ESTABLISHED and TIME-WAIT sockets whose local port is a site port in the output of `ss -tanH` (columns: state, recv-q, send-q, local, peer).
+// True for an `ss` address (127.0.0.1:44000, [::1]:44000, [::ffff:127.0.0.1]:44000) whose host part is the loopback interface.
+function isLoopbackAddress(addr) {
+  const host = String(addr || '').slice(0, String(addr || '').lastIndexOf(':')).replace(/^\[|\]$/g, '').toLowerCase();
+  return host === '::1' || /^127\./.test(host) || /^::ffff:127\./.test(host);
+}
+
+// Counts the ESTABLISHED sockets, and the TIME-WAIT sockets whose peer is not this machine, whose local port is a site port in the output of `ss -tanH`
+// (columns: state, recv-q, send-q, local, peer).
 function countSiteSockets(ssOutput) {
   let count = 0;
   for (const line of String(ssOutput || '').split('\n')) {
     const cols = line.trim().split(/\s+/);
     if (cols.length < 5 || !COUNTED_STATES.includes(cols[0])) continue;
     const port = Number(cols[3].slice(cols[3].lastIndexOf(':') + 1));
-    if (SITE_PORTS.includes(port)) count += 1;
+    if (!SITE_PORTS.includes(port)) continue;
+    if (cols[0] === 'TIME-WAIT' && isLoopbackAddress(cols[4])) continue;
+    count += 1;
   }
   return count;
 }
