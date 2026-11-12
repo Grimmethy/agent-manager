@@ -95,3 +95,18 @@ test('refusals exit 2 and write nothing', () => {
   }
   assert.equal(fs.existsSync(out), false, 'the out dir is not created for a refused call');
 });
+
+test('a bundle that fails verification exits 1, says so and leaves no file', () => {
+  const root = tmp();
+  const repo = makeRepo(root);
+  const out = path.join(root, 'out');
+  const realGit = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+  const stubDir = path.join(root, 'stub');
+  fs.mkdirSync(stubDir);
+  fs.writeFileSync(path.join(stubDir, 'git'), `#!/usr/bin/env bash\ncase " $* " in *" bundle verify "*) exit 1;; esac\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+  const r = spawnSync('bash', [SCRIPT, repo, out], { encoding: 'utf8', env: { ...process.env, PATH: `${stubDir}:${process.env.PATH}` } });
+  assert.equal(r.status, 1, `${r.stdout}${r.stderr}`);
+  assert.match(r.stderr, /the new bundle does not verify/);
+  assert.equal(r.stdout, '');
+  assert.deepEqual(fs.readdirSync(out), [], 'neither a bundle nor a part file is left');
+});
