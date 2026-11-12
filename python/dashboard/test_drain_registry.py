@@ -16,13 +16,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 import drain_registry  # noqa: E402
 
 
-def dead_pid():
-    p = subprocess.Popen([sys.executable, "-c", "pass"])
-    p.wait()
-    return p.pid
-
-
 class RunningDrains(unittest.TestCase):
+    @staticmethod
+    def _dead_pid():   # a method, not a module-level def: the size ratchet's Python scanner measures a top-level def up to the next top-level def
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        return p.pid
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -34,7 +34,7 @@ class RunningDrains(unittest.TestCase):
     def test_only_live_drain_pidfiles_sorted_by_name(self):
         self.pidfile("drain-verify.pid", os.getpid())
         self.pidfile("drain-hub.pid", os.getpid())
-        self.pidfile("drain-dead.pid", dead_pid())
+        self.pidfile("drain-dead.pid", self._dead_pid())
         self.pidfile("drain-junk.pid", "abc")
         self.pidfile("drain-zero.pid", 0)
         self.pidfile("plugin-promptforge.pid", os.getpid())
