@@ -43,7 +43,7 @@ test('the site ports are 8080, 3002 and 3010 and a pause lasts 10 minutes unless
 test('countSiteSockets counts ESTAB and TIME-WAIT sockets on a site local port and nothing else', () => {
   const out = [
     'ESTAB 0 0 192.168.40.83:8080 192.168.40.20:51234',
-    'TIME-WAIT 0 0 127.0.0.1:3002 127.0.0.1:44000',
+    'TIME-WAIT 0 0 192.168.40.83:3002 192.168.40.20:44000',
     'ESTAB 0 0 [::ffff:127.0.0.1]:3010 [::ffff:127.0.0.1]:44001',
     'LISTEN 0 511 0.0.0.0:8080 0.0.0.0:*',
     'SYN-RECV 0 0 192.168.40.83:8080 192.168.40.20:51235',
@@ -59,6 +59,20 @@ test('countSiteSockets counts ESTAB and TIME-WAIT sockets on a site local port a
   assert.equal(countSiteSockets(undefined), 0);
   assert.equal(countSiteSockets(IDLE_SS), 0);
   assert.equal(countSiteSockets(BUSY_SS), 1);
+});
+
+test('a TIME-WAIT socket whose peer is this machine is not traffic, but a loopback ESTAB socket and a TIME-WAIT from anywhere else are', () => {
+  const tw = (peer) => `TIME-WAIT 0 0 127.0.0.1:8080 ${peer}\n`;
+  assert.equal(countSiteSockets(tw('127.0.0.1:44000')), 0);
+  assert.equal(countSiteSockets(tw('127.0.0.2:44000')), 0);
+  assert.equal(countSiteSockets(tw('[::1]:44000')), 0);
+  assert.equal(countSiteSockets(tw('[::ffff:127.0.0.1]:44000')), 0);
+  assert.equal(countSiteSockets(tw('192.168.40.20:44000')), 1);
+  assert.equal(countSiteSockets(tw('100.64.0.9:44000')), 1);
+  assert.equal(countSiteSockets(tw('[fe80::1]:44000')), 1);
+  assert.equal(countSiteSockets(tw('1270.0.0.1:44000')), 1, 'only a real 127.x host is loopback');
+  assert.equal(countSiteSockets('ESTAB 0 0 127.0.0.1:8080 127.0.0.1:44000\n'), 1);
+  assert.equal(countSiteSockets('ESTAB 0 0 [::1]:3002 [::1]:44000\n'), 1);
 });
 
 test('config defaults and overrides', () => {
