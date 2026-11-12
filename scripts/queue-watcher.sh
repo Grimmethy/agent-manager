@@ -190,6 +190,10 @@ while :; do
     apply_retry_result="$(node "${PACKAGE_SRC_DIR}/apply-retry-check.js" 2>>"${HOME_LOGS}/apply-retry-check.log")"
     printf '[watchdog] apply-retry-check: %s\n' "$apply_retry_result" >&2
 
+    # Plugin drains (the drain registry helper in src/): while stop.sh's pipeline-stopped marker exists, SIGTERM any drain still running; otherwise drop the pidfile of a dead one. Its own
+    # [watchdog] lines go to this log; it never fails the tick.
+    node "${PACKAGE_SRC_DIR}/drain-registry.js" sweep >/dev/null || true
+
     # --- required plugins (begin) ---
     # Every tick, each unmet entry of config/required-plugins.json (src/required-plugins.js) is a loud, readable error in this log, never a silent skip: the failure text
     # (stderr of the check) is kept and the status lines are dropped. The hub-tasks check below stays: it also decides whether the hub sweeps run this tick.
