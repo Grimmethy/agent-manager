@@ -194,6 +194,9 @@ while :; do
     # [watchdog] lines go to this log; it never fails the tick.
     node "${PACKAGE_SRC_DIR}/drain-registry.js" sweep >/dev/null || true
 
+    # Forge mode (src/forge-mode.js): ends by itself after 6 hours or when the GPU session is gone; a no-op when not in forge mode. Never fails the tick.
+    bash "${SCRIPT_DIR}/forge-mode.sh" expire >/dev/null || true
+
     # --- required plugins (begin) ---
     # Every tick, each unmet entry of config/required-plugins.json (src/required-plugins.js) is a loud, readable error in this log, never a silent skip: the failure text
     # (stderr of the check) is kept and the status lines are dropped. The hub-tasks check below stays: it also decides whether the hub sweeps run this tick.

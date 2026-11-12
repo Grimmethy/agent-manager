@@ -15,7 +15,7 @@ import subprocess, drain_registry   # drain_registry: the detached plugin drains
 # runs, app.py is fully initialised and the import is just a dict lookup. (Same
 # pattern as routes/concepts.py, routes/second_brain.py, routes/reports.py.)
 
-pipeline_1_more_bp = Blueprint("pipeline-1-more-bp", __name__)
+pipeline_1_more_bp = Blueprint("pipeline-1-more-bp", __name__); import forge_mode; forge_mode.register(pipeline_1_more_bp)   # adds GET/POST /api/pipeline/forge-mode (python/dashboard/forge_mode.py); one line so the size-ratcheted functions here stay as they are
 
 
 def _get_project_tests_command(repo_root: Path) -> str | None:
