@@ -27,6 +27,17 @@ The owner's steps, in order. Nothing here starts by itself.
 
 A node never merges, pushes or deploys: its output is a record that wok reviews.
 
+## 2a. Giving a node the gateway and a repo copy
+
+A node has no GitHub access, so a repo reaches it as a bundle file, and the cloud-model gateway (the `cloud-providers` repo, see `cloud-lane.md`) is installed the same way. The three scripts only read or write plain files: none runs `systemctl`, `claude`, `ssh` or `scp`, none contacts a network, none writes a key or token. Every step below is yours.
+
+1. **On wok, export the repo:** `scripts/export-repo-bundle.sh /media/model-cache/github/agent-manager <out-dir>`. It checks the bundle with `git bundle verify` and prints one line, `bundle=<path> sha=<40 hex> branch=master`. A third argument names another branch; the `cloud-providers` repo's branch is `main`, so for the gateway run `scripts/export-repo-bundle.sh /media/model-cache/github/cloud-providers <out-dir> main`. It reads the repo only.
+2. **Copy the bundle files to the node** with `scp` (or any copy you trust).
+3. **On the node, import the repo:** `scripts/import-repo-bundle.sh <bundle-file> <node-repo-dir>` (add the branch name for `main`). A missing or empty directory is cloned and the clone has **no remote** (nothing to push to, no credential to hold) and the identity `agent-manager-node`. Running it again with a newer bundle fast-forwards the clone; exit 3 means the clone has uncommitted changes, is on another branch, or has history the bundle does not (nothing is changed). It prints `head=<sha> dest=<path>`. Use `<node-repo-dir>` as the repo directory you gave `scripts/provision-node.sh`.
+4. **Import the gateway the same way**, for example into `~/cloud-providers` on the node.
+5. **Write the gateway unit:** `scripts/provision-node-gateway.sh <cloud-providers-dir> ~/.config/systemd/user` (an optional third argument is the port, default 7450). It refuses anything that is not an absolute path or a port from 1024 to 65535. It writes `am-cloud-gateway.service`, which runs the gateway on the logged-in Claude account **without** the confirmation, and `am-cloud-gateway.confirm-subscription.conf.example`, a template that systemd does not read. The gateway refuses to start without the confirmation.
+6. **Your decisions and commands** (the scripts do none of them): run `claude auth login` on the node; copy the template to `~/.config/systemd/user/am-cloud-gateway.service.d/confirm-subscription.conf` **only if you accept** that Anthropic's consumer terms may not permit automated use of a Pro login (`cloud-lane.md`, "Billing"); then `systemctl --user daemon-reload` and `systemctl --user enable --now am-cloud-gateway.service`; check `curl http://127.0.0.1:7450/health`; and last set `enabled` to `true` on the cloud lane in `<pipeline-dir>/lanes.json` and restart the node's workers.
+
 ## 3. The trial (the 80 percent bar)
 
 Before the farm is scaled up, run a small batch of real tasks through one node and score it.
@@ -65,5 +76,6 @@ Machine-to-machine traffic uses the wired LAN address, with the tailnet address 
 
 - A loop that applies a ramp decision to the workers: today the owner reads the decision and changes the workers.
 - A timer that runs `node src/lend-task.js reclaim`, a timer that runs `node src/node-package-send.js`, and a command that lends the next waiting task automatically.
+- Anything that moves a repo or the gateway for you: the export, copy, import and unit-writing steps of section 2a are run by hand, and the gateway's confirmation, its login and its start are yours.
 - Automatic scale-up after a passing trial; the trial score is read by the owner.
 - The cloud lane's Sonnet escalation, concurrency back-off and the unexplained liveness-probe 401s (see `cloud-lane.md`).
