@@ -27,6 +27,9 @@ The owner's steps, in order. Nothing here starts by itself.
 
 A node never merges, pushes or deploys: its output is a record that wok reviews.
 
+### Review of a node's draft under swap-only critical memory pressure
+The reviewer lanes normally yield their tick while the memory marker is critical. The marker can be critical through the swap backstop alone (swap free under 128 MB with under 4096 MB of RAM and any I/O stall). When that is the only cause, a draft that a node sent (a record in `queue/review` with `fromNode`) is reviewed anyway, one per tick: swap free under 128 MB, at least 1024 MB available, memory full stall under 5, I/O full stall under 10. Anything else critical still yields. Kill switch: `AGENT_MANAGER_NODE_DRAFT_REVIEW_UNDER_SWAP_CRITICAL=false`. Code: `nodeDraftMayRunUnderPressure` in `src/node-draft-pressure.js`, used by `scripts/review-runner.sh`.
+
 ## 2a. Giving a node the gateway and a repo copy
 
 A node has no GitHub access, so a repo reaches it as a bundle file, and the cloud-model gateway (the `cloud-providers` repo, see `cloud-lane.md`) is installed the same way. The three scripts only read or write plain files: none runs `systemctl`, `claude`, `ssh` or `scp`, none contacts a network, none writes a key or token. Every step below is yours.
