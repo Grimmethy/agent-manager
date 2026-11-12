@@ -17,6 +17,8 @@ Wok (the machine that owns the ledger, review, verification and merge) can lend 
 | Node outbox stop | `src/node-outbox.js`, `scripts/local-worker.sh` | the node | this page |
 | Send command | `src/node-package-send.js` | the node | this page |
 | Node provisioning | `scripts/provision-node.sh` | the node | `multi-node-runbook.md` |
+| Repo bundle export and import | `scripts/export-repo-bundle.sh`, `scripts/import-repo-bundle.sh` | wok exports, the node imports | `multi-node-runbook.md`, section 2a |
+| Gateway unit for a node | `scripts/provision-node-gateway.sh` | the node | `multi-node-runbook.md`, section 2a; `cloud-lane.md` |
 | Package intake (`POST /package`) | `src/package-intake-server.js` | wok | this page |
 | Branch package (version 1) | `src/review-package.js` (`buildPackage`) | the node builds it | this page; not used for node work |
 | Branch relay | `src/branch-relay.js` | wok | `branch-relay.md`; not used for node work |
@@ -72,4 +74,4 @@ Tokens are read from files, never from the environment, never printed and never 
 
 ## What is not automatic
 
-Nothing lends a task, starts a server, registers a node, runs the heartbeat timer, sends a node's outbox, relays a branch or deploys to grimm by itself. Merging stays the normal verified flow, and deploys stay manual.
+Nothing copies a repo or the gateway to a node, confirms the gateway's use of the Claude login, or starts it (the scripts of section 2a of the runbook only read or write files). Nothing lends a task, starts a server, registers a node, runs the heartbeat timer, sends a node's outbox, relays a branch or deploys to grimm by itself. Merging stays the normal verified flow, and deploys stay manual.
