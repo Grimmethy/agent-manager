@@ -3,6 +3,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { extractKeywords } = require('./path-prefetch.js');
 
 // Extract structured information from brain-dump text
 function extractStructuredInfo(rawText, title) {
@@ -19,7 +20,9 @@ function extractStructuredInfo(rawText, title) {
   const componentPatterns = [
     /(?:in|affecting|related to|about)\s+([A-Za-z][\w\-\.\/]+)/i,
     /(?:the\s+)?([A-Z][\w\-]+(?:\s+[a-z]+)*)\s+(?:is|has|was|should|needs|lacks|fails)/i,
-    /(?:broken|bug|issue|problem|hazard)\s+(?:in|affecting|with)\s+([A-Za-z][\w\-\.\/]+)/i
+    /(?:broken|bug|issue|problem|hazard)\s+(?:in|affecting|with)\s+([A-Za-z][\w\-\.\/]+)/i,
+    // Handle function/method names in camelCase or snake_case (e.g., "buildinitialdaystate possibly returning")
+    /^([A-Z][a-z]+(?:[A-Z][a-z]+)*|[\w]+(?:_[\w]+)*)\s+(?:possibly|might|could|can|should|returns|returning|returns)\s/i
   ];
 
   for (const pattern of componentPatterns) {
@@ -42,7 +45,9 @@ function extractStructuredInfo(rawText, title) {
   const observedPatterns = [
     /(?:shows|returns|produces|gives|outputs|results in|yields|creates|generates|leads to)\s+(?:an?|the)\s+([A-Za-z][\w\s\-\.,;:!?]+?)(?:\s+|\.|\n|$)/i,
     /(?:is|was|has been)\s+(?:stuck|failing|broken|not working|silently|incorrectly)\s+(?:in|with|at)\s+(?:the\s+)?([A-Za-z][\w\s\-\.,;:!?]+?)(?:\s+|\.|\n|$)/i,
-    /(?:no|empty|missing|zero)\s+(?:results|entries|items|tasks|files|data|output|response|feedback|confirmation)\s+(?:despite|even|although|but|while|when)\s+(?:there\s+)?(?:is|are|was|were)\s+(?:known|relevant|existing|some|any)\s+([A-Za-z][\w\s\-\.,;:!?]+?)/i
+    /(?:no|empty|missing|zero)\s+(?:results|entries|items|tasks|files|data|output|response|feedback|confirmation)\s+(?:despite|even|although|but|while|when)\s+(?:there\s+)?(?:is|are|was|were)\s+(?:known|relevant|existing|some|any)\s+([A-Za-z][\w\s\-\.,;:!?]+?)/i,
+    // Handle "possibly returning shared state" pattern
+    /(?:possibly|might|could|can|should)\s+(?:returning|return|giving|producing|outputting|creating|generating)\s+([A-Za-z][\w\s\-\.,;:!?]+?)/i
   ];
 
   for (const pattern of observedPatterns) {
@@ -340,6 +345,19 @@ function processAmbiguousBrainDump(rawText, title, brainDumpEntryId, taskDir, ta
     };
   }
 
+  // Check if this is a broad, exploratory item that needs decomposition
+  if (isBroadExploratoryItem(title)) {
+    const subTasks = decomposeBroadItem(title, brainDumpEntryId);
+    return {
+      action: 'decompose',
+      reason: null,
+      previousQuestions: null,
+      scopedTask: null,
+      subTasks,
+      questions: null
+    };
+  }
+
   if (fieldsExtracted >= 2) {
     // We have enough info to scope the task
     const scopedTask = buildScopedTask(rawText, title, extractedInfo, brainDumpEntryId);
@@ -370,6 +388,91 @@ function processAmbiguousBrainDump(rawText, title, brainDumpEntryId, taskDir, ta
   };
 }
 
+// Detect broad, exploratory brain-dump items that need decomposition rather than clarification
+function isBroadExploratoryItem(title) {
+  const broadKeywords = [
+    'review', 'explore', 'documentation', 'general', 'overview',
+    'catalogue', 'survey', 'audit', 'assessment', 'analysis',
+    'tools', 'tool', 'system', 'framework', 'process', 'workflow',
+    'analytics', 'metrics', 'reporting', 'monitoring'
+  ];
+  const lower = title.toLowerCase();
+  return broadKeywords.some((kw) => lower.includes(kw));
+}
+
+// Decompose a broad exploratory item into 2-4 scoped sub-tasks
+function decomposeBroadItem(title, brainDumpEntryId) {
+  const tasks = [];
+  const lower = title.toLowerCase();
+  
+  // Extract keywords to guide decomposition
+  const keywords = extractKeywords(title);
+  const primaryTopic = keywords.length > 0 ? keywords[0].lower : 'item';
+  
+  // Generate scoped sub-tasks based on common decomposition patterns
+  if (lower.includes('review') || lower.includes('documentation')) {
+    tasks.push({
+      id: `bd-${brainDumpEntryId}-review-1`,
+      title: `Inventory current ${primaryTopic} documents and notes`,
+      rawText: `List all existing documents and notes related to ${primaryTopic}. Note which are outdated, incomplete, or missing.`,
+      priority: 8
+    });
+    tasks.push({
+      id: `bd-${brainDumpEntryId}-review-2`,
+      title: `Identify gaps in ${primaryTopic} documentation`,
+      rawText: `Based on the inventory, identify which topics are missing documentation or need updates. Prioritize by user impact.`,
+      priority: 7
+    });
+    tasks.push({
+      id: `bd-${brainDumpEntryId}-review-3`,
+      title: `Draft missing ${primaryTopic} documentation`,
+      rawText: `Write documentation for the highest-priority gaps identified. Focus on clarity and completeness.`,
+      priority: 6
+    });
+  } else if (lower.includes('explore') || lower.includes('overview')) {
+    tasks.push({
+      id: `bd-${brainDumpEntryId}-explore-1`,
+      title: `Map current ${primaryTopic} capabilities`,
+      rawText: `Document what currently exists for ${primaryTopic}: features, tools, integrations.`,
+      priority: 8
+    });
+    tasks.push({
+      id: `bd-${brainDumpEntryId}-explore-2`,
+      title: `Identify ${primaryTopic} pain points`,
+      rawText: `Gather feedback on what doesn't work well with ${primaryTopic}. List specific issues.`,
+      priority: 7
+    });
+    tasks.push({
+      id: `bd-${brainDumpEntryId}-explore-3`,
+      title: `Propose ${primaryTopic} improvements`,
+      rawText: `Based on capabilities and pain points, propose 3-5 concrete improvements to ${primaryTopic}.`,
+      priority: 6
+    });
+  } else {
+    // Generic decomposition
+    tasks.push({
+      id: `bd-${brainDumpEntryId}-decompose-1`,
+      title: `Research ${primaryTopic}现状`,
+      rawText: `Investigate the current state of ${primaryTopic}. Document findings.`,
+      priority: 8
+    });
+    tasks.push({
+      id: `bd-${brainDumpEntryId}-decompose-2`,
+      title: `Define ${primaryTopic} requirements`,
+      rawText: `Based on research, define what ${primaryTopic} should accomplish. List specific requirements.`,
+      priority: 7
+    });
+    tasks.push({
+      id: `bd-${brainDumpEntryId}-decompose-3`,
+      title: `Plan ${primaryTopic} implementation`,
+      rawText: `Create a high-level plan for implementing ${primaryTopic}. Break into phases.`,
+      priority: 6
+    });
+  }
+  
+  return tasks;
+}
+
 module.exports = {
   extractStructuredInfo,
   generateQuestions,
@@ -378,5 +481,7 @@ module.exports = {
   recordClarificationAttempt,
   clarificationHistoryPath,
   checkStaleClarification,
-  processAmbiguousBrainDump
+  processAmbiguousBrainDump,
+  isBroadExploratoryItem,
+  decomposeBroadItem
 };

@@ -14,7 +14,9 @@ const {
   recordClarificationAttempt,
   clarificationHistoryPath,
   checkStaleClarification,
-  processAmbiguousBrainDump
+  processAmbiguousBrainDump,
+  isBroadExploratoryItem,
+  decomposeBroadItem
 } = require('./scoped-clarification.js');
 
 test('acceptance criterion 1: brain-dump with clear problem description produces scoped work item', () => {
@@ -217,4 +219,60 @@ test('history written for the needs-clarification directory is read back: the se
   recordClarificationAttempt(dir, 'bd-r-2', 'ambiguous', ['second?']);
   const saved = JSON.parse(fs.readFileSync(clarificationHistoryPath(dir), 'utf8'));
   assert.deepEqual(saved.map((h) => h.brainDumpEntryId), ['bd-r-1', 'bd-r-2'], 'the second record keeps the first');
+});
+
+// The four sample brain-dump tasks from the live needs-clarification stall (HUB0XXX)
+// must not end up with a bare 'clarification-required' with no question. Each one
+// either scopes to a concrete work item or decomposes into scoped sub-tasks.
+const FOUR_STALLED_TASKS = [
+  {
+    title: 'quest analytics and playtesting tools',
+    rawText: 'Need quest analytics and playtesting tools to track quest completion rates and gather player feedback.',
+    id: 'adhoc-brain-dump-bd-1794243450131-quest-analytics-and-playtesting-tools-1794243578299'
+  },
+  {
+    title: 'quest reward economy balancing tool',
+    rawText: 'Quest reward economy balancing tool to adjust quest rewards based on player progression and difficulty.',
+    id: 'adhoc-brain-dump-bd-1794247720957-quest-reward-economy-balancing-tool-1794247793642'
+  },
+  {
+    title: 'project documentation review',
+    rawText: 'Review project documentation to ensure accuracy and completeness.',
+    id: 'adhoc-brain-dump-bd-1794249531381-project-documentation-review-1794249608616'
+  },
+  {
+    title: 'buildinitialdaystate may return shared state',
+    rawText: 'buildinitialdaystate possibly returning shared state. The function may be returning a reference to shared mutable state instead of a fresh copy, which could cause issues when multiple players load the same day.',
+    id: 'adhoc-brain-dump-bd-1794538943169-buildinitialdaystate-may-return-shared-q-1794539814578'
+  }
+];
+
+for (const { title, rawText, id } of FOUR_STALLED_TASKS) {
+  test(`acceptance criterion 4d: ${title} brain-dump gets scoped or decomposed`, () => {
+    const taskDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scoped-clar-test-'));
+    const result = processAmbiguousBrainDump(rawText, title, id, taskDir, null);
+    // Must NOT just generate questions (which would stall the task)
+    assert.notStrictEqual(result.action, 'questions', 'should not just generate questions');
+    // Must either scope to a concrete item or decompose into sub-tasks
+    assert.ok(
+      result.action === 'scope' || result.action === 'decompose',
+      `expected action 'scope' or 'decompose', got '${result.action}'`
+    );
+  });
+}
+
+test('isBroadExploratoryItem detects review items', () => {
+  assert.ok(isBroadExploratoryItem('project documentation review'));
+  assert.ok(isBroadExploratoryItem('explore quest system'));
+  assert.ok(!isBroadExploratoryItem('fix buildinitialdaystate shared state bug'));
+});
+
+test('decomposeBroadItem generates at least 2 tasks', () => {
+  const tasks = decomposeBroadItem('project documentation review', 'bd-decompose-test');
+  assert.ok(Array.isArray(tasks), 'should return an array');
+  assert.ok(tasks.length >= 2, 'should generate at least 2 sub-tasks');
+  for (const task of tasks) {
+    assert.ok(task.title, 'each task should have a title');
+    assert.ok(task.rawText, 'each task should have rawText');
+  }
 });
