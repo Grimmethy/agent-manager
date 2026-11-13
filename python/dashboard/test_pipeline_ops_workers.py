@@ -124,7 +124,7 @@ class BuildWorker(unittest.TestCase):
         self.assertEqual(got["decisions"], 1)
 
     def test_workers_are_independent_and_named(self):
-        self.assertEqual(po.WORKERS, ("scout", "checker", "merger", "steward", "hub"))
+        self.assertEqual(po.WORKERS, ("scout", "checker", "merger", "steward", "hub", "atomizer"))
         self.assertEqual(build(name="checker", trigger=TRIG)["name"], "checker")
 
 

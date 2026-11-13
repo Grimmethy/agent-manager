@@ -1,5 +1,6 @@
 """The Workers tab's cards for the agent-manager-pipeline-ops workers built on src/worker-kit.js: the poll scout (`scout`) and, as they are built, the merge-ready checker (`checker`), the
-merger (`merger`) and the idle-cost steward (`steward`) (docs/poll-scout-worker.md in that repo, 2026-11-04).
+merger (`merger`), the idle-cost steward (`steward`), the hub worker (`hub`) and the task atomizer (`atomizer`, docs/task-atomizer.md in that repo, 2026-11-13) (docs/poll-scout-worker.md
+in that repo, 2026-11-04).
 
 Like the branch verifier and the Needs-Work worker they are NOT lanes: each is a CLI that the agent-manager watchdog triggers (a `watchdogScripts` entry in plugins.json starts a detached
 drain when its input changed). One generic route reads what they leave behind, keyed by worker name, so a new worker is a name in WORKERS, not a new route:
@@ -24,7 +25,7 @@ from routes.worker_trigger import read_trigger
 
 pipeline_ops_workers_bp = Blueprint("pipeline-ops-workers-bp", __name__)
 
-WORKERS = ("scout", "checker", "merger", "steward", "hub")
+WORKERS = ("scout", "checker", "merger", "steward", "hub", "atomizer")
 RECENT_COUNT = 8
 HOLDS_CAP = 50
 HOLD = "HOLD-FOR-OWNER"
