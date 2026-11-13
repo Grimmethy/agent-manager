@@ -142,10 +142,15 @@ function archivedTaskFiles(pipelineDir) {
   return out;
 }
 
-function searchTasksTool(pipelineDir, { query, state, includeArchived } = {}) {
+function searchTasksTool(pipelineDir, { query, state, includeArchived, similar = false } = {}) {
   if (typeof query !== 'string' || !query.trim()) {
     return { error: 'search_tasks requires a non-empty "query" argument' };
   }
+  // TODO(HUB0261-2/3): replace this guard with the similar:true ranking path once HUB0262 lands src/task-similarity.js.
+  // Replacement: const ranked = rankTasks(query, candidates, { limit: 15 }) from ./task-similarity.js, attaching score, matchedOn and state to each hit,
+  // and adding note:'no close match' to the top hit when its score < DUPLICATE_SCORE. The require is added at that point, not before.
+  // Until then, refuse explicitly instead of silently falling back to lexical matching.
+  if (similar) return { error: 'search_tasks similar:true needs src/task-similarity.js (HUB0262), which has not landed yet' };
   const validStates = ['drafting', 'adhoc', ...QUEUE_STATES];
   let candidates = [];
   if (state != null) {
@@ -230,6 +235,12 @@ function queueReviewedTaskTool(pipelineDir, { title, description, project, depen
       return { error: `this task is about the project "${owner.label}" (paths under ${owner.repoRoot}) but would be queued to a different project's queue; call again with project: "${owner.label}"` };
     }
   }
+  // TODO(HUB0261-2/3): duplicate-check seam, not wired yet. Replacement code:
+  //   const ranked = rankTasks(`${title} ${description.slice(0, 600)}`, allTasks, { limit: 5 });
+  //   const dup = ranked.find((r) => r.score >= DUPLICATE_SCORE);
+  //   if (dup) return { error: `duplicate of ${dup.id}` };
+  // Needs rankTasks and DUPLICATE_SCORE from ./task-similarity.js and allTasks loaded from the target queue.
+  // There is no existing duplicate check today, and task-similarity.js does not exist yet.
   // Validate dependsOn ids exist in the target project's queue/done/
   if (Array.isArray(dependsOn) && dependsOn.length > 0) {
     const unresolved = dependsOn.filter((depId) => {
