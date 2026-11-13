@@ -199,7 +199,7 @@ function resolveAgainstRepoDetailed(repoRoot, candidatePath, extraRoots = []) {
     if (preferred.length === 1) return { resolvedPath: preferred[0], resolvedVia: 'basename' };
   }
 
-  return { resolvedPath: null, resolvedVia: null };
+  return { resolvedPath: null, resolvedVia: null, candidates: matches.length > 1 ? matches : [] };
 }
 
 function resolveAgainstRepo(repoRoot, candidatePath, extraRoots = []) {
@@ -232,8 +232,8 @@ function checkFilePaths(text, repoRoot, extraRoots = [], ref) {
         // could not confirm against the stacked ref -- fall through to the working-tree check below.
       }
     }
-    const { resolvedPath, resolvedVia } = resolveAgainstRepoDetailed(repoRoot, claimedPath, extraRoots);
-    return { claimedPath, exists: !!resolvedPath, resolvedPath, resolvedVia };
+    const { resolvedPath, resolvedVia, candidates } = resolveAgainstRepoDetailed(repoRoot, claimedPath, extraRoots);
+    return { claimedPath, exists: !!resolvedPath, resolvedPath, resolvedVia, candidates: candidates || [] };
   });
 }
 
