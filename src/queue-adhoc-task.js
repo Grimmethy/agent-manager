@@ -28,9 +28,33 @@ function defaultTaskDomain(validDomains) {
 // instead of executing it directly -- can queue a real adhoc task without shelling out
 // to this script. Throws on an invalid domain rather than the CLI's own
 // print-and-exit(1), since a library call has no business calling process.exit.
-function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority, project, generatedForRepoRoot }, { pipelineDir, domainsPath }) {
+// stacked (2026-11-04, Needs-Work repair loop piece 2): the target of a REPAIR task -- an existing agent/* branch the task's commit rides on.
+// apply's prepareApplyBranch (apply-branch-prep-route.js) reads exactly these three keys: a stacked record with seq > 1 goes through
+// prepareStackedBranch(branch) and adds a commit ON the branch; seq 1 would delete and recreate the branch off main, the opposite of a repair,
+// so it is refused here. A repair never targets main or a non-agent branch.
+function normalizeStacked(stacked) {
+  if (!stacked || typeof stacked !== 'object' || Array.isArray(stacked)) {
+    throw new Error('queueAdhocTask: stacked must be an object {branch, seq, total}');
+  }
+  const extra = Object.keys(stacked).filter((k) => !['branch', 'seq', 'total'].includes(k));
+  if (extra.length) throw new Error(`queueAdhocTask: stacked has unknown key(s): ${extra.join(', ')}`);
+  const { branch, seq, total } = stacked;
+  if (typeof branch !== 'string' || !branch.startsWith('agent/') || branch === 'agent/' || /\s/.test(branch) || branch.includes('..')) {
+    throw new Error(`queueAdhocTask: stacked.branch must be an existing agent/* branch name without whitespace or '..' (got ${JSON.stringify(branch)})`);
+  }
+  if (!Number.isInteger(seq) || seq < 2) {
+    throw new Error(`queueAdhocTask: stacked.seq must be an integer >= 2 (seq 1 would recreate the branch off main) (got ${JSON.stringify(seq)})`);
+  }
+  if (!Number.isInteger(total) || total < seq) {
+    throw new Error(`queueAdhocTask: stacked.total must be an integer >= stacked.seq (got ${JSON.stringify(total)})`);
+  }
+  return { branch, seq, total };
+}
+
+function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority, premiumSetBy, project, generatedForRepoRoot, stacked }, { pipelineDir, domainsPath }) {
   if (!title) throw new Error('queueAdhocTask: title is required');
   if (!promptContext) throw new Error('queueAdhocTask: promptContext is required');
+  const cleanStacked = stacked === undefined || stacked === null ? undefined : normalizeStacked(stacked);
 
   const validDomains = Object.keys(JSON.parse(fs.readFileSync(domainsPath, 'utf8')));
   const resolvedDomain = domain || defaultTaskDomain(validDomains);
@@ -64,6 +88,10 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriori
     // This was previously a manual step an operator had to remember to do after every
     // Chat-queued task; automating it here closes that gap.
     ...(premiumPriority ? { premiumPriority: true } : {}),
+    // Provenance of the premium flag (premiumSetBy: operator-ui | operator-bulk | chat-queue | cli | source; premiumSetAt: ISO),
+    // shown in the task modal next to the Premium Priority button. Chat's queue_reviewed_task passes 'chat-queue'; any other
+    // caller that asks for premium without a label is recorded as 'cli'. Display only: claim order reads premiumPriority alone.
+    ...(premiumPriority ? { premiumSetBy: premiumSetBy || 'cli', premiumSetAt: new Date().toISOString() } : {}),
     ...(cleanDependsOn && cleanDependsOn.length ? { dependsOn: cleanDependsOn } : {}),
     // The registered project this task was filed for (Chat's queue_reviewed_task passes it); informational.
     ...(project ? { project } : {}),
@@ -71,15 +99,25 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriori
     // stamped by the --scratch hand-carry path so the task's later blocked/needs-clarification
     // transitions know which repo to sync into without a post-hoc fix.
     ...(generatedForRepoRoot ? { generatedForRepoRoot } : {}),
+    // The branch a repair task rides on (see normalizeStacked); absent for every ordinary task.
+    ...(cleanStacked ? { stacked: cleanStacked } : {}),
   };
   const filePath = path.join(adhocDir, `${id}.json`);
   fs.writeFileSync(filePath, JSON.stringify(record, null, 2) + '\n');
   return { record, filePath };
 }
 
+const STACKED_FLAGS = ['--stacked-branch', '--stacked-seq', '--stacked-total'];
+
 function parseArgs(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i++) {
+    // The --stacked-* flags are recorded even with an empty or missing value, so stackedFromArgs/normalizeStacked refuse them (exit 1). The generic
+    // rule below skips a flag whose next argument is falsy, which would silently turn `--stacked-branch ""` into an ORDINARY task off main.
+    if (STACKED_FLAGS.includes(argv[i])) {
+      args[argv[i]] = i + 1 < argv.length ? argv[++i] : '';
+      continue;
+    }
     if ((argv[i] === '--title' || argv[i] === '--prompt-context-file' || argv[i] === '--domain' || argv[i] === '--depends-on' || argv[i] === '--scratch' || argv[i] === '--repo-root') && argv[i + 1]) {
       args[argv[i]] = argv[++i];
     }
@@ -87,12 +125,27 @@ function parseArgs(argv) {
   return args;
 }
 
+// CLI form of a stacked target: --stacked-branch <b> [--stacked-seq n] [--stacked-total n]; with only the branch, seq is 2 and total is seq.
+// seq or total without a branch is an error (returns via throw, the callers print it and exit 1 like every other bad argument).
+function stackedFromArgs(parsed) {
+  const branch = parsed['--stacked-branch'];
+  if (branch === undefined) {
+    if (parsed['--stacked-seq'] !== undefined || parsed['--stacked-total'] !== undefined) {
+      throw new Error('--stacked-seq and --stacked-total need --stacked-branch');
+    }
+    return undefined;
+  }
+  const seq = parsed['--stacked-seq'] === undefined ? 2 : Number(parsed['--stacked-seq']);
+  const total = parsed['--stacked-total'] === undefined ? seq : Number(parsed['--stacked-total']);
+  return { branch, seq, total };
+}
+
 if (require.main === module) {
   const rawArgs = process.argv.slice(2);
   const parsed = parseArgs(rawArgs);
 
   if (!parsed['--title'] || !parsed['--prompt-context-file']) {
-    console.error('Usage: node queue-adhoc-task.js --title <text> --prompt-context-file <path> [--domain <name>] [--depends-on id1,id2] [--scratch <dir>] [--repo-root <path>]');
+    console.error('Usage: node queue-adhoc-task.js --title <text> --prompt-context-file <path> [--domain <name>] [--depends-on id1,id2] [--scratch <dir>] [--repo-root <path>] [--stacked-branch <agent/branch> [--stacked-seq <n>] [--stacked-total <n>]]');
     process.exit(1);
   }
 
@@ -102,6 +155,14 @@ if (require.main === module) {
     promptContext = JSON.parse(raw);
   } catch {
     console.error(`Invalid prompt context file: ${parsed['--prompt-context-file']}`);
+    process.exit(1);
+  }
+
+  let stackedTarget;
+  try {
+    stackedTarget = stackedFromArgs(parsed);
+  } catch (e) {
+    console.error(e.message);
     process.exit(1);
   }
 
@@ -138,7 +199,7 @@ if (require.main === module) {
     try {
       const { pipelineDir, domainsPath } = getConfig();
       const { filePath } = queueAdhocTask(
-        { title: parsed['--title'], promptContext, domain: 'adhoc', generatedForRepoRoot: parsed['--repo-root'], dependsOn: parsed['--depends-on']
+        { title: parsed['--title'], promptContext, domain: 'adhoc', generatedForRepoRoot: parsed['--repo-root'], stacked: stackedTarget, dependsOn: parsed['--depends-on']
             ? parsed['--depends-on'].split(',').map((s) => s.trim()).filter(Boolean)
             : undefined },
         { pipelineDir, domainsPath },
@@ -165,7 +226,7 @@ if (require.main === module) {
 
     try {
       const { filePath } = queueAdhocTask(
-        { title: parsed['--title'], promptContext, domain: parsed['--domain'], dependsOn },
+        { title: parsed['--title'], promptContext, domain: parsed['--domain'], dependsOn, stacked: stackedTarget },
         { pipelineDir, domainsPath },
       );
       console.log(`queued adhoc task: ${filePath}`);
@@ -176,4 +237,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { queueAdhocTask, slugify, defaultTaskDomain };
+module.exports = { queueAdhocTask, slugify, defaultTaskDomain, normalizeStacked, stackedFromArgs };

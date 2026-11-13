@@ -66,8 +66,10 @@ const { parseClarificationOptions } = require('./agentic-draft-common.js');
 const { resolveGroundingRef, readFileAtRef, resolveAtRef } = require('./stacked-grounding.js');
 const { checkDraft, checkCitationsAgainstHarnessFiles } = require('./fact-checker.js');
 const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.js');
+const { checkConflict } = require('./conflict-check.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
+const { getScriptHandler } = require('./script-handler-registry.js');
 const { getPreDispatchGate } = require('./deterministic-recheck-registry.js');
 const { buildGateFalsePositiveDraft } = require('./lib/gate-verdict.js');
 const { selectAbModel } = require('./ab-model-select.js');
@@ -93,6 +95,69 @@ const { resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResear
 const { computePlanNumPredict, tryDeterministicScriptExtractEdit, tryDeterministicOnePassDecompose, tryDeterministicNodeModuleDecompose, tryDeterministicBlueprintDecompose, tryDeterministicLiteralEdit } = require('./lib/deterministic-extract.js');
 const { runCritiqueAndRevision, computeImplementBudget, callImplementModel } = require('./lib/implement-critique.js');
 
+// 2026-11-04, this task: conflict check runs before implement to catch file overlap with
+// other open branches EARLY (the dashboard's _check_conflicts only runs during review, too
+// late). If a conflict is detected, the draft is blocked with a needs-human-decision verdict
+// so a human can decide which branch to keep. This prevents the class of 13 branches that all
+// failed with "it conflicts with # other open branch(#)" because the check ran after work was
+// already done.
+async function preFlightConflictCheck(task, { pipelineDir, repoRoot }) {
+  if (!pipelineDir || !repoRoot) return null;
+  try {
+    const proposedFiles = task.promptContext?.proposeFiles || task.promptContext?.files || [];
+    if (!proposedFiles.length) return null;
+    
+    const openBranches = [];
+    const pendingDir = path.join(pipelineDir, 'queue', 'pending');
+    if (fs.existsSync(pendingDir)) {
+      const files = fs.readdirSync(pendingDir).filter(f => f.endsWith('.json'));
+      for (const file of files) {
+        if (file === `${task.id}.json`) continue; // Skip self
+        try {
+          const otherTask = JSON.parse(fs.readFileSync(path.join(pendingDir, file), 'utf8'));
+          if (otherTask.id?.startsWith('adhoc/triage-queue')) continue;
+          const match = otherTask.id?.match(/^agent\/(.+)$/);
+          if (match) {
+            const branch = match[1];
+            const r = await new Promise((resolve) => {
+              const { execFileSync } = require('child_process');
+              try {
+                const out = execFileSync('git', ['diff', '--name-only', 'origin/main', `origin/${branch}`], { cwd: repoRoot, encoding: 'utf8', env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, timeout: 30_000 });
+                resolve({ files: out.split('\n').map(l => l.trim()).filter(Boolean) });
+              } catch (e) {
+                resolve({ files: [] });
+              }
+            });
+            openBranches.push({ branch, files: r.files });
+          }
+        } catch (e) {
+          // Skip unreadable
+        }
+      }
+    }
+    
+    const conflicts = [];
+    for (const open of openBranches) {
+      const overlap = proposedFiles.filter(pf => open.files.includes(pf));
+      if (overlap.length) {
+        conflicts.push({ branch: open.branch, files: overlap });
+      }
+    }
+    
+    if (conflicts.length) {
+      return {
+        verdict: 'needs-human-decision',
+        reason: `it conflicts with ${conflicts.length} other open branch(es) that touch the same files (${conflicts.map(c => c.branch).join(', ')}); keep one`,
+        conflicts,
+      };
+    }
+  } catch (e) {
+    // Best-effort: a conflict check failure must never break the draft
+    console.error(`Conflict check failed: ${e.message}`);
+  }
+  return null;
+}
+
 // 2026-09-08, Grimmethy: "fix worker-1" -- see gpu-arbiter.js's own header for the
 // incident (worker-1's qwen2.5:3b starved into repeated hard OLLAMA_TIMEOUTs by
 // worker-reasoning's qwen3.8:27b-q4_K_M generating concurrently on the same physical
@@ -111,6 +176,10 @@ const { runCritiqueAndRevision, computeImplementBudget, callImplementModel } = r
 // currently-succeeding first try never regresses; more sampling diversity on a call that
 // already failed can only help, never hurt.
 const RETRY_TEMPERATURE = 1.0;
+
+// 2026-11-04: max retries for a truncated split-mode implement response before blocking the task.
+// Configurable for tuning; default 3 matches the task's acceptance criterion.
+const SPLIT_TRUNCATION_MAX_RETRIES = 3;
 
 // Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
 // plugin sources (agent-manager-hygiene). local-draft.js's draft path calls
@@ -358,6 +427,50 @@ function findUnverifiedEdit(implementResponse, fetchedFiles, { anchorSnippet = '
 // `invalid: true` path below) instead of silently masquerading as plain prose.
 const SPLIT_MODE_MARKER_RE = /"mode"\s*:\s*"split"/;
 
+// 2026-11-04: recover complete sub-candidates from a truncated split response (arch-review-ac-70, arch-review-ac-395).
+// When the model's output is cut off mid-JSON, scan for complete `{...}` blocks in the candidates array and return them
+// as `{ truncated: true, candidates: [...], reason: '...' }`. The caller uses recovered candidates directly (no retry)
+// and drops the incomplete trailing one. Returns `{ invalid: true, reason: '...' }` only when no complete sub-candidate
+// can be recovered -- that triggers a retry with reduced split size.
+function extractCompleteSubCandidatesFromTruncated(trimmed) {
+  const candidatesMatch = trimmed.match(/"candidates"\s*:\s*\[/);
+  if (!candidatesMatch) return null;
+  const arrStart = candidatesMatch.index + candidatesMatch[0].length;
+  let depth = 0;
+  let inString = false;
+  let stringEscape = false;
+  let candidateStart = -1;
+  const complete = [];
+  for (let i = arrStart; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (stringEscape) { stringEscape = false; continue; }
+    if (ch === '\\' && inString) { stringEscape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') {
+      if (depth === 0) candidateStart = i;
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && candidateStart !== -1) {
+        const candidateText = trimmed.slice(candidateStart, i + 1);
+        try {
+          const parsed = JSON.parse(candidateText);
+          if (parsed && typeof parsed === 'object' && typeof parsed.title === 'string' && parsed.title.trim()
+            && typeof parsed.problem === 'string' && parsed.problem.trim()
+            && typeof parsed.solution === 'string' && parsed.solution.trim()) {
+            complete.push(parsed);
+          }
+        } catch {
+          // Not valid JSON, skip
+        }
+        candidateStart = -1;
+      }
+    }
+  }
+  return complete.length > 0 ? complete : null;
+}
+
 function parseCandidateSplit(implementResponse) {
   const trimmed = (implementResponse || '').trim();
   if (!trimmed || trimmed === '""' || trimmed === "''") return null;
@@ -367,6 +480,11 @@ function parseCandidateSplit(implementResponse) {
     parsed = parseJsonMaybeFenced(trimmed);
   } catch {
     if (looksLikeSplitAttempt) {
+      // Try to recover complete sub-candidates from the truncated JSON
+      const recovered = extractCompleteSubCandidatesFromTruncated(trimmed);
+      if (recovered && recovered.length >= 1) {
+        return { truncated: true, candidates: recovered, reason: `Implement pass response was truncated mid-JSON (mode "split" detected) but ${recovered.length} complete sub-candidate(s) were recovered before the cut point. Using recovered candidates and dropping incomplete trailing ones.` };
+      }
       return { invalid: true, reason: 'Implement pass appears to have attempted mode "split" (the response contains "mode":"split") but the JSON is truncated or malformed and could not be parsed -- likely ran out of output budget mid-response. Retry with fewer/shorter sub-candidates, or increase the implement budget.' };
     }
     return null; // malformed JSON with no split marker is a separate, pre-existing failure mode -- not this check's job
@@ -850,9 +968,11 @@ async function runPlanPass(task, {
   // read-only tools before planning. runOrientPass skips itself (0 GPU) when grounding
   // already covers the task or when there's nothing concrete to orient on. Kill switch
   // AGENT_MANAGER_ADHOC_ORIENT=false.
+  let orientResult = null;
   if (substanceGated && grounding && process.env.AGENT_MANAGER_ADHOC_ORIENT !== 'false') {
     try {
       const orient = await runOrientPassFn(task, { grounding, maybeLocked });
+      orientResult = orient;
       recordOrient(attempt, { turnsUsed: orient.turnsUsed, skipped: orient.skipped });
       appendHistoryEvent(task, 'orient-done', orient.skipped ? 'skipped (grep-covered)' : `${orient.turnsUsed} turn(s)`);
       if (!orient.skipped && orient.notes) {
@@ -863,6 +983,19 @@ async function runPlanPass(task, {
     } catch (e) {
       if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
       appendHistoryEvent(task, 'advisory', `orient pass errored (non-fatal): ${String(e && e.message || e).slice(0, 160)}`);
+    }
+  }
+
+  // Context provenance stamp (2026-11-03): which grounding sources fed this draft.
+  // Pure module, deterministic, serialized size under 2048 bytes. Kill switch:
+  // AGENT_MANAGER_CONTEXT_PROVENANCE=false (default on). Failure is swallowed.
+  if (process.env.AGENT_MANAGER_CONTEXT_PROVENANCE !== 'false') {
+    try {
+      const { buildContextProvenance } = require('./lib/context-provenance.js');
+      // `grounding` is the OBJECT from buildPlanGrounding ({ text, anchorPaths, grepHits }); task._planGrounding is only its text (a string) and is deleted below.
+      task.contextProvenance = buildContextProvenance({ grounding, orient: orientResult, task });
+    } catch (e) {
+      console.warn(`[local-draft] context-provenance failed for ${task.id}: ${e.message}`);
     }
   }
 
@@ -1076,6 +1209,40 @@ async function finalizeCandidateFulfillment(task, {
       split = parseCandidateSplit(task.implementResponse);
     }
     appendHistoryEvent(task, 'implement-retry', `split had ${split && split.tooFew ? split.usable : 'too few'} usable sub-candidate(s) -- retried once asking for at least 2, one file each${retryResult.degenerate ? ' (retry degenerate, original answer kept)' : ''}`);
+  }
+  // 2026-11-04: truncated split retry (arch-review-ac-70, arch-review-ac-395). When parseCandidateSplit returns
+  // { truncated: true, candidates } we use the recovered candidates directly (no retry needed). When it returns
+  // { invalid: true, reason } with a split marker but no recoverable candidates, retry with reduced split size
+  // (ask for fewer sub-candidates, each shorter) up to MAX_SPLIT_TRUNCATION_RETRIES times before blocking.
+  if (split && split.invalid && split.reason && split.reason.includes('truncated or malformed') && !task.splitTruncationRetried) {
+    const maxRetries = SPLIT_TRUNCATION_MAX_RETRIES;
+    let retryCount = 0;
+    while (retryCount < maxRetries) {
+      retryCount += 1;
+      task.splitTruncationRetried = retryCount;
+      const correction = `Your previous implement response was truncated mid-JSON (ran out of output budget) while attempting mode "split". This retry asks for FEWER sub-candidates (max 2, down from whatever you tried before) and SHORTER descriptions -- each sub-candidate must fit in under 200 words total (title + problem + solution + benefits combined). Do not list more than 2 sub-candidates. Keep each one concise. Example shape: {\"mode\":\"split\",\"candidates\":[{\"title\":\"Short title\",\"problem\":\"One sentence.\",\"solution\":\"One sentence.\",\"benefits\":\"One sentence.\"},{\"title\":\"Another short title\",\"problem\":\"One sentence.\",\"solution\":\"One sentence.\",\"benefits\":\"One sentence.\"}]}`;
+      task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+      task.priorRejectionFeedback.push(correction);
+      const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: `${implPrompt}\\n\\n${correction}`, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
+      if (!retryResult.degenerate) {
+        task.implementResponse = retryResult.response;
+        const retrySplit = parseCandidateSplit(task.implementResponse);
+        if (retrySplit && !retrySplit.invalid && !retrySplit.truncated) {
+          split = retrySplit;
+          break; // Success -- valid split recovered
+        }
+        if (retrySplit && retrySplit.truncated && retrySplit.candidates && retrySplit.candidates.length >= 1) {
+          split = retrySplit;
+          break; // Success -- recovered candidates
+        }
+        // Still truncated or invalid -- continue retrying
+      }
+    }
+    if (split && split.invalid) {
+      appendHistoryEvent(task, 'implement-retry', `split response truncated on all ${retryCount} retry attempt(s) -- no complete sub-candidates recoverable, giving up`);
+    } else if (split && (split.truncated || split.candidates)) {
+      appendHistoryEvent(task, 'implement-retry', `split response truncated but recovered ${split.candidates ? split.candidates.length : '?'} candidate(s) after ${retryCount} retry attempt(s)`);
+    }
   }
   if (split) {
     const pc = task.promptContext || {};
@@ -1602,6 +1769,26 @@ async function draftTask(task, deps = {}) {
     concludeDraft(task);
     return { succeeded: true, blocked: false, gateVerdict: 'false-positive', ruleId: gateHit.ruleId, reason: gateHit.reason };
   }
+  // Script-handled source (src/script-handler-registry.js): the work is a script, not a diff. Run it, record its result on the task and finish as
+  // 'recorded' (no model call, no draft attempt). A throw falls into the worker's normal draft-failure accounting.
+  const scriptHandler = getScriptHandler(resolveSourceName(task));
+  if (scriptHandler) {
+    try {
+      const res = (await scriptHandler(task, {})) || {};
+      const outcome = String(res.outcome || 'done');
+      const summary = String(res.summary || '');
+      task.scriptResult = { outcome, summary, detail: res.detail === undefined ? null : res.detail, at: new Date().toISOString() };
+      task.terminalDisposition = 'recorded';
+      task.status = 'recorded';
+      appendHistoryEvent(task, 'script-handler-done', `${outcome}: ${summary}`.slice(0, 200));
+      appendHistoryEvent(task, 'recorded', 'script handler finished; no review needed');
+      return { succeeded: true, recorded: true };
+    } catch (err) {
+      const message = err && err.message ? err.message : String(err);
+      appendHistoryEvent(task, 'script-handler-failed', message.slice(0, 200));
+      return { succeeded: false, reason: `script handler failed: ${message}` };
+    }
+  }
   // One append-only record per draftTask() run (draft-attempt-record.js). runDraftPasses
   // threads `attempt` through every pass and records into it as output is produced;
   // finalizeDraftAttempt stamps the terminal verdict, pushes it onto task.draftAttempts,
@@ -1972,6 +2159,63 @@ async function main() {
     return;
   }
 
+  // 2026-11-04, this task: pre-flight conflict check. Run BEFORE draftTask to catch file
+  // overlap with other open branches EARLY. If a conflict is detected, block the draft with a
+  // needs-human-decision verdict so a human can decide which branch to keep. This prevents the
+  // class of 13 branches that all failed with "it conflicts with # other open branch(#)" because
+  // the check ran after work was already done.
+  const pipelineDir = path.dirname(path.dirname(taskPath)); // taskPath is <pipelineDir>/queue/<state>/<id>.json
+  const repoRoot = path.dirname(pipelineDir);
+  try {
+    const proposedFiles = task.promptContext?.proposeFiles || task.promptContext?.files || [];
+    if (proposedFiles.length) {
+      const openBranches = [];
+      const pendingDir = path.join(pipelineDir, 'queue', 'pending');
+      if (fs.existsSync(pendingDir)) {
+        const files = fs.readdirSync(pendingDir).filter(f => f.endsWith('.json'));
+        for (const file of files) {
+          if (file === `${task.id}.json`) continue; // Skip self
+          try {
+            const otherTask = JSON.parse(fs.readFileSync(path.join(pendingDir, file), 'utf8'));
+            if (otherTask.id?.startsWith('adhoc/triage-queue')) continue;
+            const match = otherTask.id?.match(/^agent\/(.+)$/);
+            if (match) {
+              const branch = match[1];
+              const { execFileSync } = require('child_process');
+              try {
+                const out = execFileSync('git', ['diff', '--name-only', 'origin/main', `origin/${branch}`], { cwd: repoRoot, encoding: 'utf8', env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, timeout: 30_000 });
+                openBranches.push({ branch, files: out.split('\n').map(l => l.trim()).filter(Boolean) });
+              } catch (e) {
+                // Skip branches that can't be checked
+              }
+            }
+          } catch (e) {
+            // Skip unreadable
+          }
+        }
+      }
+      
+      const conflicts = [];
+      for (const open of openBranches) {
+        const overlap = proposedFiles.filter(pf => open.files.includes(pf));
+        if (overlap.length) {
+          conflicts.push({ branch: open.branch, files: overlap });
+        }
+      }
+      
+      if (conflicts.length) {
+        const reason = `it conflicts with ${conflicts.length} other open branch(es) that touch the same files (${conflicts.map(c => c.branch).join(', ')}); keep one`;
+        task.needsHumanDecision = { verdict: 'needs-human-decision', reason, conflicts };
+        task.status = 'needs-clarification';
+        process.stdout.write(JSON.stringify({ succeeded: true, blocked: true, blockedReason: reason, blockedStage: 'pre-implement' }));
+        return;
+      }
+    }
+  } catch (e) {
+    // Best-effort: a conflict check failure must never break the draft
+    console.error(`Conflict check failed: ${e.message}`);
+  }
+
   // Defense-in-depth (2026-09-07): scripts/local-worker.sh's own claim step already
   // deletes pinnedWorker the moment it `mv`s a task out of pending/ (a one-shot operator
   // assignment shouldn't keep re-attracting the same task to the same lane on some later
@@ -2138,7 +2382,7 @@ function tryGroundingRefreshFallback(task) {
   }
 }
 
-module.exports = { reusePriorPlanForContinuation, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
+module.exports = { reusePriorPlanForContinuation, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, SPLIT_TRUNCATION_MAX_RETRIES, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on

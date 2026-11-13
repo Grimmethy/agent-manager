@@ -12,7 +12,7 @@
 
 const fs = require('fs');
 const { sharedInstancesDir } = require('./instances-dir.js');
-const { generationThrottled, makeSourceThrottle, liveLaneCount } = require('./generation-throttle.js');
+const { generationThrottled, makeGenerationBlocker, liveLaneCount } = require('./generation-throttle.js');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFileSync } = require('child_process');
@@ -25,7 +25,7 @@ const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-d
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { writeJsonAtomicSync: writeBrainDumpAtomic } = require('./atomic-write.js');
 const { rotationDemoted } = require('./premium-rotation.js');
-const { listArchivedMonthDirs } = require('./done-archive.js');
+const { QUEUE_STATES, taskIdExistsInQueue, taskIdHeldOnlyByFinishedTask } = require('./queue-presence.js'); // the queue-presence cluster lives in its own leaf (roadmap P2); taskIdExistsInQueue is re-exported below
 const { nextCandidateFulfillmentTask, windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
 const { applyArchDiscoveryCandidates, applyForensicsReport, applyDebriefReport, applyCapabilityDebriefReport, applySecondBrainOpportunities } = require('./apply-group-a.js');
 const { applyProductSpecOutline, OUTLINE_DOC_TITLE } = require('./product-spec-assembly.js');
@@ -49,7 +49,7 @@ const { runPremiseCheckAsPostImplement } = require('./candidate-premise-check.js
 const { listHeldTasksFifo, deriveResolveIdentity, selfHealResolveDeadlock, buildResolveTask } = require('./lib/task-resolve.js');
 const { taskPriority } = require('./lib/task-priority.js');
 const { markPipelineHealthAuditChecked, markUiVisibilityAuditChecked, coverageEntryActiveLocal, markPipelineDebriefReported } = require('./lib/task-audit.js');
-const { nextProductSpecSectionTask, getNextTask } = require('./lib/task-selection.js');
+const { nextProductSpecSectionTask, getNextTask, setPreemptLoaders } = require('./lib/task-selection.js'); setPreemptLoaders({ nextAdhocTask, nextDerivedTask }); // registered here (hoisted declarations) so lib/task-selection.js need not require this file
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -62,23 +62,6 @@ function readIfExists(filePath) {
     return null;
   }
 }
-
-// BUG FIXED 2026-08-21 (Grimmethy, via the dashboard's Queue tab: found the SAME task id
-// sitting as two genuinely different files, one in done/ and one in
-// done/_archived_no_action/): this list used to omit 'needs-clarification',
-// 'awaiting-confirm', and the nested done/_archived_no_action/ pseudo-state entirely, so
-// taskIdExistsInQueue (below) was blind to a task that had reached any of those three
-// locations. For a source like observability_review that re-derives the SAME id from the
-// SAME (rule, file, line) on every worker tick as long as the underlying flag is still in
-// queue/observability-flags.json (findings are never pruned just for having already
-// produced a task -- see nextObservabilityReviewTask's own comment), this was not a rare
-// coincidence: the tick right after any of its tasks got archived would mint a brand-new
-// task under the identical id, guaranteed, every time. system-report.js already treats
-// done/_archived_no_action/ as its own 'archived' pseudo-state for exactly this reason
-// (scanning "what actually got done"); this brings the dedup check in line with that
-// instead of leaving it as the one place still blind to it.
-const QUEUE_STATES = ['pending', 'drafting', 'review', 'approved', 'blocked', 'done',
-  'needs-clarification', 'awaiting-confirm', 'coordinating'];
 
 // Dependency ordering for queue/adhoc/ (2026-08-22, Grimmethy: "We need some systematic
 // way to prioritize what order adhoc tasks get completed in. Those with dependencies on
@@ -140,7 +123,7 @@ function depWorkIsOnMainBranch(repoRoot, depId) {
 // tell "genuinely resolved" apart from "still blocked". Same reasoning hub-priority.js's
 // SIBLING_RESOLVED_STATUSES already applies to hub sibling sequencing, applied here to
 // the identical class of deadlock on a dependsOn edge instead.
-const NO_CODE_COMING_DISPOSITIONS = new Set(['noop', 'dismissed', 'filed', 'abandoned', 'superseded', 'aged-out']);
+const NO_CODE_COMING_DISPOSITIONS = new Set(['noop', 'dismissed', 'filed', 'abandoned', 'superseded', 'aged-out', 'recorded']);
 
 // Default dependency-release predicate (S1 of the hub-tasks extraction, 2026-09-23) -- the
 // exact checks this function inlined before the hook existed. Resolved through the
@@ -202,6 +185,21 @@ function isDependencySatisfied(pipelineDir, depId) {
     path.join(pipelineDir, 'queue', 'done', `${trimmed}.json`),
     path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${trimmed}.json`),
   ];
+  // Also look in queue/done/_archived/<YYYY-MM>/<depId>.json where the daily done-archive
+  // pass moves completed records. Without this the dependency gate never sees a predecessor
+  // that has been archived (2026-11-09: 12 adhoc tasks in queue/adhoc/ were stuck forever
+  // because their dependsOn predecessor had been moved into _archived/ by the daily pass).
+  // Newest month first so the most recent archive is tried before older ones.
+  const archivedDir = path.join(pipelineDir, 'queue', 'done', '_archived');
+  try {
+    const months = fs.readdirSync(archivedDir).filter((entry) => {
+      try { return fs.statSync(path.join(archivedDir, entry)).isDirectory(); } catch { return false; }
+    }).sort().reverse();
+    for (const month of months) {
+      const candidate = path.join(archivedDir, month, `${trimmed}.json`);
+      if (fs.existsSync(candidate)) candidates.push(candidate);
+    }
+  } catch { /* no _archived directory -- adds nothing, fail silently */ }
   for (const candidate of candidates) {
     try {
       const data = JSON.parse(fs.readFileSync(candidate, 'utf8'));
@@ -279,77 +277,6 @@ function isSoftDependencySatisfied(pipelineDir, depId) {
     }
   }
   return false;
-}
-
-// A claimed task lives at queue/drafting/<InstanceId>/<id>.json, not queue/drafting/<id>.json
-// directly (a per-instance claim subfolder) -- every task source shares this function, so a
-// task actively being drafted is correctly seen as already-queued, not regenerated.
-// A hub renamed to its HUB#### id (hub-rename.js) leaves the id of the task it was as `formerIds`. Without this the source that derived that task
-// (function_length_fix re-derives AC-2 every tick) sees no queued task under the old id and files a DUPLICATE -- seen live 2026-09-20, minutes after
-// the AC-2 hub was renamed. Memoised on the coordinating/ dir's mtime (a rename or a new hub changes it).
-const _formerHubIdsMemo = new Map(); // coordDir -> { mtimeMs, ids:Set }
-function formerHubIds(queueDir) {
-  const coordDir = path.join(queueDir, 'coordinating');
-  let mtimeMs;
-  try { mtimeMs = fs.statSync(coordDir).mtimeMs; } catch { return new Set(); }
-  const hit = _formerHubIdsMemo.get(coordDir);
-  if (hit && hit.mtimeMs === mtimeMs) return hit.ids;
-  const ids = new Set();
-  try {
-    for (const f of fs.readdirSync(coordDir)) {
-      if (!f.endsWith('.json')) continue;
-      try { const h = JSON.parse(fs.readFileSync(path.join(coordDir, f), 'utf8')); for (const x of (Array.isArray(h.formerIds) ? h.formerIds : [])) ids.add(x); } catch { /* malformed -- skip */ }
-    }
-  } catch { /* unreadable */ }
-  _formerHubIdsMemo.set(coordDir, { mtimeMs, ids });
-  return ids;
-}
-
-function taskIdExistsInQueue(id) {
-  const { pipelineDir } = getConfig();
-  const queueDir = path.join(pipelineDir, 'queue');
-  if (formerHubIds(queueDir).has(id)) return true;
-  if (fs.existsSync(path.join(queueDir, 'done', '_archived_no_action', `${id}.json`))) return true;
-  // done-archive.js's own dated month buckets (queue/done/_archived/<YYYY-MM>/, 2026-08-24)
-  // -- without this, a task's underlying item (a brain-dump entry, a deep_dive community,
-  // an arch_import itemId) would look "never queued" the moment its completed task aged
-  // past the retention window and got moved out of done/'s top level, and could be
-  // regenerated as a live duplicate -- the exact bug this function exists to prevent, same
-  // reasoning as the _archived_no_action check just above.
-  if (listArchivedMonthDirs(pipelineDir).some((dir) => fs.existsSync(path.join(dir, `${id}.json`)))) return true;
-  return idInQueueStates(queueDir, id, QUEUE_STATES);
-}
-
-// Does <id>.json sit in any of these queue/<state>/ dirs (drafting has per-worker subfolders)?
-function idInQueueStates(queueDir, id, states) {
-  return states.some((state) => {
-    if (state !== 'drafting') return fs.existsSync(path.join(queueDir, state, `${id}.json`));
-
-    const draftingDir = path.join(queueDir, 'drafting');
-    if (fs.existsSync(path.join(draftingDir, `${id}.json`))) return true; // legacy: no subfolder
-    let entries;
-    try {
-      entries = fs.readdirSync(draftingDir, { withFileTypes: true });
-    } catch {
-      return false;
-    }
-    return entries
-      .filter((e) => e.isDirectory())
-      .some((e) => fs.existsSync(path.join(draftingDir, e.name, `${id}.json`)));
-  });
-}
-
-// True when the ONLY thing holding this id is a FINISHED task (queue/done/, its dated archive buckets or _archived_no_action) -- nothing live,
-// blocked, held or coordinating carries it. A finished task is spent: it cannot be "already queued", so a caller that needs a fresh attempt may move
-// on to the next id. Anything not finished (pending, drafting, review, approved, blocked, needs-clarification, ... or a former hub id) still blocks.
-function taskIdHeldOnlyByFinishedTask(id) {
-  const { pipelineDir } = getConfig();
-  const queueDir = path.join(pipelineDir, 'queue');
-  if (formerHubIds(queueDir).has(id)) return false;
-  if (idInQueueStates(queueDir, id, QUEUE_STATES.filter((s) => s !== 'done'))) return false;
-  if (fs.existsSync(path.join(queueDir, 'done', `${id}.json`))) return true;
-  if (fs.existsSync(path.join(queueDir, 'done', '_archived_no_action', `${id}.json`))) return true;
-  return listArchivedMonthDirs(pipelineDir).some((dir) => fs.existsSync(path.join(dir, `${id}.json`)));
 }
 
 // Titles of every currently in-flight (not yet finished) task, shown to brain_dump_sort's
@@ -2578,7 +2505,11 @@ function nextSecondBrainOpportunitiesTask() {
 // contradicting the real community file content it was given. See
 // deep-dive-grounding-check.js's own header for the incident.
 registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true, skipImplementWhenNoRealFiles: true, reviewGuidance: DEEP_DIVE_REVIEW_GUIDANCE, reportClass: 'benefit', postImplementCheck: runDeepDiveGroundingCheck });
-registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true, preValidateCitedPaths: true, reviewGuidance: PROJECT_SEARCH_REVIEW_GUIDANCE, reportClass: 'benefit', harnessSearch: 'projectSearch' });
+registerTaskSource('project_search', {
+  priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true, preValidateCitedPaths: true, reviewGuidance: PROJECT_SEARCH_REVIEW_GUIDANCE, reportClass: 'benefit', harnessSearch: 'projectSearch',
+  // Interchangeable searches pile up if generation ever leaks (1,196 queued 2026-10-20 to 10-23): keep the newest per project, archive the rest (expiry-sweep.js).
+  expiry: { idPrefixes: ['project-search-'], findExpired: (args) => require('./project-search-duplicates.js').findDuplicateProjectSearch(args) },
+});
 // No `apply` key -- domain:defaultDomain (see buildAuditTask, moved off domain:'adhoc'
 // 2026-08-20 to run on the local model instead of requiring Claude) means this
 // falls through to the generic Group-B git-branch-diff apply path, same as arch_import
@@ -3352,21 +3283,25 @@ if (require.main === module) {
   })();
 
   {
+    // An exemption lets through ONLY its own source (makeGenerationBlocker, generation-throttle.js); every other source stays under the
+    // priority-aware veto while a backlog exists. Before 2026-10-31 any exemption left `blocked` undefined, which opened the whole ladder and let
+    // project_search / deep_dive generate on every tick (1,196 identical project_search tasks piled up).
     const throttled = alreadyPending && !hasAdhocWaiting && !hasResearchWaiting && !hasBrainDumpWaiting && !hasHeldClarificationWaiting;
-    // Throttled no longer means "ask nobody": a source is vetoed only by in-flight work at least as important as
-    // itself (generation-throttle.js makeSourceThrottle), so a higher-priority source (arch_discovery 30) can still
-    // generate while lower-priority tasks (derived_task 41) already fill the slots.
     let blocked;
-    if (throttled) {
-      const { rankPriorityOfTask } = require('./next-claimable-task.js');
+    if (alreadyPending) {
+      const { rankPriorityResolved: rankPriorityOfTask } = require('./rank-priority.js'); // the CLI block above has already run ensureRegistered(), so the leaf (no registry load) is enough
       const inFlightPriorities = inFlightFiles.map((f) => {
         try { return rankPriorityOfTask(JSON.parse(fs.readFileSync(f, 'utf8'))); } catch { return Infinity; }
       });
-      const veto = makeSourceThrottle({ inFlightPriorities, laneCount: liveLaneCount(instancesDir) });
-      blocked = (source) => veto(source.priority);
+      const exemptSourceNames = [];
+      if (hasAdhocWaiting) exemptSourceNames.push('adhoc');
+      if (hasResearchWaiting) exemptSourceNames.push('research_task');
+      if (hasBrainDumpWaiting) exemptSourceNames.push('brain_dump_sort');
+      if (hasHeldClarificationWaiting) exemptSourceNames.push('path_prefetch_resolve');
+      blocked = makeGenerationBlocker({ alreadyPending, exemptSourceNames, inFlightPriorities, laneCount: liveLaneCount(instancesDir) });
     }
     const task = getNextTask({ blocked });
-    if (!task && throttled) {
+    if (!task && alreadyPending) {
       console.log('pending/ already has work queued, not adding another task');
     } else if (!task) {
       console.log('no eligible task found (all registered sources exhausted or malformed)');

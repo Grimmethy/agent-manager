@@ -14,7 +14,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const {
-  findAffectedTestFiles, runScopedTests, parseNodeTestFailures, parsePyTestFailures,
+  findAffectedTestFiles, reverseDependentsPy, runScopedTests, parseNodeTestFailures, parsePyTestFailures,
   MAX_REVERSE_DEP_FILES, MAX_TEST_FILES, RUN_TIMEOUT_MS,
 } = require('./scoped-test-runner.js');
 
@@ -360,3 +360,54 @@ test('runScopedTests: a real covering test run under a live-looking env sees a t
     assert2.deepEqual(both.failures, ['src/A.test.tsx > A > breaks']);
   });
 }
+
+// --- reverse dependents reach through sub-directories, and Python gets them too (2026-11-01) ---------------------------
+
+test('findAffectedTestFiles: a test one directory up that requires the module through a sub-directory path is found (context-trim-sweep.test.js vs src/sdk/candidate-fulfillment.js)', () => {
+  const repo = tmpRepo();
+  write(repo, 'src/sdk/thing.js', 'module.exports = {};\n');
+  write(repo, 'src/sdk/thing.test.js', '');
+  write(repo, 'src/other.test.js', "const t = require('./sdk/thing.js');\n");
+  write(repo, 'src/bare.test.js', "const t = require('./sdk/thing');\n");
+  write(repo, 'src/esm.test.js', "import { x } from '../src/sdk/thing.js';\n");
+  write(repo, 'src/longer.test.js', "const t = require('./sdk/thingy.js');\n");     // a longer name that merely starts with the base must not match
+  write(repo, 'src/unrelated.test.js', "const t = require('./sdk/other.js');\n");
+  const affected = findAffectedTestFiles(repo, ['src/sdk/thing.js']);
+  assert.deepEqual(affected.js.sort(), ['src/bare.test.js', 'src/esm.test.js', 'src/other.test.js', 'src/sdk/thing.test.js']);
+});
+
+test('findAffectedTestFiles: a plain ./base require is still found and a base in another directory is still not (bounded to the dir and its parent)', () => {
+  const repo = tmpRepo();
+  write(repo, 'src/sdk/thing.js', '');
+  write(repo, 'src/sdk/uses.test.js', "require('./thing');\n");
+  write(repo, 'elsewhere/far.test.js', "require('../src/sdk/thing.js');\n");
+  assert.deepEqual(findAffectedTestFiles(repo, ['src/sdk/thing.js']).js, ['src/sdk/uses.test.js']);
+});
+
+test('findAffectedTestFiles: Python tests that import the changed module are found (test_chat_turn_timings.py vs chat_sessions.py)', () => {
+  const repo = tmpRepo();
+  write(repo, 'chat_sessions.py', 'def f():\n    pass\n');
+  write(repo, 'test_chat_sessions.py', '');
+  write(repo, 'test_chat_turn_timings.py', 'import chat_sessions\n');
+  write(repo, 'test_from_form.py', 'from chat_sessions import f\n');
+  write(repo, 'test_dotted.py', 'from plugin.chat_sessions import f\n');
+  write(repo, 'test_longer.py', 'import chat_sessions_extra\n');          // a longer module name must not match
+  write(repo, 'test_comment.py', '# import chat_sessions\nx = 1\n');       // not at the start of a statement
+  write(repo, 'test_unrelated.py', 'import os\n');
+  const affected = findAffectedTestFiles(repo, ['chat_sessions.py']);
+  assert.deepEqual(affected.py.sort(), ['test_chat_sessions.py', 'test_chat_turn_timings.py', 'test_dotted.py', 'test_from_form.py']);
+  assert.deepEqual(affected.js, []);
+});
+
+test('reverseDependentsPy: only for a non-test .py file, bounded to its directory and parent, capped, never repeats an included file', () => {
+  const repo = tmpRepo();
+  write(repo, 'pkg/sub/mod.py', '');
+  write(repo, 'pkg/test_up.py', 'import mod\n');
+  write(repo, 'far/test_far.py', 'import mod\n');
+  assert.deepEqual(reverseDependentsPy(repo, 'pkg/sub/mod.py', new Set()), ['pkg/test_up.py']);
+  assert.deepEqual(reverseDependentsPy(repo, 'pkg/sub/mod.py', new Set(['pkg/test_up.py'])), []);
+  assert.deepEqual(reverseDependentsPy(repo, 'pkg/test_up.py', new Set()), [], 'a test file has no dependents');
+  assert.deepEqual(reverseDependentsPy(repo, 'pkg/sub/mod.js', new Set()), []);
+  for (let i = 0; i < MAX_REVERSE_DEP_FILES + 4; i++) write(repo, `pkg/sub/test_many_${i}.py`, 'import mod\n');
+  assert.equal(reverseDependentsPy(repo, 'pkg/sub/mod.py', new Set()).length, MAX_REVERSE_DEP_FILES);
+});

@@ -174,7 +174,25 @@ const MODEL = process.env.LOCAL_MODEL;
 // path sent none at all and inherited Ollama's 5-minute default, so a single agentic turn
 // that outran 5 min (model reasoning + a 240s run_bash + the GPU lock held elsewhere in
 // between) paid a full cold reload (~114s observed) on the next turn.
-const KEEP_ALIVE = process.env.LOCAL_KEEP_ALIVE || process.env.ORNITH_KEEP_ALIVE || '30m';
+// 2026-11-06 (owner: never unload, never swap): the default is no longer '30m' and a shorter override is ignored; see src/keep-alive.js.
+const { resolveKeepAlive, NEVER_EXPIRE } = require('./keep-alive.js');
+const { ensureResident } = require('./model-resident.js');
+const KEEP_ALIVE = resolveKeepAlive(process.env.LOCAL_KEEP_ALIVE, process.env.ORNITH_KEEP_ALIVE);
+
+// 2026-11-07 (owner: never unload, never swap a model). Ollama restarts its runner -- a full reload of the 21 GB model -- whenever a request's num_ctx
+// differs from the loaded one. Three checks sent a small hardcoded 8192 (candidate-premise-check, deep-dive-grounding-check, plan-critique) and
+// each use cost two reloads. A caller-supplied numCtx that is not the pipeline's pinned value is therefore ignored here, once-per-(source, value)
+// warning; AGENT_MANAGER_ALLOW_CALLER_NUM_CTX=1 restores caller control (A/B eval work that really wants another context).
+const warnedNumCtx = new Set();
+function pinNumCtx(callerNumCtx, pinned, source) {
+  if (!callerNumCtx || callerNumCtx === pinned || process.env.AGENT_MANAGER_ALLOW_CALLER_NUM_CTX === '1') return callerNumCtx || pinned;
+  const key = `${source || 'none'}|${callerNumCtx}`;
+  if (!warnedNumCtx.has(key)) {
+    warnedNumCtx.add(key);
+    console.warn(`[local-client] ignoring numCtx=${callerNumCtx} from source=${source || 'none'}: a different context restarts the model runner; using ${pinned}`);
+  }
+  return pinned;
+}
 
 function detectDegenerate(text, { allowEmpty = false, doneReason, isDraft = false } = {}) {
   // 2026-09-05, Grimmethy: root-caused a whole cluster of blocked pipeline_forensics_fix
@@ -336,7 +354,7 @@ async function callOnce({ prompt, images, think = true, temperature = 0.4, numCt
     }
   }
 
-  const resolvedNumCtx = numCtx || gpuCapacity.resolveNumCtx({ estimatedTokens: promptTokens, numPredict });
+  const resolvedNumCtx = pinNumCtx(numCtx, gpuCapacity.resolveNumCtx({ estimatedTokens: promptTokens, numPredict }), source);
 
   const options = { num_ctx: resolvedNumCtx, num_predict: numPredict, temperature };
   if (repeatPenalty) options.repeat_penalty = repeatPenalty;
@@ -365,6 +383,9 @@ async function callOnce({ prompt, images, think = true, temperature = 0.4, numCt
   // here.
   const instancesDir = resolveInstancesDir();
   const lockModel = model || MODEL;
+  // Residency gate (2026-11-06, owner: never time out a model load, never swap): make sure the model is resident at this call's num_ctx BEFORE the
+  // request clock starts; see src/model-resident.js. Skipped with no pipeline env (bare test requires), never throws.
+  await ensureResident({ url: OLLAMA_URL, model: lockModel, numCtx: resolvedNumCtx, instancesDir });
   const lockPath = instancesDir ? inflightLock.acquire(instancesDir, lockModel, process.env.AGENT_MANAGER_INSTANCE_ID) : null;
   const resolvedTimeoutMs = timeoutMs || resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model: lockModel });
   // Stable per-worker-lane session id (not per-call) so TokenFold sees these as a
@@ -547,7 +568,35 @@ function capNumPredictToFit({ numPredict, promptTokens = 0, tokensPerSecond, cei
   return fit;
 }
 
+// HUB0280-02: stages whose callers already write their own model_calls row (src/local-draft.js, src/lib/implement-critique.js,
+// src/local-agentic-write-draft.js, src/research-agentic-draft.js); call() skips these so a model call is recorded exactly once.
+const CALLER_RECORDED_STAGES = ['plan', 'implement', 'implement-retry', 'critique', 'revise', 'agentic-write'];
+
+// Best-effort row in model_calls for a call whose caller does not record it (reviewer votes, needs-clarification triage votes). The model
+// label is the call's model or this module's default; latency covers the whole call including retries while the token counts are the final
+// attempt's, as on the plan/implement rows. Never throws.
+function recordUnrecordedCall(opts, startedAt, latencyMs, result) {
+  try {
+    if (!opts || typeof opts.taskId !== 'string' || !opts.taskId) return;
+    if (typeof opts.stage !== 'string' || !opts.stage || CALLER_RECORDED_STAGES.includes(opts.stage)) return;
+    if (!result || result.degenerate) return;
+    require('./model-stats-client.js').recordCall({
+      taskId: opts.taskId, stage: opts.stage, model: opts.model || MODEL, startedAt, latencyMs, result, source: opts.source || null,
+    });
+  } catch (e) {
+    console.warn(`[local-client] model_calls record failed for ${opts && opts.taskId} (non-fatal): ${e && e.message}`);
+  }
+}
+
 async function call(opts, maxRetries = 2) {
+  const startedAt = new Date().toISOString();
+  const startMs = Date.now();
+  const result = await callUnrecorded(opts, maxRetries);
+  recordUnrecordedCall(opts, startedAt, Date.now() - startMs, result);
+  return result;
+}
+
+async function callUnrecorded(opts, maxRetries = 2) {
   let lastDegenerate = null;
   let lastError = null;
   let gotAnyResponse = false;
@@ -760,7 +809,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, maxNumPredictThatFits, capNumPredictToFit, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
+module.exports = { call, callOnce, CALLER_RECORDED_STAGES, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, NEVER_EXPIRE, maxNumPredictThatFits, capNumPredictToFit, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,

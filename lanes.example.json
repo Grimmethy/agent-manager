@@ -17,5 +17,13 @@
     "taskClasses": ["adhoc"],
     "preempt": "never",
     "enabled": false
+  },
+  {
+    "gpu": "tuner",
+    "provider": "script",
+    "ollamaUrl": "http://127.0.0.1:7449",
+    "taskClasses": ["tuning_experiment"],
+    "preempt": "never",
+    "enabled": false
   }
 ]

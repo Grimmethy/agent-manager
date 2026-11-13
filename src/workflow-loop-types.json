@@ -1,0 +1,642 @@
+{
+  "schemaVersion": 1,
+  "loops": [
+    {
+      "id": "loop:stalled",
+      "name": "Stalled-task worker",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:agent-manager-pipeline-ops:stalled-trigger",
+      "gate": "STALLED_WORKER_MODE in ~/.config/pipeline-ops/stalled.env",
+      "steps": [
+        {
+          "id": "snapshot",
+          "label": "Snapshot",
+          "does": "Lists the tasks parked in needs-clarification or blocked across the pipelines and groups them by normalised failure signature.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "evidence",
+          "label": "Evidence pack",
+          "does": "Runs the fixed checks on the chosen task (original exists, cited paths, known fix applies, replay, sibling count) and writes facts only.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "classify",
+          "label": "Classify",
+          "does": "The one judgement: picks one of five outcomes from the evidence pack; a validator rejects anything outside the list.",
+          "model": {
+            "provider": "cloud",
+            "name": "claude-sonnet-5-5",
+            "fromLane": null
+          }
+        },
+        {
+          "id": "act",
+          "label": "Act",
+          "does": "Archives, requeues or files the mechanism task and appends the ledger line.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "draft",
+          "label": "Draft mechanism task",
+          "does": "Only for ESCALATE-MECHANISM: writes the task text of the filing from the bucket evidence.",
+          "model": {
+            "provider": "cloud",
+            "name": "claude-sonnet-5-5",
+            "fromLane": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "loop:verifier",
+      "name": "Branch verifier",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:agent-manager-pipeline-ops:verify-trigger",
+      "gate": "VERIFIER_MODE in ~/.config/pipeline-ops/verifier.env",
+      "steps": [
+        {
+          "id": "index",
+          "label": "Index",
+          "does": "Lists the unverified agent branches across the pooled projects.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "evidence",
+          "label": "Evidence pack",
+          "does": "Scratch worktree, changed files, conflict check, suite on the branch against a clean base, hub context, redundancy.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "decide",
+          "label": "Decide",
+          "does": "Picks merge, needs-work, hold or discard from named facts in a fixed order. No model call (the planned model step is not built).",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "act",
+          "label": "Record",
+          "does": "Writes the verdict through the dashboard verdict route (dry-run by default) after a write-ahead ledger line.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "loop:needs-work",
+      "name": "Needs-Work worker",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:agent-manager-pipeline-ops:nw-trigger",
+      "gate": "NEEDSWORK_MODE in ~/.config/pipeline-ops/needswork.env",
+      "steps": [
+        {
+          "id": "index",
+          "label": "Index",
+          "does": "Lists the Needs-Work branches across pooled projects with reason, verdict source and age.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "evidence",
+          "label": "Evidence pack",
+          "does": "Task lookup, rivals, candidate check result and the reason signature count.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "decide",
+          "label": "Decide",
+          "does": "Picks one of six outcomes by named facts in a fixed precedence. No model call.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "act",
+          "label": "Act",
+          "does": "Records a verdict, requeues or files through the existing dashboard routes (dry-run by default).",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "loop:hub",
+      "name": "Hub worker",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:agent-manager-pipeline-ops:hub-trigger",
+      "gate": "HUB_MODE in ~/.config/pipeline-ops/hub.env",
+      "steps": [
+        {
+          "id": "index",
+          "label": "Index",
+          "does": "Lists held hubs joined to their records and the first unbuilt piece.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "evidence",
+          "label": "Evidence pack",
+          "does": "State and age of the first open piece, the hub branch judgement, abandoned pieces.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "decide",
+          "label": "Decide",
+          "does": "Picks in flight, superseded, abandoned-only or hold by a fixed precedence. No model call.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "act",
+          "label": "Act",
+          "does": "Retires the hub or adds a piece through the hub routes (dry-run by default).",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "loop:scout",
+      "name": "Poll scout",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:agent-manager-pipeline-ops:scout-trigger",
+      "gate": "SCOUT_MODE in ~/.config/pipeline-ops/scout.env",
+      "steps": [
+        {
+          "id": "index",
+          "label": "Index",
+          "does": "Lists the pooled projects with their checkout, branch and origin sha.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "evidence",
+          "label": "Evidence pack",
+          "does": "Checkout state, baseline, cached poll-detector scan and open filings.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "decide",
+          "label": "Decide",
+          "does": "Picks one of six outcomes (not on main, scan failed, no baseline, nothing new, too many, file). No model call.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "act",
+          "label": "Act",
+          "does": "Files one task through queueAdhocTask or runs the detector baseline (dry-run by default).",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "loop:checker",
+      "name": "Merge-ready checker",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:agent-manager-pipeline-ops:checker-trigger",
+      "gate": "CHECKER_MODE in ~/.config/pipeline-ops/checker.env",
+      "steps": [
+        {
+          "id": "index",
+          "label": "Index",
+          "does": "Lists candidate branches with their judged head sha.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "evidence",
+          "label": "Evidence pack",
+          "does": "Git facts from origin objects, the verdict, whether the branch equals the reviewed diff.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "decide",
+          "label": "Decide",
+          "does": "Picks one of five outcomes by named facts. No model call.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "act",
+          "label": "Act",
+          "does": "Posts one verdict request to the dashboard (dry-run by default).",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "loop:merger",
+      "name": "Merger",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:agent-manager-pipeline-ops:merger-trigger",
+      "gate": "MERGER_MODE in ~/.config/pipeline-ops/merger.env",
+      "steps": [
+        {
+          "id": "index",
+          "label": "Candidates",
+          "does": "Reads the candidates from the checker ledger.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "evidence",
+          "label": "Evidence pack",
+          "does": "Checker row, listing row, remote proof, running merges and the worker own recent merges.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "decide",
+          "label": "Decide",
+          "does": "Picks merge, wait, drop or already merged by a fixed precedence. No model call.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "act",
+          "label": "Merge",
+          "does": "Sends one request to the dashboard merge route and proves the result on the remote.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "loop:steward",
+      "name": "Idle-cost steward",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:agent-manager-pipeline-ops:steward-trigger",
+      "gate": "STEWARD_MODE in ~/.config/pipeline-ops/steward.env",
+      "steps": [
+        {
+          "id": "index",
+          "label": "Slot",
+          "does": "Reads the current idle-cost audit slot.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "evidence",
+          "label": "Evidence pack",
+          "does": "The audit of the slot, the earlier audit, the rises per originator and whether the worst was filed.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "decide",
+          "label": "Decide",
+          "does": "Picks one of five outcomes by named facts. No model call.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "act",
+          "label": "Act",
+          "does": "Files one task through queueAdhocTask and writes the registry (dry-run by default).",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "loop:context-map",
+      "name": "Codebase-map worker",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:agent-manager-context-ops:map-trigger",
+      "gate": "CONTEXT_MAP_MODE in ~/.config/pipeline-ops/context-map.env",
+      "steps": [
+        {
+          "id": "watch",
+          "label": "Watch",
+          "does": "Wakes when the core checkout HEAD changes.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "scan",
+          "label": "Citation scan",
+          "does": "Compares every map citation with the files and symbols at HEAD.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "decide",
+          "label": "Decide",
+          "does": "Picks FRESH, FIX-RANGES, REWRITE-ROW, SUGGEST-ANCHORS, SUGGEST-ROWS or HOLD-FOR-OWNER. No model call.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "act",
+          "label": "Act",
+          "does": "Files one batched task when there are findings and none is open (dry-run by default).",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "loop:context-memory",
+      "name": "Memory-index worker",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:agent-manager-context-ops:memory-trigger",
+      "gate": "CONTEXT_MEMORY_MODE in ~/.config/pipeline-ops/context-memory.env",
+      "steps": [
+        {
+          "id": "watch",
+          "label": "Watch",
+          "does": "Wakes when MEMORY.md or the memory directory changes.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "lint",
+          "label": "Lint",
+          "does": "Checks size, long entries, dangling links, orphans and duplicates.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "decide",
+          "label": "Decide",
+          "does": "Picks OK, OVER-BUDGET, LONG-ENTRIES, DANGLING, ORPHAN, DUPLICATE, ARCHIVE-CANDIDATES or HOLD-FOR-OWNER. No model call.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "act",
+          "label": "Report",
+          "does": "Writes the ledger decision and a compaction proposal for a person to apply; edits no memory file.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "loop:context-impact",
+      "name": "Context-impact worker",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:agent-manager-context-ops:impact-trigger",
+      "gate": "CONTEXT_IMPACT_MODE in ~/.config/pipeline-ops/context-impact.env",
+      "steps": [
+        {
+          "id": "watch",
+          "label": "Watch",
+          "does": "Wakes when a measured channel changes.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "measure",
+          "label": "Measure",
+          "does": "Recomputes the gauge snapshot from the transcript and pipeline channels.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "decide",
+          "label": "Decide",
+          "does": "Applies the thresholds and the cooldowns to the gauges. No model call.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "act",
+          "label": "Act",
+          "does": "Appends the snapshot and, in on mode, files a task for a breached gauge (dry-run now).",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "loop:uiconf",
+      "name": "UI conformance loop",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:uiforge:watchdog-trigger",
+      "gate": "UI_CONFORMANCE_MODE (off, dry-run or on) for the uiforge watchdog trigger",
+      "steps": [
+        {
+          "id": "trigger",
+          "label": "Trigger",
+          "does": "Runs once per watchdog tick: a git rev-parse when nothing changed.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "sweep",
+          "label": "Sweep",
+          "does": "Starts the detached UI conformance sweep over the configured pages.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "apply",
+          "label": "Apply handler",
+          "does": "The script lane worker-uiconf turns sweep findings into tasks.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": "worker-uiconf"
+          }
+        }
+      ]
+    },
+    {
+      "id": "loop:pfscraper",
+      "name": "PF scraper builder",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:pf-loops:pfscraper-trigger",
+      "gate": "PFSCRAPER_MODE in ~/.config/pipeline-ops/pfscraper.env",
+      "steps": [
+        {
+          "id": "index",
+          "label": "Index",
+          "does": "Maps ZIP to county to config folder and registry row.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "evidence",
+          "label": "Evidence pack",
+          "does": "Registry row, validator result and, when a build is possible, a capped source probe.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "decide",
+          "label": "Decide",
+          "does": "Fixed facts first; then one judgement between NEW-CONFIG and BESPOKE-NEEDED.",
+          "model": {
+            "provider": "cloud",
+            "name": "claude-sonnet-5-5",
+            "fromLane": null
+          }
+        },
+        {
+          "id": "act",
+          "label": "Act",
+          "does": "Files one premium task into the taxharvest-scrapers pipeline (dry-run by default).",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -210,8 +210,7 @@ const LOW_CONFIDENCE_GROUNDING_NOTE = '[LOW-CONFIDENCE GROUNDING: no reliable an
 //   REJECTED   -> { archiveReason }                      (snippet nowhere; the lifecycle
 //                files the candidate straight to done/_archived_no_action/ and moves on)
 function validateCitationBeforeFiling(ctx) {
-  const sourceName = ctx && ctx.sourceName;
-  if (sourceName !== 'observability_fix' && sourceName !== 'performance_fix') return null; // gates ONLY these two sources
+  // Gate is safe for all sources via early returns; source-name check removed per ADR-0022.
   const section = ctx && ctx.section;
   const listed = ((ctx && ctx.files) || []).filter((p) => typeof p === 'string' && p.length);
   if (!listed.length) return null; // no cited path to validate against

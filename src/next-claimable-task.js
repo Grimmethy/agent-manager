@@ -6,6 +6,9 @@ const path = require('path');
 const { HUB_TIER_PRIORITY, isHubTierTask, hubIdForTask } = require('./hub-priority.js');
 const { ROTATION_DEMOTED_PRIORITY, rotationDemoted, laneAvoided } = require('./premium-rotation.js');
 const { openQueueCache, readTaskCached } = require('./queue-cache.js');
+const { bandedPriority, readClaimBands } = require('./workflow-claim-order.js'); // AGENT_MANAGER_PRIORITY_MODE=group ranks by the authored group order; absent = the registered priority
+const { effectivePriority, rankPriorityOfTask, loadSourceRegistry, readTaskSafe, BOT_ADHOC_PRIORITY_PENALTY } = require('./workflow-priority.js');
+const { claimableOnNode } = require('./node-affinity.js'); // multi-node: a task lent to another node (leasedTo) is never claimed here
 
 // Extracted from scripts/local-worker.sh's inline claim-ranking script (the 2026-08-22
 // priority+mtime fix) -- now one tested module instead of an untested `node -e` block in the
@@ -70,83 +73,6 @@ const { openQueueCache, readTaskCached } = require('./queue-cache.js');
 // on THAT specific lane right now"; premiumPriority is for "keep this at the front of
 // the queue no matter which lane gets to it next, for as long as it takes."
 //
-// Shared by pickClaimableTasks and listAssignableTasks so the two can never disagree --
-// same discipline as the rest of this file, and the exact class of bug the "ghost in the machine" concept's own
-// standing-mechanism-vs-one-time-check lesson (AGENTS.md) warns to watch for: a rule that
-// only ever gets applied in ONE of two places that are supposed to agree.
-//
-// Hub-work tier (2026-09-30, Grimmethy: hub sub-tasks handled ahead of ordinary work but below a human-pinned premium task):
-// `hubTier` is true for an `atomic` decompose child or a child of a LIVE coordinating hub (hub-priority.js isHubTierTask, resolved
-// through the source's hubOrder hook so an override is honored). Ranks HUB_TIER_PRIORITY (-1000): after premiumPriority
-// (-Infinity), before every registered source priority. Derived from live hub membership at rank time -- never stamped on the task
-// -- so it cannot drift. Within the tier the existing hub key (hubPriority, hub createdAt) and mtime decide.
-const BOT_ADHOC_PRIORITY_PENALTY = 30; // 10 -> 40, landing alongside brain_dump_sort (42) / secondbrain (40) -- thematically apt, since most bot-adhoc IS brain_dump_sort's own continued output
-function effectivePriority(task, basePriority, resolveSourceNameFn, hubTier = false) {
-  if (task && task.premiumPriority) return -Infinity;
-  if (hubTier) return HUB_TIER_PRIORITY;
-  if (task && resolveSourceNameFn(task) === 'adhoc' && !task.humanQueued) return basePriority + BOT_ADHOC_PRIORITY_PENALTY;
-  return basePriority;
-}
-
-// Loads the FULL source registry: core sources (task-sources.js's load-time
-// registerTaskSource calls) AND out-of-tree plugin sources (config.js's ensureRegistered(),
-// which requires each enabled plugin's register.js). This module used to require only
-// task-sources.js, so in the real claim path (local-worker.sh runs this file as a CLI) every
-// plugin-registered source -- the whole hygiene family: change_review, observability_*,
-// function_length_*, performance_*, arch_* -- resolved to NO registry entry: priority
-// Infinity (sorted after everything, including brain_dump_sort at 70) and tier defaulting to
-// 'low'. The pipeline sorted brain dumps while hygiene tasks sat in pending (2026-09-19,
-// PF-Client-Portal). Best-effort: a config problem here must degrade to the old behavior,
-// never stop claiming.
-function loadSourceRegistry() {
-  require('./task-sources.js');
-  try { require('./config.js').ensureRegistered(); } catch (_) { /* best-effort */ }
-}
-
-function readTaskSafe(fullPath) {
-  let mtimeMs = 0;
-  try { mtimeMs = fs.statSync(fullPath).mtimeMs; } catch (_) { /* file vanished mid-scan */ }
-  let task = null;
-  try { task = JSON.parse(fs.readFileSync(fullPath, 'utf8')); } catch (_) { /* corrupt/partial write -- still listed, worst priority, matching prior behavior */ }
-  return { task, mtimeMs };
-}
-
-// The rank priority of one task (lower number = claimed sooner): its source's registered priority with the
-// bot-adhoc penalty / premium override applied. Infinity when unresolvable (sorts last, still listed). Shared by
-// pickClaimableTasks (claim ranking) and task-sources.js's generation throttle, so "how important is this
-// in-flight task" can never disagree between the two.
-//
-// `opts.hubTier` (boolean) is supplied by pickClaimableTasks, which already resolved it through the task's source hubOrder hook;
-// when absent (the generation throttle) it is derived from the live coordinating/ records under `opts.pipelineDir` (default: the
-// configured pipeline dir). The hub tier is applied BEFORE the derived_task early return below so a derived hub child gets it too;
-// a premiumPriority task still ranks -Infinity.
-function rankPriorityOfTask(task, opts = {}) {
-  if (!task) return Infinity;
-  loadSourceRegistry();
-  let hubTier = opts.hubTier;
-  if (hubTier === undefined) {
-    try {
-      const pipelineDir = opts.pipelineDir || require('./config.js').getConfig().pipelineDir;
-      hubTier = isHubTierTask(pipelineDir, task, opts.hubKeyCache);
-    } catch (_) { hubTier = false; /* no config / unreadable hub records -- ordinary ranking */ }
-  }
-  if (hubTier) return task.premiumPriority ? -Infinity : HUB_TIER_PRIORITY;
-  const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-  try {
-    // A derived_task carries domain:'adhoc' (so every draft/apply path treats it exactly like adhoc --
-    // resolveSourceName() sends it there), but it must RANK at its own registered priority (48,
-    // self-maintenance band), never adhoc's base 10 + BOT_ADHOC_PRIORITY_PENALTY. Look it up by its
-    // literal source name.
-    if (task.source === 'derived_task') {
-      const dt = getRegisteredSource('derived_task');
-      return (dt && typeof dt.priority === 'number') ? dt.priority : Infinity;
-    }
-    const source = getRegisteredSource(resolveSourceName(task));
-    if (source && typeof source.priority === 'number') return effectivePriority(task, source.priority, resolveSourceName);
-  } catch (_) { /* unresolvable -- Infinity */ }
-  return Infinity;
-}
-
 // Lane preference (2026-09-20, Grimmethy: "I'd like the system to default to using the 3090 over the p40 in the
 // event that there is only one task"). Every lane claims any pending task, so which lane got a lone task was
 // whichever worker happened to tick first -- often the P40 (slower), while the 3090 sat idle. The FIRST lane in
@@ -258,6 +184,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     const premium = !!(task && task.premiumPriority === true); // same test the shell side used to re-read every file for
     const pinnedWorker = task && task.pinnedWorker;
     if (pinnedWorker && pinnedWorker !== instanceId) continue; // pinned to another instance -- not a candidate for this one
+    if (!claimableOnNode(task, process.env.AGENT_MANAGER_NODE_ID)) continue; // leased to another node, or unleased and this worker is not on the ledger owner
     if (pinnedWorker === instanceId) {
       pinned.push({ name, mtimeMs, premium });
       continue;
@@ -350,7 +277,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     const hubOrder = (registered && registered.hubOrder) || DEFAULT_HUB_ORDER;
     const oc = task ? hubOrder.orderCandidate(pipelineDir, task, hubKeyCache) : null;
     const hk = oc ? oc.hubKey : { isHubChild: false };
-    const hubKey = hk.isHubChild ? { rank: hk.rank, createdAt: hk.createdAt } : noHubKey;
+    const hubKey = hk.isHubChild ? { rank: hk.rank, createdAt: hk.createdAt, remaining: hk.remaining } : noHubKey;
     const hubTier = !!(oc && oc.isHubWork);
     const rankedPriority = rankPriorityOfTask(task, { hubTier });
     // A premium task that keeps getting blocked rotates behind fresh premium work, but still ahead of the hub tier and everything else.
