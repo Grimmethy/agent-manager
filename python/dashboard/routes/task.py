@@ -22,19 +22,20 @@ def _qdir_for_request(body=None, queue_only=False):
     """(queue dir, scope) for the project a request names (2026-10-30). `?project=<repoRoot>` (or "project" in a JSON body) selects another registered
     project's queue exactly like the branch and premium routes do (branch_projects.resolve_scope); absent or equal to the active project = the active
     project's queue as before, scope None. An unregistered project is a 404 and never falls back to the active one. `queue_only=True` (the archive route) also accepts a registered project that is not its own git repo, via
-    branch_projects.resolve_queue_dir; every other caller keeps the git-repo requirement."""
+    queue_projects.resolve_queue_dir; every other caller keeps the git-repo requirement."""
     from app import get_active_repo_root, queue_dir
     project = request.args.get("project") or (body.get("project") if isinstance(body, dict) else None)
     if not project:
         return queue_dir(), None
     import branch_projects
+    import queue_projects
     try:
         scope = branch_projects.resolve_scope(project, get_active_repo_root())
     except LookupError as e:
         if not queue_only:
             abort(404, description=str(e))
         try:
-            qdir = branch_projects.resolve_queue_dir(project, get_active_repo_root())
+            qdir = queue_projects.resolve_queue_dir(project, get_active_repo_root())
         except LookupError as e2:
             abort(404, description=str(e2))
         return (qdir, None) if qdir else (queue_dir(), None)

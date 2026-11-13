@@ -18,6 +18,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 import app  # noqa: E402
+import branch_projects  # noqa: E402
+import queue_projects  # noqa: E402
 
 
 class TestArchiveQueueOnlyProject(unittest.TestCase):
@@ -90,6 +92,12 @@ class TestArchiveQueueOnlyProject(unittest.TestCase):
         r = self.client.post("/api/task/pending/t6/archive", query_string={"project": str(self.active_repo)})
         self.assertEqual(r.status_code, 200)
         self.assertTrue((self.active_q / "done" / "_archived_no_action" / "t6.json").is_file())
+
+    def test_the_lookup_lives_in_queue_projects_not_branch_projects(self):
+        """branch_projects.py has frozen function caps (src/size-ratchet); the lookup must not drift back into it."""
+        self.assertIsNone(queue_projects.resolve_queue_dir(None, str(self.active_repo)))
+        self.assertIsNone(queue_projects.resolve_queue_dir(str(self.active_repo), str(self.active_repo)))
+        self.assertFalse(hasattr(branch_projects, "resolve_queue_dir"))
 
     def test_requeue_still_needs_a_git_repo_project(self):
         self.put(self.other_q, "blocked", "t7", status="blocked")
