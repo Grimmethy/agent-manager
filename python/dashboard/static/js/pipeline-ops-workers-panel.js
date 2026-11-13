@@ -37,8 +37,9 @@ const poWorkerInfo = {
   merger: { label: '🔀 merger', does: 'merges branches the checker approved' },
   steward: { label: '📉 idle-cost steward', does: 'files a task for the worst rising idle-cost originator' },
   hub: { label: '🧩 hub worker', does: 'drains the hidden hubs: answers or requeues stuck pieces, replaces abandoned ones, retires dead hubs' },
+  atomizer: { label: '⚛️ task atomizer', does: 'replays a loop\'s model stages on smaller models and files the next step: lower a stage, split it, or ask the owner' },
 };
-const poWorkerOrder = ['scout', 'checker', 'merger', 'steward', 'hub'];
+const poWorkerOrder = ['scout', 'checker', 'merger', 'steward', 'hub', 'atomizer'];
 
 function poWorkerLabel(name) {
   return poWorkerInfo[name] ? poWorkerInfo[name].label : name;

@@ -53,6 +53,15 @@ test('the hub worker has a card after the steward, with its own name and what it
   assert.match(html, /drains the hidden hubs/);
 });
 
+test('the task atomizer has a card after the hub worker, with its own name and what it does', () => {
+  const html = section({ workers: { custom: live({ name: 'custom' }), atomizer: live({ name: 'atomizer' }), hub: live({ name: 'hub' }), scout: live() } });
+  const ids = [...html.matchAll(/id="po-worker-panel-([a-z]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(ids, ['scout', 'hub', 'atomizer', 'custom']);
+  assert.match(html, /⚛️ task atomizer/);
+  assert.match(html, /replays a loop&#39;s model stages on smaller models|replays a loop's model stages on smaller models/);
+  assert.equal(section({ workers: { atomizer: { configured: false, name: 'atomizer' } } }).includes('po-worker-panel-atomizer'), false);
+});
+
 test('the card has the id, the mode and trigger badges, the age of the last tick, the meta line and the switch', () => {
   const html = build('scout', live());
   assert.match(html, /<span class="id">🔎 poll scout<\/span>/);
