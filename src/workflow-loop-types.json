@@ -637,6 +637,85 @@
           }
         }
       ]
+    },
+    {
+      "id": "loop:atomizer",
+      "name": "Task atomizer",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:agent-manager-pipeline-ops:atomizer-trigger",
+      "gate": "ATOMIZER_MODE in ~/.config/pipeline-ops/atomizer.env",
+      "steps": [
+        {
+          "id": "index",
+          "label": "Index",
+          "does": "Lists the model stages named in the stages/<loop>.json manifests of the pooled projects (script stages are not listed).",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "evidence",
+          "label": "Evidence pack",
+          "does": "Stored cases, the latest replay score of each rung, split attempts, filed tasks and the guards (host Ollama, ComfyUI lease, io pressure, paused pipeline); facts only.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "decide",
+          "label": "Decide",
+          "does": "One of a closed list of outcomes from fixed facts in a fixed order; a validator rejects anything the pack does not support.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "capture",
+          "label": "Capture cases",
+          "does": "Asks rung 1 (Sonnet) about real inputs of a stage and stores the answers as the frozen reference.",
+          "model": {
+            "provider": "cloud",
+            "name": "claude-sonnet-5-5",
+            "fromLane": null
+          }
+        },
+        {
+          "id": "replay",
+          "label": "Replay",
+          "does": "Replays the stored cases on the next rung of the ladder (Haiku, ornith:35b, qwen3-vl:4b-instruct on the RX 580) and scores them against the reference; the card shows the smallest rung, the final target.",
+          "model": {
+            "provider": "local",
+            "name": "qwen3-vl:4b-instruct",
+            "fromLane": null
+          }
+        },
+        {
+          "id": "split",
+          "label": "Draft a split",
+          "does": "Only for a stage that failed the bar: asks rung 1 to propose smaller steps for it.",
+          "model": {
+            "provider": "cloud",
+            "name": "claude-sonnet-5-5",
+            "fromLane": null
+          }
+        },
+        {
+          "id": "act",
+          "label": "Act",
+          "does": "Writes the ledger line and files one task in the owning repo (lower a rung, split a stage, a ticket for the owner); never merges or edits another loop.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        }
+      ]
     }
   ]
 }
