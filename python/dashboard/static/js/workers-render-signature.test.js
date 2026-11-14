@@ -29,9 +29,14 @@ test('workersStripVolatile: ages and heartbeat clock readings go, everything els
   assert.equal(run(ctx, 'workersStripVolatile', null), null);
 });
 
+test('workersStripVolatile: a plain age key (ageS on every hold row of the stalled-task and Needs-Work panels, which changed on every fetch) is stripped too', () => {
+  const out = json(run(load(), 'workersStripVolatile', { holds: [{ id: 'a', ageS: 41 }, { id: 'b', ageSeconds: 7, ageMs: 9, age: 3 }] }));
+  assert.deepEqual(out, { holds: [{ id: 'a' }, { id: 'b' }] });
+});
+
 test('workersStripVolatile: a key that merely contains age is kept (stage, message, page)', () => {
   const out = json(run(load(), 'workersStripVolatile', { stage: 1, message: 2, page: 3, ageGroup: 4, Age: 5 }));
-  assert.deepEqual(out, { stage: 1, message: 2, page: 3, ageGroup: 4 });
+  assert.deepEqual(out, { stage: 1, message: 2, page: 3, ageGroup: 4 });          // ageGroup does not end an age key; only age / ageS / ageSeconds / ageMs do
 });
 
 test('workersRenderSignature: the same page with only the ages moved gives the same signature', () => {

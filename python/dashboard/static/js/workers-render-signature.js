@@ -6,8 +6,8 @@
 
 let lastWorkersSignature = '';
 
-// Keys that only say how old something is or when a heartbeat last landed: heartbeatAgeSeconds, stateAgeSeconds, endedAgeS, checkedAgeS, lastHeartbeat ...
-const WORKERS_VOLATILE_KEY = /(Age(S|Seconds|Ms)?|^lastHeartbeat|^_fetchedAtMs)$/;
+// Keys that only say how old something is or when a heartbeat last landed: heartbeatAgeSeconds, stateAgeSeconds, endedAgeS, checkedAgeS, the plain ageS of every hold row, lastHeartbeat ...
+const WORKERS_VOLATILE_KEY = /(Age(S|Seconds|Ms)?|^age(S|Seconds|Ms)?|^lastHeartbeat|^_fetchedAtMs)$/;
 
 function workersStripVolatile(value) {
   if (Array.isArray(value)) return value.map(workersStripVolatile);
