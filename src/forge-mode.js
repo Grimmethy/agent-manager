@@ -8,7 +8,7 @@
 //   GPU session POST <PromptForge>/api/gpu/acquire {owner:'forge-mode'}: PromptForge evicts the local models and starts ComfyUI, and while the lease is held the workers and reviewers idle
 //               by themselves (scripts/agent-manager-common.sh comfyui_lease_held) and resume when it is released. No second mechanism is invented here.
 //   P40 VM      --vm off shuts the libvirt domain down gracefully and waits for 'shut off'; `off` starts it again only if forge mode shut it down. Default: keep.
-// `on` refuses first, with the numbers and what holds the memory, when MemAvailable after the planned steps would be under 10 GB or the I/O pressure (some, 10 s) is 50 percent or more.
+// `on` has no memory or I/O pressure limit (removed 2026-11-14, owner: the pipeline is paused, so a limit only blocked the run); status still reports both numbers.
 // A failing step rolls the earlier ones back. Forge mode ends by itself after 6 hours or when the GPU session is gone (`expire`, called by the watchdog). One log line per step.
 // Standard library only; every side effect goes through an injectable `io` so the tests never touch the machine.
 
@@ -18,8 +18,6 @@ const path = require('node:path');
 const http = require('node:http');
 const { spawnSync } = require('node:child_process');
 
-const MIN_AVAIL_MB = 10240;
-const MAX_IO_SOME10 = 50;
 const MAX_AGE_MIN = 360;
 const VM_WAIT_S = 180;
 
@@ -42,15 +40,6 @@ function readings(env = process.env) {
 function topRss(exec, n = 5) {
   const r = exec('ps', ['-eo', 'rss=,comm=', '--sort=-rss']);
   return String(r.stdout || '').split('\n').filter(Boolean).slice(0, n).map((l) => { const [rss, ...c] = l.trim().split(/\s+/); return `${c.join(' ')} ${(Number(rss) / 1024).toFixed(0)} MB`; });
-}
-
-// -> { ok, reasons[], top[] }. plannedFreeMB: what the planned steps will give back (the VM when it goes, the models PromptForge evicts).
-function preflight({ availMB, io, plannedFreeMB = 0, minAvailMB = MIN_AVAIL_MB, maxIo = MAX_IO_SOME10, top = [] }) {
-  const reasons = [];
-  if (availMB === null || availMB === undefined) reasons.push('MemAvailable is unreadable');
-  else if (availMB + plannedFreeMB < minAvailMB) reasons.push(`MemAvailable ${Math.round(availMB)} MB + ${Math.round(plannedFreeMB)} MB freed by the plan = ${Math.round(availMB + plannedFreeMB)} MB, under the ${minAvailMB} MB needed`);
-  if (io !== null && io !== undefined && io >= maxIo) reasons.push(`I/O pressure (some, 10 s) is ${io}%, the limit is under ${maxIo}%`);
-  return { ok: reasons.length === 0, reasons, top };
 }
 
 // ---- real io (replaced in tests) ----
@@ -95,15 +84,7 @@ async function on({ vm = 'keep' } = {}, io = realIo()) {
   if (readMarker(env)) { io.log('already in forge mode (see status)'); return 0; }
   const vmRunning = vm === 'off' && vmState(io) === 'running';
   const rd = readings(env);
-  const planned = (vmRunning ? Number(env.FORGE_MODE_VM_MB || 4300) : 0) + (await io.modelsMB());
-  const pre = preflight({ ...rd, plannedFreeMB: planned, top: topRss(io.exec) });
-  if (!pre.ok) {
-    io.log(`refused: ${pre.reasons.join('; ')}`);
-    if (pre.top.length) io.log(`holding memory: ${pre.top.join(', ')}`);
-    if (vm !== 'off') io.log('hint: --vm off shuts the P40 VM down and frees about 4 GB');
-    return 1;
-  }
-  io.log(`preflight ok (MemAvailable ${Math.round(rd.availMB)} MB, I/O ${rd.io}%)`);
+  io.log(`readings (not limits): MemAvailable ${rd.availMB === null ? '?' : Math.round(rd.availMB)} MB, I/O ${rd.io}%`);
   const undo = [];
   const fail = async (why) => { io.log(`failed: ${why}; rolling back`); for (const u of undo.reverse()) await u(); return 1; };
   const state = { since: new Date(io.now()).toISOString(), vm, vmShutDown: false, gpu: false };
@@ -178,4 +159,4 @@ async function main(argv, io = realIo()) {
 
 if (require.main === module) main(process.argv.slice(2)).then((c) => process.exit(c)).catch((e) => { process.stderr.write(`[forge-mode] failed: ${e && e.message ? e.message : e}\n`); process.exit(1); });
 
-module.exports = { MIN_AVAIL_MB, MAX_IO_SOME10, MAX_AGE_MIN, VM_WAIT_S, markerPath, readMarker, readings, preflight, on, off, status, expire, main, realIo };
+module.exports = { MAX_AGE_MIN, VM_WAIT_S, markerPath, readMarker, readings, on, off, status, expire, main, realIo };

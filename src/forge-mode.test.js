@@ -52,36 +52,15 @@ function world({ availMB = 12000, io = 10, vm = 'running', acquireStatus = 200, 
   return { home, calls, state, io: i, steps: () => calls.filter((c) => !c.startsWith('log:')), logs: () => calls.filter((c) => c.startsWith('log:')).join('\n') };
 }
 
-test('preflight: MemAvailable after the plan needs 10240 MB (boundary included), I/O some 10 s must be under 50, unreadable memory refuses', () => {
-  assert.equal(fm.preflight({ availMB: 10240, io: 49.9 }).ok, true);
-  assert.equal(fm.preflight({ availMB: 10239, io: 10 }).ok, false);
-  assert.equal(fm.preflight({ availMB: 6000, io: 10, plannedFreeMB: 4300 }).ok, true);
-  assert.equal(fm.preflight({ availMB: 5000, io: 10, plannedFreeMB: 4300 }).ok, false);
-  const hi = fm.preflight({ availMB: 20000, io: 50 });
-  assert.equal(hi.ok, false);
-  assert.match(hi.reasons[0], /I\/O pressure/);
-  assert.equal(fm.preflight({ availMB: null, io: 1 }).ok, false);
-  assert.equal(fm.preflight({ availMB: 20000, io: null }).ok, true);
+test('on has no memory or I/O limit: low memory and heavy I/O still enter forge mode and change things', async () => {
+  const w = world({ availMB: 2000, io: 95, vm: 'running' });
+  assert.equal(await fm.on({ vm: 'keep' }, w.io), 0);
+  assert.doesNotMatch(w.logs(), /refused/);
+  assert.equal(fs.existsSync(marker(w.home)), true);
+  assert.deepEqual(w.steps(), ['acquire:forge-mode:marker=true']);
 });
 
-test('on refuses with the numbers, the top memory holders and a hint, and changes nothing', async () => {
-  const w = world({ availMB: 2000, vm: 'running' });
-  assert.equal(await fm.on({ vm: 'keep' }, w.io), 1);
-  assert.match(w.logs(), /refused: MemAvailable 2000 MB .* under the 10240 MB needed/);
-  assert.match(w.logs(), /holding memory: qemu-system-x86 3906 MB, llama-server 2930 MB/);
-  assert.match(w.logs(), /hint: --vm off/);
-  assert.deepEqual(w.steps(), []);
-  assert.equal(fs.existsSync(marker(w.home)), false);
-});
-
-test('on refuses on high I/O pressure even with plenty of memory', async () => {
-  const w = world({ availMB: 15000, io: 80 });
-  assert.equal(await fm.on({}, w.io), 1);
-  assert.match(w.logs(), /I\/O pressure \(some, 10 s\) is 80%/);
-  assert.deepEqual(w.steps(), []);
-});
-
-test('on with --vm off counts the VM memory as freed, then: marker first, GPU session second, VM shutdown third', async () => {
+test('on with --vm off: marker first, GPU session second, VM shutdown third', async () => {
   const w = world({ availMB: 6500, vm: 'running' });
   assert.equal(await fm.on({ vm: 'off' }, w.io), 0);
   assert.deepEqual(w.steps(), ['acquire:forge-mode:marker=true', 'virsh shutdown']);                // the marker existed when the GPU session was asked for

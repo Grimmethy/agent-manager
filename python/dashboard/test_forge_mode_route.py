@@ -19,26 +19,12 @@ GOOD = {"paused": False, "memAvailMB": 11000, "ioSome10": 12.0, "vm": {"state": 
 
 
 class Refusal(unittest.TestCase):
-    def test_enough_memory_and_low_io_goes(self):
+    def test_a_readable_status_goes_whatever_the_memory_and_io_numbers(self):
         self.assertEqual(forge_mode.refusal(GOOD, "keep"), [])
+        self.assertEqual(forge_mode.refusal({**GOOD, "memAvailMB": 2000, "ioSome10": 95}, "keep"), [])
+        self.assertEqual(forge_mode.refusal({**GOOD, "memAvailMB": None}, "keep"), [])
 
-    def test_low_memory_refused_with_the_numbers(self):
-        r = forge_mode.refusal({**GOOD, "memAvailMB": 2000}, "keep")
-        self.assertEqual(len(r), 1)
-        self.assertIn("2000 MB", r[0])
-
-    def test_vm_off_counts_the_memory_it_gives_back_only_when_the_vm_runs(self):
-        low = {**GOOD, "memAvailMB": 6500}
-        self.assertEqual(forge_mode.refusal(low, "off"), [])
-        self.assertEqual(len(forge_mode.refusal(low, "keep")), 1)
-        self.assertEqual(len(forge_mode.refusal({**low, "vm": {"state": "shut off"}}, "off")), 1)
-
-    def test_io_limit_is_inclusive(self):
-        self.assertEqual(len(forge_mode.refusal({**GOOD, "ioSome10": 50}, "keep")), 1)
-        self.assertEqual(forge_mode.refusal({**GOOD, "ioSome10": 49.9}, "keep"), [])
-
-    def test_unreadable_memory_and_unreadable_status_are_refused(self):
-        self.assertEqual(len(forge_mode.refusal({**GOOD, "memAvailMB": None}, "keep")), 1)
+    def test_unreadable_status_is_refused(self):
         self.assertEqual(len(forge_mode.refusal({"error": "boom"}, "keep")), 1)
 
     def test_already_paused_is_refused(self):
@@ -88,14 +74,10 @@ class Routes(unittest.TestCase):
         self.assertTrue(res.get_json()["started"])
         bg.assert_called_once_with(["on", "--vm", "off"])
 
-    def test_on_without_headroom_is_409_with_the_numbers_and_starts_nothing(self):
-        res, bg = self.post({"on": True}, st={**GOOD, "memAvailMB": 2000})
-        self.assertEqual(res.status_code, 409)
-        body = res.get_json()
-        self.assertFalse(body["started"])
-        self.assertIn("2000 MB", body["reasons"][0])
-        self.assertEqual(body["status"]["memAvailMB"], 2000)
-        bg.assert_not_called()
+    def test_on_with_low_memory_and_high_io_still_starts(self):
+        res, bg = self.post({"on": True}, st={**GOOD, "memAvailMB": 2000, "ioSome10": 90})
+        self.assertEqual(res.status_code, 202)
+        bg.assert_called_once_with(["on", "--vm", "keep"])
 
     def test_vm_defaults_to_keep_and_a_bad_vm_is_400(self):
         res, bg = self.post({"on": True})
