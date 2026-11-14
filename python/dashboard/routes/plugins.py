@@ -17,6 +17,8 @@ plugins_bp = Blueprint("plugins-bp", __name__)
 def api_plugins():
     from app import PLUGINS_MANIFEST_PATH, _manifest_tabs_enabled, _read_plugins_manifest
     manifest = _read_plugins_manifest()
+    behind_plugins = []
+    pm = plugin_process_manager.PluginProcessManager()
     for p in manifest:
         # A processName-bearing entry (e.g. the 4 wikiforge-* tabs sharing one real
         # node server.js) needs live status just as much as a slotted one -- process_key()
@@ -24,10 +26,15 @@ def api_plugins():
         # under, not necessarily this entry's own name (2026-09-28).
         if p.get("slot") or p.get("processName"):
             p["running"] = plugin_process_manager.is_running(plugin_process_manager.process_key(p))
+        behind_info = pm.behind_checkout(p)
+        p["restartNeeded"] = bool(behind_info.get("behind"))
+        if behind_info.get("behind"):
+            behind_plugins.append(p.get("name") or p.get("slot") or str(p))
     return jsonify({
         "plugins": manifest,
         "manifestPath": str(PLUGINS_MANIFEST_PATH),
         "manifestTabsEnabled": _manifest_tabs_enabled(),
+        "behindPlugins": behind_plugins,
     })
 
 
@@ -330,7 +337,7 @@ def api_plugins_update():
 @plugins_bp.route("/api/plugins/<name>/ui/<path:filename>")
 def api_plugin_ui_asset(name, filename):
     """Serves a .js/.css asset out of a plugin's own ui/ directory (piece 2 of the
-    manifest-driven dashboard tab; Docs/hub-tasks-extraction-plan.md section 5). This is
+    manifest-driven dashboard tab; docs/design-notes/hub-tasks-extraction-plan.md section 5). This is
     how a plugin's tab content reaches the browser without an iframe: the tab-bar merge
     (a later piece) points the dashboard at this route for `tab.script`, and a plugin may
     load further same-origin assets (additional scripts, a stylesheet) from here too.

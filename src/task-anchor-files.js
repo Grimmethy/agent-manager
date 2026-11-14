@@ -21,6 +21,7 @@ const path = require('path');
 const { extractForbiddenPaths } = require('./adhoc-diff-sanity.js');
 const { resolveGroundingRef, readFileAtRef } = require('./stacked-grounding.js');
 const { resolveAgainstRepoDetailed } = require('./fact-checker.js');
+const { backtickIdentifiers } = require('./lib/backtick-identifiers.js'); // moved to a leaf so fact-checker.js need not require this file; still re-exported below
 
 const MAX_FILES = 6;
 const MAX_CHARS_PER_FILE = 16000;
@@ -68,24 +69,6 @@ function resolveAdrNumber(repoRoot, num) {
 function withinRoot(repoRoot, rel) {
   const full = path.resolve(repoRoot, rel);
   return full.startsWith(path.resolve(repoRoot) + path.sep) ? full : null;
-}
-
-// Just the backtick-quoted names -- the task author's own EXPLICIT symbol list (as
-// opposed to taskIdentifiers' broader heuristic sweep below), highest-confidence because
-// it required no guessing to extract. adhocHarnessSearchPlanPrompt (prompts.js) uses this
-// to steer the harness-search tier's query choice toward these over a bare file path --
-// 2026-09-06, root-caused live: a file-decompose "move these symbols" sub-task (rawText
-// names its symbols in backticks) had the harness-search plan pass choose the SOURCE
-// FILE'S OWN PATH as its query instead of any of the named symbols -- a generically
-// common path (mentioned in dozens of unrelated tests/docs/scripts) returned almost pure
-// noise, one irrelevant unrelated file got embedded as "the" fetched content, and the
-// resulting bloated, low-signal context contributed to the plan pass truncating on every
-// retry (see local-client.js's call() truncation-escalation fix for the other half of
-// that incident).
-function backtickIdentifiers(rawText) {
-  const out = new Set();
-  for (const m of rawText.matchAll(/`([A-Za-z_][\w.]*(?:\(\))?)`/g)) out.add(m[1].replace(/\(\)$/, ''));
-  return [...out];
 }
 
 // Distinctive identifiers the task names -- backtick-quoted tokens, snake_case /

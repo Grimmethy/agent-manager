@@ -14,7 +14,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
+const { applyAdhocDiff, renameSources, unquoteGitPath } = require('./apply-adhoc-diff.js');
 
 // Queued hub members lead with `HUB#### · i/n · ` (hub-serial.js); most assertions here care about the piece's own title.
 const plain = (s) => String(s).replace(/^HUB\d{4,} · \d+\/\d+ · /, '');
@@ -87,6 +87,47 @@ test('applyAdhocDiff returns {skipped} when task.rawDiff is empty, without touch
   assert.equal(result.skipped, true);
   assert.match(result.reason, /no code change needed/);
   assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v1\n');
+});
+
+test('applyAdhocDiff returns emptyDiff:true for an empty diff that is NOT no-changes-needed', () => {
+  const repoDir = makeRepo();
+  // rawDiff is empty, but adhocResolution is NOT 'no-changes-needed' -- this is the
+  // "agentic draft produced nothing" case HUB0306 targets. Must carry emptyDiff:true
+  // so applyTask can block a stacked hub child instead of silently marking it done.
+  const task = { id: 'apply-test-empty-diff', rawDiff: '', implementResponse: 'summary', adhocResolution: 'implemented' };
+
+  const result = applyAdhocDiff({ task, repoRoot: repoDir });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.emptyDiff, true, 'empty-diff flag must be present when the model did not claim no-changes-needed');
+  assert.match(result.reason, /adhoc agentic draft produced no diff/);
+  assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v1\n');
+});
+
+test('applyAdhocDiff does NOT set emptyDiff for adhocResolution === no-changes-needed', () => {
+  const repoDir = makeRepo();
+  const task = { id: 'apply-test-3', rawDiff: '', implementResponse: 'Already resolved, no change needed.', adhocResolution: 'no-changes-needed' };
+
+  const result = applyAdhocDiff({ task, repoRoot: repoDir });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.emptyDiff, undefined, 'emptyDiff must be absent for an explicit no-changes-needed model call');
+});
+
+test('applyAdhocDiff does NOT set emptyDiff for a decompose parent', () => {
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const task = {
+    id: 'apply-test-decompose-empty',
+    rawDiff: '',
+    adhocResolution: 'decompose',
+    subTaskProposals: [{ title: 'Piece one', rawText: 'First.' }],
+  };
+
+  const result = applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+
+  assert.equal(result.coordinating, true);
+  assert.equal(result.emptyDiff, undefined, 'emptyDiff must be absent for a decompose parent');
 });
 
 test('applyAdhocDiff applies a real diff whose hunk header line-count is wrong (regression: 2026-08-18 "corrupt patch" incident)', () => {
@@ -612,4 +653,188 @@ test('applyAdhocDiff (decompose) moves the carried diff onto the first piece and
   assert.equal(task.carriedPartialDiff, undefined);
   assert.equal(task.carriedPartialDiffChars, diff.length);
   assert.equal(readQueuedAdhocTasks(pipelineDir).filter((t) => t.priorPartialDiff === diff).length, 1);
+});
+
+test('applyAdhocDiff copies a valid prerequisiteHubs from a proposal onto that piece only, and drops an invalid value', () => {
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const task = {
+    id: 'apply-test-prereq-1', rawDiff: '', implementResponse: 'Split.', adhocResolution: 'decompose',
+    subTaskProposals: [
+      { title: 'Piece one', rawText: 'Do the first piece.' },
+      { title: 'Piece two', rawText: 'Do the second piece.', prerequisiteHubs: ['HUB0006', 'not-a-hub'] },
+      { title: 'Piece three', rawText: 'Do the third piece.', prerequisiteHubs: ['bogus'] },
+    ],
+  };
+  applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+  const queued = readQueuedAdhocTasks(pipelineDir);
+  const by = (t) => queued.find((q) => plain(q.title) === t);
+  assert.equal(by('Piece one').prerequisiteHubs, undefined);
+  assert.deepEqual(by('Piece two').prerequisiteHubs, ['HUB0006']);
+  assert.equal(by('Piece three').prerequisiteHubs, undefined);
+});
+
+test('applyAdhocDiff writes a proposal\'s files as a Files: line exactly once, never over an existing one, and a docs-only piece then passes the substance gate', () => {
+  const { adhocDiffSubstanceProblem } = require('./adhoc-diff-sanity.js');
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const codeish = 'Combine job types into expandable rows in python/dashboard/templates/index.html -- renderJobListTab(). Document the change.';
+  const task = {
+    id: 'apply-test-files-1', rawDiff: '', implementResponse: 'Split.', adhocResolution: 'decompose',
+    subTaskProposals: [
+      { title: 'Docs piece', rawText: codeish, files: ['README.md', 'VERIFY.md'] },
+      { title: 'Has own line', rawText: `${codeish}\nFiles: docs/x.md`, files: ['README.md'] },
+      { title: 'No files', rawText: codeish },
+    ],
+  };
+  applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+  const queued = readQueuedAdhocTasks(pipelineDir);
+  const by = (t) => queued.find((q) => plain(q.title) === t);
+  const docsDiff = 'diff --git a/README.md b/README.md\nnew file mode 100644\nindex 0000000..abc1234\n--- /dev/null\n+++ b/README.md\n@@ -0,0 +1 @@\n+content\n';
+  assert.equal((by('Docs piece').promptContext.rawText.match(/^Files:/gim) || []).length, 1);
+  assert.match(by('Docs piece').promptContext.rawText, /\nFiles: README\.md, VERIFY\.md$/);
+  assert.equal((by('Has own line').promptContext.rawText.match(/^Files:/gim) || []).length, 1);
+  assert.match(by('Has own line').promptContext.rawText, /Files: docs\/x\.md$/);
+  assert.equal(by('No files').promptContext.rawText, codeish);
+  assert.equal(adhocDiffSubstanceProblem(by('Docs piece'), docsDiff), null, 'declared docs files: not docs-only');
+  assert.equal(adhocDiffSubstanceProblem(by('No files'), docsDiff).code, 'docs-only', 'without the line the keyword scan still flags it');
+});
+
+test('applyAdhocDiff lists owner-gated pieces in the result, and none when no piece is gated', () => {
+  const repoDir = makeRepo();
+  const mk = (id, proposals) => ({ id, rawDiff: '', implementResponse: 'Split.', adhocResolution: 'decompose', subTaskProposals: proposals });
+  const gated = applyAdhocDiff({
+    task: mk('apply-test-gates-1', [
+      { title: 'Plain piece', rawText: 'Do the plain thing.' },
+      { title: 'Vendor the library', rawText: 'Download it. This step needs owner approval before any download.' },
+    ]),
+    repoRoot: repoDir, pipelineDir: fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-')),
+  });
+  assert.equal(gated.ownerGates.length, 1);
+  assert.equal(gated.ownerGates[0].why, 'owner approval');
+  assert.match(gated.ownerGates[0].id, /vendor-the-library/);
+  assert.match(gated.ownerGates[0].title, /Vendor the library/);
+  const none = applyAdhocDiff({
+    task: mk('apply-test-gates-2', [{ title: 'One', rawText: 'Do one.' }, { title: 'Two', rawText: 'Do two.' }]),
+    repoRoot: repoDir, pipelineDir: fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-')),
+  });
+  assert.deepEqual(none.ownerGates, []);
+});
+
+
+// ---- a rename in a task diff must delete the old path too (2026-11-04, HUB0321: apply staged only the new name `git apply --numstat` lists, so the moved file stayed behind) ----
+
+const renameHeader = (from, to) => `diff --git a/${from} b/${to}\nsimilarity index 98%\nrename from ${from}\nrename to ${to}\nindex 1111111..2222222 100644\n--- a/${from}\n+++ b/${to}\n@@ -1 +1 @@\n-a\n+b\n`;
+
+test('renameSources: the old path of each rename, in patch order, each once', () => {
+  const diff = renameHeader('tests/a.test.js', 'src/a.test.js') + renameHeader('docs/x.md', 'docs/y.md') + renameHeader('tests/a.test.js', 'src/a2.test.js');
+  assert.deepEqual(renameSources(diff), ['tests/a.test.js', 'docs/x.md']);
+});
+
+test('renameSources: nothing for a diff without a rename, a copy, a created or deleted file, content that merely looks like a header, or no input', () => {
+  const plainChange = 'diff --git a/f.js b/f.js\n--- a/f.js\n+++ b/f.js\n@@ -1 +1 @@\n-a\n+b\n';
+  const copy = 'diff --git a/a.js b/b.js\nsimilarity index 100%\ncopy from a.js\ncopy to b.js\n';
+  const created = 'diff --git a/n.js b/n.js\nnew file mode 100644\n--- /dev/null\n+++ b/n.js\n@@ -0,0 +1 @@\n+rename from nowhere\n';
+  const deleted = 'diff --git a/d.js b/d.js\ndeleted file mode 100644\n--- a/d.js\n+++ /dev/null\n@@ -1 +0,0 @@\n-rename from nowhere\n';
+  for (const d of [plainChange, copy, created, deleted, '', null, undefined, 42]) assert.deepEqual(renameSources(d), [], String(d).slice(0, 30));
+});
+
+test('renameSources: a path with spaces is kept whole, and a quoted path (non-ASCII, quote, backslash, tab) is unquoted', () => {
+  assert.deepEqual(renameSources('rename from my dir/a b.txt\nrename to x\n'), ['my dir/a b.txt']);
+  assert.deepEqual(renameSources('rename from "w\\303\\251ird.txt"\nrename to "w\\303\\251ird2.txt"\n'), ['wéird.txt']);
+  assert.deepEqual(renameSources('rename from "a\\"b\\\\c\\td.txt"\nrename to z\n'), ['a"b\\c\td.txt']);
+});
+
+test('renameSources: a header with no path adds nothing', () => {
+  assert.deepEqual(renameSources('rename from \nrename to x\n'), []);
+  assert.deepEqual(renameSources('rename from \r\nrename to x\n'), []);
+});
+
+test('renameSources: a Windows line ending after the path is not part of the path', () => {
+  assert.deepEqual(renameSources('rename from tests/a.test.js\r\nrename to src/a.test.js\r\n'), ['tests/a.test.js']);
+});
+
+test('unquoteGitPath: plain paths pass through; quoted paths decode C escapes and octal UTF-8 bytes', () => {
+  assert.equal(unquoteGitPath('src/a.js'), 'src/a.js');
+  assert.equal(unquoteGitPath(''), '');
+  assert.equal(unquoteGitPath(undefined), '');
+  assert.equal(unquoteGitPath('"w\\303\\251.txt"'), 'wé.txt');
+  assert.equal(unquoteGitPath('"a\\nb"'), 'a\nb');
+  assert.equal(unquoteGitPath('"q\\"x"'), 'q"x');
+  assert.equal(unquoteGitPath('"bs\\\\x"'), 'bs\\x');
+  assert.equal(unquoteGitPath('"unknown\\qescape"'), 'unknown\\qescape');
+  assert.equal(unquoteGitPath('"just-a-quote'), '"just-a-quote');
+  assert.equal(unquoteGitPath('"'), '"', 'a lone quote is not an empty quoted path');
+});
+
+function repoWithMovableFile() {
+  const repoDir = makeRepo();
+  fs.mkdirSync(path.join(repoDir, 'tests'));
+  fs.writeFileSync(path.join(repoDir, 'tests', 'moved.test.js'), Array.from({ length: 12 }, (_, i) => `line ${i}`).join('\n') + '\n');
+  git(['add', '-A'], repoDir);
+  git(['commit', '-m', 'add a test'], repoDir);
+  return repoDir;
+}
+const move = (change) => (dir) => {
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  git(['mv', 'tests/moved.test.js', 'src/moved.test.js'], dir);
+  if (change) fs.writeFileSync(path.join(dir, 'src', 'moved.test.js'), fs.readFileSync(path.join(dir, 'src', 'moved.test.js'), 'utf8').replace('line 3', 'line three'));
+};
+const commitFiles = (repoDir, files) => { git(['add', ...files], repoDir); git(['commit', '-m', 'apply'], repoDir); return git(['ls-tree', '-r', '--name-only', 'HEAD'], repoDir).split('\n').filter(Boolean); };
+
+test('applyAdhocDiff: a rename with a content change lists BOTH paths, and staging them and committing removes the old file from the tree', () => {
+  const repoDir = repoWithMovableFile();
+  const rawDiff = makeRealDiff(repoDir, move(true));
+  assert.match(rawDiff, /^rename from tests\/moved\.test\.js$/m, 'the fixture diff really is a rename');
+  const result = applyAdhocDiff({ task: { id: 'rename-1', rawDiff, adhocResolution: 'implemented' }, repoRoot: repoDir });
+  assert.deepEqual([...result.files].sort(), ['src/moved.test.js', 'tests/moved.test.js']);
+  assert.equal(fs.existsSync(path.join(repoDir, 'tests', 'moved.test.js')), false);
+  assert.match(fs.readFileSync(path.join(repoDir, 'src', 'moved.test.js'), 'utf8'), /line three/);
+  const tree = commitFiles(repoDir, result.files);
+  assert.ok(tree.includes('src/moved.test.js'));
+  assert.ok(!tree.includes('tests/moved.test.js'), 'the old path is gone from the commit, not left behind');
+});
+
+test('applyAdhocDiff: a pure rename (no content change, no hunks) lists both paths too', () => {
+  const repoDir = repoWithMovableFile();
+  const rawDiff = makeRealDiff(repoDir, move(false));
+  assert.match(rawDiff, /^rename from tests\/moved\.test\.js$/m);
+  const result = applyAdhocDiff({ task: { id: 'rename-2', rawDiff, adhocResolution: 'implemented' }, repoRoot: repoDir });
+  assert.deepEqual([...result.files].sort(), ['src/moved.test.js', 'tests/moved.test.js']);
+  assert.ok(!commitFiles(repoDir, result.files).includes('tests/moved.test.js'));
+});
+
+test('applyAdhocDiff: the same move written as a delete plus a create (no rename detection) works and lists both paths once', () => {
+  const repoDir = repoWithMovableFile();
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-scratch-'));
+  git(['clone', repoDir, scratch]);
+  git(['config', 'user.email', 'test@example.com'], scratch);
+  git(['config', 'user.name', 'Test'], scratch);
+  move(false)(scratch);
+  git(['add', '-A'], scratch);
+  const rawDiff = git(['diff', '--cached', '--no-renames'], scratch);
+  assert.doesNotMatch(rawDiff, /rename from/);
+  const result = applyAdhocDiff({ task: { id: 'rename-3', rawDiff, adhocResolution: 'implemented' }, repoRoot: repoDir });
+  assert.deepEqual([...result.files].sort(), ['src/moved.test.js', 'tests/moved.test.js']);
+  assert.ok(!commitFiles(repoDir, result.files).includes('tests/moved.test.js'));
+});
+
+test('applyAdhocDiff: a plain change and a plain delete are unchanged (one path each, nothing added)', () => {
+  const repoDir = repoWithMovableFile();
+  const del = applyAdhocDiff({ task: { id: 'plain-del', rawDiff: makeRealDiff(repoDir, (dir) => fs.rmSync(path.join(dir, 'tests', 'moved.test.js'))), adhocResolution: 'implemented' }, repoRoot: repoDir });
+  assert.deepEqual(del.files, ['tests/moved.test.js']);
+  const repo2 = makeRepo();
+  const change = applyAdhocDiff({ task: { id: 'plain-change', rawDiff: makeRealDiff(repo2, (dir) => fs.writeFileSync(path.join(dir, 'tracked.txt'), 'v9\n')), adhocResolution: 'implemented' }, repoRoot: repo2 });
+  assert.deepEqual(change.files, ['tracked.txt']);
+});
+
+test('applyAdhocDiff: a rename whose apply FAILS leaves the old file in place (the failure cleanup also covers the old path)', () => {
+  const repoDir = repoWithMovableFile();
+  const rawDiff = makeRealDiff(repoDir, move(true));
+  fs.writeFileSync(path.join(repoDir, 'tests', 'moved.test.js'), 'something else entirely\nthat shares no context\n');   // the target no longer matches the diff
+  git(['add', '-A'], repoDir);
+  git(['commit', '-m', 'diverge'], repoDir);
+  assert.throws(() => applyAdhocDiff({ task: { id: 'rename-4', rawDiff, adhocResolution: 'implemented' }, repoRoot: repoDir }), /git apply failed/);
+  assert.equal(fs.readFileSync(path.join(repoDir, 'tests', 'moved.test.js'), 'utf8'), 'something else entirely\nthat shares no context\n', 'the old file is still there, unchanged');
+  assert.equal(fs.existsSync(path.join(repoDir, 'src', 'moved.test.js')), false, 'no stray new file is left');
 });

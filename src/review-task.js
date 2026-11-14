@@ -41,6 +41,8 @@
 
 const fs = require('fs');
 const { sharedInstancesDir } = require('./instances-dir.js');
+const { REVIEW_LINES: REVIEW_POLL_LINES } = require('./lib/poll-avoidance-lines.js');
+const { REVIEW_LINES: REVIEW_IO_LINES } = require('./lib/io-avoidance-lines.js');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig, ensureRegistered } = require('./config.js');
@@ -52,17 +54,19 @@ const { resolveModelProfile } = require('./model-provider.js');
 const { majorityVote: localMajorityVoteBackend } = require('./local-client.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
-const { isStructuredGroupBChange, looksLikeReadToolCall } = require('./lib/structured-change.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
-const { unnamedChangedFiles, changedFilesOfDiff } = require('./lib/draft-side-effects.js');
+const { unnamedChangedFiles } = require('./lib/draft-side-effects.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-const { decideEmptyApprovalOutcome } = require('./empty-approval-decision.js');
-const { decidePremiseRecheckOutcome } = require('./premise-recheck-decision.js');
-const { detectTruncatedImplementResponse } = require('./validate-implement-truncation.js');
-const { classifyNullOutcome } = require('./advisory-null-outcome.js');
 const { getDecomposeProposalDetection } = require('./hub-review-detection.js');
 const { getSplitCoverageJudging } = require('./split-coverage-judging-route.js');
-const { verifyDeterministicDraft } = require('./decompose-review-registry.js');
+const { EXECUTED_VERIFY_BUDGET_MS, EV_MAX_ITEMS, summariseSyntax, extractTaskDiff, summariseExecutedVerification, summariseUnpinned, executedVerificationBlockReason, isHubChildTask, GATE_REPLAY_MAX_ITEMS, summariseGateReplay } = require('./review-executed-verification.js');
+const { INERT_MAX_ITEMS, editsOfImplementResponse, summariseUndefinedRemoval, undefinedRemovalWhere, undefinedRemovalBlockReason, summariseInertAdditions, summariseSkipPaths } = require('./review-advisory-checks.js');
+const { runEarlyGates } = require('./review-early-gates.js');
+const { getDomainConfig, prepareFactCheck } = require('./review-grounding.js');
+const { verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, NON_IMPL_PATTERNS, namesExtractedPieces } = require('./review-gate-helpers.js');
+const { runDeterministicGates } = require('./review-deterministic-gates.js');
+const { runPreVoteChecks } = require('./review-prevote-checks.js');
+const { runVoteAndDecide } = require('./review-vote-decision.js');
 // script-extract.js stays in core (also required directly by scripts/extract-core-ui.js,
 // a standalone dev CLI that can't depend on an optional plugin) -- this require reaches
 // its registerDeterministicReview('script-extract', ...) side effect normally, same as any
@@ -92,19 +96,6 @@ function writeTaskJson(taskPath, task) {
   fs.renameSync(tmp, taskPath);
 }
 
-function getDomainConfig(domainsPath, domain) {
-  const domains = JSON.parse(fs.readFileSync(domainsPath, 'utf8'));
-  const cfg = domains[domain];
-  if (!cfg) throw new Error(`Unknown task domain: ${domain} (valid: ${Object.keys(domains).join(', ')})`);
-  return cfg;
-}
-
-function getWorkDir(cfg, { repoRoot, secondBrainDir }) {
-  if (cfg.workDirKind === 'repoRoot' || cfg.workDirKind === 'taxharvestRoot') return repoRoot;
-  if (cfg.workDirKind === 'secondBrainDir') return secondBrainDir;
-  throw new Error(`Unknown workDirKind: ${cfg.workDirKind}`);
-}
-
 // Local-model review and worker draft calls share one local GPU/model slot -- stagger review's
 // start if a worker looks actively mid-call, same contention-avoidance local-worker.ps1's
 // Wait-ForLocalAvailability does. Best-effort: never blocks more than ~15s total.
@@ -130,196 +121,6 @@ async function waitForLocalAvailability(instancesDir, maxWaitAttempts = 3, waitS
   }
 }
 
-// Deterministic empty-approve: several task sources' implement prompts explicitly ask for
-// the empty string when there's genuinely nothing to change (see prompts.js), a legitimate
-// approved outcome at review time -- and (2026-08-22/23) some are further exempted from
-// the isNonImplementation gate below (NON_IMPL_PATTERNS / the <80-char-no-code-fence
-// heuristic, written assuming every draft is code) because their OWN valid deliverable
-// can be a short advisory prose verdict instead -- a real "false positive, here's why"
-// paragraph, or staleness_audit's own short "nothing new to add here" report, would
-// otherwise trip the same false-positive-for-refusal heuristic.
-//
-// 2026-08-23 (Grimmethy: "What else needs to be moved in order to properly modularize
-// the maintenance tasks?"): both used to be hardcoded arrays here, duplicated ALMOST
-// verbatim as local-draft.js's own allowEmptyImplement/CANDIDATE_FULFILLMENT_SOURCES --
-// confirmed live, EMPTY_APPROVAL_SOURCES and allowEmptyImplement were the exact same 11
-// names, a duplicate-list bug class waiting to happen (add a source to one, forget the
-// other). Now read directly off each source's own registerTaskSource() entry
-// (emptyApproval/advisoryProse flags) instead -- the actual prerequisite a plugin needed
-// to add a new maintenance source without editing this file at all; see
-// function-length-review.js's own registration for the pattern.
-function isEmptyApprovalSource(source) {
-  const entry = getRegisteredSource(source);
-  return !!(entry && entry.emptyApproval);
-}
-function isAdvisoryProseSource(source) {
-  const entry = getRegisteredSource(source);
-  return !!(entry && entry.advisoryProse);
-}
-// A source declaring deterministicReview replaces the whole LLM majority-vote path with a
-// mechanical validate function (brain_dump_sort: parse the classification JSON, check the
-// secondBrainPath taxonomy, check belongsToProject is a real label). Returns the validator
-// or null. See runReview's early branch.
-function deterministicReviewValidator(source) {
-  const entry = getRegisteredSource(source);
-  return entry && typeof entry.deterministicReviewValidate === 'function' ? entry.deterministicReviewValidate : null;
-}
-function isEffectivelyEmpty(trimmed) {
-  return trimmed === '' || trimmed === '""' || trimmed === "''";
-}
-
-// 2026-09-08, Second Brain [[dspy-deterministic-prompt-tuning]] research applied: DSPy's
-// optimizer family compiles a signature against a real, labeled corpus of outcomes rather
-// than trusting a hand-tuned heuristic's own self-assessment. fact-checker.js's own header
-// comment calls the ungrounded-url/ungrounded-field gate "high-precision, almost never a
-// false positive" -- but this session's own investigation found 4 confirmed false
-// positives against that exact claim (a newly-declared constant, a real field outside the
-// diff's touched files, a field on an unchanged diff context line, a self-invented shell
-// echo marker), discovered only by manually grepping every historical hard-block and
-// hand-auditing each one -- there was no standing record of this gate's own real
-// true/false-positive rate at all. One NDJSON line per hard block (not just the terminal
-// verdict already in the task's own history) means a future audit is `grep`, not manual
-// archaeology across queue/done/ -- same discipline local-client.js's degenerate-audit.log
-// and local-tool-client.js's context-budget-audit.log already established for their own
-// gates. Best-effort: must never affect the real review outcome.
-// 2026-09-08: now a thin wrapper over pipeline-history.js's unified writer -- see that
-// file's own header for why the 4 separately-invented per-class log files (this one
-// included) were consolidated into one NDJSON stream discriminated by `type`, mirroring
-// dspy.settings.GLOBAL_HISTORY. Same call signature as before; no call site changed.
-function logFactCheckAudit(pipelineDir, entry) {
-  logPipelineEvent(pipelineDir, 'fact-check-block', entry);
-}
-
-// HUB0090 · 2/2 · review-time relocation-validation (sibling of HUB0091's draft-time
-// grounding-refresh fallback in local-draft.js -- that one re-fetches BEFORE drafting,
-// this one forgives at review time): the ungrounded-url/ungrounded-field deterministic
-// gate compares the draft's symbols against the frozen fetchedFiles window, but that
-// window is a truncated slice (AC-61; see arch-import-premise-check.js's 2026-09-18
-// comment) and the draft may legitimately edit a file OUTSIDE the frozen list -- e.g. a
-// symbol moved by a decompose that landed after the frozen snapshot was taken. Before
-// that gate auto-rejects, check per flagged target symbol: (a) does the frozen file at
-// CURRENT HEAD still contain it (re-fetched whole, past the window) -- if yes the symbol
-// was only truncated out of the window, not missing; (b) if the frozen file lacks it but
-// the file the draft is actually editing contains it -- the draft is a valid relocation.
-// Either way the gate is not disqualifying and the draft goes on to the normal vote.
-// Conservative on purpose: a symbol found in NEITHER the frozen file at HEAD nor any of
-// the draft's own files stays flagged and the original auto-reject runs unchanged.
-function readRepoFileAtHead(repoRoot, relPath) {
-  try { return fs.readFileSync(path.resolve(repoRoot, relPath), 'utf8'); }
-  catch { return null; } // file gone at HEAD (deleted/renamed) -- caller treats as "lacks symbol"
-}
-function validateRelocatedDraftSymbols(task, flags, repoRoot) {
-  const draftFiles = [...new Set(changedFilesOfDiff((task && task.rawDiff) || ''))];
-  const frozenFiles = (((task && task.promptContext) || {}).fetchedFiles) || [];
-  const frozen = Array.isArray(frozenFiles) ? frozenFiles.filter((f) => f && typeof f.path === 'string') : [];
-  const validated = [];
-  const remaining = [];
-  for (const flag of flags) {
-    const symbol = (flag && typeof flag.detail === 'string' && flag.detail) || null;
-    if (!symbol) { remaining.push(flag); continue; }
-    let hit = null;
-    for (const f of frozen) {
-      // AC-61 variant: fetchedFiles[].context is a windowed, truncated slice of each
-      // file -- "does the frozen file still contain the symbol" must be answered against
-      // the file at current HEAD, so re-fetch the whole file when the window lacks it.
-      const inWindow = typeof f.context === 'string' && f.context.includes(symbol);
-      const frozenFull = inWindow ? '(window)' : readRepoFileAtHead(repoRoot, f.path);
-      if (frozenFull === '(window)' || (frozenFull !== null && frozenFull.includes(symbol))) {
-        hit = { type: flag.type, symbol, frozenFile: f.path, draftFile: null, ac61Refetch: frozenFull !== '(window)', note: 'symbol present in the frozen file (outside the truncated window)' };
-        break;
-      }
-      // Relocation: frozen file LACKS the symbol at HEAD while the draft's own edited
-      // file CONTAINS it -- pass the gate, don't auto-reject.
-      const draftFile = draftFiles.find((d) => {
-        const content = readRepoFileAtHead(repoRoot, d);
-        return content !== null && content.includes(symbol);
-      });
-      if (draftFile) {
-        hit = { type: flag.type, symbol, frozenFile: f.path, draftFile, ac61Refetch: true, note: 'symbol absent from the frozen file at HEAD but present in the draft\'s own file -- valid relocation' };
-        break;
-      }
-    }
-    if (hit) validated.push(hit); else remaining.push(flag);
-  }
-  return { validated, remaining };
-}
-
-// Deterministic review gate for a script-extract decompose move (see local-draft.js's
-// tryDeterministicScriptExtractEdit). Real incident, 2026-09-07: the implement pass
-// already re-verifies every symbol via a real V8-parser oracle before constructing the
-// diff -- there is no judgment call left for a model to make -- but the diff itself can
-// be far too large for the review model's own context window to hold at all. Confirmed
-// live: a real 26-symbol move produced a 600,794-char implementResponse (~200K tokens)
-// against this pipeline's 16,384-token PINNED_NUM_CTX -- the reviewer never actually saw
-// the real content and hallucinated "the draft is empty, no IMPLEMENT diff." Re-deriving
-// the expected extraction fresh from CURRENT repo state and requiring an exact byte
-// match is a strictly STRONGER guarantee than an LLM skim of a diff it can't even fit in
-// context -- same "don't ask a model to verify what code can verify with certainty"
-// principle as this pipeline's other deterministic gates just above/below this one.
-// Deterministic-review hook (S4a of the hub-tasks extraction, 2026-09-24): the actual
-// re-derivation/byte-compare logic (all the reasoning above about WHY this gate exists
-// still applies) now lives in script-extract.js's own registerDeterministicReview call --
-// see decompose-review-registry.js's header. This file only gates on the kind and
-// dispatches, so it never needs script-extract.js's implementation, only whatever
-// registered against 'script-extract'.
-function verifyDeterministicScriptExtractDraft(task, repoRoot, groundingRef) {
-  const ctx = task.promptContext;
-  if (!(ctx && ctx.deterministicApply === 'script-extract')) return null;
-  return verifyDeterministicDraft(task, repoRoot, groundingRef);
-}
-
-// Same principle as verifyDeterministicScriptExtractDraft above, for a WHOLE fully-
-// mechanical file-decompose filed as one deterministic task ([[hub-task-integration]]):
-//   deterministicApply='one-pass-decompose'  -> HTML, decompose-one-pass.js
-//   deterministicApply='node-module-decompose' -> src/*.js, decompose-node-module.js
-//   deterministicApply='blueprint-decompose' -> Flask blueprint, decompose-flask-blueprint.js
-// Deterministic-review hook (S4a of the hub-tasks extraction, 2026-09-24): the shared
-// re-derivation/byte-compare logic (verifyOnePassStyleRederivation) and each kind's own
-// `rebuild` registration now live in decompose-review-registry.js / each producer's own
-// file -- see their headers. This file only gates on the kind and dispatches.
-function verifyDeterministicOnePassDecomposeDraft(task, repoRoot) {
-  const kind = task.promptContext && task.promptContext.deterministicApply;
-  if (kind !== 'one-pass-decompose' && kind !== 'node-module-decompose' && kind !== 'blueprint-decompose') return null;
-  return verifyDeterministicDraft(task, repoRoot);
-}
-
-// The mode:"read" tool-call request is matched structurally by looksLikeReadToolCall (lib/structured-change.js), not by a bare
-// regex: a diff that merely mentions the string must not be rejected as a tool call.
-const NON_IMPL_PATTERNS = [
-  /^(let me|i need to|i will|i'll|i am going to|i'm going to)\s+(read|check|look at|search|verify|examine|understand)\b/i,
-];
-
-function decodeGroupBContent(implementResponse) {
-  try {
-    const parsed = parseJsonMaybeFenced(implementResponse);
-    const items = Array.isArray(parsed) ? parsed : [parsed];
-    const parts = [];
-    for (const item of items) {
-      if (item && typeof item.content === 'string') parts.push(item.content);
-      if (item && typeof item.find === 'string') parts.push(item.find);
-      if (item && typeof item.replace === 'string') parts.push(item.replace);
-    }
-    return parts.join('\n \n');
-  } catch (e) {
-    return '';
-  }
-}
-
-// 2026-09-13 (screaminggoatclubmt investigation, pipeline-forensics-fix-ac-24): a Group B
-// implement response ([{mode:'edit',...}, {mode:'create',...}], the same shape
-// decodeGroupBContent above already knows how to read) reaches buildVerdictPrompt below as
-// task.implementResponse's RAW, compact JSON.stringify string -- real newlines inside
-// find/replace/content escaped to literal backslash-n, everything on one line. Root-caused
-// live: a draft that genuinely included both a correct edit AND a real, substantial new
-// test file (test/ac-24-duplicate-flag-acceptance.js, positive+negative assertions) was
-// REJECTED TWICE by the local reviewer model with the identical verdict "the draft omits
-// the acceptance test" -- reproducing the exact prompt sent confirmed the test file's full
-// content genuinely was present, verbatim, but buried as an escaped substring inside one
-// unbroken JSON line the quantized local reviewer failed to parse/attend to. This is a
-// legibility failure the pipeline itself induces, not the model being unreasonable given
-// what it was shown -- decodeGroupBContent already exists for exactly this shape, but is
-// wired up only to the narrow fixedLiterals byte-match gate, never to the prompt every
-// generic (non-deterministically-verified) review actually reads.
 // Renders each op as its own labeled section with REAL newlines restored, so the reviewer
 // sees legible before/after text instead of an escaped blob. Falls through to the raw
 // string unchanged for anything that isn't recognizably Group B (a single JSON object, a
@@ -382,7 +183,6 @@ function resolveDynamicReviewField(field, task) {
 // that does not exist" (the file is created by the diff, absent from the live repo). This renders the recorded result as ground truth, with the limits of
 // what it proves stated up front so a clean run is not mistaken for "the change is correct". Empty string when there is no result (gate off / not run).
 const EV_MAX_FILES = 8;
-const EV_MAX_ITEMS = 6;
 function evList(items, max) {
   const shown = items.slice(0, max).join(', ');
   return items.length > max ? `${shown} (+${items.length - max} more)` : shown;
@@ -449,6 +249,8 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   // source, not just research (a code claim citing "as of today" could hit the same trap).
   lines.push(`The real current date is ${new Date().toISOString().slice(0, 10)}. Do not assume any earlier date is "now," and do not reject a cited source, URL, or claimed date merely for being after some earlier date you might otherwise assume is current -- judge recency/plausibility against the real date above, not your own training-data intuition of "the present."`);
   lines.push('The drafting model produced the plan and implementation below and cannot verify its own claims -- treat every concrete claim as UNVERIFIED.');
+  lines.push(REVIEW_POLL_LINES);
+  lines.push(REVIEW_IO_LINES);
   lines.push('');
   lines.push(`TASK: ${task.title} (domain=${task.domain}, source=${task.source})`);
   // A decompose / candidate-split proposal is judged on COVERAGE -- do the sub-tasks
@@ -506,9 +308,19 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push(executedSection);
     lines.push('');
   }
+  const reproSection = require('./review-repro.js').formatReproSection(task.executedVerification && task.executedVerification.repro);
+  if (reproSection) {
+    lines.push(reproSection);
+    lines.push('');
+  }
   const inertSection = formatInertAdditionsSection(task.inertAdditions);
   if (inertSection) {
     lines.push(inertSection);
+    lines.push('');
+  }
+  const overlapSection = require('./review-content-overlap.js').formatContentOverlapSection(task.contentOverlap);
+  if (overlapSection) {
+    lines.push(overlapSection);
     lines.push('');
   }
   const inertTargetSection = require('./lib/inert-target.js').formatInertTargetSection(task.inertTarget);
@@ -609,128 +421,6 @@ function classifyVote(markers, minReasoningChars) {
   };
 }
 
-// --- executed verification (2026-09-30) ---------------------------------------------------------
-// The reviewer votes on the draft's own NARRATED "Acceptance:" results and never reproduces any of them. review-verify.js applies the diff in a
-// private scratch worktree, runs the tests that cover it and re-runs the commands the draft claims PASS on (sandboxed), and returns failed /
-// passed / inconclusive. Only a genuine `failed` blocks; `inconclusive` (diff will not apply -- often a stacked slice that depends on an unmerged
-// one --, sandbox missing, timeout, nothing runnable) goes on to the vote exactly as before. Kill switch: AGENT_MANAGER_REVIEW_EXECUTED_VERIFY=false.
-// 2026-10-07: must exceed review-verify.js's test timeout (210s) plus the syntax/command checks, or the
-// budget clamp turns a slow-but-passing covering suite into a timeout. Override with
-// AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS.
-const EXECUTED_VERIFY_BUDGET_MS = 360000;
-
-// Changed-file syntax gate result (review-verify checkChangedFilesSyntax): counts, plus the skipped files with the reason, capped.
-function summariseSyntax(s) {
-  const list = (a) => (Array.isArray(a) ? a : []).slice(0, EV_MAX_ITEMS).map((x) => String(x).slice(0, 160));
-  return {
-    checked: Array.isArray(s.checked) ? s.checked.length : 0,
-    failed: list(s.failed),
-    preexisting: list(s.preexisting),
-    skipped: (Array.isArray(s.skipped) ? s.skipped : []).slice(0, EV_MAX_ITEMS)
-      .map((x) => ({ file: String((x && x.file) || '').slice(0, 160), reason: String((x && x.reason) || '').slice(0, 120) })),
-  };
-}
-
-// A compact, record-safe view of a review-verify result for task.executedVerification (no raw output beyond what a redraft needs).
-function summariseExecutedVerification(ev) {
-  return {
-    status: ev.status,
-    at: new Date().toISOString(),
-    reasons: (ev.reasons || []).slice(0, 6).map((r) => String(r).slice(0, 300)),
-    tests: ev.tests ? { ran: ev.tests.ran || [], passed: ev.tests.passed, failures: (ev.tests.failures || []).slice(0, 10), ...(ev.tests.preexisting && ev.tests.preexisting.length ? { preexisting: ev.tests.preexisting.slice(0, 10) } : {}), ...(ev.tests.dependentsUnverified && ev.tests.dependentsUnverified.length ? { dependentsUnverified: ev.tests.dependentsUnverified.slice(0, 10) } : {}), ...(ev.tests.passedFiles && ev.tests.passedFiles.length ? { passedFiles: ev.tests.passedFiles.slice(0, 10) } : {}), ...(ev.tests.timedOutFiles && ev.tests.timedOutFiles.length ? { timedOutFiles: ev.tests.timedOutFiles.slice(0, 10) } : {}), ...(ev.tests.preexistingOnlyFiles && ev.tests.preexistingOnlyFiles.length ? { preexistingOnlyFiles: ev.tests.preexistingOnlyFiles.slice(0, 10) } : {}), ...(ev.tests.partial && ev.tests.partial.length ? { partial: ev.tests.partial.slice(0, 6).map((x) => ({ file: x.file, count: x.count, passed: x.passed, tests: (x.tests || []).slice(0, 6).map((t) => String(t).slice(0, 100)) })) } : {}) } : null,
-    commands: (ev.commands || []).map((c) => ({
-      criterion: String(c.criterion || '').slice(0, 160), command: c.command, claimedPass: !!c.claimedPass, outcome: c.outcome, exitCode: c.exitCode,
-    })),
-    ...(ev.unpinned && typeof ev.unpinned === 'object' ? { unpinned: summariseUnpinned(ev.unpinned) } : {}),
-    ...(ev.syntax && typeof ev.syntax === 'object' ? { syntax: summariseSyntax(ev.syntax) } : {}),
-  };
-}
-
-// Unpinned-change result (review-verify checkUnpinned, brain dump #1664): hunks the covering tests do not pin. Counts are clamped to numbers and the hunk list is capped.
-function summariseUnpinned(u) {
-  const n = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
-  return {
-    total: n(u.total), checked: n(u.checked), skipped: n(u.skipped),
-    hunks: (Array.isArray(u.hunks) ? u.hunks : []).slice(0, EV_MAX_ITEMS)
-      .map((h) => ({ file: String((h && h.file) || '').slice(0, 160), start: n(h && h.start), end: n(h && h.end) })),
-  };
-}
-
-// The block reason doubles as the redraft feedback (reject-retry-check hands blockedReason back to the drafter), so it names what failed.
-function executedVerificationBlockReason(ev) {
-  const bits = [];
-  if (ev.tests && ev.tests.passed === false) {
-    const names = (ev.tests.failures || []).slice(0, 5).join('; ');
-    bits.push(`the tests covering it (${(ev.tests.ran || []).join(', ')}) FAIL${names ? `: ${names}` : ''}`);
-  }
-  for (const c of (ev.commands || []).filter((x) => x.outcome === 'contradicted')) {
-    bits.push(`the draft claimed PASS for \`${c.command}\` but it exits ${c.exitCode}`);
-  }
-  const tail = (ev.tests && ev.tests.passed === false && ev.tests.raw)
-    || ((ev.commands || []).find((c) => c.outcome === 'contradicted') || {}).detail || '';
-  return `Deterministic gate: executed verification failed -- the diff was applied in a scratch worktree and ${bits.join('; ') || (ev.reasons || []).join('; ')}.${tail ? ` Output tail: ${String(tail).trim().slice(-700)}` : ''} No local-model review call spent on a draft whose own tests or claimed checks demonstrably fail.`;
-}
-
-// --- inert additions, as the voters see them (brain dump #1665) -------------------------------------------------------------------------------------
-// review-inert.js lists NEW functions/classes/files in the diff that nothing else references (not another added line, not code already on the base; a use only in
-// a test, an export list or a comment does not count). Four of ten needs-work branches examined on 2026-09-30 were half a feature of exactly this kind. It is
-// advisory: a hub slice may be wired by a later sibling, and a library helper may be what the task asked for, so it goes to the voters as evidence and never blocks.
-const INERT_MAX_ITEMS = 8;
-
-// A slice of a hub (stacked branch, dependency, parent hub) can legitimately add something a later sibling wires up.
-function isHubChildTask(task) {
-  if (!task || typeof task !== 'object') return false;
-  return !!(task.stacked || task.parentHub
-    || (Array.isArray(task.dependsOn) && task.dependsOn.length) || (Array.isArray(task.softDependsOn) && task.softDependsOn.length)
-    || /^HUB\d+\b/.test(String(task.title || '')) || /^HUB\d+-/.test(String(task.id || '')));
-}
-
-// A ref `git grep` can search: the remote-tracking branch the draft was based on, else the local one, else null (not a git checkout).
-function resolveInertBaseRef(repoRoot, branch) {
-  const { execFileSync } = require('child_process');
-  for (const ref of [`origin/${branch}`, branch]) {
-    try {
-      execFileSync('git', ['-C', repoRoot, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { stdio: 'ignore', timeout: 10000 });
-      return ref;
-    } catch { /* try the next */ }
-  }
-  return null;
-}
-
-// Undefined-identifier-after-removal (src/review-undefined-after-removal.js, brain dump #1768): a change that deletes a declaration but leaves a use of the name in the
-// post-change file. The draft is read from whichever shape it has: an adhoc rawDiff, or a Group B edit array (the arch_review / *_fix lanes carry no rawDiff).
-// AGENT_MANAGER_REVIEW_UNDEFINED_CHECK: 'false' = off, 'advisory' = evidence for the voters only, anything else (default) = block.
-function editsOfImplementResponse(task) {
-  try {
-    const parsed = parseJsonMaybeFenced(task && task.implementResponse);
-    const items = Array.isArray(parsed) ? parsed : [parsed];
-    const isOp = (i) => i && typeof i === 'object' && typeof i.file === 'string'
-      && ((i.mode === 'edit' && typeof i.find === 'string' && typeof i.replace === 'string') || (i.mode === 'create' && typeof i.content === 'string') || i.mode === 'delete');
-    return items.length && items.every(isOp) ? items : null;
-  } catch { return null; }
-}
-
-function summariseUndefinedRemoval(r) {
-  const n = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
-  const uses = Array.isArray(r && r.uses) ? r.uses : [];
-  return {
-    at: new Date().toISOString(), considered: n(r && r.considered), unknown: n(r && r.unknown), total: uses.length,
-    uses: uses.slice(0, 8).map((u) => ({
-      file: String((u && u.file) || '').slice(0, 160), name: String((u && u.name) || '').slice(0, 120),
-      lines: (Array.isArray(u && u.lines) ? u.lines : []).slice(0, 5).map((l) => ({ line: n(l && l.line), text: String((l && l.text) || '').slice(0, 140) })),
-    })),
-  };
-}
-
-function undefinedRemovalWhere(u) {
-  return `\`${u.name}\` in ${u.file} (${u.lines.map((l) => `line ${l.line}: ${l.text}`).join(' | ')})`;
-}
-
-function undefinedRemovalBlockReason(summary) {
-  const items = (summary && summary.uses) || [];
-  return `Deterministic gate: undefined identifier after removal -- the change deletes the declaration of ${items.length} name(s) that the file still uses, so the code would throw a ReferenceError when that line runs: ${items.map(undefinedRemovalWhere).join('; ')}. Either keep the declaration, or replace every remaining use with the new form.`;
-}
-
 function formatUndefinedRemovalSection(ua) {
   if (!ua || typeof ua !== 'object' || !Array.isArray(ua.uses) || !ua.uses.length) return '';
   return [
@@ -739,17 +429,6 @@ function formatUndefinedRemovalSection(ua) {
       + ua.uses.map(undefinedRemovalWhere).join('; ') + '.',
     'Unless a remaining use is unreachable or the name is a global, this draft throws a ReferenceError at that line: it should be rejected.',
   ].join('\n');
-}
-
-function summariseInertAdditions(r, hubChild) {
-  const n = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
-  const inert = Array.isArray(r && r.inert) ? r.inert : [];
-  return {
-    at: new Date().toISOString(), considered: n(r && r.considered), unknown: n(r && r.unknown), hubChild: !!hubChild, total: inert.length,
-    inert: inert.slice(0, INERT_MAX_ITEMS).map((i) => ({
-      kind: ['function', 'class', 'file'].includes(i && i.kind) ? i.kind : 'function', name: String((i && i.name) || '').slice(0, 120), file: String((i && i.file) || '').slice(0, 160), line: n(i && i.line),
-    })),
-  };
 }
 
 function formatInertAdditionsSection(ia) {
@@ -763,32 +442,6 @@ function formatInertAdditionsSection(ia) {
     ? 'This task is one slice of a hub, so a later sibling may legitimately wire these up. Check whether the task text or the plan says which slice does; if it does, this is expected and not a reason to reject.'
     : 'Nothing in this task wires them in. Unless the task asked only for a reusable helper or module to be used later, ask whether the draft is half a feature: a field nothing reads, a file nothing loads, a function nothing calls. This is evidence to weigh, not a verdict.');
   return out.join('\n');
-}
-
-// --- gate replay, as the voters see it (brain dump "Pipeline yellow hardening 7/8") -----------------------------------------------------------------------
-// gate-replay.js replays every gate/guard/detector the diff adds or changes over tasks that already ran. On 2026-10-01 three such drafts passed their own tests and three
-// unanimous approve votes while flagging 5.7% of finished tasks, 21% of merged edit drafts, and changing every source's evidence set. The numbers below are what the votes lacked.
-const GATE_REPLAY_MAX_ITEMS = 3;
-
-function summariseGateReplay(replay) {
-  if (!replay || typeof replay !== 'object') return null;
-  const { replayVerdict, gateReplayMaxRate } = require('./gate-replay.js');
-  const n = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
-  const cands = Array.isArray(replay.candidates) ? replay.candidates : [];
-  const skipped = Array.isArray(replay.skipped) ? replay.skipped : [];
-  if (!cands.length && !skipped.length) return null;
-  const verdict = replayVerdict(replay, { maxRate: gateReplayMaxRate() });
-  return {
-    at: new Date().toISOString(), block: verdict.block, blockReasons: verdict.reasons.map((r) => String(r).slice(0, 300)), maxRate: gateReplayMaxRate(),
-    candidates: cands.slice(0, GATE_REPLAY_MAX_ITEMS).map((c) => ({
-      name: String(c.name || '').slice(0, 80), file: String(c.file || '').slice(0, 120), family: String(c.family || '').slice(0, 20), blocking: !!c.blocking, total: n(c.total), mergedTotal: n(c.mergedTotal),
-      beforeFlaggedMerged: c.before ? n(c.before.flaggedMerged) : null, afterFlaggedMerged: c.after ? n(c.after.flaggedMerged) : 0, afterFlagged: c.after ? n(c.after.flagged) : 0,
-      rateMerged: Number.isFinite(c.rateMerged) ? c.rateMerged : null, newCount: n(c.newlyFlaggedMergedCount),
-      newRateMerged: n(c.mergedTotal) ? n(c.newlyFlaggedMergedCount) / n(c.mergedTotal) : null,
-      examples: (Array.isArray(c.newlyFlaggedMerged) ? c.newlyFlaggedMerged : []).slice(0, 3).map((x) => ({ id: String((x && x.id) || '').slice(0, 70), detail: String((x && x.detail) || '').slice(0, 100) })),
-    })),
-    skipped: skipped.slice(0, GATE_REPLAY_MAX_ITEMS).map((x) => ({ name: String((x && x.name) || '').slice(0, 80), reason: String((x && x.reason) || '').slice(0, 160) })),
-  };
 }
 
 function formatGateReplaySection(gr) {
@@ -819,24 +472,6 @@ function formatPolicyChangeSection(pc) {
   ].join('\n');
 }
 
-// --- skip / dismiss / early-exit paths, as the voters see them (brain dump #1667) --------------------------------------------------------------------
-// review-skip-paths.js lists the places a diff ADDS code that can archive, dismiss, skip or short-circuit work. Three of ten needs-work branches examined on
-// 2026-09-30 did that and wrongly dropped real cases while their tests passed (a startup exemption ahead of a hot-path check, a gate that archived a genuine finding
-// whose snippet lacked the loop header, a zero-result early exit shared by every project). Advisory: the voters are told what the draft must then show.
-const SKIP_PATH_MAX_ITEMS = 8;
-
-function summariseSkipPaths(r) {
-  const n = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
-  const paths = Array.isArray(r && r.paths) ? r.paths : [];
-  return {
-    at: new Date().toISOString(), total: Math.max(n(r && r.total), paths.length),
-    paths: paths.slice(0, SKIP_PATH_MAX_ITEMS).map((p) => ({
-      kind: ['status-label', 'skip-flag', 'early-exit', 'gate-function'].includes(p && p.kind) ? p.kind : 'status-label',
-      file: String((p && p.file) || '').slice(0, 160), line: n(p && p.line), text: String((p && p.text) || '').slice(0, 120),
-    })),
-  };
-}
-
 function formatSkipPathSection(sp) {
   if (!sp || typeof sp !== 'object' || !Array.isArray(sp.paths) || !sp.paths.length) return '';
   const where = sp.paths.map((p) => `${p.file}:${p.line} (${p.kind}: ${p.text})`);
@@ -853,7 +488,7 @@ function formatSkipPathSection(sp) {
  * The actual review logic, independent of the CLI/stdout wrapper below -- exported (via
  * the reviewTask wrapper) so tests can call it directly with a fake localMajorityVote.
  */
-async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null, findInertFn = null, findSkipPathsFn = null, findUndefinedFn = null } = {}) {
+async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null, findInertFn = null, findSkipPathsFn = null, findUndefinedFn = null, findOverlapFn = null } = {}) {
   // Resolved here rather than as a static default param, same reasoning as
   // local-draft.js's draftTask() -- the right backend depends on the task's reasoning
   // tier, only known once the task object is in hand. Passing the whole task (not just
@@ -896,734 +531,23 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     : baseMajorityVote;
   appendHistoryEvent(task, 'review-started');
 
-  // 2026-09-08, brain-dump bd-1788787323412 ("investigate the COMPLETED 20 (line 2714)
-  // failure mode"): a draft whose implementResponse is a refusal sentence followed by a
-  // code fragment that cuts off mid-string (an unterminated trailing quote -- the
-  // incident's own literal "...Topology signature) used to reach the full fact-check +
-  // majority-vote machinery below, burning a real review round on content that was never
-  // going to apply. Checked here, first, before any real work -- cheap and applies to
-  // every source, not just the one this incident happened on. (The task that first
-  // described this fix named review-runner.ps1/decode-group-b-content.js as the
-  // insertion point -- that pair is the Windows reference implementation's own
-  // fixedLiterals compliance gate and is never invoked from the real Linux path;
-  // review-runner.sh calls this module, review-task.js, directly, with no
-  // decode-group-b-content.js step at all. Wired here instead: the actual live entry
-  // point every draft's review goes through.)
-  // A genuinely empty/whitespace-only implementResponse is NOT this guard's concern --
-  // decideEmptyApprovalOutcome below already handles that case deliberately (approve when
-  // harness search found zero real hits, block otherwise), a more informed decision than
-  // this guard's blanket "empty = truncated" rule 1 would make. Only run the guard on
-  // NON-empty text, where its real job (a refusal sentence followed by a code fragment
-  // that cuts off mid-string) applies.
-  const rawImplementResponse = task.implementResponse || '';
-  const truncationCheck = rawImplementResponse.trim()
-    ? detectTruncatedImplementResponse(rawImplementResponse, resolveSourceName(task))
-    : { truncated: false, reason: null };
-  if (truncationCheck.truncated) {
-    const rawText = rawImplementResponse;
-    task.reviewProvider = 'deterministic-truncation-guard';
-    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: truncationCheck.reason });
-    appendHistoryEvent(task, 'blocked', `${truncationCheck.reason} (raw text length ${rawText.length}, starts "${rawText.slice(0, 80)}", ends "${rawText.slice(-80)}")`);
-    return { succeeded: true, verdict: 'blocked', blockedReason: truncationCheck.reason, blockedStage: 'review', factCheckVerdict: 'skipped' };
-  }
+  const earlyResult = runEarlyGates({ task, recordModelOutcome, secondBrainDir, repoRoot });
+  if (earlyResult) return earlyResult;
 
-  // Deterministic review (brain_dump_sort, 2026-09-03): a mechanical validate replaces the
-  // LLM majority vote entirely -- no grounding subprocess, no fact-check, no vote. The vote
-  // was rejecting valid classifications on folder/filename nitpicks its own guidance forbade
-  // (8 permanently-blocked tasks). A failure here still sets blockedStage:'review', so
-  // reject-retry-check folds the specific reason into the next draft (an informed retry).
-  const detValidate = deterministicReviewValidator(resolveSourceName(task));
-  if (detValidate) {
-    let outcome;
-    try {
-      outcome = detValidate(task, { secondBrainDir, repoRoot });
-    } catch (e) {
-      outcome = { ok: false, reason: `deterministic review validator threw: ${e.message}` };
-    }
-    if (outcome && outcome.ok) {
-      task.reviewedAt = new Date().toISOString();
-      task.reviewProvider = 'deterministic-brain-dump-sort';
-      task.localVerdict = 'Auto-approved: deterministic classification validation passed (no vote).';
-      recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
-      appendHistoryEvent(task, 'approved', 'deterministic-brain-dump-sort');
-      return { succeeded: true, verdict: 'approved', factCheckVerdict: 'skipped' };
-    }
-    const reason = `Deterministic review: ${outcome ? outcome.reason : 'validation failed'}`;
-    task.reviewProvider = 'deterministic-brain-dump-sort';
-    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-    appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict: 'skipped' };
-  }
+  const prepared = prepareFactCheck({ task, repoRoot, secondBrainDir, domainsPath, deepDiveCoveragePath, pipelineDir, recordModelOutcome });
+  if (prepared.early) return prepared.early;
+  const { factCheck, factCheckVerdict, repoRootForCheck, groundingText, factCheckExtraRoots, groundingRef } = prepared;
 
-  // Honest null outcome (2026-09-27, advisory-null-outcome.js): a pipeline_forensics `NO CLEAR ROOT CAUSE -- <signal>`, a
-  // pipeline_debrief `NO CONFIDENT INEFFICIENCY -- <signal>` line or a pipeline_health_audit `FALSE POSITIVE -- <why>` is the
-  // form the prompts instruct for "the evidence supports no finding". The LLM vote kept rejecting it (3/3 forensics nulls 2/2
-  // REJECT despite reviewGuidance saying a null is valid; 4/4 health-audit FALSE POSITIVE lines as "refusals"), so the only way
-  // through was fabrication. A well-formed null is approved mechanically -- no fact-check, no vote -- and falls through to the
-  // normal path for anything else. Same shape as the deterministic-review branch above.
-  const nullOutcome = classifyNullOutcome(resolveSourceName(task), rawImplementResponse);
-  if (nullOutcome) {
-    task.reviewedAt = new Date().toISOString();
-    task.reviewProvider = 'deterministic-null-outcome';
-    task.localVerdict = `Auto-approved: honest null outcome (${nullOutcome.kind}) -- deterministic, no vote.`;
-    recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
-    appendHistoryEvent(task, 'approved', `deterministic-null-outcome: ${nullOutcome.kind}`);
-    return { succeeded: true, verdict: 'approved', factCheckVerdict: 'skipped' };
-  }
+  const gated = runDeterministicGates({ task, factCheck, factCheckVerdict, repoRootForCheck, factCheckExtraRoots, groundingRef, pipelineDir, recordModelOutcome });
+  if (gated.early) return gated.early;
+  const { trimmedImplResponse } = gated;
 
-  const domainCfg = getDomainConfig(domainsPath, task.domain);
-  const workDir = getWorkDir(domainCfg, { repoRoot, secondBrainDir });
+  const preVoteBlock = runPreVoteChecks({ task, repoRoot, repoRootForCheck, pipelineDir, factCheckVerdict, recordModelOutcome, trimmedImplResponse, verifyDiffFn, findInertFn, findOverlapFn, findUndefinedFn, findSkipPathsFn });
+  if (preVoteBlock) return preVoteBlock;
 
-  // fact-check: deep_dive's real "repo root" for this purpose is the cloned external
-  // project (looked up by promptContext.projectSlug), not agent-manager's own repo --
-  // otherwise every referenced file reports as missing.
-  let repoRootForCheck = workDir;
-  if (task.source === 'deep_dive' && deepDiveCoveragePath && fs.existsSync(deepDiveCoveragePath)) {
-    try {
-      const ddCoverage = JSON.parse(fs.readFileSync(deepDiveCoveragePath, 'utf8'));
-      const ddProj = ddCoverage.projects && ddCoverage.projects[task.promptContext.projectSlug];
-      if (ddProj && ddProj.clonePath) repoRootForCheck = ddProj.clonePath;
-    } catch (e) { /* fall back to workDir */ }
-  }
-
-  const taskPathForGrounding = path.join(require('os').tmpdir(), `review-grounding-${task.id}.json`);
-  let groundingText = '';
-  try {
-    fs.writeFileSync(taskPathForGrounding, JSON.stringify(task));
-    groundingText = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPathForGrounding], { encoding: 'utf8' });
-  } catch (e) {
-    console.error(`[review-task] grounding-source generation failed for ${taskPathForGrounding}: ${e.stack || e.message || String(e)}`);
-    groundingText = '';
-  } finally {
-    try { fs.unlinkSync(taskPathForGrounding); } catch (e) { /* best-effort cleanup */ }
-  }
-
-  // Feed the consumer's configured code dirs (AGENT_MANAGER_GREP_DIRS) as extraRoots so
-  // resolveAgainstRepo can turn a bare `app.py` into `server/app.py` instead of reporting
-  // it "missing" -> "fabricated". Only meaningful when the fact-check runs against
-  // agent-manager's OWN repoRoot (the default); for a deep_dive external clone or the
-  // second-brain vault, these dirs don't apply and simply won't match -- harmless.
-  const factCheckExtraRoots = (repoRootForCheck === workDir)
-    ? (() => { try { return getConfig().grepAllowedDirs; } catch { return []; } })()
-    : [];
-  // 2026-09-08, root-caused live: a stacked task correctly citing a sibling's real,
-  // committed-but-unmerged value was hard-blocked as "cites a value that appears nowhere
-  // in its real grounding source" -- the grep ran against repoRootForCheck's plain working
-  // tree, never the shared stacked branch. resolveGroundingRef is null for any non-stacked
-  // task (the overwhelming majority) or when the deep_dive external-clone repoRootForCheck
-  // swap already happened above, so this only diverges for the exact stacked case.
-  const groundingRef = (repoRootForCheck === workDir) ? resolveGroundingRef(task, repoRootForCheck) : null;
-
-  // Pre-fact-check gate for sources registering preValidateCitedPaths -- project_search / arch_import (2026-09-08 brain-dump request):
-  // those two sources' drafts are plain prose citing specific files and line numbers as
-  // evidence for a claim, not a Group B diff -- checkDraft's own fabricated-path handling
-  // is tuned for a diff's claimed file targets, not "does this cited EVIDENCE actually
-  // exist." Cheaper and runs first: a draft that fails this never reaches the rest of the
-  // fact-checker or a review call at all. blockedReason is prefixed 'ungrounded draft:
-  // fabricated file path' so blocked-task-classifiers.js's hasFabricatedFilePath treats
-  // it as the same retryable:false category a real diff-side fabrication already is.
-  const preValidateSource = resolveSourceName(task);
-  const preValidateEntry = getRegisteredSource(preValidateSource);
-  // `preValidateCitedPaths: true` on the source's registration (project_search in core, arch_import in the hygiene plugin).
-  if (preValidateEntry && preValidateEntry.preValidateCitedPaths === true) {
-    const preValidation = preValidateCitedPaths(task.implementResponse || '', repoRootForCheck, factCheckExtraRoots);
-    if (!preValidation.valid) {
-      const reason = `ungrounded draft: fabricated file path -- pre-validation: ${preValidation.failures.join('; ')}`;
-      task.reviewProvider = 'deterministic-pre-validation';
-      logFactCheckAudit(pipelineDir, {
-        taskId: task.id, source: preValidateSource, reason,
-        flags: preValidation.failures.map((f) => ({ type: 'pre-validation', detail: f })),
-      });
-      recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-      appendHistoryEvent(task, 'blocked', reason);
-      return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict: 'skipped' };
-    }
-  }
-
-  const factCheck = checkDraft(task.implementResponse || '', repoRootForCheck, groundingText || undefined, factCheckExtraRoots, groundingRef);
-  // `imprecise-file-path` is informational (a real file cited with a sloppy prefix) --
-  // it must not by itself flip the verdict label to "flagged".
-  const factCheckVerdict = (factCheck.flags || []).some((f) => f.type !== 'imprecise-file-path') ? 'flagged' : 'pass';
-
-  // 2026-08-24 (pipeline hardening -- resurrects a real gap closed once already on
-  // 2026-08-12 for the old Windows/PowerShell review-runner.ps1, never carried forward
-  // across this project's Linux port): fact-checker.js's own comments call ungrounded-url
-  // and ungrounded-field "almost never a false positive" -- checkGroundedValues() only
-  // ever flags a value when there IS real grounding source text to compare against and
-  // the value appears NOWHERE in it, placeholders already exempted. That precision was
-  // being wasted as advisory context a review vote could (and did) simply ignore, the
-  // same "known-bad signal, only advisory" shape every OTHER deterministic gate in this
-  // function already treats as disqualifying. Hard-blocks before spending a review call,
-  // same as the empty-response/non-implementation/fixed-literals gates below.
-  // 2026-08-25, root-caused live via a real blocked adhoc task (second-brain review
-  // sweep): RESOLUTION: decompose (adhoc-agentic-draft.js's "task judged too large,
-  // propose sub-tasks instead of a diff" outcome, carved out in buildVerdictPrompt below
-  // -- see its own comment) got hard-blocked here anyway, before ever reaching that
-  // carve-out, because a decompose proposal's sub-task rawText routinely SUGGESTS names
-  // for config/paths a FUTURE sub-task should create (e.g. "add
-  // AGENT_MANAGER_SECOND_BRAIN_REVIEW_COVERAGE_PATH, following the pattern of
-  // stalenessAuditCoveragePath" -- explicitly marked as a proposal, "e.g.", never a claim
-  // that it already exists). checkGroundedValues' whole premise is "a value cited as
-  // already-real that appears nowhere in the grounding source is fabricated" -- a
-  // category error against text that is deliberately proposing something new, the exact
-  // same "new declaration, not a claimed-existing value" distinction NEW_DECLARATION_RE
-  // already carves out for a real diff's own `+const NAME = ...` line, just for a
-  // decompose proposal's prose instead of a diff. Scoped ONLY to the two high-precision
-  // flags that hard-block with no review call at all -- factCheck's OTHER checks (missing-
-  // file, fabricated-commit-reference, unconfirmed-relationship) still run and still hard-
-  // block a decompose response exactly as before: those check "does this cite something
-  // that claims to already exist," which stays a real fabrication signal even in a
-  // decompose proposal's prose. And the full factCheck (including these two flags) is
-  // still handed to the reviewer model via buildVerdictPrompt below regardless -- this
-  // only removes the automatic no-review-call block, not the information itself.
-  // 2026-08-26: a `{"mode": "split"}` proposal (see candidateSplitInstructions) is the
-  // exact same category as a decompose proposal above -- prose describing FUTURE
-  // sub-candidates, which routinely names config/field values a future drafting pass
-  // should create, not a claim that something already exists. Same carve-out, same
-  // "still checked, just not auto-blocked" scoping.
-  //
-  // 2026-09-02: the same category error for an advisoryProse candidate-generating review
-  // source (function_length_review / performance_review / observability_review). Their
-  // deliverable is a `### AC-NNN` candidate block whose Solution paragraph PROPOSES names
-  // for helpers/constants a FUTURE fix pass should introduce ("extract into a
-  // RETRYABLE_WITH_BACKOFF branch", "compute START_MS once outside the loop") -- never a
-  // claim that RETRYABLE_WITH_BACKOFF / START_MS already exists. checkGroundedValues'
-  // premise ("a value cited as already-real that appears nowhere is fabricated") is a
-  // category error against a proposal, exactly like the decompose case above. Confirmed
-  // live: function-length-...reject-retry-check-js-90 (RETRYABLE_WITH_BACKOFF),
-  // performance-...uptime-log-js-58 (START_MS). Still handed to the vote via
-  // buildVerdictPrompt -- just not an automatic no-review block.
-  const isDecomposeProposal = getDecomposeProposalDetection().isDecomposeOrSplitProposal(task);
-  const isProposalNotClaim = isDecomposeProposal || isAdvisoryProseSource(resolveSourceName(task));
-  let highPrecisionFlags = isProposalNotClaim
-    ? []
-    : (factCheck.flags || []).filter((f) => f.type === 'ungrounded-url' || f.type === 'ungrounded-field');
-  // HUB0090 · 2/2 · relocation-validation branch: a draft whose edited file is not in the
-  // frozen Files: list is NOT auto-rejected when the flagged target symbol has genuinely
-  // moved (frozen file lacks it at current HEAD, the draft's file carries it) or was only
-  // truncated out of the frozen window (AC-61). Only flags it cannot explain stay for the
-  // original gate below, which is untouched and still reachable.
-  if (highPrecisionFlags.length > 0) {
-    const relocation = validateRelocatedDraftSymbols(task, highPrecisionFlags, repoRootForCheck);
-    if (relocation.validated.length > 0) {
-      const draftFilesList = changedFilesOfDiff(task.rawDiff || '').join(', ') || '(no diff)';
-      for (const v of relocation.validated) {
-        appendHistoryEvent(task, 'relocation-validated',
-          `HUB0090: ${v.type} symbol "${v.symbol}" -- ${v.note}; frozenFile: ${v.frozenFile}; draftFile: ${v.draftFile || '(draft edits: ' + draftFilesList + ')'}; ac61Refetch: ${v.ac61Refetch}`);
-      }
-      highPrecisionFlags = relocation.remaining;
-    }
-  }
-  if (highPrecisionFlags.length > 0) {
-    const detail = highPrecisionFlags.map((f) => `${f.type}: ${f.detail}`).join('; ');
-    const reason = `Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ${detail}. This fact-check flag is high-precision (almost never a false positive) and treated as disqualifying, not merely advisory context a vote could ignore -- no local-model review call spent on a draft already known to contain a hallucinated value.`;
-    task.reviewProvider = 'deterministic-ungrounded-value';
-    logFactCheckAudit(pipelineDir, { taskId: task.id, source: resolveSourceName(task), flags: highPrecisionFlags });
-    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-    appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-  }
-
-  // reverts-a-prior-fix (2026-09-08, root-caused live via change-review-fix-ac-1 -- see
-  // fact-checker.js's checkRevertsAPriorFix header for the full incident): a Group B edit
-  // that git history shows is reverting toward code an earlier commit of THIS pipeline's
-  // own (AC-\d+-marked) removed is very likely undoing an already-confirmed fix without
-  // knowing it -- the same "high-precision, disqualifying, no review call spent" tier as
-  // ungrounded-url/ungrounded-field above, not merely advisory context a vote (which only
-  // ever checks fidelity to the CURRENT finding, never the target line's own history)
-  // could ignore or miss entirely.
-  const revertFlags = isProposalNotClaim ? [] : (factCheck.flags || []).filter((f) => f.type === 'reverts-a-prior-fix');
-  if (revertFlags.length > 0) {
-    const detail = revertFlags.map((f) => f.detail).join('; ');
-    const reason = `Deterministic gate: this edit reverts code that git history shows was itself the deliberate resolution of an earlier confirmed fix in this pipeline -- ${detail}. Not merely advisory context a vote could ignore -- no local-model review call spent on a draft already known to be undoing a confirmed prior fix; needs a human to judge whether the earlier fix should actually be reversed.`;
-    task.reviewProvider = 'deterministic-reverts-a-prior-fix';
-    logFactCheckAudit(pipelineDir, { taskId: task.id, source: resolveSourceName(task), flags: revertFlags });
-    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-    appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-  }
-
-  const onePassVerdict = verifyDeterministicOnePassDecomposeDraft(task, repoRootForCheck);
-  if (onePassVerdict) {
-    if (onePassVerdict.ok) {
-      task.reviewedAt = new Date().toISOString();
-      task.reviewProvider = 'deterministic-one-pass-decompose-approve';
-      task.localVerdict = `Auto-approved: a whole ${onePassVerdict.moduleCount}-module file-decompose that byte-matches a fresh re-derivation (V8-parser oracle) from current repo state -- no local-model review call spent (the diff is also far larger than the review model's context window).`;
-      recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
-      appendHistoryEvent(task, 'approved', 'deterministic-one-pass-decompose-approve');
-      return { succeeded: true, verdict: 'approved', factCheckVerdict };
-    }
-    const reason = `Deterministic gate: this one-pass decompose's diff no longer matches a fresh re-derivation from current repo state -- ${onePassVerdict.reason}. No local-model review call spent. Requeue re-runs the deterministic draft against the then-current file.`;
-    task.reviewProvider = 'deterministic-one-pass-decompose-reject';
-    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-    appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-  }
-
-  const scriptExtractVerdict = verifyDeterministicScriptExtractDraft(task, repoRootForCheck, groundingRef);
-  if (scriptExtractVerdict) {
-    if (scriptExtractVerdict.ok) {
-      task.reviewedAt = new Date().toISOString();
-      task.reviewProvider = 'deterministic-script-extract-approve';
-      task.localVerdict = 'Auto-approved: this diff is a re-derivable, byte-exact extraction (script-extract.js\'s V8-parser oracle) -- no local-model review call spent (the diff is also far too large to fit in the review model\'s own context window, which is why this gate exists rather than an LLM skim).';
-      recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
-      appendHistoryEvent(task, 'approved', 'deterministic-script-extract-approve');
-      return { succeeded: true, verdict: 'approved', factCheckVerdict };
-    }
-    const reason = `Deterministic gate: this script-extract move's diff no longer matches a fresh re-derivation from current repo state -- ${scriptExtractVerdict.reason}. No local-model review call spent (this diff is also far too large for the review model's context window regardless).`;
-    task.reviewProvider = 'deterministic-script-extract-reject';
-    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-    appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-  }
-
-  const trimmedImplResponse = (task.implementResponse || '').trim();
-  const effectivelyEmpty = isEffectivelyEmpty(trimmedImplResponse);
-
-  // Empty-implement outcome for the 4 "empty is a documented valid outcome" sources.
-  // ONE shared definition (src/empty-approval-decision.js) -- review-runner.ps1 calls the
-  // same module via its CLI, so this can never drift between the two runtimes again.
-  // Replaces the earlier per-runtime flip + the AGENT_MANAGER_DEEP_DIVE_EMPTY_APPROVE_FAIL
-  // kill switch (2026-09-10). 'approve' = empty AND the harness search that fed this task
-  // found real hits (model had material, chose to produce nothing -- the documented
-  // "reviewed it, nothing actionable" no-op). 'block' = empty AND zero harness hits
-  // (nothing to review; the anchor search is deterministic against unchanged inputs so a
-  // blind requeue only re-derives the same empty grounding). null -> fall through.
-  const emptyOutcome = decideEmptyApprovalOutcome(task);
-  if (emptyOutcome === 'block-no-context') {
-    const reason = `Deterministic gate: ${task.source} was given no source files for this task (promptContext.files is empty -- the graph likely names files that are missing or unreadable, or a stale task carries context captured before a fix). Any draft would be ungrounded, so none is reviewed or approved; a blind requeue re-sends the same empty context. Rebuild the graph or regenerate the task.`;
-    task.reviewProvider = 'deterministic-no-context-fail';
-    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-    appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-  }
-  if (emptyOutcome === 'block') {
-    const reason = 'Deterministic gate: implementResponse is empty AND the harness search that fed this task found zero hits -- nothing to review, and a blind requeue only re-derives the same empty grounding (no local-model review call spent)';
-    task.reviewProvider = 'deterministic-empty-fail';
-    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-    appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-  }
-  if (emptyOutcome === 'approve') {
-    task.reviewedAt = new Date().toISOString();
-    task.reviewProvider = 'deterministic-empty-approve';
-    task.localVerdict = `Auto-approved: implementResponse is genuinely empty and the harness search that fed this task found real hits -- a documented valid "nothing actionable" outcome for ${task.source} (no local-model review call spent -- this is deterministic, not a judgment call)`;
-    recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
-    appendHistoryEvent(task, 'approved', 'deterministic-empty-approve');
-    return { succeeded: true, verdict: 'approved', factCheckVerdict };
-  }
-
-  // 2026-09-18 (brain-dump bd-1789602379616, following up on PR #322's exhaustion-
-  // escalation fix): a candidate-fulfillment "_fix" task's implementResponse can be the
-  // documented "FALSE POSITIVE -- <reason>" refusal line (prompts.js's own instructed
-  // format for "this finding no longer applies") -- but that response is short and has
-  // no code fence, so without this check it falls straight into the isNonImplementation
-  // gate just below and gets rejected exactly like a genuinely bad draft, even when the
-  // refusal is CORRECT. decidePremiseRecheckOutcome re-runs the ORIGINAL *_review
-  // source's own deterministic scanner rule against the cited file's CURRENT content --
-  // see that module's own header for why "the rule finds nothing anywhere in the file"
-  // is a safe, conservative confirmation (not a guess) that this exact candidate's
-  // complaint is gone. Ordered before isNonImplementation so a confirmed-correct refusal
-  // never reaches that gate at all -- no wasted retry, no wasted human escalation.
-  const premiseRecheckOutcome = decidePremiseRecheckOutcome(task, { repoRoot: repoRootForCheck, extraRoots: factCheckExtraRoots });
-  if (premiseRecheckOutcome === 'approve') {
-    task.reviewedAt = new Date().toISOString();
-    task.reviewProvider = 'deterministic-premise-recheck-approve';
-    task.localVerdict = 'Auto-approved: implementResponse is a FALSE POSITIVE refusal, and a deterministic re-scan of the '
-      + `original ${getRegisteredSource(task.source) && getRegisteredSource(task.source).premiseRecheckSource}'s own rule set `
-      + 'against the cited file\'s current content confirms nothing is flagged there anymore -- verified, not a judgment call '
-      + '(no local-model review call spent).';
-    recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
-    appendHistoryEvent(task, 'approved', 'deterministic-premise-recheck-approve');
-    return { succeeded: true, verdict: 'approved', factCheckVerdict };
-  }
-
-  let isNonImplementation = false;
-  if (!effectivelyEmpty) {
-    isNonImplementation = looksLikeReadToolCall(trimmedImplResponse) || NON_IMPL_PATTERNS.some((pat) => pat.test(trimmedImplResponse));
-    // A short fence-free response is presumed to be meta-commentary -- unless it IS a structurally valid change set
-    // (lib/structured-change.js): `{"mode": "delete", "file": "<path>"}` is 71-79 characters for this repo's short paths and
-    // was blocked on length alone (deadcode_fix, 9 stranded tasks). NON_IMPL_PATTERNS above still win, so a short
-    // mode:"read" request is rejected exactly as before, and the delete-specific safeguards downstream are untouched.
-    if (!isNonImplementation && trimmedImplResponse.length < 80 && !trimmedImplResponse.includes('```')
-      && !isStructuredGroupBChange(trimmedImplResponse)) {
-      isNonImplementation = true;
-    }
-  }
-  if (isNonImplementation && !isEmptyApprovalSource(task.source) && !isAdvisoryProseSource(task.source)) {
-    const reason = 'Deterministic gate: implementResponse is a bare tool-call request or meta-commentary, not a real implementation attempt -- no local-model review call spent (mechanically detectable, not a judgment call).';
-    task.reviewProvider = 'deterministic-non-implementation';
-    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-    appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-  }
-
-  const fixedLiterals = (task.promptContext && task.promptContext.fixedLiterals) || [];
-  if (fixedLiterals.length > 0) {
-    const decoded = decodeGroupBContent(task.implementResponse || '');
-    const compareText = decoded || trimmedImplResponse;
-    // .trimEnd() on the literal only, not compareText -- narrowly tolerates a missing
-    // trailing newline (never semantically meaningful for "was this copied correctly")
-    // without loosening the check anywhere else. Confirmed live 2026-08-14: a whole-file
-    // fixedLiterals block ending in "\n" (the normal convention for a source file) was
-    // faithfully reproduced character-for-character by the model EXCEPT for that final
-    // newline once embedded as a JSON string value -- a false-positive rejection on an
-    // otherwise-perfect copy, burning a real retry attempt on a class of mismatch that
-    // carries no actual signal about whether the content was copied correctly.
-    const missing = fixedLiterals.filter((lit) => !compareText.includes(lit.content.trimEnd()));
-    if (missing.length > 0) {
-      const missingNames = missing.map((m) => m.name).join(', ');
-      const reason = `Deterministic gate: draft does not contain the required fixed block(s) character-for-character: ${missingNames}. These were given verbatim in the task and must be copied exactly, not rewritten from memory -- no local-model review call spent on a draft that already fails a mechanical check.`;
-      task.reviewProvider = 'deterministic-fixed-literals';
-      recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-      appendHistoryEvent(task, 'blocked', reason);
-      return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-    }
-  }
-
-  // 2026-08-24 (pipeline hardening -- same resurrected gap as the ungrounded-value block
-  // above, closed once already on 2026-08-12 for review-runner.ps1, never carried
-  // forward across this project's Linux port): local-draft.js's own critique+revision
-  // pass had already found real issues in this exact draft (task.critiqueOutcome ===
-  // 'issues-flagged'), but review-task.js never once read that field -- a draft its own
-  // critique had flagged as broken could still win a clean vote, because the review pass
-  // simply never knew the critique ran at all. task.revisionApplied is only ever false
-  // here when local-draft.js's own follow-up revision call came back degenerate (see its
-  // own comment) -- meaning the ORIGINAL, critique-flagged draft is what's about to reach
-  // review, with a known, real, already-identified problem review has no visibility into.
-  if (task.critiqueOutcome === 'issues-flagged' && !task.revisionApplied) {
-    const reason = `Deterministic gate: this draft's own critique pass flagged real issues, and the follow-up revision attempt failed (degenerate) or was never applied -- the draft reaching review is the SAME one the critique already found problems with. No local-model review call spent voting on a draft already known to have unaddressed issues.${task.critiqueText ? ` Critique: ${task.critiqueText.slice(0, 500)}` : ''}`;
-    task.reviewProvider = 'deterministic-unaddressed-critique';
-    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-    appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-  }
-
-  // Component 2 (2026-09-04): an adhoc task with acceptance criteria whose implement draft
-  // produced NO "Acceptance:" block reporting a check for each -- block before spending a
-  // vote, same discipline as the fixedLiterals / unaddressed-critique gates above. Kill
-  // switch AGENT_MANAGER_ADHOC_ACCEPTANCE_GATE=false (keeps the review-question folding, drops
-  // this hard gate -- the advisory-first rollout step).
-  if (process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE_GATE !== 'false'
-      && resolveSourceName(task) === 'adhoc'
-      && task.adhocResolution === 'implemented'
-      && Array.isArray(task.acceptanceCriteria) && task.acceptanceCriteria.length
-      && !(Array.isArray(task.acceptanceResults) && task.acceptanceResults.length)) {
-    const reason = `Deterministic gate: this task has ${task.acceptanceCriteria.length} acceptance criteria but the implement draft produced no "Acceptance:" block reporting a check for each -- no local-model review call spent on a draft that skipped its own definition of done.`;
-    task.reviewProvider = 'deterministic-missing-acceptance';
-    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-    appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-  }
-
-  // Enforce code-diff presence for a source that registers requireCodeShapeInCandidate (function_length_review; 2026-09-08 brain-dump
-  // request): its deliverable is an `### AC-NNN` candidate whose Solution shows the
-  // proposed change, not just prose describing what should change -- a prose-only draft
-  // routinely got voted through, then rejected downstream (fulfillment) for having
-  // nothing concrete to implement. Block before spending a review call, same discipline
-  // as the neighboring deterministic gates above. Kept permissive enough to still pass a
-  // legitimate candidate whose Solution includes an inline fenced snippet or diff hunk --
-  // this only rejects PURE prose with no code shape at all.
-  //
-  // Scoped to CANDIDATE drafts (2026-09-19, PF-Client-Portal HotlistView.tsx:47): the review prompt
-  // (function-length-review.js) says a FALSE POSITIVE / UNCERTAIN verdict is "ONE short paragraph...
-  // plain prose only -- no code fence", so a prose verdict is the CORRECT output there. This gate used
-  // to reject it, so every false-positive verdict burned 3 drafts and escalated to a human. Only a draft
-  // that is a candidate (an `### AC-NNN` block, the parser's contract) owes a code shape.
-  // Registration flag `requireCodeShapeInCandidate: true` (function_length_review, in the hygiene plugin).
-  const codeShapeEntry = getRegisteredSource(resolveSourceName(task));
-  if (codeShapeEntry && codeShapeEntry.requireCodeShapeInCandidate === true && trimmedImplResponse
-      && /^#{2,4}\s*AC-\S+/m.test(trimmedImplResponse)
-      && !/```/.test(trimmedImplResponse)
-      && !/^(?:---|\+\+\+|@@)/m.test(trimmedImplResponse)
-      && !/^(?:\+|-)(?!\s*$)\S/m.test(trimmedImplResponse)) {
-    const reason = 'Deterministic gate: missing-code-diff -- candidate drafts from this source must show the concrete change as a fenced code block or diff hunk, not prose-only commentary describing what should change. No local-model review call spent on a draft with no code shape at all.';
-    task.reviewProvider = 'deterministic-missing-code-diff';
-    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-    appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-  }
-
-  // Edit-set syntax gate (lib/edit-set-syntax.js, 2026-10-08, TaxHarvest AC-271): the executed-verification block below runs only for adhoc drafts that carry
-  // a rawDiff, so a Group B draft (a JSON edit set -- arch_review / function_length_fix / observability_fix / change_review_fix ...) was never syntax-checked and
-  // an edit that split an import reached pending-merge. Replays the set against the repo and parses every created/edited file; a file that parsed before the
-  // edit and does not now is a deterministic block, same discipline as the gates above (no vote is spent). Coverage (checked / skipped with reasons) is
-  // stamped on task.editSetSyntax for the voters. Never throws; AGENT_MANAGER_EDIT_SYNTAX_GATE=advisory|off.
-  try {
-    const { usesGroupB } = require('./lib/apply-core.js');
-    const ess = require('./lib/edit-set-syntax.js');
-    const essMode = ess.syntaxGateMode();
-    if (essMode !== 'off' && usesGroupB(task) && trimmedImplResponse) {
-      let editItems = null;
-      try { const v = parseJsonMaybeFenced(trimmedImplResponse); editItems = v ? (Array.isArray(v) ? v : [v]) : null; } catch { editItems = null; }
-      if (editItems && editItems.some((i) => i && (i.mode === 'edit' || i.mode === 'create'))) {
-        const syn = ess.checkEditSetSyntax(editItems, repoRoot);
-        task.editSetSyntax = { at: new Date().toISOString(), checked: syn.checked, skipped: syn.skipped, failed: syn.failed.map((f) => f.file), preexisting: syn.preexisting };
-        if (syn.failed.length) {
-          const reason = `Deterministic gate: edit-set-syntax -- ${ess.syntaxFeedbackFor(syn.failed)}`.slice(0, 900);
-          if (essMode === 'advisory') {
-            appendHistoryEvent(task, 'advisory', reason.slice(0, 600));
-          } else {
-            task.reviewProvider = 'deterministic-edit-set-syntax';
-            recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-            appendHistoryEvent(task, 'blocked', reason);
-            return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-          }
-        }
-      }
-    }
-  } catch (e) {
-    console.error(`[review] edit-set syntax gate errored for ${task.id} (non-fatal, continuing): ${e && e.message}`);
-  }
-
-  // Executed verification: see the block comment above summariseExecutedVerification. Adhoc implement drafts only (they carry a real rawDiff plus
-  // the acceptance results the draft claims); every other source keeps its own gates.
-  if (process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY !== 'false'
-      && resolveSourceName(task) === 'adhoc'
-      && task.adhocResolution === 'implemented'
-      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
-    let ev = null;
-    try {
-      const verify = verifyDiffFn || require('./review-verify.js').verifyDiff;
-      // A stacked hub sub-task builds on its shared branch, not on master -- verify against the same base the draft used.
-      const baseBranch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
-      const budget = parseInt(process.env.AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS, 10);
-      ev = verify({ taskId: task.id, rawDiff: task.rawDiff, acceptanceResults: task.acceptanceResults || [], repoRoot, mainBranch: baseBranch, budgetMs: budget > 0 ? budget : EXECUTED_VERIFY_BUDGET_MS, checkUnpinned: process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK !== 'false', pipelineDir, checkReplay: process.env.AGENT_MANAGER_REVIEW_GATE_REPLAY !== 'false' });
-    } catch (e) {
-      console.error(`[review] executed verification errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
-    }
-    if (ev && ev.status) {
-      task.executedVerification = summariseExecutedVerification(ev);
-      const ranTests = ev.tests && ev.tests.ran ? ev.tests.ran.length : 0;
-      const confirmed = (ev.commands || []).filter((c) => c.outcome === 'confirmed').length;
-      appendHistoryEvent(task, 'advisory', `executed verification: ${ev.status} (${ranTests} covering test file(s), ${confirmed} claimed check(s) re-run and confirmed${ev.unpinned && Array.isArray(ev.unpinned.hunks) && ev.unpinned.hunks.length ? `, ${ev.unpinned.hunks.length} unpinned hunk(s)` : ''}${ev.status === 'inconclusive' && ev.reasons && ev.reasons[0] ? `; ${String(ev.reasons[0]).slice(0, 160)}` : ''})`);
-      if (ev.replay) {
-        let gr = null;
-        try { gr = summariseGateReplay(ev.replay); } catch (e) { console.error(`[review] gate replay summary errored for ${task.id} (non-fatal, continuing): ${e && e.message}`); }
-        if (gr) {
-          task.gateReplay = gr;
-          if (gr.candidates.length) {
-            appendHistoryEvent(task, 'advisory', `gate replay: ${gr.candidates.map((c) => `${c.name} flags ${c.afterFlaggedMerged}/${c.mergedTotal} merged tasks (base ${c.beforeFlaggedMerged == null ? 'n/a' : c.beforeFlaggedMerged})`).join('; ')}${gr.block ? ' -- over the limit' : ''}`.slice(0, 480));
-          }
-          // Advisory by default (the numbers go to the voters); AGENT_MANAGER_GATE_REPLAY_BLOCK=true turns an over-limit result into a deterministic block, like a failing test.
-          if (gr.block && process.env.AGENT_MANAGER_GATE_REPLAY_BLOCK === 'true') {
-            const reason = `Deterministic gate: replaying the new/changed gate over tasks that already ran -- ${gr.blockReasons.join('; ')}. A gate that flags already-merged work is a false-positive defect; narrow it (exclude what the draft itself creates, fixtures, prose) and add a regression test built from these tasks.`.slice(0, 900);
-            task.reviewProvider = 'deterministic-gate-replay';
-            recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-            appendHistoryEvent(task, 'blocked', reason);
-            return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-          }
-        }
-      }
-      if (ev.status === 'failed') {
-        const reason = executedVerificationBlockReason(ev);
-        task.reviewProvider = 'deterministic-executed-verification';
-        recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-        appendHistoryEvent(task, 'blocked', reason);
-        return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-      }
-    }
-  }
-
-  // Inert additions (see formatInertAdditionsSection): a cheap diff + git-grep check, independent of the executed-verification switch. Advisory only.
-  if (process.env.AGENT_MANAGER_REVIEW_INERT_CHECK !== 'false'
-      && resolveSourceName(task) === 'adhoc'
-      && task.adhocResolution === 'implemented'
-      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
-    try {
-      const find = findInertFn || require('./review-inert.js').findInertAdditions;
-      const branch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
-      const baseRef = resolveInertBaseRef(repoRoot, branch) || (findInertFn ? branch : null);
-      if (baseRef) {
-        const r = find({ rawDiff: task.rawDiff, repoRoot, baseRef });
-        if (r && Array.isArray(r.inert)) {
-          task.inertAdditions = summariseInertAdditions(r, isHubChildTask(task));
-          if (r.inert.length) {
-            appendHistoryEvent(task, 'advisory', `inert-addition check: ${r.inert.length} unreferenced addition(s) (${r.inert.slice(0, 4).map((i) => i.name).join(', ')}${r.inert.length > 4 ? ', ...' : ''})${task.inertAdditions.hubChild ? ' -- hub slice, a sibling may wire it' : ''}`);
-          }
-        }
-      }
-    } catch (e) {
-      console.error(`[review] inert-addition check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
-    }
-  }
-
-  // Undefined identifier after removal (see undefinedRemovalBlockReason): a declaration the change deletes whose name the file still uses. Covers an adhoc rawDiff and a
-  // Group B edit array. Blocks by default; AGENT_MANAGER_REVIEW_UNDEFINED_CHECK=advisory only shows the voters; =false skips it. Never throws.
-  const undefinedMode = process.env.AGENT_MANAGER_REVIEW_UNDEFINED_CHECK;
-  if (undefinedMode !== 'false') {
-    const rawDiffOk = resolveSourceName(task) === 'adhoc' && task.adhocResolution === 'implemented' && typeof task.rawDiff === 'string' && task.rawDiff.trim();
-    const edits = rawDiffOk ? null : editsOfImplementResponse(task);
-    if (rawDiffOk || edits) {
-      try {
-        const find = findUndefinedFn || require('./review-undefined-after-removal.js').findUndefinedAfterRemoval;
-        const branch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
-        const baseRef = resolveInertBaseRef(repoRoot, branch) || (findUndefinedFn ? branch : null);
-        if (baseRef) {
-          const r = find({ rawDiff: rawDiffOk ? task.rawDiff : undefined, edits: edits || undefined, repoRoot, baseRef });
-          if (r && Array.isArray(r.uses)) {
-            task.undefinedAfterRemoval = summariseUndefinedRemoval(r);
-            if (r.uses.length) {
-              if (undefinedMode === 'advisory') {
-                appendHistoryEvent(task, 'advisory', `undefined-after-removal check: ${r.uses.length} removed declaration(s) still used (${r.uses.slice(0, 4).map((u) => u.name).join(', ')})`);
-              } else {
-                const reason = undefinedRemovalBlockReason(task.undefinedAfterRemoval);
-                task.reviewProvider = 'deterministic-undefined-after-removal';
-                recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-                appendHistoryEvent(task, 'blocked', reason);
-                return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-              }
-            }
-          }
-        }
-      } catch (e) {
-        console.error(`[review] undefined-after-removal check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
-      }
-    }
-  }
-
-  // Skip / dismiss paths (see formatSkipPathSection): a pure diff scan, independent of the other checks' switches. Advisory only.
-  if (process.env.AGENT_MANAGER_REVIEW_SKIPPATH_RULE !== 'false'
-      && resolveSourceName(task) === 'adhoc'
-      && task.adhocResolution === 'implemented'
-      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
-    try {
-      const find = findSkipPathsFn || require('./review-skip-paths.js').findSkipPaths;
-      const r = find({ rawDiff: task.rawDiff });
-      if (r && Array.isArray(r.paths)) {
-        task.skipPaths = summariseSkipPaths(r);
-        if (r.paths.length) {
-          appendHistoryEvent(task, 'advisory', `skip-path rule: ${task.skipPaths.total} dismiss/skip path(s) in the diff (${[...new Set(r.paths.map((p) => p.kind))].join(', ')})`);
-        }
-      }
-    } catch (e) {
-      console.error(`[review] skip-path check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
-    }
-  }
-
-  // Policy-change classification (src/policy-change.js; brain dump "Pipeline yellow hardening 5/8, revised"): is this diff a change to how the pipeline itself behaves, and can a
-  // replay over finished work settle it? Recorded on the task either way so the escalation rate can be measured; it only BLOCKS (escalating to a human) when
-  // AGENT_MANAGER_POLICY_CHANGE_ROUTING=true. Never throws.
-  if (process.env.AGENT_MANAGER_POLICY_CHANGE_CLASSIFY !== 'false'
-      && resolveSourceName(task) === 'adhoc'
-      && task.adhocResolution === 'implemented'
-      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
-    try {
-      const pc = require('./policy-change.js');
-      const rawText = (task.promptContext && task.promptContext.rawText) || '';
-      const classification = pc.classifyPolicyChange({ rawDiff: task.rawDiff, text: rawText, title: task.title });
-      const decision = pc.decidePolicyRouting({ classification, gateReplay: task.gateReplay, task });
-      task.policyChange = {
-        at: new Date().toISOString(), policy: !!classification.policy, kinds: classification.kinds, pureMove: !!classification.pureMove, hint: !!classification.hint,
-        route: decision.route, reason: decision.reason,
-        signals: classification.signals.slice(0, 4).map((x) => ({ kind: x.kind, file: x.file, line: x.line, text: String(x.text || '').slice(0, 120) })),
-      };
-      if (classification.policy) {
-        appendHistoryEvent(task, 'advisory', `policy change: ${classification.kinds.join(', ')} -> ${decision.route}${pc.policyRoutingEnabled() ? '' : ' (shadow: escalation is off)'}`);
-      }
-      if (decision.route === 'escalate') {
-        task.policyChange.brief = pc.buildPolicyBrief({ classification, gateReplay: task.gateReplay, taskTitle: task.title });
-        if (pc.policyRoutingEnabled()) {
-          const reason = `Policy change: ${classification.kinds.join(', ')} -- ${decision.reason}. Escalated to a human instead of a vote.`.slice(0, 400);
-          task.reviewProvider = 'deterministic-policy-change';
-          recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-          appendHistoryEvent(task, 'blocked', reason);
-          return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-        }
-      }
-    } catch (e) {
-      console.error(`[review] policy-change classification errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
-    }
-  }
-
-  await waitForLocalAvailability(instancesDir);
-
-  const verdictPrompt = buildVerdictPrompt(task, factCheck, groundingText);
-  // minAgreeing: 2 of 3 -- a genuine majority, matching majorityVote()'s own documented
-  // default and intent (an ABSOLUTE count of agreeing real votes, guarding against e.g. 1
-  // real + 2 degenerate votes looking like a confident 1-0 consensus -- see that function's
-  // comment). This was 3 (i.e. requiring full unanimity from 3 independent, temperature-0.2
-  // but still stochastic votes) -- confirmed live 2026-08-16: 23 of 181 blocked tasks,
-  // the second-largest group in queue/blocked/, were real 2-1 splits (both real REJECT-
-  // majority AND, invisibly, any real APPROVE-majority) discarded as "no confident
-  // majority" purely because one of three votes dissented, not because the verdict was
-  // actually unclear.
-  const voteResult = await resolvedMajorityVote({
-    prompt: verdictPrompt,
-    classify: classifyVote(['APPROVE', 'REJECT'], 20),
-    n: 3,
-    minAgreeing: 2,
-    temperature: 0.2,
-    source: task.source,
-  });
-
-  // 2026-08-24, Grimmethy: "are there any efficiency buffs you can think of" -- voteErrors
-  // (added alongside majorityVote()'s own per-vote resilience fix, commit 0ac54b9) was
-  // computed but never actually read anywhere -- real diagnostic signal (which votes
-  // hard-failed, and why) silently discarded on every single review, exactly the kind of
-  // "why did this take 3x longer than expected" trail that took hours of manual log
-  // archaeology to reconstruct by hand earlier tonight. Surfaced into both voteSummary
-  // (so it's visible in the task's own history without opening the raw field) and a new
-  // task.voteErrors (so it's queryable structured data, same convention task.localVotes
-  // already uses for the real vote responses).
-  const voteErrorSuffix = voteResult.voteErrors && voteResult.voteErrors.length > 0
-    ? `, ${voteResult.voteErrors.length} vote(s) hard-failed`
-    : '';
-  const voteSummary = `votes: ${voteResult.realVoteCount}/${voteResult.requestedVotes} real${voteErrorSuffix}`;
-
-  if (!voteResult.confident || !voteResult.verdict) {
-    // brain-dump bd-1788725054994: Tasks 13/18/20/24 were requeued solely on 3/3
-    // inconclusive votes, costing tokens without changing task complexity. An adhoc
-    // task passes through with a caveat instead of blocking.
-    const _sourceName = resolveSourceName(task);
-    const _inconclusiveDecision = decideInconclusiveOutcome(_sourceName, voteResult);
-    if (_inconclusiveDecision.passThrough) {
-      task.reviewedAt = new Date().toISOString();
-      task.reviewProvider = 'local';
-      task.localVotes = voteResult.votes;
-      task.voteErrors = voteResult.voteErrors;
-      recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: `pass-with-caveat: inconclusive votes on adhoc source (${_sourceName})` });
-      appendHistoryEvent(task, 'approved', `pass-with-caveat: inconclusive votes (${voteSummary}), adhoc pass-through`);
-      return { succeeded: true, verdict: 'approved', factCheckVerdict };
-    }
-    const reason = `Local-model review inconclusive, no confident majority (${voteSummary})`;
-    task.reviewProvider = 'local';
-    task.localVotes = voteResult.votes;
-    task.voteErrors = voteResult.voteErrors;
-    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-    appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
-  }
-
-  if (voteResult.verdict === 'APPROVE') {
-    const sampleVote = voteResult.votes.find((v) => v.verdict === 'APPROVE');
-    task.reviewedAt = new Date().toISOString();
-    task.reviewProvider = 'local';
-    task.localVerdict = `Confident majority APPROVE (${voteSummary})\n\n${sampleVote ? sampleVote.response : ''}`;
-    task.localVotes = voteResult.votes;
-    task.voteErrors = voteResult.voteErrors;
-    recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
-    appendHistoryEvent(task, 'approved', voteSummary);
-    return { succeeded: true, verdict: 'approved', factCheckVerdict };
-  }
-
-  const sampleVote = voteResult.votes.find((v) => v.verdict === 'REJECT');
-  const match = sampleVote && sampleVote.response.match(/REJECT:\s*(.+)/);
-  const reason = match ? match[1] : `REJECT (${voteSummary})`;
-  task.reviewProvider = 'local';
-  task.localVotes = voteResult.votes;
-  task.voteErrors = voteResult.voteErrors;
-  recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
-  appendHistoryEvent(task, 'blocked', reason);
-  return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+  return runVoteAndDecide({ task, factCheck, groundingText, factCheckVerdict, instancesDir, resolvedMajorityVote, recordModelOutcome, waitForLocalAvailability, buildVerdictPrompt, classifyVote, decideInconclusiveOutcome });
 }
 
-// Thin wrapper over runReview: keeps task.status in step with the verdict (and so with the
-// queue directory review-runner.sh moves the file to next -- approved/ or blocked/). Only
-// local-draft.js was ever maintaining task.status ('needs-review'), so every approved task
-// kept that stale value and the dashboard list view -- which reads task.status straight
-// through task_summary() -- showed the whole approved/ backlog as "needs-review". The
-// verdict strings ('approved' / 'blocked') are already exactly the status values we want.
 async function reviewTask(task, opts = {}) {
   const result = await runReview(task, opts);
   if (result && result.succeeded && (result.verdict === 'approved' || result.verdict === 'blocked')) {
@@ -1687,7 +611,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { EXECUTED_VERIFY_BUDGET_MS, reviewTask, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { namesExtractedPieces, getDomainConfig, EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview, INERT_MAX_ITEMS };
 
 if (require.main === module) {
   main();

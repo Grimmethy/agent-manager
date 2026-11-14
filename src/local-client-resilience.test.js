@@ -36,7 +36,9 @@ function withServer(handler, fn) {
     const server = http.createServer((req, res) => {
       if (req.method === 'GET' && req.url === '/api/ps') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end('{"models":[]}');
+        // 2026-11-06: local-client.js DOES ask /api/ps again, through the residency gate (src/model-resident.js). Report the model resident so the
+        // gate sends no warm-up POST and these tests' request-count expectations keep measuring only the real calls.
+        res.end(JSON.stringify({ models: [{ name: process.env.LOCAL_MODEL }] }));
         return;
       }
       handler(req, res);
@@ -447,7 +449,7 @@ test('majorityVote() stops calling once 2 of 3 votes already agree -- the 3rd ca
 // no way to actually reach a vote, since majorityVote is the only caller of call() review
 // uses. Proves the override actually reaches the real HTTP request body, not just that the
 // param is accepted without erroring.
-test('majorityVote() forwards model/numCtx/numPredict overrides into the real request body', async () => {
+test('majorityVote() forwards model/numPredict overrides into the real request body but never a numCtx other than the pinned one (a different context restarts the runner)', async () => {
   let capturedBody = null;
   await withServer(
     (req, res) => {
@@ -467,7 +469,7 @@ test('majorityVote() forwards model/numCtx/numPredict overrides into the real re
         model: 'qwen2.5:3b', numCtx: 8192, numPredict: 400,
       });
       assert.equal(capturedBody.model, 'qwen2.5:3b', 'must override the module-level LOCAL_MODEL default');
-      assert.equal(capturedBody.options.num_ctx, 8192, 'must override PINNED_NUM_CTX');
+      assert.equal(capturedBody.options.num_ctx, require('./gpu-capacity.js').PINNED_NUM_CTX, 'a caller numCtx is replaced by PINNED_NUM_CTX (owner rule 2026-11-07: never swap the model)');
       assert.equal(capturedBody.options.num_predict, 400);
     }
   );
@@ -699,4 +701,187 @@ test('the degenerate and hard-failure audit entries record whether think was on 
       assert.deepEqual(degenerate.map((l) => l.think), [true, false], 'the first truncation asked for reasoning; the retry after a zero-content truncation did not');
     }
   );
+});
+
+// 2026-10-24 (rx580 lane): the escalation ladder asked for a numPredict that cannot finish inside the per-call ceiling at the lane's measured rate
+// (5600 tokens ~350 s at 16 tok/s vs the 300 s ceiling), so attempts 3-5 were OLLAMA_TIMEOUT and a doomed plan held the lane ~20 min. These pin the
+// clamp: only against a RECORDED rate, never shrinking the unmeasured ladder the two tests above pin.
+async function withMeasuredRate(base, tokensPerSecond, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-clamp-'));
+  const saved = { root: process.env.AGENT_MANAGER_REPO_ROOT, inst: process.env.AGENT_MANAGER_INSTANCES_DIR };
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_INSTANCES_DIR = path.join(dir, 'instances');
+  fs.mkdirSync(process.env.AGENT_MANAGER_INSTANCES_DIR, { recursive: true });
+  try {
+    require('./local-throughput.js').recordSample(process.env.AGENT_MANAGER_INSTANCES_DIR, { evalCount: tokensPerSecond * 10, evalDurationNs: 10e9, endpoint: base, model: 'test-model' });
+    return await fn();
+  } finally {
+    if (saved.root === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = saved.root;
+    if (saved.inst === undefined) delete process.env.AGENT_MANAGER_INSTANCES_DIR; else process.env.AGENT_MANAGER_INSTANCES_DIR = saved.inst;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function alwaysTruncatedServer(capturedNumPredicts) {
+  return (req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw);
+      capturedNumPredicts.push(body.options.num_predict);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ response: 'a plan that never ends because', done: true, done_reason: 'length', eval_count: body.options.num_predict, prompt_eval_count: 1000 }));
+    });
+  };
+}
+
+test('call() clamps a truncated retry to what fits the per-call ceiling at the measured rate, then stops instead of re-issuing a call that cannot finish', async () => {
+  const capturedNumPredicts = [];
+  await withServer(alwaysTruncatedServer(capturedNumPredicts), async (base) => {
+    const { call } = freshLocalClient(base); // first: it clears AGENT_MANAGER_REPO_ROOT, which withMeasuredRate then sets for the call
+    await withMeasuredRate(base, 16, async () => {
+      const result = await call({ prompt: 'x', think: false, numPredict: 1400 }, 4);
+      assert.equal(result.degenerate, 'truncated');
+      // fit = floor((300 * 0.9 - 1000 / 150) * 16) = 4213: the 5600 the plain ladder asked for is never requested, and nothing is re-issued after the clamp stops growing
+      assert.deepEqual(capturedNumPredicts, [1400, 2800, 4213]);
+    });
+  });
+});
+
+test('maxNumPredictThatFits: 90% of the ceiling less prefill at 150 tok/s, times the measured rate', () => {
+  const { maxNumPredictThatFits } = freshLocalClient('http://127.0.0.1:1');
+  assert.equal(maxNumPredictThatFits({ promptTokens: 1000, tokensPerSecond: 16, ceilingMs: 300_000 }), 4213);
+  assert.equal(maxNumPredictThatFits({ promptTokens: 0, tokensPerSecond: 11, ceilingMs: 300_000 }), 2970);
+  assert.ok(maxNumPredictThatFits({ promptTokens: 1000, tokensPerSecond: 16, ceilingMs: 900_000 }) > 8000, 'the slow-endpoint ceiling leaves the 8000 cap in charge');
+  assert.equal(maxNumPredictThatFits({ promptTokens: 60_000, tokensPerSecond: 16, ceilingMs: 300_000 }), 0, 'a prompt whose prefill alone spends the budget fits nothing');
+});
+
+// 2026-10-24 (rx580, change_review): the retry clamp above limits only ESCALATED budgets; a >10000-char change_review diff asks for a 6000-token plan
+// on the FIRST call, ~375 s at 16 tok/s against the 300 s ceiling, so it timed out every time (one task: 8 cycles, ~2 h). callOnce now caps the
+// num_predict it sends. With the cap in place a truncation of that first call leaves the retry clamp nothing bigger than the fit to escalate to, so
+// the ladder stops after one call. freshLocalClient always sets ORNITH_TIMEOUT_MS (a deliberate timeout, which skips the cap), so these build a
+// client with both timeout overrides removed BEFORE require, as an operator-default environment would be.
+function freshLocalClientDefaultTimeout(baseUrl, env = {}) {
+  process.env.OLLAMA_URL = baseUrl;
+  process.env.LOCAL_MODEL = 'test-model';
+  delete process.env.ORNITH_TIMEOUT_MS;
+  delete process.env.LOCAL_TIMEOUT_MS;
+  Object.assign(process.env, env);
+  process.env.AGENT_MANAGER_REPO_ROOT = '';
+  delete require.cache[require.resolve('./local-client.js')];
+  try { return require('./local-client.js'); } finally { delete process.env.LOCAL_TIMEOUT_MS; }
+}
+
+function recordingServer(sent) {
+  return (req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      sent.push(JSON.parse(raw).options.num_predict);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(generateResponse('a complete plan.'));
+    });
+  };
+}
+
+test('callOnce caps the num_predict it sends to what fits the per-call ceiling at the recorded rate', async () => {
+  const sent = [];
+  await withServer(recordingServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base);
+    await withMeasuredRate(base, 16, () => client.callOnce({ prompt: 'x', think: false, numPredict: 6000 }));
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0] < 6000 && sent[0] > 4000, `expected a cap near 4300 for 16 tok/s and a 300 s ceiling, got ${sent[0]}`);
+    // the sent value is exactly the helper's fit for some small prompt-token estimate (the dated line, the injected side-finding instruction and the prompt)
+    const matches = Array.from({ length: 2000 }, (_, p) => client.maxNumPredictThatFits({ promptTokens: p, tokensPerSecond: 16, ceilingMs: 300_000 }));
+    assert.ok(matches.includes(sent[0]), 'the cap must be the maxNumPredictThatFits value, not an unrelated number');
+  });
+});
+
+test('callOnce sends the requested num_predict unchanged when no rate has been recorded', async () => {
+  const sent = [];
+  await withServer(recordingServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base);
+    await client.callOnce({ prompt: 'x', think: false, numPredict: 6000 });
+    assert.deepEqual(sent, [6000]);
+  });
+});
+
+test('callOnce leaves num_predict alone when the caller passed an explicit timeoutMs', async () => {
+  const sent = [];
+  await withServer(recordingServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base);
+    await withMeasuredRate(base, 16, () => client.callOnce({ prompt: 'x', think: false, numPredict: 6000, timeoutMs: 20_000 }));
+    assert.deepEqual(sent, [6000]);
+  });
+});
+
+test('callOnce leaves num_predict alone when an operator LOCAL_TIMEOUT_MS override is set', async () => {
+  const sent = [];
+  await withServer(recordingServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base, { LOCAL_TIMEOUT_MS: '20000' });
+    await withMeasuredRate(base, 16, () => client.callOnce({ prompt: 'x', think: false, numPredict: 6000 }));
+    assert.deepEqual(sent, [6000]);
+  });
+});
+
+test('capNumPredictToFit: unchanged when it fits, capped when it does not, unchanged below the 1024 floor', () => {
+  const { capNumPredictToFit } = freshLocalClient('http://127.0.0.1:1');
+  assert.equal(capNumPredictToFit({ numPredict: 1400, promptTokens: 1000, tokensPerSecond: 16, ceilingMs: 300_000 }), 1400);
+  assert.equal(capNumPredictToFit({ numPredict: 6000, promptTokens: 1000, tokensPerSecond: 16, ceilingMs: 300_000 }), 4213);
+  // a prompt whose prefill leaves under 1024 tokens of budget at 16 tok/s: capping would give a uselessly short output, so the request stands
+  assert.equal(capNumPredictToFit({ numPredict: 6000, promptTokens: 38_000, tokensPerSecond: 16, ceilingMs: 300_000 }), 6000);
+});
+
+test('call(): a truncation of the capped first call ends the ladder after that one call, not three timeouts', async () => {
+  const sent = [];
+  await withServer(alwaysTruncatedServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base);
+    const result = await withMeasuredRate(base, 16, () => client.call({ prompt: 'x', think: false, numPredict: 6000 }, 2));
+    assert.equal(result.degenerate, 'truncated');
+    assert.equal(sent.length, 1, 'nothing bigger than the fit exists to escalate to');
+    assert.ok(sent[0] < 6000, 'and that one call carried the capped budget');
+  });
+});
+
+test('residency gate: callOnce warms a non-resident model first, and a slow load never counts against the work request timeout', async () => {
+  const order = [];
+  let resident = false;
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/api/ps') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ models: resident ? [{ name: 'test-model' }] : [] }));
+      return;
+    }
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw);
+      const isWarm = body.prompt === 'hi' && body.options && body.options.num_predict === 1;
+      order.push(isWarm ? 'warm' : 'work');
+      if (isWarm) {
+        // a load slower than the 1000 ms work timeout configured below
+        setTimeout(() => { resident = true; res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(generateResponse('')); }, 1500);
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(generateResponse('done'));
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-resident-gate-test-'));
+  try {
+    process.env.OLLAMA_URL = `http://127.0.0.1:${server.address().port}`;
+    process.env.LOCAL_MODEL = 'test-model';
+    process.env.ORNITH_TIMEOUT_MS = '1000';
+    process.env.AGENT_MANAGER_REPO_ROOT = dir;
+    process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+    delete require.cache[require.resolve('./local-client.js')];
+    delete require.cache[require.resolve('./model-resident.js')];
+    const { callOnce } = require('./local-client.js');
+    const out = await callOnce({ prompt: 'x', think: false });
+    assert.equal(out.response, 'done');
+    assert.deepEqual(order, ['warm', 'work'], 'the warm-up goes first, then exactly one work request');
+  } finally {
+    server.close();
+  }
 });

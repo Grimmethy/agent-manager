@@ -11,9 +11,11 @@
 const fs = require('fs');
 const path = require('path');
 const { postJson } = require('./ollama-http.js');
+const { resolveKeepAlive } = require('./keep-alive.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { DEFAULT_PINNED_NUM_CTX } = require('./gpu-capacity.js');
 const gpuGuard = require('./gpu-guard.js');
+const { readWorkerModelOverrides, effectiveLaneModel } = require('./worker-model-override.js');
 
 const MAX_SAMPLES = 50;
 const FRESH_MS = 30 * 60 * 1000; // a verdict older than this is not trusted either way
@@ -40,8 +42,8 @@ function statePath(instancesDir, laneId) { return path.join(instancesDir, `lane-
 function readState(instancesDir, laneId) {
   try {
     const parsed = JSON.parse(fs.readFileSync(statePath(instancesDir, laneId), 'utf8'));
-    return { samples: Array.isArray(parsed.samples) ? parsed.samples : [], probingSince: parsed.probingSince || null };
-  } catch (_) { return { samples: [], probingSince: null }; }
+    return { samples: Array.isArray(parsed.samples) ? parsed.samples : [], probingSince: parsed.probingSince || null, lastInconclusiveAt: parsed.lastInconclusiveAt || null };
+  } catch (_) { return { samples: [], probingSince: null, lastInconclusiveAt: null }; }
 }
 function readSamples(instancesDir, laneId) { return readState(instancesDir, laneId).samples; }
 function writeState(instancesDir, laneId, state) {
@@ -92,11 +94,11 @@ function laneDegradedBetween(instancesDir, laneId, fromIso, toIso, cfg = healthC
 // The probe MUST look exactly like the lane's own calls: Ollama reloads a resident model when num_ctx changes, so a probe at a different context
 // would evict the lane's pinned model (a 27B reload is ~100 s, longer than the probe timeout) and make a healthy lane look dead and busy. Same
 // num_ctx / num_batch / keep_alive as the lane's real requests (src/gpu-capacity.js pins, lane registry numCtx/numBatch, LOCAL_KEEP_ALIVE).
-async function probeEndpoint({ url, model, numCtx = DEFAULT_PINNED_NUM_CTX, numBatch = null, keepAlive = '30m', post = postJson, timeoutMs = 90000 }) {
+async function probeEndpoint({ url, model, numCtx = DEFAULT_PINNED_NUM_CTX, numBatch = null, keepAlive, post = postJson, timeoutMs = 90000 }) {
   const started = Date.now();
   try {
     const r = await post(`${String(url).replace(/\/$/, '')}/api/generate`, {
-      model, prompt: PROBE_PROMPT, stream: false, think: false, keep_alive: keepAlive,
+      model, prompt: PROBE_PROMPT, stream: false, think: false, keep_alive: resolveKeepAlive(keepAlive),
       options: { num_predict: 48, temperature: 0, num_ctx: numCtx, ...(numBatch ? { num_batch: numBatch } : {}) },
     }, timeoutMs);
     const evalNs = Number(r && r.eval_duration);
@@ -108,6 +110,18 @@ async function probeEndpoint({ url, model, numCtx = DEFAULT_PINNED_NUM_CTX, numB
   }
 }
 
+// Which models does this Ollama endpoint have resident right now? -> array of names, or null when it cannot be asked (down, slow, unparsable).
+// A model swap is the one thing a health probe must not cause or misread: loading a big model can take minutes (ornith:35b from the HDD: ~470 s,
+// the dense 27B ~107 s), longer than the probe timeout.
+async function residentModels(url, { fetchFn = fetch, timeoutMs = 5000 } = {}) {
+  try {
+    const res = await fetchFn(`${String(url).replace(/\/$/, '')}/api/ps`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) return null;
+    const body = await res.json();
+    return (Array.isArray(body && body.models) ? body.models : []).map((m) => String((m && (m.name || m.model)) || '')).filter(Boolean);
+  } catch (_) { return null; }
+}
+
 function laneIdleNow(instancesDir, laneId, now) {
   try {
     const hb = JSON.parse(fs.readFileSync(path.join(instancesDir, `${laneId}.json`), 'utf8'));
@@ -117,24 +131,47 @@ function laneIdleNow(instancesDir, laneId, now) {
 }
 
 // Probe every lane that is idle and due. `lanes` come from lanes.js (the host lane has env {} and is served by process OLLAMA_URL / LOCAL_MODEL).
-async function runDueProbes({ lanes, instancesDir, pipelineDir, env = process.env, now = Date.now(), probe = probeEndpoint, leaseHeldFor = gpuGuard.leaseHeldFor } = {}) {
+async function runDueProbes({ lanes, instancesDir, pipelineDir, env = process.env, now = Date.now(), probe = probeEndpoint, leaseHeldFor = gpuGuard.leaseHeldFor, resident = residentModels, overrides } = {}) {
   const cfg = healthConfig(env);
   const out = [];
   if (!cfg.enabled) return out;
   const hostUrl = env.AGENT_MANAGER_HOST_OLLAMA_URL || env.OLLAMA_URL || 'http://localhost:11434';
+  // The model a lane is really running includes a dashboard override; only the live process environment reads the live settings file (tests pass env: {}).
+  const modelOverrides = overrides !== undefined ? overrides : (env === process.env ? readWorkerModelOverrides() : {});
   for (const lane of lanes || []) {
+    // A cloud lane has no tokens/s to judge (the gateway reports no eval_duration, so every probe would read as a failure) and each probe would be a billed call.
+    // A script lane has no model at all (its work is a script handler): nothing to probe.
+    if (lane.cloud || lane.script) continue;
     const url = (lane.env && lane.env.OLLAMA_URL) || hostUrl;
-    const model = lane.model || (lane.env && lane.env.LOCAL_MODEL);
+    const model = effectiveLaneModel(lane, modelOverrides);
     if (!model || !laneIdleNow(instancesDir, lane.id, now)) continue;
     // A leased card belongs to its lease holder for now (a KaggleForge eval, a Forge session): a probe is a model call, and it would reload the model the holder evicted.
     if (leaseHeldFor(url)) continue;
-    const { samples, probingSince } = readState(instancesDir, lane.id);
+    const { samples, probingSince, lastInconclusiveAt } = readState(instancesDir, lane.id);
     const last = samples.length ? samples[samples.length - 1] : null;
     if (last && now - Date.parse(last.at) < cfg.intervalMs) continue;
+    if (lastInconclusiveAt && now - Date.parse(lastInconclusiveAt) < cfg.intervalMs) continue;
     // The watchdog runs this in the background every tick; a probe still in flight (it can take up to the timeout) must not be doubled.
     if (probingSince && now - Date.parse(probingSince) < cfg.timeoutMs + 15000) continue;
-    writeState(instancesDir, lane.id, { samples, probingSince: new Date(now).toISOString() });
-    const r = await probe({ url, model, numCtx: lane.numCtx || DEFAULT_PINNED_NUM_CTX, numBatch: lane.numBatch || null, keepAlive: env.LOCAL_KEEP_ALIVE || env.ORNITH_KEEP_ALIVE || '30m', timeoutMs: cfg.timeoutMs });
+    // Never probe over a different resident model: the probe would evict it and wait out a load longer than its own timeout (2026-10-27).
+    const before = await resident(url);
+    if (before && before.length && !before.includes(model)) {
+      out.push({ lane: lane.id, skipped: `a different model is resident (${before.join(', ')}), not probing ${model}` });
+      continue;
+    }
+    writeState(instancesDir, lane.id, { samples, probingSince: new Date(now).toISOString(), lastInconclusiveAt });
+    const r = await probe({ url, model, numCtx: lane.numCtx || DEFAULT_PINNED_NUM_CTX, numBatch: lane.numBatch || null, keepAlive: resolveKeepAlive(env.LOCAL_KEEP_ALIVE, env.ORNITH_KEEP_ALIVE), timeoutMs: cfg.timeoutMs });
+    // A probe that failed while its model was NOT resident (or was replaced mid-probe) measured a model load, not the lane's speed: inconclusive, no sample,
+    // retried after the normal interval. A failure with the model resident, or with the endpoint unreachable, is still a real failure.
+    if (!r.ok) {
+      const after = await resident(url);
+      if (after && !after.includes(model)) {
+        writeState(instancesDir, lane.id, { samples, lastInconclusiveAt: new Date(now).toISOString() });
+        logPipelineEvent(pipelineDir, 'lane-health', { lane: lane.id, model, ok: false, inconclusive: true, reason: `${r.error}; ${model} was not resident afterwards (resident: ${after.join(', ') || 'none'})` });
+        out.push({ lane: lane.id, inconclusive: true, error: r.error, resident: after });
+        continue;
+      }
+    }
     const sample = { at: new Date(now).toISOString(), ok: r.ok, tps: Math.round(r.tps * 100) / 100, totalMs: r.totalMs, error: r.error };
     const next = [...samples, sample].slice(-MAX_SAMPLES);
     writeState(instancesDir, lane.id, { samples: next });
@@ -146,7 +183,7 @@ async function runDueProbes({ lanes, instancesDir, pipelineDir, env = process.en
   return out;
 }
 
-module.exports = { healthConfig, assess, laneDegraded, laneDegradedBetween, probeEndpoint, runDueProbes, readSamples, PROBE_PROMPT };
+module.exports = { healthConfig, assess, laneDegraded, laneDegradedBetween, probeEndpoint, runDueProbes, readSamples, residentModels, PROBE_PROMPT };
 
 // CLI: `node src/lane-health.js` runs due probes (what the watchdog calls) and prints one JSON line; `--status` prints each lane's latest verdict.
 if (require.main === module) {

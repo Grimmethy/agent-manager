@@ -12,7 +12,7 @@
 
 const fs = require('fs');
 const { sharedInstancesDir } = require('./instances-dir.js');
-const { generationThrottled, makeSourceThrottle, liveLaneCount } = require('./generation-throttle.js');
+const { generationThrottled, makeGenerationBlocker, liveLaneCount } = require('./generation-throttle.js');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFileSync } = require('child_process');
@@ -25,7 +25,7 @@ const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-d
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { writeJsonAtomicSync: writeBrainDumpAtomic } = require('./atomic-write.js');
 const { rotationDemoted } = require('./premium-rotation.js');
-const { listArchivedMonthDirs } = require('./done-archive.js');
+const { QUEUE_STATES, taskIdExistsInQueue, taskIdHeldOnlyByFinishedTask } = require('./queue-presence.js'); // the queue-presence cluster lives in its own leaf (roadmap P2); taskIdExistsInQueue is re-exported below
 const { nextCandidateFulfillmentTask, windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
 const { applyArchDiscoveryCandidates, applyForensicsReport, applyDebriefReport, applyCapabilityDebriefReport, applySecondBrainOpportunities } = require('./apply-group-a.js');
 const { applyProductSpecOutline, OUTLINE_DOC_TITLE } = require('./product-spec-assembly.js');
@@ -33,6 +33,7 @@ const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { DEFAULT_HUB_ORDER } = require('./hub-priority.js');
+const { unmetPrerequisiteHubs } = require('./hub-prerequisites.js');
 const derivedGate = require('./derived-gate.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
 const pipelineForensics = require('./pipeline-forensics.js');
@@ -48,7 +49,7 @@ const { runPremiseCheckAsPostImplement } = require('./candidate-premise-check.js
 const { listHeldTasksFifo, deriveResolveIdentity, selfHealResolveDeadlock, buildResolveTask } = require('./lib/task-resolve.js');
 const { taskPriority } = require('./lib/task-priority.js');
 const { markPipelineHealthAuditChecked, markUiVisibilityAuditChecked, coverageEntryActiveLocal, markPipelineDebriefReported } = require('./lib/task-audit.js');
-const { nextProductSpecSectionTask, getNextTask } = require('./lib/task-selection.js');
+const { nextProductSpecSectionTask, getNextTask, setPreemptLoaders } = require('./lib/task-selection.js'); setPreemptLoaders({ nextAdhocTask, nextDerivedTask }); // registered here (hoisted declarations) so lib/task-selection.js need not require this file
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -61,23 +62,6 @@ function readIfExists(filePath) {
     return null;
   }
 }
-
-// BUG FIXED 2026-08-21 (Grimmethy, via the dashboard's Queue tab: found the SAME task id
-// sitting as two genuinely different files, one in done/ and one in
-// done/_archived_no_action/): this list used to omit 'needs-clarification',
-// 'awaiting-confirm', and the nested done/_archived_no_action/ pseudo-state entirely, so
-// taskIdExistsInQueue (below) was blind to a task that had reached any of those three
-// locations. For a source like observability_review that re-derives the SAME id from the
-// SAME (rule, file, line) on every worker tick as long as the underlying flag is still in
-// queue/observability-flags.json (findings are never pruned just for having already
-// produced a task -- see nextObservabilityReviewTask's own comment), this was not a rare
-// coincidence: the tick right after any of its tasks got archived would mint a brand-new
-// task under the identical id, guaranteed, every time. system-report.js already treats
-// done/_archived_no_action/ as its own 'archived' pseudo-state for exactly this reason
-// (scanning "what actually got done"); this brings the dedup check in line with that
-// instead of leaving it as the one place still blind to it.
-const QUEUE_STATES = ['pending', 'drafting', 'review', 'approved', 'blocked', 'done',
-  'needs-clarification', 'awaiting-confirm', 'coordinating'];
 
 // Dependency ordering for queue/adhoc/ (2026-08-22, Grimmethy: "We need some systematic
 // way to prioritize what order adhoc tasks get completed in. Those with dependencies on
@@ -139,7 +123,7 @@ function depWorkIsOnMainBranch(repoRoot, depId) {
 // tell "genuinely resolved" apart from "still blocked". Same reasoning hub-priority.js's
 // SIBLING_RESOLVED_STATUSES already applies to hub sibling sequencing, applied here to
 // the identical class of deadlock on a dependsOn edge instead.
-const NO_CODE_COMING_DISPOSITIONS = new Set(['noop', 'dismissed', 'filed', 'abandoned', 'superseded', 'aged-out']);
+const NO_CODE_COMING_DISPOSITIONS = new Set(['noop', 'dismissed', 'filed', 'abandoned', 'superseded', 'aged-out', 'recorded']);
 
 // Default dependency-release predicate (S1 of the hub-tasks extraction, 2026-09-23) -- the
 // exact checks this function inlined before the hook existed. Resolved through the
@@ -177,13 +161,45 @@ function releaseSignalsForRecord(record) {
   return defaultReleaseSignals(record);
 }
 
+// A NESTED hub (a piece that was itself decomposed) keeps its record in queue/coordinating/ until the whole stacked branch merges, so it never reaches
+// done/ and the lookups below can never find it (2026-10-23, chat plugin HUB0003: piece 1 became sub-hub HUB0004 with all three pieces built on the shared
+// stacked branch; pieces 2-5 dependsOn it and waited for ever, 0 of 5 built). Same rule the stacked exemption in defaultReleaseSignals applies to a done/ record:
+// the code is committed on the SHARED branch, which is all the next step reads. So a coordinating record that carries a stacked.branch and whose pieces are
+// ALL finished (pending-merge, done, merged, applied-direct, or one of the no-code-coming dispositions) releases its dependents. Fail-closed: no record, no
+// stacked branch, no pieces, or one open or blocked piece is not satisfied.
+const NESTED_HUB_PIECE_DONE = new Set(['pending-merge', 'done', 'merged', 'applied-direct', 'gone', ...NO_CODE_COMING_DISPOSITIONS]);
+function nestedHubBuilt(pipelineDir, depId) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'coordinating', `${depId}.json`), 'utf8'));
+    if (!rec || !rec.stacked || !rec.stacked.branch) return false;
+    const subs = Array.isArray(rec.subTasks) ? rec.subTasks : [];
+    return subs.length > 0 && subs.every((sub) => sub && typeof sub.status === 'string' && NESTED_HUB_PIECE_DONE.has(sub.status));
+  } catch { return false; }
+}
+
 function isDependencySatisfied(pipelineDir, depId) {
   const trimmed = (depId || '').trim();
   if (!trimmed) return true; // a blank/malformed entry blocks nothing -- not this function's job to validate authoring mistakes
+  if (nestedHubBuilt(pipelineDir, trimmed)) return true;
   const candidates = [
     path.join(pipelineDir, 'queue', 'done', `${trimmed}.json`),
     path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${trimmed}.json`),
   ];
+  // Also look in queue/done/_archived/<YYYY-MM>/<depId>.json where the daily done-archive
+  // pass moves completed records. Without this the dependency gate never sees a predecessor
+  // that has been archived (2026-11-09: 12 adhoc tasks in queue/adhoc/ were stuck forever
+  // because their dependsOn predecessor had been moved into _archived/ by the daily pass).
+  // Newest month first so the most recent archive is tried before older ones.
+  const archivedDir = path.join(pipelineDir, 'queue', 'done', '_archived');
+  try {
+    const months = fs.readdirSync(archivedDir).filter((entry) => {
+      try { return fs.statSync(path.join(archivedDir, entry)).isDirectory(); } catch { return false; }
+    }).sort().reverse();
+    for (const month of months) {
+      const candidate = path.join(archivedDir, month, `${trimmed}.json`);
+      if (fs.existsSync(candidate)) candidates.push(candidate);
+    }
+  } catch { /* no _archived directory -- adds nothing, fail silently */ }
   for (const candidate of candidates) {
     try {
       const data = JSON.parse(fs.readFileSync(candidate, 'utf8'));
@@ -261,59 +277,6 @@ function isSoftDependencySatisfied(pipelineDir, depId) {
     }
   }
   return false;
-}
-
-// A claimed task lives at queue/drafting/<InstanceId>/<id>.json, not queue/drafting/<id>.json
-// directly (a per-instance claim subfolder) -- every task source shares this function, so a
-// task actively being drafted is correctly seen as already-queued, not regenerated.
-// A hub renamed to its HUB#### id (hub-rename.js) leaves the id of the task it was as `formerIds`. Without this the source that derived that task
-// (function_length_fix re-derives AC-2 every tick) sees no queued task under the old id and files a DUPLICATE -- seen live 2026-09-20, minutes after
-// the AC-2 hub was renamed. Memoised on the coordinating/ dir's mtime (a rename or a new hub changes it).
-const _formerHubIdsMemo = new Map(); // coordDir -> { mtimeMs, ids:Set }
-function formerHubIds(queueDir) {
-  const coordDir = path.join(queueDir, 'coordinating');
-  let mtimeMs;
-  try { mtimeMs = fs.statSync(coordDir).mtimeMs; } catch { return new Set(); }
-  const hit = _formerHubIdsMemo.get(coordDir);
-  if (hit && hit.mtimeMs === mtimeMs) return hit.ids;
-  const ids = new Set();
-  try {
-    for (const f of fs.readdirSync(coordDir)) {
-      if (!f.endsWith('.json')) continue;
-      try { const h = JSON.parse(fs.readFileSync(path.join(coordDir, f), 'utf8')); for (const x of (Array.isArray(h.formerIds) ? h.formerIds : [])) ids.add(x); } catch { /* malformed -- skip */ }
-    }
-  } catch { /* unreadable */ }
-  _formerHubIdsMemo.set(coordDir, { mtimeMs, ids });
-  return ids;
-}
-
-function taskIdExistsInQueue(id) {
-  const { pipelineDir } = getConfig();
-  const queueDir = path.join(pipelineDir, 'queue');
-  if (formerHubIds(queueDir).has(id)) return true;
-  if (fs.existsSync(path.join(queueDir, 'done', '_archived_no_action', `${id}.json`))) return true;
-  // done-archive.js's own dated month buckets (queue/done/_archived/<YYYY-MM>/, 2026-08-24)
-  // -- without this, a task's underlying item (a brain-dump entry, a deep_dive community,
-  // an arch_import itemId) would look "never queued" the moment its completed task aged
-  // past the retention window and got moved out of done/'s top level, and could be
-  // regenerated as a live duplicate -- the exact bug this function exists to prevent, same
-  // reasoning as the _archived_no_action check just above.
-  if (listArchivedMonthDirs(pipelineDir).some((dir) => fs.existsSync(path.join(dir, `${id}.json`)))) return true;
-  return QUEUE_STATES.some((state) => {
-    if (state !== 'drafting') return fs.existsSync(path.join(queueDir, state, `${id}.json`));
-
-    const draftingDir = path.join(queueDir, 'drafting');
-    if (fs.existsSync(path.join(draftingDir, `${id}.json`))) return true; // legacy: no subfolder
-    let entries;
-    try {
-      entries = fs.readdirSync(draftingDir, { withFileTypes: true });
-    } catch {
-      return false;
-    }
-    return entries
-      .filter((e) => e.isDirectory())
-      .some((e) => fs.existsSync(path.join(draftingDir, e.name, `${id}.json`)));
-  });
 }
 
 // Titles of every currently in-flight (not yet finished) task, shown to brain_dump_sort's
@@ -523,6 +486,8 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
       const unmet = parsed.dependsOn.filter((depId) => !isDependencySatisfied(pipelineDir, depId));
       if (unmet.length > 0) continue;
     }
+    // prerequisiteHubs (hub-prerequisites.js): the piece needs files only another open hub's unmerged branch has, so it waits for that hub's MERGE.
+    if (unmetPrerequisiteHubs(pipelineDir, parsed).length > 0) continue;
     // softDependsOn (see isSoftDependencySatisfied's own comment): same skip-past
     // behavior, but satisfied once the dependency reaches queue/done/ -- no merge
     // required. A separate array from dependsOn so a coordinator can mix hard
@@ -1001,29 +966,55 @@ function nextDeepDiveTask() {
     return at - bt;
   });
 
-  // Collect the degree-sorted, budget-capped file list for one community (null when the
-  // community has no nodes at all in the graph -- same skip rule as the old inline code).
-  // Same degree-by-file, budget-capped selection as nextArchDiscoveryTask() -- see
-  // DEEP_DIVE_CONTEXT_BUDGET_CHARS's own comment for the reasoning; deep_dive reuses
-  // the identical convention rather than inventing a second one.
-  const collectFiles = (proj, community) => {
+  // Per-tick graph cache (2026-10-22, generation-tick cost): every lane runs this function between tasks, and for a project with ~2,000 onboarded
+  // communities the old code re-read and re-parsed the repo's .deep-dive-graph.json (up to 7 MB) once PER COMMUNITY, then read source files, before
+  // finding out the community already had a task -- 71-77 s of idle GPU per tick (profile: 45 of 63 s in this function). The graph of one project is
+  // now parsed once per call and its nodes are indexed by community, so each community costs a Map lookup. Same degree-by-file selection as before.
+  const graphCache = new Map(); // clonePath -> { nodesByCommunity, degreeByNodeId, rankedByCommunity }
+  const graphFor = (proj) => {
+    let g = graphCache.get(proj.clonePath);
+    if (g) return g;
     const graphPath = path.join(proj.clonePath, '.deep-dive-graph.json');
     const graphData = JSON.parse(readIfExists(graphPath) || '{"nodes":[],"links":[]}');
-    const memberNodes = (graphData.nodes || []).filter((n) => n.community === community.id);
-    if (memberNodes.length === 0) return null;
-
+    const nodesByCommunity = new Map();
+    for (const n of graphData.nodes || []) {
+      const list = nodesByCommunity.get(n.community);
+      if (list) list.push(n); else nodesByCommunity.set(n.community, [n]);
+    }
     const degreeByNodeId = {};
     for (const link of graphData.links || []) {
       degreeByNodeId[link.source] = (degreeByNodeId[link.source] || 0) + 1;
       degreeByNodeId[link.target] = (degreeByNodeId[link.target] || 0) + 1;
     }
-    const degreeByFile = {};
-    for (const node of memberNodes) {
-      if (!node.source_file) continue;
-      degreeByFile[node.source_file] = (degreeByFile[node.source_file] || 0) + (degreeByNodeId[node.id] || 0);
-    }
-    const rankedFiles = Object.entries(degreeByFile).sort((a, b) => b[1] - a[1]);
+    g = { nodesByCommunity, degreeByNodeId, rankedByCommunity: new Map() };
+    graphCache.set(proj.clonePath, g);
+    return g;
+  };
 
+  // The degree-sorted [file, degree] list for one community, from the graph alone (no file is read); null when the community has no nodes at all in
+  // the graph -- same skip rule as the old inline code.
+  const rankedFilesFor = (proj, community) => {
+    const g = graphFor(proj);
+    if (g.rankedByCommunity.has(community.id)) return g.rankedByCommunity.get(community.id);
+    const memberNodes = g.nodesByCommunity.get(community.id) || [];
+    let ranked = null;
+    if (memberNodes.length > 0) {
+      const degreeByFile = {};
+      for (const node of memberNodes) {
+        if (!node.source_file) continue;
+        degreeByFile[node.source_file] = (degreeByFile[node.source_file] || 0) + (g.degreeByNodeId[node.id] || 0);
+      }
+      ranked = Object.entries(degreeByFile).sort((a, b) => b[1] - a[1]);
+    }
+    g.rankedByCommunity.set(community.id, ranked);
+    return ranked;
+  };
+
+  // Collect the budget-capped file list (contents read from disk) for a community's ranked files.
+  // Same degree-by-file, budget-capped selection as nextArchDiscoveryTask() -- see
+  // DEEP_DIVE_CONTEXT_BUDGET_CHARS's own comment for the reasoning; deep_dive reuses
+  // the identical convention rather than inventing a second one.
+  const collectFiles = (proj, rankedFiles) => {
     const files = [];
     let budgetUsed = 0;
     for (const [sourceFile, degree] of rankedFiles) {
@@ -1044,8 +1035,15 @@ function nextDeepDiveTask() {
   // records the consumed slice so the next tick emits the next one. A community at or
   // under the cap keeps today's exact behavior: one task, the unsuffixed ID.
   for (const c of candidates) {
-    const files = collectFiles(c.proj, c.community);
-    if (files === null) continue; // community has no graph nodes -- same skip as before
+    const rankedFiles = rankedFilesFor(c.proj, c.community);
+    if (rankedFiles === null) continue; // community has no graph nodes -- same skip as before
+    // Exact cheap skip, decided BEFORE any source file is read. A community with at most DEEP_DIVE_MAX_FILES_PER_TASK ranked files can never need
+    // more than one slice (files is a subset of rankedFiles), so below it always gets the unsliced id; with no slice counter to reset
+    // (consumedSlices unset/0 -- a set counter takes the full path so its reset-and-save below still runs) a task already in the queue under that id means
+    // the loop would `continue`. Anything else (a bigger community, a slice counter, no task yet) goes through the original logic unchanged.
+    if (!c.community.consumedSlices && rankedFiles.length <= DEEP_DIVE_MAX_FILES_PER_TASK
+        && taskIdExistsInQueue(`deep-dive-${c.slug}-${c.community.id}`)) continue;
+    const files = collectFiles(c.proj, rankedFiles);
 
     const totalSlices = Math.max(1, Math.ceil(files.length / DEEP_DIVE_MAX_FILES_PER_TASK));
     let id;
@@ -1194,9 +1192,28 @@ function readProjectLabels() {
 // Kept in sync with apply-group-a.js's own MAX_SORT_ATTEMPTS.
 const MAX_SORT_ATTEMPTS = 3;
 
-function brainDumpSortTaskId(entry) {
-  const n = entry.sortAttempt || 0;
-  return n > 0 ? `brain-dump-sort-${entry.id}-a${n}` : `brain-dump-sort-${entry.id}`;
+function brainDumpSortTaskId(entry, attempt = entry.sortAttempt || 0) {
+  return attempt > 0 ? `brain-dump-sort-${entry.id}-a${attempt}` : `brain-dump-sort-${entry.id}`;
+}
+
+// The attempt number a still-captured entry should be sorted under next, or null when nothing may be generated for it right now.
+// Starts at entry.sortAttempt and steps past every attempt whose id is held ONLY by a finished task: a sort task that finished
+// (noop, filed, skipped as stale) and left the entry 'captured' has used up that attempt, whatever the counter says. Without this the
+// entry was invisible forever behind its own spent id -- measured 2026-10-22: 17 agent-manager entries (11 whose apply was rejected
+// before the rejection bumped sortAttempt, 5 edited after they were sorted: the dashboard edit resets status to 'captured' but not the
+// id) while the rx580 lane logged "no eligible task found". A live, blocked or held task on an attempt id still blocks the entry
+// (no duplicate), and the walk stops at MAX_SORT_ATTEMPTS so a task that finishes without result cannot loop. Pure reads; nothing is written.
+function nextFreeSortAttempt(entry) {
+  for (let n = entry.sortAttempt || 0; n < MAX_SORT_ATTEMPTS; n += 1) {
+    const id = brainDumpSortTaskId(entry, n);
+    if (!taskIdExistsInQueue(id)) return n;
+    if (!taskIdHeldOnlyByFinishedTask(id)) return null;
+  }
+  return null;
+}
+
+function isBrainDumpEntrySortable(entry) {
+  return !!entry && entry.status === 'captured' && !entry.suppressed && nextFreeSortAttempt(entry) !== null;
 }
 
 // At most this many entries are linked to existing work in one generator call (each check reads the queue: ~170 ms
@@ -1223,6 +1240,24 @@ function linkBrainDumpEntriesToExistingWork(brainDumpPath, pipelineDir, links, b
   }
 }
 
+// Persists the attempt number a sort task is being emitted under when it is ahead of the stored counter (see nextFreeSortAttempt), so the
+// apply-skip / review-exhaustion bump (sortAttempt + 1) moves on to the NEXT id instead of landing back on this task's own id. Re-reads the
+// file right before writing (a concurrent dashboard edit is not lost), only touches a still-captured entry whose counter is behind, and
+// uses the atomic writer. Best-effort: a failed write only means the bump may re-use this id, which the dedupe check still blocks.
+function advanceBrainDumpSortAttempt(brainDumpPath, pipelineDir, entry, attempt) {
+  try {
+    const fresh = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
+    const cur = (Array.isArray(fresh.entries) ? fresh.entries : []).find((x) => x && x.id === entry.id);
+    if (!cur || cur.status !== 'captured' || (cur.sortAttempt || 0) >= attempt) return;
+    const from = cur.sortAttempt || 0;
+    cur.sortAttempt = attempt;
+    writeBrainDumpAtomic(brainDumpPath, fresh);
+    logPipelineEvent(pipelineDir, 'brain-dump-sort-attempt-advanced', { entryId: cur.id, serial: cur.serial ?? null, from, to: attempt, reason: 'earlier sort task(s) finished without sorting the entry' });
+  } catch (e) {
+    console.error(`[task-sources] brain-dump sortAttempt advance failed (best-effort): ${e.message}`);
+  }
+}
+
 function nextBrainDumpSortTask() {
   const { brainDumpPath, secondBrainDir, pipelineDir } = getConfig();
   if (!brainDumpPath) return null;
@@ -1246,9 +1281,7 @@ function nextBrainDumpSortTask() {
   // nothing to act on, because generation itself had stopped dead. Same "skip an
   // in-queue one and keep looking" loop nextArchImportTask/nextUnusedExportTask already
   // use for their own oldest-first selection.
-  const eligible = entries.filter((e) => e && e.status === 'captured' && !e.suppressed
-    && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
-    && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
+  const eligible = entries.filter(isBrainDumpEntrySortable);
   // Existing-work check (2026-10-18, see brain-dump-existing-work.js): an entry whose work is already a task -- queued,
   // done or archived -- is linked to that task instead of being sorted again (no classification spent). Bounded per call.
   let chosen = null;
@@ -1261,7 +1294,9 @@ function nextBrainDumpSortTask() {
   if (links.length) linkBrainDumpEntriesToExistingWork(brainDumpPath, pipelineDir, links, 'generator');
   if (!chosen) return null;
 
-  const taskId = brainDumpSortTaskId(chosen);
+  const attempt = nextFreeSortAttempt(chosen);
+  if (attempt > (chosen.sortAttempt || 0)) advanceBrainDumpSortAttempt(brainDumpPath, pipelineDir, chosen, attempt);
+  const taskId = brainDumpSortTaskId(chosen, attempt);
 
   return {
     id: taskId,
@@ -1649,6 +1684,45 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // It now takes the one pinned context (gpu-capacity.js PINNED_NUM_CTX) like everything else.
 registerModelProfile('brain-dump-cheap-local', { backend: 'local', think: false });
 registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', deterministicReview: true, deterministicReviewValidate: brainDumpSortReviewValidate, reportClass: 'housekeeping', strictOutputOnly: true });
+// brain_dump_resolution_check (2026-10-26): per-entry 'already fixed on master?' check.
+// Evidence pack built BEFORE model call (capped ~3000 chars), deterministic validator
+// downgrades 'yes' if evidence not grounded in pack. Never closes or edits entry text.
+// Uses qwen3-vl:8b-instruct on rx580 lane (16384 numCtx). Registered here so this file
+// is the single source of truth for the domain string.
+const { next: nextBrainDumpResolutionCheck, apply: applyBrainDumpResolutionCheck, validate: validateBrainDumpResolutionCheck, localCall: localCallBrainDumpResolutionCheck } = require('./brain-dump-resolution-check.js');
+registerTaskSource('brain_dump_resolution_check', {
+  priority: taskPriority('brain_dump_resolution_check', 44),
+  next: nextBrainDumpResolutionCheck,
+  apply: applyBrainDumpResolutionCheck,
+  modelProfile: 'qwen3-vl:8b-instruct',
+  deterministicReview: true,
+  deterministicReviewValidate: validateBrainDumpResolutionCheck,
+  reportClass: 'housekeeping',
+  strictOutputOnly: true,
+});
+// brain_dump_disposition (2026-09-16, HUB0119 1/4): the domain for the structured
+// disposition decision on a brain-dump entry that must NOT become code work -- the
+// counterpart of brain_dump_sort's requiresCode/requiresResearch routing. Registered here
+// so this file is the single source of truth for the domain string (same
+// domain===source convention brain_dump_sort uses above, which is what
+// resolveSourceName()/_ensure_task_domains key off). strictOutputOnly:true mirrors
+// brain_dump_sort exactly (structured decision output, no rawDiff); requiresWorktree:false
+// is consumed by the apply-task.js branch (sibling HUB0119 3/4) so a disposition never
+// spins up a git worktree. No auto-generator: next() returns null because tasks in this
+// domain are produced by the apply-adhoc-diff.js routing (sibling 2/4), not by a source
+// scanner. deterministicReviewValidate is intentionally null for now -- its consumers
+// (review-task.js, reject-retry-check.js) guard with `typeof === 'function'` and safely
+// fall through to the ordinary review path until sibling 2/4 supplies the real validator.
+registerTaskSource('brain_dump_disposition', {
+  priority: taskPriority('brain_dump_disposition', 43),
+  next: () => null,
+  modelProfile: 'brain-dump-cheap-local',
+  deterministicReview: true,
+  deterministicReviewValidate: null,
+  reportClass: 'housekeeping',
+  strictOutputOnly: true,
+  requiresWorktree: false,
+});
 // Priority 45 -- right after brain_dump_sort (42) generates the held task in the first
 // place, ahead of every other job type. A held task blocks real work from ever being
 // drafted at all, so resolving it (or at least trying to) deserves to jump the queue,
@@ -2431,7 +2505,11 @@ function nextSecondBrainOpportunitiesTask() {
 // contradicting the real community file content it was given. See
 // deep-dive-grounding-check.js's own header for the incident.
 registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true, skipImplementWhenNoRealFiles: true, reviewGuidance: DEEP_DIVE_REVIEW_GUIDANCE, reportClass: 'benefit', postImplementCheck: runDeepDiveGroundingCheck });
-registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true, preValidateCitedPaths: true, reviewGuidance: PROJECT_SEARCH_REVIEW_GUIDANCE, reportClass: 'benefit', harnessSearch: 'projectSearch' });
+registerTaskSource('project_search', {
+  priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true, preValidateCitedPaths: true, reviewGuidance: PROJECT_SEARCH_REVIEW_GUIDANCE, reportClass: 'benefit', harnessSearch: 'projectSearch',
+  // Interchangeable searches pile up if generation ever leaks (1,196 queued 2026-10-20 to 10-23): keep the newest per project, archive the rest (expiry-sweep.js).
+  expiry: { idPrefixes: ['project-search-'], findExpired: (args) => require('./project-search-duplicates.js').findDuplicateProjectSearch(args) },
+});
 // No `apply` key -- domain:defaultDomain (see buildAuditTask, moved off domain:'adhoc'
 // 2026-08-20 to run on the local model instead of requiring Claude) means this
 // falls through to the generic Group-B git-branch-diff apply path, same as arch_import
@@ -2917,7 +2995,7 @@ function writeTask(task) {
 }
 
 module.exports = {
-  getNextTask, writeTask, taskIdExistsInQueue,
+  getNextTask, writeTask, taskIdExistsInQueue, isBrainDumpEntrySortable,
   nextTroubleLogTask, nextAdhocTask, nextDerivedTask, nextSecondBrainTask,
   nextCandidateFulfillmentTask, windowFetchedFileContent, nextProjectSearchTask,
   nextDeepDiveTask, nextBrainDumpSortTask,
@@ -3136,9 +3214,7 @@ if (require.main === module) {
     if (!brainDumpPath) return false;
     try {
       const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
-      return Array.isArray(data.entries) && data.entries.some((e) => e && e.status === 'captured' && !e.suppressed
-        && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
-        && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
+      return Array.isArray(data.entries) && data.entries.some(isBrainDumpEntrySortable);
     } catch {
       return false;
     }
@@ -3207,21 +3283,25 @@ if (require.main === module) {
   })();
 
   {
+    // An exemption lets through ONLY its own source (makeGenerationBlocker, generation-throttle.js); every other source stays under the
+    // priority-aware veto while a backlog exists. Before 2026-10-31 any exemption left `blocked` undefined, which opened the whole ladder and let
+    // project_search / deep_dive generate on every tick (1,196 identical project_search tasks piled up).
     const throttled = alreadyPending && !hasAdhocWaiting && !hasResearchWaiting && !hasBrainDumpWaiting && !hasHeldClarificationWaiting;
-    // Throttled no longer means "ask nobody": a source is vetoed only by in-flight work at least as important as
-    // itself (generation-throttle.js makeSourceThrottle), so a higher-priority source (arch_discovery 30) can still
-    // generate while lower-priority tasks (derived_task 41) already fill the slots.
     let blocked;
-    if (throttled) {
-      const { rankPriorityOfTask } = require('./next-claimable-task.js');
+    if (alreadyPending) {
+      const { rankPriorityResolved: rankPriorityOfTask } = require('./rank-priority.js'); // the CLI block above has already run ensureRegistered(), so the leaf (no registry load) is enough
       const inFlightPriorities = inFlightFiles.map((f) => {
         try { return rankPriorityOfTask(JSON.parse(fs.readFileSync(f, 'utf8'))); } catch { return Infinity; }
       });
-      const veto = makeSourceThrottle({ inFlightPriorities, laneCount: liveLaneCount(instancesDir) });
-      blocked = (source) => veto(source.priority);
+      const exemptSourceNames = [];
+      if (hasAdhocWaiting) exemptSourceNames.push('adhoc');
+      if (hasResearchWaiting) exemptSourceNames.push('research_task');
+      if (hasBrainDumpWaiting) exemptSourceNames.push('brain_dump_sort');
+      if (hasHeldClarificationWaiting) exemptSourceNames.push('path_prefetch_resolve');
+      blocked = makeGenerationBlocker({ alreadyPending, exemptSourceNames, inFlightPriorities, laneCount: liveLaneCount(instancesDir) });
     }
     const task = getNextTask({ blocked });
-    if (!task && throttled) {
+    if (!task && alreadyPending) {
       console.log('pending/ already has work queued, not adding another task');
     } else if (!task) {
       console.log('no eligible task found (all registered sources exhausted or malformed)');

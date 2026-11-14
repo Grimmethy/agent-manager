@@ -355,6 +355,80 @@ test('nextBrainDumpSortTask stops offering an entry once sortAttempt hits MAX_SO
   assert.equal(nextBrainDumpSortTask(), null);
 });
 
+// --- A finished sort task must not make a still-captured entry invisible (2026-10-22) --------------
+// Measured on the live agent-manager brain dump: 17 captured entries with sortAttempt 0 whose first sort task had FINISHED (11 apply-rejected as a
+// 'noop' before rejections bumped the counter; 5 sorted, then edited, which resets status to 'captured' but not the id). Their spent id blocked
+// regeneration forever and worker-rx580 logged "no eligible task found" with 45 entries waiting.
+
+function sortFixture(entry) {
+  const dir = makeBrainDumpFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({ entries: [{ id: 'bd-1', rawText: 'x', status: 'captured', ...entry }] }));
+  const put = (sub, name) => {
+    const d = path.join(dir, 'queue', ...sub);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, `${name}.json`), '{}');
+  };
+  return { dir, put, ts: freshTaskSources(dir), stored: () => JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, 'utf8')).entries[0] };
+}
+
+test('a captured entry whose attempt-0 sort task finished in done/ is offered under the next id and the counter is advanced', () => {
+  const f = sortFixture({});
+  f.put(['done'], 'brain-dump-sort-bd-1');
+  const task = f.ts.nextBrainDumpSortTask();
+  assert.ok(task, 'a spent done/ record must not bury a still-captured entry');
+  assert.equal(task.id, 'brain-dump-sort-bd-1-a1');
+  assert.equal(f.stored().sortAttempt, 1, 'the stored counter follows the emitted id, so a later exhaustion bump moves on to a2');
+});
+
+test('a finished sort task in a done-archive month bucket or _archived_no_action/ also frees the next attempt', () => {
+  for (const sub of [['done', '_archived', '2026-09'], ['done', '_archived_no_action']]) {
+    const f = sortFixture({});
+    f.put(sub, 'brain-dump-sort-bd-1');
+    const task = f.ts.nextBrainDumpSortTask();
+    assert.ok(task, `${sub.join('/')} must not bury the entry`);
+    assert.equal(task.id, 'brain-dump-sort-bd-1-a1');
+  }
+});
+
+test('the walk steps past several finished attempts and stops at MAX_SORT_ATTEMPTS', () => {
+  const f = sortFixture({});
+  f.put(['done'], 'brain-dump-sort-bd-1');
+  f.put(['done'], 'brain-dump-sort-bd-1-a1');
+  assert.equal(f.ts.nextBrainDumpSortTask().id, 'brain-dump-sort-bd-1-a2');
+  const g = sortFixture({});
+  for (const id of ['brain-dump-sort-bd-1', 'brain-dump-sort-bd-1-a1', 'brain-dump-sort-bd-1-a2']) g.put(['done'], id);
+  assert.equal(g.ts.nextBrainDumpSortTask(), null, 'three spent attempts exhaust the entry: a task that finishes without result cannot loop');
+  assert.equal(g.stored().sortAttempt, undefined, 'an exhausted entry is not written to');
+});
+
+test('an attempt id held by a live, blocked or held task still blocks the entry (no duplicate)', () => {
+  for (const state of ['pending', 'blocked', 'needs-clarification', 'review']) {
+    const f = sortFixture({});
+    f.put(['done'], 'brain-dump-sort-bd-1');
+    f.put([state], 'brain-dump-sort-bd-1-a1');
+    assert.equal(f.ts.nextBrainDumpSortTask(), null, `a1 sitting in ${state}/ must block`);
+    assert.equal(f.stored().sortAttempt, undefined, 'nothing is written when nothing is emitted');
+  }
+});
+
+test('after the counter was advanced, an exhaustion bump lands on the next id even though the blocked task holds the previous one', () => {
+  const f = sortFixture({ sortAttempt: 2 });
+  f.put(['done'], 'brain-dump-sort-bd-1');
+  f.put(['blocked'], 'brain-dump-sort-bd-1-a1');
+  assert.equal(f.ts.nextBrainDumpSortTask().id, 'brain-dump-sort-bd-1-a2');
+});
+
+test('isBrainDumpEntrySortable agrees with the generator: the throttle exemption uses it, so a spent id does not leave pending/ throttled with nothing to add', () => {
+  const f = sortFixture({});
+  f.put(['done'], 'brain-dump-sort-bd-1');
+  const entry = f.stored();
+  assert.equal(f.ts.isBrainDumpEntrySortable(entry), true);
+  assert.equal(f.ts.isBrainDumpEntrySortable({ ...entry, suppressed: true }), false);
+  assert.equal(f.ts.isBrainDumpEntrySortable({ ...entry, status: 'sorted' }), false);
+  f.put(['pending'], 'brain-dump-sort-bd-1-a1');
+  assert.equal(f.ts.isBrainDumpEntrySortable(entry), false);
+});
+
 // --- nextBrainDumpSortTask's selfProjectLabel (2026-08-16) ------------------------------
 // Confirmed live: a real self-referential note ("brain dump entries should track an
 // interaction count") was classified actionable:false, belongsToProject:null despite
@@ -1426,6 +1500,91 @@ test('nextAdhocTask still correctly waits when the dependency is "pending-merge"
   });
   const { nextAdhocTask } = freshTaskSources(dir);
   assert.equal(nextAdhocTask(), null, 'pending-merge must still block -- unlike the no-code dispositions, real code is waiting to land');
+});
+
+// done-archive pass moves completed records into queue/done/_archived/<YYYY-MM>/<id>.json
+// (2026-11-09: 12 adhoc tasks were stuck forever because their dependsOn predecessor had
+// been archived and isDependencySatisfied() never looked there). These tests prove the
+// dependency gate now sees archived predecessors, and only the named dependency is released.
+function writeArchivedDoneFile(dir, yearMonth, id, contents) {
+  const archivedDir = path.join(dir, 'queue', 'done', '_archived', yearMonth);
+  fs.mkdirSync(archivedDir, { recursive: true });
+  fs.writeFileSync(path.join(archivedDir, `${id}.json`), JSON.stringify(contents));
+}
+
+test('nextAdhocTask claims a dependent whose dependency was archived into queue/done/_archived/<YYYY-MM>/ with mergedAt', () => {
+  const dir = makeAdhocFixtureRepo();
+  // Predecessor lives ONLY in the archive -- not in queue/done/ directly.
+  writeArchivedDoneFile(dir, '2026-09', 'adhoc-archived-prereq-1', {
+    id: 'adhoc-archived-prereq-1', title: 'archived prereq', mergedAt: '2026-09-15T00:00:00.000Z',
+  });
+  writeAdhocFile(dir, 'dependent.json', {
+    id: 'adhoc-archived-dependent-1',
+    title: 'Depends on an archived prereq that has mergedAt',
+    dependsOn: ['adhoc-archived-prereq-1'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task, 'archived predecessor with mergedAt must release the dependent');
+  assert.equal(task.id, 'adhoc-archived-dependent-1');
+});
+
+test('nextAdhocTask releases only the dependent that names an archived predecessor, not one that names an unrelated id', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeArchivedDoneFile(dir, '2026-10', 'adhoc-archived-prereq-2', {
+    id: 'adhoc-archived-prereq-2', title: 'archived prereq 2', mergedAt: '2026-10-01T00:00:00.000Z',
+  });
+  // Unrelated record in the same month directory -- proves we look up by id, not just scan the dir.
+  writeArchivedDoneFile(dir, '2026-10', 'adhoc-unrelated-record', {
+    id: 'adhoc-unrelated-record', title: 'unrelated', terminalDisposition: 'noop',
+  });
+  // Dependent that names the archived predecessor -- should be released.
+  writeAdhocFile(dir, 'named.json', {
+    id: 'adhoc-named-dependent',
+    title: 'Names the archived prereq',
+    dependsOn: ['adhoc-archived-prereq-2'],
+  });
+  // Dependent that names an id that exists nowhere -- should NOT be released.
+  writeAdhocFile(dir, 'unrelated-dep.json', {
+    id: 'adhoc-unrelated-dep',
+    title: 'Names an unrelated id',
+    dependsOn: ['adhoc-nonexistent-id'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task, 'at least one candidate must be claimable');
+  assert.equal(task.id, 'adhoc-named-dependent', 'only the dependent that names the archived predecessor is released');
+});
+
+test('nextAdhocTask still blocks when the dependency is absent everywhere including _archived/', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'blocked.json', {
+    id: 'adhoc-archived-blocked-1',
+    title: 'Depends on a missing id',
+    dependsOn: ['adhoc-never-existed-xyz'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null, 'a predecessor that does not exist anywhere must still block');
+});
+
+test('nextAdhocTask keeps a dependent blocked when the archived predecessor has no mergedAt and its work is not on main', () => {
+  const dir = makeAdhocFixtureRepo();
+  // Archived predecessor: status done but no mergedAt, no terminalDisposition, no stacked branch.
+  // Without the fail-closed check the dependent would be released -- it must NOT.
+  writeArchivedDoneFile(dir, '2026-11', 'adhoc-archived-no-merge', {
+    id: 'adhoc-archived-no-merge', title: 'archived prereq, never merged',
+  });
+  writeAdhocFile(dir, 'dependent.json', {
+    id: 'adhoc-archived-blocked-2',
+    title: 'Depends on an archived prereq with no merge signal',
+    dependsOn: ['adhoc-archived-no-merge'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null, 'archived predecessor with no mergedAt and no terminalDisposition must keep fail-closed behavior');
 });
 
 // Hub-aware draft sequencing (2026-09-18, pipeline hardening -- Grimmethy: "These hub
@@ -3485,4 +3644,189 @@ test('nextBrainDumpSortTask links an entry whose work already exists, keeps a co
   assert.equal(hist.length, 1);
   assert.equal(hist[0].entryId, 'bd-done-work');
   assert.equal(hist[0].taskId, 'adhoc-carried-1');
+});
+
+// --- nextDeepDiveTask: a community that already has a task must not cost any file reads (2026-10-22) --------
+// Measured on the live agent-manager queue: the generation tick every lane runs between tasks took 71-77 s (45 s in this function) because each of
+// ~2,000 onboarded communities re-parsed the repo's graph JSON and read its source files BEFORE the "already has a task" check. These pin the
+// cheap exact skip, the once-per-project graph parse, and every behaviour the old loop had around it (slices, the stale-counter reset, no-node
+// communities), so the speed-up cannot change which task is emitted.
+
+// One onboarded fake clone for THIS project. spec.communities: [{ id, files, consumedSlices?, task?: 'unsliced' | 's<N>' }]. A file's degree is its
+// index + 1, so the highest-index file ranks first.
+function deepDiveWorld(communities, { slug = 'lead-repo' } = {}) {
+  const dir = makeDeepDiveFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_PROJECT_SEARCH_INDEX_PATH, fixtureIndexMd([]));
+  const clone = path.join(dir, 'clones', slug);
+  fs.mkdirSync(clone, { recursive: true });
+  const nodes = [];
+  const links = [];
+  for (const c of communities) {
+    for (let k = 0; k < c.files; k += 1) {
+      const file = `c${c.id}_f${k}.js`;
+      fs.writeFileSync(path.join(clone, file), `// community ${c.id} file ${k}\n` + 'x'.repeat(100));
+      nodes.push({ id: `${c.id}:${k}`, community: c.id, source_file: file });
+      for (let d = 0; d <= k; d += 1) links.push({ source: `${c.id}:${k}`, target: `sink-${c.id}-${k}-${d}` });
+    }
+    if (c.task) {
+      const id = c.task === 'unsliced' ? `deep-dive-${slug}-${c.id}` : `deep-dive-${slug}-${c.id}-${c.task}`;
+      fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'queue', 'done', `${id}.json`), '{}');
+    }
+  }
+  fs.writeFileSync(path.join(clone, '.deep-dive-graph.json'), JSON.stringify({ nodes, links }));
+  const coverage = {
+    projects: {
+      [slug]: {
+        sourceUrl: `https://github.com/x/${slug}`,
+        clonePath: clone,
+        relevantToProject: path.basename(dir),
+        communities: communities.map((c) => ({ id: c.id, name: `community ${c.id}`, lastReviewedAt: null, ...(c.consumedSlices ? { consumedSlices: c.consumedSlices } : {}) })),
+      },
+    },
+  };
+  fs.writeFileSync(process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH, JSON.stringify(coverage, null, 2));
+  return { dir, clone, readCoverage: () => JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH, 'utf8')) };
+}
+
+// Runs fn with fs.readFileSync counting reads of the graph file and of source files inside the clone.
+function countReads(clone, fn) {
+  const real = fs.readFileSync;
+  const reads = { graph: 0, source: 0 };
+  fs.readFileSync = function patched(p, ...rest) {
+    const s = String(p);
+    if (s.endsWith('.deep-dive-graph.json')) reads.graph += 1;
+    else if (s.startsWith(clone) && s.endsWith('.js')) reads.source += 1;
+    return real.call(this, p, ...rest);
+  };
+  try { return { result: fn(), reads }; } finally { fs.readFileSync = real; }
+}
+
+test('deep_dive emits the one community without a task and reads the graph once and only that community\'s files', () => {
+  const comms = [];
+  for (let id = 0; id < 40; id += 1) comms.push({ id, files: 3, task: id === 17 ? undefined : 'unsliced' });
+  const w = deepDiveWorld(comms);
+  const { nextDeepDiveTask } = freshTaskSources(w.dir);
+  const { result, reads } = countReads(w.clone, () => nextDeepDiveTask());
+  assert.ok(result, 'the one community without a task must be emitted');
+  assert.equal(result.id, 'deep-dive-lead-repo-17');
+  assert.deepEqual(result.promptContext.files.map((f) => f.path), ['c17_f2.js', 'c17_f1.js', 'c17_f0.js'], 'highest-degree file first, as before');
+  assert.equal(reads.graph, 1, 'one parse of the project graph per call, not one per community');
+  assert.equal(reads.source, 3, 'source files are read only for the community that emits');
+});
+
+test('deep_dive with every community already tasked returns null and reads no source file at all', () => {
+  const w = deepDiveWorld(Array.from({ length: 60 }, (_, id) => ({ id, files: 4, task: 'unsliced' })));
+  const { nextDeepDiveTask } = freshTaskSources(w.dir);
+  const { result, reads } = countReads(w.clone, () => nextDeepDiveTask());
+  assert.equal(result, null);
+  assert.equal(reads.source, 0);
+  assert.equal(reads.graph, 1);
+});
+
+test('deep_dive still slices a community over the cap: s0 first (coverage advanced), then s1 once s0 has a task', () => {
+  const w = deepDiveWorld([{ id: 5, files: 13 }]);
+  const { nextDeepDiveTask } = freshTaskSources(w.dir);
+  const first = nextDeepDiveTask();
+  assert.equal(first.id, 'deep-dive-lead-repo-5-s0');
+  assert.equal(first.promptContext.files.length, 12);
+  assert.equal(w.readCoverage().projects['lead-repo'].communities[0].consumedSlices, 1);
+  fs.mkdirSync(path.join(w.dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(w.dir, 'queue', 'done', 'deep-dive-lead-repo-5-s0.json'), '{}');
+  const second = freshTaskSources(w.dir).nextDeepDiveTask();
+  assert.equal(second.id, 'deep-dive-lead-repo-5-s1');
+  assert.deepEqual(second.promptContext.files.map((f) => f.path), ['c5_f0.js']);
+});
+
+test('deep_dive: a community that grew past the cap after its unsliced task finished is NOT skipped by the cheap check', () => {
+  // 13 ranked files > 12, an unsliced task exists, no slice counter: the old loop emitted s0, so must this one.
+  const w = deepDiveWorld([{ id: 9, files: 13, task: 'unsliced' }]);
+  const t = freshTaskSources(w.dir).nextDeepDiveTask();
+  assert.ok(t, 'a grown community must still emit');
+  assert.equal(t.id, 'deep-dive-lead-repo-9-s0');
+});
+
+test('deep_dive: a stale slice counter on a now-small community is still reset and saved (the cheap skip must not bypass it)', () => {
+  const w = deepDiveWorld([{ id: 3, files: 4, consumedSlices: 2, task: 'unsliced' }]);
+  assert.equal(freshTaskSources(w.dir).nextDeepDiveTask(), null);
+  assert.ok(!w.readCoverage().projects['lead-repo'].communities[0].consumedSlices, 'consumedSlices must be reset to 0 exactly as before');
+});
+
+test('deep_dive: a community with no graph nodes is skipped and the next one still emits', () => {
+  const w = deepDiveWorld([{ id: 1, files: 0 }, { id: 2, files: 2 }]);
+  const t = freshTaskSources(w.dir).nextDeepDiveTask();
+  assert.equal(t.id, 'deep-dive-lead-repo-2');
+});
+
+test('deep_dive: a community exactly at the cap with a finished task is skipped, one file over is not', () => {
+  const at = deepDiveWorld([{ id: 1, files: 12, task: 'unsliced' }]);
+  assert.equal(freshTaskSources(at.dir).nextDeepDiveTask(), null);
+  const over = deepDiveWorld([{ id: 1, files: 13, task: 'unsliced' }]);
+  assert.equal(freshTaskSources(over.dir).nextDeepDiveTask().id, 'deep-dive-lead-repo-1-s0');
+});
+
+
+// isDependencySatisfied: a fully built NESTED hub (2026-10-23, chat plugin HUB0003). Its record stays in queue/coordinating/ until the stacked branch merges, so it
+// never reaches done/ and the dependents of "piece 1" waited for ever.
+function writeCoordinatingFile(dir, id, content) {
+  const d = path.join(dir, 'queue', 'coordinating'); fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, `${id}.json`), JSON.stringify(content));
+}
+const subHub = (statuses, stacked = { branch: 'agent/decompose-parent', seq: 1, total: 3 }) => ({
+  id: 'sub-hub-1', stacked, subTasks: statuses.map((status, i) => ({ id: `p${i}`, status })),
+});
+
+test('nextAdhocTask: a dependency on a nested hub whose pieces are all built on the shared stacked branch is satisfied', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeCoordinatingFile(dir, 'sub-hub-1', subHub(['pending-merge', 'pending-merge', 'merged']));
+  writeAdhocFile(dir, 'dependent.json', { id: 'adhoc-dependent-1', title: 'x', dependsOn: ['sub-hub-1'] });
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task, 'the sub-hub is built; its dependent must not wait for a merge of the whole branch');
+  assert.equal(task.id, 'adhoc-dependent-1');
+});
+
+test('nextAdhocTask: a nested hub with an open or blocked piece, no pieces, no stacked branch, or no record still holds its dependent', () => {
+  const cases = {
+    'one piece in progress': subHub(['pending-merge', 'in-progress']),
+    'one piece blocked': subHub(['pending-merge', 'blocked']),
+    'no pieces': subHub([]),
+    'no stacked branch': subHub(['pending-merge'], undefined),
+  };
+  for (const [label, rec] of Object.entries(cases)) {
+    const dir = makeAdhocFixtureRepo();
+    if (label === 'no stacked branch') delete rec.stacked;
+    writeCoordinatingFile(dir, 'sub-hub-1', rec);
+    writeAdhocFile(dir, 'dependent.json', { id: 'adhoc-dependent-1', title: 'x', dependsOn: ['sub-hub-1'] });
+    const { nextAdhocTask } = freshTaskSources(dir);
+    assert.equal(nextAdhocTask(), null, label);
+  }
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'dependent.json', { id: 'adhoc-dependent-1', title: 'x', dependsOn: ['no-such-record'] });
+  assert.equal(freshTaskSources(dir).nextAdhocTask(), null, 'no record at all');
+});
+
+// prerequisiteHubs (hub-prerequisites.js, 2026-10-23): a piece that needs files only another open hub's unmerged branch has waits for that hub's MERGE.
+test('nextAdhocTask holds a piece whose prerequisite hub is still coordinating, and claims it once that hub has left coordinating/', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'queue', 'coordinating'), { recursive: true });
+  const hubFile = path.join(dir, 'queue', 'coordinating', 'adhoc-hub6.json');
+  fs.writeFileSync(hubFile, JSON.stringify({ id: 'adhoc-hub6', hubLabel: 'HUB0006', subTasks: [] }));
+  writeAdhocFile(dir, 'piece.json', { id: 'adhoc-piece-1', title: 'Needs accounts.py from HUB0006', createdAt: new Date().toISOString(), prerequisiteHubs: ['HUB0006'] });
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null, 'held while HUB0006 is still open');
+  fs.unlinkSync(hubFile);
+  const task = freshTaskSources(dir).nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-piece-1');
+  assert.deepEqual(task.prerequisiteHubs, ['HUB0006'], 'the field survives the claim');
+});
+
+test('nextAdhocTask is unchanged for a task with no prerequisiteHubs even while hubs are open', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'queue', 'coordinating'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'coordinating', 'adhoc-hub6.json'), JSON.stringify({ id: 'adhoc-hub6', hubLabel: 'HUB0006', subTasks: [] }));
+  writeAdhocFile(dir, 'plain.json', { id: 'adhoc-plain-1', title: 'Ordinary task' });
+  const task = freshTaskSources(dir).nextAdhocTask();
+  assert.equal(task && task.id, 'adhoc-plain-1');
 });

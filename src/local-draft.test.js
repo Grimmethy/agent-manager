@@ -1933,20 +1933,57 @@ test('parseCandidateSplit returns invalid:true when mode is "split" but fewer th
 // silently return null here -- indistinguishable from "never attempted a split at all" --
 // and fall through as ordinary prose, which fact-checker.js's unrelated ALL-CAPS-field
 // heuristic then flagged as hallucination. See [[dspy-signatures]] Second Brain note.
-test('parseCandidateSplit returns invalid:true (not null) for a genuine split attempt truncated mid-JSON', () => {
+test('parseCandidateSplit returns truncated:true (not null) for a genuine split attempt truncated mid-JSON with at least one recoverable candidate', () => {
   const { parseCandidateSplit } = require('./local-draft.js');
   // The real shape: valid JSON up through the first candidate, cut off mid-second-candidate.
+  // With recovery, the one complete candidate is recovered and the response is flagged truncated.
   const truncated = '{"mode":"split","candidates":[{"title":"Add ENDPOINT_MAP","files":"src/model-provider.js","problem":"p","solution":"s","benefits":"b"},{"title":"Add getEndpoint","files":"src/model-provider.js","problem":"p2","solution":"s2","benefits';
   const result = parseCandidateSplit(truncated);
-  assert.equal(result.invalid, true, 'a recognizable split attempt with broken JSON must be a distinguishable failure, not null');
-  assert.match(result.reason, /truncated or malformed/);
-  assert.match(result.reason, /mode "split"/);
+  assert.equal(result.truncated, true, 'a recognizable split attempt with broken JSON must be flagged truncated, not null');
+  assert.equal(result.candidates.length, 1, 'must recover the one complete candidate');
+  assert.equal(result.candidates[0].title, 'Add ENDPOINT_MAP');
+  assert.match(result.reason, /truncated mid-JSON/);
+  assert.match(result.reason, /1 complete/);
 });
 
 test('parseCandidateSplit still returns null for malformed JSON that is NOT a split attempt (no false positive from the truncation carve-out)', () => {
   const { parseCandidateSplit } = require('./local-draft.js');
   assert.equal(parseCandidateSplit('{"mode":"edit","file":"x.js","find":"a truncated'), null);
   assert.equal(parseCandidateSplit('not json at all, and not truncated JSON either'), null);
+});
+
+// 2026-11-04: test the new truncated-split recovery path (arch-review-ac-70, arch-review-ac-395).
+test('parseCandidateSplit returns truncated:true with recovered candidates when a split response has at least 2 complete sub-candidates before the cut', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  // Two complete sub-candidates followed by a cut-off third.
+  const truncated = '{"mode":"split","candidates":[{"title":"First","problem":"p1","solution":"s1","benefits":"b1"},{"title":"Second","problem":"p2","solution":"s2","benefits":"b2"},{"title":"Third","problem":"p3","solution":"s3","benefits"';
+  const result = parseCandidateSplit(truncated);
+  assert.equal(result.truncated, true, 'must flag truncated');
+  assert.equal(result.candidates.length, 2, 'must recover the two complete candidates');
+  assert.equal(result.candidates[0].title, 'First');
+  assert.equal(result.candidates[1].title, 'Second');
+  assert.match(result.reason, /truncated mid-JSON/);
+  assert.match(result.reason, /2 complete/);
+});
+
+test('parseCandidateSplit returns truncated:true with one recovered candidate when exactly one complete sub-candidate precedes the cut', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  // One complete sub-candidate followed by a cut-off second.
+  const truncated = '{"mode":"split","candidates":[{"title":"Only one","problem":"p1","solution":"s1","benefits":"b1"},{"title":"Incomplete","problem":"p2","solution"';
+  const result = parseCandidateSplit(truncated);
+  assert.equal(result.truncated, true, 'must flag truncated');
+  assert.equal(result.candidates.length, 1, 'must recover the one complete candidate');
+  assert.equal(result.candidates[0].title, 'Only one');
+  assert.match(result.reason, /truncated mid-JSON/);
+  assert.match(result.reason, /1 complete/);
+});
+
+test('parseCandidateSplit returns invalid:true (not truncated) when a split response has zero complete sub-candidates', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  const truncated = '{"mode":"split","candidates":[{"title"';
+  const result = parseCandidateSplit(truncated);
+  assert.equal(result.invalid, true);
+  assert.equal(result.truncated, undefined);
 });
 
 test('parseCandidateSplit returns null for anything that is not a split attempt (normal edit/create/delete/empty responses pass through untouched)', () => {
@@ -4412,5 +4449,185 @@ test('reusePriorPlanForContinuation never short-circuits the plan-critique re-pl
     const task = { id: 'adhoc-x', domain: 'adhoc', source: 'manual', promptContext: { rawText: 'x' }, isAgenticContinuation: true, lastGoodPlan: CONTINUATION_PLAN, _planCritiqueRevised: true };
     assert.equal(reusePriorPlanForContinuation(task, null), false);
     assert.equal(task.planResponse, undefined);
+  });
+});
+
+// archImportImplementPrompt now asks for the exact line "no real file to adapt" when no listed file fits. The implement pass must treat
+// that as a terminal no-op (empty implementResponse, so the emptyApproval source auto-approves), not as a candidate to critique or requeue.
+async function runArchImportWithImplementAnswer(implementAnswer) {
+  let out;
+  const prevCoreRoot = process.env.AGENT_MANAGER_CORE_REPO_ROOT;
+  const prevGrep = process.env.AGENT_MANAGER_GREP_DIRS;
+  try {
+    await withFixtureRepo(async (draftTask, dir) => {
+      process.env.AGENT_MANAGER_CORE_REPO_ROOT = dir;
+      process.env.AGENT_MANAGER_GREP_DIRS = 'src';
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'realfile.js'), 'function stubProbeSymbol() {}\n');
+      const calls = [];
+      const localCall = async (prompt) => {
+        calls.push(prompt);
+        return { response: calls.length === 1 ? 'QUERY: stubProbeSymbol' : implementAnswer, degenerate: null, attempts: 1 };
+      };
+      const task = { id: 'arch-import-stub', domain: 'default', source: 'arch_import', title: 't', promptContext: { sourceProject: 'other-repo', rating: 'Strong', itemTitle: 'x', itemRationale: 'y' } };
+      const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+      out = { task, result, calls: calls.length };
+    });
+  } finally {
+    if (prevCoreRoot === undefined) delete process.env.AGENT_MANAGER_CORE_REPO_ROOT; else process.env.AGENT_MANAGER_CORE_REPO_ROOT = prevCoreRoot;
+    if (prevGrep === undefined) delete process.env.AGENT_MANAGER_GREP_DIRS; else process.env.AGENT_MANAGER_GREP_DIRS = prevGrep;
+  }
+  return out;
+}
+
+test('arch_import: the "no real file to adapt" stub is a terminal no-op with an empty implementResponse', async () => {
+  for (const answer of ['no real file to adapt', '  No real file to adapt.\n']) {
+    const { task, result, calls } = await runArchImportWithImplementAnswer(answer);
+    assert.equal(task.promptContext.harnessHits.length > 0, true, 'the fixture must give the plan real harness hits, else the zero-hit skip would fire instead');
+    assert.equal(calls, 2, 'plan and implement only: no critique or revision call after the stub');
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(task.implementResponse, '');
+    assert.ok((task.history || []).some((e) => e.stage === 'implement-done' && /no real file to adapt/.test(e.detail || e.message || JSON.stringify(e))));
+  }
+});
+
+test('arch_import: a response that merely mentions the stub phrase is not treated as the stub', async () => {
+  const answer = 'Candidate: reuse stubProbeSymbol in src/realfile.js. There is no real file to adapt elsewhere.';
+  const { task } = await runArchImportWithImplementAnswer(answer);
+  assert.notEqual(task.implementResponse, '');
+});
+
+test('a source that does not opt in via skipImplementWhenNoHarnessHits keeps a "no real file to adapt" answer untouched', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    registerTaskSource('stub_probe_no_optin', { priority: 80, next: () => null, emptyApproval: true });
+    updateTaskSource('stub_probe_no_optin', { buildPlanPrompt: p.archImportPlanPrompt, buildImplementPrompt: p.archImportImplementPrompt });
+    let n = 0;
+    const localCall = async () => ({ response: ++n === 1 ? 'a plan' : 'no real file to adapt', degenerate: null, attempts: 1 });
+    const task = { id: 'stub-no-optin', domain: 'default', source: 'stub_probe_no_optin', title: 't', promptContext: {} };
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() }).catch(() => {});
+    assert.equal(task.implementResponse, 'no real file to adapt');
+  });
+});
+
+// 2026-11-03, context-provenance: stamp which grounding sources fed each drafted task.
+// Pure module tests are in src/lib/context-provenance.test.js; these integration tests
+// verify the stamp is actually attached by runPlanPass and survives persistence.
+test('draftTask attaches task.contextProvenance with expected shape', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'context-provenance-shape', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount++;
+      if (callCount === 1) return { response: 'confident match: none -- no real match', degenerate: null, attempts: 1 };
+      if (callCount === 2) return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+
+    assert.ok(task.contextProvenance, 'contextProvenance must be attached');
+    assert.equal(task.contextProvenance.v, 1);
+    assert.equal(typeof task.contextProvenance.anchorFileCount, 'number');
+    assert.ok(Array.isArray(task.contextProvenance.anchorPaths));
+    assert.equal(typeof task.contextProvenance.grepQueryCount, 'number');
+    assert.equal(typeof task.contextProvenance.grepHitFileCount, 'number');
+    assert.ok(Array.isArray(task.contextProvenance.grepHitFiles));
+    assert.equal(typeof task.contextProvenance.groundingChars, 'number');
+    assert.equal(typeof task.contextProvenance.planWasGrounded, 'boolean');
+    assert.equal(typeof task.contextProvenance.orientRan, 'boolean');
+    assert.ok(task.contextProvenance.orientTurns === null || typeof task.contextProvenance.orientTurns === 'number');
+    assert.equal(typeof task.contextProvenance.priorRejectionCount, 'number');
+    assert.equal(typeof task.contextProvenance.priorVerdictCount, 'number');
+  });
+});
+
+test('draftTask: a task that names a real file is stamped as grounded (the stamp reads the grounding OBJECT, not its text); one that names nothing is not', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    const fsx = require('fs');
+    const pathx = require('path');
+    fsx.mkdirSync(pathx.join(dir, 'src'), { recursive: true });
+    fsx.writeFileSync(pathx.join(dir, 'src', 'stamp-target.js'), "'use strict';\n\nfunction stampTarget(x) {\n  return x;\n}\n\nmodule.exports = { stampTarget };\n");
+    const mk = (id, rawText) => ({ id, domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText } });
+    const run = async (task) => {
+      let callCount = 0;
+      const localCall = async () => {
+        callCount++;
+        if (callCount === 1) return { response: 'confident match: none -- no real match', degenerate: null, attempts: 1 };
+        if (callCount === 2) return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1 };
+        return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+      };
+      await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+      return task.contextProvenance;
+    };
+    const grounded = await run(mk('context-provenance-grounded', 'Change stampTarget in src/stamp-target.js so that it returns its argument unchanged and add a test for it.'));
+    assert.equal(grounded.planWasGrounded, true);
+    assert.ok(grounded.groundingChars > 0, 'groundingChars must count the grounding text');
+    assert.ok(grounded.anchorPaths.includes('src/stamp-target.js'), 'the named file must be an anchor');
+    assert.ok(grounded.anchorFileCount >= 1);
+    assert.equal(grounded.orientRan, true, 'the orient result of a grounded plan pass reaches the stamp (a skipped orient still counts as ran with 0 turns)');
+    assert.equal(grounded.orientTurns, 0);
+    const bare = await run(mk('context-provenance-bare', 'do the thing'));
+    assert.equal(bare.planWasGrounded, false);
+    assert.equal(bare.groundingChars, 0);
+    assert.equal(bare.anchorFileCount, 0);
+    assert.equal(bare.orientRan, false);
+    assert.equal(bare.orientTurns, null);
+  });
+});
+
+test('draftTask: contextProvenance survives persistence (write then read back)', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    const task = { id: 'context-provenance-persist', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount++;
+      if (callCount === 1) return { response: 'confident match: none -- no real match', degenerate: null, attempts: 1 };
+      if (callCount === 2) return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+
+    // Write the task to disk (simulating persistence).
+    const fs = require('fs');
+    const path = require('path');
+    const queueDir = path.join(dir, 'queue', 'pending');
+    fs.mkdirSync(queueDir, { recursive: true });
+    fs.writeFileSync(path.join(queueDir, `${task.id}.json`), JSON.stringify(task));
+
+    // Read it back.
+    const readBack = JSON.parse(fs.readFileSync(path.join(queueDir, `${task.id}.json`), 'utf8'));
+    assert.ok(readBack.contextProvenance, 'contextProvenance must survive persistence');
+    assert.equal(readBack.contextProvenance.v, 1);
+    assert.equal(readBack.contextProvenance.planWasGrounded, task.contextProvenance.planWasGrounded);
+  });
+});
+
+test('draftTask: kill switch AGENT_MANAGER_CONTEXT_PROVENANCE=false removes the stamp', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const prevEnv = process.env.AGENT_MANAGER_CONTEXT_PROVENANCE;
+    process.env.AGENT_MANAGER_CONTEXT_PROVENANCE = 'false';
+    try {
+      const task = { id: 'context-provenance-kill', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } };
+
+      let callCount = 0;
+      const localCall = async () => {
+        callCount++;
+        if (callCount === 1) return { response: 'confident match: none -- no real match', degenerate: null, attempts: 1 };
+        if (callCount === 2) return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1 };
+        return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+      };
+
+      await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+
+      assert.equal(task.contextProvenance, undefined, 'contextProvenance must NOT be attached when kill switch is on');
+    } finally {
+      if (prevEnv === undefined) delete process.env.AGENT_MANAGER_CONTEXT_PROVENANCE; else process.env.AGENT_MANAGER_CONTEXT_PROVENANCE = prevEnv;
+    }
   });
 });

@@ -1,0 +1,76 @@
+# WorldForge Data Schema
+# Defines the structure for worlds, biomes, environments, and areas.
+# Used by WorldForge to validate and serialize world-building content.
+
+world:
+  name:
+    type: string
+    required: true
+    description: Human-readable world name (e.g. "Aetheria").
+  description:
+    type: string
+    required: false
+    description: Free-text summary of the world's premise.
+  biome_type:
+    type: string
+    required: true
+    description: Primary biome classification (e.g. "fantasy", "sci-fi", "post-apocalyptic").
+  environment_theme:
+    type: string
+    required: true
+    description: Dominant aesthetic/theme (e.g. "ethereal", "industrial", "overgrown").
+  areas:
+    type: array
+    required: true
+    items:
+      $ref: "#/definitions/area"
+    description: Ordered list of areas that compose the world.
+
+definitions:
+  biome:
+    name:
+      type: string
+      required: true
+      description: Biome identifier (e.g. "crystal_caverns").
+    biome_type:
+      type: string
+      required: true
+      description: Classification of this biome.
+    environment_theme:
+      type: string
+      required: true
+      description: Visual/atmospheric theme for this biome.
+    description:
+      type: string
+      required: false
+    areas:
+      type: array
+      items:
+        $ref: "#/definitions/area"
+
+  area:
+    id:
+      type: string
+      required: true
+      description: Unique area identifier.
+    name:
+      type: string
+      required: true
+      description: Display name for the area.
+    biome_type:
+      type: string
+      required: true
+      description: Biome classification for this area.
+    environment_theme:
+      type: string
+      required: true
+      description: Environmental theme for this area.
+    background_reference:
+      type: string
+      required: false
+      description: Reference to a SceneForge background asset (e.g. scene ID or file path).
+    connections:
+      type: array
+      items:
+        type: string
+      description: IDs of areas this one connects to.

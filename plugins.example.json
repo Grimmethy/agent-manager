@@ -1,0 +1,12 @@
+[
+  {
+    "name": "gpu-broker",
+    "tab": {
+      "key": "gpu-broker",
+      "label": "🎛 GPU Cards",
+      "kind": "script",
+      "script": "ui/gpu-broker-tab.js",
+      "group": "Forges"
+    }
+  }
+]

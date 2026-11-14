@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const {
   classifyBlockedTask, categorizeBlockedReason, hasZeroHitHarnessSearch, hasUnreliableGrounding,
   hasInvalidPremise, hasFabricatedFilePath, hasFabricatedSymbolCitation, hasNoContextFiles, signatureForTask,
-  findClassifier, REASON_CATEGORIES,
+  findClassifier, REASON_CATEGORIES, isInfraError,
 } = require('./blocked-task-classifiers.js');
 
 test('classifyBlockedTask recognizes a pre-stamped external-dependency task as environment-side, non-retryable', () => {
@@ -302,4 +302,64 @@ test('harness-side variant of the malformed-JSON apply failure is NOT mislabeled
   assert.equal(result.category, 'unreliable-grounding');
   assert.equal(result.faultSide, 'harness');
   assert.equal(result.retryable, false);
+});
+
+// isInfraError (HUB0195 · 1/4) -- the shared "did the model ever see this work?"
+// predicate. Keys ONLY on already-stamped fields: agentic-draft-common.js's
+// infraErrorBefore/infraErrorNote pair, or scripts/local-worker.sh's
+// "apparent infra outage" blockedReason wording. Deliberately NOT a
+// classifyBlockedTask category -- these tests pin its three positive signals and
+// its negatives so a sibling gate's import can rely on the exact shape.
+test('isInfraError: sticky infraErrorBefore flag is a positive signal', () => {
+  assert.equal(isInfraError({ infraErrorBefore: true }), true);
+  assert.equal(isInfraError({ infraErrorBefore: true, blockedReason: 'model hallucination' }), true);
+});
+
+test('isInfraError: non-empty infraErrorNote string is a positive signal', () => {
+  assert.equal(isInfraError({ infraErrorNote: 'Ollama HTTP 404: model not found' }), true);
+  assert.equal(isInfraError({ infraErrorNote: 'tool timed out' }), true);
+});
+
+test('isInfraError: local-worker "apparent infra outage" blockedReason is a positive signal', () => {
+  // Both exact wordings scripts/local-worker.sh stamps (requeue-round and giving-up):
+  assert.equal(isInfraError({ blockedReason: 'draft call failed 3 times in a row on an apparent infra outage (most recent: timeout) -- requeued (survived outage round 3/5) instead of permanently blocking' }), true);
+  assert.equal(isInfraError({ blockedReason: 'draft call failed on an apparent infra outage that did not clear even after 5 requeue round(s) -- giving up rather than retrying forever (most recent: timeout)' }), true);
+});
+
+test('isInfraError: empty-string infraErrorNote is NOT a positive signal', () => {
+  assert.equal(isInfraError({ infraErrorNote: '' }), false);
+});
+
+test('isInfraError: null / undefined infraErrorNote and non-boolean infraErrorBefore are NOT positive', () => {
+  assert.equal(isInfraError({ infraErrorNote: null }), false);
+  assert.equal(isInfraError({ infraErrorNote: undefined }), false);
+  assert.equal(isInfraError({ infraErrorBefore: 'true' }), false);
+  assert.equal(isInfraError({ infraErrorBefore: 1 }), false);
+});
+
+test('isInfraError: no-signal task with other blocked-task fields is false', () => {
+  const task = {
+    blockedReason: 'model hallucination in the implement pass',
+    localRejectCount: 3,
+    retryableDraftBlock: false,
+    needsClarification: { reason: 'design-decision', openQuestions: ['q'] },
+  };
+  assert.equal(isInfraError(task), false);
+});
+
+test('isInfraError: blockedReason WITHOUT the exact infra-outage wording is false', () => {
+  assert.equal(isInfraError({ blockedReason: 'draft call failed 3 times in a row (most recent: timeout) -- giving up rather than retrying every tick forever and starving this lane' }), false);
+  assert.equal(isInfraError({ blockedReason: 'outage, but not an apparent infra one' }), false); // scrambled wording without the intact phrase
+  assert.equal(isInfraError({ blockedReason: 'model refused: no changes needed' }), false);
+});
+
+test('isInfraError: guards null / undefined / non-object input', () => {
+  assert.equal(isInfraError(null), false);
+  assert.equal(isInfraError(undefined), false);
+  assert.equal(isInfraError('apparent infra outage'), false);
+  assert.equal(isInfraError(42), false);
+});
+
+test('isInfraError: empty object is false', () => {
+  assert.equal(isInfraError({}), false);
 });

@@ -114,6 +114,17 @@ class RequeuePreservesCoordinationFieldsTest(unittest.TestCase):
     # file-decompose sub-task lost `atomic: true`, so local-draft.js's `!task.atomic`
     # pre-split guard ("a file-decompose child IS the output of a decomposition;
     # re-splitting it loops") no longer held, and the model tried to decompose it again.
+    def test_requeue_preserves_prerequisiteHubs_field(self):
+        task_id = "adhoc-decompose-hub-z-03-needs-other-hub"
+        self._write_blocked(task_id, {
+            "id": task_id, "domain": "adhoc", "source": "manual", "title": "needs accounts.py",
+            "promptContext": {}, "prerequisiteHubs": ["HUB0006"], "blockedReason": "some infra error",
+        })
+        resp = self.client.post(f"/api/task/blocked/{task_id}/requeue")
+        self.assertEqual(resp.status_code, 200)
+        requeued = json.loads((self.pipeline_dir / "queue" / "pending" / f"{task_id}.json").read_text(encoding="utf-8"))
+        self.assertEqual(requeued.get("prerequisiteHubs"), ["HUB0006"])
+
     def test_requeue_preserves_atomic_and_noDecompose_fields(self):
         task_id = "adhoc-decompose-hub-z-02-tasks-and-branches-js"
         self._write_blocked(task_id, {

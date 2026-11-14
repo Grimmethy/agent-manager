@@ -1,0 +1,42 @@
+{
+  "deep_dive": {
+    "workDirKind": "repoRoot",
+    "successCheck": "git-branch-diff"
+  },
+  "project_search": {
+    "workDirKind": "repoRoot",
+    "successCheck": "git-branch-diff"
+  },
+  "brain_dump_sort": {
+    "workDirKind": "repoRoot",
+    "successCheck": "git-branch-diff"
+  },
+  "path_prefetch_resolve": {
+    "workDirKind": "repoRoot",
+    "successCheck": "git-branch-diff"
+  },
+  "secondbrain": {
+    "workDirKind": "repoRoot",
+    "successCheck": "git-branch-diff"
+  },
+  "default": {
+    "workDirKind": "repoRoot",
+    "successCheck": "git-branch-diff"
+  },
+  "adhoc": {
+    "workDirKind": "repoRoot",
+    "successCheck": "git-branch-diff"
+  },
+  "research": {
+    "workDirKind": "secondBrainDir",
+    "successCheck": "git-branch-diff"
+  },
+  "wiki_content": {
+    "workDirKind": "repoRoot",
+    "successCheck": "git-branch-diff"
+  },
+  "character_content": {
+    "workDirKind": "repoRoot",
+    "successCheck": "git-branch-diff"
+  }
+}

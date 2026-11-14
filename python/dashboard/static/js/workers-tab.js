@@ -1,32 +1,6 @@
 // Workers tab: the per-instance cards, recent-task and run-log lists, the completed-tasks section and the stale-heartbeat timers. Moved verbatim out of core-ui.js (2026-10-01); a plain global <script>, loaded by index.html right after core-ui.js and before the inline script that schedules updateStaleTimers.
 // No require()/module.exports: the browser loads this with a plain <script src> tag, so every name below is a shared global.
 
-function fmtAge(sec) {
-  if (sec == null) return '?';
-  if (sec < 60) return sec + 's';
-  if (sec < 3600) return Math.round(sec / 60) + 'm';
-  return Math.round(sec / 3600) + 'h';
-}
-
-function statusBadgeClass(status, stale) {
-  if (stale) return 'bad';
-  if (status === 'offline') return 'idle';
-  if (status === 'working' || status === 'checking') return 'ok';
-  if (status === 'idle') return 'idle';
-  // 'queued' (2026-08-19): a claimed task waiting its turn behind another lane at the
-  // single-flight lock (agent-manager-common.sh's acquire_single_flight_lock) -- amber,
-  // same as the generic 'warn' fallback below, but named explicitly so it reads as a
-  // deliberate third state (green=actively running, amber=waiting its turn, gray=idle)
-  // rather than falling through by accident.
-  if (status === 'queued') return 'warn';
-  return 'warn';
-}
-
-function modelKindForInstance(inst) {
-  if (inst.instanceId === 'watchdog') return null;
-  return 'ollama'; // every lane runs a local model (lanes are one per GPU)
-}
-
 async function setWorkerModel(instanceId, model) {
   await fetch(`/api/worker-models/${encodeURIComponent(instanceId)}`, {
     method: 'POST',
@@ -131,8 +105,16 @@ function renderRunLogList(runs) {
 const COMPLETED_TASKS_OUTCOME_OK_RE = /^(approved|merged|applied-direct|pending-merge)$/;
 
 function renderCompletedTasksSection() {
+  // Chat badge (HUB0252): rows whose outcome is 'chat turn' (or whose source is 'chat')
+  // originate from the chat plugin (session_id == taskId) -- render a distinct 💬 badge
+  // so the operator can tell them apart from normal completed tasks at a glance.
+  const chatBadge = (t) => {
+    const isChat = (t.outcome === 'chat turn') || (t.source === 'chat');
+    if (!isChat) return '';
+    return `<span class="chat-badge" title="Chat session" style="margin-right:0.4em;font-size:0.95em;cursor:default" aria-label="Chat session">💬</span>`;
+  };
   const rows = completedTasksLog.map(t => `
-    <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}">${escapeHtmlBright(t.title || t.taskId)}</a>
+    <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}">${chatBadge(t)}${escapeHtmlBright(t.title || t.taskId)}</a>
       <span class="meta">${t.outcome ? `<strong style="color:var(${COMPLETED_TASKS_OUTCOME_OK_RE.test(t.outcome || '') ? '--ok' : '--bad'})">${escapeHtml(t.outcome)}</strong> · ` : ''}${t.source ? escapeHtml(t.source) + ' · ' : ''}${t.instanceId ? escapeHtml(t.instanceId) + ' · ' : ''}${t.model ? escapeHtml(t.model) + ' · ' : ''}${t.completedAt ? fmtAge((Date.now() - new Date(t.completedAt).getTime()) / 1000) + ' ago' : ''}</span>
     </li>`).join('');
   const footer = completedTasksExhausted
@@ -209,6 +191,19 @@ async function refreshNewestCompletedTasks() {
   }
 }
 
+// The Workers tab's top bar: the view toggle and the Pause Claude checkbox (moved out of renderWorkers to keep it under its size-ratchet cap).
+function buildWorkersFilterBarHtml(workerModels) {
+  return `
+    <div class="worker-filter-bar" style="margin-bottom:12px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px">
+      ${typeof workersViewToggleHtml === 'function' ? workersViewToggleHtml('cards') : '<div></div>'}
+      <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
+        <input type="checkbox" id="claude-pause-toggle" style="margin:0" ${workerModels.claudePaused ? 'checked' : ''}>
+        Pause Claude (preserve subscription tokens)
+      </label>
+    </div>
+  `;
+}
+
 // isPoll (2026-09-07, Grimmethy: "please fix the dropdown reset on poll thing, that
 // is extraordinarily irritating and has bit me several times"): the 5s refresh()
 // cycle (index.html's renderMain(), 'workers' branch) used to call this unconditionally,
@@ -224,6 +219,7 @@ async function refreshNewestCompletedTasks() {
 // selects, i.e. the operator is actively mid-choice. The next 5s tick tries again.
 async function renderWorkers(isPoll) {
   const isStale = renderStaleCheck();
+  if (typeof workersViewMode === 'function' && workersViewMode() === 'graph') { await renderGraphView(document.getElementById('main'), isPoll); return; }
   if (isPoll) {
     const active = document.activeElement;
     if (active && (active.classList.contains('worker-type-select') || active.classList.contains('worker-task-select'))) {
@@ -243,7 +239,7 @@ async function renderWorkers(isPoll) {
   // call-level data (review-task.js's majorityVote never calls recordCall, see that
   // route's own docstring) so it keeps the existing terminal-state recent-tasks view.
   const expandedIsWorker = !!(expandedWorkerId && expandedWorkerId.startsWith('worker'));
-  const [instances, workerModels, costSummary, recentTasks] = await Promise.all([
+  const [instances, workerModels, costSummary, recentTasks, cloudMeter, stalledWorker, verifierWorker, needsworkWorker, contextMapWorker, contextMemoryWorker, contextImpactWorker, pipelineOpsWorkers] = await Promise.all([
     fetchJson('/api/instances'),
     fetchJson('/api/worker-models'),
     fetchJson('/api/models/cost-summary'),
@@ -252,6 +248,20 @@ async function renderWorkers(isPoll) {
     expandedWorkerId
       ? fetchJson(`/api/instances/${encodeURIComponent(expandedWorkerId)}/${expandedIsWorker ? 'run-log' : 'recent-tasks'}`)
       : Promise.resolve(null),
+    // Cloud spend panel (cloud-spend-panel.js): fail soft -- a missing or erroring meter just hides the panel.
+    fetchJson('/api/cloud-meter').catch(() => null),
+    // Stalled-task worker panel (stalled-worker-panel.js): fail soft the same way.
+    fetchJson('/api/stalled-worker').catch(() => null),
+    // Branch-verifier card (verifier-worker-panel.js): fail soft the same way.
+    fetchJson('/api/branch-verifier').catch(() => null),
+    // Needs-Work worker card (needswork-worker-panel.js): fail soft the same way.
+    fetchJson('/api/needswork-worker').catch(() => null),
+    // Context-worker cards (context-worker-panel.js): fail soft the same way.
+    fetchJson('/api/context-worker/map').catch(() => null),
+    fetchJson('/api/context-worker/memory').catch(() => null),
+    fetchJson('/api/context-worker/impact').catch(() => null),
+    // Pipeline-ops worker cards (pipeline-ops-workers-panel.js): fail soft the same way.
+    fetchJson('/api/pipeline-ops-workers').catch(() => null),
   ]);
   // Candidate list for each worker's own "assign task" override dropdown (2026-09-07
   // follow-up, Grimmethy after live-testing the override: "the only tasks I have
@@ -295,15 +305,12 @@ async function renderWorkers(isPoll) {
       delete pendingWorkerAssign[inst.instanceId];
     }
   });
-  const filterBar = `
-    <div class="worker-filter-bar" style="margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
-      <div></div>
-      <label style="display:flex; align-items:center; gap:6px; font-size:0.9em; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
-        <input type="checkbox" id="claude-pause-toggle" ${workerModels.claudePaused ? 'checked' : ''}>
-        Pause Claude (preserve subscription tokens)
-      </label>
-    </div>
-  `;
+  // Nothing shown has changed since the last draw (only ages): a poll/event-driven redraw would rebuild the same page, so leave it alone (workers-render-signature.js).
+  const renderSignature = typeof workersRenderSignature === 'function' ? workersRenderSignature(
+    { instances, workerModels, costSummary, recentTasks, cloudMeter, stalledWorker, verifierWorker, needsworkWorker, contextMapWorker, contextMemoryWorker, contextImpactWorker, pipelineOpsWorkers, assignableByInstance },
+    { expanded: expandedWorkerId, pinned: pendingWorkerAssign, chosen: selectedWorkerTaskType, completed: completedTasksLog.length, newest: completedTasksLog[0] ? (completedTasksLog[0].taskId || completedTasksLog[0].id || completedTasksLog[0].endedAt || null) : null }) : '';
+  if (typeof workersCanSkipRender === 'function' && workersCanSkipRender(renderSignature, isPoll, main)) return;
+  const filterBar = buildWorkersFilterBarHtml(workerModels);
   const shown = instances;
   if (isStale()) return;
   if (instances.length === 0) { main.innerHTML = '<div class="empty">No instances found -- is the pipeline running?</div>'; return; }
@@ -316,96 +323,16 @@ async function renderWorkers(isPoll) {
   main.innerHTML = filterBar + (shown.length === 0
     ? '<div class="empty">No workers match this filter.</div>'
     : shown.map(inst => `
-    <div class="worker-card clickable" data-instance-id="${escapeAttr(inst.instanceId)}">
+    <div class="worker-card clickable${typeof workerCardOffClass === 'function' ? workerCardOffClass(inst) : ''}" data-instance-id="${escapeAttr(inst.instanceId)}">
       <div class="row">
         <span class="id">${inst.instanceId}</span>
-        ${(() => {
-          const kind = modelKindForInstance(inst);
-          if (!kind) return '';
-          const current = overrides[inst.instanceId] || '';
-          const optionsFor = (label, values) => values.length
-            ? `<optgroup label="${escapeAttr(label)}">${values.map(m => `<option value="${escapeAttr(m.value)}" ${m.value === current ? 'selected' : ''}>${m.label}</option>`).join('')}</optgroup>`
-            : '';
-          let body;
-          if (kind === 'mixed') {
-            // Prefixed so local-worker.sh's refresh_active_model can tell which backend
-            // was picked -- see that function's own comment for why this is the fix for
-            // "reasoning only shows subscription models."
-            body = optionsFor('Claude (subscription)', (workerModels.claudeModels || []).map(m => ({ value: `claude:${m}`, label: m })))
-              + optionsFor('Local (Ollama)', (workerModels.ollamaModels || []).map(m => ({ value: `ollama:${m}`, label: m })));
-          } else {
-            body = (workerModels.ollamaModels || []).map(m => `<option value="${escapeAttr(m)}" ${m === current ? 'selected' : ''}>${m}</option>`).join('');
-          }
-          return `<select class="worker-model-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()"><option value="">(default)</option>${body}</select>`;
-        })()}
-        ${canAssignTask(inst) ? (() => {
-          const items = assignableByInstance[inst.instanceId] || [];
-          // Grouped by source (task TYPE) so the picker shows "pipeline_debrief (7)"
-          // etc first, rather than one flat list where a deep single-type backlog
-          // buries everything else (see selectedWorkerTaskType's own header comment).
-          const bySource = {};
-          items.forEach((t) => {
-            const key = t.source || 'unknown';
-            (bySource[key] = bySource[key] || []).push(t);
-          });
-          const sourceKeys = Object.keys(bySource).sort();
-          const selectedType = selectedWorkerTaskType[inst.instanceId] || '';
-          // Keep the previously-picked type visible even if its bucket happens to be
-          // empty on THIS particular poll (its last task just got claimed elsewhere, or
-          // this instance's own assignable-tasks fetch above hit its catch and fell back
-          // to [] for one cycle) -- 2026-09-07, same complaint as isPoll above: a
-          // transient empty bucket used to collapse the whole drill-down back to the
-          // type-only picker, which looked identical to "your selection got reset" even
-          // though selectedWorkerTaskType was never actually cleared.
-          if (selectedType && !sourceKeys.includes(selectedType)) sourceKeys.push(selectedType);
-          sourceKeys.sort();
-          const typeSelect = `<select class="worker-type-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Assign a specific task to this worker, overriding the automated priority/tier claim order -- includes tasks already claimed by other workers, tier-filtered for this worker type">
-            <option value="">(assign a task…)</option>
-            ${sourceKeys.map(k => `<option value="${escapeAttr(k)}" ${k === selectedType ? 'selected' : ''}>${escapeHtml(k)} (${(bySource[k] || []).length})</option>`).join('')}
-          </select>`;
-          if (!selectedType) return typeSelect;
-          const tasksOfSelectedType = bySource[selectedType] || [];
-          // A native <select> sizes itself to its widest <option> text -- an untruncated
-          // task title (adhoc/decompose titles especially routinely run 80-100+ chars)
-          // pushed this whole control off the right edge of the worker card (2026-09-07,
-          // Grimmethy: "when I open the manual task that has long task names it sets the
-          // selector to the size of the largest... names should be truncated"). Truncate
-          // what's SHOWN; the option's own `title` attribute (native hover tooltip) and
-          // `data-title` (read by setWorkerTask's confirm-dialog text) both still carry
-          // the full, untruncated title -- nothing is actually lost, just not rendered
-          // into the control's own width.
-          const OPTION_LABEL_MAX = 70;
-          const truncateLabel = (s) => (s.length > OPTION_LABEL_MAX ? `${s.slice(0, OPTION_LABEL_MAX - 1)}…` : s);
-          const optionLabel = (t) => {
-            // A hub member leads with its HUB#### slot (2026-09-20) so a hub in progress is recognisable in this list.
-            const rawTitle = t.title || t.id;
-            const base = t.hub && !/^HUB\d/.test(rawTitle) ? `${hubTag(t.hub)} · ${rawTitle}` : rawTitle;
-            // pinnedTo (2026-09-07, Grimmethy: "why do the 2 reasoning workers have
-            // different lists? they really should share the same task list") -- a task
-            // pending but already pinned to a SIBLING lane (same tier) now shows here
-            // too instead of being invisible; picking it just re-pins it to this lane
-            // instead (no kill needed, nothing is running on it yet, unlike the
-            // "⚠ running on" case below).
-            let full = base;
-            if (t.location && t.location !== 'pending') full = `⚠ running on ${t.location.replace(/^drafting:/, '')} — ${base}`;
-            else if (t.pinnedTo) full = `📌 pinned to ${t.pinnedTo} — ${base}`;
-            // premiumPriority (2026-09-07, Grimmethy: "I am getting tired of manually
-            // selecting it for the worker queue every pass") -- surfaces here so the
-            // operator can SEE this task is already set to always-claim-first and
-            // doesn't need to keep re-picking it via this very dropdown.
-            if (t.premiumPriority) full = `★ ${full}`;
-            return truncateLabel(full);
-          };
-          const taskSelect = `<select class="worker-task-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Pick a specific ${escapeAttr(selectedType)} task to assign to this worker">
-            <option value="">${tasksOfSelectedType.length ? `(choose a ${escapeHtml(selectedType)} task…)` : `(no ${escapeHtml(selectedType)} tasks right now)`}</option>
-            ${tasksOfSelectedType.map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}" data-source-lane="${escapeAttr(t.location && t.location !== 'pending' ? t.location.replace(/^drafting:/, '') : '')}" title="${escapeAttr(t.title || t.id)}">${escapeHtml(optionLabel(t))}</option>`).join('')}
-          </select>`;
-          return typeSelect + taskSelect;
-        })() : ''}
+        ${buildWorkerModelSelectHtml(inst, workerModels, overrides)}
+        ${canAssignTask(inst) ? buildTaskPickerHtml(inst, assignableByInstance[inst.instanceId] || [], selectedWorkerTaskType[inst.instanceId] || '') : ''}
         <div class="badge-col">
-          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
+          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : statusLabel(inst.status)}</span>
           ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
           <span class="state-timer" id="state-timer-${inst.instanceId}">${inst.stateAgeSeconds != null ? 'in this state ' + fmtDuration(inst.stateAgeSeconds) : ''}</span>
+          ${typeof buildWorkerSwitchHtml === 'function' ? buildWorkerSwitchHtml(inst) : ''}
         </div>
       </div>
       <div class="meta">
@@ -422,7 +349,8 @@ async function renderWorkers(isPoll) {
         ${recentTasks ? (recentTasks.runs ? renderRunLogList(recentTasks.runs) : renderRecentTasksList(recentTasks.tasks || [])) : '<div class="meta">Loading…</div>'}
       </div>` : ''}
     </div>
-  `).join('')) + renderCompletedTasksSection();
+  `).join('')) + (typeof renderCloudSpendSection === 'function' ? renderCloudSpendSection(cloudMeter) : '') + (typeof renderStalledWorkerSection === 'function' ? renderStalledWorkerSection(stalledWorker) : '') + (typeof renderVerifierWorkerSection === 'function' ? renderVerifierWorkerSection(verifierWorker) : '') + (typeof renderNeedsworkWorkerSection === 'function' ? renderNeedsworkWorkerSection(needsworkWorker) : '') + (typeof renderContextWorkerSection === 'function' ? renderContextWorkerSection(contextMapWorker, contextMemoryWorker, Date.now(), contextImpactWorker) : '') + (typeof renderPipelineOpsWorkersSection === 'function' ? renderPipelineOpsWorkersSection(pipelineOpsWorkers) : '') + renderCompletedTasksSection();
+  if (typeof rememberWorkersSignature === 'function') rememberWorkersSignature(renderSignature);
   window.scrollTo(0, scrollY);
   setupCompletedTasksObserver();
   if (!completedTasksLog.length && !completedTasksLoading && !completedTasksExhausted) {
@@ -431,6 +359,17 @@ async function renderWorkers(isPoll) {
   main.querySelectorAll('.worker-card[data-instance-id]').forEach((card) => {
     card.onclick = () => toggleWorkerExpand(card.dataset.instanceId);
   });
+  if (typeof wireWorkerSwitchButtons === 'function') wireWorkerSwitchButtons(main);
+  if (typeof wireStalledWorkerSwitch === 'function') wireStalledWorkerSwitch(main);
+  if (typeof wireStalledWorkerExpand === 'function') wireStalledWorkerExpand(main, renderWorkers);
+  if (typeof wireVerifierWorkerSwitch === 'function') wireVerifierWorkerSwitch(main);
+  if (typeof wireVerifierWorkerExpand === 'function') wireVerifierWorkerExpand(main, renderWorkers);
+  if (typeof wireNeedsworkWorkerSwitch === 'function') wireNeedsworkWorkerSwitch(main);
+  if (typeof wireNeedsworkWorkerExpand === 'function') wireNeedsworkWorkerExpand(main, renderWorkers);
+  if (typeof wireContextWorkerSwitch === 'function') wireContextWorkerSwitch(main);
+  if (typeof wireContextWorkerExpand === 'function') wireContextWorkerExpand(main, renderWorkers);
+  if (typeof wirePipelineOpsWorkerSwitch === 'function') wirePipelineOpsWorkerSwitch(main);
+  if (typeof wirePipelineOpsWorkerExpand === 'function') wirePipelineOpsWorkerExpand(main, renderWorkers);
   const claudePauseToggle = main.querySelector('#claude-pause-toggle');
   if (claudePauseToggle) {
     claudePauseToggle.onchange = (e) => setClaudePaused(e.target.checked);
@@ -464,6 +403,7 @@ async function renderWorkers(isPoll) {
   main.querySelectorAll('[data-open-task-anywhere]').forEach((link) => {
     link.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openTaskAnywhere(link.dataset.openTaskAnywhere); };
   });
+  if (typeof wireWorkersViewToggle === 'function') wireWorkersViewToggle(main);
   updateStaleTimers();
 }
 

@@ -162,10 +162,13 @@ if (require.main === module) {
   }
   let rows = readScorecard(dir, { windowDays: days });
   // --with-variants loads the source registry (heavy: needs AGENT_MANAGER_REPO_ROOT) to tag each row with its variantOf parent.
+  // The registry is filled by loading task-sources.js, which (through lanes.js) requires THIS file; so the annotation runs in a child process
+  // (registry-variants.js) instead of an import back, and the import cycle is cut (roadmap step 1, piece P5).
   if (process.argv.includes('--with-variants')) {
+    const child = require('child_process').spawnSync(process.execPath, [require('path').join(__dirname, 'registry-variants.js')], { input: JSON.stringify(rows), encoding: 'utf8', maxBuffer: 1 << 28 });
     try {
-      require('./task-sources.js');
-      rows = annotateVariants(rows, require('./task-source-registry.js').variantParentOf);
+      if (child.status !== 0) throw new Error((child.stderr || '').trim().split('\n').pop() || `exit ${child.status}`);
+      rows = JSON.parse(child.stdout);
     } catch (e) { console.error(`--with-variants: registry unavailable (${e.message}); rows left unannotated`); }
   }
   if (process.argv.includes('--json')) console.log(JSON.stringify(rows, null, 2));

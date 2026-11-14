@@ -583,3 +583,38 @@ test('extractLiveRepoGrounding still reads a trailing sentence period and a :lin
   assert.equal(extractLiveRepoGrounding('See src/a.tsx.', repoRoot)[0].path, 'src/a.tsx');
   assert.equal(extractLiveRepoGrounding('See src/a.tsx:1-1 for it', repoRoot)[0].path, 'src/a.tsx');
 });
+
+
+// --- only the current draft attempt's worklog grounds a review (2026-10-23, chat plugin HUB0008-03) -------------------------------------------------
+// The worklog accumulates every attempt. An earlier attempt's real `ls: cannot access 'accounts.py'` (before the prerequisite merged) sat next to the new
+// draft's real `accounts.py` and the reviewer blocked the correct draft on the stale one.
+const { tiersOfCurrentAttempt } = require('./get-grounding-source.js');
+
+test('tiersOfCurrentAttempt: keeps tiers finished at or after the latest draft-started, drops older attempts, and keeps everything when it cannot tell', () => {
+  const tiers = [{ at: '2026-10-23T10:00:00Z', n: 'old1' }, { at: '2026-10-23T11:00:00Z', n: 'old2' }, { at: '2026-10-23T12:30:00Z', n: 'mine1' }, { at: '2026-10-23T12:40:00Z', n: 'mine2' }];
+  const history = [{ stage: 'draft-started', at: '2026-10-23T09:59:00Z' }, { stage: 'draft-started', at: '2026-10-23T12:00:00Z' }, { stage: 'plan-done', at: '2026-10-23T12:20:00Z' }];
+  assert.deepEqual(tiersOfCurrentAttempt(tiers, history).map((t) => t.n), ['mine1', 'mine2']);
+  assert.deepEqual(tiersOfCurrentAttempt(tiers, [{ stage: 'plan-done', at: '2026-10-23T12:20:00Z' }]).length, 4, 'no draft-started event: all tiers');
+  assert.deepEqual(tiersOfCurrentAttempt(tiers, undefined).length, 4);
+  assert.deepEqual(tiersOfCurrentAttempt(tiers, [{ stage: 'draft-started', at: 'not a date' }]).length, 4, 'unreadable time: all tiers');
+  assert.deepEqual(tiersOfCurrentAttempt([{ n: 'no-time' }, ...tiers], history).map((t) => t.n), ['no-time', 'mine1', 'mine2'], 'a tier without a time is kept');
+  assert.deepEqual(tiersOfCurrentAttempt(undefined, history), []);
+});
+
+test('CLI end-to-end: a stale attempt\'s worklog output is not grounding, the current attempt\'s is', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-stale-worklog-'));
+  fs.mkdirSync(path.join(repoRoot, 'queue', 'worklogs'), { recursive: true });
+  const call = (txt) => ({ n: 1, tool: 'run_bash', args: { command: 'ls accounts.py' }, resultPreview: txt });
+  fs.writeFileSync(path.join(repoRoot, 'queue', 'worklogs', 'stale-task-1.json'), JSON.stringify({ taskId: 'stale-task-1', tiers: [
+    { tier: 'local-agentic-write', at: '2026-10-23T10:00:00Z', calls: [call('STALE_ENOENT_ACCOUNTS_MISSING')] },
+    { tier: 'local-agentic-write', at: '2026-10-23T14:57:00Z', calls: [call('CURRENT_ACCOUNTS_PRESENT')] },
+  ] }));
+  const task = {
+    id: 'stale-task-1', domain: 'adhoc', source: 'manual', promptContext: { rawText: 'do the thing' }, implementResponse: 'accounts.py is present.',
+    history: [{ stage: 'draft-started', at: '2026-10-23T10:00:00Z' }, { stage: 'draft-started', at: '2026-10-23T14:47:00Z' }],
+  };
+  const taskPath = path.join(repoRoot, 'task.json'); fs.writeFileSync(taskPath, JSON.stringify(task));
+  const stdout = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPath], { encoding: 'utf8', env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: repoRoot } });
+  assert.match(stdout, /CURRENT_ACCOUNTS_PRESENT/);
+  assert.doesNotMatch(stdout, /STALE_ENOENT_ACCOUNTS_MISSING/);
+});

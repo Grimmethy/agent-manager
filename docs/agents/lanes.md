@@ -44,6 +44,7 @@ that the thing to remove.)
 | `tier` | no | positive number, billions of parameters. Defaults to the size parsed from `model` (`qwen3-vl:8b-instruct` -> 8); set it when the tag carries no size. Capability routing only compares tiers; a lane with an unknown tier is never reserved around |
 | `reserve` | no | `"auto"` (default: this lane is reserved for a source once the capability ledger shows it handles it), `"always"` (reserved for everything in its `taskClasses`, no evidence needed), or `false` (never reserve work for this lane) |
 | `reviewer` | no | `true` also runs a **review daemon** on this lane's GPU (`reviewer-<gpu>`, `scripts/review-runner.sh`), so its three CONFIRM/DENY votes go to this lane's Ollama instead of queueing behind the host GPU. Default `false`. The host lane always has the plain `reviewer`; the legacy P40 lane (not in the registry) opts in with `AGENT_MANAGER_P40_REVIEWER=true` in `agent-manager.env`. Needs a pipeline restart. See "Review daemons" below |
+| `provider` | no | `ollama` (default), `cloud` or `script`. A **cloud lane** points at the cloud-providers gateway instead of a GPU and **requires** a non-empty `taskClasses`; it also requires `preempt` `never`, cannot have `reviewer: true`, and ignores `numCtx` / `numBatch`. See `docs/agents/cloud-lane.md` A **script lane** (`script`, 2026-11-02) runs a script handler instead of a model: it is bounded like a cloud lane (non-empty `taskClasses`, `preempt` `never`, no reviewer, `numCtx`/`numBatch` ignored), `model` is optional (default `script`), and `ollamaUrl` is the service the script talks to; it is never health-probed, Forge-leased or offered to chat. |
 | `slow` | no | `true` for a categorically slower endpoint (the P40 is the model case): longer per-call timeout ceiling and watchdog zombie threshold, so a slow-but-alive lane is not killed mid-call. Default `false` |
 
 ## Behaviours worth knowing
@@ -99,6 +100,10 @@ to a larger lane instead of looping on the small one. A reviewer rejection is no
 Needs known tiers on both lanes; the biggest lane never escalates. Caveat: `avoidLanes` is per task and permanent, so a task escalated off the
 8B waits for a bigger lane even if none is currently alive.
 
+## The P40 VM's memory
+
+The P40 lane's `llama-server` runs in a libvirt VM with the card passed through, so its RAM is pinned and the virtio balloon cannot hand it back to the host. The virtio-mem design, the pre-checks, the operator runbook and the rollback are in `docs/agents/p40-vm-memory.md` (tooling in `scripts/p40-vm-memory/`).
+
 ## Review daemons (2026-10-18)
 
 Reviews (the three-vote gate in `src/review-task.js`) used to run on ONE daemon on the host GPU, queueing behind the host lane's drafts; the 3090 is the busiest card, and
@@ -110,14 +115,16 @@ a review waiting behind it can hit the 5-minute per-call limit (seen on the firs
   reviewed and kept until the next item starts, so it outlives the approve/block move. A claim whose owner is dead, or that is older than 3 h, is taken over.
 - **What it does not do:** one review still runs its three votes on ONE GPU (the claimer's); it parallelises across tasks, not within one. The P40 is ~3x slower than
   the 3090 per token, so a task claimed by the P40 reviewer finishes later than it would have on a free 3090: the gain is throughput when the 3090 reviewer is busy, not latency.
-- **Single-flight locks** are keyed by model name; the P40's model tag differs from the 3090's, so they do not serialise against each other (that is the point). Do not give
-  two review lanes the same model tag on different GPUs unless you want them to.
+- **Single-flight locks** are keyed by the Ollama ENDPOINT (`ollama-<host>-<port>`, `localOllamaLockKey()` in `src/lib/ollama-lock-key.js`), the same key worker drafts use through
+  `gpu-arbiter.js`, so a lane's worker and its reviewer take turns on one GPU ("one role per cycle per lane") while lanes on different endpoints never wait for each other, whatever
+  model tag they run. The review daemon gets the key from `review_lock_key()` in `scripts/review-runner.sh` (it was the model name until 2026-10-21, a different lockfile for the same
+  GPU: `worker-p40` and `reviewer-p40` overlapped and the P40 VM's llama-server was OOM-killed). `scripts/review-runner-lock-key.test.js` guards it.
 - **Priority:** the arbiter class of a review outranks a draft on the same endpoint, so on the P40 a review goes before a waiting `worker-p40` draft, as on the 3090.
 - **Arbiter hold (drafts only):** `node scripts/gpu-arbiter-cli.js hold --key <endpoint key> --pid <its pid> [--cls review] [--task ID]` takes an arbiter place ticket for a process that is not a lane, released when that pid exits, on SIGTERM, or on a higher class's cancel-below; `status --key K` lists it under `reserved`, and each start/release is a `gpu-hold` line in `pipeline-history.log`. Only callers that take arbiter tickets wait behind it, which today means drafts; reviews take none (see below), and a draft lane still claims and then waits the 600 s arbiter deadline. To reserve a card, use the endpoint-scoped lease below.
 
 ## Endpoint-scoped GPU lease (2026-10-18)
 
-The Forge-family lease (`~/.local/state/agent-manager/comfyui-lease.json`, see PromptForge's `Docs/GPU_FAMILY_PROTOCOL.md`) is how anything outside the pipeline takes a
+The Forge-family lease (`~/.local/state/agent-manager/comfyui-lease.json`, see the GPU broker repo's `Docs/GPU_FAMILY_PROTOCOL.md` (`agent-manager-gpu-broker`)) is how anything outside the pipeline takes a
 card from it. While a fresh lease is held, `local-client.js` refuses to START a model call (`ForgePauseError`, "paused, not failed": no retry, no failure count), and
 `local-worker.sh` / `review-runner.sh` yield their ticks. That covers drafts, the reviewer's votes and every other `local-client.js` caller. It does **not** go through
 the gpu-arbiter: a reviewer vote takes no arbiter ticket, so an arbiter place ticket (`holdPlace`) holds off drafts only. Use the lease to reserve a card.
@@ -139,12 +146,79 @@ A lease may now be **scoped to some cards**, so a plugin that reserves one card 
 - **One file, one holder.** Do not write over a fresh lease whose `holder` is someone else. PromptForge's `lease_intact()` ends its own session when the holder changes. The
   holder must treat the file disappearing, or its `holder` changing, as preemption and get off the card.
 - **Pipeline start wins.** `scripts/launch.sh` deletes the lease on an explicit pipeline start, scoped or not. A holder that finds its lease gone must stop, not rewrite it.
-- **Still to do outside this repo:** PromptForge's `Docs/GPU_FAMILY_PROTOCOL.md` should describe `endpoints` and the holder rule. KaggleForge's runner (`server/gpu_lease.py`) is the first writer.
+- **Done outside this repo (2026-10-23):** the GPU broker repo's `Docs/GPU_FAMILY_PROTOCOL.md` describes `endpoints` and the holder rule. KaggleForge's runner (`server/gpu_lease.py`) is the first writer.
 - **Not true as written elsewhere in this file:** the "Review daemons" section says a review's arbiter class outranks a draft on the same endpoint. Reviews take no arbiter
   ticket (`review-task.js` and `local-client.js` never call the arbiter), so that priority does not exist; the lease is what holds a review off.
 
+## When a lane's endpoint is down (2026-10-23)
+
+**What the pipeline does.** `scripts/local-worker.sh` probes the lane's Ollama endpoint (`GET /api/version`, any HTTP answer counts) at the top of every tick. While it
+does not answer the lane claims and resumes nothing, writes a heartbeat with pass `endpoint-unreachable` (status `idle`), logs `Ollama endpoint ... is not answering` on the
+first down tick and every 20th, and re-probes every `AGENT_MANAGER_ENDPOINT_DOWN_PAUSE_S` (default `ORC_TICK_SECS`, which `orc-common.sh` pins to 30). It resumes by itself and
+logs `answers again`. `AGENT_MANAGER_ENDPOINT_PROBE=off` disables it. Before this (grimm hard reset, 2026-10-23) a dead endpoint made the lane resume and claim tasks that could only
+fail: 540 failed ticks in 12 h and six tasks parked in `blocked/`. Tasks parked that way earlier are requeued once by the known-fixed entry `lane-endpoint-outage-parked`
+(`src/known-fixed-failures.js`), and only when the endpoint they name answers.
+
+**Finding the cause (the RX 580 on grimm).** `~/.local/state/agent-manager/logs/worker-rx580.log`, then `curl http://100.96.112.78:11434/api/version`, `tailscale ping grimm-linux`,
+and over `ssh grimm`: `systemctl status ollama`, `systemctl --failed`, `journalctl -k -b 0 | grep ntfs`. The 2026-10-23 cause: grimm hard-reset, `/workspace` (NTFS, the models'
+disk) came back dirty, `ntfs3` refused to mount it (`volume is dirty and "force" flag is not set`), and `ollama.service` (`RequiresMountsFor=/workspace`) never started.
+
+**What is installed on grimm (outside this repo).** `/etc/fstab` mounts `/workspace` with `force` (the driver replays the journal instead of refusing; original in
+`/etc/fstab.bak-2026-10-23-before-ntfs-force`), and `ollama-ensure.timer` runs `/usr/local/sbin/ollama-ensure.sh` every 3 minutes (and 90 s after boot): if `ollama.service` is not
+active it mounts `/workspace` and starts it, logging to the journal (`journalctl -t ollama-ensure`). A real `chkdsk` from Windows is still worth doing when convenient.
+
+## Switching a worker off
+
+Any worker lane (`worker-<gpu>`, including `worker-cloud`) can be switched off by the operator and back on without restarting the pipeline. This exists mostly for the cloud lane, which draws on a subscription allowance, but it works for every lane.
+
+- **State** is one marker file per worker in a global directory: `$HOME/.local/state/agent-manager/disabled-workers/<id>` (override with `AGENT_MANAGER_DISABLED_WORKERS_DIR`). Because it is global it survives pipeline restarts and a change of active project. `src/worker-switch.js` owns the rule (`switchDir`, `isDisabled`, `setDisabled`, `listDisabled`) and has a CLI: `node src/worker-switch.js disable|enable <id>`, `is-disabled <id>` (exit 0 when off), `list`, `dir`. Only ids matching `worker-<letters or digits>` are accepted.
+- **What an off worker does.** `scripts/local-worker.sh` checks the switch first thing each tick (`worker_switched_off` in `scripts/agent-manager-common.sh`). A switched-off worker claims, resumes and borrows nothing, writes a heartbeat with status `disabled`, and sleeps (`AGENT_MANAGER_SWITCHED_OFF_PAUSE_S` overrides the pause, default the tick interval). The process stays alive, so the watchdog needs no change, and it prints one line when it goes off and one when it comes back.
+- **In-flight work finishes first.** The check is once per tick, so a task already being drafted completes; a task already in `drafting/` waits there until the worker is switched back on. An operator pin to an off worker simply waits too.
+- **A disabled lane counts as not alive** (`laneAliveFromHeartbeat` in `src/capability-routing.js`), so lane avoidance and capability reservation never steer a task to a lane that will not claim it. Turning off the only other lane therefore cannot strand a task.
+- **Fails open.** If the switch cannot be read (node missing, bad directory) the worker is treated as on: a broken switch must never stall the pipeline.
+- **Dashboard API.** `GET /api/instances` marks every worker lane with `switchable: true` and `disabled: true|false` (reviewers and the watchdog carry neither key); a worker switched off while it is still finishing a task shows its real status with `disabled: true`, and once idle its status is `disabled`. `POST /api/instances/<id>/enabled` with `{"enabled": true|false}` switches one worker (`python/dashboard/worker_switch.py` shells out to the node CLI so the rule lives once): 400 for a bad body or a non-worker id, 404 when switching OFF an id that is not a defined lane, always allowed when switching ON (clears a stale marker). The route only writes or removes the marker; it never starts, stops or restarts the pipeline.
+- **Workers tab button.** Every worker card has a **Turn off** / **Turn on** button (`python/dashboard/static/js/worker-switch-ui.js`; reviewers and the watchdog have none). Off dims the card. A worker that is still on a task shows **turning off after this task** and finishes it; an idle one shows **turning off…** until its next tick (seconds), then its status badge reads `disabled`. **Turn on** takes effect within about one tick, and the worker logs that it is back on. The button appears after the dashboard restarts onto code that has it (the Werkzeug reloader does that on its own when the Python files change). Failures show a toast with the server's reason.
+
+## Pausing a machine (2026-11-11)
+
+Besides the per-worker switch, two machine-wide pauses exist so a whole machine can stop claiming work, for example while someone is using the site that runs on it. They are marker files in the same directory as the per-worker switch: `_pause-node` (this machine) and `_pause-global` (the whole system; other machines receive it through their heartbeat reply, a later piece of the multi-node plan). The leading underscore means they can never be a worker id, so nothing that lists switched-off workers sees them.
+
+- **Content.** One JSON object `{scope, reason, source, setAt, expiresAt}`. `source` says who set it (`operator`, `dashboard`, `site-traffic`, `wok`); whoever clears a pause on behalf of an automatic source should clear only a marker with that source.
+- **Effect.** `isDisabled(id)` in `src/worker-switch.js` is true for every worker lane when either pause is active, so `scripts/local-worker.sh` needs no change: a paused machine's workers claim nothing, heartbeat `disabled`, and finish any task already in flight. The reviewers, the apply loop and the watchdog are not worker lanes and keep running.
+- **Expires and fails open.** A pause with an `expiresAt` in the past counts as not paused, and so does a missing, unreadable or malformed marker. An automatic source sets a short expiry and refreshes it, so a dead monitor can never leave a machine paused.
+- **Dashboard.** `GET /api/pause` (read in-process, never starts node), `POST /api/pause/<node|global>` with `{reason?, ttlMin?}` (source is recorded as `dashboard`) and `POST /api/resume/<node|global>`; the Workers tab shows a bar with **Pause this machine** / **Pause everything** (and the matching Resume buttons, with a note of who set the pause, why and until when) above the worker cards in both the list and the graph view. 'Pause everything' writes the local `_pause-global` marker; other machines receive it through their heartbeat reply (a later piece).
+- **CLI.** `node src/worker-switch.js pause <node|global> [--reason <text>] [--source <text>] [--ttl-min <n>]`, `resume <node|global>`, `pause-status` (JSON `{node, global, workers}`).
+
+## Model overrides, model swaps and the health probe (2026-10-27)
+
+The Workers tab (and `POST /api/worker-models/<instance>`) can override the model one instance uses; it applies from that instance's next tick, no restart.
+- **Clearing an override restores the launch-time model.** `scripts/local-worker.sh` and `scripts/review-runner.sh` remember the model they were launched with
+  in `AGENT_MANAGER_BASE_LOCAL_MODEL` (set once, inherited by the `--once` children a daemon spawns) and set `LOCAL_MODEL` from `effective_local_model`
+  (`agent-manager-common.sh`) every tick. Before, a removed override left the last one exported and the lane kept asking for the overridden model.
+- **The lane registry follows the override.** `getLanes()` (process environment only) replaces a lane's `model` and `tier` with its override
+  (`registeredModel` keeps the registered one), so the health probe, capability routing and tier lookups judge the model that is really running.
+- **A model swap is not a dead lane.** Cold loads from the HDD are slow: `ornith:35b` took 467-492 s (`load_duration`), the dense 27B about 107 s, against a 90 s
+  probe timeout (`AGENT_MANAGER_LANE_HEALTH_TIMEOUT_SECS`) and a 300 s Ollama request timeout. `src/lane-health.js` therefore never probes over a different
+  resident model (it would evict it), and a probe that fails while its model is not resident afterwards is recorded as inconclusive (no sample, no degraded
+  verdict, retried after the normal interval). A failure with the model resident, or with the endpoint unreachable, still degrades the lane.
+- **Two big models cannot share the 3090.** A trial of another model needs the worker AND the host `reviewer` on it (they share one Ollama), the chat and Forge
+  sessions off the card (both evict it), and the old model unloaded explicitly (`keep_alive: 0`): `OLLAMA_KEEP_ALIVE=-1` pins it.
+
+## Script-handled sources (2026-11-02)
+
+A task source whose work is a script rather than a model-drafted diff (a tuning experiment, an archive, a ledger line) registers a handler with
+`registerScriptHandler(sourceName, fn)` (`src/script-handler-registry.js`; `fn(task, ctx)` returns `{outcome, summary, detail?}`, throwing is allowed).
+`draftTask()` in `src/local-draft.js` looks the handler up right after the pre-dispatch gate and BEFORE any draft attempt or model call. On success the
+result is stored on the task (`task.scriptResult`), the task gets `terminalDisposition: 'recorded'` and returns `{succeeded: true, recorded: true}`;
+`scripts/local-worker.sh` then moves it to `queue/done/` (blocked and needs-clarification keep priority). On a throw the draft fails with
+`script handler failed: <message>` and the worker's normal draft-failure accounting applies. A source with no handler is untouched.
+
+`recorded` is a terminal, stable disposition and releases `dependsOn` edges like `noop`. The lane that claims such tasks is a registry entry with
+`provider: "script"` (no model, no reviewer; see the entry-fields table); `lanes.example.json` ships a disabled example. The plugin that owns the source (llm-tuner's `tuning_experiment`) registers the handler and the lane's `taskClasses` names that source. Tests:
+`src/script-handler-registry.test.js`, `src/local-draft-script-handler.test.js`, `scripts/local-worker-recorded.test.js`.
+
 ## Tests
 
-`src/lanes.test.js` (registry parsing, validation, fail-closed, id/endpoint collisions, CLI), `src/next-claimable-task.test.js` (allowlist),
+`src/worker-model-override.test.js`, `scripts/model-override-reset.test.js` (override read, effective model, restore on clear), `src/lanes.test.js` (registry parsing, validation, fail-closed, id/endpoint collisions, CLI), `src/next-claimable-task.test.js` (allowlist),
 `scripts/gpu-arbiter-cli-endpoint.test.js` (remote-lane guard), `scripts/gpu-arbiter-cli.test.js` (hold lifecycle), `src/gpu-guard.test.js` + `scripts/comfyui-lease-endpoint.test.js` (endpoint-scoped lease, shell/JS parity), `python/dashboard/test_chat_preempt.py` + `test_expected_instances.py`
 (dashboard parity and preemption sets).

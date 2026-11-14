@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { liveLaneCount, generationThrottled } = require('./generation-throttle.js');
+const { liveLaneCount, generationThrottled, makeGenerationBlocker } = require('./generation-throttle.js');
 
 function makeInstances(entries) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gen-throttle-'));
@@ -72,4 +72,43 @@ test('a live assignable:false worker heartbeat is not counted as a lane; missing
     write(extra);
     assert.equal(liveLaneCount(dir), 2, JSON.stringify(extra));
   }
+});
+
+// --- makeGenerationBlocker (2026-10-31): an exemption lets through only its own source ------------------------------------------------------------
+const src = (name, priority) => ({ name, priority });
+
+test('makeGenerationBlocker: no backlog blocks nothing (undefined)', () => {
+  assert.equal(makeGenerationBlocker({ alreadyPending: false, exemptSourceNames: ['adhoc'], inFlightPriorities: [1, 1, 1], laneCount: 2 }), undefined);
+});
+
+test('makeGenerationBlocker: with a backlog and no exemption a priority-85 source is blocked, a priority-30 source is not', () => {
+  const blocked = makeGenerationBlocker({ alreadyPending: true, exemptSourceNames: [], inFlightPriorities: [41, 41, 41], laneCount: 3 });
+  assert.equal(blocked(src('project_search', 85)), true);
+  assert.equal(blocked(src('arch_discovery', 30)), false);
+});
+
+test('makeGenerationBlocker: an exempt source is never blocked, even when in-flight work outranks it', () => {
+  const blocked = makeGenerationBlocker({ alreadyPending: true, exemptSourceNames: ['brain_dump_sort'], inFlightPriorities: [10, 10, 10], laneCount: 2 });
+  assert.equal(blocked(src('brain_dump_sort', 42)), false);
+  assert.equal(blocked(src('derived_task', 42)), true, 'same priority, not exempt: still vetoed');
+});
+
+test('makeGenerationBlocker: an active exemption does NOT open the ladder for other sources (the project_search flood)', () => {
+  const blocked = makeGenerationBlocker({ alreadyPending: true, exemptSourceNames: ['adhoc'], inFlightPriorities: [10, 10, 10], laneCount: 3 });
+  assert.equal(blocked(src('adhoc', 10)), false);
+  assert.equal(blocked(src('project_search', 85)), true);
+  assert.equal(blocked(src('deep_dive', 82)), true);
+});
+
+test('makeGenerationBlocker: in-flight work less important than the source does not block it', () => {
+  const blocked = makeGenerationBlocker({ alreadyPending: true, exemptSourceNames: [], inFlightPriorities: [85, 85, 85], laneCount: 2 });
+  assert.equal(blocked(src('arch_discovery', 30)), false);
+  assert.equal(blocked(src('project_search', 85)), true);
+});
+
+test('makeGenerationBlocker: several exemptions let through each of their own sources and nothing else', () => {
+  const blocked = makeGenerationBlocker({ alreadyPending: true, exemptSourceNames: ['adhoc', 'path_prefetch_resolve'], inFlightPriorities: [1, 1], laneCount: 1 });
+  assert.equal(blocked(src('adhoc', 10)), false);
+  assert.equal(blocked(src('path_prefetch_resolve', 45)), false);
+  assert.equal(blocked(src('brain_dump_sort', 42)), true);
 });

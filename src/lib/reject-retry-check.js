@@ -151,10 +151,50 @@ function stalePremiseGateNoLongerFires(task, { repoRoot, detectFn } = {}) {
   if (!repoRoot) return false;
   try {
     const detect = detectFn || require('../decompose-premise-check.js').detectStaleDecomposePremise;
-    return detect(task, { repoRoot }) === null;
+    // Pass the same context as local-agentic-write-draft.js so the re-evaluation uses
+    // the same logic: files this sub-task or its siblings create are not "truly missing".
+    const decomposeCtx = task?.promptContext?.decomposedFrom;
+    const context = {
+      createdFiles: extractScopeFilesFromTask(task),
+      siblingCreatedFiles: extractSiblingScopeFilesFromDecompose(decomposeCtx),
+    };
+    const r = detect(task, { repoRoot, context });
+    // "No longer fires" == no blocking finding: null OR the { stale: false, suppressions }
+    // audit-only shape (dismissals recorded, nothing blocking remains).
+    return r === null || !r.stale;
   } catch {
     return false;
   }
+}
+
+// Extract file paths declared in a piece's "Files:" scope lines. Used by the stale-premise
+// gate to determine which files a sub-task (or its siblings) are meant to create, so the
+// staleness check can distinguish "expected to be created" from "truly missing".
+function extractScopeFilesFromTask(task) {
+  const scopeLines = task?.promptContext?.decomposedFrom?.pieces?.[0]?.scopeLines || [];
+  const files = new Set();
+  for (const line of scopeLines) {
+    if (typeof line === 'string' && line.startsWith('Files:')) {
+      const trimmed = line.slice('Files:'.length).trim();
+      if (trimmed) files.add(trimmed);
+    }
+  }
+  return files;
+}
+
+function extractSiblingScopeFilesFromDecompose(decomposeCtx) {
+  const siblings = decomposeCtx?.pieces || [];
+  const files = new Set();
+  for (const sib of siblings) {
+    const scopeLines = sib?.scopeLines || [];
+    for (const line of scopeLines) {
+      if (typeof line === 'string' && line.startsWith('Files:')) {
+        const trimmed = line.slice('Files:'.length).trim();
+        if (trimmed) files.add(trimmed);
+      }
+    }
+  }
+  return files;
 }
 
 // 2026-10-07 (blocked class B): local-agentic-write-draft.js's external-dependency gate blocked

@@ -1,6 +1,6 @@
-# Agent Pipeline
+# Agent Pipeline Glossary
 
-A queue-based system that delegates scoped implementation tasks to a local Ornith model, with plan/implement/critique passes and majority-vote review before anything reaches git.
+This file is a glossary of terms used in this repository. It is a glossary and nothing else — no implementation detail, no incident narrative. Long incident stories live in `docs/design-notes/`.
 
 ## Language
 
@@ -8,8 +8,8 @@ A queue-based system that delegates scoped implementation tasks to a local Ornit
 A priority-ranked generator, registered via `registerTaskSource`, that produces tasks for the queue (e.g. `adhoc`, `deep_dive`, `backlog_fulfillment`). The priority ladder between task sources determines claim order. Sources come from this repo's `src/task-sources.js` **and** from any out-of-tree plugin loaded via `AGENT_MANAGER_REGISTER_PATH` — the programming-hygiene sources (`observability_*`, `performance_*`, `function_length_*`, `arch_*`, `unused_export`) live in the **agent-manager-hygiene** plugin, not here. See `docs/PLUGIN_API.md`.
 _Avoid_: source (ambiguous with the `source` field below — always say "task source" for the generator)
 
-**Core-scope source**:
-A task source registered with `scope: 'core'` whose subject is agent-manager ITSELF (its daemons, queue health, failure classes, README, dashboard UI): `pipeline_health_audit`, `pipeline_self_audit`, `pipeline_forensics`, `pipeline_forensics_fix`, `pipeline_debrief`, `doc_drift_fix`, `ui_visibility_audit`. It runs only when agent-manager is the active project (`src/lib/source-scope.js`, enforced at generation, at claim, and in the watchdog sweeps that call a source directly); on any other project it is skipped, so a self-audit can't outrank that project's hygiene work or file pipeline findings into its brain dump. `AGENT_MANAGER_CORE_SOURCES_ANYWHERE=true` disables the gate. The Job List marks these rows "agent-manager only".
+**Self-scope source** (replaces "Core-scope source"):
+A task source registered with `scope: 'self'` whose subject is its own plugin's files (e.g. `staleness_audit`, `capability_debrief`). The list moves to the self-audit plugin when extracted.
 _Avoid_: pipeline source (ambiguous -- every source runs in the pipeline)
 
 **Source** (task field):
@@ -21,14 +21,14 @@ Governs where and how a task executes: its working-directory kind and success ch
 _Avoid_: source
 
 **Claim**:
-A task file that has been moved into a per-instance drafting folder (an atomic, same-volume `Move-Item`), marking it as owned by that instance.
+A task file that has been moved into a per-instance drafting folder, marking it as owned by that instance.
 
 **Orphaned claim**:
 A claim whose owning process is confirmed dead. Recovered automatically at the next worker startup (crash-resume).
 _Avoid_: stranded claim (a different failure state, see below)
 
 **Stranded claim**:
-A claim sitting inside a drafting folder whose owning process is alive, but the file isn't the one that owner is currently working — invisible to crash-resume, since recovery only checks folder-level ownership, not per-file. Not recovered automatically; requires manual or `pipeline-doctor.ps1` intervention.
+A claim sitting inside a drafting folder whose owning process is alive, but the file isn't the one that owner is currently working — invisible to crash-resume, since recovery only checks folder-level ownership, not per-file. Not recovered automatically; requires manual intervention.
 _Avoid_: orphaned claim
 
 **Instance**:
@@ -38,38 +38,54 @@ One running process identified by an `instanceId` (a worker lane named for its G
 One worker process pinned to one GPU endpoint, named for the GPU (`worker-3090`, `worker-p40`, `worker-rx580`). Lanes are data, not code: the host lane, the legacy P40 lane and every entry of the lanes registry file (`lanes.json`, see `docs/agents/lanes.md`) are turned into lane definitions by `src/lanes.js`, the single definition `launch.sh`, the watchdog's restart rule, the claim loop and the dashboard all read. A lane may declare a `taskClasses` allowlist (only those task sources are offered to it), `preempt` (whether an interactive chat turn may kill its call) and `slow` (longer timeouts for a categorically slower endpoint) and `numCtx` (the lane's one pinned context window, for cards smaller than the 24 GB ones).
 _Avoid_: worker type, tier (the old reasoning/worker split is gone)
 
+**Cloud lane**:
+A lane whose endpoint is the cloud-providers gateway (an Ollama-compatible service on `127.0.0.1:7450` that forwards to Claude Haiku) instead of a GPU: a `lanes.json` entry with `"provider": "cloud"` and a mandatory `taskClasses` allowlist, conventionally `["adhoc"]`. It exists only for extra throughput on adhoc tasks. It is explicit and bounded: it is never an overflow path for tasks that fail locally, hygiene scan sources stay off it, it never changes claim order or throttles local lanes, and the GPU-only logic (Forge lease yield, host VRAM headroom, lane-health probes, chat cards) skips it. Billing is the API key by default; the subscription adapter is owner-confirmed. See `docs/agents/cloud-lane.md`.
+_Avoid_: overflow lane, fallback lane, the old `AGENT_MANAGER_CLAUDE_SOURCES` per-source provider switch
+
 **Heartbeat**:
 The JSON file an instance writes on every status change (`pid`, `status`, `currentTaskId`, `currentPass`, `lastHeartbeat`) — the system's only source of truth for whether an instance is alive and what it's doing.
 
 **Watchdog sweep**:
-A periodic check (`coordinator-sweep.js`, `decompose-loop-autoroute.js`, `blocked-drain.js`, `staleness-audit.js`'s sweep, `context-trim-sweep.js`, and others) that `queue-watcher.sh watchdog` invokes as a plain one-shot `node <script>.js` subprocess once per tick, then exits — **not a standalone daemon and not its own `instanceId`/heartbeat**. Confirmed live 2026-09-06: a Chat investigation ran `ps aux | grep decompose`, found nothing, and concluded the decompose mechanism (and, by extension, the whole pipeline) was down — while `watchdog`'s own heartbeat was fresh and 5 other real worker/reviewer processes were actively running the entire time. A sweep script will *always* be absent from `ps aux` between ticks even when working perfectly, because it only exists as a process for the seconds its own tick takes to run. The correct liveness question for any sweep is never "is a process named after it running" — it's "is `instances/watchdog.json`'s `lastHeartbeat` fresh" (that one heartbeat covers every sweep watchdog owns) plus, if you need to know a specific sweep actually ran recently and what it did, its own log file under `~/.local/state/agent-manager/logs/` (e.g. `coordinator-sweep.log`, `decompose-loop-autoroute.log`) or the task-level evidence a sweep leaves behind (a `stalenessFlag`, an `advisory` history entry, a moved queue file).
+A periodic check (`coordinator-sweep.js`, `decompose-loop-autoroute.js`, `blocked-drain.js`, `staleness-audit.js`'s sweep, `context-trim-sweep.js`, and others) that `queue-watcher.sh watchdog` invokes as a plain one-shot `node <script>.js` subprocess once per tick, then exits — **not a standalone daemon and not its own `instanceId`/heartbeat**. The correct liveness question for any sweep is never "is a process named after it running" — it's "is `instances/watchdog.json`'s `lastHeartbeat` fresh" (that one heartbeat covers every sweep watchdog owns) plus, if you need to know a specific sweep actually ran recently and what it did, its own log file under `~/.local/state/agent-manager/logs/` (e.g. `coordinator-sweep.log`, `decompose-loop-autoroute.log`) or the task-level evidence a sweep leaves behind (a `stalenessFlag`, an `advisory` history entry, a moved queue file). See `docs/design-notes/2026-09-06-sweep-liveness-incident.md` for the incident that prompted this clarification.
 
 **Duplicate instance**:
-Two or more processes sharing the same `instanceId`, racing to write the same heartbeat file and claim from the same drafting folder. Caused by a manual restart racing `queue-watchdog`'s automatic one; root-caused 2026-07-19 (see `docs/pipeline-incident-2026-07-19.md`) and **fixed in code** since 2026-08-16 — every spawn path (`local-worker`, `queue-watchdog`, `apply-runner`, `review-runner`, `queue-watcher`) now calls a startup liveness check (`Test-InstanceLiveness` / `check_instance_liveness` in `agent-manager-common.ps1`/`.sh`) that refuses to start under an `instanceId` a confirmed-alive process already holds, hardened twice more since (2026-08-22: pure pid-liveness instead of a heartbeat-staleness window that could wrongly call a slow-but-alive process dead; 2026-08-25: the surviving process claims its own heartbeat immediately on startup, before any slower setup work, closing the remaining window where a stale pre-restart heartbeat could fool a concurrent `dead-process-check` tick into spawning a replacement). This entry was left stale after that fix landed and caused several redundant "still unfixed" tasks/brain-dump entries — if you're about to file one, check `git log --oneline -- src/agent-manager-common.ps1` for `Test-InstanceLiveness` first.
+Two or more processes sharing the same `instanceId`, racing to write the same heartbeat file and claim from the same drafting folder. Fixed in code since 2026-08-16. See `docs/design-notes/duplicate-instance-history.md` for incident details.
 
 **Pass**:
-One of the stages a task's draft goes through inside a single instance: `plan` → `implement` → `critique` → (optionally) `revise`. Distinct from review, which happens afterward, by a separate instance.
-_Avoid_: review (a pass belongs to drafting; review is its own later stage)
+One of the stages a task's draft goes through inside a single instance (plan, implement, critique).
 
 **Degenerate**:
-An Ornith response judged mechanically unusable — empty, or otherwise failing a basic sanity check — before anything is evaluated for correctness. Caught immediately and blocks the task (`blockedReason: "<Pass> pass degenerate: <reason>"`). Distinct from a response that is merely wrong, which review exists to catch.
+A task that has failed to make progress through the draft loop and is now stuck (e.g. infinite loop, repeated rejection).
 
 **Blocked**:
-A task sitting in `queue/blocked/`, not actively being worked. Reached from a degenerate pass, a manual intervention (e.g. breaking a crash loop), or a review-stage rejection — the `blockedStage` field on the task is what distinguishes which, and it decides what happens next.
-_Avoid_: rejected (too narrow — only review-stage rejection is a "rejection" in the auto-retry sense)
+A task that cannot proceed because it is waiting for something external (e.g. human input, another task to finish).
 
 **Review-stage rejection**:
-A blocked task whose `blockedStage` is exactly `"review"` — a real reviewer looked at the draft and rejected it. The *only* kind of blocked task `queue-watchdog` auto-requeues for a fresh redraft (up to `MaxOrnithRejectRetries` times). Every other blocked task sits permanently until a human acts — including anything manually blocked to break a crash loop, which must deliberately use a `blockedStage` other than `"review"` or it will resume looping.
+A review verdict that sends a draft back for revision (Needs Work), not a final rejection (Done with Issues).
 
 **Priority ladder**:
-The ordered list of registered task sources — lower number wins. `getNextTask()` walks it in order, so a task source only fires once every higher-priority one has nothing to offer.
-
-**Gated main**:
-The pipeline never pushes to a remote's main branch on its own -- the only way onto main is a human merge (the dashboard's merge button, or a PR). A `directToMain` source's approved candidate-doc append is committed onto ONE rolling branch, `agent/triage-queue` (shared, not per-task, because every task appends to the same `Docs/*_CANDIDATES.md` and separate branches would conflict at the end of that file), pushed, and left `pending-merge`; the task's apply note says "queued on agent/triage-queue ... awaiting a human merge" and deliberately avoids the phrases "committed to main"/"triage batch", which `task-disposition.js` reads as already-shipped (`applied-direct`). Consequence: a candidate doc is not visible to its consumer (`arch_review` etc., which read main) until that branch is merged. Also gated: the coordinator's auto-merge of verified mechanical moves, `resetToMain`'s fast-forward of origin (it rescues local-ahead commits to `agent/rescued-<main>-<ts>` instead), and `pushMain` (refuses). Single switch: `AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH=true` restores the old behavior (`src/lib/main-push-policy.js`). Added 2026-09-19 after an `arch_discovery` doc append reached a third-party repo's `origin/main` unattended, ~30s after approval.
-_Avoid_: direct commit, auto-merge (both are the ungated behavior this replaced)
+The ordered list of task sources that determines claim order when multiple sources have tasks ready.
 
 **Adhoc**:
-The special task source (priority 10, always wins the priority ladder) for tasks injected directly into `queue/adhoc/`, bypassing normal generation. Tasks from it carry `source: 'manual'`.
+A manually-filed task, not generated by a task source.
 
 **Candidate**:
-A proposed finding written by a discovery-style task source (e.g. `arch_discovery`) into a doc for later action, self-rated Strong or Weak, for a human or a consumer task source to act on.
+A proposed solution to a task, recorded in a candidate doc (`Docs/*_CANDIDATES.md`).
+
+**Kernel**:
+The minimal Agent Manager platform: queue state machine, task records, claim and heartbeat, lanes and GPU/budget guards, plugin loader + SDK, event stream, dashboard shell (queue, instances, lanes, plugin manifest, pipeline start/stop), and the main-push check. The Kernel contains no task-source name string, no `registerTaskSource` call, and no plugin logic. See ADR-0025.
+
+**Required plugin**:
+A plugin repo pinned in the Kernel's `requiredPlugins` manifest with a version range. The Kernel fails loudly if one is missing or out of range. See ADR-0025 for the seven required plugins.
+
+**Optional plugin**:
+A plugin repo not in the `requiredPlugins` manifest. The Kernel does not enforce presence.
+
+**Manager (forge-manager / business-manager)**:
+The Agent Manager system split into Kernel + plugin repos. Manager repos (forge-manager, business-manager) reach the Kernel only over HTTP (AM's `/api/task/...` and the gpu-broker); no cross-repo code imports. Each registers as one tab group in AM's single dashboard front door and also runs standalone.
+
+**Shared service**:
+A service used across multiple plugins/repos (e.g., gpu-broker, cloud-providers, wikiforge). Shared services stay independent.
+
+**Merge gate / READY record**:
+Evidence for the exact head SHA on main: branch equals reviewed diff, merges cleanly, tests pass on the trial merge, mutants rejected, diff does only what the task asked. Gated main, RESTATED: main changes only through ONE path, the merge gate, and only with a recorded READY evidence record for that exact head SHA. Nothing else may push to main: no worker, no plugin, no hand git push. The Kernel enforces the single-path rule; the merge plugin supplies the gate. A human merge is just another caller of the same path. See `docs/design-notes/2026-09-19-gated-main-incident.md` for the incident that prompted this clarification.

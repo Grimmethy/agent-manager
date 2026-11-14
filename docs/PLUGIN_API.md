@@ -25,6 +25,9 @@ plugin. `grep -rn "require(.*hygiene\|require.*agent-manager-hygiene" src/` must
 | **`capability-ledger.js`**, **`lanes.js`** | `readScorecard`, `buildScorecard`, `annotateVariants`; `getLanes`, `laneById`; CLI `node src/lanes.js --json` | Task-atomization hook 3: the documented read surface for measurement. `lanes.js --json` lists every lane's `id, gpu, model, tier, numCtx, numBatch, slow, local, preempt, taskClasses, reserve, endpoint` (no launch env). The scorecard rows are `{ source, model, tier, lanes, n, ok, okRate, lower, p50WallMs, p95WallMs, tpsP50, failStreak, outcomes }`. |
 | `config.js` | `getConfig`, `resolveGraphPath` | the plugin passes `getConfig` into each module's `register(deps)`. It never calls `ensureRegistered` — core does. |
 | `task-sources.js` | `taskIdExistsInQueue`, `taskPriority` | `taskIdExistsInQueue` is a general queue primitive; `taskPriority` reads the priority-override map. Injected via `register(deps)`. `nextCandidateFulfillmentTask` / `windowFetchedFileContent` are still re-exported here for back-compat but the SDK path below is canonical. |
+| `script-handler-registry.js` | `registerScriptHandler(sourceName, fn)`, `getScriptHandler(sourceName)` | A task source whose work is a script, not a model-drafted diff (2026-11-02, the llm-tuner tuning lane). `fn(task, ctx)` is async and returns `{outcome, summary, detail?}`. `draftTask()` runs it before any model call; the task finishes with `terminalDisposition: 'recorded'` and moves straight to `queue/done/`. A throw fails the draft through the normal failure accounting. Pair it with a `script` lane (`docs/agents/lanes.md`, "Script-handled sources"). A duplicate registration throws. |
+| `lib/task-priority.js` | `taskPriority(source, default)` | The same function `task-sources.js` re-exports (a test asserts they are identical), so a plugin may import either. |
+| `sdk/size-limits.js` | `findLongFiles(repoRoot, { maxLines })`, `findLongFunctions(text, relPath, { maxLines })`, `countLines(text)`, `tokenizeJs(text)`, `findJsFunctionSpans(tokens)`, `findPyFunctionSpans(lines)` | **SDK helper (size ratchet).** Pure size detection with no allowlist knowledge: `findLongFiles` and `findLongFunctions` report every file or function over the limit (defaults 500 and 100 lines, from `AGENT_MANAGER_MAX_FILE_LINES` and `AGENT_MANAGER_MAX_FUNCTION_LINES`), so a plugin can build its own size check. The core gate that uses it is `src/size-ratchet.test.js`; see `docs/agents/size-ratchet.md`. |
 | **`sdk/candidate-fulfillment.js`** | `nextCandidateFulfillmentTask`, `windowFetchedFileContent`, plus all of `candidate-docs.js` re-exported | **SDK helpers (ADR-0022 Stage D).** The candidate-fulfillment lifecycle in one module: read an `### AC-NNN` doc, pick the oldest actionable Strong candidate, ground it in real windowed file content. Core ships and documents this but registers nothing with it — `backlog_fulfillment` and the plugin's `arch_review` / `*_fix` are all consumers. `windowFetchedFileContent` returns `{ text, confidence, anchorCount, usedSnippetFuzzyMatch }` (not a bare string, since 2026-09-05's context-trim fix) — `confidence` is `'strong'`/`'weak'`/`'none'` depending on how reliable the anchor was, and a `'weak'`/`'none'` result has a `[LOW-CONFIDENCE GROUNDING]` note prepended to `text` for the model. `usedSnippetFuzzyMatch` tells a caller whether the candidate's frozen `Snippet:` field still matches current file content — the staleness signal `context-trim-sweep.js` re-checks on every retry. Also lower-level grounding helpers (`findFuzzyMatch`, `windowAroundIndex`, `snippetFromSection`, `quotedSymbolsFromSection`, `MAX_FETCHED_FILE_CHARS`, `MAX_ARCH_REVIEW_TASK_CHARS`) for a plugin's own grounding tests. |
 | `candidate-docs.js` | `applyArchDiscoveryCandidates`, `parseArchDiscoveryCandidates`, `nextAvailableCandidateId`, `isEffectivelyEmptyResponse` | AC-NNN candidate-doc *write* primitives, shared with core `backlog_decomposition`. `apply-group-a.js` and `sdk/candidate-fulfillment.js` both re-export them. |
 | `apply-group-a.js` | `applyVerdictOnly` | shared with core `staleness_audit` — a plain prose verdict is a documented no-op at apply. |
@@ -66,12 +69,53 @@ Registration fields added for the last holdouts (each opts a source into one cor
 | `noAutoRetry: true` | `reject-retry-check.js` | Opts a source out of the blind-redraft-and-retry sweep entirely (2026-09-28) -- a blocked task from this source is left exactly as-is (never auto-requeued for a fresh draft-started cycle, never counted toward `MAX_LOCAL_REJECT_RETRIES`/`exhausted`). For a source whose redraft is a genuine multi-minute plan+implement+critique cycle run at batch scale (`wiki_transcript_extract`/`wiki_page_promote`), the operator may prefer "one attempt and done, move to the next item" over spending that time re-attempting one that already failed. |
 | `genuineVerdict: { idPrefix? }` | `lib/inert-target.js` (derived-premise sweep) | This source's `done/` records (id/filename starting `idPrefix`) whose `implementResponse` carries a vetted `### AC-N` + `Strength: Strong` candidate count as a GENUINE verdict, letting the sweep RETIRE a derived finding about an unreferenced symbol instead of just holding it (the dead-code triage, `unused_export`). Core resolves a record's source through `registerSourceAlias`, so a source whose tasks stamp another `source` string just registers the alias. |
 
-A source that needs a mandatory, source-specific instruction in its implement prompt (e.g. `function_length_review`'s two-outcome verdict constraint) puts it in its own `buildImplementPrompt`; core's dispatcher no longer special-cases any source name.
+A source that needs a mandatory, source-specific instruction in its implement prompt (e.g. `function_length_review`'s two-outcome verdict constraint) puts it in its own `buildImple
+
+## plugins.json is host-local
+
+`plugins.json` (repo root) is gitignored — it is **host-local configuration**, not part of the plugin contract. A rebuilt host starts with no plugins registered, no dashboard tabs, no GPU broker card page. The broker's tab entry exists on this host because it was added by hand; on a fresh host it would be silently lost.
+
+**What ships with the plugin, what lives on the host:**
+
+| Lives in the plugin repo | Lives in agent-manager's `plugins.json` (host-local) |
+|---|---|
+| `register.js` (calls `registerTaskSource`) | The `name`/`tab` entry that wires the plugin into the dashboard |
+| `ui/<tab>.js` (the tab script) | The `script` path that points at it |
+| `README.md` (documents the tab entry) | The `group` that places the tab in the Forges section |
+
+**Worked example — GPU broker (the only plugin with a tab in the Forges group):**
+
+The broker's `README.md` documents its exact entry verbatim:
+
+```
+tab: {key: 'gpu-broker', label: '🎛 GPU Cards', kind: 'script', script: 'ui/gpu-broker-tab.js', group: 'Forges'}
+```
+
+`plugins.example.json` (in this repo, also gitignored) lists this entry without machine-specific env values — it is the source of truth for "what entries should exist on a fresh host". Validate it with:
+
+```bash
+/media/model-cache/github/agent-manager/.venv/bin/python -m unittest python.dashboard.test_plugins_example_validation -v
+```
+
+The test asserts every entry passes `_validate_plugin_tab()` (the same validation the dashboard uses at `/api/plugins`) and that no entry contains machine-specific values like `/media/` paths or `127.0.0.1` URLs.
+
+**Provisioning checklist for a new host:**
+
+1. `git clone` agent-manager (skip the GPU broker repo until step 4)
+2. `git clone` each plugin repo to a known location (e.g. `/media/model-cache/github/`)
+3. Copy `plugins.example.json` to `plugins.json`: `cp plugins.example.json plugins.json`
+4. For each plugin in the example, verify the entry matches the plugin's README; edit `plugins.json` if the README documents a different shape
+5. For each plugin, set `AGENT_MANAGER_REGISTER_PATH` to include its `register.js` (comma-separated, see `src/config.js`'s `ensureRegistered()`)
+6. Start the broker (or whichever plugin has a long-lived server): `cd /media/model-cache/github/agent-manager-gpu-broker && python server/app.py &`
+7. Open the dashboard; the Forges group should list the broker tab
+8. Click the tab — if it 404s, the `script` path in `plugins.json` does not match the plugin's actual `ui/` layout; fix the entry
+
+A plugin that ships a tab **must document its exact `plugins.json` entry in its own README** — see the broker's `README.md` for the pattern. Core never invents entries; the operator copies from the example and verifies against the README.mentPrompt`; core's dispatcher no longer special-cases any source name.
 
 Known, deliberate exceptions:
 
 - **`src/arch-discovery-structcheck.js`** names `arch_discovery` / `arch_import` — it is
-  invoked by hardcoded path from `src/local-worker.ps1` (the Windows worker) and is
+  was invoked by hardcoded path from the retired Windows worker (`src/local-worker.ps1`, deleted) and is
   arch-specific by nature. Allowlisted in the guard test. Not reached on the Linux path.
 - **`python/dashboard/app.py`'s `SOURCE_DESCRIPTIONS` / `_SOURCE_TO_DOMAIN_KEY`** name every
   source, plugin ones included. This is the dashboard's server-side *display* catalog for a
@@ -79,6 +123,20 @@ Known, deliberate exceptions:
   domain-key map with a documented silent-failure mode if wrong. Making it fully
   topology-derived (extending `--dump-topology` with `description`/`domain` + a frozen
   fallback) is a self-contained dashboard refactor, tracked separately.
+
+## Required plugins
+
+Some plugins are separate repositories that Agent Manager cannot run without. `config/required-plugins.json` is the Kernel's list of them, and a missing or out-of-range one must fail loudly (the rule `scripts/queue-watcher.sh` already applies to `agent-manager-hub-tasks`), never be skipped silently:
+
+```json
+{ "requiredPlugins": [ { "name": "agent-manager-hub-tasks", "range": "^0.1.0", "entry": "register.js" } ] }
+```
+
+- `name` is the plugin's name in `plugins.json` (resolved by `src/resolve-plugin-root.js`, enabled entries only); `range` is a semver range the `version` in the plugin's own `package.json` must satisfy (the releases are a pinned set); `entry` is a file the plugin root must contain (default `register.js`).
+- Supported ranges: an exact version, `=`, `>`, `>=`, `<`, `<=`, `^`, `~`, x-ranges and `*`, joined by spaces (AND) or `||` (OR). Pre-release and build tags are ignored. Any other range is `INVALID_RANGE`, never a pass.
+- `src/required-plugins.js` exports `loadRequired`, `checkRequiredPlugins`, `assertRequiredPlugins` (throws `RequiredPluginError` carrying the readable text from `failureText`) and `satisfies`. Each result has a status: `ok`, `MISSING`, `NO_VERSION`, `OUT_OF_RANGE`, `INVALID_RANGE` or `NO_ENTRY`.
+- `node src/required-plugins.js [--config <file>] [--json]` is the same check as a command: it prints the status, writes the failure text to stderr and exits 3 when anything is unmet (2 when the config itself cannot be read, 0 when all are met). `scripts/launch.sh` runs it before anything else is started: when it fails, no pipeline daemon is started (the dashboard still is), the error is printed on stderr and the script exits with the check's code (3 unmet, 2 unusable config). `scripts/queue-watcher.sh` runs it on every tick and writes the failure text of each unmet plugin to its log (`[watchdog] [required-plugins] ERROR: ...`); it never aborts a tick. The dashboard status is a later piece.
+- The list is data. It names only the plugins that exist as separate repositories today; each extraction task adds its plugin (adhoc, draft, review, apply, merge, models) in the same change that creates the repository.
 
 ## Expiring queued work (optional)
 
@@ -109,7 +167,7 @@ registerTaskSource('my_source', {
 
 A script-loaded plugin (`registerPath`, no server `url`) may declare its own row in the
 dashboard's tab bar instead of core hardcoding one for it. This is the manifest-driven
-dashboard tab (`Docs/hub-tasks-extraction-plan.md` section 5, built as six small pieces on
+dashboard tab (`docs/design-notes/hub-tasks-extraction-plan.md` section 5, built as six small pieces on
 `feat/manifest-tab-slot-schema`) — the precondition for moving a whole UI-owning subsystem
 such as Hub Tasks into its own plugin repo. A working example lives at
 `test-fixtures/manifest-tab-example-plugin/` (see "End-to-end proof" below).
@@ -198,6 +256,24 @@ at is the one that just disappeared, `redirectFromGoneActiveTab()` runs the dash
 normal tab-switch transition (`switchToTab()`) to a safe fallback (`'project'` by default)
 instead of leaving them on a dead tab.
 
+### Keeping the tab current: announce
+
+The dashboard has no redraw timer (ADR-0024, "triggers, not polls"): a plugin tab is drawn when it is opened and again when its plugin says something changed. The party that changes
+the data announces it:
+
+```
+POST /api/plugins/<plugin name>/announce        ->  {"ok": true, "plugin": "<name>", "seq": 42}
+```
+
+`<plugin name>` is the `name` of the plugin's `plugins.json` entry (the same name as `pluginName` on its tab row). Call it from the plugin's server (or its tab script) after the data
+behind the tab changed, for example after a job finished or a record was written. Every open dashboard receives a `plugin-changed` event, and ONLY the open tab of that plugin calls its
+renderer again; every other tab ignores it. Notes:
+
+- An unknown plugin name answers 404 and publishes nothing; with `AGENT_MANAGER_EVENT_STREAM=off` the route answers 404 `{"enabled": false}`.
+- Announce when something CHANGED, not on a timer: a loop that announces every few seconds is the poll this mechanism replaces.
+- The tabs that keep their own state while open (PromptForge, AdForge and ScriptForge, in `SELF_RENDERING_TABS` of `static/js/live-updates.js`) are never redrawn by an announcement.
+- A plugin that never announces keeps working: its tab shows what it drew when it was opened (reload or switch away and back to redraw).
+
 ### End-to-end proof
 
 `test-fixtures/manifest-tab-example-plugin/` (`register.js` + `ui/example-tab.js`) is a
@@ -216,7 +292,20 @@ Only a script-loaded plugin (`registerPath`, no server) can declare a tab today 
 server-slotted plugin (`slot`/`url`, e.g. the Hardware tab's plugins) cannot yet. Moving an
 existing hardcoded tab (Hub Tasks, or the PromptForge/AdForge/ScriptForge iframe
 companions) onto this mechanism is separate follow-up work, tracked in
-`Docs/hub-tasks-extraction-plan.md`.
+`docs/design-notes/hub-tasks-extraction-plan.md`.
+
+## Watchdog scripts (optional)
+
+A plugin that needs "check something cheap every tick, act only on a change" declares it in its `plugins.json` entry instead of starting a timer of its own (ADR-0024: the watchdog is the single clock):
+
+```json
+{ "name": "uiforge", "registerPath": "/path/uiforge/register.js", "enabled": true, "watchdogScripts": ["harness/watchdog-trigger.js"] }
+```
+
+- `src/plugin-watchdog-scripts.js` lists the scripts of every ENABLED entry. Each path must be relative to the plugin root (the directory of `registerPath`), contain no `..`, and end in `.js`; anything else is skipped with a reason on stderr, never thrown. Extra manifest fields survive both the JS reader and the dashboard's plugin toggle, which rewrites whole entries.
+- `scripts/run-plugin-watchdog-scripts.sh`, called from `scripts/queue-watcher.sh` once per tick, runs each script with `timeout` (`AGENT_MANAGER_PLUGIN_WATCHDOG_TIMEOUT_SECS`, default 20), sends its stderr to `<HOME_LOGS>/watchdog-plugin-<plugin>.log`, logs its FIRST stdout line as `[watchdog] <plugin>:<script>: <line>`, and logs a failure or timeout once without stopping the tick or the scripts after it. `AGENT_MANAGER_PLUGIN_WATCHDOG_SCRIPTS=off` disables it. With no plugin declaring scripts a tick pays one extra node start (about 40 ms measured).
+- A script must do ONE cheap edge check (compare a stored sha or file stats) and return fast. Anything slow starts a detached, lock-protected singleton (`scripts/lib/start-singleton-bg.sh`), the way the proactive decompose sweep does.
+- This is an interim hook. The event that would make a script unnecessary is the queue-events journal (ADR-0024 S1, not built yet); a script should count every change it finds without an event so that gap stays measurable.
 
 ## Reserving a GPU and showing the job (optional)
 
@@ -285,3 +374,29 @@ Write `instances/worker-<name>.json` in the pipeline dir (e.g. `worker-kaggle-p4
 - `arch-import-fetch.js` stays in core: it's a repo-search harness loaded unconditionally
   by `local-draft.js` / `adhoc-harness-draft.js` and shared with non-hygiene self-audit
   sources — not a task source.
+
+## Enforced public surface
+
+Plugins may import from the agent-manager checkout only what this document names (plus
+everything under `src/sdk/`). That is enforced, not advisory:
+
+- `scripts/plugin-import-boundary.json` holds the data: `publicModules` (derived from the
+  `src/*.js`, `src/lib/*.js` and `src/sdk/*.js` modules this document names, regenerated by
+  `node scripts/check-plugin-imports.js --init`) and a frozen `allowlist` of today's
+  violations, keyed `plugin:file:module`.
+- `scripts/check-plugin-imports.js` scans the plugin repos listed in `plugins.json` for
+  `require('agent-manager/src/<module>')` of anything that is neither public nor allowlisted.
+- `src/plugin-import-boundary.test.js` runs the checker (fixture tests always; the real-repo
+  test skips with a message when `plugins.json` or a sibling plugin repo is absent, because
+  CI for this repo does not have them).
+- **The allowlist only shrinks.** `--shrink` drops entries that no longer occur; only `--init`
+  adds entries. Today it holds 16 distinct core modules for `agent-manager-hygiene` and 9 for
+  `agent-manager-hub-tasks`; `agent-manager-pipeline-ops`, `agent-manager-context-ops` and
+  `pf-loops` import nothing outside the public surface through this form.
+- A new non-public import fails the test: promote the module into the SDK (when two or more
+  plugins need it) or move the code into the plugin. Growing the surface means naming the
+  module in this document and re-running `--init` in the same change.
+
+`src/no-plugin-source-names.test.js` applies the same ratchet to `python/dashboard/**/*.py`:
+the hygiene-owned task-source names may appear in no more places than its frozen
+`PYTHON_FROZEN_HITS` map allows (comments and docstrings excluded).

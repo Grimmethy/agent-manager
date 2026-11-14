@@ -1,0 +1,180 @@
+{
+  "version": 1,
+  "repo": "agent-manager",
+  "findings": [
+    {
+      "signature": "38f32c66054260801f211f15f5ae958bd48e132c",
+      "path": "python/dashboard/app_settings_helpers.py",
+      "kind": "sleep-loop",
+      "language": "py"
+    },
+    {
+      "signature": "55342b636a0f7ca97a710eb99abf9e1d56426164",
+      "path": "python/dashboard/app_source_plugin_helpers.py",
+      "kind": "sleep-loop",
+      "language": "py"
+    },
+    {
+      "signature": "70cea6ec7743e5953c4bdce30bb270e0ab1f3447",
+      "path": "python/dashboard/routes/internal_chat.py",
+      "kind": "sleep-loop",
+      "language": "py"
+    },
+    {
+      "signature": "6f534f2441f06b263b617238312ea0a34b73e776",
+      "path": "python/dashboard/single_flight_lock.py",
+      "kind": "sleep-loop",
+      "language": "py"
+    },
+    {
+      "signature": "9cfbc0ea599ade3ee297cb490bacfce83aa728be",
+      "path": "python/dashboard/static/js/brain-dump-and-second-brain.js",
+      "kind": "set-interval",
+      "language": "js"
+    },
+    {
+      "signature": "710c89bd20532836b3cd17fa04820e0dd0ed35e1",
+      "path": "python/dashboard/static/js/branches-joblist-hardware-tabs.js",
+      "kind": "set-interval",
+      "language": "js"
+    },
+    {
+      "signature": "95db432c678aa47af8b9f4adbd44b3d131893c11",
+      "path": "python/dashboard/static/js/hygiene-tab.js",
+      "kind": "set-interval",
+      "language": "js"
+    },
+    {
+      "signature": "9187975e0d24b3621665f5710936e8d594576d21",
+      "path": "python/dashboard/static/js/project-tab.js",
+      "kind": "set-interval",
+      "language": "js"
+    },
+    {
+      "signature": "c07010f3d66b80c55782aae8d2bac652270f6e29",
+      "path": "python/dashboard/static/js/task-detail-modal.js",
+      "kind": "set-interval",
+      "language": "js"
+    },
+    {
+      "signature": "3dcf14aca8725ade4722c0f9947f3d1583eac12e",
+      "path": "python/dashboard/templates/index.html",
+      "kind": "set-interval",
+      "language": "js"
+    },
+    {
+      "signature": "97c03b0a5d29b03699f6e819cdaa196399aaf874",
+      "path": "python/dashboard/templates/index.html",
+      "kind": "set-interval",
+      "language": "js"
+    },
+    {
+      "signature": "d41fe19b30bd9c0d6ca86671bfd195e878d901d9",
+      "path": "python/visualize_assets/autosave-positions.js",
+      "kind": "set-interval",
+      "language": "js"
+    },
+    {
+      "signature": "ddfbf798b790865dc31c165cfc41945e489f2475",
+      "path": "scripts/agent-manager-common.sh",
+      "kind": "sleep-loop",
+      "language": "sh"
+    },
+    {
+      "signature": "67c334d5037232bc4eb39e08c3c069c68f953e61",
+      "path": "scripts/gpu-arbiter-cli.js",
+      "kind": "set-interval",
+      "language": "js"
+    },
+    {
+      "signature": "0af77f64591ad9e81e41087f124b23a2508a859a",
+      "path": "scripts/local-worker.sh",
+      "kind": "sleep-loop",
+      "language": "sh"
+    },
+    {
+      "signature": "574ad3de3268eb4990b9460040c66e912648d1a0",
+      "path": "scripts/local-worker.sh",
+      "kind": "sleep-loop",
+      "language": "sh"
+    },
+    {
+      "signature": "a6e84c4937cbd13253291dcde2b03fcd1614c333",
+      "path": "scripts/local-worker.sh",
+      "kind": "sleep-loop",
+      "language": "sh"
+    },
+    {
+      "signature": "d1a4f46757604b01a8436532fc4c30240b76e31e",
+      "path": "scripts/p40-vm-memory/controller.js",
+      "kind": "self-rearming-timeout",
+      "language": "js"
+    },
+    {
+      "signature": "b8321b27f068fd651db27cdc6c5141817d333674",
+      "path": "scripts/p40-vm-memory/measure.js",
+      "kind": "self-rearming-timeout",
+      "language": "js"
+    },
+    {
+      "signature": "83e36372f53033a53ecb32f61f327108f0169fe7",
+      "path": "scripts/queue-watcher.sh",
+      "kind": "sleep-loop",
+      "language": "sh"
+    },
+    {
+      "signature": "2bb0842cbded5e646afe6b30c902b46c1d65f182",
+      "path": "scripts/review-runner.sh",
+      "kind": "sleep-loop",
+      "language": "sh"
+    },
+    {
+      "signature": "44339d1eef83b483efd1acebe7647ee58fbbddda",
+      "path": "scripts/review-runner.sh",
+      "kind": "sleep-loop",
+      "language": "sh"
+    },
+    {
+      "signature": "9c95af962a33fc59835dd055904fbb6e35505529",
+      "path": "scripts/review-runner.sh",
+      "kind": "sleep-loop",
+      "language": "sh"
+    },
+    {
+      "signature": "c6775f7d47ee98c6ea1f69fe14355ece4f1d56b0",
+      "path": "scripts/review-runner.sh",
+      "kind": "sleep-loop",
+      "language": "sh"
+    },
+    {
+      "signature": "fbb07b99d09de495cd79003a5bf5e68f71354638",
+      "path": "scripts/tailnet-gateway.js",
+      "kind": "set-interval",
+      "language": "js"
+    },
+    {
+      "signature": "73d19f9d65f4d15f08c44fd4bc5966f79d7bc519",
+      "path": "scripts/with-test-tmp.js",
+      "kind": "set-interval",
+      "language": "js"
+    },
+    {
+      "signature": "60378d7dba035cd03e336c8eb7c3e22d10e8d26f",
+      "path": "src/gpu-arbiter.js",
+      "kind": "set-interval",
+      "language": "js"
+    },
+    {
+      "signature": "689f42e2db31dcf251dc77da6fefe17819f70688",
+      "path": "src/gpu-arbiter.js",
+      "kind": "set-interval",
+      "language": "js"
+    },
+    {
+      "signature": "7991af8a750360d2e45da8c4719509f3a1b19000",
+      "path": "src/gpu-arbiter.js",
+      "kind": "set-interval",
+      "language": "js"
+    }
+  ]
+}

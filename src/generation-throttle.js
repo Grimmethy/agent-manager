@@ -65,4 +65,17 @@ function makeSourceThrottle({ inFlightPriorities, laneCount }) {
   };
 }
 
-module.exports = { liveLaneCount, generationThrottled, makeSourceThrottle };
+// The `blocked` predicate getNextTask() takes (task-selection.js), for one generation tick. Nothing is blocked while there is no backlog
+// (alreadyPending false -> undefined). With a backlog EVERY source is vetoed by makeSourceThrottle except the sources named in exemptSourceNames:
+// an exemption (adhoc waiting, a sortable brain-dump entry, a held clarification, research) exists to let ITS OWN source through, never to open the
+// whole ladder. Until 2026-10-31 any exemption removed the veto for all sources, so with a backlog 3,600 deep and one adhoc piece waiting, project_search
+// (priority 85) and deep_dive generated a fresh task every worker tick (1,196 identical project_search tasks piled up between 2026-10-20 and 10-23).
+// inFlightPriorities: rank priority of every task in pending/ + drafting/ (Infinity for an unresolvable one).
+function makeGenerationBlocker({ alreadyPending, exemptSourceNames = [], inFlightPriorities = [], laneCount = 1 }) {
+  if (!alreadyPending) return undefined;
+  const exempt = new Set(exemptSourceNames);
+  const veto = makeSourceThrottle({ inFlightPriorities, laneCount });
+  return (source) => !exempt.has(source && source.name) && veto(source && source.priority);
+}
+
+module.exports = { liveLaneCount, generationThrottled, makeSourceThrottle, makeGenerationBlocker };

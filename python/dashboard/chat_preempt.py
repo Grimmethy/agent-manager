@@ -281,7 +281,7 @@ def _kill_and_requeue_instance(instance_id: str, note: str) -> dict:
     return {"killed": True, "taskId": task_id}
 
 
-def _arbiter_cancel_below(cls: str = "interactive") -> list:
+def _arbiter_cancel_below(cls: str = "interactive", key: str = None) -> list:
     """Ask the GPU arbiter (src/gpu-arbiter.js, via its CLI) to cancel every ticket below
     `cls` on the CHAT'S OWN GPU (`--local`: the endpoint the chat talks to, i.e. the host
     GPU / worker-3090) -- never the P40 lane, which is a different endpoint and stays in
@@ -289,7 +289,10 @@ def _arbiter_cancel_below(cls: str = "interactive") -> list:
     should remain in action"). The arbiter marks each cancelRequested and SIGKILLs any
     active holder; the worker daemon requeues its task. Before this it keyed by MODEL NAME
     while worker tickets are keyed by endpoint, so it found nothing and the chat never took
-    over any lane. Best-effort."""
+    over any lane. Best-effort.
+
+    `key` (2026-10-23, Grimmethy: chat may run on a card other than the 3090): cancel on that endpoint key (ollama-<host>-<port>) instead of
+    --local. Only the chat-card picker (chat_card.py) supplies it, and only for the card the reply actually runs on."""
     from app import ENV_FILE_PATH, PACKAGE_ROOT, read_env_file
     import json
     cli = PACKAGE_ROOT / "scripts" / "gpu-arbiter-cli.js"
@@ -297,7 +300,7 @@ def _arbiter_cancel_below(cls: str = "interactive") -> list:
         return []
     try:
         cp = subprocess.run(
-            ["node", str(cli), "cancel-below", "--local", "--cls", cls],
+            ["node", str(cli), "cancel-below", *(["--key", key] if key else ["--local"]), "--cls", cls],
             capture_output=True, text=True, timeout=15,
             env={**os.environ, **read_env_file(ENV_FILE_PATH)},
         )
@@ -309,8 +312,38 @@ def _arbiter_cancel_below(cls: str = "interactive") -> list:
         return []
 
 
-def _preempt_pipeline_for_chat() -> list:
-    """Free the local model for a chat turn. Worker draft lanes go through the GPU arbiter
+def _arbiter_busy_rows(summary: list) -> list:
+    """Rows for a holder that is STILL on the chat's own GPU after the preempt: the arbiter's `status --local` names a holder that the cancel did not
+    kill (2026-10-25: a chat turn waited ~12 minutes behind worker-3090 while the event said only 'freed reviewer', so nothing told the operator the
+    GPU was not free). Row shape {lane: <holder class>, action: 'busy', taskId, phase, ageSeconds: None}. Best-effort like the cancel: any failure -> []."""
+    from app import ENV_FILE_PATH, PACKAGE_ROOT, read_env_file
+    import json
+    cli = PACKAGE_ROOT / "scripts" / "gpu-arbiter-cli.js"
+    if not cli.is_file():
+        return []
+    try:
+        cp = subprocess.run(
+            ["node", str(cli), "status", "--local"],
+            capture_output=True, text=True, timeout=15,
+            env={**os.environ, **read_env_file(ENV_FILE_PATH)},
+        )
+        holder = (json.loads((cp.stdout or "{}").strip() or "{}") or {}).get("holder")
+        if not holder:
+            return []
+        killed = {r.get("taskId") for r in (summary or []) if r.get("action") == "killed" and r.get("taskId")}
+        if holder.get("taskId") and holder.get("taskId") in killed:
+            return []
+        return [{"lane": holder.get("cls"), "action": "busy", "taskId": holder.get("taskId"),
+                 "phase": holder.get("phase"), "ageSeconds": None}]
+    except Exception as e:  # noqa: BLE001 -- best-effort, never block a chat turn
+        print(f"[chat-preempt] arbiter status failed (non-fatal): {e}", file=sys.stderr, flush=True)
+        return []
+
+
+def _preempt_pipeline_for_chat(card: dict = None) -> list:
+    """Free the local model for a chat turn. `card` is chat_card.resolve_chat_card's choice for this turn: a blocked choice preempts nothing, a
+    choice on another card cancels only that card's lane draft (by its arbiter key) and leaves the host lane running, and the host card (or no
+    card) takes the path below unchanged. The reviewer of another card's lane is not touched. Worker draft lanes go through the GPU arbiter
     now -- one cancel-below call. The reviewer is not on the arbiter yet, so it keeps the
     age-gated legacy kill below. Best-effort throughout. Returns [{lane, action, taskId,
     ageSeconds}]."""
@@ -321,6 +354,12 @@ def _preempt_pipeline_for_chat() -> list:
     qdir = queue_dir()
     if not inst_dir or not inst_dir.is_dir():
         return []
+
+    if card is not None:
+        if card.get("blocked") or not card.get("lane"):
+            return []
+        if not card.get("local"):
+            return _arbiter_cancel_below("interactive", key=card.get("lockKey")) if card.get("lockKey") else []
 
     summary = _arbiter_cancel_below("interactive")
 
@@ -416,4 +455,5 @@ def _preempt_pipeline_for_chat() -> list:
                       file=sys.stderr, flush=True)
         except Exception as e:  # noqa: BLE001 -- best-effort, never block the chat turn
             print(f"[chat-preempt] {lane}: skipped ({e})", file=sys.stderr, flush=True)
+    summary.extend(_arbiter_busy_rows(summary))
     return summary

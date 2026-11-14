@@ -1,0 +1,138 @@
+# MechanicsForge Data Schema
+# Defines the structure for game mechanics, their parameters, and composition rules.
+# Used by MechanicsForge to validate and serialize game mechanic definitions.
+
+mechanic:
+  name:
+    type: string
+    required: true
+    description: Human-readable mechanic identifier (e.g. "fireball", "shield_wall").
+  type:
+    type: string
+    required: true
+    description: >
+      High-level mechanic category.
+      Allowed values: "damage", "heal", "buff", "debuff", "status", "utility", "resource", "movement".
+  parameters:
+    type: object
+    required: true
+    additionalProperties:
+      type: string
+    description: >
+      Free-form key-value pairs describing mechanic-specific configuration.
+      Keys are identifiers (e.g. "power", "duration", "target_count");
+      values are string representations of their values (e.g. "100", "5", "3").
+  balance_weight:
+    type: number
+    required: true
+    minimum: 0
+    description: >
+      Relative power/cost weight used by balance systems.
+      Higher values indicate more impactful (or costly) mechanics.
+      0 < weight <= 10 is the typical range.
+  description:
+    type: string
+    required: false
+    description: Free-text summary of what the mechanic does.
+  tags:
+    type: array
+    items:
+      type: string
+    required: false
+    description: Optional categorization tags (e.g. "aoe", "pve", "pvp").
+  composition:
+    $ref: "#/definitions/composition_rule"
+    description: Rules governing how this mechanic combines with others.
+
+definitions:
+  composition_rule:
+    mode:
+      type: string
+      required: true
+      description: >
+        How this mechanic combines with others in a composition.
+        Allowed values: "stack", "chain", "replace", "conditional", "exclusive".
+    triggers:
+      type: array
+      items:
+        type: string
+      required: false
+      description: >
+        Names of other mechanics whose activation can trigger this one.
+    conditions:
+      type: array
+      items:
+        $ref: "#/definitions/condition"
+      required: false
+      description: >
+        Pre-conditions that must hold for this mechanic to be eligible in a composition.
+    modifiers:
+      type: array
+      items:
+        $ref: "#/definitions/modifier"
+      required: false
+      description: >
+        Effects this mechanic applies to other mechanics in the composition.
+    synergy_with:
+      type: array
+      items:
+        type: string
+      required: false
+      description: >
+        Names of mechanics this one synergizes with (bonus when composed together).
+    conflicts_with:
+      type: array
+      items:
+        type: string
+      required: false
+      description: >
+        Names of mechanics this one conflicts with (cannot coexist in a composition).
+
+  condition:
+    field:
+      type: string
+      required: true
+      description: Parameter or attribute field to check.
+    op:
+      type: string
+      required: true
+      description: Comparison operator (e.g. "gte", "lt", "eq", "exists").
+    value:
+      type: string
+      required: false
+      description: Value to compare against (string representation).
+
+  modifier:
+    target:
+      type: string
+      required: true
+      description: Name of the mechanic or attribute this modifier affects.
+    delta:
+      type: string
+      required: true
+      description: >
+        Numeric change to apply (string representation, e.g. "+10", "-0.5").
+    duration:
+      type: string
+      required: false
+      description: Duration in turns or seconds (string representation).
+
+# Example composition:
+#
+# mechanic:
+#   name: "fireball"
+#   type: "damage"
+#   parameters:
+#     power: "100"
+#     range: "5"
+#     aoe_radius: "2"
+#   balance_weight: 3.5
+#   composition:
+#     mode: "chain"
+#     triggers: ["ignite"]
+#     synergy_with: ["wind_gust"]
+#     conflicts_with: ["water_shield"]
+#     modifiers:
+#       - target: "burn_duration"
+#         delta: "+2"
+#         duration: "3"

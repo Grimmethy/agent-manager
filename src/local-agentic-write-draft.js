@@ -28,6 +28,7 @@ const path = require('path');
 const fs = require('fs');
 const { getConfig } = require('./config.js');
 const { runPlanWithTools, ORIENT_TURN_LIMIT, REQUEST_TIMEOUT_MS } = require('./local-tool-client.js');
+const { isForgePause } = require('./gpu-guard.js');
 const { resolveReadOnlySiblingRoots } = require('./accessible-roots.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock, formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
@@ -41,6 +42,36 @@ const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { stampTaskShape, shapeBlocksDecompose, preliminaryDecomposeDecision } = require('./task-shape.js');
+
+// Extract file paths declared in a piece's "Files:" scope lines. Used by the stale-premise
+// gate to determine which files a sub-task (or its siblings) are meant to create, so the
+// staleness check can distinguish "expected to be created" from "truly missing".
+function extractScopeFiles(task) {
+  const scopeLines = task?.promptContext?.decomposedFrom?.pieces?.[0]?.scopeLines || [];
+  const files = new Set();
+  for (const line of scopeLines) {
+    if (typeof line === 'string' && line.startsWith('Files:')) {
+      const trimmed = line.slice('Files:'.length).trim();
+      if (trimmed) files.add(trimmed);
+    }
+  }
+  return files;
+}
+
+function extractSiblingScopeFiles(decomposeCtx) {
+  const siblings = decomposeCtx?.pieces || [];
+  const files = new Set();
+  for (const sib of siblings) {
+    const scopeLines = sib?.scopeLines || [];
+    for (const line of scopeLines) {
+      if (typeof line === 'string' && line.startsWith('Files:')) {
+        const trimmed = line.slice('Files:'.length).trim();
+        if (trimmed) files.add(trimmed);
+      }
+    }
+  }
+  return files;
+}
 
 // A leaf that blows a full tier-3 budget with zero edits is auto-decomposed as a backstop
 // (the preliminary check in local-draft.js should catch most of these first). Bounded: a
@@ -182,13 +213,51 @@ function stripCodeForGate(text) {
   return String(text || '').replace(/```[\s\S]*?(?:```|$)/g, ' ').replace(/`[^`\n]*`/g, ' ');
 }
 
+// 2026-10-30 (questforge deploy-kit task, blocked twice as 'a git remote operation'): a task whose deliverables are FILES TO WRITE can describe
+// what a guide or script should SAY ("5. Docs/DEPLOY.md: ... step by step: copy the app (git clone or rsync ...)"). That is content for a file,
+// not an operation the task performs. Two signals must both hold, so a genuine instruction is never exempted: (1) the task declares files to
+// create (a `Files:` line, `WHAT: create ...`, or `create ... ONLY`), and (2) the match sits on a line that is the description of one named
+// document ("<path>.md: ..." or "guide:" at the start of the line, optionally after a list marker).
+function taskDeclaresFilesToCreate(text) {
+  return /^\s*Files:\s*\S/m.test(text) || /\bWHAT:\s*create\b/i.test(text) || /\bcreate\b[^\n]{0,300}\bONLY\b/i.test(text);
+}
+
+const DOC_DESCRIPTION_LINE_RE = /^\s*(?:[-*]\s+|\d+[.)]\s+)?(?:[`'"]?[\w./-]*\.(?:md|txt|rst|sh|service|template|example|ya?ml|json)[`'"]?|(?:the\s+)?(?:deploy\s+)?(?:guide|readme|runbook|docs?|documentation))\s*:/i;
+
+function isDocContentMention(text, matchIndex) {
+  if (!taskDeclaresFilesToCreate(text)) return false;
+  const lineStart = text.lastIndexOf('\n', matchIndex) + 1;
+  return DOC_DESCRIPTION_LINE_RE.test(text.slice(lineStart, matchIndex));
+}
+
+// 2026-10-30 (HUB0256-01, 'map git push --delete errors containing "denied"'): a marker followed by a noun that names the RESULT of the command
+// (errors, output, failures, ...) describes handling that result, not performing the operation. After the match the text may carry flags
+// (--delete, -f) and up to 3 plain words before that noun. Genuine instructions ('git push origin main after the edit', 'git push --force')
+// have no such noun and keep blocking.
+const RESULT_NOUN_RE = /^(?:\s+-{1,2}[\w-]+)*(?:\s+[\w'"-]+){0,3}?\s+(?:errors?|failures?|output|messages?|exit codes?|stderr|responses?)\b/i;
+
+function isResultHandlingMention(text, matchIndex, matchLength) {
+  return RESULT_NOUN_RE.test(text.slice(matchIndex + matchLength, matchIndex + matchLength + 80));
+}
+
+function isIgnorableMention(text, m) {
+  return isDocContentMention(text, m.index) || isResultHandlingMention(text, m.index, m[0].length);
+}
+
+function firstGenuineMatch(marker, text) {
+  const re = new RegExp(marker.re.source, marker.re.flags.includes('g') ? marker.re.flags : marker.re.flags + 'g');
+  const matches = [...text.matchAll(re)];
+  if (!matches.length || isNegatedMatch(text, matches[0].index)) return null;
+  if (!isIgnorableMention(text, matches[0])) return matches[0];
+  return matches.slice(1).find((m) => !isNegatedMatch(text, m.index) && !isIgnorableMention(text, m)) || null;
+}
+
 // Pure classifier: the first non-negated marker hit in the task's own ask, or null.
 function classifyExternalDependency(task) {
   const ctx = (task && task.promptContext) || {};
   const text = stripCodeForGate([task && task.title, ctx.rawText].filter(Boolean).join(' '));
   for (const marker of EXTERNAL_DEP_MARKERS) {
-    const match = marker.re.exec(text);
-    if (match && !isNegatedMatch(text, match.index)) return { label: marker.label, severity: marker.severity };
+    if (firstGenuineMatch(marker, text)) return { label: marker.label, severity: marker.severity };
   }
   return null;
 }
@@ -687,8 +756,18 @@ async function draftAdhocViaLocalAgenticWrite(task, {
   // attempt on a local-draft.js sub-task citing line 2178 against a file decompose #226
   // had already shrunk to 1327 lines. See detectStaleDecomposePremise's own header for
   // what this does and (importantly) does not catch.
-  const staleDecompose = detectStaleDecomposePremise(task, { repoRoot: getConfig().repoRoot });
-  if (staleDecompose) {
+  // Gates on .stale, not just truthiness: the check can also return { stale: false,
+  // suppressions: [...] } when every dismissal is recorded but nothing blocking remains
+  // (e.g. a file the task's whole point is to create).
+  // Context extraction: which files this sub-task and its siblings create, so the
+  // staleness check can distinguish "expected to be created" from "truly missing".
+  const decomposeCtx = task?.promptContext?.decomposedFrom;
+  const context = {
+    createdFiles: extractScopeFiles(task),
+    siblingCreatedFiles: extractSiblingScopeFiles(decomposeCtx),
+  };
+  const staleDecompose = detectStaleDecomposePremise(task, { repoRoot: getConfig().repoRoot, context });
+  if (staleDecompose && staleDecompose.stale) {
     return {
       succeeded: true,
       blocked: true,
@@ -782,6 +861,7 @@ async function draftAdhocViaLocalAgenticWrite(task, {
     if (giveUp) return giveUp;
     return verdict;
   } catch (e) {
+    if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (local-draft.js, local-worker.sh) -- never turn it into a failed attempt
     return { succeeded: false, reason: `local write-agentic draft failed: ${e.message}` };
   }
 }
@@ -794,4 +874,5 @@ module.exports = {
   draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS, budgetBlockEnabled, buildTimeBudgetLine,
   isLeafTask, leafDecomposeLocked, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
   detectExternalDependency, classifyExternalDependency, externalDependencyAdvisory, scopeComplexityGate, EXTERNAL_DEP_MARKERS, partialDiffFallbackPrompt,
+  isDocContentMention, taskDeclaresFilesToCreate, isResultHandlingMention,
 };

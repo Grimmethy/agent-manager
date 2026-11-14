@@ -40,8 +40,12 @@ from werkzeug.exceptions import HTTPException
 # dashboard/ -- added explicitly rather than relying on an installed package, matching
 # this whole project's no-build-step, run-from-source philosophy.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import event_stream  # noqa: E402
+import branch_git_memo  # noqa: E402
+import hub_index  # noqa: E402
 import graph_build  # noqa: E402
 from app_proactive_sweep import proactive_sweep_argv, proactive_sweep_lock_path  # noqa: E402
+from response_compression import compress_response  # noqa: E402
 import visualize_graph  # noqa: E402
 
 import plugin_process_manager
@@ -101,6 +105,8 @@ from app_catalog_helpers import (  # noqa: F401
     CONCEPT_STABLE_STATUSES,
     GHOST_CONCEPT_ID,
     _BRANCH_CACHE_TTL_SECONDS,
+    _ACTION_FETCH_REUSE_SECONDS,
+    _ACTION_FETCH_TIMEOUT_SECONDS,
     _BRANCH_FETCH_TTL_SECONDS,
     _COMMUNITY_ID_SUFFIX_RE,
     _DEEP_DIVE_ITEM_RE,
@@ -189,6 +195,7 @@ from app_branch_helpers import (  # noqa: F401
     _summarize_hub,
     _summarize_task_record,
     branch_task_ids,
+    branch_trailer_ids,
     partition_held_hub_branches,
 )
 
@@ -230,6 +237,8 @@ app = Flask(__name__)
 # here ever restarted the process. Independent of the reloader below (this one's Jinja2's
 # own cache, not Werkzeug's process-restart-on-.py-change).
 app.config["TEMPLATES_AUTO_RELOAD"] = True
+# gzip for text responses (page, static scripts, JSON, plugin proxy) -- see response_compression.py.
+app.after_request(compress_response)
 
 
 @app.errorhandler(HTTPException)
@@ -446,7 +455,7 @@ def record_project_registry_entry(repo_root: str, pipeline_dir: str, domains_pat
             "label": Path(normalized_root).name,
         }
         # applyRepoRoot is hand-set per project (see _start_pipeline) -- never let this
-        # upsert silently drop it. `pool` (docs/idle-pool-borrowing.md) is the same kind of
+        # upsert silently drop it. `pool` (docs/design-notes/idle-pool-borrowing.md) is the same kind of
         # hand-set opt-in: an idle lane may borrow work from this project; switching to the
         # project from the Project tab must not silently un-opt it.
         for k in ("applyRepoRoot", "grepDirs", "pool"):
@@ -727,40 +736,35 @@ def index():
     return render_template("index.html")
 
 
-def worker_lane_ids() -> list[str]:
-    """The pipeline's worker lane ids -- one per GPU, named for the GPU (worker-3090, worker-p40).
-    src/lanes.js is the single definition (launch.sh, the watchdog's restart rule and this list
-    all read it); shelled out to rather than re-derived here so the two languages can never drift,
-    and cached briefly because this is called from status polls. Falls back to the last good answer
-    (or a single 'worker-local') if node is unavailable."""
-    now = time.monotonic()
-    if _LANE_IDS_CACHE["ids"] and now - _LANE_IDS_CACHE["at"] < _LANE_IDS_TTL_S:
-        return list(_LANE_IDS_CACHE["ids"])
-    ids: list[str] = []
+def _lane_inputs_key():
+    """What src/lanes.js reads, as a cheap comparable value: the lanes registry file and the env file (stat keys) and the AGENT_MANAGER_* environment. While it is unchanged the cached lane
+    definitions are still right; when it changes the cache is stale (swr_cache.py) and is refreshed in the background."""
+    env = {**os.environ, **read_env_file(ENV_FILE_PATH)}
+    registry = env.get("AGENT_MANAGER_LANES_PATH") or str(SRC_DIR.parent / "lanes.json")
+
+    def stat_key(path):
+        try:
+            st = os.stat(path)
+            return (st.st_ino, st.st_size, st.st_mtime_ns)
+        except OSError:
+            return None
+    return (stat_key(registry), stat_key(ENV_FILE_PATH), hash(tuple(sorted((k, v) for k, v in env.items() if k.startswith("AGENT_MANAGER_")))))
+
+
+def _compute_lane_ids() -> list[str]:
     try:
         cp = subprocess.run(
             ["node", str(SRC_DIR / "lanes.js"), "--ids"],
             capture_output=True, text=True, timeout=5,
             env={**os.environ, **read_env_file(ENV_FILE_PATH)},
         )
-        ids = [line.strip() for line in cp.stdout.splitlines() if line.strip()]
+        return [line.strip() for line in cp.stdout.splitlines() if line.strip()]
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("could not read worker lanes from src/lanes.js: %s", exc)
-    if ids:
-        _LANE_IDS_CACHE.update(at=now, ids=ids)
-        return list(ids)
-    return list(_LANE_IDS_CACHE["ids"]) or ["worker-local"]
+        return []
 
 
-def worker_lane_defs() -> list[dict]:
-    """The pipeline's lanes as full definitions ({id, gpu, local, preempt, taskClasses, env}), in lane order.
-    Same single source as worker_lane_ids() (src/lanes.js: the host lane, the legacy P40 lane, and the lanes registry file), shelled out to
-    so the two languages cannot drift, and cached briefly. Returns the last good answer, or [] when node/lanes.js is unavailable --
-    callers must treat [] as "unknown" and fall back, never as "no lanes"."""
-    now = time.monotonic()
-    if _LANE_DEFS_CACHE["lanes"] and now - _LANE_DEFS_CACHE["at"] < _LANE_IDS_TTL_S:
-        return list(_LANE_DEFS_CACHE["lanes"])
-    lanes: list[dict] = []
+def _compute_lane_defs() -> list[dict]:
     try:
         cp = subprocess.run(
             ["node", str(SRC_DIR / "lanes.js")],
@@ -769,13 +773,29 @@ def worker_lane_defs() -> list[dict]:
         )
         parsed = json.loads(cp.stdout)
         if isinstance(parsed, list):
-            lanes = [l for l in parsed if isinstance(l, dict) and l.get("id")]
+            return [l for l in parsed if isinstance(l, dict) and l.get("id")]
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         logger.warning("could not read worker lane definitions from src/lanes.js: %s", exc)
-    if lanes:
-        _LANE_DEFS_CACHE.update(at=now, lanes=lanes)
-        return list(lanes)
-    return list(_LANE_DEFS_CACHE["lanes"])
+    return []
+
+
+def worker_lane_ids() -> list[str]:
+    """The pipeline's worker lane ids -- one per GPU, named for the GPU (worker-3090, worker-p40).
+    src/lanes.js is the single definition (launch.sh, the watchdog's restart rule and this list
+    all read it); shelled out to rather than re-derived here so the two languages can never drift.
+    Cached by what lanes.js reads, not by a clock, and refreshed in the background when that changed (swr_cache.py): a request never waits for node
+    once a value exists. Falls back to the last good answer (or a single 'worker-local') if node is unavailable."""
+    import swr_cache
+    ids = swr_cache.cached_value(_LANE_IDS_CACHE, "ids", _lane_inputs_key, _compute_lane_ids, _LANE_IDS_TTL_S)
+    return ids or ["worker-local"]
+
+
+def worker_lane_defs() -> list[dict]:
+    """The pipeline's lanes as full definitions ({id, gpu, local, preempt, taskClasses, env}), in lane order.
+    Same single source and the same cache rule as worker_lane_ids() (src/lanes.js: the host lane, the legacy P40 lane, and the lanes registry file).
+    Returns the last good answer, or [] when node/lanes.js is unavailable -- callers must treat [] as "unknown" and fall back, never as "no lanes"."""
+    import swr_cache
+    return swr_cache.cached_value(_LANE_DEFS_CACHE, "lanes", _lane_inputs_key, _compute_lane_defs, _LANE_IDS_TTL_S)
 
 
 def reviewer_instance_ids() -> list[str]:
@@ -845,7 +865,10 @@ def _scan_recently_completed_tasks(limit, before_iso=None, reviewed_only=False):
     """Scans queue/done/'s own top level (mtime-sorted, most-recent-first; NOT the dated
     queue/done/_archived/<YYYY-MM>/ or _archived_no_action/ buckets -- those hold work
     already aged out of the "recent" window this is for) for completed tasks, reading
-    each one's own real history/terminalDisposition -- NOT model_calls.
+    each one's own real history/terminalDisposition -- NOT model_calls. Also folds in
+    chat sessions (chat_sessions.py's session store, keyed by instance_id='chat') so the
+    Workers tab's completed log shows the full picture of what the pipeline has finished
+    this session, regardless of whether it was a task or a chat turn.
 
     2026-09-08, Grimmethy: "Under reviewer they're all showing approved and 5 hours ago.
     I don't think it's updating properly." Root-caused live: model_calls is the ONLY
@@ -925,7 +948,111 @@ def _scan_recently_completed_tasks(limit, before_iso=None, reviewed_only=False):
         if len(results) >= limit:
             next_cursor = mtime_iso
             break
+
+    # Chat sessions (instance_id='chat') -- also folded into the completed log so the
+    # Workers tab shows every piece of pipeline work, not just tasks. Chat sessions live
+    # in the agent-manager repo's .agent-manager-chat-sessions.json (see chat_sessions.py),
+    # keyed by session id. Each session carries startedAt/endedAt/transcript; we use the
+    # latest of those as the session's "mtime" for ordering and cursor purposes, and
+    # filter out sessions whose last activity is within the last 30s to avoid racing
+    # with an in-flight turn (a session actively being written to would show a stale
+    # snapshot and confuse the frontend).
+    _add_chat_completed_rows(results, before_ts, limit - len(results))
+
+    if len(results) >= limit and not next_cursor:
+        # Chat rows pushed us past the limit; the cursor is the oldest mtime we kept.
+        next_cursor = results[-1].get("completedAt")
     return results, next_cursor
+
+
+def _add_chat_completed_rows(results: list, before_ts, remaining_budget: int):
+    """Append chat session rows to `results`, respecting `before_ts` and `remaining_budget`.
+    Chat sessions live in the agent-manager repo's .agent-manager-chat-sessions.json
+    (see chat_sessions.py). Each session is a dict keyed by session id; we iterate every
+    session, compute a synthetic "mtime" from its latest activity, and emit a row shaped
+    like the existing done/ rows (taskId, title, source='chat', outcome='chat turn') so
+    the frontend renders them uniformly.
+
+    Sessions with last activity within the past 30s are skipped -- the chat panel is
+    still writing to them right now and a half-finished snapshot would show stale
+    content. This matches the same "don't race with active work" principle the cursor
+    rule already encodes for tasks."""
+    if remaining_budget <= 0:
+        return
+    storage_dir = PACKAGE_ROOT
+    sessions_path = storage_dir / ".agent-manager-chat-sessions.json"
+    if not sessions_path.is_file():
+        return
+    data = read_json_safe(sessions_path)
+    if not isinstance(data, dict):
+        return
+    now_ts = time.time()
+    cutoff_ts = now_ts - 30.0
+    for session_id, session in data.items():
+        if not isinstance(session, dict):
+            continue
+        # Compute the session's "last activity" timestamp.
+        last_activity = None
+        ended_at = session.get("endedAt")
+        if ended_at:
+            last_activity = _iso_to_ts(ended_at)
+        if last_activity is None:
+            started_at = session.get("startedAt")
+            if started_at:
+                last_activity = _iso_to_ts(started_at)
+        if last_activity is None:
+            continue
+        # Skip sessions still actively being written to (last activity within 30s).
+        if last_activity > cutoff_ts:
+            continue
+        if before_ts is not None and last_activity >= before_ts:
+            continue
+        transcript = session.get("transcript") or []
+        turns_used = sum(1 for t in transcript if isinstance(t, dict) and t.get("role") == "assistant")
+        # Title: first user message in the transcript, or the session id if empty.
+        title = None
+        for t in transcript:
+            if isinstance(t, dict) and t.get("role") == "user":
+                text = t.get("text") or ""
+                if text.strip():
+                    title = text.strip()[:120]
+                    break
+        if not title:
+            title = session_id
+        duration_s = None
+        started = _iso_to_ts(session.get("startedAt"))
+        ended = _iso_to_ts(session.get("endedAt"))
+        if started and ended:
+            duration_s = int(ended - started)
+        row = {
+            "taskId": session_id,
+            "title": title,
+            "source": "chat",
+            "model": session.get("model"),
+            "instanceId": "chat",
+            "completedAt": datetime.fromtimestamp(last_activity, tz=timezone.utc).isoformat(),
+            "outcome": "chat turn",
+            "session_id": session_id,
+            "duration": duration_s,
+            "turns_used": turns_used,
+        }
+        results.append(row)
+        remaining_budget -= 1
+        if remaining_budget <= 0:
+            break
+
+
+def _iso_to_ts(iso: str | None):
+    """Parse an ISO-8601 timestamp (with optional 'Z') into a float unix timestamp, or
+    None on any failure. Used to compare chat session timestamps against the mtime-based
+    cursor without round-tripping through isoformat() and losing precision."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except (ValueError, TypeError, OSError):
+        return None
 
 
 def _relocate_task_to_pending(qdir: Path, task_id: str, target_instance_id: str) -> dict:
@@ -1144,14 +1271,14 @@ def _delete_local_branch(repo_root, branch):
     return {"deleted": True, "sha": sha}
 
 
-def _record_manual_requeue(task: dict, *, reason_hint: str, requeue_writer: str, actor: str = "operator-manual"):
+def _record_manual_requeue(task: dict, *, reason_hint: str, requeue_writer: str, actor: str = "operator-manual", pipeline_dir=None):
     """Best-effort: record an operator-initiated requeue into requeue-attribution.db with
     actor='operator-manual', so the Ghost-in-the-Machine concept card can trend hand-fixes
     against pipeline-mechanism recoveries. Never raises -- a telemetry write must not turn
     a working requeue into a 500. See requeue_attribution_client.py."""
     try:
         import requeue_attribution_client
-        d = get_pipeline_dir()
+        d = Path(pipeline_dir) if pipeline_dir else get_pipeline_dir()
         requeue_attribution_client.classify_requeue(
             task,
             reason_hint=reason_hint,
@@ -1688,6 +1815,7 @@ def _run_build(path_str: str, grep_dirs: list[str]):
         log_lines.append(msg)
         with _build_lock:
             _build_state[path_str]["log"] = list(log_lines)
+        event_stream.announce("project-build-changed", path=path_str)
 
     try:
         ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -1730,10 +1858,12 @@ def _run_build(path_str: str, grep_dirs: list[str]):
 
         with _build_lock:
             _build_state[path_str]["running"] = False
+        event_stream.announce("project-build-changed", path=path_str)
     except Exception as e:
         with _build_lock:
             _build_state[path_str]["running"] = False
             _build_state[path_str]["error"] = str(e)
+        event_stream.announce("project-build-changed", path=path_str)
 
 
 def _pipeline_daemon_pids() -> list:
@@ -1945,13 +2075,43 @@ def _worker_project_info(hb: dict, active_label, active_qdir):
     return project, borrowed, qdir
 
 
+_HUB_LABEL_RE = re.compile(r"^HUB\d{4}$")
+
+
 def _find_task_record_anywhere(qdir, task_id):
     """(data, state) for a task id across every queue location a branch's task could be
     sitting in -- the QUEUE_STATES dirs, the manual + dated + superseded archives, and the
     per-worker drafting subfolders -- or (None, None). Same coverage as _task_state_index,
-    plus queue/done/_superseded/ (file-decompose re-file supersessions)."""
+    plus queue/done/_superseded/ (file-decompose re-file supersessions).
+
+    Hub-label resolution (HUB0251): when task_id matches /^HUB\\d{4}$/, resolve the label
+    via _hub_label_index scoped to the project (qdir). One hub with that label -> return
+    its record; zero -> fall through to the existing "task not found" path; two or more
+    hubs claiming the same label -> raise (defensive, labels should be unique). Exact-task-id
+    resolution is unchanged for non-hub ids."""
     if not qdir or not task_id:
         return None, None
+    if _HUB_LABEL_RE.match(task_id):
+        index = _hub_label_index(qdir)
+        # Deduplicate: the index maps id/formerId -> hub, so the same hub can appear
+        # multiple times in index.values() if it has formerIds. Only count each hub
+        # once by its canonical id.
+        seen_ids = set()
+        matching = []
+        for hub in index.values():
+            hid = hub.get("id")
+            if hub.get("hubLabel") == task_id and hid not in seen_ids:
+                matching.append(hub)
+                seen_ids.add(hid)
+        if len(matching) == 0:
+            return None, None
+        if len(matching) == 1:
+            return matching[0], "coordinating"
+        ids = [m.get("id") or "unknown" for m in matching]
+        raise ValueError(
+            f"Ambiguous hub label {task_id!r}: matches {len(matching)} hubs "
+            f"({', '.join(str(i) for i in ids)})"
+        )
     for state in QUEUE_STATES:
         d = read_json_safe(qdir / state / f"{task_id}.json")
         if d:
@@ -1983,6 +2143,9 @@ def _hub_for_branch(qdir, branch, commit_task_ids):
     in its subTasks. Returns a _summarize_hub dict or None."""
     if not qdir:
         return None
+    if hub_index.enabled():
+        hit = hub_index.lookup(qdir, branch, list(commit_task_ids or []), read_json_safe)
+        return _summarize_hub(hit[0], hit[1]) if hit else None
     task_set = set(commit_task_ids or [])
     seen = []
     coord = qdir / "coordinating"
@@ -2109,6 +2272,10 @@ def _triage_candidate_count(repo_root, main_branch, full_ref, subject, label):
 
 
 def _branch_content_already_on_main(repo_root, main_branch, full_ref):
+    return _branch_content_state(repo_root, main_branch, full_ref) is True
+
+
+def _branch_content_state(repo_root, main_branch, full_ref):
     """True when every file this branch changed (vs. where it forked from main) is byte-identical on origin/<main>: there is nothing left to merge.
 
     Why (2026-09-21): a SQUASH merge writes a new commit on main and leaves the branch's own commits unmerged by ancestry, so `rev-list main..branch` stayed >0 and
@@ -2127,43 +2294,57 @@ def _branch_content_already_on_main(repo_root, main_branch, full_ref):
         differing = _run_git(["diff", "--name-only", "-z", f"origin/{main_branch}", full_ref, "--", *changed], repo_root)
         return not any(differing.split("\0"))
     except (RuntimeError, subprocess.SubprocessError, OSError):
-        return False
+        return None      # git failed: the answer is False for the listing (the branch stays), but it is not final, so a memo must not keep it
 
 
-def _list_unmerged_branches_uncached(force_fetch=True):
-    repo_root = get_active_repo_root()
+def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_dir=None, fetch_timeout=30):
+    """The ACTIVE project's list by default. repo_root/pipeline_dir name another registered project (branch_projects.py): it always fetches (the caller owns that
+    project's timer) and leaves the active project's held-hub cache and fetch timer alone."""
+    other = repo_root is not None
+    if not other:
+        repo_root = get_active_repo_root()
+        pipeline_dir = get_pipeline_dir()
     if not repo_root:
         return []
     repo_root = Path(repo_root)
-    pipeline_dir = get_pipeline_dir()
+    if other:
+        pipeline_dir = Path(pipeline_dir) if pipeline_dir else repo_root
 
     # The fetch is the single slowest step (14-16 s measured at load 13) and moves no state a recompute depends on within a minute, so it has its own timer.
     with _branch_cache_lock:
-        fetch_due = force_fetch or (time.time() - _branch_fetch_state["at"]) >= _BRANCH_FETCH_TTL_SECONDS
+        fetch_due = other or force_fetch or (time.time() - _branch_fetch_state["at"]) >= _BRANCH_FETCH_TTL_SECONDS
     if fetch_due:
-        _run_git(["fetch", "origin", "--prune"], repo_root, timeout=30)
-        with _branch_cache_lock:
-            _branch_fetch_state["at"] = time.time()
+        _run_git(["fetch", "origin", "--prune"], repo_root, timeout=fetch_timeout)
+        if not other:
+            with _branch_cache_lock:
+                _branch_fetch_state["at"] = time.time()
     main_branch = _detect_main_branch(repo_root)
+    qdir = (pipeline_dir / "queue") if pipeline_dir else None
 
     raw = _run_git(
-        ["for-each-ref", "--format=%(refname:short)%09%(committerdate:iso-strict)%09%(subject)", "refs/remotes/origin/agent/"],
+        ["for-each-ref", "--format=%(refname:short)%09%(objectname)%09%(committerdate:iso-strict)%09%(subject)", "refs/remotes/origin/agent/"],
         repo_root,
     )
+    # The per-branch git facts below depend only on the branch head and the base head: branch_git_memo keeps them while neither moved. An unreadable base sha bypasses the memo.
+    try:
+        base_sha = _run_git(["rev-parse", "--verify", "--quiet", f"origin/{main_branch}"], repo_root).strip()
+    except (RuntimeError, subprocess.SubprocessError, OSError):
+        base_sha = ""
+    memo = branch_git_memo.get
     branches = []
     for line in raw.splitlines():
         if not line.strip():
             continue
         parts = line.split("\t")
-        if len(parts) != 3:
+        if len(parts) != 4:
             continue
-        full_ref, pushed_at, subject = parts
+        full_ref, head_sha, pushed_at, subject = parts
         branch = full_ref.removeprefix("origin/")
         task_id = branch.removeprefix("agent/")
 
         try:
-            ahead_raw = _run_git(["rev-list", "--count", f"origin/{main_branch}..{full_ref}"], repo_root)
-            ahead = int(ahead_raw.strip() or "0")
+            ahead = memo(repo_root, base_sha, head_sha, "ahead",
+                         lambda: int(_run_git(["rev-list", "--count", f"origin/{main_branch}..{full_ref}"], repo_root).strip() or "0"))
         except (RuntimeError, ValueError) as exc:
             logger.warning("Skipping branch %s: failed to compute ahead-count (%s: %s)", full_ref, type(exc).__name__, exc)
             continue
@@ -2171,22 +2352,25 @@ def _list_unmerged_branches_uncached(force_fetch=True):
             # Already fully merged (e.g. landed by hand, or a stale ref pending prune on
             # the remote) -- nothing for a human to act on, would just be clutter here.
             continue
-        if _branch_content_already_on_main(repo_root, main_branch, full_ref):
+        if memo(repo_root, base_sha, head_sha, "squashed", lambda: _branch_content_state(repo_root, main_branch, full_ref), final=lambda v: v is not None) is True:
             # Landed by SQUASH (or an identical hand-applied change): the commits are "ahead" by ancestry but there is nothing left to merge.
             continue
 
         try:
-            behind_raw = _run_git(["rev-list", "--count", f"{full_ref}..origin/{main_branch}"], repo_root)
-            behind = int(behind_raw.strip() or "0")
+            behind = memo(repo_root, base_sha, head_sha, "behind",
+                          lambda: int(_run_git(["rev-list", "--count", f"{full_ref}..origin/{main_branch}"], repo_root).strip() or "0"))
         except (RuntimeError, ValueError):
             behind = None
 
-        conflict = _check_merge_conflict(repo_root, main_branch, branch)
+        conflict = memo(repo_root, base_sha, head_sha, "conflict", lambda: _check_merge_conflict(repo_root, main_branch, branch), final=lambda v: v.get("checked") is True)
 
         label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
         candidate_count = _triage_candidate_count(repo_root, main_branch, full_ref, subject, label)
-        qdir = (pipeline_dir / "queue") if pipeline_dir else None
-        hub = get_hub_data_provider().hub_for_branch(qdir, branch, branch_task_ids(_run_git, repo_root, main_branch, full_ref, task_id))
+        try:
+            trailers = memo(repo_root, base_sha, head_sha, "trailers", lambda: branch_trailer_ids(_run_git, repo_root, main_branch, full_ref))
+        except (RuntimeError, subprocess.SubprocessError, OSError):
+            trailers = []
+        hub = get_hub_data_provider().hub_for_branch(qdir, branch, list(dict.fromkeys([task_id, *trailers])))
         branches.append({
             "branch": branch,
             "taskId": task_id,
@@ -2210,12 +2394,30 @@ def _list_unmerged_branches_uncached(force_fetch=True):
             "hub": hub,
         })
 
+    delta = branch_git_memo.take_delta()
+    if delta["misses"]:
+        print(f"[branches] git memo for {repo_root}: {delta['hits']} hit(s), {delta['misses']} miss(es)", file=sys.stderr)
     branches, held = partition_held_hub_branches(branches)
     with _branch_cache_lock:
-        _branch_cache["held"] = held
+        if other:
+            _branch_cache.setdefault("held_other", {})[str(repo_root)] = held
+        else:
+            _branch_cache["held"] = held
     _annotate_hub_sibling_conflicts(repo_root, branches)
     import branch_verdicts  # lazy: keeps app.py's import block untouched
-    branch_verdicts.enrich_branches_with_verdicts(queue_dir(), repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
+    branch_verdicts.enrich_branches_with_verdicts(qdir, repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
+    if other and qdir:
+        # A verdict posted for a branch this project's list did not (yet) show waits in ITS queue/pending_verdicts. The active project's list applies its own after every
+        # refresh (_store_branch_list); no one drained the others', so those verdicts never reached a card. Apply them here, after the cards carry headSha (the apply drops a
+        # verdict whose listing row has none), then enrich again so THIS refresh already returns the verdict. A held hub branch is not in `branches`: its verdict keeps waiting.
+        try:
+            import branch_verdicts_pending as bvp
+            parked = len(bvp.list_pending_verdicts(qdir))
+            bvp.apply_pending_verdicts(qdir, repo_root, lambda force=False: branches, _run_git, branch_verdicts)      # returns at once when nothing is parked
+            if len(bvp.list_pending_verdicts(qdir)) != parked:
+                branch_verdicts.enrich_branches_with_verdicts(qdir, repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
+        except Exception as exc:  # noqa: BLE001 -- listing must never fail because of a parked verdict
+            print(f"[branches] pending verdict apply for {repo_root} failed (non-fatal): {exc}", file=sys.stderr)
     branches.sort(key=lambda b: b["pushedAt"])
     return branches
 
@@ -2224,6 +2426,23 @@ def _store_branch_list(branches):
     with _branch_cache_lock:
         _branch_cache["at"] = time.time()
         _branch_cache["branches"] = branches
+        _branch_cache["filled"] = True   # a list was computed at least once: an invalidated cache still has a last good list to serve
+        fingerprint = event_stream.digest([branches, _branch_cache.get("held"), _branch_cache.get("held_other")])
+        changed = fingerprint != _branch_cache.get("digest")
+        _branch_cache["digest"] = fingerprint
+    if changed:
+        event_stream.announce("branch-list-changed", project="active")      # the Branches tab re-reads the cached list (a recompute that found nothing new says nothing)
+    # Apply any pending verdicts for branches that are now in the listing
+    try:
+        import branch_verdicts_pending as bvp
+        import branch_verdicts as bv
+        qdir = queue_dir()
+        if qdir:
+            repo_root = get_active_repo_root()
+            if repo_root:
+                bvp.apply_pending_verdicts(qdir, repo_root, list_unmerged_branches, _run_git, bv)
+    except Exception as exc:
+        print(f"[branches] pending verdict apply failed (non-fatal): {exc}", file=sys.stderr)
 
 
 def _refresh_branch_list_in_background():
@@ -2237,15 +2456,21 @@ def _refresh_branch_list_in_background():
             _branch_fetch_state["refreshing"] = False
 
 
-def list_unmerged_branches(force=False):
+def list_unmerged_branches(force=False, stale_ok=False):
     """Fresh cache -> it. force=True or no cache yet (including right after _invalidate_branch_cache) -> synchronous recompute. A STALE non-empty cache is returned
-    immediately while ONE background thread refreshes it (stale-while-revalidate): the full recompute costs ~37 s under load, longer than the tab's 30 s timeout."""
+    immediately while ONE background thread refreshes it (stale-while-revalidate): the full recompute costs ~37 s under load, longer than the tab's 30 s timeout.
+
+    stale_ok=True (the read-only listing endpoint, 2026-11-02): the request NEVER recomputes. An invalidated cache (a merge, discard or verdict just reset its
+    timestamp) still holds its last good list, which is served at once while the one background refresh runs. Before the very first list exists there is nothing to
+    serve, so that one request computes it (as before). Callers that must see their own change in the list (the verdict, merge and discard routes) keep stale_ok=False
+    and recompute."""
     with _branch_cache_lock:
         age = time.time() - _branch_cache["at"]
         have_cache = _branch_cache["at"] > 0
+        filled = bool(_branch_cache.get("filled")) or have_cache
         if not force and age < _BRANCH_CACHE_TTL_SECONDS:
             return _branch_cache["branches"]
-        if not force and have_cache:
+        if not force and (have_cache or (stale_ok and filled)):
             stale = _branch_cache["branches"]
             start_refresh = not _branch_fetch_state["refreshing"]
             if start_refresh:
@@ -2260,7 +2485,7 @@ def list_unmerged_branches(force=False):
             t.start()
         return stale
     try:
-        branches = _list_unmerged_branches_uncached(force_fetch=force)
+        branches = _list_unmerged_branches_uncached(force_fetch=force, **({"fetch_timeout": _ACTION_FETCH_TIMEOUT_SECONDS} if force else {}))
     except (RuntimeError, subprocess.SubprocessError, OSError) as e:
         # Best-effort, same "a check failing here must never block the rest of the
         # dashboard" rule as everything else that shells out in this file -- a git/network
@@ -2272,41 +2497,119 @@ def list_unmerged_branches(force=False):
     return branches
 
 
-def list_held_hub_groups():
-    """Hubs whose built children are pushed but not listed yet (see partition_held_hub_branches)."""
+def branch_list_refreshing():
+    """True while the served list is not a fresh one: a background refresh is running, the cache was invalidated, or it is older than its TTL."""
+    with _branch_cache_lock:
+        return bool(_branch_fetch_state["refreshing"]) or (time.time() - _branch_cache["at"]) >= _BRANCH_CACHE_TTL_SECONDS     # an invalidated cache (at = 0) is older than any TTL
+
+
+def list_held_hub_groups(include_other_projects=False):
+    """Hubs whose built children are pushed but not listed yet (see partition_held_hub_branches). include_other_projects adds the groups the background
+    refresh found in every other registered project, each tagged with its `project` ({label, repoRoot}); a project not scanned yet contributes nothing."""
     list_unmerged_branches(force=False)
     with _branch_cache_lock:
-        return list(_branch_cache.get("held") or [])
+        groups = list(_branch_cache.get("held") or [])
+        others = dict(_branch_cache.get("held_other") or {})
+    if include_other_projects:
+        import branch_projects  # lazy, same as the listing route
+        active_repo = get_active_repo_root()
+        # Tag the active project's own groups with its project label/repoRoot -- the
+        # Hub worker (src/hub-index.js buildIndex) requires h.project.repoRoot and drops
+        # untagged groups as "project undefined is not registered". Other projects'
+        # groups are tagged below.
+        if active_repo:
+            active_tag = branch_projects.project_tag(next(
+                (p for p in branch_projects.registered_projects(active_repo) if p["active"]),
+                None,
+            ))
+            if active_tag:
+                groups = [{**g, "project": active_tag} for g in groups]
+        for p in branch_projects.registered_projects(active_repo):
+            if not p["active"]:
+                groups.extend({**g, "project": branch_projects.project_tag(p)} for g in others.get(str(p["repoRoot"]), []))
+    return groups
 
 
-def _invalidate_branch_cache(refetch=True):
+def _invalidate_branch_cache(refetch=True, drop_branch=None):
     """Drop the cached list so the next one is recomputed synchronously. refetch=True (default: a merge/discard moved a remote ref) also forces the next recompute to
     fetch; refetch=False (a verdict was recorded, no remote ref moved) keeps the fetch timer so the recompute does not pay for another fetch."""
     with _branch_cache_lock:
         _branch_cache["at"] = 0.0
         if refetch:
             _branch_fetch_state["at"] = 0.0
+        if drop_branch:
+            # The branch that was just merged or discarded must leave the list at once, even though the full recompute now runs in the background.
+            _branch_cache["branches"] = [b for b in _branch_cache["branches"] if b.get("branch") != drop_branch]
 
 
 def _sync_live_checkout(main_branch):
+    """Fast-forward the dashboard's own checkout after a merge (see _sync_live_checkout_unguarded).
+    The merge is already on origin when this runs, so git being too slow to answer (a fetch takes ~47 s
+    at load 25) must be reported as "not synced", never raised: raising turned a merge that had landed
+    into an uncaught 500 and skipped stamping the task record."""
+    try:
+        return _sync_live_checkout_unguarded(main_branch)
+    except subprocess.TimeoutExpired as exc:
+        cmd = " ".join(str(a) for a in (exc.cmd if isinstance(exc.cmd, (list, tuple)) else [exc.cmd]))
+        return {
+            "synced": False,
+            "reason": f"git did not answer in time while syncing the dashboard checkout (`{cmd}` took longer than {exc.timeout:g} s; the machine is busy). "
+                      "The merge itself is on origin: run `git pull --ff-only` in the dashboard checkout, or merge any other branch to retry.",
+        }
+
+
+def _sync_live_checkout_unguarded(main_branch):
     """After a branch lands on the ACTIVE repo root's main, fast-forward THIS dashboard's
     own repo (PACKAGE_ROOT) to match, if it's a clone of the same remote and clean enough
     to fast-forward safely. Never force/reset here -- a dirty PACKAGE_ROOT (e.g. a
     developer's own in-progress manual edit, confirmed to happen during this same
     incident) is left alone and reported, not silently discarded; that mirrors this
-    codebase's own git-safety norms elsewhere (never auto-discard uncommitted work)."""
+    codebase's own git-safety norms elsewhere (never auto-discard uncommitted work).
+
+    Untracked files (e.g. bak backups of env/plugin files) no longer block the
+    fast-forward -- they are not tracked by git, so an incoming commit cannot
+    overwrite them. However, if an incoming commit ADDS a file at a path that
+    already exists as an untracked file, the fast-forward would fail (git refuses
+    to overwrite a working-tree file with a commit that adds the same path), so
+    we pre-check for that collision and report the offending paths."""
+    # Only check tracked modifications -- untracked files do not block a fast-forward
+    # because they are not in any commit and therefore cannot collide with incoming
+    # content (unless the incoming commit itself adds a file at that path, handled
+    # below).
     status = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=str(PACKAGE_ROOT), capture_output=True, text=True, timeout=15,
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=str(PACKAGE_ROOT), capture_output=True, text=True, timeout=15,
     )
     if status.returncode != 0:
         return {"synced": False, "reason": "PACKAGE_ROOT is not a git repo or git status failed"}
     if status.stdout.strip():
         return {"synced": False, "reason": "PACKAGE_ROOT has uncommitted local changes -- left untouched, sync it by hand"}
 
+    # Pre-check: if the incoming commits add any file that already exists as an
+    # untracked file in the working tree, git pull --ff-only will refuse to
+    # overwrite it. Report those paths so the user can resolve them.
+    head = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
+    _run_git(["fetch", "origin"], PACKAGE_ROOT, timeout=_ACTION_FETCH_TIMEOUT_SECONDS)
+    remote_ref = f"origin/{main_branch}"
+    try:
+        # name-status: lists paths with status codes (A=added, M=modified, D=deleted).
+        diff_out = _run_git(["diff", "--name-status", "--diff-filter=A", f"{head}..{remote_ref}"], PACKAGE_ROOT)
+        added_paths = {line.split(None, 1)[1].strip() for line in diff_out.strip().splitlines() if line.strip()}
+    except RuntimeError:
+        added_paths = set()
+
+    if added_paths:
+        untracked_out = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=str(PACKAGE_ROOT), capture_output=True, text=True, timeout=15,
+        )
+        untracked = {p for p in untracked_out.stdout.strip().splitlines() if p.strip()} if untracked_out.stdout.strip() else set()
+        collisions = sorted(added_paths & untracked)
+        if collisions:
+            return {"synced": False, "reason": f"untracked files block fast-forward: {', '.join(collisions)}"}
+
     try:
         before = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
-        _run_git(["fetch", "origin"], PACKAGE_ROOT)
-        _run_git(["pull", "--ff-only", "origin", main_branch], PACKAGE_ROOT)
+        _run_git(["merge", "--ff-only", remote_ref], PACKAGE_ROOT, timeout=_ACTION_FETCH_TIMEOUT_SECONDS)
         after = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
     except RuntimeError as e:
         return {"synced": False, "reason": str(e)}
@@ -2547,7 +2850,7 @@ def _resolve_plugin_root(name: str):
     return None
 
 
-# --- Manifest-driven dashboard tab (Docs/hub-tasks-extraction-plan.md section 5) --------
+# --- Manifest-driven dashboard tab (docs/design-notes/hub-tasks-extraction-plan.md section 5) --------
 # A plugins.json entry may declare a `tab` object so its own dashboard tab is served from
 # the plugin's repo instead of a hardcoded row in templates/index.html. `_validate_plugin_tab`
 # is the schema gate: callers (api_plugins_add today; the tab-bar merge and the plugin
@@ -2877,25 +3180,13 @@ def _launch_pipeline_subprocess(child_env: dict, raw_path: str, include_apply: b
         )
         return {"started": True, "repoRoot": raw_path}
 
-    creationflags = subprocess.CREATE_NEW_CONSOLE
-    scripts = [
-        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "local-worker.ps1"), "-InstanceId", "worker-1"], "Local Worker 1"),
-        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "review-runner.ps1")], "Local Review Runner"),
-        (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "queue-watchdog.ps1")], "Queue Watchdog"),
-    ]
-    if include_apply:
-        scripts.insert(2, (["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(SRC_DIR / "apply-runner.ps1")], "Apply Runner"))
-
-    for args, _label in scripts:
-        subprocess.Popen(args, env=child_env, creationflags=creationflags, cwd=str(PACKAGE_ROOT))
-
-    return {"started": True, "repoRoot": raw_path, "includeApply": include_apply, "skipPush": skip_push}
+    return {"started": False, "reason": "Windows is no longer supported: the PowerShell loops were retired; run scripts/launch.sh on Linux."}
 
 
 def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict:
     """Writes the chosen path/toggles into agent-manager.env (creating the file if it
     doesn't exist yet) and spawns the relevant loops as real, visible console windows,
-    same as launch.bat's own `start powershell.exe -NoExit ...` pattern -- shared by
+    through scripts/launch.sh -- shared by
     /api/pipeline/start and _restart_pipeline()."""
     # Pre-flight (2026-10-15): report -- and snapshot to a patch file -- uncommitted TRACKED changes in the
     # repo being entered AND the one being left, before _build_pipeline_env overwrites the active repo
@@ -2949,11 +3240,12 @@ def _restart_pipeline():
 # --- Decomposed route blueprints (file-decompose) ---
 from routes.reports import reports_bp  # noqa: E402
 from routes.concepts import concepts_bp  # noqa: E402
+from routes.touchpoints import touchpoints_bp  # noqa: E402
 from routes.second_brain import second_brain_bp  # noqa: E402
 from routes.brain_dump import brain_dump_bp  # noqa: E402
 from routes.benchmark import benchmark_bp  # noqa: E402
 from routes.trajectories import trajectories_bp  # noqa: E402
-from routes.capability import capability_bp  # noqa: E402
+from routes.capability import capability_bp; from routes.required_plugins import required_plugins_bp; from routes.triggers import triggers_bp  # noqa: E402,E702 -- one line: the file's tail functions are size-frozen
 from routes.embedded_tools import embedded_tools_bp  # noqa: E402
 from routes.hardware import hardware_bp  # noqa: E402
 from routes.claude_settings import claude_settings_bp  # noqa: E402
@@ -2961,6 +3253,7 @@ from routes.discovery import discovery_bp  # noqa: E402
 from routes.hygiene import hygiene_bp  # noqa: E402
 from routes.deep_dive import deep_dive_bp  # noqa: E402
 from routes.job_types import job_types_bp  # noqa: E402
+from routes.workflow_graph import workflow_graph_bp  # noqa: E402
 from routes.worker_models_1_more import worker_models_1_more_bp  # noqa: E402
 from routes.instances import instances_bp  # noqa: E402
 from routes.chat import chat_bp  # noqa: E402
@@ -2973,14 +3266,23 @@ from routes.branch_verdicts import branch_verdicts_bp  # noqa: E402
 from routes.plugins import plugins_bp  # noqa: E402
 from routes.task import task_bp  # noqa: E402
 from routes.shared_misc import shared_misc_bp  # noqa: E402
+from routes.cloud_meter import cloud_meter_bp  # noqa: E402
+from routes.stalled_worker import stalled_worker_bp  # noqa: E402
+from routes.verifier_worker import verifier_worker_bp  # noqa: E402
+from routes.needswork_worker import needswork_worker_bp  # noqa: E402
+from routes.pipeline_ops_workers import pipeline_ops_workers_bp  # noqa: E402
+from routes.context_worker import context_worker_bp  # noqa: E402
+from routes.event_stream import event_stream_bp  # noqa: E402
 
 app.register_blueprint(reports_bp)
+app.register_blueprint(event_stream_bp)
 app.register_blueprint(concepts_bp)
+app.register_blueprint(touchpoints_bp)
 app.register_blueprint(second_brain_bp)
 app.register_blueprint(brain_dump_bp)
 app.register_blueprint(benchmark_bp)
 app.register_blueprint(trajectories_bp)
-app.register_blueprint(capability_bp)
+app.register_blueprint(capability_bp); app.register_blueprint(required_plugins_bp); app.register_blueprint(triggers_bp)
 app.register_blueprint(embedded_tools_bp)
 app.register_blueprint(hardware_bp)
 app.register_blueprint(claude_settings_bp)
@@ -2988,6 +3290,7 @@ app.register_blueprint(discovery_bp)
 app.register_blueprint(hygiene_bp)
 app.register_blueprint(deep_dive_bp)
 app.register_blueprint(job_types_bp)
+app.register_blueprint(workflow_graph_bp)
 app.register_blueprint(worker_models_1_more_bp)
 app.register_blueprint(instances_bp)
 app.register_blueprint(chat_bp)
@@ -2998,6 +3301,12 @@ app.register_blueprint(task_anywhere_1_more_bp)
 app.register_blueprint(pipeline_1_more_bp)
 app.register_blueprint(branch_verdicts_bp)
 app.register_blueprint(plugins_bp)
+app.register_blueprint(cloud_meter_bp)
+app.register_blueprint(stalled_worker_bp)
+app.register_blueprint(verifier_worker_bp)
+app.register_blueprint(needswork_worker_bp)
+app.register_blueprint(pipeline_ops_workers_bp)
+app.register_blueprint(context_worker_bp)
 app.register_blueprint(task_bp)
 app.register_blueprint(shared_misc_bp)
 

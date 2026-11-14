@@ -9,7 +9,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { splitCoveringTiers, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS, TEST_TIMEOUT_MS } = require('./review-verify.js');
-const { addedTestNames, verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback, relinkExternalDependencies, sandboxUnresolvedDependency } = require('./review-verify.js');
+const { addedTestNames, verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback, extraCoveringMax, relinkExternalDependencies, sandboxUnresolvedDependency } = require('./review-verify.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 
 const DIFF = 'diff --git a/src/a.js b/src/a.js\n--- a/src/a.js\n+++ b/src/a.js\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/src/a.test.js b/src/a.test.js\nnew file mode 100644\n--- /dev/null\n+++ b/src/a.test.js\n@@ -0,0 +1 @@\n+z\n';
@@ -181,6 +181,53 @@ test('an exception inside verification is inconclusive and still cleans up', () 
   assert.equal(f.calls.cleanup, 1);
 });
 
+// --- checkTestPinning tests --------------------------------------------------------------------------------
+const { checkTestPinning } = require('./review-verify.js');
+
+test('checkTestPinning: test-only diff with tests passing on base returns tests-passing-on-base', () => {
+  const result = checkTestPinning({
+    srcFiles: [],
+    testFiles: ['src/a.test.js'],
+    testsPassedOnBase: true,
+    testsFailedOnBase: false,
+    rawDiff: 'diff --git a/src/a.test.js b/src/a.test.js',
+  });
+  assert.equal(result, 'tests-passing-on-base');
+});
+
+test('checkTestPinning: test-only diff with tests failing on base returns tests-failing-on-base', () => {
+  const result = checkTestPinning({
+    srcFiles: [],
+    testFiles: ['src/a.test.js'],
+    testsPassedOnBase: false,
+    testsFailedOnBase: true,
+    rawDiff: 'diff --git a/src/a.test.js b/src/a.test.js',
+  });
+  assert.equal(result, 'tests-failing-on-base');
+});
+
+test('checkTestPinning: diff with refactor in header returns header-with-keyword', () => {
+  const result = checkTestPinning({
+    srcFiles: ['src/a.js'],
+    testFiles: ['src/a.test.js'],
+    testsPassedOnBase: true,
+    testsFailedOnBase: false,
+    rawDiff: 'refactor: clean up a.js',
+  });
+  assert.equal(result, 'header-with-keyword');
+});
+
+test('checkTestPinning: diff with production changes and tests passing on base returns tests-passing-on-base', () => {
+  const result = checkTestPinning({
+    srcFiles: ['src/a.js'],
+    testFiles: ['src/a.test.js'],
+    testsPassedOnBase: true,
+    testsFailedOnBase: false,
+    rawDiff: 'diff --git a/src/a.js b/src/a.js',
+  });
+  assert.equal(result, 'tests-passing-on-base');
+});
+
 // --- real integration: real git worktree + real bwrap sandbox ------------------------------------------
 const HAVE_BWRAP = wrapWithSandbox('true', [], { workDir: '/tmp', readOnlyBinds: [], writableBinds: [], env: {} }).available;
 
@@ -304,14 +351,44 @@ test('findSymbolCoveringTests matches whole identifiers only, ranks by distinct 
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('findTestsWithSymbolFallback prefers the file-name based finder and only falls back when it finds nothing', () => {
+test('findTestsWithSymbolFallback returns the file-name tests PLUS the symbol-covering ones (capped), and only the symbol ones when there is no co-located test', () => {
   const root = makeDashTree();
   try {
     const diff = '@@ -1,2 +1,2 @@ def _build_pipeline_env():\n-    return 1\n+    return 2\n';
+    // no co-located test: the symbol finder keeps its own result, as before
     assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py'], diff).py, ['python/dashboard/test_alpha.py', 'python/dashboard/test_delta.py', 'python/dashboard/test_zeta.py']);
-    fs.writeFileSync(path.join(root, 'python/dashboard/test_app.py'), 'pass\n');     // now a co-located test exists
-    assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py'], diff).py, ['python/dashboard/test_app.py']);
+    fs.writeFileSync(path.join(root, 'python/dashboard/test_app.py'), 'pass\n');     // now a co-located test exists: it stays first, the symbol tests follow (they used to be dropped)
+    assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py'], diff).py, ['python/dashboard/test_app.py', 'python/dashboard/test_alpha.py', 'python/dashboard/test_delta.py', 'python/dashboard/test_zeta.py']);
+    // a test file the diff itself changes is never listed twice
+    assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py', 'python/dashboard/test_app.py'], diff).py.filter((f) => f === 'python/dashboard/test_app.py').length, 1);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('findTestsWithSymbolFallback caps the extra symbol tests at AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX and 0 restores the old primary-or-fallback behaviour', () => {
+  const root = makeDashTree();
+  const saved = process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX;
+  try {
+    const diff = '@@ -1,2 +1,2 @@ def _build_pipeline_env():\n-    return 1\n+    return 2\n';
+    fs.writeFileSync(path.join(root, 'python/dashboard/test_app.py'), 'pass\n');
+    // test_alpha.py does `from app import ...`, so the primary finder already returns it as an importer; delta and zeta are the symbol-only extras
+    process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX = '1';
+    assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py'], diff).py, ['python/dashboard/test_app.py', 'python/dashboard/test_alpha.py', 'python/dashboard/test_delta.py']);
+    process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX = '0';
+    assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py'], diff).py, ['python/dashboard/test_app.py', 'python/dashboard/test_alpha.py']);
+    assert.equal(extraCoveringMax({}), 6);
+    assert.equal(extraCoveringMax({ AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX: 'x' }), 6);
+    assert.equal(extraCoveringMax({ AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX: '3' }), 3);
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX; else process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX = saved;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the extras land in the DEPENDENTS tier, so a slow extra never turns the primary result inconclusive', () => {
+  const found = { js: ['src/sdk/a.test.js', 'src/other.test.js'], py: [] };
+  const tiers = splitCoveringTiers(['src/sdk/a.js'], found);
+  assert.deepEqual(tiers.primary.js, ['src/sdk/a.test.js']);
+  assert.deepEqual(tiers.dependents.js, ['src/other.test.js']);
 });
 
 const PY3 = ['/usr/bin/python3', '/usr/local/bin/python3'].find((p) => fs.existsSync(p));
@@ -887,6 +964,20 @@ test('a dependent file that also fails on the base in the sandbox is unverified,
   assert.deepEqual(r.tests.dependentsUnverified, ['src/dep.test.js']);
 });
 
+test('dependent files run one process each: one that only fails in the sandbox no longer hides a sibling that really regressed (context-trim-sweep.test.js on the red-test branch)', () => {
+  const files = ['src/a.js', 'src/a.test.js', 'src/dep1.test.js', 'src/dep2.test.js'];
+  // primary ok; dep1 fails with the diff AND on the base (sandbox only); dep2 fails with the diff but passes on the base (a real regression)
+  const run = scriptedRun([passing, failing('env only'), failing('real regression'), failing('env only'), passing]);
+  const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js', 'src/dep1.test.js', 'src/dep2.test.js'], py: [] }), prepare: baseTree(files), run });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.deepEqual(run.calls.slice(0, 3).map((c) => c.args.filter((a) => a.endsWith('.test.js'))), [['src/a.test.js'], ['src/dep1.test.js'], ['src/dep2.test.js']], 'one process per dependent file');
+  assert.equal(r.status, 'failed');
+  assert.equal(r.tests.passed, false);
+  assert.deepEqual(r.tests.failures, ['real regression']);
+  assert.deepEqual(r.tests.dependentsUnverified, ['src/dep1.test.js']);
+  assert.deepEqual(r.tests.dependents, ['src/dep1.test.js', 'src/dep2.test.js']);
+});
+
 test('a primary file that also fails on the base in the sandbox still makes the result inconclusive', () => {
   const run = scriptedRun([failing('env only'), failing('env only')]);
   const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js'], py: [] }), prepare: baseTree(TIER_FILES), run });
@@ -1279,4 +1370,41 @@ test('runSandboxed starts the command in the requested sub-directory of the work
   assert.equal(probe.output.trim(), dir);
   const inner = runSandboxed({ worktreeDir: dir, bin: 'node', args: ['-e', 'console.log(process.cwd())'], timeoutMs: 20000, pythonBin: null, mainRepoRoot: null, cwd: 'pkg/inner' });
   assert.equal(inner.output.trim(), path.join(dir, 'pkg', 'inner'));
+});
+
+// ---- Python tests under a top-level test/ directory: Python's own `test` package shadows the dotted module name ----
+
+const { pythonTestArgs } = require('./review-verify.js');
+
+test('pythonTestArgs: a single file under a top-level test/ directory runs by discovery from its own directory', () => {
+  assert.deepEqual(pythonTestArgs(['test/test_stub.py']), ['-m', 'unittest', 'discover', '-s', 'test', '-p', 'test_stub.py']);
+  assert.deepEqual(pythonTestArgs(['test/sub/test_x.py']), ['-m', 'unittest', 'discover', '-s', 'test/sub', '-p', 'test_x.py']);
+});
+
+test('pythonTestArgs: package-style and other paths keep the dotted module form', () => {
+  assert.deepEqual(pythonTestArgs(['python/dashboard/test_foo.py']), ['-m', 'unittest', 'python.dashboard.test_foo']);
+  assert.deepEqual(pythonTestArgs(['tests/test_x.py']), ['-m', 'unittest', 'tests.test_x']);
+  assert.deepEqual(pythonTestArgs(['testing/test_x.py']), ['-m', 'unittest', 'testing.test_x']);   // only the exact directory name `test` collides
+  assert.deepEqual(pythonTestArgs(['a/test_a.py', 'b/test_b.py']), ['-m', 'unittest', 'a.test_a', 'b.test_b']);
+  assert.deepEqual(pythonTestArgs([]), ['-m', 'unittest']);
+});
+
+test('pythonTestArgs: a list of several test/ files keeps the dotted form (the suites run one file per process)', () => {
+  assert.deepEqual(pythonTestArgs(['test/test_a.py', 'test/test_b.py']), ['-m', 'unittest', 'test.test_a', 'test.test_b']);
+});
+
+test('end to end: a passing test under test/ (no __init__.py) passes by discovery, and the dotted name does not', () => {
+  const { spawnSync } = require('child_process');
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'py-test-dir-'));
+  try {
+    fs.mkdirSync(path.join(repo, 'test'));
+    fs.writeFileSync(path.join(repo, 'test', 'test_ok.py'), 'import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n\nif __name__ == "__main__":\n    unittest.main()\n');
+    const run = (args) => spawnSync('python3', args, { cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: '1' } });
+    const byDiscovery = run(pythonTestArgs(['test/test_ok.py']));
+    assert.equal(byDiscovery.status, 0, byDiscovery.stderr);
+    assert.match(byDiscovery.stderr, /Ran 1 test/);
+    const dotted = run(['-m', 'unittest', 'test.test_ok']);   // what the gate used to run
+    assert.notEqual(dotted.status, 0);
+    assert.match(dotted.stderr, /No module named/);
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
 });

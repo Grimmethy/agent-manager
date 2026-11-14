@@ -58,6 +58,17 @@ const LIVE_FETCH_MAX_CHARS_PER_FILE = 4000;
 const { extractRequestObjectTokens } = require('./request-object-tokens.js');
 const MAX_HITS_PER_OBJECT = 4;
 
+// The worklog tiers that belong to the task's current draft attempt: those whose `at` is not before the latest 'draft-started' history event. Pure.
+function tiersOfCurrentAttempt(tiers, history) {
+  const list = Array.isArray(tiers) ? tiers : [];
+  let started = NaN;
+  for (const h of Array.isArray(history) ? history : []) {
+    if (h && h.stage === 'draft-started') { const t = Date.parse(h.at); if (Number.isFinite(t) && !(t < started)) started = t; }
+  }
+  if (!Number.isFinite(started)) return list;
+  return list.filter((tier) => { const t = Date.parse(tier && tier.at); return !Number.isFinite(t) || t >= started - 1000; });
+}
+
 function buildRequestObjectGrounding(rawText) {
   const tokens = extractRequestObjectTokens(rawText);
   if (tokens.length === 0) return '';
@@ -366,7 +377,12 @@ function main() {
         const worklogPath = path.join(pipelineDir, 'queue', 'worklogs', `${task.id}.json`);
         if (fs.existsSync(worklogPath)) {
           const worklog = JSON.parse(fs.readFileSync(worklogPath, 'utf8'));
-          for (const tier of worklog.tiers || []) {
+          // Only the CURRENT draft attempt's tool output grounds this review (2026-10-23, chat plugin HUB0008-03): the worklog accumulates every tier of every
+          // attempt, so after the prerequisite was fixed (accounts.py merged) the reviewer still read the OLD attempts' real `ls: cannot access 'accounts.py'`
+          // next to the new draft's real `accounts.py`, sided with the stale failure and blocked a correct draft three times. A tier belongs to this attempt
+          // when it finished at or after the task's latest 'draft-started' event; with no such event (or an unreadable time) every tier is kept, as before.
+          const tiers = tiersOfCurrentAttempt(worklog.tiers || [], task.history);
+          for (const tier of tiers) {
             for (const call of tier.calls || []) {
               if (call.resultPreview) parts.push(String(call.resultPreview));
             }
@@ -425,7 +441,7 @@ function main() {
   process.stdout.write(parts.join('\n\n'));
 }
 
-module.exports = { extractLiveRepoGrounding, refreshFetchedFileContent, extractRequestObjectTokens, buildRequestObjectGrounding, main };
+module.exports = { tiersOfCurrentAttempt, extractLiveRepoGrounding, refreshFetchedFileContent, extractRequestObjectTokens, buildRequestObjectGrounding, main };
 
 if (require.main === module) {
   main();

@@ -5,9 +5,8 @@ let currentBranches = [];
 let currentHeldHubs = [];
 
 async function fetchHeldHubs() {
-  try { return await fetchJson('/api/git/held-hub-branches', { timeoutMs: 30000 }); } catch (e) { return []; }
+  try { return await fetchJson('/api/git/held-hub-branches?projects=all', { timeoutMs: 30000 }); } catch (e) { return []; }
 }
-let branchesPollTimer = null;
 
 function branchCardHtml(b) {
   // willConflict is a git merge-tree preview (app.py's _check_merge_conflict) -- a
@@ -42,12 +41,14 @@ function branchCardHtml(b) {
       ? `<span class="badge bad" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Hub ${escapeAttr(b.hub.id)}: ${b.hub.progress.done}/${b.hub.progress.total} done${b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : ''} -- click to open the hub">⚠ hub mid-flight</span>`
       : `<span class="badge ok" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Coordinator hub complete -- click to open the hub">✓ hub complete</span>`)
     : '';
+  const foreign = !branchIsActiveProject(b);
   return `
-    <div class="worker-card" data-branch-row="${escapeAttr(b.branch)}" data-open-branch="${escapeAttr(b.branch)}" data-verdict-key="${branchVerdictKey(b)}" style="cursor:pointer;${branchVerdictBorderStyle(b)}">
+    <div class="worker-card" data-branch-row="${escapeAttr(branchRowKey(b))}" data-open-branch="${escapeAttr(branchRowKey(b))}" data-verdict-key="${branchVerdictKey(b)}" style="cursor:pointer;${branchVerdictBorderStyle(b)}">
+      ${b.project ? `<div style="margin-bottom:8px">${branchProjectChipHtml(b)}</div>` : ''}
       <div class="row">
         <span class="id">${escapeHtmlBright(b.title)}</span>
         <div class="badge-col">
-          ${hubBadge}
+          ${foreign ? hubBadge.replace(/ data-open-hub="[^"]*"/, '').replace('cursor:pointer', 'cursor:default') : hubBadge}
           ${conflictBadge}
           <span class="badge warn">${b.ahead} commit${b.ahead === 1 ? '' : 's'} ahead</span>
           ${behindBadge}
@@ -60,11 +61,11 @@ function branchCardHtml(b) {
         ${!b.matchedTaskState ? ' · <span title="No matching queue/ task file found -- label is the branch\'s own last commit subject.">no task record found</span>' : ''}
         ${b.matchedTaskState === 'task-log' ? ' · <span title="No live queue/ record exists for this task anymore -- this came from the git-tracked task-logs/ file apply-task.js committed alongside the change, so it survives archival.">from committed task log</span>' : ''}
       </div>
-      ${b.description ? `<div style="margin-top:6px;font-size:13px;color:var(--text)">${escapeHtml(b.description)}</div>` : ''}
-      <div class="meta" style="font-family:monospace;font-size:11px;margin-top:4px">${escapeHtml(b.branch)}</div>
+      ${b.description ? `<div style="margin-top:8px;font-size:14px;color:var(--text)">${escapeHtml(b.description)}</div>` : ''}
+      <div class="meta" style="font-family:monospace;font-size:12px;margin-top:4px">${escapeHtml(b.branch)}</div>
       <div class="row" style="margin-top:8px">
-        <button class="action" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}" data-hub-midflight="${hubMidFlight === true}" data-hub-status="${escapeAttr(b.hub ? b.hub.progress.done + '/' + b.hub.progress.total + ' done' + (b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : '') : '')}">Merge to ${escapeHtml(b.mainBranch)}</button>
-        <button class="secondary" data-discard-branch="${escapeAttr(b.branch)}" title="Permanently delete this remote branch and archive its task -- for a branch you've decided NOT to merge.">Discard</button>
+        <button class="action" data-project="${escapeAttr(branchProjectRequestRoot(b))}" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}" data-hub-midflight="${hubMidFlight === true}" data-hub-status="${escapeAttr(b.hub ? b.hub.progress.done + '/' + b.hub.progress.total + ' done' + (b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : '') : '')}">Merge to ${escapeHtml(b.mainBranch)}</button>
+        <button class="secondary" data-project="${escapeAttr(branchProjectRequestRoot(b))}" data-discard-branch="${escapeAttr(b.branch)}" title="Permanently delete this remote branch and archive its task -- for a branch you've decided NOT to merge.">Discard</button>
       </div>
     </div>
   `;
@@ -73,6 +74,18 @@ function branchCardHtml(b) {
 // Wires one card's own click handlers -- called both after a full rebuild (every card)
 // and after appending a single new card during a background poll (just that one), so a
 // poll never has to re-wire cards that were already working.
+// What to tell the owner after a merge that SUCCEEDED but left something undone (the dashboard's own checkout could not be fast-forwarded,
+// or a record could not be stamped). '' when everything went through. The merge is on origin either way; never word it as a failure.
+function mergeNoticeText(result) {
+  const parts = [];
+  const sync = result && result.liveSync;
+  if (sync && sync.synced === false && sync.reason) parts.push(sync.reason);
+  for (const w of (result && Array.isArray(result.warnings)) ? result.warnings : []) {
+    if (w && !parts.includes(w)) parts.push(w);
+  }
+  return parts.length ? 'Merged, but not everything finished:\n\n' + parts.join('\n\n') : '';
+}
+
 function wireBranchCard(card) {
   card.onclick = (e) => {
     // Don't hijack the Merge/Discard buttons' own clicks -- each has its own handler
@@ -81,7 +94,7 @@ function wireBranchCard(card) {
     // DIFFERENT task's detail (the hub, not this branch), so it must win over the
     // row's own "open this branch's detail" click.
     if (e.target.closest('[data-merge-branch]') || e.target.closest('[data-discard-branch]') || e.target.closest('[data-open-hub]')) return;
-    const b = currentBranches.find((x) => x.branch === card.dataset.openBranch);
+    const b = currentBranches.find((x) => branchRowKey(x) === card.dataset.openBranch);
     if (b) renderBranchDetailModal(b);
   };
 
@@ -98,23 +111,26 @@ function wireBranchCard(card) {
     mergeBtn.onclick = async (e) => {
       e.stopPropagation();
       const branch = mergeBtn.dataset.mergeBranch;
+      const project = mergeBtn.dataset.project || '';
       const midFlight = mergeBtn.dataset.hubMidflight === 'true';
       const confirmMsg = mergeBtn.dataset.willConflict === 'true'
         ? `"${branch}" is flagged as WILL CONFLICT with master on: ${mergeBtn.dataset.conflictFiles}.\n\nThe merge will very likely fail and need manual resolution. Attempt it anyway?`
         : midFlight
           ? `"${branch}" belongs to a coordinator hub that is NOT finished (${mergeBtn.dataset.hubStatus}).\n\nMerging now ships an incomplete decomposition -- the moved routes will 404 until the wiring task lands. Force the merge anyway?`
           : `Merge "${branch}" into master and sync the live dashboard?`;
-      if (!confirm(confirmMsg)) return;
+      if (!confirm(branchConfirmWithProject(confirmMsg, mergeBtn))) return;
       mergeBtn.disabled = true;
       mergeBtn.textContent = 'Merging...';
       try {
-        const resp = await fetch(`/api/git/branches/${encodeURIComponent(branch)}/merge`, {
+        const resp = await fetch(branchActionUrl(branch, 'merge', project), {
           method: 'POST',
           headers: midFlight ? { 'Content-Type': 'application/json' } : {},
           body: midFlight ? JSON.stringify({ force: true }) : undefined,
         });
         const result = await resp.json();
         if (!resp.ok || !result.succeeded) throw new Error(result.reason || `HTTP ${resp.status}`);
+        const notice = mergeNoticeText(result);
+        if (notice) alert(notice);
         if (result.liveSync && result.liveSync.restartTriggered) {
           mergeBtn.textContent = 'Merged -- dashboard reloading...';
           // Werkzeug's reloader restart is near-instant but not synchronous with this
@@ -141,11 +157,12 @@ function wireBranchCard(card) {
     discardBtn.onclick = async (e) => {
       e.stopPropagation();
       const branch = discardBtn.dataset.discardBranch;
-      if (!confirm(`Discard "${branch}"?\n\nThis PERMANENTLY DELETES the remote branch (not just merging it later) and archives its task as dismissed. This cannot be undone from here.`)) return;
+      const project = discardBtn.dataset.project || '';
+      if (!confirm(branchConfirmWithProject(`Discard "${branch}"?\n\nThis PERMANENTLY DELETES the remote branch (not just merging it later) and archives its task as dismissed. This cannot be undone from here.`, discardBtn))) return;
       discardBtn.disabled = true;
       discardBtn.textContent = 'Discarding...';
       try {
-        const resp = await fetch(`/api/git/branches/${encodeURIComponent(branch)}/discard`, { method: 'POST' });
+        const resp = await fetch(branchActionUrl(branch, 'discard', project), { method: 'POST' });
         const result = await resp.json();
         if (!resp.ok || !result.succeeded) throw new Error(result.reason || `HTTP ${resp.status}`);
         await renderBranchesTab();
@@ -174,7 +191,7 @@ async function renderBranchesTab() {
     // out after 8s" instead of the list. 30s matches the server's own per-subprocess
     // timeout (_run_git/_check_merge_conflict both use 30s) as the floor for how long a
     // single one of those git calls is allowed to legitimately take.
-    branches = await fetchJson('/api/git/unmerged-branches', { timeoutMs: 30000 });
+    branches = await fetchBranchList();
   } catch (e) {
     main.innerHTML = `<div class="empty">Error loading branches: ${escapeHtml(e.message)}</div>`;
     return;
@@ -193,16 +210,8 @@ async function renderBranchesTab() {
 // started here instead of picked up by refresh()'s renderMain() dispatch.
 async function enterBranchesTab() {
   await renderBranchesTab();
-  if (branchesPollTimer) clearInterval(branchesPollTimer);
-  // 15s, not 5s: this route is already the expensive one (server-side git work scales
-  // with branch count, confirmed 9s+ with a modest 17 branches) -- polling it as often
-  // as the old blind 5s cycle did was a real part of why fetches piled up and the tab
-  // kept showing "timed out" instead of settling.
-  branchesPollTimer = setInterval(refreshBranchesTab, 15000);
-}
-
-function leaveBranchesTab() {
-  if (branchesPollTimer) { clearInterval(branchesPollTimer); branchesPollTimer = null; }
+  // No timer: this route is the expensive one (server-side git work scales with branch count), so the list is re-read when the server says it changed
+  // (branch-list-changed) and the server is asked to look when something that feeds the list happened (counts-changed, branches-changed; see live-updates.js).
 }
 
 // The actual fix for "the reset needs to stop happening": a background poll now only
@@ -213,11 +222,11 @@ function leaveBranchesTab() {
 // replacing it with an error banner. The full renderBranchesTab() (tab entry, and after
 // a deliberate merge/discard) is untouched and still shows a real error if IT fails --
 // there's nothing yet on screen worth preserving at that point.
-async function refreshBranchesTab() {
+async function refreshBranchesTab({ kick = false } = {}) {
   if (activeTab !== 'branches') return;
   let branches;
   try {
-    branches = await fetchJson('/api/git/unmerged-branches', { timeoutMs: 30000 });
+    branches = await fetchBranchList({ kick });
   } catch (e) {
     console.warn('[branches] background refresh failed (non-fatal, keeping current list):', e.message);
     return;
@@ -240,28 +249,37 @@ async function refreshBranchesTab() {
     return;
   }
 
-  const seen = new Set();
-  for (const b of filterBranchesByVerdict(branches, branchVerdictFilter)) {
-    seen.add(b.branch);
-    const existing = main.querySelector(`[data-branch-row="${CSS.escape(b.branch)}"]`);
-    // Already on screen -- leave it (see header comment), unless its verdict bucket changed: then swap the card so the border/badge update.
-    if (existing && existing.dataset.verdictKey === branchVerdictKey(b)) continue;
-    if (existing) existing.remove();
-    const wrapper = document.createElement('div');
-    wrapper.innerHTML = branchCardHtml(b);
-    const card = wrapper.firstElementChild;
-    main.appendChild(card);
-    wireBranchCard(card);
+  const shown = filterBranchesByVerdict(branches, branchVerdictFilter);
+  const onScreen = new Set([...main.querySelectorAll('[data-branch-row]')].map((c) => c.dataset.branchRow));
+  const wanted = new Set(shown.map(branchRowKey));
+  const membershipChanged = onScreen.size !== wanted.size || [...wanted].some((k) => !onScreen.has(k));
+  const pendingNow = main.querySelector('[data-projects-pending]') !== null;
+  const refreshingNow = main.querySelector('[data-list-refreshing]') !== null;
+  if (membershipChanged || pendingNow !== (branchProjectsPending.length > 0) || refreshingNow !== !!branchListRefreshing) {
+    // A card appeared or went away (or the "still scanning" note changed): rebuild, keeping the scroll position. Project headers sit between the cards, so
+    // appending a lone card (the old behaviour) would land it under the wrong project.
+    const y = window.scrollY;
+    currentBranches = branches;
+    currentHeldHubs = await fetchHeldHubs();
+    renderBranchListInto(main, branches);
+    window.scrollTo(0, y);
+    return;
   }
-  main.querySelectorAll('[data-branch-row]').forEach((card) => {
-    if (!seen.has(card.dataset.branchRow)) card.remove();
-  });
+  for (const b of shown) {
+    const existing = main.querySelector(`[data-branch-row="${CSS.escape(branchRowKey(b))}"]`);
+    // Already on screen -- leave it (see header comment), unless its verdict bucket changed: then swap the card so the border/badge update.
+    if (existing && existing.dataset.verdictKey !== branchVerdictKey(b)) {
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = branchCardHtml(b);
+      const card = wrapper.firstElementChild;
+      existing.replaceWith(card);
+      wireBranchCard(card);
+    }
+  }
   currentBranches = branches;
-  refreshBranchVerdictFilterBar(main, branches);
   currentHeldHubs = await fetchHeldHubs();
-  const heldEl = main.querySelector('[data-held-hubs]');
-  if (heldEl) heldEl.outerHTML = heldHubsHtml(currentHeldHubs);
-  else main.insertAdjacentHTML('beforeend', heldHubsHtml(currentHeldHubs));
+  refreshBranchVerdictFilterBar(main, branches);       // the counts, including the hidden-hubs button
+  refreshHeldHubsPanel(main);
 }
 
 async function renderBranchDetailModal(b) {
@@ -274,13 +292,14 @@ async function renderBranchDetailModal(b) {
     // Same reasoning as renderBranchesTab's own fetchJson call above -- this hits
     // list_unmerged_branches(force=False) too (to resolve the hub), so it can be slow
     // for the same reason on a cold cache.
-    data = await fetchJson(`/api/git/branches/${encodeURIComponent(b.branch)}/commits`, { timeoutMs: 30000 });
+    data = await fetchJson(`/api/git/branches/${encodeURIComponent(b.branch)}/commits${branchIsActiveProject(b) ? '' : '?project=' + encodeURIComponent(b.project.repoRoot)}`, { timeoutMs: 30000 });
   } catch (e) {
     content.innerHTML = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtmlBright(b.title)}</h2><div class="meta" style="color:var(--bad)">Error loading history: ${escapeHtml(e.message)}</div>`;
     return;
   }
   let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtmlBright(b.title)}</h2>`;
-  html += `<div class="meta" style="font-family:monospace;font-size:11px">${escapeHtml(b.branch)} → ${escapeHtml(b.mainBranch)}</div>`;
+  if (b.project) html += `<div style="margin:4px 0">${branchProjectChipHtml(b)}</div>`;
+  html += `<div class="meta" style="font-family:monospace;font-size:12px">${escapeHtml(b.branch)} → ${escapeHtml(b.mainBranch)}</div>`;
   if (b.domain) html += `<div class="field-label">Domain / Source</div><div>${escapeHtml(b.domain)} / ${escapeHtml(b.source || '')}</div>`;
   if (b.description) html += `<div class="field-label">What this changes</div><div>${escapeHtml(b.description)}</div>`;
   html += branchVerdictDetailHtml(b);
@@ -295,16 +314,16 @@ async function renderBranchDetailModal(b) {
     html += `<div class="worker-card" style="margin:4px 0">`;
     const hubBuilt = p.built != null ? Math.max(p.built, p.done || 0) : (p.done || 0);
     if (!hub.readyToMerge) {
-      html += `<div class="badge bad" style="margin-bottom:6px">⚠ mid-flight — not ready to merge</div>`;
+      html += `<div class="badge bad" style="margin-bottom:8px">⚠ mid-flight — not ready to merge</div>`;
     } else if (hub.state === 'done') {
-      html += `<div class="badge ok" style="margin-bottom:6px">✓ hub complete</div>`;
+      html += `<div class="badge ok" style="margin-bottom:8px">✓ hub complete</div>`;
     } else {
-      html += `<div class="badge ok" style="margin-bottom:6px">✓ ready to merge — every piece is built</div>`;
+      html += `<div class="badge ok" style="margin-bottom:8px">✓ ready to merge — every piece is built</div>`;
     }
     html += `<div class="meta"><a href="javascript:void(0)" data-open-hub="${escapeAttr(hub.id)}" style="cursor:pointer">${escapeHtmlBright(hub.title || hub.id)}</a> · ${hubBuilt}/${p.total} built${hubBuilt > (p.done || 0) ? ` · ${p.done || 0} merged` : ''}`
       + (gate ? ` · integration gate <strong>${escapeHtml(gate)}</strong>` : '') + `</div>`;
     if (hub.blockedReason) html += `<div class="meta" style="color:var(--bad);margin-top:4px">${escapeHtmlBright(hub.blockedReason)}</div>`;
-    html += `<div class="task-history" style="margin-top:6px">` + (hub.subTasks || []).map((st) =>
+    html += `<div class="task-history" style="margin-top:8px">` + (hub.subTasks || []).map((st) =>
       `<div class="task-history-row"><span class="task-history-stage">${escapeHtmlBright(st.title || st.id)}</span> `
       + `<span class="badge ${st.status === 'done' || st.status === 'merged' ? 'ok' : st.status === 'blocked' || st.status === 'needs-clarification' ? 'bad' : ''}">${escapeHtml(st.status || '?')}</span>`
       + (st.heldFor ? ` <span class="meta" title="Held until this earlier piece of the hub lands on main">held: waiting for an earlier piece (${escapeHtml(st.heldFor.status || '?')})</span>` : '') + `</div>`
@@ -333,23 +352,24 @@ async function renderBranchDetailModal(b) {
       // task's REAL pipeline log (plan → implement tiers → review votes → disposition).
       if (c.task) {
         const t = c.task;
-        row += `<div class="meta" style="margin-top:2px">task <code>${escapeHtml(t.id)}</code> · ${escapeHtml(t.state || '?')}`
+        row += `<div class="meta" style="margin-top:4px">task <code>${escapeHtml(t.id)}</code> · ${escapeHtml(t.state || '?')}`
           + (t.terminalDisposition ? ` · ${escapeHtml(t.terminalDisposition)}` : '')
           + (t.reviewVotes ? ` · review ${escapeHtml(t.reviewVotes)}` : '') + `</div>`;
         if (t.description) row += `<div style="font-size:12px;margin-top:4px">${escapeHtml(t.description)}</div>`;
-        row += `<div class="task-history" style="margin-top:6px">` + (t.history || []).map((e) => {
+        row += `<div class="task-history" style="margin-top:8px">` + (t.history || []).map((e) => {
           const eWhen = e.at ? new Date(e.at).toLocaleTimeString() : '';
           return `<div class="task-history-row"><span class="task-history-stage">${escapeHtml(e.stage || '?')}</span> `
             + `<span class="meta">${escapeHtml(eWhen)}</span>`
             + (e.detail ? ` <span style="font-size:12px">${escapeHtml(e.detail)}</span>` : '') + `</div>`;
         }).join('') + `</div>`;
       } else {
-        if (c.taskId) row += `<div class="meta" style="margin-top:2px">task <code>${escapeHtml(c.taskId)}</code> — no queue record found</div>`;
+        if (c.taskId) row += `<div class="meta" style="margin-top:4px">task <code>${escapeHtml(c.taskId)}</code> — no queue record found</div>`;
         if (c.body) row += `<pre>${escapeHtml(c.body)}</pre>`;
       }
       return row + `</div>`;
     }).join('');
   }
+  if (!branchIsActiveProject(b)) html = html.replace(/ data-open-hub="[^"]*"/g, '');  // that hub lives in another project's queue
   content.innerHTML = html;
   content.querySelectorAll('[data-open-hub]').forEach((el) => {
     el.onclick = (e) => {
@@ -426,7 +446,7 @@ async function renderJobListTab() {
   const backboneHtml = mapAvailable ? `
     <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px;">
       ${PIPELINE_STAGE_ORDER.map((stage) => `
-        <div style="flex:1; min-width:110px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px; text-align:center;">
+        <div style="flex:1; min-width:110px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px; text-align:center;">
           <div style="font-size:22px; font-weight:700; color:${stageTotals[stage] > 0 ? 'var(--accent)' : 'var(--muted)'};">${stageTotals[stage]}</div>
           <div class="meta">${PIPELINE_STAGE_LABELS[stage]}</div>
         </div>
@@ -579,7 +599,7 @@ async function renderJobListTab() {
       <td>${headerPriorityCell}</td>
       <td colspan="10">
         <button type="button" class="fam-toggle" data-family="${escapeAttr(item.key)}"
-          style="background:none;border:none;color:inherit;cursor:pointer;font:inherit;padding:0 6px 0 0">${collapsed ? '▶' : '▼'}</button>
+          style="background:none;border:none;color:inherit;cursor:pointer;font:inherit;padding:0 8px 0 0">${collapsed ? '▶' : '▼'}</button>
         <b>${escapeHtml(item.label)}</b>
         <span class="meta"> — ${item.members.length} sources · ${spread}</span>
       </td>
@@ -601,14 +621,14 @@ async function renderJobListTab() {
   // rather than auto-generated.
   const detailInsetsHtml = mapAvailable ? `
     <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:24px;">
-      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px;">
+      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:16px;">
         <div style="font-weight:600; margin-bottom:8px;">Adhoc draft (domain:'adhoc', source:'manual')</div>
         <div class="meta" style="line-height:1.7;">
           A single local multi-turn agentic pass, <b>local-agentic-write</b> (local-agentic-write-draft.js) — real read/grep/glob/edit/write/run_bash tool access against an isolated worktree. No Claude tier, and no cheaper escalation tiers ahead of it: those existed 2026-09-01 through 2026-09-06, removed after real production history showed the cheap tiers won only ~11% of the time combined while costing the other ~89% their full time for nothing, and a safety audit found no incident of this pass's write access producing a bad edit a cheaper read-only tier would have caught. Declines (blocks for a human) if it can't confidently make the change.<br>
           Can resolve to <b>decompose</b> (task judged too large — queues 2+ fresh adhoc sub-tasks to <code>queue/adhoc/</code> instead of a diff) or <b>needs-human-decision</b> (routes to <code>queue/needs-clarification/</code>, never judged by an automatic reviewer).
         </div>
       </div>
-      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px;">
+      <div style="flex:1; min-width:320px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:16px;">
         <div style="font-weight:600; margin-bottom:8px;">Split escape hatch (candidate-fulfillment sources — see "split-capable" badge)</div>
         <div class="meta" style="line-height:1.7;">
           Implement can output <code>{"mode":"split","candidates":[...]}</code> instead of a diff when the real candidate genuinely doesn't fit one atomic JSON edit (prompts.js's candidateSplitInstructions). Skips critique (no diff to critique) and goes straight to review, judged on scope-coverage rather than "does it contain code." At apply time, the sub-candidates are written back into the <i>same</i> candidates doc the original came from (the exact appender arch_discovery's own apply already uses) — each one then flows through the normal pickup loop on a later tick, small enough to land as its own single edit.
@@ -618,9 +638,9 @@ async function renderJobListTab() {
   ` : '';
 
   if (isStale()) return;
-  main.innerHTML = `<div style="margin-bottom:10px"><button id="reset-job-type-counts" class="secondary">Reset counts</button></div>`
+  main.innerHTML = `<div style="margin-bottom:8px"><button id="reset-job-type-counts" class="secondary">Reset counts</button></div>`
     + backboneHtml
-    + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Behavior</th><th>Live (in-flight)</th><th title="Min / Avg / Max turnsUsed across every recorded runPlanWithTools() call for this source">Turns (min/avg/max)</th><th>Times Performed</th><th>Available</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`
+    + `<div class="table-scroll"><table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Behavior</th><th>Live (in-flight)</th><th title="Min / Avg / Max turnsUsed across every recorded runPlanWithTools() call for this source">Turns (min/avg/max)</th><th>Times Performed</th><th>Available</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table></div>`
     + unregisteredHtml
     + detailInsetsHtml;
 
@@ -864,7 +884,7 @@ function renderWatchConfigChecklist(watchConfig) {
     </label>`).join('');
   return `
     <div class="field-label">Watching</div>
-    <div style="margin-bottom:10px;">${items}</div>
+    <div style="margin-bottom:8px;">${items}</div>
     <div class="meta" style="margin-bottom:14px;">Unchecked categories stop being measured
       each tick (not just hidden here) -- on a CPU-constrained box, checking only CPU
       skips the plugin's own expensive probe call entirely.</div>`;
@@ -1032,7 +1052,7 @@ async function renderMain() {
     else if (activeTab === 'discovery') await renderDiscoveryTab();
     else if (activeTab === 'branches') await renderBranchesTab();
     else if (activeTab === 'reports') await renderReportsTab();
-    else if (activeTab === 'tokenfold') await renderTokenfoldTab();
+    else if (activeTab === 'tokenfold') await renderTokenfoldTab(); else if (activeTab === 'triggers') await renderTriggersTab();
     else if (activeTab === 'promptforge') await renderPromptForgeTab();
     else if (activeTab === 'adforge') await renderAdForgeTab();
     else if (activeTab === 'scriptforge') await renderScriptForgeTab();
@@ -1056,43 +1076,111 @@ async function renderMain() {
 // tab whose render takes longer than 5s would be superseded every time and never paint.
 function refresh() { return runRefreshGuarded(refreshCycle); }
 
-async function refreshCycle() {
+// Header chip for host-memory pressure (model in core-ui.js memoryChipModel). Shown only while the broker reports tight/critical; the owner-only "Unload Ollama"
+// button appears only when the broker says the action is enabled, and disappears for the session if the broker answers 403/404.
+let memoryUnloadHidden = false;
+function renderMemoryChip(memory) {
+  const el = document.getElementById('memory-chip');
+  if (!el) return;
+  const model = memoryChipModel(memory);
+  if (!model.visible) { el.hidden = true; el.className = ''; el.textContent = ''; el.title = ''; return; }
+  el.hidden = false;
+  el.className = model.className;
+  el.title = model.title;
+  el.textContent = model.text;
+  if (model.canUnload && !memoryUnloadHidden) {
+    const btn = document.createElement('button');
+    btn.className = 'action';
+    btn.style.marginLeft = '8px';
+    btn.textContent = 'Unload Ollama';
+    btn.title = 'Owner action: unload the Ollama models held on the GPU (nothing does this automatically)';
+    btn.onclick = unloadOllamaFromChip;
+    el.appendChild(btn);
+  }
+}
+
+async function unloadOllamaFromChip() {
+  if (!window.confirm('Unload the Ollama models? Running generations that use them will have to reload.')) return;
+  try {
+    const r = await fetch('/api/memory/unload-ollama', { method: 'POST' });
+    if (r.status === 403 || r.status === 404) { memoryUnloadHidden = true; renderMemoryChip(counts && counts.memory); return; }
+    const body = await r.json().catch(() => ({}));
+    const el = document.getElementById('memory-chip');
+    if (el) el.title = r.ok ? `Unloaded: ${(body.unloaded || []).join(', ') || 'nothing was loaded'}` : `Unload failed: ${body.error || r.status}`;
+  } catch (e) {
+    const el = document.getElementById('memory-chip');
+    if (el) el.title = `Unload failed: ${e.message}`;
+  }
+}
+
+// The page's refresh, in the parts the live updates (live-updates.js) ask for one at a time. refreshCycle() below is all of them in order: the page-load refresh, the
+// action-triggered refreshes and the fallback poll when the event stream is unavailable.
+async function refreshSummary() {
   try {
     counts = await fetchJson('/api/summary');
     document.getElementById('pipeline-status').textContent = 'connected';
+    renderMemoryChip(counts.memory);
   } catch (e) {
     document.getElementById('pipeline-status').textContent = 'disconnected';
   }
-  // Re-sync plugin-declared tabs every cycle (piece 5; Docs/hub-tasks-extraction-plan.md
-  // section 5) so a plugin toggled off/removed from elsewhere (another browser tab, a
-  // pipeline restart, a hand-edited plugins.json) drops its nav row promptly instead of
-  // only at next page load. If the row the user is currently looking at is the one that
-  // just vanished, redirectFromGoneActiveTab() runs the full leave/enter transition to a
-  // safe fallback tab itself (via switchToTab) -- in that case skip the render calls below,
-  // which would otherwise double-render on top of what the redirect already did.
+}
+
+// Re-sync plugin-declared tabs (piece 5; docs/design-notes/hub-tasks-extraction-plan.md section 5) so a plugin toggled off/removed from elsewhere drops its nav row promptly instead of
+// only at next page load. -> true when the tab the user was looking at vanished and redirectFromGoneActiveTab() already did the full leave/enter transition to a safe
+// fallback tab: the caller must then skip its own render calls, which would double-render on top of that.
+async function refreshPluginTabs() {
   await syncPluginTabs();
-  if (redirectFromGoneActiveTab()) return;
+  return redirectFromGoneActiveTab();
+}
+
+// Project and Brain Dump tabs manage their own rendering (enter*Tab/leave*Tab) so a user's in-progress folder browsing or a half-typed capture note isn't wiped out by a
+// generic redraw; promptforge / adforge / scriptforge are embedded iframes that a redraw would reload out from under the user's inputs; concepts, filed and branches lost
+// clicks to a mid-click rebuild (branches also has its own diffing refresh, refreshBranchesTab). The list is SELF_RENDERING_TABS in live-updates.js.
+async function refreshMain() {
+  if (!isSelfRenderingTab(activeTab)) await renderMain();
+}
+
+async function refreshCycle() {
+  await refreshSummary();
+  if (await refreshPluginTabs()) return;
   renderNav();
-  // Project and Brain Dump tabs manage their own rendering (enter*Tab/leave*Tab) so a
-  // user's in-progress folder browsing or a half-typed capture note isn't wiped out by
-  // this generic 5s cycle -- only the nav badge counts above still update while open.
-  // promptforge / adforge / scriptforge are embedded iframes -- re-running
-  // renderMain() every 5s would rebuild them and reload the app out from under the
-  // user's inputs, same reason project / brain-dump opt out here.
-  // concepts (2026-09-06): confirmed live -- a "View timeline" click could lose the
-  // race against this same 5s cycle rebuilding the tab's DOM via innerHTML mid-click,
-  // silently discarding the interaction with no error. Same class of bug Brain Dump's
-  // own opt-out already exists to prevent; re-entering the tab still re-fetches once.
-  // filed (2026-09-14): same reasoning as brain-dump's own opt-out just above -- a
-  // suppress/prioritize/delete click mid-flight (button disabled, awaiting its fetch)
-  // shouldn't get its DOM silently rebuilt out from under it by this 5s cycle.
-  // branches (2026-09-15): same class of bug again, plus its own wrinkle -- the route
-  // behind this tab is the slow one (server-side git work scales with branch count,
-  // 9s+ measured with just 17), so this blind 5s full-teardown cycle was firing a fresh
-  // request before the last one had even resolved, and replacing the whole list with a
-  // "timed out" error on every miss. enterBranchesTab()/leaveBranchesTab() now run
-  // their own 15s poll that diffs in new/removed branches instead of rebuilding.
-  if (!['project', 'brain-dump', 'filed', 'hygiene', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'].includes(activeTab)) await renderMain();
+  await refreshMain();
+}
+
+// What the event stream asked for (a plan from planForEvent), in the same order refreshCycle uses.
+async function applyLivePlan(plan) {
+  if (plan.summary) await refreshSummary();
+  if (plan.plugins && await refreshPluginTabs()) return;
+  if (plan.nav) renderNav();
+  if (plan.main) await refreshMain();
+  if (plan.branches && typeof refreshBranchesTab === 'function') await refreshBranchesTab({ kick: !!plan.kick });
+  if (plan.panels) await refreshActiveTabPanels();
+  if (plan.modal && typeof refreshTaskDetailModal === 'function') await refreshTaskDetailModal();
+  if (plan.touchpoints && typeof refreshTouchpointsChip === 'function') await refreshTouchpointsChip();
+}
+
+// The open self-rendering tab's own panel refreshers (it is never redrawn whole): the Project tab's pipeline and status panels, the Brain Dump tab's entry list (unforced: it skips an open edit or discussion), the Hygiene tab's inventory (quiet: no spinner; its own in-flight guard drops an overlapping load).
+async function refreshActiveTabPanels() {
+  if (activeTab === 'project' && typeof refreshPipelineStatus === 'function') {
+    await refreshPipelineStatus();
+    if (typeof refreshProjectStatus === 'function') await refreshProjectStatus();
+  } else if (activeTab === 'brain-dump' && typeof refreshBrainDumpEntries === 'function') {
+    await refreshBrainDumpEntries();
+  } else if (activeTab === 'hygiene' && typeof loadHygiene === 'function') {
+    await loadHygiene({ quiet: true });
+  }
+}
+
+function startPageLiveUpdates() {
+  return startLiveUpdates({
+    EventSource: typeof EventSource !== 'undefined' ? EventSource : null,
+    apply: (plan) => runRefreshGuarded(() => applyLivePlan(plan)),
+    poll: async () => { await refresh(); await refreshActiveTabPanels(); if (typeof refreshTaskDetailModal === 'function') await refreshTaskDetailModal(); },     // the closed-stream fallback also keeps the open tab's panels current
+    getTab: () => activeTab,
+    isPluginTab: (tab) => { const t = typeof findTabByKey === 'function' ? findTabByKey(tab) : null; return !!(t && t.pluginScript); },
+    pluginNameOf: (tab) => { const t = typeof findTabByKey === 'function' ? findTabByKey(tab) : null; return (t && t.pluginScript && typeof t.pluginName === 'string') ? t.pluginName : null; },
+    setStatus: (text) => { document.getElementById('pipeline-status').textContent = text; },
+  });
 }
 
 function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }
