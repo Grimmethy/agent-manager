@@ -32,6 +32,7 @@ const {
 } = require('./forensic-bundle.js');
 const { readWorkLog } = require('./work-log.js');
 const { isNoopApplyDetail, lastAppliedEvent } = require('./task-disposition.js');
+const { joinContextOutcomes } = require('./context-outcomes.js');
 
 // Did this done/ task actually ship real terminal work, or was it a no-op (empty/
 // degenerate implement, "no candidates -- nothing to apply", a false-positive dismissal)?
@@ -59,6 +60,11 @@ function splitWindowByShipped(windowTasks) {
 }
 
 const DEFAULT_BUDGET_CHARS = 28000;
+// The context-effectiveness section (2026-11-05, piece P3 of the context-impact loop): plain counts from joinContextOutcomes over the SAME window, so the report's
+// "So What" pass can cite them. Bounded on purpose: assembleText only knows the forensic drop tags, so the debrief's real size protection is the final hard
+// truncation, and a bigger section would squeeze out the COMPLETED and CONTRAST evidence behind it.
+const MAX_CONTEXT_SECTION_CHARS = 1600;
+const MAX_CONTEXT_STRATA = 4;
 // A debrief over 3-4 done tasks is just re-litigating one task's own history -- not a
 // pattern. This floor matches pipeline_forensics's own CLARIFICATION_CLUSTER_THRESHOLD-style
 // "confident it's systemic" reasoning, sized a bit larger since done/ accumulates faster
@@ -184,9 +190,39 @@ function renderFraming(shippedTasks, noopCount, contrastRecords, windowStart, wi
   ].filter((l) => l !== undefined).join('\n');
 }
 
+function renderCell(c) {
+  if (!c) return '-';
+  if (c.insufficient) return `insufficient(n=${c.n})`;
+  return `n=${c.n} first-pass=${c.approvedFirstPass} stuck=${c.blockedOrNeedsClarification} median-stages=${c.medianHistoryStages}`;
+}
+
+// Plain-count rendering of a joinContextOutcomes report, or null when no task in the window carries a stamp (the section is then ABSENT, not an error).
+// Descriptive only: it states the caveats the report carries and never a conclusion.
+function renderContextEffectiveness(report, maxChars = MAX_CONTEXT_SECTION_CHARS) {
+  if (!report || !report.counts || !report.counts.stamped) return null;
+  const c = report.counts;
+  const lines = [
+    'CONTEXT EFFECTIVENESS (descriptive counts from the context provenance stamp, same window as above; NOT an estimate of any effect):',
+    `tasks in window: shipped ${c.shipped}, stuck ${c.blocked + c.needsClarification}; stamped ${c.stamped}, unstamped ${c.unstamped}; a cell under ${report.minCellN} tasks reports insufficient.`,
+  ];
+  const sources = Object.entries(report.strata || {}).filter(([, v]) => v.stamped > 0)
+    .sort((a, b) => b[1].stamped - a[1].stamped || a[0].localeCompare(b[0])).slice(0, MAX_CONTEXT_STRATA);
+  for (const [source, v] of sources) {
+    lines.push(`${source}: stamped ${v.stamped}, stuck ${v.stuck}, unstamped baseline ${renderCell(v.unstamped)}`);
+    for (const [feature, buckets] of Object.entries(v.cells || {})) {
+      const parts = Object.entries(buckets).map(([b, cell]) => `${b}: ${renderCell(cell)}`);
+      if (parts.length) lines.push(`  ${feature} -- ${parts.join(' | ')}`);
+    }
+  }
+  lines.push(`caveats: ${(report.caveats || []).join('; ')}`);
+  const text = lines.join('\n');
+  const marker = '\n...[context section truncated]';
+  return text.length <= maxChars ? text : `${text.slice(0, Math.max(0, maxChars - marker.length))}${marker}`;
+}
+
 function buildDebriefBundle({
   pipelineDir, dbPath, sinceIso, now = Date.now(), maxWindow = MAX_WINDOW_TASKS,
-  maxContrast = MAX_CONTRAST_TASKS, budgetChars = DEFAULT_BUDGET_CHARS,
+  maxContrast = MAX_CONTRAST_TASKS, budgetChars = DEFAULT_BUDGET_CHARS, joinFn = joinContextOutcomes,
 } = {}) {
   const windowTasks = collectDoneWindow(pipelineDir, sinceIso, maxWindow);
   if (windowTasks.length < MIN_WINDOW_TASKS) {
@@ -204,6 +240,19 @@ function buildDebriefBundle({
   const windowStart = terminalTs(windowTasks[0]);
   const windowEnd = terminalTs(windowTasks[windowTasks.length - 1]);
 
+  // Context effectiveness: the SAME window (its first and last terminal time). Optional evidence: a failure leaves the section out, never fails the bundle.
+  let contextSection = null;
+  let contextStamped = 0;
+  try {
+    const startMs = Date.parse(windowStart);
+    const endMs = Date.parse(windowEnd);
+    if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
+      const report = joinFn({ pipelineDir, sinceMs: endMs - startMs, nowMs: endMs, untilMs: endMs });
+      contextStamped = (report && report.counts && report.counts.stamped) || 0;
+      contextSection = renderContextEffectiveness(report);
+    }
+  } catch (e) { contextSection = null; }
+
   const subjectIds = shippedTasks.map((t) => t.id);
   const taskIds = windowTasks.map((t) => t.id); // archive-on-confirm blast radius: the whole window
   const contrastIds = contrastRecords.map((r) => r.task.id);
@@ -218,6 +267,7 @@ function buildDebriefBundle({
   const sections = [
     { text: renderFraming(shippedTasks, noopTasks.length, contrastRecords, windowStart, windowEnd) },
   ];
+  if (contextSection) sections.push({ text: contextSection, dropTag: 'contextEffectiveness' });
   shippedTasks.forEach((task, i) => {
     sections.push({
       text: gatherEvidenceForTask({ task, state: 'done' }, worklogById.get(task.id), callsById.get(task.id), { label: `COMPLETED ${i + 1}` }),
@@ -251,6 +301,8 @@ function buildDebriefBundle({
       worklogs: worklogById.size,
       droppedForBudget: dropped,
       chars: text.length,
+      contextStamped,
+      contextSectionChars: contextSection ? contextSection.length : 0,
     },
   };
 }
@@ -261,7 +313,10 @@ module.exports = {
   MAX_CONTRAST_TASKS,
   DEFAULT_BUDGET_CHARS,
   ROUTING_ADVICE_CAVEAT,
+  MAX_CONTEXT_SECTION_CHARS,
+  MAX_CONTEXT_STRATA,
   renderFraming,
+  renderContextEffectiveness,
   collectDoneWindow,
   collectContrastTasks,
   buildDebriefBundle,

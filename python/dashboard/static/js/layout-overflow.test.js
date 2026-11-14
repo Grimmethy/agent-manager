@@ -1,6 +1,6 @@
 'use strict';
 
-// Dashboard columns, 2026-10-25: nav (200px) + main + the 380px chat sidebar must always fit the window. A flex item's default min-width:auto kept
+// Dashboard columns, 2026-10-25: nav (232px) + main + the 380px chat sidebar must always fit the window. A flex item's default min-width:auto kept
 // main at its widest child (the Project tab's 802px visualization iframe, 842px with padding), so at a 1366px window the page was 1422px wide, scrolled
 // sideways and clipped the sidebar's right edge. main now gives way (min-width:0) and scrolls wide content inside itself. Pure text checks on
 // templates/index.html.
@@ -52,7 +52,7 @@ test('main (outside the phone media query) can shrink and scrolls wide content i
 });
 
 test('the side columns keep their fixed width and refuse to shrink, so main is the column that gives way', () => {
-  assert.match(baseRule('nav') || '', /width:\s*200px/);
+  assert.match(baseRule('nav') || '', /width:\s*232px/);
   assert.match(baseRule('nav') || '', /flex-shrink:\s*0/);
   assert.match(baseRule('.plugin-sidebar') || '', /width:\s*380px/);
   assert.match(baseRule('.plugin-sidebar') || '', /flex-shrink:\s*0/);

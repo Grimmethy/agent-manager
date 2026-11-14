@@ -10,6 +10,12 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
+// hasPremium reads its stage directories through the RAM cache (queue-cache.js). Keep this file's cache files, and those of the CLI processes it spawns,
+// out of the real /dev/shm location.
+const CACHE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'pool-projects-cache-'));
+process.env.AGENT_MANAGER_QUEUE_CACHE_DIR = CACHE_ROOT;
+process.on('exit', () => { try { fs.rmSync(CACHE_ROOT, { recursive: true, force: true }); } catch (_) { /* best-effort */ } });
+
 const { poolProjects, poolEnvFor, poolEnvArgs, markBorrowed, enabled } = require('./pool-projects.js');
 const { sharedInstancesDir } = require('./instances-dir.js');
 
@@ -115,6 +121,7 @@ test('CLI: --list prints the pool as JSON, --env-args prints one env token per l
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
   fs.copyFileSync(script, path.join(dir, 'src', 'pool-projects.js'));
   fs.copyFileSync(path.join(__dirname, 'hub-prerequisites.js'), path.join(dir, 'src', 'hub-prerequisites.js'));   // pool-projects.js requires it
+  fs.copyFileSync(path.join(__dirname, 'queue-cache.js'), path.join(dir, 'src', 'queue-cache.js'));   // and so does hasPremium's cache
   fs.copyFileSync(fx.projectsPath, path.join(dir, 'projects.json'));
   const run = (...args) => execFileSync('node', [path.join(dir, 'src', 'pool-projects.js'), ...args], { env, encoding: 'utf8' });
   const list = JSON.parse(run('--list'));
@@ -257,7 +264,7 @@ test('CLI: --env-args resolves a non-pool project, --has-premium exits 0/1, --pr
   delete env.AGENT_MANAGER_PREMIUM_REACH;
   const dir = path.join(fx.root, 'pkg');
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
-  for (const f of ['pool-projects.js', 'pipeline-history.js', 'hub-prerequisites.js']) fs.copyFileSync(path.join(__dirname, f), path.join(dir, 'src', f));
+  for (const f of ['pool-projects.js', 'pipeline-history.js', 'hub-prerequisites.js', 'queue-cache.js']) fs.copyFileSync(path.join(__dirname, f), path.join(dir, 'src', f));
   fs.copyFileSync(fx.projectsPath, path.join(dir, 'projects.json'));
   const cli = path.join(dir, 'src', 'pool-projects.js');
   const run = (...args) => execFileSync('node', [cli, ...args], { env, encoding: 'utf8' });
@@ -409,4 +416,290 @@ test('premiumProjects: gated home premium tasks no longer hide other repos\' cla
   writeTask(home.pipelineDir, 'done', 'HUB0024-03', { id: 'HUB0024-03', mergedAt: '2026-10-25T00:00:00Z' });
   fs.rmSync(path.join(home.pipelineDir, 'queue', 'blocked', 'HUB0024-03.json'));
   assert.equal(hasPremium(home.pipelineDir, { role: 'worker', lane: 'worker-3090' }), true, 'once HUB0024-04 is claimable the home project wins the tie again');
+});
+
+// --- hasPremium reads its stage directories through the RAM cache (queue-cache.js) ---------------------------------------------------------------
+
+const withCacheEnv = (name, value, fn) => {
+  const prev = process.env[name];
+  process.env[name] = value;
+  try { return fn(); } finally { if (prev === undefined) delete process.env[name]; else process.env[name] = prev; }
+};
+
+// Every directory under queue/ made an hour old: a directory untouched for a while is what lets the cache's fast path apply from the second call on
+// (a freshly changed directory is always re-scanned).
+const ageQueueDirs = (pipelineDir) => {
+  const old = new Date(Date.now() - 3600 * 1000);
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) if (e.isDirectory()) walk(path.join(dir, e.name));
+    fs.utimesSync(dir, old, old);
+  };
+  walk(path.join(pipelineDir, 'queue'));
+};
+
+const askBoth = (pipe, role = 'worker', lane = 'worker-a') => [
+  hasPremium(pipe, { role, lane }),
+  withCacheEnv('AGENT_MANAGER_QUEUE_CACHE', 'false', () => hasPremium(pipe, { role, lane })),
+  hasPremium(pipe, { role, lane }),
+];
+
+test('hasPremium gives the expected answer, with the cache on (cold and cached) and off, for each shape of queue', () => {
+  const cases = [];
+  const fresh = () => { const fx = fixture([{ name: 'p' }]); return fx.list[0].pipelineDir; };
+  { const pipe = fresh(); cases.push(['an empty queue', pipe, false]); }
+  { const pipe = fresh(); writeTask(pipe, 'pending', 'plain', { id: 'plain', premiumPriority: false }); cases.push(['only non-premium tasks', pipe, false]); }
+  { const pipe = fresh(); writeTask(pipe, 'pending', 'hot', { id: 'hot', premiumPriority: true }); cases.push(['a premium task in pending', pipe, true]); }
+  { const pipe = fresh(); writeTask(pipe, 'adhoc', 'held', { id: 'held', premiumPriority: true, dependsOn: ['missing-dep'] }); cases.push(['a premium adhoc task held by an unmet dependency', pipe, false]); }
+  { const pipe = fresh(); fs.mkdirSync(path.join(pipe, 'queue', 'pending'), { recursive: true }); fs.writeFileSync(path.join(pipe, 'queue', 'pending', 'bad.json'), '{ not json'); cases.push(['a corrupt file only', pipe, false]); }
+  { const pipe = fresh(); fs.mkdirSync(path.join(pipe, 'queue', 'pending'), { recursive: true }); fs.writeFileSync(path.join(pipe, 'queue', 'pending', 'bad.json'), '{ not json'); writeTask(pipe, 'pending', 'later', { id: 'later', premiumPriority: true }); cases.push(['a corrupt file next to a premium task', pipe, true]); }
+  { const pipe = fresh(); writeTask(pipe, 'pending', 'str', { id: 'str', premiumPriority: 'true' }); cases.push(['a string flag', pipe, false]); }
+  cases.push(['a pipeline directory that does not exist', path.join(os.tmpdir(), `no-such-pipeline-${process.pid}-${Date.now()}`), false]);
+  for (const [label, pipe, want] of cases) assert.deepEqual(askBoth(pipe), [want, want, want], label);
+});
+
+test('a cached hasPremium call reads and stats no task file', (t) => {
+  const fx = fixture([{ name: 'p' }]);
+  const pipe = fx.list[0].pipelineDir;
+  for (let i = 0; i < 25; i++) writeTask(pipe, 'pending', `plain-${i}`, { id: `plain-${i}`, premiumPriority: false });
+  writeTask(pipe, 'adhoc', 'other', { id: 'other' });
+  ageQueueDirs(pipe);
+  assert.equal(hasPremium(pipe, { role: 'worker', lane: 'worker-a' }), false);
+  const touched = [];
+  const realRead = fs.readFileSync;
+  const realStat = fs.statSync;
+  t.mock.method(fs, 'readFileSync', function (p, ...rest) {
+    if (String(p).startsWith(pipe) && String(p).endsWith('.json')) touched.push(`read ${path.basename(String(p))}`);
+    return realRead.call(fs, p, ...rest);
+  });
+  t.mock.method(fs, 'statSync', function (p, ...rest) {
+    if (String(p).startsWith(pipe) && String(p).endsWith('.json')) touched.push(`stat ${path.basename(String(p))}`);
+    return realStat.call(fs, p, ...rest);
+  });
+  assert.equal(hasPremium(pipe, { role: 'worker', lane: 'worker-a' }), false);
+  assert.deepEqual(touched, []);
+});
+
+test('a premium task added after a cached call is found by the next call, and found no more once it is gone', () => {
+  const fx = fixture([{ name: 'p' }]);
+  const pipe = fx.list[0].pipelineDir;
+  writeTask(pipe, 'pending', 'plain', { id: 'plain' });
+  ageQueueDirs(pipe);
+  const counts = () => hasPremium(pipe, { role: 'worker', lane: 'worker-a' });
+  assert.equal(counts(), false);
+  assert.equal(counts(), false);
+  writeTask(pipe, 'pending', 'late', { id: 'late', premiumPriority: true });
+  assert.equal(counts(), true, 'added after the cache was filled');
+  fs.rmSync(path.join(pipe, 'queue', 'pending', 'late.json'));
+  assert.equal(counts(), false, 'removed again');
+});
+
+test('a task edited in place is re-read once its directory is re-validated', () => {
+  const fx = fixture([{ name: 'p' }]);
+  const pipe = fx.list[0].pipelineDir;
+  writeTask(pipe, 'pending', 'edited', { id: 'edited', premiumPriority: false });
+  ageQueueDirs(pipe);
+  const counts = () => hasPremium(pipe, { role: 'worker', lane: 'worker-a' });
+  assert.equal(counts(), false);
+  writeTask(pipe, 'pending', 'edited', { id: 'edited', premiumPriority: true, note: 'made premium in place' });
+  const bumped = new Date(Date.now() + 5000);
+  fs.utimesSync(path.join(pipe, 'queue', 'pending'), bumped, bumped);
+  assert.equal(counts(), true);
+});
+
+test('the dependency gate is judged afresh on every call even while the premium task itself is served from the cache', () => {
+  const { pipe, counts } = premiumFixture();
+  writeTask(pipe, 'adhoc', 'child', { id: 'child', premiumPriority: true, dependsOn: ['dep'] });
+  ageQueueDirs(pipe);
+  assert.equal(counts(), false, 'its dependency has no record yet');
+  assert.equal(counts(), false, 'still held, now from the cache');
+  writeTask(pipe, 'done', 'dep', { id: 'dep', mergedAt: '2026-10-25T00:00:00Z' });
+  assert.equal(counts(), true, 'the dependency was released without the adhoc/ directory or the task file changing');
+});
+
+test('if the cache layer itself breaks, hasPremium reads the stage directly and still answers correctly', (t) => {
+  const fx = fixture([{ name: 'p' }]);
+  const pipe = fx.list[0].pipelineDir;
+  writeTask(pipe, 'pending', 'plain', { id: 'plain' });
+  const counts = () => hasPremium(pipe, { role: 'worker', lane: 'worker-a' });
+  t.mock.method(require('crypto'), 'createHash', () => { throw new Error('the cache layer cannot name its file'); });
+  assert.equal(counts(), false);
+  writeTask(pipe, 'pending', 'hot', { id: 'hot', premiumPriority: true });
+  assert.equal(counts(), true, 'a premium task is still found when the cache layer throws');
+  writeTask(pipe, 'adhoc', 'held', { id: 'held', premiumPriority: true, dependsOn: ['missing-dep'] });
+  fs.rmSync(path.join(pipe, 'queue', 'pending', 'hot.json'));
+  assert.equal(counts(), false, 'the dependency gate still applies on the direct path');
+  assert.equal(hasPremium(path.join(os.tmpdir(), `no-such-pipeline-${process.pid}-${Date.now()}`), { role: 'worker' }), false);
+});
+
+
+// ---- stalled reviews: a record waiting in review/ with nobody reviewing it is made visible (2026-11-10) ----
+const { stalledReviews, noteStalledReviews } = require('./pool-projects.js');
+const HISTORY_FILE = path.join('instances', 'pipeline-history.log');
+
+function stallWorld() {
+  const fx = fixture([{ name: 'home' }, { name: 'other' }]);
+  const home = fx.list[0].pipelineDir; const other = fx.list[1].pipelineDir;
+  const put = (pipe, name, rec, ageMin) => {
+    const dir = path.join(pipe, 'queue', 'review'); fs.mkdirSync(dir, { recursive: true });
+    const f = path.join(dir, name); fs.writeFileSync(f, JSON.stringify(rec));
+    const t = new Date(Date.now() - ageMin * 60000); fs.utimesSync(f, t, t);
+  };
+  const claimDir = path.join(fx.root, 'claims'); fs.mkdirSync(claimDir, { recursive: true });
+  const events = (pipe) => { try { return fs.readFileSync(path.join(pipe, HISTORY_FILE), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+  return { ...fx, home, other, put, claimDir, events, stateFile: path.join(fx.root, 'stalled.json') };
+}
+
+test('stalledReviews lists records waiting 10+ minutes in the home and every registered project, flags premium, and skips young ones', () => {
+  const w = stallWorld();
+  w.put(w.other, 'old-premium.json', { premiumPriority: true }, 22);
+  w.put(w.other, 'old-regular.json', { title: 'x' }, 15);
+  w.put(w.other, 'young.json', { premiumPriority: true }, 3);
+  w.put(w.home, 'home-old.json', {}, 40);
+  const r = stalledReviews({ homePipelineDir: w.home, projectsPath: w.projectsPath, claimDir: w.claimDir });
+  assert.deepEqual(r.map((x) => [x.label, x.file, x.premium]).sort(), [['home', 'home-old.json', false], ['other', 'old-premium.json', true], ['other', 'old-regular.json', false]]);
+  assert.ok(r.every((x) => x.ageMs >= 10 * 60000));
+});
+
+test('stalledReviews skips a record a live reviewer has claimed but lists one whose claim owner is dead; a missing review dir or bad projects file never throws', () => {
+  const w = stallWorld();
+  w.put(w.other, 'claimed.json', {}, 30); w.put(w.other, 'abandoned.json', {}, 30);
+  fs.mkdirSync(path.join(w.claimDir, 'claimed.json.d')); fs.writeFileSync(path.join(w.claimDir, 'claimed.json.d', 'owner'), `${process.pid} reviewer\n`);
+  fs.mkdirSync(path.join(w.claimDir, 'abandoned.json.d')); fs.writeFileSync(path.join(w.claimDir, 'abandoned.json.d', 'owner'), '2147483646 reviewer\n');
+  assert.deepEqual(stalledReviews({ projectsPath: w.projectsPath, claimDir: w.claimDir }).map((x) => x.file), ['abandoned.json']);
+  assert.deepEqual(stalledReviews({ projectsPath: path.join(w.root, 'nope.json'), claimDir: w.claimDir }), []);
+  fs.writeFileSync(path.join(w.root, 'bad.json'), 'not json');
+  assert.deepEqual(stalledReviews({ projectsPath: path.join(w.root, 'bad.json') }), []);
+});
+
+test('noteStalledReviews writes ONE review-stalled event per stalled record on THAT record\'s project with the reason, then stays quiet for an hour', () => {
+  const w = stallWorld();
+  w.put(w.other, 'old-premium.json', { premiumPriority: true }, 22);
+  w.put(w.home, 'home-old.json', {}, 40);
+  const lines = [];
+  const base = { homePipelineDir: w.home, projectsPath: w.projectsPath, claimDir: w.claimDir, stateFile: w.stateFile, log: (m) => lines.push(m) };
+  const first = noteStalledReviews({ ...base, reason: 'host memory pressure (critical), so reviewers are yielding their ticks' });
+  assert.equal(first.length, 2);
+  const ev = w.events(w.other);
+  assert.equal(ev.length, 1);
+  assert.deepEqual([ev[0].type, ev[0].file, ev[0].premium, ev[0].project, ev[0].reason], ['review-stalled', 'old-premium.json', true, 'other', 'host memory pressure (critical), so reviewers are yielding their ticks']);
+  assert.ok(ev[0].ageMinutes >= 22);
+  assert.equal(w.events(w.home).length, 1);
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /^\[review-stalled\] (other|home): .* has waited \d+ min for a review.*; reason: host memory pressure/);
+  // the same records again within the hour: nothing new
+  assert.equal(noteStalledReviews({ ...base, reason: 'again' }).length, 0);
+  assert.equal(w.events(w.other).length, 1);
+  // an hour later the same still-stalled record is noted again
+  assert.equal(noteStalledReviews({ ...base, reason: 'later', now: new Date(Date.now() + 61 * 60000) }).length, 2);
+  assert.equal(w.events(w.other).length, 2);
+});
+
+test('noteStalledReviews forgets a record that left review/, so a later stall of the same file is noted again; it never moves or edits a record', () => {
+  const w = stallWorld();
+  w.put(w.other, 'r.json', { premiumPriority: true }, 30);
+  const before = fs.readFileSync(path.join(w.other, 'queue', 'review', 'r.json'), 'utf8');
+  const base = { projectsPath: w.projectsPath, claimDir: w.claimDir, stateFile: w.stateFile, log: () => {} };
+  assert.equal(noteStalledReviews({ ...base, reason: 'a' }).length, 1);
+  assert.equal(fs.readFileSync(path.join(w.other, 'queue', 'review', 'r.json'), 'utf8'), before);
+  fs.rmSync(path.join(w.other, 'queue', 'review', 'r.json'));
+  assert.equal(noteStalledReviews({ ...base, reason: 'b' }).length, 0);
+  w.put(w.other, 'r.json', { premiumPriority: true }, 30);
+  assert.equal(noteStalledReviews({ ...base, reason: 'c' }).length, 1);
+});
+
+test('the stalled-review note is independent of the premium-reach kill switch, which still turns reach off', () => {
+  const w = stallWorld();
+  w.put(w.other, 'p.json', { premiumPriority: true }, 30);
+  const saved = process.env.AGENT_MANAGER_PREMIUM_REACH;
+  process.env.AGENT_MANAGER_PREMIUM_REACH = 'false';
+  try {
+    assert.equal(require('./pool-projects.js').premiumReachEnabled(), false);
+    assert.equal(noteStalledReviews({ projectsPath: w.projectsPath, claimDir: w.claimDir, stateFile: w.stateFile, log: () => {}, reason: 'x' }).length, 1);
+  } finally { if (saved === undefined) delete process.env.AGENT_MANAGER_PREMIUM_REACH; else process.env.AGENT_MANAGER_PREMIUM_REACH = saved; }
+});
+
+// ---- premium reviews under tight memory pressure (owner decision 2026-11-10; critical still yields) ----
+const { premiumMayRunUnderPressure } = require('./pool-projects.js');
+
+test('premiumMayRunUnderPressure: tight with a premium review waiting runs; tight without one yields; critical yields even with premium; ok is never changed', () => {
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: {} }), true);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: false, env: {} }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'critical', hasPremiumReview: true, env: {} }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'critical', hasPremiumReview: false, env: {} }), false);
+  // ok is not a pressure state: the shell never asks, and the function does not turn it into an override
+  assert.equal(premiumMayRunUnderPressure({ state: 'ok', hasPremiumReview: true, env: {} }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: undefined, hasPremiumReview: true, env: {} }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: 'yes', env: {} }), false, 'only a real true counts');
+});
+
+test('premiumMayRunUnderPressure: AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT=false restores the old answer (always yield); any other value keeps the new behaviour', () => {
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: 'false' } }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: 'FALSE' } }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: 'true' } }), true);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: '' } }), true);
+});
+
+test('--premium-under-pressure: exit 0 only for tight with a premium review in the home review/ or another registered project; critical, no premium and the kill switch exit 1', () => {
+  const w = stallWorld();
+  const cli = path.join(__dirname, 'pool-projects.js');
+  const env = (extra = {}) => ({ ...process.env, AGENT_MANAGER_PROJECTS_PATH: w.projectsPath, AGENT_MANAGER_POOL_STATE_PATH: w.stateFile, ...extra });
+  const code = (state, e) => { try { execFileSync('node', [cli, '--premium-under-pressure', w.home, state], { env: env(e), stdio: 'pipe' }); return 0; } catch (err) { return err.status; } };
+  assert.equal(code('tight'), 1, 'nothing waiting anywhere: yield');
+  w.put(w.other, 'p.json', { id: 'p', premiumPriority: true, status: 'needs-review' }, 1);
+  assert.equal(code('tight'), 0, 'a premium review waits in another registered project');
+  assert.equal(code('critical'), 1, 'critical still yields');
+  assert.equal(code('tight', { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: 'false' }), 1, 'kill switch');
+  w.put(w.home, 'h.json', { id: 'h', premiumPriority: true, status: 'needs-review' }, 1);
+  assert.equal(code('tight'), 0, 'a premium review waits in the home review/');
+});
+
+test('review-runner.sh asks premiumMayRunUnderPressure before it yields, limits the tick to premium items and reviews one item per tick, and still yields otherwise', () => {
+  const sh = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'review-runner.sh'), 'utf8');
+  const guard = sh.indexOf('if mem_pressure_high; then');
+  const ask = sh.indexOf('--premium-under-pressure "$PIPELINE_DIR" "$mem_state"');
+  const yieldMsg = sh.indexOf('yielding this tick -- host RAM pressure');
+  assert.ok(guard > 0 && ask > guard && yieldMsg > ask, 'the question is asked inside the pressure block, before the yield');
+  assert.match(sh, /TICK_PREMIUM_ONLY=true; UNDER_PRESSURE=true/);
+  assert.match(sh, /elif "\$TICK_PREMIUM_ONLY"; then ls -1tr/, 'the item list uses the per-tick premium-only flag');
+  assert.equal((sh.match(/(^|[\s;])PREMIUM_ONLY=/gm) || []).length, 2, 'PREMIUM_ONLY is assigned only at the top of the script (false, then true for a borrowed child), never inside the loop, so the per-tick copy cannot carry a stale value');
+  assert.match(sh, /tight memory pressure: reviewing premium item %s anyway/);
+  assert.match(sh, /if "\$ONCE" \|\| "\$UNDER_PRESSURE"; then break; fi/, 'one item per tick under pressure');
+  // the premium-only borrowed tick re-enters the same block, so it is allowed under tight pressure too; critical reaches the review code only through the node-draft exception (src/node-draft-pressure.test.js)
+  assert.match(sh, /if "\$ONCE" && \[\[ "\$\{AGENT_MANAGER_PREMIUM_ONLY_TICK:-\}" == "true" \]\]; then PREMIUM_ONLY=true; fi/);
+});
+
+// ---- the once-per-hour stalled note is atomic across reviewer daemons (2026-11-10: two daemons ticking together wrote the same event twice) ----
+test('two reviewer processes noting the same stalled record at the same moment write exactly ONE review-stalled event', async () => {
+  const { execFile } = require('child_process');
+  const poolFile = path.join(__dirname, 'pool-projects.js');
+  const child = `
+    const [t, poolFile, projectsPath, claimDir, stateFile, home] = process.argv.slice(1);
+    const { noteStalledReviews } = require(poolFile);
+    while (Date.now() < Number(t)) { /* start together */ }
+    noteStalledReviews({ projectsPath, claimDir, stateFile, homePipelineDir: home, reason: 'race', log: () => {} });
+  `;
+  for (let trial = 0; trial < 4; trial++) {
+    const w = stallWorld();
+    w.put(w.other, 'p.json', { premiumPriority: true }, 30);
+    const t = String(Date.now() + 700);
+    const run = () => new Promise((resolve, reject) => execFile('node', ['-e', child, t, poolFile, w.projectsPath, w.claimDir, w.stateFile, w.home], { env: { ...process.env, AGENT_MANAGER_QUEUE_CACHE_DIR: CACHE_ROOT } }, (err) => (err ? reject(err) : resolve())));
+    await Promise.all([run(), run()]);
+    assert.equal(w.events(w.other).length, 1, `trial ${trial}: exactly one event for the one stalled record`);
+  }
+});
+
+test('the stalled note keeps one claim per record: a fresh claim blocks a second note, a claim older than the hour is replaced once, and claims of records that left review/ are removed', () => {
+  const w = stallWorld();
+  w.put(w.other, 'a.json', { premiumPriority: true }, 30);
+  w.put(w.other, 'b.json', {}, 30);
+  const base = { projectsPath: w.projectsPath, claimDir: w.claimDir, stateFile: w.stateFile, log: () => {} };
+  const claims = path.join(path.dirname(w.stateFile), 'stalled-reviews');
+  assert.equal(noteStalledReviews({ ...base, reason: '1' }).length, 2);
+  assert.equal(fs.readdirSync(claims).length, 2, 'one claim per stalled record');
+  assert.equal(noteStalledReviews({ ...base, reason: '2', now: new Date(Date.now() + 59 * 60000) }).length, 0, 'a claim under an hour old blocks a second note');
+  assert.equal(noteStalledReviews({ ...base, reason: '3', now: new Date(Date.now() + 61 * 60000) }).length, 2, 'older than the hour: replaced and noted again');
+  assert.equal(fs.readdirSync(claims).length, 2, 'replacing leaves no stray directory behind');
+  fs.rmSync(path.join(w.other, 'queue', 'review', 'b.json'));
+  noteStalledReviews({ ...base, reason: '4', now: new Date(Date.now() + 62 * 60000) });
+  assert.equal(fs.readdirSync(claims).length, 1, 'the claim of the record that left review/ is removed');
 });

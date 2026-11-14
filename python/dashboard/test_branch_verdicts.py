@@ -185,6 +185,32 @@ class StoreAndStaleness(unittest.TestCase):
         bv.record_verdict(self.q, "agent/x", "s", "merge", ["actually fine"], "manual")
         self.assertEqual(bv.get_verdict(self.q, "agent/x", "s")["verdict"], "merge")
 
+    def test_worker_is_a_known_source_and_never_overwrites_chat_or_manual_for_the_same_sha(self):
+        for human in ("chat", "manual"):
+            bv.record_verdict(self.q, "agent/x", "s", "merge", ["human said so"], human)
+            rec, written = bv.record_verdict(self.q, "agent/x", "s", "needs-work", ["automated"], "worker")
+            self.assertFalse(written)
+            self.assertEqual((rec["source"], bv.get_verdict(self.q, "agent/x", "s")["verdict"]), (human, "merge"))
+        self.assertIn("worker", bv.SOURCES)
+
+    def test_worker_overwrites_deterministic_and_an_older_worker_verdict_but_deterministic_never_overwrites_worker(self):
+        bv.record_verdict(self.q, "agent/x", "s", "discard", ["cherry"], "deterministic")
+        rec, written = bv.record_verdict(self.q, "agent/x", "s", "merge", ["tests pass"], "worker")
+        self.assertTrue(written)
+        self.assertEqual(bv.get_verdict(self.q, "agent/x", "s")["source"], "worker")
+        rec, written = bv.record_verdict(self.q, "agent/x", "s", "needs-work", ["now conflicts"], "worker")
+        self.assertTrue(written)
+        self.assertEqual(bv.get_verdict(self.q, "agent/x", "s")["verdict"], "needs-work")
+        rec, written = bv.record_verdict(self.q, "agent/x", "s", "discard", ["cherry again"], "deterministic")
+        self.assertFalse(written)
+        self.assertEqual(bv.get_verdict(self.q, "agent/x", "s")["source"], "worker")
+
+    def test_manual_overwrites_a_worker_verdict_and_clear_never_removes_it(self):
+        bv.record_verdict(self.q, "agent/a", "s", "merge", ["automated"], "worker")
+        self.assertFalse(bv.clear_verdict(self.q, "agent/a", "s"))
+        bv.record_verdict(self.q, "agent/a", "s", "needs-work", ["I looked"], "manual")
+        self.assertEqual(bv.get_verdict(self.q, "agent/a", "s")["source"], "manual")
+
     def test_clear_only_removes_deterministic(self):
         bv.record_verdict(self.q, "agent/a", "s", "discard", [], "deterministic")
         bv.record_verdict(self.q, "agent/b", "s", "merge", [], "chat")
@@ -280,6 +306,20 @@ class PriorVerdictOnTask(unittest.TestCase):
         bv.write_task_log(self.q, "t1", None, "agent/t1", "discard", ["superseded by X"], "chat", "s")
         self.assertNotIn("priorVerdict", self._read()["promptContext"])
         self.assertEqual(len(self._read()["history"]), 3)  # the history events are still written
+
+    def test_worker_needs_work_stamps_the_prior_verdict_and_worker_merge_clears_it_but_discard_and_hold_do_not_stamp(self):
+        self._task()
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "needs-work", ["2 touched tests fail"], "worker", "s1")
+        pv = self._read()["promptContext"]["priorVerdict"]
+        self.assertEqual((pv["verdict"], pv["source"], pv["reasons"], pv["sha"]), ("needs-work", "worker", ["2 touched tests fail"], "s1"))
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "hold", ["hub unfinished"], "worker", "s2")
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "discard", ["already merged"], "worker", "s3")
+        self.assertEqual(self._read()["promptContext"]["priorVerdict"]["reasons"], ["2 touched tests fail"])
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "merge", ["tests pass"], "worker", "s4")
+        self.assertNotIn("priorVerdict", self._read()["promptContext"])
+        self._task()
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "hold", ["hub unfinished"], "worker", "s5")
+        self.assertNotIn("priorVerdict", self._read()["promptContext"])
 
     def test_deterministic_needs_work_does_not_replace_a_chat_one(self):
         self._task()

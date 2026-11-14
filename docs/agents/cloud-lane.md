@@ -49,3 +49,16 @@ There is no GPU behind the gateway, so the GPU-only logic skips it (`isCloudEndp
 4. **Plugin registration is not done yet.** The gateway is not listed in `plugins.json` (a gitignored, per-install file), and the dashboard's add route needs a `register.js`, which the cloud-providers repo does not have yet; a follow-up task in that repo's pipeline adds a no-op one. Until it lands, start the gateway by hand as in step 1.
 
 To turn it off, set `"enabled": false` on the entry and restart the pipeline.
+
+## What went wrong on the lane, and the budget check
+
+Diagnosis from the lane's own records on 2026-11-11 (gateway at `http://127.0.0.1:7450`, tailnet address `100.80.1.14:7450`, worker log `~/.local/state/agent-manager/logs/local-worker-worker-cloud.log`, 825 KB; run log `GET /api/instances/worker-cloud/run-log`; the gateway ledger and `GET /meter`):
+
+- **The gateway mostly worked.** Its ledger holds 177 calls, 176 of them ok, at an average of 12,271 input tokens per call; month to date 1145 calls, 15,142,254 tokens in and 1,543,201 out.
+- **The lane ignored the gateway's 429.** The gateway enforces `tokenBudget` `perHour` 1,500,000 and answers HTTP 429 "hourly token budget reached" once it is spent. The lane's endpoint breaker (`ollama_endpoint_reachable`) counted ANY HTTP answer as alive, so it kept claiming tasks: 455 draft failures in the worker log are that 429, each one burning a task's infra requeue round.
+- **Of the 30 run-log rows**, 24 are `OLLAMA_HTTP_ERROR`, 5 abandoned and 1 done.
+- **91 liveness-probe 401s** are in the log; their cause is not established. The abandon reasons are not recorded anywhere yet.
+
+The fix for the dominant failure: after the liveness answer, `ollama_endpoint_reachable` runs `node src/gateway-budget.js check <endpoint>`, which reads that endpoint's `/meter`. A spent budget exits 3, the breaker reads it as not ready, and the lane claims nothing until its next tick instead of failing drafts. It fails OPEN everywhere else: no `/meter` (a plain local Ollama answers 404), junk JSON, a timeout, or a budget of 0 (no cap) all count as ready. `AGENT_MANAGER_BUDGET_PROBE=off` turns the check off.
+
+Once per budget episode (until the gateway's announced reset) it appends one line to `hits.jsonl` (when, the hourly budget, how much was used: the observed ceiling) and sends one summary-level notice (`src/notify.js`, key `cloud-budget-reached`). State lives in `AGENT_MANAGER_BUDGET_STATE_DIR`, default `~/.local/state/agent-manager/cloud-budget`. Tests: `src/gateway-budget.test.js` and `scripts/endpoint-budget.test.js`.

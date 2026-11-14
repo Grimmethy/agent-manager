@@ -181,6 +181,15 @@ class TestDiscardBranch(unittest.TestCase):
             for p in patches:
                 p.stop()
 
+    def test_discard_drops_the_discarded_card_from_the_cached_list_at_once(self):
+        # The listing endpoint serves the last cached list while the recompute runs in the background (2026-11-02). The discard route itself lists the branch (that is how it
+        # proves the branch is one the dashboard offered), so without the drop the card would still be in the cache the next read serves.
+        repo = make_repo_with_pushed_branch("agent/discard-cache-1")
+        res = self._discard(repo, "agent/discard-cache-1")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(app._branch_cache["at"], 0.0)
+        self.assertNotIn("agent/discard-cache-1", [b.get("branch") for b in app._branch_cache["branches"]])
+
     def test_discard_also_deletes_the_local_branch_and_reports_its_sha_for_recovery(self):
         repo = make_repo_with_pushed_branch("agent/discard-local-1")
         tip = self._sha(repo, "agent/discard-local-1")
@@ -289,7 +298,7 @@ class TestRemovalSnapshot(unittest.TestCase):
 
     def setUp(self):
         app._invalidate_branch_cache()
-        self.client = app.app.test_client()
+        self.client = __import__("gate_test_support").client(self)
         # The real apply lock is ~/.local/state/agent-manager/locks/apply-task.lock, the SAME file the live apply-task.sh loop holds every tick.
         # An endpoint test that takes it for real gets a 409 whenever the live pipeline happens to be mid-apply (seen under load: the older
         # tests in this file are exposed to that flake). These tests are about the ledger row, not the lock, so they do not touch it.

@@ -342,6 +342,11 @@ def _summarize_hub(data, state):
     gate = data.get("integrationGate") or {}
     all_children_built = len(subs) > 0 and built_n == len(subs)
     gate_clear = gate.get("status") in (None, "passed", "skipped")
+    # An ABANDONED piece counts as finished for hub auto-completion (coordinator-sweep.js, on purpose), but it is not code that shipped: a hub whose wiring
+    # piece was abandoned is not ready to merge (pf-admin-ui HUB0001 read ready with piece 3/3 abandoned, so its sheet was never rendered). The hub record's
+    # `abandonedPiecesWaived: true` is the owner's explicit "merge it anyway".
+    abandoned = [st.get("id") for st in subs if st.get("status") == "abandoned"]
+    abandon_clear = not abandoned or data.get("abandonedPiecesWaived") is True
     return {
         "id": data.get("id"),
         "title": data.get("title"),
@@ -360,16 +365,19 @@ def _summarize_hub(data, state):
         "blockedReason": data.get("blockedReason"),
         # Ready to merge = every piece is BUILT (finished, committed, waiting on the merge -- not necessarily merged already) and the
         # integration gate has passed or was skipped. A hub already in done/ shipped.
-        "readyToMerge": bool(state == "done" or (all_children_built and gate_clear)),
+        "readyToMerge": bool(state == "done" or (all_children_built and gate_clear and abandon_clear)),
+        "abandonedPieces": abandoned,
     }
 
 
 # Hold unfinished hub children out of the Unmerged Branches pool (yellow hardening 8/8, 2026-10-02). A child of a model-decomposed hub is often the
 # first half of a feature: a helper nothing calls, or a test for code that is not there yet. Alone it can only ever be verified as "hold".
 # Its branch is still pushed (apply-task.js pushes every branch so no work lives only on one disk); it is just not LISTED until the hub is
-# readyToMerge, so the whole hub reaches verification together. Only hubs whose children a model decomposed are held: function-length,
-# change-review and other deterministic-source hubs, and any hub that owns a branch of its own, are listed as before.
-HOLDABLE_HUB_SOURCES = ("manual", "derived_task")
+# readyToMerge, so the whole hub reaches verification together. Held: hubs whose children a model decomposed (manual / derived_task, in ANY domain: a
+# hub filed with domain 'default' is just as unfinished) and change_review_fix hubs (their regression-test piece is the missing half). Still listed
+# as before: function-length, performance and arch-review hubs (independent behaviour-preserving pieces, each mergeable alone) and any hub that owns a
+# branch of its own.
+HOLDABLE_HUB_SOURCES = ("manual", "derived_task", "change_review_fix")
 
 
 def hold_unfinished_hub_children_enabled():
@@ -381,7 +389,7 @@ def hub_child_is_held(hub):
         return False
     if hub.get("state") != "coordinating" or hub.get("readyToMerge") or hub.get("branch"):
         return False
-    return hub.get("domain") == "adhoc" and hub.get("source") in HOLDABLE_HUB_SOURCES
+    return hub.get("source") in HOLDABLE_HUB_SOURCES
 
 
 def partition_held_hub_branches(branches):
@@ -403,12 +411,17 @@ def partition_held_hub_branches(branches):
     return listed, list(groups.values())
 
 
+def branch_trailer_ids(run_git, repo_root, main_branch, full_ref):
+    """The `Task:` trailer ids on the branch's commits. Raises when git fails (so a caller that remembers the answer never stores a failure as "no trailers")."""
+    return _TASK_TRAILER_RE.findall(run_git(["log", f"origin/{main_branch}..{full_ref}", "--format=%b"], repo_root))
+
+
 def branch_task_ids(run_git, repo_root, main_branch, full_ref, task_id):
     """The branch name's own id plus the `Task:` trailer ids on its commits. The branch NAME is not the sub-task id for a hub child
     (agent/decompose-<hub> carries HUB0113-01-...), so the trailers are what let the listing find the owning hub -- the same join
     branch_verdicts.resolve_owner uses. Without them a hub child had no hub in the listing and could not be held."""
     try:
-        trailers = _TASK_TRAILER_RE.findall(run_git(["log", f"origin/{main_branch}..{full_ref}", "--format=%b"], repo_root))
+        trailers = branch_trailer_ids(run_git, repo_root, main_branch, full_ref)
     except (RuntimeError, subprocess.SubprocessError, OSError):
         trailers = []
     return list(dict.fromkeys([task_id, *trailers]))

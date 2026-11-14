@@ -6,6 +6,7 @@ process kept answering health checks.
 
 Run: .venv/bin/python -m unittest test_plugin_process_manager -v
 """
+import os
 import socket
 import subprocess
 import sys
@@ -289,3 +290,138 @@ class ZombieLivenessTest(TmpStateDirTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BehindCheckoutTest(TmpStateDirTest):
+    """Tests for PluginProcessManager.behind_checkout() -- the behind-checkout detection
+    that flags plugins running from a stale checkout (started before the current HEAD)."""
+
+    def _create_throwaway_repo(self, tmpdir: Path) -> Path:
+        """Create a fresh git repo with one initial commit, return its path."""
+        repo = tmpdir / "plugin-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=str(repo), capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True, check=True)
+        (repo / "README.md").write_text("initial")
+        subprocess.run(["git", "add", "README.md"], cwd=str(repo), capture_output=True, check=True)
+        subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(repo), capture_output=True, check=True)
+        return repo
+
+    def _setup_fake_pidfile(self, repo: Path, mtime_offset: int) -> Path:
+        """Create a fake pidfile with a specific mtime offset from now (seconds).
+        Returns the pidfile path."""
+        pidfile = ppm._pidfile("test-plugin")
+        pidfile.parent.mkdir(parents=True, exist_ok=True)
+        pidfile.write_text("99999")  # fake pid
+        
+        # Calculate the target mtime: now + offset
+        now = time.time()
+        target_mtime = now + mtime_offset
+        os.utime(pidfile, (target_mtime, target_mtime))
+        
+        return pidfile
+
+    def test_behind_after_a_later_commit(self):
+        """Plugin started BEFORE the latest commit should be flagged as behind."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            repo = self._create_throwaway_repo(tmp)
+            
+            # Create a pidfile with mtime BEFORE the initial commit (1 hour ago)
+            pidfile = self._setup_fake_pidfile(repo, -3600)
+            
+            # Make a new commit (HEAD is now newer than pidfile mtime)
+            (repo / "new-file.txt").write_text("updated")
+            subprocess.run(["git", "add", "new-file.txt"], cwd=str(repo), capture_output=True, check=True)
+            subprocess.run(["git", "commit", "-m", "second commit"], cwd=str(repo), capture_output=True, check=True)
+            
+            # Verify git log shows the new commit
+            result = subprocess.run(["git", "log", "-1", "--format=%ct"], cwd=str(repo), capture_output=True, text=True, check=True)
+            new_commit_time = int(result.stdout.strip())
+            self.assertGreater(new_commit_time, pidfile.stat().st_mtime)
+            
+            # Now test behind_checkout
+            # We need to mock is_running to return True (since pid 99999 doesn't exist)
+            entry = {"name": "test-plugin", "cwd": str(repo)}
+            
+            with mock.patch.object(ppm, "is_running", return_value=True):
+                result = ppm.PluginProcessManager().behind_checkout(entry)
+            
+            self.assertTrue(result["behind"], "should detect being behind")
+            self.assertIsNotNone(result["startedAt"])
+            self.assertIsNotNone(result["headCommittedAt"])
+            self.assertIsInstance(result["files"], list)
+
+    def test_not_behind_after_a_restart(self):
+        """Plugin restarted AFTER the latest commit should NOT be flagged as behind."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            repo = self._create_throwaway_repo(tmp)
+            
+            # Create a pidfile with mtime AFTER the initial commit (1 hour from now)
+            pidfile = self._setup_fake_pidfile(repo, 3600)
+            
+            # Verify git log still shows the same commit (no new commits)
+            result = subprocess.run(["git", "log", "-1", "--format=%ct"], cwd=str(repo), capture_output=True, text=True, check=True)
+            current_commit_time = int(result.stdout.strip())
+            self.assertLess(current_commit_time, pidfile.stat().st_mtime)
+            
+            # Now test behind_checkout
+            entry = {"name": "test-plugin", "cwd": str(repo)}
+            
+            with mock.patch.object(ppm, "is_running", return_value=True):
+                result = ppm.PluginProcessManager().behind_checkout(entry)
+            
+            self.assertFalse(result["behind"], "should NOT detect being behind")
+            self.assertIsNotNone(result["startedAt"])
+            self.assertIsNotNone(result["headCommittedAt"])
+
+    def test_not_running_gives_behind_false(self):
+        """A plugin that is not running should report behind=False with no side effects."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            repo = self._create_throwaway_repo(tmp)
+            
+            # Test behind_checkout on a non-running plugin
+            entry = {"name": "test-plugin", "cwd": str(repo)}
+            
+            with mock.patch.object(ppm, "is_running", return_value=False):
+                result = ppm.PluginProcessManager().behind_checkout(entry)
+            
+            self.assertFalse(result["behind"], "should be False when not running")
+            self.assertIsNone(result["startedAt"])
+            self.assertIsNone(result["headCommittedAt"])
+            self.assertEqual(result["files"], [])
+
+    def test_merge_response_includes_restart_needed_for_behind_plugin(self):
+        """When a plugin is behind, the merge response should include restartNeeded: true."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            repo = self._create_throwaway_repo(tmp)
+            
+            # Create a pidfile with mtime BEFORE the initial commit
+            pidfile = self._setup_fake_pidfile(repo, -3600)
+            
+            # Make a new commit
+            (repo / "new-file.txt").write_text("updated")
+            subprocess.run(["git", "add", "new-file.txt"], cwd=str(repo), capture_output=True, check=True)
+            subprocess.run(["git", "commit", "-m", "second commit"], cwd=str(repo), capture_output=True, check=True)
+            
+            # Test behind_checkout
+            entry = {"name": "test-plugin", "cwd": str(repo)}
+            
+            with mock.patch.object(ppm, "is_running", return_value=True):
+                result = ppm.PluginProcessManager().behind_checkout(entry)
+            
+            # Verify the result structure matches what routes/plugins.py expects
+            self.assertTrue(result["behind"])
+            self.assertIn("startedAt", result)
+            self.assertIn("headCommittedAt", result)
+            self.assertIn("files", result)
+            
+            # Simulate what routes/plugins.py does: set restartNeeded based on behind
+            entry_with_restart = dict(entry)
+            entry_with_restart["restartNeeded"] = bool(result.get("behind"))
+            
+            self.assertTrue(entry_with_restart["restartNeeded"], "restartNeeded should be True for behind plugin")

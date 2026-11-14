@@ -76,3 +76,37 @@ test('meminfo unavailable: not checked, not pressure (fail open)', async () => {
   assert.equal(r.checked, false);
   assert.equal(r.pressure, false);
 });
+
+// ---- the two real incidents, so this guard and the gpu-broker's classifier (server/core/mem_pressure.py, tests/test_mem_pressure.py) agree --------
+// 2026-11-01: MemAvailable 274 MB, swap 0 MB free of 6143. Both implementations call it pressure/critical.
+// 2026-10-12: swap 0 kB free with RAM still modest (about 3 GB). Both call it pressure (the swap rule is the BACKSTOP here and in the classifier).
+// A healthy box (6.5 GB available, 3.1 GB swap free of 6 GB): neither calls it pressure.
+// Where they intentionally differ: this guard only reads meminfo; a disk-stall-only incident (plenty of RAM, io full 57) is seen by the classifier
+// through kernel pressure stall information, which is why lanes now read the broker's marker first and run this guard only as the fallback.
+test('incident 2026-11-01 (274 MB available, no swap free) is pressure', () => {
+  const r = assessMemory(mem(274, 0, 6143));
+  assert.equal(r.pressure, true);
+  assert.match(r.note, /only 274MB RAM available/);
+});
+
+test('incident 2026-10-12 (swap exhausted, RAM about 3 GB) is pressure by the swap backstop', () => {
+  const r = assessMemory(mem(3000, 0, 6144));
+  assert.equal(r.pressure, true);
+  assert.match(r.note, /swap nearly exhausted/);
+});
+
+test('a healthy box (6.5 GB available, 3.1 GB swap free of 6 GB) is not pressure', () => {
+  assert.equal(assessMemory(mem(6506, 3177, 6143)).pressure, false);
+});
+
+test('the boundaries the classifier shares: 2048 MB available is fine, 2047 is pressure; swap 128 MB free with modest RAM follows the configured floor', () => {
+  assert.equal(assessMemory(mem(2048, 6000)).pressure, false);
+  assert.equal(assessMemory(mem(2047, 6000)).pressure, true);
+  assert.equal(assessMemory(mem(3000, 127), { minSwapFreeMb: 128 }).pressure, true);
+  assert.equal(assessMemory(mem(3000, 128), { minSwapFreeMb: 128 }).pressure, false);
+  assert.equal(assessMemory(mem(4096, 127), { minSwapFreeMb: 128 }).pressure, false);     // RAM at twice the floor: the swap rule no longer applies
+});
+
+test('a disk-stall-only incident (plenty of RAM) is invisible to this guard, which is why the marker is read first', () => {
+  assert.equal(assessMemory(mem(6000, 3000)).pressure, false);
+});

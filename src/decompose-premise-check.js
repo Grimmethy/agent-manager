@@ -79,6 +79,26 @@ function isEnabled() {
   return process.env.AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK !== 'false';
 }
 
+// Collect file paths declared in sibling pieces' "Files:" scope lines.
+// Used by the stale-premise gate to suppress false positives where a sibling
+// piece in the same hub branch declares it will create or edit the cited file.
+// The hub coordinator populates promptContext.decomposedFrom.pieces[] and each
+// piece carries scopeLines[] written by queueSubTasks (literal "Files:" prefix).
+function getSiblingScopeFiles(task) {
+  const siblings = task?.promptContext?.decomposedFrom?.pieces || [];
+  const files = new Set();
+  for (const sib of siblings) {
+    const scopeLines = sib?.scopeLines || [];
+    for (const line of scopeLines) {
+      if (typeof line === 'string' && line.startsWith('Files:')) {
+        const trimmed = line.slice('Files:'.length).trim();
+        if (trimmed) files.add(trimmed);
+      }
+    }
+  }
+  return files;
+}
+
 // Injectable for tests -- default reads the real file from disk.
 function realLineCount(repoRoot, relPath) {
   try {
@@ -209,12 +229,18 @@ function sentenceAround(text, index) {
   return text.slice(a, b);
 }
 
-function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCount, resolveFn = resolveCitedFile } = {}) {
+function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCount, resolveFn = resolveCitedFile, context = {} } = {}) {
   if (!isEnabled()) return null;
   const pc = (task && task.promptContext) || {};
   if (!pc.decomposedFrom) return null; // only ever a decompose product -- see header
   const rawText = String(pc.rawText || '');
   if (!rawText || !repoRoot) return null;
+
+  // Context from the decomposition: which files this sub-task creates, and which files
+  // its siblings create. Used to suppress "missing-file" findings for paths that are
+  // expected to be created (by this task or a sibling) rather than truly missing.
+  const createdFiles = new Set(context.createdFiles || []);
+  const siblingCreatedFiles = new Set(context.siblingCreatedFiles || []);
 
   const pathMap = new Map();
   let pm;
@@ -341,6 +367,55 @@ function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCou
         suppressions.push({ path: relPath, reason: 'create-verb-introduced', sentence: sentenceAround(rawText, p.index), lineRef: ref.line });
         continue;
       }
+      // Context-based guard: if the decomposition output records this file as one to be
+      // created (by this sub-task or a sibling), it is not truly missing -- it is expected
+      // to be created. Suppress with an audit entry distinguishing the two cases.
+      if (createdFiles.has(relPath)) {
+        suppressions.push({
+          path: relPath,
+          reason: 'context-created-self',
+          source: 'decompose-context',
+          sentence: sentenceAround(rawText, p.index),
+          lineRef: ref.line,
+        });
+        continue;
+      }
+      if (siblingCreatedFiles.has(relPath)) {
+        const matchingSib = task?.promptContext?.decomposedFrom?.pieces?.find(
+          (s) => (s?.scopeLines || []).some(
+            (l) => typeof l === 'string' && l.startsWith('Files:') && l.includes(relPath),
+          ),
+        );
+        suppressions.push({
+          path: relPath,
+          reason: 'context-created-sibling',
+          pieceId: matchingSib?.id || 'unknown',
+          source: 'decompose-context',
+          sentence: sentenceAround(rawText, p.index),
+          lineRef: ref.line,
+        });
+        continue;
+      }
+      // Sibling-piece guard (legacy): if any sibling in the hub branch declares this file in its
+      // "Files:" scope line, the file is not truly missing -- a later/independent piece
+      // will create it. Suppress with an audit entry naming the sibling piece.
+      const siblingFiles = getSiblingScopeFiles(task);
+      if (siblingFiles.has(relPath)) {
+        const legacyMatchingSib = task?.promptContext?.decomposedFrom?.pieces?.find(
+          (s) => (s?.scopeLines || []).some(
+            (l) => typeof l === 'string' && l.startsWith('Files:') && l.includes(relPath),
+          ),
+        );
+        suppressions.push({
+          path: relPath,
+          reason: 'sibling-creates',
+          pieceId: legacyMatchingSib?.id || 'unknown',
+          source: 'sibling-scopeFiles',
+          sentence: sentenceAround(rawText, p.index),
+          lineRef: ref.line,
+        });
+        continue;
+      }
       findings.push({ kind: 'missing-file', relPath, detail: `cites \`${relPath}\`, but that file does not exist in the repo` });
       continue;
     }
@@ -379,11 +454,23 @@ function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCou
     // retry-check.js both do).
     return { stale: false, findings: [], suppressions: dedupedSuppressions, reason: null };
   }
+  // Classify findings by kind for the error message: missing-file findings are split
+  // into "expected to be created" (no, those were suppressed above) and "expected to
+  // pre-exist" (truly stale). Line-overshoot findings are always stale.
+  const missingFileFindings = dedupedFindings.filter((f) => f.kind === 'missing-file');
+  const overshootFindings = dedupedFindings.filter((f) => f.kind === 'line-overshoot');
+  const reasons = [];
+  if (missingFileFindings.length) {
+    reasons.push(`cites ${missingFileFindings.map((f) => `\`${f.relPath}\``).join(', ')}, but those files do not exist in the repo and are not recorded as files to be created by this decomposition`);
+  }
+  if (overshootFindings.length) {
+    reasons.push(...overshootFindings.map((f) => f.detail));
+  }
   return {
     stale: true,
     findings: dedupedFindings,
     suppressions: dedupedSuppressions,
-    reason: `This sub-task's premise may be stale (filed by an internal decompose, then the codebase moved on): ${dedupedFindings.map((f) => f.detail).join('; ')}.`,
+    reason: `This sub-task's premise may be stale (filed by an internal decompose, then the codebase moved on): ${reasons.join('; ')}.`,
   };
 }
 

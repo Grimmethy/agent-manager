@@ -21,6 +21,50 @@ test('a project always gets the same color', () => {
   assert.notEqual(bp.branchProjectHue('storyforge'), bp.branchProjectHue('promptforge'));
 });
 
+test('unpinned repos keep the hue the hash always gave them', () => {
+  assert.equal(bp.branchProjectHue('storyforge'), 58);
+  assert.equal(bp.branchProjectHue('promptforge'), 155);
+  assert.equal(bp.branchProjectHue('crosslister'), 163);
+  assert.equal(bp.branchProjectHue(''), 0);
+  assert.equal(bp.branchProjectHue(undefined), 0);
+});
+
+test('the daily repos are pinned, and the pins win over the hash', () => {
+  assert.deepEqual(bp.BRANCH_PROJECT_PINS, {
+    questforge: 133, 'agent-manager': 253, tokenfold: 186, 'pf-backend': 221, uiforge: 279, 'agent-manager-chat-plugin-am': 160,
+    'lead-call-desk': 71, 'pf-admin-ui': 107, 'taxharvest-scrapers': 305, 'trade-calculator': 331, uxforge: 15,
+  });
+  assert.equal(bp.branchProjectHue('uiforge'), 279);
+  assert.equal(bp.branchProjectHue('uxforge'), 15);
+  assert.ok(Number.isInteger(bp.branchProjectHue('toString')), 'a label named like an Object method still gets a numeric hue');
+  assert.ok(Number.isInteger(bp.branchProjectHue('constructor')));
+});
+
+test('pinned hues are at least 26 degrees apart', () => {
+  const hues = Object.values(bp.BRANCH_PROJECT_PINS);
+  const dist = (a, b) => Math.min(Math.abs(a - b), 360 - Math.abs(a - b));
+  for (let i = 0; i < hues.length; i++) for (let j = i + 1; j < hues.length; j++) assert.ok(dist(hues[i], hues[j]) >= 26, `${hues[i]} vs ${hues[j]}`);
+});
+
+test('project colour is hsl at saturation 55 and lightness 30 and white text stays readable for every hue', () => {
+  assert.equal(bp.branchProjectColorCss('questforge'), 'hsl(133 55% 30%)');
+  const lin = (v) => { const c = v / 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+  const rgb = (h, s, l) => { const a = s * Math.min(l, 1 - l); const f = (n) => { const k = (n + h / 30) % 12; return Math.round(255 * (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)))); }; return [f(0), f(8), f(4)]; };
+  let min = Infinity;
+  for (let h = 0; h < 360; h++) {
+    const [r, g, b] = rgb(h, 0.55, 0.3);
+    min = Math.min(min, 1.05 / (0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b) + 0.05));
+  }
+  assert.ok(min >= 4.5, `lowest ratio ${min}`);
+});
+
+test('chip and header use the shared colour', () => {
+  assert.match(bp.branchProjectChipHtml(mk('a', 'questforge', true)), /background:hsl\(133 55% 30%\)/);
+  const header = bp.branchProjectHeaderHtml({ project: { label: 'uiforge', active: false, repoRoot: '/r/uiforge' }, branches: [{}, {}] });
+  assert.match(header, /background:hsl\(279 55% 30%\)/);
+  assert.match(header, /2 branches/);
+});
+
 test('chip names the project, marks the active one and escapes the label', () => {
   assert.match(bp.branchProjectChipHtml(mk('a', 'chat', true)), /chat ● active/);
   assert.doesNotMatch(bp.branchProjectChipHtml(mk('a', 'chat', false)), /active</);

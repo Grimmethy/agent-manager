@@ -624,6 +624,41 @@ test('checkGroundedValues does not flag a URL that exists literally elsewhere in
   assert.deepEqual(flags, []);
 });
 
+// checkGroundedValues: IP literal URLs are never exempt as "named service" -----------
+// 2026-10-22: extractDomainRoot on an IPv4 host returns the third octet (e.g. '112'
+// from 100.96.112.78), which appears incidentally in any other IP, version string,
+// port, etc. in source text -- so an invented IP sharing that octet would previously
+// slip through the high-precision named-service gate. Fix: extractDomainRoot returns
+// null for any IP literal hostname, so isNamedServiceUrl never exempts it.
+
+test('checkGroundedValues flags an invented IP that shares an octet with a grounded IP', () => {
+  const sourceText = 'AGENT_URL=http://100.96.112.78:7450';
+  const draftText = 'use http://100.96.112.99:7450 (invented, same third-octet)';
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, [{ type: 'ungrounded-url', detail: 'http://100.96.112.99:7450' }]);
+});
+
+test('checkGroundedValues does not flag an exact-grounded IP literal (substring match confirms it)', () => {
+  const sourceText = 'AGENT_URL=http://100.96.112.78:7450';
+  const draftText = 'use http://100.96.112.78:7450 (exact match)';
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, []);
+});
+
+test('checkGroundedValues flags an invented IPv6 literal', () => {
+  const sourceText = 'See https://real-internal-docs.example.test/page';
+  const draftText = 'also http://[2001:db8::1]:8080 (made up)';
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, [{ type: 'ungrounded-url', detail: 'http://[2001:db8::1' }]);
+});
+
+test('checkGroundedValues still exempts a named domain (ntfy.sh) grounded by name in source', () => {
+  const sourceText = 'Default to ntfy for notifications: https://ntfy.sh/docs/publish/';
+  const draftText = 'Use https://ntfy.sh/abc123 for the webhook endpoint.';
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, []);
+});
+
 // --- resolvedVia / imprecise-file-path (2026-08-30): a real file cited with a missing or
 // wrong directory prefix is a citation nit, not fabrication. -----------------------------
 const { resolveAgainstRepoDetailed } = require('./fact-checker.js');
@@ -1194,4 +1229,35 @@ test('removed and context URLs inside the diff are still never flagged, and an a
 test('once prose ends the diff block, later lines are prose too: an indented URL line after a prose line is flagged', () => {
   const draft = ['diff --git a/src/a.js b/src/a.js', '@@ -1 +1,2 @@', ' const a = 1;', '+const b = 2;', 'That is the change.', `  details at ${FABRICATED_URL}`].join('\n');
   assert.deepEqual(checkGroundedValues(draft, SOURCE_WITHOUT_URLS).map((f) => f.detail), [FABRICATED_URL]);
+});
+
+// 2026-11-02 stalled-task loop: ungrounded-field false positives on names the draft defines itself or the platform defines ---------------
+const ufgDiff = (...added) => ['Summary.', '', '=== DIFF ===', 'diff --git a/deploy/x.sh b/deploy/x.sh', '@@ -0,0 +1,3 @@', ...added.map((l) => '+' + l)].join('\n');
+const UFG_UNRELATED = 'grounding that mentions none of these names';
+
+test('ungrounded-field: a Python annotated module constant the draft declares is not flagged', () => {
+  const flags = checkGroundedValues(ufgDiff('RULE_TABLE: dict[str, bool] = {', 'NAME_LIST: Tuple[str, ...] = ("a", "b")'), UFG_UNRELATED);
+  assert.deepEqual(flags, []);
+});
+
+test('ungrounded-field: shell export/readonly/local declarations the draft adds are not flagged', () => {
+  const flags = checkGroundedValues(ufgDiff('export BACKUP_TARGET=/srv/b', 'readonly RETRY_LIMIT=3', 'local WORK_DIR_NAME=x'), UFG_UNRELATED);
+  assert.deepEqual(flags, []);
+});
+
+test('ungrounded-field: an annotated-looking dict entry, a kwarg and a comparison are still not declarations', () => {
+  assert.deepEqual(checkGroundedValues(ufgDiff('  "MADE_UP_KEY": value,'), UFG_UNRELATED).map((f) => f.detail), ['MADE_UP_KEY']);
+  assert.deepEqual(checkGroundedValues(ufgDiff('call(MADE_UP_ARG=3)'), UFG_UNRELATED).map((f) => f.detail), ['MADE_UP_ARG']);
+  assert.deepEqual(checkGroundedValues(ufgDiff('MADE_UP_CMP: x == y'), UFG_UNRELATED).map((f) => f.detail), ['MADE_UP_CMP']);
+});
+
+test('ungrounded-field: @NAME@ template placeholders on added lines are exempt, the same token in prose is not', () => {
+  assert.deepEqual(checkGroundedValues(ufgDiff('ExecStart=@APP_DIR@/backup.sh --to=@BACKUP_TO@'), UFG_UNRELATED), []);
+  const prose = ['The unit reads BACKUP_TO from the environment.', '', '=== DIFF ===', 'diff --git a/a b/a', '@@ -1 +1 @@', '+x'].join('\n');
+  assert.deepEqual(checkGroundedValues(prose, UFG_UNRELATED).map((f) => f.detail), ['BACKUP_TO']);
+});
+
+test('ungrounded-field: language and OS constants are exempt, a made-up config key is still flagged', () => {
+  const flags = checkGroundedValues(ufgDiff('DIR="$(dirname "${BASH_SOURCE[0]}")"', 'RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX', 'Environment=NODE_ENV=production', 'if (MADE_UP_LIMIT) {}'), UFG_UNRELATED);
+  assert.deepEqual(flags.map((f) => f.detail), ['MADE_UP_LIMIT']);
 });

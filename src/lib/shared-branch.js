@@ -45,10 +45,92 @@ function listJson(dir) {
 
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
 
+// Build a snapshot of all queue files for caching across multiple calls
+// Returns: { [state]: { files: { filename: { content, mtimeMs, size } }, mtime } }
+function buildQueueSnapshot(pipelineDir) {
+  const snapshot = {};
+  for (const state of SCAN_DIRS) {
+    const dir = state === 'drafting' ? path.join(pipelineDir, 'queue', 'drafting') : path.join(pipelineDir, 'queue', state);
+    const files = {};
+    let latestMtime = 0;
+    const collectFiles = (dirPath) => {
+      try {
+        const entries = fs.readdirSync(dirPath);
+        for (const entry of entries) {
+          const full = path.join(dirPath, entry);
+          try {
+            const stat = fs.statSync(full);
+            if (stat.isDirectory()) {
+              collectFiles(full);
+            } else if (entry.endsWith('.json')) {
+              try {
+                const content = fs.readFileSync(full, 'utf8');
+                files[entry] = { content, mtimeMs: stat.mtimeMs, size: stat.size };
+                if (stat.mtimeMs > latestMtime) latestMtime = stat.mtimeMs;
+              } catch { /* skip unreadable files */ }
+            }
+          } catch { /* skip stat failures */ }
+        }
+      } catch { /* skip directory read failures */ }
+    };
+    collectFiles(dir);
+    snapshot[state] = { files, mtime: latestMtime };
+  }
+  return snapshot;
+}
+
+// Build a precomputed sibling index from a snapshot for quick branch lookups
+// Returns: { [branch]: Set<{id, state}> }
+function buildSiblingIndex(snapshot) {
+  const index = {};
+  for (const state of SCAN_DIRS) {
+    const stateData = snapshot[state];
+    if (!stateData || !stateData.files) continue;
+    for (const filename of Object.keys(stateData.files)) {
+      try {
+        const task = JSON.parse(stateData.files[filename].content);
+        if (!task || !task.id) continue;
+        if (!isLive(task)) continue; // Skip terminal tasks
+        const appliedEvs = appliedEvents(task);
+        if (appliedEvs.length === 0) continue;
+        // Check all branches this task is applied to
+        const branches = new Set();
+        for (const ev of appliedEvs) {
+          const branch = bare(String(ev.detail || '').split(/\s/)[0]);
+          if (branch) branches.add(branch);
+        }
+        if (task && task.stacked && task.stacked.branch) {
+          const stackedBranch = bare(task.stacked.branch);
+          if (stackedBranch) branches.add(stackedBranch);
+        }
+        for (const branch of branches) {
+          if (!index[branch]) index[branch] = new Set();
+          index[branch].add(JSON.stringify({ id: task.id, state }));
+        }
+      } catch { /* skip parse failures */ }
+    }
+  }
+  // Convert sets to arrays for easier consumption
+  const result = {};
+  for (const branch of Object.keys(index)) {
+    result[branch] = [...index[branch]].map((s) => JSON.parse(s));
+  }
+  return result;
+}
+
 // -> { siblings: [{ id, state }] } or { siblings: [], error }
-function liveSiblingsOnBranch({ pipelineDir, branch, selfId }) {
+function liveSiblingsOnBranch({ pipelineDir, branch, selfId, snapshot }) {
   try {
     if (!pipelineDir || !branch) return { siblings: [], error: 'missing pipelineDir or branch' };
+    
+    // If snapshot provided, use precomputed index
+    if (snapshot) {
+      const index = buildSiblingIndex(snapshot);
+      const siblings = index[branch] || [];
+      return { siblings: siblings.filter((s) => s.id !== selfId) };
+    }
+    
+    // Original filesystem scan
     const out = [];
     const seen = new Set();
     for (const state of SCAN_DIRS) {
@@ -69,4 +151,4 @@ function liveSiblingsOnBranch({ pipelineDir, branch, selfId }) {
   }
 }
 
-module.exports = { liveSiblingsOnBranch, isAppliedTo, isLive, TERMINAL, SCAN_DIRS, bare };
+module.exports = { liveSiblingsOnBranch, buildQueueSnapshot, buildSiblingIndex, isAppliedTo, isLive, TERMINAL, SCAN_DIRS, bare };

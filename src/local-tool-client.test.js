@@ -280,6 +280,16 @@ test('readTaskTool with no section returns a task_summary-shaped overview, exclu
   });
 });
 
+test('read_task tool description mentions hub labels in addition to exact task id', () => {
+  withFixtureRepo((mod) => {
+    const def = mod.TOOLS.find((t) => t.function.name === 'read_task').function;
+    assert.match(def.description, /hub label/);
+    assert.match(def.description, /HUB\\d\{4\}/);
+    assert.match(def.parameters.properties.taskId.description, /hub label/);
+    assert.match(def.parameters.properties.taskId.description, /HUB\\d\{4\}/);
+  });
+});
+
 test('readTaskTool with section: "plan" returns just the plan text, windowed', () => {
   withFixtureRepo((mod, dir) => {
     const plan = Array.from({ length: 10 }, (_, i) => `plan line ${i + 1}`).join('\n');
@@ -433,6 +443,27 @@ test('editFileTool errors, without editing, when "find" matches more than once',
   });
 });
 
+test('runBashTool starts in the primary root: pwd is the first root, even with a second root registered', () => {
+  withFixtureRepo((mod, dir) => {
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'run-bash-other-'));
+    const result = mod.runBashTool([dir, other], { command: 'pwd' });
+    if (result.error) {
+      assert.match(result.error, /sandbox \(bwrap\) is not available/);
+    } else {
+      assert.equal(result.stdout.trim(), fs.realpathSync(dir));
+    }
+  });
+});
+
+test('run_bash write-tool description tells the model it already starts in the checkout and not to cd to it', () => {
+  const mod = require('./local-tool-client.js');
+  const bash = mod.WRITE_TOOLS.find((t) => t.function.name === 'run_bash');
+  assert.ok(bash, 'run_bash is in WRITE_TOOLS');
+  assert.match(bash.function.description, /START in the primary repo root/);
+  assert.match(bash.function.description, /never begin a command with `cd /);
+  assert.match(bash.function.description, /`cd` only to reach a DIFFERENT repo/);
+});
+
 test('runBashTool runs a real command in the repo root and captures stdout', () => {
   withFixtureRepo((mod, dir) => {
     fs.writeFileSync(path.join(dir, 'marker.txt'), 'present\n');
@@ -514,6 +545,8 @@ test('buildWriteToolHandlers.queue_reviewed_task writes a real adhoc task and re
     assert.equal(record.promptContext.rawText, 'AC-57 is clean, no conflicts -- add the re-admission path in src/decompose.js.');
     assert.equal(record.promptContext.raisedFrom, 'chat');
     assert.equal(record.premiumPriority, true, 'every task Chat queues is something a human is actively watching it work on right now');
+    assert.equal(record.premiumSetBy, 'chat-queue', 'provenance shown in the task modal');
+    assert.ok(Number.isFinite(Date.parse(record.premiumSetAt)), 'premiumSetAt is an ISO timestamp');
     assert.match(result.message, /premium priority/);
   });
 });
@@ -591,17 +624,19 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
 // all for Chat, queue_reviewed_task is the only way to make a real change), not a
 // prompt-level "please prefer queuing" ask.
 
-test('CHAT_TOOLS declares exactly the nine chat-safe tools -- no write_file/edit_file', () => {
+test('CHAT_TOOLS declares exactly the nineteen chat-safe tools (thirteen plus the six read-only GitHub tools) -- no write_file/edit_file', () => {
   withFixtureRepo((mod) => {
     const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
     assert.deepEqual(names, [
-      'answer_task_clarification', 'list_projects', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
-      'requeue_blocked_task', 'resolve_task_clarification', 'run_bash', 'withdraw_task',
+      'answer_task_clarification', 'chat_status', 'check_branch',
+      'github_list_contents', 'github_read_file', 'github_recent_commits', 'github_repo_overview', 'github_search_code', 'github_search_repos',
+      'list_projects', 'list_unverified_branches', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
+      'record_branch_verdict', 'requeue_blocked_task', 'resolve_task_clarification', 'run_bash', 'withdraw_task',
     ]);
   });
 });
 
-test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all nine chat tools', () => {
+test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all twelve chat tools', () => {
   withFixtureRepo((mod, dir) => {
     const handlers = mod.buildChatToolHandlers([dir], dir, dir);
     assert.equal(handlers.write_file, undefined);
@@ -609,6 +644,7 @@ test('buildChatToolHandlers has no write_file/edit_file handler even if called d
     for (const name of [
       'run_bash', 'queue_reviewed_task', 'answer_task_clarification',
       'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task', 'withdraw_task', 'propose_command',
+      'list_unverified_branches', 'record_branch_verdict', 'check_branch',
     ]) {
       assert.equal(typeof handlers[name], 'function', `expected a handler for ${name}`);
     }
@@ -658,6 +694,67 @@ test('runPlanWithTools with a non-chat source still sends the full WRITE_TOOLS s
     const sentToolNames = sentBodies[0].tools.map((t) => t.function.name).sort();
     assert.ok(sentToolNames.includes('write_file'));
     assert.ok(sentToolNames.includes('edit_file'));
+  });
+});
+
+// --- chat_status tool (2026-10-29, post-incident hardening) ----------------------------
+// The earlier defect: chat_status was added to TOOLS/buildToolHandlers (shared), so it
+// reported only the 7 shared tools (omitting CHAT_TOOLS) and gates.mergeVerdictNeedsCheck
+// was always false (it looked in TOOLS where record_branch_verdict/list_unverified_branches
+// never are). This test suite asserts the fix: chat_status is in CHAT_TOOLS only, reports
+// the union of TOOLS+CHAT_TOOLS, and derives the gate from CHAT_TOOLS.
+
+test('chat_status is NOT in shared TOOLS (only in CHAT_TOOLS)', () => {
+  withFixtureRepo((mod) => {
+    const toolNames = mod.TOOLS.map((t) => t.function.name);
+    assert.ok(!toolNames.includes('chat_status'), 'chat_status must not be in shared TOOLS (it is a chat-only tool)');
+    assert.equal(mod.TOOLS.length, 6, 'shared TOOLS must have exactly 6 entries (not 7 with chat_status)');
+    const chatToolNames = mod.CHAT_TOOLS.map((t) => t.function.name);
+    assert.ok(chatToolNames.includes('chat_status'), 'chat_status must be in CHAT_TOOLS');
+  });
+});
+
+test('chat_status handler reports the union of TOOLS + CHAT_TOOLS (not just TOOLS)', () => {
+  withFixtureRepo((mod, dir) => {
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = handlers.chat_status({});
+    const toolNames = result.tools.sort();
+    // Must include shared tools
+    assert.ok(toolNames.includes('grep_codebase'), 'must include grep_codebase');
+    assert.ok(toolNames.includes('read_file'), 'must include read_file');
+    assert.ok(toolNames.includes('list_directory'), 'must include list_directory');
+    assert.ok(toolNames.includes('list_roots'), 'must include list_roots');
+    assert.ok(toolNames.includes('read_task'), 'must include read_task');
+    assert.ok(toolNames.includes('search_tasks'), 'must include search_tasks');
+    // Must include chat tools (the earlier defect was that these were missing)
+    assert.ok(toolNames.includes('record_branch_verdict'), 'must include record_branch_verdict from CHAT_TOOLS');
+    assert.ok(toolNames.includes('list_unverified_branches'), 'must include list_unverified_branches from CHAT_TOOLS');
+    assert.ok(toolNames.includes('run_bash'), 'must include run_bash from CHAT_TOOLS');
+    assert.ok(toolNames.includes('queue_reviewed_task'), 'must include queue_reviewed_task from CHAT_TOOLS');
+    // Must include chat_status itself
+    assert.ok(toolNames.includes('chat_status'), 'must include chat_status');
+    assert.ok(toolNames.includes('github_search_repos'), 'must include the GitHub tools registered in CHAT_TOOLS');
+    // Total: 6 (TOOLS) + 19 (CHAT_TOOLS: 13 + 6 read-only GitHub tools) = 25
+    assert.equal(result.tools.length, 25, 'must report all 25 tools (6 shared + 19 chat)');
+  });
+});
+
+test('chat_status handler derives gates.mergeVerdictNeedsCheck from CHAT_TOOLS (not TOOLS)', () => {
+  withFixtureRepo((mod, dir) => {
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = handlers.chat_status({});
+    // CHAT_TOOLS includes record_branch_verdict and list_unverified_branches, so the gate must be true
+    assert.equal(result.gates.mergeVerdictNeedsCheck, true, 'gates.mergeVerdictNeedsCheck must be true when CHAT_TOOLS includes record_branch_verdict/list_unverified_branches');
+  });
+});
+
+test('chat_status handler includes a stale-checkout warning when behind origin', () => {
+  withFixtureRepo((mod, dir) => {
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = handlers.chat_status({});
+    // The warning is included (may be null if not behind, but the field must exist)
+    assert.ok('warning' in result, 'chat_status must include a warning field');
+    assert.ok(typeof result.warning === 'string' || result.warning === null, 'warning must be a string or null');
   });
 });
 
@@ -851,7 +948,7 @@ function withMockedChat(scriptedTurns, fn, { killSwitch = null, localCallRespons
     postJsonStream: async () => { throw new Error('streaming path not exercised in this test'); },
   });
   stub('./single-flight-lock.js', { withLock: (_dir, f) => f() });
-  stub('./local-client.js', { call: async () => ({ response: localCallResponse }), KEEP_ALIVE: '30m' });
+  stub('./local-client.js', { call: async () => ({ response: localCallResponse }), KEEP_ALIVE: '8760h' });
   try {
     const mod = require('./local-tool-client.js');
     return fn(mod, dir, { sentBodies });
@@ -904,7 +1001,7 @@ test('every /api/chat turn carries keep_alive (the exported local-client KEEP_AL
     await mod.runPlanWithTools({ prompt: 'go' });
     assert.ok(sentBodies.length >= 2, 'both turns hit /api/chat');
     for (const body of sentBodies) {
-      assert.equal(body.keep_alive, '30m', 'keep_alive is sent on every turn, not just the first');
+      assert.equal(body.keep_alive, '8760h', 'keep_alive is sent on every turn, not just the first');
       assert.equal(body.options.num_ctx, require('./gpu-capacity.js').PINNED_NUM_CTX);
     }
   });
@@ -1567,6 +1664,48 @@ test('nudgeToEditEarly defaults off: a normal run gets no nudge', async () => {
   });
 });
 
+// --- End-of-budget warning (TURNS_LEFT_WARNING) ------------------------------------------
+
+async function runBudgetWarning({ withEdit, nudgeToEditEarly = true, maxTurns = 10, steps = 8 }) {
+  const prevO = process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
+  const prevW = process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING;
+  process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = '2';
+  process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING = '3';
+  try {
+    const explore = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+    const edit = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'x', replace: 'y' } } }] };
+    const finish = { role: 'assistant', content: 'RESOLUTION: implemented\ndid it' };
+    const script = [withEdit ? edit : explore, ...Array(steps).fill(explore), finish];
+    let count = 0;
+    await withMockedChat(script, async (mod, dir, { sentBodies }) => {
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+      await mod.runPlanWithTools({ prompt: 'go', maxTurns, nudgeToEditEarly, primaryRoot: dir });
+      const msgs = sentBodies[sentBodies.length - 1].messages;
+      count = msgs.filter((m) => m.role === 'user' && /Budget warning: \d+ turns remain/.test(m.content || '')).length;
+    });
+    return count;
+  } finally {
+    if (prevO === undefined) delete process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS; else process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = prevO;
+    if (prevW === undefined) delete process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING; else process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING = prevW;
+  }
+}
+
+test('turns-left warning: a run that has edited gets exactly one warning near the end of its budget', async () => {
+  assert.equal(await runBudgetWarning({ withEdit: true }), 1);
+});
+
+test('turns-left warning: no warning when the run made no edit (the early nudges cover that)', async () => {
+  assert.equal(await runBudgetWarning({ withEdit: false }), 0);
+});
+
+test('turns-left warning: no warning without nudgeToEditEarly (chat and other callers)', async () => {
+  assert.equal(await runBudgetWarning({ withEdit: true, nudgeToEditEarly: false }), 0);
+});
+
+test('turns-left warning: no warning when maxTurns is not greater than the window', async () => {
+  assert.equal(await runBudgetWarning({ withEdit: true, maxTurns: 3, steps: 1 }), 0);
+});
+
 test('leafMustEdit: a firmer "final warning" fires when a leaf still has not edited after the soft nudge', async () => {
   const prev = process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
   process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = '2';
@@ -1696,7 +1835,7 @@ function withMockedStreamingChat(turnsOfLines, fn) {
     },
   });
   stub('./single-flight-lock.js', { withLock: (_dir, f) => f() });
-  stub('./local-client.js', { call: async () => ({ response: 'fallback' }), KEEP_ALIVE: '30m' });
+  stub('./local-client.js', { call: async () => ({ response: 'fallback' }), KEEP_ALIVE: '8760h' });
   try {
     const mod = require('./local-tool-client.js');
     return fn(mod, dir);
@@ -2303,6 +2442,75 @@ test('tool-loop audit: AGENT_MANAGER_TOOL_LOOP_AUDIT=off writes no audit file an
   }
 });
 
+// --- garbled tool-name repair ---------------------------------------------------------------
+
+function toolCallTurn(name, args = { path: '.' }) {
+  return { role: 'assistant', content: '', tool_calls: [{ function: { name, arguments: args } }] };
+}
+
+async function runWithName(name) {
+  let toolMsg = null;
+  let audit = [];
+  await withMockedChat([toolCallTurn(name), { role: 'assistant', content: 'done' }], async (mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+    const r = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 5, primaryRoot: dir, taskId: 'repair-t' });
+    toolMsg = r.toolCallLog ? r.toolCallLog[0] : null;
+    audit = readAuditLines(dir).filter((e) => e.type === 'repaired-name');
+  });
+  return { toolMsg, audit };
+}
+
+test('tool-name repair: real garbled grep_codebase names from the ornith trajectories resolve to grep_codebase', async () => {
+  for (const bad of ['grep_codecode', 'grep_codeome', 'grep_codease', 'grep_codeuse', 'grep_codeise', 'grep_codeace', 'grep_code']) {
+    const { toolMsg, audit } = await runWithName(bad);
+    assert.ok(toolMsg, bad);
+    assert.equal(toolMsg.tool, 'grep_codebase', bad);
+    assert.equal(toolMsg.repairedFrom, bad);
+    assert.ok(!/unknown tool/.test(JSON.stringify(toolMsg.result)), `${bad}: ran the real tool`);
+    assert.equal(audit.length, 1, bad);
+    assert.equal(audit[0].tool, 'grep_codebase');
+    assert.equal(audit[0].nameChars, bad.length);
+    assert.ok(!Object.values(audit[0]).includes(bad), 'the garbled name itself is not logged');
+  }
+});
+
+test('tool-name repair: names that are not close to exactly one tool keep the unknown-tool error', async () => {
+  for (const bad of ['list_files', 'grep_code_codebase', 'frobnicate_everything', 'edit', 'x']) {
+    const { toolMsg, audit } = await runWithName(bad);
+    assert.ok(toolMsg, bad);
+    assert.equal(toolMsg.tool, bad, bad);
+    assert.match(toolMsg.result.error, /unknown tool/, bad);
+    assert.equal(audit.length, 0, bad);
+  }
+});
+
+test('tool-name repair: resolveToolName length and ambiguity guards (direct)', () => {
+  const { resolveToolName } = require('./local-tool-client.js');
+  const names = ['read_file', 'grep_codebase', 'edit_file', 'list_directory', 'run_bash'];
+  assert.equal(resolveToolName('grep_codecode', names), 'grep_codebase');
+  assert.equal(resolveToolName('grep_co', names), null, 'shorter than 8 characters is never repaired');
+  assert.equal(resolveToolName('edit_f', names), null, 'shorter than 8 characters is never repaired');
+  assert.equal(resolveToolName('read_file', names.filter((n) => n !== 'read_file')), null, 'one registered candidate away is a 6-char-prefix match only when close enough: read_file has no registered neighbour');
+  // two candidates sharing the first 6 characters, both close: ambiguous, no repair
+  assert.equal(resolveToolName('search_fileX', ['search_files', 'search_filer']), null);
+  assert.equal(resolveToolName('search_filesX', ['search_files', 'search_filexyz']), 'search_files', 'a clear winner (distance 1 vs 3) still repairs');
+  assert.equal(resolveToolName(undefined, names), null);
+  assert.equal(resolveToolName('x'.repeat(60), names), null);
+});
+
+test('tool-name repair: an exact tool name is untouched (no repairedFrom, no audit line)', async () => {
+  const { toolMsg, audit } = await runWithName('list_directory');
+  assert.equal(toolMsg.tool, 'list_directory');
+  assert.equal(toolMsg.repairedFrom, undefined);
+  assert.equal(audit.length, 0);
+});
+
+test('tool-name repair: a RESOLUTION line sent as a tool name gets an instruction, not a tool list', async () => {
+  const { toolMsg } = await runWithName('RESOLUTION: needs-human-decision\n</parameter=1');
+  assert.match(toolMsg.result.error, /belongs in your final message/);
+  assert.ok(!/Available tools/.test(toolMsg.result.error));
+});
+
 test('tool-loop audit: executeToolCalls keeps its 5-parameter declaration (outcomes are classified from toolCallLog in the loop instead)', () => {
   // executeToolCalls is module-private, so its arity is checked on the source declaration.
   const src = fs.readFileSync(path.join(__dirname, 'local-tool-client.js'), 'utf8');
@@ -2544,3 +2752,36 @@ test('a turn with no proposals has no commandProposals field', async () => {
     assert.equal(result.commandProposals, undefined);
   });
 });
+
+test('the check_branch chat tool: its handler delegates to checkBranchTool, and the list, record and check descriptions tell the chat the order and the limits', async () => {
+  let handlers; let tools;
+  withFixtureRepo((mod, dir) => { handlers = mod.buildChatToolHandlers([dir], dir, dir); tools = mod.CHAT_TOOLS; });
+  const refused = await handlers.check_branch({});
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /check_branch requires a non-empty "branch"/, 'the handler reaches checkBranchTool, which validates its own arguments');
+
+  // and it passes branch and project through the right way round: a stand-in dashboard that lists nothing makes the not-listed message name both
+  const http = require('node:http');
+  const stub = http.createServer((req, res) => { res.setHeader('Content-Type', 'application/json'); res.end('[]'); });
+  const port = await new Promise((resolve) => stub.listen(0, '127.0.0.1', () => resolve(stub.address().port)));
+  const prevPort = process.env.AGENT_MANAGER_DASHBOARD_PORT;
+  process.env.AGENT_MANAGER_DASHBOARD_PORT = String(port);
+  try {
+    const notListed = await handlers.check_branch({ branch: 'agent/zzz', project: 'some-project' });
+    assert.equal(notListed.ok, false);
+    assert.match(notListed.error, /^"agent\/zzz" in project "some-project" is not a currently listed unmerged branch/);
+  } finally {
+    if (prevPort === undefined) delete process.env.AGENT_MANAGER_DASHBOARD_PORT; else process.env.AGENT_MANAGER_DASHBOARD_PORT = prevPort;
+    await new Promise((resolve) => stub.close(resolve));
+  }
+
+  const byName = (n) => tools.find((t) => t.function.name === n).function;
+  assert.match(byName('list_unverified_branches').description, /check_branch .* then read the diff .* then record_branch_verdict/);
+  assert.match(byName('record_branch_verdict').description, /Call check_branch for the branch first/);
+  const check = byName('check_branch');
+  assert.match(check.description, /several minutes/);
+  assert.match(check.description, /run_bash cannot do this: its sandbox is read-only and a command is limited to 30 seconds/);
+  assert.deepEqual(check.parameters.required, ['branch']);
+  assert.deepEqual(Object.keys(check.parameters.properties).sort(), ['branch', 'project']);
+});
+
