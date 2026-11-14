@@ -151,23 +151,23 @@ mkdir -p "$DONE_DIR" "$BLOCKED_DIR" "$AWAITING_CONFIRM_DIR" "$COORDINATING_DIR"
 # alike. Called right before every mv into $BLOCKED_DIR below; a task that already has a
 # real blockedReason (the normal case) is left untouched.
 ensure_blocked_reason() {
-  local task_path="$1" fallback_note="$2"
+  local task_path="$1" fallback_note="$2" stage_override="${3:-}" exact="${4:-}"
   node -e '
     const fs = require("fs");
-    const [p, fallback] = process.argv.slice(1);
+    const [p, fallback, stage, exact] = process.argv.slice(1);
     try {
       const task = JSON.parse(fs.readFileSync(p, "utf8"));
       if (task.blockedReason) process.exit(0); // already has a real reason -- nothing to backstop
-      const reason = (fallback && fallback.trim())
+      const reason = exact === "1" ? fallback : (fallback && fallback.trim())
         ? `apply-task.sh backstop: no blockedReason was ever recorded for this failure (likely a SIGKILL mid-apply, since even a caught exception writes one) -- last known output: ${fallback.trim().slice(0, 500)}`
         : "apply-task.sh backstop: no blockedReason was ever recorded for this failure (likely a SIGKILL mid-apply) and no output was captured either -- check apply-task.log around this task'\''s timestamp for the real cause.";
       task.blockedReason = reason;
-      task.blockedStage = task.blockedStage || "apply";
+      task.blockedStage = stage || task.blockedStage || "apply";
       task.history = Array.isArray(task.history) ? task.history : [];
-      task.history.push({ stage: "blocked", at: new Date().toISOString(), detail: reason });
+      task.history.push({ stage: stage === "apply-failed" ? "apply-failed" : "blocked", at: new Date().toISOString(), detail: reason });
       fs.writeFileSync(p, JSON.stringify(task, null, 2));
     } catch (e) { /* best-effort -- never block the real mv on this backstop */ }
-  ' "$task_path" "$fallback_note" 2>/dev/null || true
+  ' "$task_path" "$fallback_note" "$stage_override" "$exact" 2>/dev/null || true
 }
 
 # Split approved tasks into directToMain triage tasks (candidate-doc appends -- batchable
@@ -226,7 +226,13 @@ for file in "${other_files[@]}"; do
   task_id="$(basename "$file" .json)"
   printf '[apply-task] applying %s...\n' "$task_id"
 
-  result="$(node "${REPO_DIR}/src/apply-task.js" "$file")"
+  # Capture stderr to a temp file so we can inspect it for diagnostic info (TypeError, etc.)
+  # when the node process crashes. The backstop (ensure_blocked_reason) uses it to write
+  # a real blockedReason instead of the generic "no blockedReason was ever recorded" text.
+  STDERR_FILE=$(mktemp)
+  trap "rm -f '$STDERR_FILE'" EXIT
+  result="$(node "${REPO_DIR}/src/apply-task.js" "$file" 2>"$STDERR_FILE")"
+  EXIT_CODE=$?
   succeeded="$(printf '%s' "$result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
   # Checked BEFORE succeeded -- a delete-containing Group B batch reports succeeded:false
   # (nothing was touched, so it genuinely isn't a success) but this is a hold for a human,
@@ -248,7 +254,38 @@ for file in "${other_files[@]}"; do
     move_task_file_locked "$task_id" "$file" "${DONE_DIR}/${task_id}.json"
     printf '[apply-task] %s: applied -> %s\n' "$task_id" "$result"
   else
-    ensure_blocked_reason "$file" "$result"
+    # Check if the node process itself crashed (non-zero exit) -- if so, stderr likely has
+    # the real cause (e.g., a plugin's register.js threw TypeError). Capture it for the backstop.
+    if [[ $EXIT_CODE -ne 0 ]]; then
+      # Get last 40 lines of stderr
+      LAST_LINES=$(tail -n 40 "$STDERR_FILE")
+      
+      # Check for non-transient patterns (TypeError, ReferenceError, Cannot find module, Error: at top level)
+      NON_TRANSIENT_MATCH=$(echo "$LAST_LINES" | grep -E "^TypeError:|^ReferenceError:|^Error:|Cannot find module" | head -n 1)
+      
+      if [[ -n "$NON_TRANSIENT_MATCH" ]]; then
+        # Non-transient failure: use the error line as blockedReason, mark as apply-failed (not requeueable)
+        FIRST_LINE=$(echo "$LAST_LINES" | grep -v "^$" | head -n 1)
+        if [[ -n "$FIRST_LINE" ]]; then
+          BLOCKED_REASON="${NON_TRANSIENT_MATCH}"
+          # Append remaining lines, truncated to 1500 chars
+          REMAINING=$(printf '%s\n' "$LAST_LINES" | grep -vxF -- "$NON_TRANSIENT_MATCH" | head -n 39)
+          if [[ -n "$REMAINING" ]]; then
+            BLOCKED_REASON="${BLOCKED_REASON}
+${REMAINING}"
+          fi
+          BLOCKED_REASON=$(echo "$BLOCKED_REASON" | head -c 1500)
+          # Write the real reason and apply-failed stage through the shared backstop helper (not requeueable)
+          ensure_blocked_reason "$file" "$BLOCKED_REASON" "apply-failed" "1"
+        fi
+      else
+        # Transient failure or no output: use the backstop with stderr captured
+        ensure_blocked_reason "$file" "$LAST_LINES"
+      fi
+    else
+      # Node process exited 0 but result says failed -- use stdout as fallback
+      ensure_blocked_reason "$file" "$result"
+    fi
     move_task_file_locked "$task_id" "$file" "${BLOCKED_DIR}/${task_id}.json"
     printf '[apply-task] %s: FAILED -> %s\n' "$task_id" "$result" >&2
   fi
