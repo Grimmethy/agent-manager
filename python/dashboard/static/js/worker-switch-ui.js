@@ -74,4 +74,5 @@ function wireWorkerSwitchButtons(root) {
       setWorkerEnabled(btn.dataset.instanceId, btn.dataset.nextEnabled === 'true');
     };
   });
+  if (typeof renderMachinePauseBar === 'function') renderMachinePauseBar(root); // machine-pause-bar.js, when loaded
 }

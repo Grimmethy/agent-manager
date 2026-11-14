@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # loc
 source "${SCRIPT_DIR}/orc-common.sh"                                                  # load shared env loader and config — required first step before any daemon logic since everything depends on AGENT_MANAGER_REPO_ROOT being set correctly (which the .env file provides).
 readonly INSTANCE_ID="${1:-review-0}"                                              # default instance id for this review-daemon; same convention as PowerShell's `$env:InstanceID -or 'default'` pattern so logs can be grouped per-review-job.
 export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so local-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
-# --once (docs/idle-pool-borrowing.md): ONE tick, exit 10 (reviewed something) / 0 (nothing) -- how an idle reviewer BORROWS a tick from another suite
+# --once (docs/design-notes/idle-pool-borrowing.md): ONE tick, exit 10 (reviewed something) / 0 (nothing) -- how an idle reviewer BORROWS a tick from another suite
 # project, run as a child of the reviewer daemon under that project's env (same contract as local-worker.sh --once).
 ONCE=false
 [[ "${2:-}" == "--once" ]] && ONCE=true
@@ -21,6 +21,9 @@ if "$ONCE" && [[ "${AGENT_MANAGER_PREMIUM_ONLY_TICK:-}" == "true" ]]; then PREMI
 # (the same helper as local-worker.sh's; one node process for the whole listing).
 filter_premium_names() {
   node -e 'const fs=require("fs"),path=require("path"),d=process.argv[1];for(const n of fs.readFileSync(0,"utf8").split("\n")){if(!n)continue;try{if(JSON.parse(fs.readFileSync(path.join(d,n),"utf8")).premiumPriority===true)console.log(n)}catch(e){}}' "$1" 2>/dev/null
+}
+filter_node_draft_names() {
+  node -e 'const fs=require("fs"),path=require("path"),d=process.argv[1];for(const n of fs.readFileSync(0,"utf8").split("\n")){if(!n)continue;try{const t=JSON.parse(fs.readFileSync(path.join(d,n),"utf8"));if(typeof t.fromNode==="string"&&t.fromNode)console.log(n)}catch(e){}}' "$1" 2>/dev/null
 }
 
 # Refuse to start if a live process already holds this instanceId -- see local-worker.sh's
@@ -43,6 +46,9 @@ trap 'printf "[review-%s] SIGTERM/SIGINT received -- exiting after current tick.
 
 HOME_LOGS="${HOME_LOGS:-$LOG_DIR}"                                                  # HOME_LOGS where we drop per-instance log files (so each daemon writes to its own file in a common folder rather than clobbering one another). Same idea as PowerShell's $env:LocalStatePath/log/$env:InstanceID pattern.
 LOG_FILE="${HOME_LOGS}/review-runner-${INSTANCE_ID}.log"          # per-instance log file — keeps reviewer status separate from worker (so operator can grep one without seeing other loops' output mixed in). Same pattern as PowerShell's `Start-Transcript -Path $jobLog` which each daemon script opens for its own status tracking.
+source "${SCRIPT_DIR}/wake-common.sh"   # wait_for_queue_change: the idle wait (ADR-0024 S3)
+LAST_WAKE=""; WAKE_RECONCILE_HITS=0; LAST_TICK_START=0; LAST_TICK_START_MS=0
+PACKAGE_SRC_DIR="${PACKAGE_SRC_DIR:-${SCRIPT_DIR}/../src}"
 
 mkdir -p "$HOME_LOGS" 2>/dev/null                                                      # ensure logs directory exists before writing to it; bash won't auto-create parent dirs on file write redirects (equivalent of PowerShell's `New-Item -ItemType Directory -Force $logDir` that always runs even if folder already exists — simpler one-liner than Test-Path check first).
 LOG_DIR="${LOG_DIR:-$HOME_LOGS}"                                                     # LOG_DIR for script-local use; same fallback pattern as other daemons.
@@ -105,7 +111,7 @@ refresh_active_model() {
   export LOCAL_MODEL
 }
 
-# Borrow a tick from another suite project when this reviewer's own review/ queue is empty (docs/idle-pool-borrowing.md): same walk as
+# Borrow a tick from another suite project when this reviewer's own review/ queue is empty (docs/design-notes/idle-pool-borrowing.md): same walk as
 # local-worker.sh's borrow_from_pool, tracked under the 'reviewer' role so a project the WORKER found empty is still visible here.
 borrow_review_from_pool() {
   [[ "${AGENT_MANAGER_POOL_BORROW:-true}" != "false" ]] || return 0
@@ -128,6 +134,13 @@ borrow_review_from_pool() {
     node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark-empty "$pipe" reviewer >>"$LOG_FILE" 2>&1 || true
   done
   return 0
+}
+
+# Stalled reviews (2026-11-10): a record that has waited 10+ minutes in ANY registered project's review/ with no live claim gets ONE 'review-stalled' history event
+# (and one log line per record per hour) naming why this reviewer is not reviewing it. Piggybacks on this tick -- no timer. src/pool-projects.js noteStalledReviews.
+note_stalled_reviews() {
+  local reason="$1"
+  AGENT_MANAGER_INSTANCES_DIR="$INSTANCES_DIR" node "${PACKAGE_SRC_DIR}/pool-projects.js" --note-stalled-reviews "$PIPELINE_DIR" "$reason" >>"$LOG_FILE" 2>&1 || true
 }
 
 # Premium reach (2026-10-18, Grimmethy: "premium priority tasks happen regardless of what project repo is currently selected (currently
@@ -161,7 +174,9 @@ borrow_premium_review_from_projects() {
   return 1
 }
 
-while :; do                                                                     # infinite iteration until script exits (or is SIGTERM'd by system). Bash doesn't have Python-style 'while True:' so uses ':' no-op as condition which always returns 0=success so loop body executes forever; same semantic effect of PowerShell's `$true` boolean we use above.
+while :; do
+  LAST_TICK_START="$(date +%s)"; LAST_TICK_START_MS="$(date +%s%3N)"                 # the idle wait measures its minimum gap from here and reports any review item that arrived after it (catch-up)
+  # infinite iteration until script exits (or is SIGTERM'd by system). Bash doesn't have Python-style 'while True:' so uses ':' no-op as condition which always returns 0=success so loop body executes forever; same semantic effect of PowerShell's `$true` boolean we use above.
   refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work.
   printf '[review-%s] tick: scanning queue/review/ for items to review...\n' "$INSTANCE_ID"    # status message echoing what the loop is doing — same info PowerShell logs via `Write-Verbose "Scanning $draftingPath..."`. Using printf not echo so format strings like '%d' don't get interpreted as %d literally (bash's echo sometimes enables escape sequences depending on shell; more portable via printf).
   write_heartbeat_file "$INSTANCE_ID" "idle" "${LOCAL_MODEL:-}" "" "" "$STARTED_AT"   # previously never called anywhere in this script -- the dashboard's Workers tab had no way to know this instance existed even while it was (uselessly) spinning at ~100% CPU.
@@ -174,17 +189,35 @@ while :; do                                                                     
   # the GPU for an image generation this tick.
   if comfyui_lease_held "${OLLAMA_URL:-http://localhost:11434}"; then
     printf '[review-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+    note_stalled_reviews 'PromptForge holds the GPU (comfyui-lease), so reviewers are yielding'
+    lane_note_gpu_pause "$INSTANCE_ID" "${LOCAL_MODEL:-}" "$STARTED_AT"   # heartbeat says "paused" (Workers tab) and remembers to warm the model up afterwards
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
     continue
   fi
+  lane_warm_after_pause "$INSTANCE_ID" "${LOCAL_MODEL:-}" "$STARTED_AT"   # no-op unless the lease was just released: reload the model before reviewing
 
   # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
+  # 2026-11-10 (owner: "premium reviews can run under tight pressure"): under a TIGHT marker (never critical) a waiting premium review is still reviewed --
+  # premium items only, one per tick. Kill switch AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT=false. src/pool-projects.js premiumMayRunUnderPressure.
+  # PREMIUM_ONLY is assigned only at the top of this script (once per process, from the borrowed-child env) and never inside this loop, so this per-tick copy
+  # cannot carry a value over from an earlier tick; only the pressure block below may raise it, and only for this tick.
+  TICK_PREMIUM_ONLY="$PREMIUM_ONLY"; UNDER_PRESSURE=false; TICK_NODE_DRAFT_ONLY=false
   if mem_pressure_high; then
-    printf '[review-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
-    if "$ONCE"; then exit 0; fi
-    sleep "${ORC_TICK_SECS:-30}"
-    continue
+    mem_state="$(mem_marker_state 2>/dev/null || echo tight)"
+    if node "${PACKAGE_SRC_DIR}/pool-projects.js" --premium-under-pressure "$PIPELINE_DIR" "$mem_state" 2>>"$LOG_FILE"; then
+      TICK_PREMIUM_ONLY=true; UNDER_PRESSURE=true
+    elif [[ "$mem_state" == critical ]] && node "${PACKAGE_SRC_DIR}/node-draft-pressure.js" "$PIPELINE_DIR" "$mem_state" "$(mem_marker_num swap_free_mb)" "$(mem_marker_num available_mb)" "$(mem_marker_num mem_full)" "$(mem_marker_num io_full)" 2>>"$LOG_FILE"; then
+      # 2026-11-12: critical ONLY through the swap backstop (swap gone, >= 1 GB free, no real stall) and a draft from another machine is waiting: review it, one per tick.
+      # Kill switch AGENT_MANAGER_NODE_DRAFT_REVIEW_UNDER_SWAP_CRITICAL=false. src/node-draft-pressure.js.
+      TICK_NODE_DRAFT_ONLY=true; UNDER_PRESSURE=true
+    else
+      printf '[review-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
+      note_stalled_reviews "host memory pressure ($mem_state), so reviewers are yielding their ticks"
+      if "$ONCE"; then exit 0; fi
+      sleep "${ORC_TICK_SECS:-30}"
+      continue
+    fi
   fi
 
   # GPU headroom check -- review's own majorityVote call spends real Ollama calls too
@@ -196,12 +229,13 @@ while :; do                                                                     
   did_work=false                                                                 # tracks whether this tick actually reviewed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment).
 
   # Premium reach: another project's premium review goes before this reviewer's home REGULAR reviews (home premium still wins -- see the function).
+  if ! "$ONCE"; then note_stalled_reviews 'no live reviewer has claimed it yet'; fi
   if ! "$ONCE" && borrow_premium_review_from_projects; then sleep 1; continue; fi
   items=()
   while IFS= read -r name; do
     [[ "$name" == *.json ]]                                                    || continue        # only process JSON files, same filter as local-worker.sh's own claim loop (and same class of bug fixed there: a bare `!` would silently skip every real task file).
     items+=("$name")
-  done < <(if "$PREMIUM_ONLY"; then ls -1tr "$review_dir" 2>/dev/null | filter_premium_names "$review_dir"; else ls -1tr "$review_dir" 2>/dev/null; fi)   # -t: sort by mtime; -r: reverse (oldest first) -- see this loop's own comment below for why lexical order was wrong.
+  done < <(if "$TICK_NODE_DRAFT_ONLY"; then ls -1tr "$review_dir" 2>/dev/null | filter_node_draft_names "$review_dir"; elif "$TICK_PREMIUM_ONLY"; then ls -1tr "$review_dir" 2>/dev/null | filter_premium_names "$review_dir"; else ls -1tr "$review_dir" 2>/dev/null; fi)   # -t: sort by mtime; -r: reverse (oldest first) -- see this loop's own comment below for why lexical order was wrong.
 
   # Iterate each item currently sitting in review/, oldest-first BY FILE MTIME (fixed
   # 2026-08-20, Grimmethy: "we need to build this sort of analysis into the daily report"
@@ -240,6 +274,7 @@ while :; do                                                                     
     # old gate was real, immediately-reviewable local work sitting unreviewed for hours
     # any time Claude happened to be paused, confirmed live via a multi-hour
     # queue/review/ backlog with items unreviewed since 2026-08-25.
+    if "$UNDER_PRESSURE"; then if "$TICK_NODE_DRAFT_ONLY"; then printf '[review-%s] swap-only critical memory pressure: reviewing node draft %s anyway\n' "$INSTANCE_ID" "$name" >&2; else printf '[review-%s] tight memory pressure: reviewing premium item %s anyway\n' "$INSTANCE_ID" "$name" >&2; fi; fi
     printf '[review-%s] reviewing %s\n' "$INSTANCE_ID" "$name" >&2
     # "queued" until the single-flight lock is actually held, then "working" -- see
     # local-worker.sh's process_drafting_file for the full rationale (2026-08-19,
@@ -396,7 +431,7 @@ while :; do                                                                     
     fi
     write_heartbeat_file "$INSTANCE_ID" "idle" "${LOCAL_MODEL:-}" "" "" "$STARTED_AT"
     did_work=true
-    if "$ONCE"; then break; fi   # a borrowed tick reviews ONE item, then the reviewer re-checks its home review/ before borrowing again
+    if "$ONCE" || "$UNDER_PRESSURE"; then break; fi   # under tight pressure: one premium item per tick. A borrowed tick reviews ONE item, then the reviewer re-checks its home review/ before borrowing again
   done
   release_current_claim                                                         # the last item of this tick is done too
 
@@ -413,11 +448,16 @@ while :; do                                                                     
   if ! "$did_work"; then borrow_review_from_pool; fi
 
   if "$did_work"; then
+    if [[ "$LAST_WAKE" == "timeout" ]]; then
+      WAKE_RECONCILE_HITS=$((WAKE_RECONCILE_HITS + 1))
+      printf '[review-%s] wake reconcile: found work after a TIMEOUT wake (hit %s) -- a queue change was not announced in a watched directory.\n' "$INSTANCE_ID" "$WAKE_RECONCILE_HITS" >&2
+    fi
+    LAST_WAKE=""
     sleep 1
   else
     # Wait N seconds before next scan pass. THIS WAS PREVIOUSLY PLACED AFTER THE LOOP'S
     # CLOSING `done` (dead code, unreachable) -- the loop never paused between ticks and spun
     # at ~100% CPU continuously instead. Moved inside the loop body where it actually runs.
-    sleep "${ORC_TICK_SECS:-30}"
+    wait_for_queue_change review "$QUEUE_DIR"      # ADR-0024 S3: wake when an item is ADDED to queue/review of this or any registered project, else after the fallback
   fi
 done                                                                              # top-level infinite while-loop terminator — same structure each daemon script follows (infinite polling until SIGTERM / SIGINT interrupts) so all four loops behave consistently when user wants to stop them all at once via launch.sh.

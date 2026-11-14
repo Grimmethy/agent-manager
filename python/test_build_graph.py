@@ -11,10 +11,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 import graph_build  # noqa: E402
+import graph_edge_resolution  # noqa: E402
 
 
 class BuildImportGraphSymlinkTest(unittest.TestCase):
@@ -72,6 +74,10 @@ class BuildImportGraphFileCacheTest(unittest.TestCase):
             # genuinely trusted (mtime/size unchanged), this wrong edge survives into the
             # next build's graph -- proof the file's real text was never re-scanned.
             file_cache["files"]["src/a.js"]["edges"] = ["src/c.js"]
+            # The entry also stores the file's raw specs (re-resolved against the current file_set on a cache hit so files ADDED since
+            # the last parse are still discovered, AC-64). Make those deliberately wrong too ("imports nothing"): the real b.js edge can
+            # then only come back by re-reading the file's text, which a cache hit must never do.
+            file_cache["files"]["src/a.js"]["unresolved_specs"] = []
 
             graph = graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
             self.assertTrue(graph.has_edge("src/a.js", "src/c.js"), "cached (even if stale) edges must be trusted when mtime/size are unchanged")
@@ -110,6 +116,72 @@ class BuildImportGraphFileCacheTest(unittest.TestCase):
             (repo / "src" / "a.js").write_text("// no import now\n")
             graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
             self.assertNotIn("src/b.js", file_cache["files"], "a deleted file's stale cache entry must not linger forever")
+
+    def test_cache_hit_discovers_newly_added_target(self):
+        """AC-64 regression: a file added to the repo after the first build should be
+        linked on the next build even if the importing file's text didn't change.
+        Without the unresolved_specs re-resolution, the edge would be silently missing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "src").mkdir()
+            # a.js imports both b.js and c.js
+            (repo / "src" / "a.js").write_text("require('./b.js'); require('./c.js');\n")
+            (repo / "src" / "b.js").write_text("module.exports = {};\n")
+            # c.js NOT in file_set yet
+
+            file_cache = {}
+            graph = graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
+            # First build: only b.js in file_set, so only edge to b.js
+            self.assertTrue(graph.has_edge("src/a.js", "src/b.js"))
+            self.assertFalse(graph.has_edge("src/a.js", "src/c.js"))
+            # Cache entry for a.js should have unresolved_specs containing the spec for c.js
+            self.assertIn("unresolved_specs", file_cache["files"]["src/a.js"])
+            # The spec for c.js should be in unresolved_specs (exact format depends on regex)
+            unresolved = file_cache["files"]["src/a.js"]["unresolved_specs"]
+            self.assertTrue(any("c.js" in s for s in unresolved), f"unresolved_specs {unresolved} should contain c.js spec")
+
+            # Now add c.js (DO NOT touch a.js - keep its mtime/size unchanged)
+            (repo / "src" / "c.js").write_text("module.exports = {};\n")
+
+            # Second build: a.js unchanged (same mtime/size), so cache hit
+            graph = graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
+            # Now the edge to c.js should appear via re-resolution of unresolved_specs
+            self.assertTrue(graph.has_edge("src/a.js", "src/c.js"),
+                            "AC-64 fix: newly-added target should be discovered on cache hit")
+
+
+    def test_cache_hit_discovers_newly_added_import_target(self):
+        # AC-64 regression (HUB0088 3/3): service.py imports new_util, which is absent on
+        # the first build. Once new_util.py exists, a second build with the same file_cache
+        # must link service.py -> new_util.py while service.py is still a CACHE HIT (not
+        # re-read or re-extracted), which only works via unresolved_specs re-resolution.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            src = repo / "backend" / "src"
+            src.mkdir(parents=True)
+            (src / "service.py").write_text("from new_util import helper\n")
+
+            file_cache = {}
+            graph = graph_build.build_import_graph(repo, ["backend/src"], file_cache=file_cache)
+            self.assertEqual(graph.number_of_nodes(), 1)
+            self.assertEqual(graph.number_of_edges(), 0)
+            first_entry = dict(file_cache["files"]["backend/src/service.py"])
+
+            (src / "new_util.py").write_text("def helper():\n    return 1\n")
+
+            with mock.patch.object(graph_edge_resolution, "_extract_specs_for_file",
+                                   wraps=graph_edge_resolution._extract_specs_for_file) as spy:
+                graph = graph_build.build_import_graph(repo, ["backend/src"], file_cache=file_cache)
+
+            # service.py must not be re-extracted on the second build (cache hit).
+            extracted = [call.args[0].name for call in spy.call_args_list]
+            self.assertNotIn("service.py", extracted)
+            self.assertEqual(graph.number_of_nodes(), 2)
+            self.assertEqual(graph.number_of_edges(), 1)
+            self.assertTrue(graph.has_edge("backend/src/service.py", "backend/src/new_util.py"))
+            second_entry = file_cache["files"]["backend/src/service.py"]
+            self.assertEqual(second_entry["mtime"], first_entry["mtime"])
+            self.assertEqual(second_entry["size"], first_entry["size"])
 
 
 class ResolveZigImportTest(unittest.TestCase):

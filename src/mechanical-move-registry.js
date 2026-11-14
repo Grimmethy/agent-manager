@@ -1,6 +1,6 @@
 'use strict';
 
-// verifyMove hook (S3 of the hub-tasks extraction, 2026-09-23, Docs/hub-tasks-extraction-plan.md
+// verifyMove hook (S3 of the hub-tasks extraction, 2026-09-23, docs/design-notes/hub-tasks-extraction-plan.md
 // section 3 design point 2). decompose-auto-merge.js (hub KERNEL code -- moved to
 // agent-manager-hub-tasks in S5e, 2026-09-25, per the plan's own layering) used to hardcode the vocabulary of
 // `promptContext.deterministicApply` kind strings that are safe to auto-merge

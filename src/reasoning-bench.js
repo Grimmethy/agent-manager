@@ -52,6 +52,7 @@
 const fs = require('fs');
 const path = require('path');
 const local = require('./local-client.js');
+const { NEVER_EXPIRE: KEEP_ALIVE } = require('./keep-alive.js');
 const { postJson } = require('./ollama-http.js');
 const { CASES } = require('./reasoning-bench-cases.js');
 
@@ -194,7 +195,7 @@ function extractMetrics(callResult) {
 async function measureLoad(model) {
   const t0 = Date.now();
   try {
-    const result = await postJson(`${OLLAMA_URL}/api/generate`, { model, prompt: 'hi', think: false, stream: false, keep_alive: '30m', options: { num_predict: 1 } }, 120_000);
+    const result = await postJson(`${OLLAMA_URL}/api/generate`, { model, prompt: 'hi', think: false, stream: false, keep_alive: KEEP_ALIVE, options: { num_predict: 1 } }, 120_000);
     return { loadDurationMs: result.load_duration != null ? result.load_duration / 1e6 : null, wallClockMs: Date.now() - t0, error: null };
   } catch (e) {
     return { loadDurationMs: null, wallClockMs: Date.now() - t0, error: e.message };
@@ -202,12 +203,11 @@ async function measureLoad(model) {
 }
 
 async function measureUnload(model) {
-  const t0 = Date.now();
   try {
-    await postJson(`${OLLAMA_URL}/api/generate`, { model, prompt: '', stream: false, keep_alive: 0 }, 60_000);
-    return { unloadDurationMs: Date.now() - t0, error: null };
+    // 2026-11-06 (owner: never unload a model): the benchmark no longer sends keep_alive:0. The field stays (null) so summaries and the printer keep working.
+    return { unloadDurationMs: null, error: null };
   } catch (e) {
-    return { unloadDurationMs: Date.now() - t0, error: e.message };
+    return { unloadDurationMs: null, error: e.message };
   }
 }
 

@@ -44,7 +44,7 @@ that the thing to remove.)
 | `tier` | no | positive number, billions of parameters. Defaults to the size parsed from `model` (`qwen3-vl:8b-instruct` -> 8); set it when the tag carries no size. Capability routing only compares tiers; a lane with an unknown tier is never reserved around |
 | `reserve` | no | `"auto"` (default: this lane is reserved for a source once the capability ledger shows it handles it), `"always"` (reserved for everything in its `taskClasses`, no evidence needed), or `false` (never reserve work for this lane) |
 | `reviewer` | no | `true` also runs a **review daemon** on this lane's GPU (`reviewer-<gpu>`, `scripts/review-runner.sh`), so its three CONFIRM/DENY votes go to this lane's Ollama instead of queueing behind the host GPU. Default `false`. The host lane always has the plain `reviewer`; the legacy P40 lane (not in the registry) opts in with `AGENT_MANAGER_P40_REVIEWER=true` in `agent-manager.env`. Needs a pipeline restart. See "Review daemons" below |
-| `provider` | no | `ollama` (default) or `cloud`. A **cloud lane** points at the cloud-providers gateway instead of a GPU and **requires** a non-empty `taskClasses`; it also requires `preempt` `never`, cannot have `reviewer: true`, and ignores `numCtx` / `numBatch`. See `docs/agents/cloud-lane.md` |
+| `provider` | no | `ollama` (default), `cloud` or `script`. A **cloud lane** points at the cloud-providers gateway instead of a GPU and **requires** a non-empty `taskClasses`; it also requires `preempt` `never`, cannot have `reviewer: true`, and ignores `numCtx` / `numBatch`. See `docs/agents/cloud-lane.md` A **script lane** (`script`, 2026-11-02) runs a script handler instead of a model: it is bounded like a cloud lane (non-empty `taskClasses`, `preempt` `never`, no reviewer, `numCtx`/`numBatch` ignored), `model` is optional (default `script`), and `ollamaUrl` is the service the script talks to; it is never health-probed, Forge-leased or offered to chat. |
 | `slow` | no | `true` for a categorically slower endpoint (the P40 is the model case): longer per-call timeout ceiling and watchdog zombie threshold, so a slow-but-alive lane is not killed mid-call. Default `false` |
 
 ## Behaviours worth knowing
@@ -179,6 +179,16 @@ Any worker lane (`worker-<gpu>`, including `worker-cloud`) can be switched off b
 - **Dashboard API.** `GET /api/instances` marks every worker lane with `switchable: true` and `disabled: true|false` (reviewers and the watchdog carry neither key); a worker switched off while it is still finishing a task shows its real status with `disabled: true`, and once idle its status is `disabled`. `POST /api/instances/<id>/enabled` with `{"enabled": true|false}` switches one worker (`python/dashboard/worker_switch.py` shells out to the node CLI so the rule lives once): 400 for a bad body or a non-worker id, 404 when switching OFF an id that is not a defined lane, always allowed when switching ON (clears a stale marker). The route only writes or removes the marker; it never starts, stops or restarts the pipeline.
 - **Workers tab button.** Every worker card has a **Turn off** / **Turn on** button (`python/dashboard/static/js/worker-switch-ui.js`; reviewers and the watchdog have none). Off dims the card. A worker that is still on a task shows **turning off after this task** and finishes it; an idle one shows **turning off…** until its next tick (seconds), then its status badge reads `disabled`. **Turn on** takes effect within about one tick, and the worker logs that it is back on. The button appears after the dashboard restarts onto code that has it (the Werkzeug reloader does that on its own when the Python files change). Failures show a toast with the server's reason.
 
+## Pausing a machine (2026-11-11)
+
+Besides the per-worker switch, two machine-wide pauses exist so a whole machine can stop claiming work, for example while someone is using the site that runs on it. They are marker files in the same directory as the per-worker switch: `_pause-node` (this machine) and `_pause-global` (the whole system; other machines receive it through their heartbeat reply, a later piece of the multi-node plan). The leading underscore means they can never be a worker id, so nothing that lists switched-off workers sees them.
+
+- **Content.** One JSON object `{scope, reason, source, setAt, expiresAt}`. `source` says who set it (`operator`, `dashboard`, `site-traffic`, `wok`); whoever clears a pause on behalf of an automatic source should clear only a marker with that source.
+- **Effect.** `isDisabled(id)` in `src/worker-switch.js` is true for every worker lane when either pause is active, so `scripts/local-worker.sh` needs no change: a paused machine's workers claim nothing, heartbeat `disabled`, and finish any task already in flight. The reviewers, the apply loop and the watchdog are not worker lanes and keep running.
+- **Expires and fails open.** A pause with an `expiresAt` in the past counts as not paused, and so does a missing, unreadable or malformed marker. An automatic source sets a short expiry and refreshes it, so a dead monitor can never leave a machine paused.
+- **Dashboard.** `GET /api/pause` (read in-process, never starts node), `POST /api/pause/<node|global>` with `{reason?, ttlMin?}` (source is recorded as `dashboard`) and `POST /api/resume/<node|global>`; the Workers tab shows a bar with **Pause this machine** / **Pause everything** (and the matching Resume buttons, with a note of who set the pause, why and until when) above the worker cards in both the list and the graph view. 'Pause everything' writes the local `_pause-global` marker; other machines receive it through their heartbeat reply (a later piece).
+- **CLI.** `node src/worker-switch.js pause <node|global> [--reason <text>] [--source <text>] [--ttl-min <n>]`, `resume <node|global>`, `pause-status` (JSON `{node, global, workers}`).
+
 ## Model overrides, model swaps and the health probe (2026-10-27)
 
 The Workers tab (and `POST /api/worker-models/<instance>`) can override the model one instance uses; it applies from that instance's next tick, no restart.
@@ -193,6 +203,19 @@ The Workers tab (and `POST /api/worker-models/<instance>`) can override the mode
   verdict, retried after the normal interval). A failure with the model resident, or with the endpoint unreachable, still degrades the lane.
 - **Two big models cannot share the 3090.** A trial of another model needs the worker AND the host `reviewer` on it (they share one Ollama), the chat and Forge
   sessions off the card (both evict it), and the old model unloaded explicitly (`keep_alive: 0`): `OLLAMA_KEEP_ALIVE=-1` pins it.
+
+## Script-handled sources (2026-11-02)
+
+A task source whose work is a script rather than a model-drafted diff (a tuning experiment, an archive, a ledger line) registers a handler with
+`registerScriptHandler(sourceName, fn)` (`src/script-handler-registry.js`; `fn(task, ctx)` returns `{outcome, summary, detail?}`, throwing is allowed).
+`draftTask()` in `src/local-draft.js` looks the handler up right after the pre-dispatch gate and BEFORE any draft attempt or model call. On success the
+result is stored on the task (`task.scriptResult`), the task gets `terminalDisposition: 'recorded'` and returns `{succeeded: true, recorded: true}`;
+`scripts/local-worker.sh` then moves it to `queue/done/` (blocked and needs-clarification keep priority). On a throw the draft fails with
+`script handler failed: <message>` and the worker's normal draft-failure accounting applies. A source with no handler is untouched.
+
+`recorded` is a terminal, stable disposition and releases `dependsOn` edges like `noop`. The lane that claims such tasks is a registry entry with
+`provider: "script"` (no model, no reviewer; see the entry-fields table); `lanes.example.json` ships a disabled example. The plugin that owns the source (llm-tuner's `tuning_experiment`) registers the handler and the lane's `taskClasses` names that source. Tests:
+`src/script-handler-registry.test.js`, `src/local-draft-script-handler.test.js`, `scripts/local-worker-recorded.test.js`.
 
 ## Tests
 

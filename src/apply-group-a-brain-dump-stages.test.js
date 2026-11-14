@@ -126,10 +126,22 @@ test('a matched project gets an adhoc task with prefetched paths; a machine-rais
   assert.equal(nm.queued(path.join(nm.base, 'pipeA', 'queue', 'needs-clarification'))[0].needsClarification.reason, 'no-match');
   anchor = { status: 'ambiguous', paths: ['src/b.js'], candidates: ['src/b.js', 'src/c.js'] };
   const am = world();
-  am.run({ belongsToProject: 'agent-manager' });
-  const at = am.queued(path.join(am.base, 'pipeA', 'queue', 'needs-clarification'))[0];
-  assert.equal(at.needsClarification.reason, 'ambiguous');
-  assert.deepEqual(at.promptContext.prefetchedPaths, ['src/b.js']);
+  const ambiguousResult = am.run({ belongsToProject: 'agent-manager' });
+  // Ambiguous tasks should either be scoped (queued to adhoc/) or have specific questions (queued to needs-clarification/)
+  const needsClarTasks = am.queued(path.join(am.base, 'pipeA', 'queue', 'needs-clarification'));
+  const adhocTasks = am.queued(path.join(am.base, 'pipeA', 'queue', 'adhoc'));
+  if (needsClarTasks.length > 0) {
+    const at = needsClarTasks[0];
+    assert.equal(at.needsClarification.reason, 'clarification-required');
+    assert.ok(Array.isArray(at.needsClarification.questions) && at.needsClarification.questions.length > 0, 'should have specific questions');
+    assert.deepEqual(at.promptContext.prefetchedPaths, ['src/b.js']);
+  } else if (adhocTasks.length > 0) {
+    const at = adhocTasks[0];
+    assert.ok(at.promptContext.scopedBody, 'scoped task should have scopedBody');
+    assert.deepEqual(at.promptContext.prefetchedPaths, ['src/b.js']);
+  } else {
+    assert.fail('ambiguous task should be queued to either needs-clarification or adhoc');
+  }
   anchor = { status: 'greenfield', paths: [] };
 });
 

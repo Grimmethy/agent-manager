@@ -9,6 +9,7 @@ const { resolveGraphPath, getSecondBrainDir } = require('./config.js');
 const { writeAtomicSync, writeJsonAtomicSync } = require('./atomic-write.js');
 const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-dump-existing-work.js');
 const { checkEntryTargets, isEnabled: targetCheckEnabled } = require('./brain-dump-target-check.js');
+const { checkBrainDumpDuplicate, isEnabled: duplicateCheckEnabled } = require('./lib/brain-dump-duplicate-check.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { normalizeTokens, jaccardSimilarity } = require('./text-similarity.js');
 const {
@@ -20,6 +21,7 @@ const {
   deriveBelongsToProject,
   isInvestigationFinding,
 } = require('./brain-dump-sort-classify.js');
+const { processAmbiguousBrainDump } = require('./scoped-clarification.js');
 
 function readProjectRegistry() {
   const registryPath = process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH || path.join(__dirname, '..', 'projects.json');
@@ -447,9 +449,41 @@ function buildAdhocTaskForEntry(ctx, matchedProject) {
     adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
     adhocTask.needsClarification = { reason: 'no-match' };
   } else if (anchorResult.status === 'ambiguous') {
-    adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
-    adhocTask.needsClarification = { reason: 'ambiguous', candidates: anchorResult.candidates };
-    if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+    // 2026-11-04 (brain-dump tasks stalling as 'ambiguous'): attempt to scope the task
+    // or generate specific questions instead of leaving it stuck with a generic signature.
+    // The task file may not exist yet (first time through), so we pass null for taskFile.
+    const clarificationResult = processAmbiguousBrainDump(
+      rawText,
+      adhocTask.title,
+      brainDumpEntryId,
+      path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification'),
+      null
+    );
+
+    if (clarificationResult.action === 'scope') {
+      // Successfully scoped: write the scoped body and queue to adhoc/
+      adhocTask.title = clarificationResult.scopedTask.title;
+      adhocTask.promptContext.scopedBody = clarificationResult.scopedTask.body;
+      adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'adhoc');
+      if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+    } else if (clarificationResult.action === 'escalate') {
+      // Escalate: task is stale or was previously marked ambiguous
+      adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'blocked');
+      adhocTask.needsClarification = {
+        reason: 'stale-clarification',
+        escalationReason: clarificationResult.reason,
+        candidates: anchorResult.candidates
+      };
+    } else {
+      // Generate specific questions
+      adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
+      adhocTask.needsClarification = {
+        reason: 'clarification-required',
+        questions: clarificationResult.questions,
+        candidates: anchorResult.candidates
+      };
+      if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+    }
   }
   // 'greenfield': adhocTask left exactly as constructed above, queues normally with
   // no prefetchedPaths field at all -- there is nothing to prefetch from yet.
@@ -634,6 +668,30 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
       linkedTo: existing.taskId,
       reason: `work for this brain-dump entry already exists: ${existing.taskId} (${existing.state}, matched by ${existing.how}) -- not queueing another task`,
     };
+  }
+
+  // Duplicate pre-queue check (2026-10-31, brain-dump-duplicate-check.js): an entry that duplicates another brain-dump entry
+  // (same cited file paths + first identifier) or an unmerged agent/* branch in the target repo is NOT turned into an adhoc
+  // task. It stays in Brain Dump with entry.duplicateOf set to the id/branch of the duplicate; sortAttempt is parked at the
+  // budget so brain_dump_sort does not pick it again. Kill switch: AGENT_MANAGER_BRAIN_DUMP_DUPLICATE_CHECK=false. Escape
+  // hatch: entry.duplicateOverride === true.
+  if (duplicateCheckEnabled()) {
+    // The target repo is known only when the sort named a registered project; without it the branch half is skipped (fails open), the entry half still runs.
+    const dupProject = result.belongsToProject ? readProjectRegistry().find((p) => p.label === result.belongsToProject) : null;
+    const dupCheck = checkBrainDumpDuplicate(entry, { brainDumpPath, repoRoot: dupProject ? dupProject.repoRoot : null });
+    if (dupCheck) {
+      entry.duplicateOf = dupCheck.duplicateOf;
+      entry.sortAttempt = Math.max(entry.sortAttempt || 0, 3);
+      fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+      writeJsonAtomicSync(brainDumpPath, data);
+      try { logPipelineEvent(pipelineDir, 'brain-dump-duplicate-check', { entryId: entry.id, serial: entry.serial ?? null, duplicateOf: dupCheck.duplicateOf, source: dupCheck.source, key: dupCheck.key }); } catch { /* best-effort log */ }
+      return {
+        skipped: true,
+        duplicateCheck: true,
+        linkedTo: dupCheck.duplicateOf,
+        reason: `brain-dump entry not queued: duplicates ${dupCheck.source} "${dupCheck.duplicateOf}" (entry.duplicateOf stamped; set duplicateOverride to force it)`,
+      };
+    }
   }
 
   // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code
