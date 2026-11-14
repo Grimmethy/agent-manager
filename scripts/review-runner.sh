@@ -254,6 +254,7 @@ while :; do
   # immediately after an 'approved' result; this script's single `while :; do ... sleep
   # 30; done` loop has no equivalent fast-repeat path, so processing the whole snapshot
   # per tick is what keeps a backlog from taking N*30s longer than it needs to).
+  # Review path is single-lane: the reviewer is always Ornith (see header, line 96), so no lane gate applies to this loop.
   for name in "${items[@]}"; do
     release_current_claim                                                      # the previous item's approve/block move is done by now -- see claim_review_item
     file="${review_dir}/${name}"
