@@ -88,6 +88,54 @@ test('workersCanSkipRender: nothing is skipped before a first draw or after the 
   assert.equal(run(ctx, 'workersCanSkipRender', '', true, fakeMain(true)), false);
 });
 
+const wpage = (over = {}, ages = 5) => ({ workers: [{ id: 'w1', state: 'idle', stage: 'plan', heartbeatAgeSeconds: ages, lastHeartbeat: 't' + ages, _fetchedAtMs: ages, ...over }], holds: [{ id: 'h1', checkedAgeS: ages, endedAgeMs: ages * 1000 }] });
+const sigOf = (ctx, p, u = ui) => run(ctx, 'workersRenderSignature', p, u);
+const skipAfter = (ctx, first, second, u2 = ui) => { run(ctx, 'rememberWorkersSignature', sigOf(ctx, first)); return run(ctx, 'workersCanSkipRender', sigOf(ctx, second, u2), true, fakeMain(true)); };
+
+test('workersCanSkipRender: a poll whose payloads differ only in ages skips the redraw', () => {
+  assert.equal(skipAfter(load(), wpage({}, 5), wpage({}, 9)), true);
+});
+
+test('workersCanSkipRender: a state change does not skip', () => {
+  assert.equal(skipAfter(load(), wpage({ state: 'idle' }), wpage({ state: 'failed' })), false);
+});
+
+test('workersCanSkipRender: a lowercase stage change does not skip', () => {
+  assert.equal(skipAfter(load(), wpage({ stage: 'plan' }), wpage({ stage: 'build' })), false);
+});
+
+test('workersCanSkipRender: an expanded-card change (expandedWorkerId) does not skip', () => {
+  assert.equal(skipAfter(load(), wpage(), wpage(), { ...ui, expanded: 'w1' }), false);
+});
+
+test('workersCanSkipRender: an empty signature from a failed fetch does not skip', () => {
+  const ctx = load();
+  run(ctx, 'rememberWorkersSignature', sigOf(ctx, wpage()));
+  assert.equal(sigOf(ctx, { ...wpage(), workers: null }), '');
+  assert.equal(run(ctx, 'workersCanSkipRender', '', true, fakeMain(true)), false);
+});
+
+test('workersCanSkipRender: an operator call (not a poll) does not skip', () => {
+  const ctx = load();
+  run(ctx, 'rememberWorkersSignature', sigOf(ctx, wpage()));
+  assert.equal(run(ctx, 'workersCanSkipRender', sigOf(ctx, wpage()), false, fakeMain(true)), false);
+});
+
+test('workersCanSkipRender: a mainEl without .worker-filter-bar does not skip', () => {
+  const ctx = load();
+  run(ctx, 'rememberWorkersSignature', sigOf(ctx, wpage()));
+  assert.equal(run(ctx, 'workersCanSkipRender', sigOf(ctx, wpage()), true, fakeMain(false)), false);
+});
+
+test('workersStripVolatile: leaves its input unchanged', () => {
+  const ctx = load();
+  const input = { workers: [{ id: 'w1', heartbeatAgeSeconds: 5, checkedAgeS: 2, lastHeartbeat: 't', _fetchedAtMs: 1, nested: { endedAgeMs: 3, keep: [{ ageX: 1, Age: 2, n: 1 }] } }] };
+  const before = JSON.stringify(input);
+  const out = json(run(ctx, 'workersStripVolatile', input));
+  assert.equal(JSON.stringify(input), before);
+  assert.deepEqual(out, { workers: [{ id: 'w1', nested: { keep: [{ ageX: 1, n: 1 }] } }] });
+});
+
 test('wiring: index.html loads the module right after workers-tab.js and renderWorkers asks before drawing and remembers after', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', '..', 'templates', 'index.html'), 'utf8');
   const tab = html.indexOf('/static/js/workers-tab.js'), sig = html.indexOf('/static/js/workers-render-signature.js');
