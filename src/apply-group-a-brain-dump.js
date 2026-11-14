@@ -143,6 +143,20 @@ function recordDuplicateGateDismissal(entry, { noteId, rejectedCandidate, reason
   return reason;
 }
 
+function buildDismissalRecord(entryId, candidate, reason, existingTitles) {
+  const c = String(candidate || '');
+  const cTokens = normalizeTokens(c);
+  const titles = Array.isArray(existingTitles) ? existingTitles : [];
+  // Best Jaccard against any queued title. A dismissed candidate matched none at the
+  // validation bar, so no matchedTitle is recorded.
+  let similarity = 0;
+  for (const title of titles) {
+    const s = jaccardSimilarity(cTokens, normalizeTokens(String(title || '')));
+    if (s > similarity) similarity = s;
+  }
+  return { entryId, candidate: c, reason, similarity };
+}
+
 function allNoteBasenames(secondBrainDir) {
   const names = new Set();
   const walk = (abs, depth) => {
@@ -480,6 +494,7 @@ function buildAdhocTaskForEntry(ctx, matchedProject) {
 
 // Stage: the possible-duplicate gate. Returns { skip } (a recoverable skip on the first flag) or { adhocDir } (possibly redirected to needs-clarification).
 function applyDuplicateGate(ctx, matchedProject, built) {
+  const dismissals = [];
   const { data, entry, result, rawText, brainDumpEntryId, existingQueuedTitles, brainDumpPath } = ctx;
   const { adhocTask } = built;
   let { adhocDir } = built;
@@ -508,6 +523,7 @@ function applyDuplicateGate(ctx, matchedProject, built) {
       // (a) valid candidate-list match -- trust it.
     } else if (isGroundedInInput(result.possibleDuplicateOf, rawText)) {
       // HUB0115 1/3 -- record the dismissal (pure side effect, after the decision).
+      dismissals.push(buildDismissalRecord(brainDumpEntryId, result.possibleDuplicateOf, 'phrase-echo', existingQueuedTitles));
       recordDuplicateGateDismissal(entry, {
         noteId: brainDumpEntryId,
         rejectedCandidate: result.possibleDuplicateOf,
@@ -517,6 +533,7 @@ function applyDuplicateGate(ctx, matchedProject, built) {
       result.possibleDuplicateOf = null;
     } else {
       // HUB0115 1/3 -- record the dismissal (pure side effect, after the decision).
+      dismissals.push(buildDismissalRecord(brainDumpEntryId, result.possibleDuplicateOf, 'ungrounded', existingQueuedTitles));
       recordDuplicateGateDismissal(entry, {
         noteId: brainDumpEntryId,
         rejectedCandidate: result.possibleDuplicateOf,
@@ -549,7 +566,7 @@ function applyDuplicateGate(ctx, matchedProject, built) {
       entry.duplicateGateAttempts = duplicateGateAttempts + 1;
       console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} matched against "${result.possibleDuplicateOf}" (duplicateGateAttempts=${entry.duplicateGateAttempts}) -- retrying with a fresh classification pass instead of routing to needs-clarification`);
       return { skip: recoverableSortSkip(data, entry, brainDumpPath,
-        `possible duplicate of "${result.possibleDuplicateOf}" on the first flag -- retrying with a fresh classification pass`) };
+        `possible duplicate of "${result.possibleDuplicateOf}" on the first flag -- retrying with a fresh classification pass`), dismissals, dismissalCount: dismissals.length };
     }
     console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} matched against "${result.possibleDuplicateOf}" again (duplicateGateAttempts=${duplicateGateAttempts}) -- routing to needs-clarification`);
     adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
@@ -567,7 +584,7 @@ function applyDuplicateGate(ctx, matchedProject, built) {
     };
   }
 
-  return { adhocDir };
+  return { adhocDir, dismissals, dismissalCount: dismissals.length };
 }
 
 // Stage: write the adhoc task into its queue dir and mark the brain-dump entry actioned.
