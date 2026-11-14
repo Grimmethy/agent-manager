@@ -155,6 +155,110 @@ class TestDiscardBranch(unittest.TestCase):
             for p in patches:
                 p.stop()
 
+    # --- stubbed _run_git tests (2026-11-04, HUB0256) -------------------------------------------------------
+    # These tests stub app._run_git to simulate git push outcomes without touching a real remote.
+    # They verify the route's response shape and status codes for the three key scenarios:
+    # 1. Permission denied (403)
+    # 2. Normal success
+    # 3. 'Already gone' success (ref already deleted)
+
+    def test_discard_returns_403_with_reasonCode_no_push_access_on_permission_error(self):
+        """When git push raises RuntimeError with 403/permission markers, the route maps it to 403 with reasonCode 'no-push-access'."""
+        repo = make_repo_with_pushed_branch("agent/discard-test-6")
+        patches = self._patches(repo)
+
+        def _stubbed_run_git(args, cwd, timeout=30):
+            """Only fail on the discard push; let list_unmerged_branches' rev-parse succeed."""
+            if isinstance(args, list) and len(args) >= 2 and args[0] == "push" and "--delete" in args:
+                raise RuntimeError("remote: Permission to user@repo.git denied (HTTP 403). Authentication failed.")
+            return "0" * 40
+
+        def _stubbed_list_unmerged_branches(force=False):
+            return [{"branch": "agent/discard-test-6", "headSha": "0" * 40, "mainBranch": "main"}]
+
+        run_git_patch = mock.patch.object(app, "_run_git", side_effect=_stubbed_run_git)
+        list_patch = mock.patch.object(app, "list_unmerged_branches", side_effect=_stubbed_list_unmerged_branches)
+        patches.extend([run_git_patch, list_patch])
+        for p in patches:
+            p.start()
+        try:
+            res = self.client.post("/api/git/branches/agent%2Fdiscard-test-6/discard")
+            self.assertEqual(res.status_code, 403)
+            body = res.get_json()
+            self.assertFalse(body["succeeded"])
+            self.assertEqual(body["reasonCode"], "no-push-access")
+            self.assertEqual(body["reason"], "Push permission denied")
+            # Nothing should be archived when the remote delete failed.
+            self.assertFalse((repo / "queue" / "done" / "_archived_no_action" / "discard-test-6.json").exists())
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_discard_returns_200_with_succeeded_true_on_normal_success(self):
+        """When git push succeeds normally, the route returns 200 with succeeded=true and taskArchived=true."""
+        repo = make_repo_with_pushed_branch("agent/discard-test-7")
+        task_id = "discard-test-7"
+        (repo / "queue" / "done" / f"{task_id}.json").write_text(json.dumps({
+            "id": task_id, "domain": "default", "source": "manual", "title": "t", "history": [],
+        }))
+        patches = self._patches(repo)
+
+        def _stubbed_run_git(args, cwd, timeout=30):
+            return "0" * 40
+
+        def _stubbed_list_unmerged_branches(force=False):
+            return [{"branch": "agent/discard-test-7", "headSha": "0" * 40, "mainBranch": "main"}]
+
+        run_git_patch = mock.patch.object(app, "_run_git", side_effect=_stubbed_run_git)
+        list_patch = mock.patch.object(app, "list_unmerged_branches", side_effect=_stubbed_list_unmerged_branches)
+        patches.extend([run_git_patch, list_patch])
+        for p in patches:
+            p.start()
+        try:
+            res = self.client.post("/api/git/branches/agent%2Fdiscard-test-7/discard")
+            self.assertEqual(res.status_code, 200)
+            body = res.get_json()
+            self.assertTrue(body["succeeded"])
+            self.assertTrue(body["taskArchived"])
+            # The task file should be moved to _archived_no_action.
+            self.assertFalse((repo / "queue" / "done" / f"{task_id}.json").exists())
+            self.assertTrue((repo / "queue" / "done" / "_archived_no_action" / f"{task_id}.json").exists())
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_discard_returns_200_with_succeeded_true_on_already_gone(self):
+        """When git push raises RuntimeError with 'remote ref does not exist', the route treats it as success (the goal is already achieved)."""
+        repo = make_repo_with_pushed_branch("agent/discard-test-8")
+        task_id = "discard-test-8"
+        (repo / "queue" / "done" / f"{task_id}.json").write_text(json.dumps({
+            "id": task_id, "domain": "default", "source": "manual", "title": "t", "history": [],
+        }))
+        patches = self._patches(repo)
+
+        def _stubbed_run_git(args, cwd, timeout=30):
+            if isinstance(args, list) and len(args) >= 2 and args[0] == "push" and "--delete" in args:
+                raise RuntimeError("error: remote ref does not exist agent/discard-test-8")
+            return "0" * 40
+
+        def _stubbed_list_unmerged_branches(force=False):
+            return [{"branch": "agent/discard-test-8", "headSha": "0" * 40, "mainBranch": "main"}]
+
+        run_git_patch = mock.patch.object(app, "_run_git", side_effect=_stubbed_run_git)
+        list_patch = mock.patch.object(app, "list_unmerged_branches", side_effect=_stubbed_list_unmerged_branches)
+        patches.extend([run_git_patch, list_patch])
+        for p in patches:
+            p.start()
+        try:
+            res = self.client.post("/api/git/branches/agent%2Fdiscard-test-8/discard")
+            self.assertEqual(res.status_code, 200)
+            body = res.get_json()
+            self.assertTrue(body["succeeded"])
+            self.assertTrue(body["taskArchived"])
+        finally:
+            for p in patches:
+                p.stop()
+
 
     # --- local-branch cleanup (2026-09-19) ---------------------------------------------------------------
     # The discard used to delete only the REMOTE branch. The apply repo is usually the pipeline's own
