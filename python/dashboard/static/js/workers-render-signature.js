@@ -7,7 +7,7 @@
 let lastWorkersSignature = '';
 
 // Keys that only say how old something is (suffix Age, AgeS, AgeSeconds or AgeMs; case-sensitive) or when a heartbeat last landed.
-const WORKERS_VOLATILE_KEY = /(Age|AgeS|AgeSeconds|AgeMs)$/;
+const WORKERS_VOLATILE_KEY = /(Age|AgeS|AgeSeconds|AgeMs)$|^age(S|Seconds|Ms)?$/;
 const WORKERS_VOLATILE_EXACT = new Set(['lastHeartbeat', '_fetchedAtMs']);
 
 function workersIsVolatileKey(key) {

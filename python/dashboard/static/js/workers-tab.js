@@ -309,7 +309,7 @@ async function renderWorkers(isPoll) {
   });
   // Nothing shown has changed since the last draw (only ages): a poll/event-driven redraw would rebuild the same page, so leave it alone (workers-render-signature.js).
   const renderSignature = !assignableFetchFailed && typeof workersRenderSignature === 'function' ? workersRenderSignature(
-    { instances, workerModels, costSummary, recentTasks: expandedWorkerId ? recentTasks : 'not-expanded', cloudMeter, stalledWorker, verifierWorker, needsworkWorker, contextMapWorker, contextMemoryWorker, contextImpactWorker, pipelineOpsWorkers, assignableByInstance },
+    { instances, workerModels, costSummary, recentTasks, cloudMeter, stalledWorker, verifierWorker, needsworkWorker, contextMapWorker, contextMemoryWorker, contextImpactWorker, pipelineOpsWorkers, assignableByInstance },
     { expanded: expandedWorkerId, pinned: pendingWorkerAssign, chosen: selectedWorkerTaskType, completed: completedTasksLog.length, newest: completedTasksLog[0] ? (completedTasksLog[0].taskId || completedTasksLog[0].id || completedTasksLog[0].endedAt || null) : null }) : '';
   if (typeof workersCanSkipRender === 'function' && workersCanSkipRender(renderSignature, isPoll, main)) return;
   const filterBar = buildWorkersFilterBarHtml(workerModels);
