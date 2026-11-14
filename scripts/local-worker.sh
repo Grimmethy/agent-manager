@@ -416,6 +416,15 @@ process_drafting_file() {
         // process producing truly zero output is itself strong evidence of an external
         // kill/crash, not a content failure the model produced -- treated as infra-shaped
         // here for exactly that reason.
+        // Lane attribution (HUB0164 3/4): a failure is lane-attributable only when the module says so.
+        // Any load or parse error leaves laneAttributable false, so the bounded path behaves as before.
+        let laneAttributable = false;
+        let laneRecorder = null;
+        try {
+          const attrMod = require(process.argv[5]);
+          laneRecorder = attrMod.recordLaneFailure;
+          laneAttributable = attrMod.classifyInfraFailure({ failureText: draftResult, laneId: process.argv[6], primaryLaneId: process.argv[7] }).laneAttributable === true;
+        } catch (e) { laneAttributable = false; }
         const isInfra = INFRA_FAILURE_PATTERN.test(draftResult || "") || !(draftResult || "").trim();
         const infraRequeueCount = o.infraRequeueCount || 0;
         o.history = o.history || [];
@@ -428,7 +437,19 @@ process_drafting_file() {
           });
           fs.writeFileSync(p, JSON.stringify(o, null, 2));
           console.log("requeue");
-        } else if (isInfra && infraRequeueCount < infraRequeueLimit) {
+        } else if (laneAttributable === true) {
+          // Lane-attributable infra failure: record it against the failing lane and requeue
+          // without charging this task's infraRequeueCount.
+          try { if (laneRecorder) laneRecorder(process.argv[6], { reason: draftResult, instancesDir: process.argv[8] }); } catch (e) { /* best-effort */ }
+          o.draftFailureCount = 0;
+          o.history.push({
+            stage: "requeued",
+            at: new Date().toISOString(),
+            detail: `draft call failed ${failureCount} times in a row on an infra failure attributable to lane ${process.argv[6]} (most recent: ${draftResult}) -- requeued without counting against this task`,
+          });
+          fs.writeFileSync(p, JSON.stringify(o, null, 2));
+          console.log("requeue");
+        } else if (isInfra && laneAttributable === false && infraRequeueCount < infraRequeueLimit) {
           o.infraRequeueCount = infraRequeueCount + 1;
           o.draftFailureCount = 0;
           o.history.push({
@@ -448,7 +469,7 @@ process_drafting_file() {
           fs.writeFileSync(p, JSON.stringify(o, null, 2));
           console.log("block");
         }
-      ' "$wpath" "$draft_result" "$failure_count" "${DRAFT_INFRA_REQUEUE_LIMIT:-3}")"
+      ' "$wpath" "$draft_result" "$failure_count" "${DRAFT_INFRA_REQUEUE_LIMIT:-3}" "${PACKAGE_SRC_DIR}/infra-attribution.js" "$INSTANCE_ID" "${AGENT_MANAGER_PRIMARY_LANE:-worker-0}" "$INSTANCES_DIR")"
 
       if [[ "$action" == "requeue" ]]; then
         mkdir -p "${QUEUE_DIR}/pending" >/dev/null 2>&1
