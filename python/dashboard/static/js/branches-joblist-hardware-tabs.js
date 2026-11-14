@@ -164,9 +164,29 @@ function wireBranchCard(card) {
       try {
         const resp = await fetch(branchActionUrl(branch, 'discard', project), { method: 'POST' });
         const result = await resp.json();
-        if (!resp.ok || !result.succeeded) throw new Error(result.reason || `HTTP ${resp.status}`);
+        if (!resp.ok || !result.succeeded) {
+          const err = new Error(result.reason || `HTTP ${resp.status}`);
+          err.reasonCode = result.reasonCode;
+          throw err;
+        }
         await renderBranchesTab();
       } catch (e) {
+        if (e.reasonCode === 'no-push-access') {
+          // Keep the card in place (a full re-render would wipe this notice) and
+          // re-enable the button so the user can see the failure in context.
+          discardBtn.disabled = false;
+          discardBtn.textContent = 'Discard';
+          const card = discardBtn.closest('.worker-card');
+          if (card && !card.querySelector('[data-discard-notice]')) {
+            const note = document.createElement('div');
+            note.className = 'meta';
+            note.dataset.discardNotice = 'no-push-access';
+            note.style.color = 'var(--bad, #c00)';
+            note.textContent = "You don't have push access to this repository — the discard was rejected by the remote.";
+            card.appendChild(note);
+          }
+          return;
+        }
         alert('Discard failed: ' + e.message);
         await renderBranchesTab();
       }
