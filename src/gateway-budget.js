@@ -49,6 +49,22 @@ function budgetFromMeter(meter) {
   return { perHour, used, remaining, resetsInSec, exceeded: remaining <= 0 };
 }
 
+// A gateway 429 reason string (`ollama http 429: <json body>`) -> {budget: true, resetsInSec} when the hourly token budget is what refused the request, else
+// {budget: false}. Pure: no logging, timers or file writes.
+function isTokenBudgetRejection(reason) {
+  if (typeof reason !== 'string') return { budget: false };
+  const PREFIX = 'ollama http 429:';
+  if (!reason.startsWith(PREFIX)) return { budget: false };
+  let parsed;
+  try { parsed = JSON.parse(reason.slice(PREFIX.length)); } catch (e) { return { budget: false }; }
+  if (parsed?.error !== 'hourly token budget reached') return { budget: false };
+  const fromBudget = Number(parsed.tokenBudget?.resetsInSec);
+  if (Number.isFinite(fromBudget)) return { budget: true, resetsInSec: fromBudget };
+  const retryAfter = Number(parsed['retry-after']);
+  if (Number.isFinite(retryAfter)) return { budget: true, resetsInSec: retryAfter };
+  return { budget: true, resetsInSec: undefined };
+}
+
 // GET <origin of url>/meter as parsed JSON, or null for anything else (never throws).
 function fetchMeter(url, timeoutMs = DEFAULT_TIMEOUT_MS) {
   return new Promise((resolve) => {
@@ -122,4 +138,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 }
 
-module.exports = { stateDir, budgetFromMeter, fetchMeter, recordHit, describe, checkEndpoint, main, EXIT_OK, EXIT_USAGE, EXIT_BUDGET };
+module.exports = { stateDir, budgetFromMeter, isTokenBudgetRejection, fetchMeter, recordHit, describe, checkEndpoint, main, EXIT_OK, EXIT_USAGE, EXIT_BUDGET };

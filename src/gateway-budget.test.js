@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
-const { stateDir, budgetFromMeter, fetchMeter, recordHit, describe, checkEndpoint, main, EXIT_OK, EXIT_USAGE, EXIT_BUDGET } = require('./gateway-budget.js');
+const { stateDir, budgetFromMeter, isTokenBudgetRejection, fetchMeter, recordHit, describe, checkEndpoint, main, EXIT_OK, EXIT_USAGE, EXIT_BUDGET } = require('./gateway-budget.js');
 
 const T0 = Date.UTC(2026, 10, 11, 18, 0, 0);
 const SPENT = { tokenBudget: { perHour: 1500000, used: 1518237, remaining: -18237, resetsInSec: 1196 } };
@@ -183,4 +183,38 @@ test('main: usage errors exit 2 and a real gateway over budget exits 3', async (
   try {
     assert.equal(await main(['check', g.url], env, { send: async () => {}, out: () => {} }), EXIT_BUDGET);
   } finally { await g.close(); }
+});
+
+test('isTokenBudgetRejection reads resetsInSec from the body tokenBudget', () => {
+  const body = 'ollama http 429: ' + JSON.stringify({ error: 'hourly token budget reached', tokenBudget: { resetsInSec: 42 } });
+  assert.deepEqual(isTokenBudgetRejection(body), { budget: true, resetsInSec: 42 });
+});
+
+test('isTokenBudgetRejection falls back to retry-after when the body has no tokenBudget resetsInSec', () => {
+  const body = 'ollama http 429: ' + JSON.stringify({ error: 'hourly token budget reached', 'retry-after': 17 });
+  assert.deepEqual(isTokenBudgetRejection(body), { budget: true, resetsInSec: 17 });
+});
+
+test('isTokenBudgetRejection rejects a wrong prefix', () => {
+  const reason = 'ollama http 500: ' + JSON.stringify({ error: 'hourly token budget reached' });
+  assert.deepEqual(isTokenBudgetRejection(reason), { budget: false });
+});
+
+test('isTokenBudgetRejection rejects a different error value', () => {
+  const reason = 'ollama http 429: ' + JSON.stringify({ error: 'rate limited' });
+  assert.deepEqual(isTokenBudgetRejection(reason), { budget: false });
+});
+
+test('isTokenBudgetRejection rejects malformed JSON without throwing', () => {
+  assert.deepEqual(isTokenBudgetRejection('ollama http 429: {oops'), { budget: false });
+});
+
+test('isTokenBudgetRejection rejects non-string input without throwing', () => {
+  for (const bad of [undefined, null, 5, {}]) assert.deepEqual(isTokenBudgetRejection(bad), { budget: false });
+});
+
+test('isTokenBudgetRejection with neither numeric source reports budget but an undefined resetsInSec', () => {
+  const r = isTokenBudgetRejection('ollama http 429: ' + JSON.stringify({ error: 'hourly token budget reached' }));
+  assert.equal(r.budget, true);
+  assert.equal(r.resetsInSec, undefined);
 });
