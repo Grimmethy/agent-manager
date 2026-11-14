@@ -1587,6 +1587,14 @@ test('a task without the deterministicApply marker never triggers the script-ext
   });
 });
 
+test('silent-catch plan cap: a dismissed plan over the cap is truncated, a genuine finding is never capped', () => {
+  const { capPlanStageOutput, SILENT_CATCH_PLAN_MAX_CHARS } = require('./silent-catch-plan-cap');
+  const long = 'a'.repeat(SILENT_CATCH_PLAN_MAX_CHARS + 500);
+  assert.equal(capPlanStageOutput(long, 'silent-catch-block', 'dismiss').length, SILENT_CATCH_PLAN_MAX_CHARS);
+  assert.equal(capPlanStageOutput(long, 'silent-catch-block', null), long, 'a genuine silent-catch finding must never be capped');
+  assert.equal(capPlanStageOutput('short plan', 'silent-catch-block', 'dismiss'), 'short plan');
+});
+
 // The require.main CLI-guard regression test that used to live here (2026-09-14,
 // screaminggoatclubmt) moved to agent-manager-hygiene/src/decompose-node-module.test.js
 // with decompose-node-module.js itself (S4a of the hub-tasks extraction, 2026-09-24) --

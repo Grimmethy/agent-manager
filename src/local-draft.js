@@ -714,6 +714,20 @@ const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) 
 // degenerate planResult never reaches here -- the `!planResult.degenerate` in the re-roll
 // condition below stays as the unit-test contract that a degenerate input simply skips
 // the re-roll.
+// Plan-stage cap for silent-catch-block dismissals (see silent-catch-plan-cap.js). Only an
+// observability_review finding that the review already dismissed counts as an expected
+// dismissal; a bare silent-catch-block rule never does, so a genuine finding's plan is never
+// truncated. Logs 'plan-done-capped' only when the text actually shrinks.
+function capPlanForTask(task, text, appendHistoryEvent) {
+  const ruleId = (task.promptContext && (task.promptContext.originalRule || task.promptContext.rule)) || '';
+  const expected = (task.source === 'observability_review' && task.reviewDisposition === 'dismissed') ? 'dismiss' : null;
+  const capped = require('./silent-catch-plan-cap').capPlanStageOutput(text, ruleId, expected);
+  if (capped.length < text.length) {
+    appendHistoryEvent(task, 'plan-done-capped', `ruleId=${ruleId} expectedDisposition=${expected} originalLength=${text.length} cappedLength=${capped.length}`);
+  }
+  return capped;
+}
+
 async function attemptSeedReroll({
   planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task,
 }) {
@@ -738,14 +752,14 @@ async function attemptSeedReroll({
   if (stillThin && seedPlan) {
     // Thin rolls, but a real plan from a prior attempt exists -- reuse it verbatim rather
     // than hand the implement tiers a stub with no map.
-    task.planResponse = seedPlan;
+    task.planResponse = capPlanForTask(task, seedPlan, appendHistoryEvent);
     task.lastGoodPlan = seedPlan;
     recordPlan(attempt, { text: seedPlan, attempts: totalAttempts, reRolled, seededFromPrior: true });
     appendHistoryEvent(task, 'plan-done', `${totalAttempts} attempt(s), reused a prior attempt's plan (${seedPlan.length} chars) after ${reRolled ? 'two thin rolls' : 'a thin roll'}`);
     return { planResult, totalAttempts, reRolled, stillThin, seededFromPrior: true };
   }
 
-  task.planResponse = planResult.response;
+  task.planResponse = capPlanForTask(task, planResult.response, appendHistoryEvent);
   // Fix 2b: keep the last good plan outside draftAttempts (so record collapse can't drop
   // it -- it is the seed source for any later retry). Never store a thin one.
   if (!stillThin) task.lastGoodPlan = planResult.response;
@@ -1054,7 +1068,7 @@ async function runPlanPass(task, {
     }
     // A degenerate re-roll carries no usable plan -- keep the previous one.
     if (!reRoll.degenerate) {
-      task.planResponse = reRoll.response;
+      task.planResponse = capPlanForTask(task, reRoll.response, appendHistoryEvent);
       // Keep the seed source (lastGoodPlan) consistent with the plan we now accept.
       if (!planIsThin(reRoll.response)) task.lastGoodPlan = reRoll.response;
     }
