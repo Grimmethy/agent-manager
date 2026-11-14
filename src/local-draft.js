@@ -69,6 +69,7 @@ const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.
 const { checkConflict } = require('./conflict-check.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
+const { realFilesOf } = require('./deep-dive-grounding-check.js');
 const { getScriptHandler } = require('./script-handler-registry.js');
 const { getPreDispatchGate } = require('./deterministic-recheck-registry.js');
 const { buildGateFalsePositiveDraft } = require('./lib/gate-verdict.js');
@@ -1402,10 +1403,18 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   // empty implementResponse auto-approves with zero further local-model spend -- the
   // exact outcome a compliant model would have produced anyway.
   const skipImplementOnNoHits = getRegisteredSource(resolveSourceName(task))?.skipImplementWhenNoHarnessHits;
-  if (skipImplementOnNoHits && Array.isArray(task.promptContext.harnessHits) && task.promptContext.harnessHits.length === 0) {
+  const skipNoRealFiles = getRegisteredSource(resolveSourceName(task))?.skipImplementWhenNoRealFiles;
+  const hitsSkip = !!(skipImplementOnNoHits && Array.isArray(task.promptContext.harnessHits) && task.promptContext.harnessHits.length === 0);
+  const realFilesSkip = !hitsSkip && !!skipNoRealFiles && realFilesOf(task).length === 0;
+  if (hitsSkip || realFilesSkip) {
+    const skipNote = hitsSkip
+      ? 'deterministic empty (harness search found zero real matches)'
+      : 'deterministic empty (no real file content fetched -- implement call skipped)';
     task.implementResponse = '';
-    recordImplement(attempt, { note: 'deterministic empty (harness search found zero real matches)' });
-    appendHistoryEvent(task, 'implement-done', 'deterministic empty (harness search found zero real matches -- implement call skipped, not left to the model to follow the empty-string instruction)');
+    recordImplement(attempt, { note: skipNote });
+    appendHistoryEvent(task, 'implement-done', hitsSkip
+      ? 'deterministic empty (harness search found zero real matches -- implement call skipped, not left to the model to follow the empty-string instruction)'
+      : skipNote + ' -- implement call skipped');
     concludeDraft(task);
     return { done: true, result: { succeeded: true, blocked: false } };
   }
