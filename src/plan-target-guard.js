@@ -180,7 +180,7 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
       }
     }
     
-    if (explicitTypes.get(entry.claimedPath) === 'create') {
+    if (explicitTypes.get(entry.claimedPath) === 'create' || (entry.exists === false && isDeclaredCreateTarget(planText, entry.claimedPath, taskTextOf(task)))) {
       createPaths.push(effectivePath);
     } else {
       modifyPaths.push(effectivePath);
@@ -223,7 +223,12 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
   const paths = resolvedMissing.map((entry) => entry.effectivePath);
   
   // 2026-11-08: include actionable feedback suggesting to mark as create target
-  const feedback = ' -- mark as a create target (e.g. "create `' + paths[0] + '`)") or correct the path';
+  // Ambiguous: a bare name matched more than one real file. List the candidates so the operator can pick one.
+  const ambiguous = resolvedMissing.filter((e) => Array.isArray(e.candidates) && e.candidates.length > 1);
+  const candidateNote = ambiguous.length
+    ? ' -- ambiguous, candidate paths: ' + ambiguous.map((e) => e.claimedPath + ' => ' + e.candidates.map((c) => c.split(repoRoot.replace(/\/$/, '') + '/').join('')).join(' | ')).join('; ')
+    : '';
+  const feedback = ' -- mark as a create target (e.g. "create `' + paths[0] + '`)") or correct the path' + candidateNote;
   
   return {
     blocked: true,
