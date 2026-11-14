@@ -86,6 +86,20 @@ function mergeNoticeText(result) {
   return parts.length ? 'Merged, but not everything finished:\n\n' + parts.join('\n\n') : '';
 }
 
+// Helper (2026-11-14, HUB0256-2/3): render a plain message for discard failures,
+// with a special path for no-push-access so the user knows it's a permission issue,
+// not a generic git error.
+function formatDiscardResponse(result, resp) {
+  if (result.reasonCode === 'no-push-access') {
+    return (
+      'Discard failed: you don\'t have write access to this repository. ' +
+      'The remote rejected the push (403). Delete the remote branch manually ' +
+      'or ask a maintainer for push access.'
+    );
+  }
+  return result.reason || `HTTP ${resp.status}`;
+}
+
 function wireBranchCard(card) {
   card.onclick = (e) => {
     // Don't hijack the Merge/Discard buttons' own clicks -- each has its own handler
@@ -171,23 +185,13 @@ function wireBranchCard(card) {
         }
         await renderBranchesTab();
       } catch (e) {
-        if (e.reasonCode === 'no-push-access') {
-          // Keep the card in place (a full re-render would wipe this notice) and
-          // re-enable the button so the user can see the failure in context.
-          discardBtn.disabled = false;
-          discardBtn.textContent = 'Discard';
-          const card = discardBtn.closest('.worker-card');
-          if (card && !card.querySelector('[data-discard-notice]')) {
-            const note = document.createElement('div');
-            note.className = 'meta';
-            note.dataset.discardNotice = 'no-push-access';
-            note.style.color = 'var(--bad, #c00)';
-            note.textContent = "You don't have push access to this repository — the discard was rejected by the remote.";
-            card.appendChild(note);
-          }
-          return;
+        const msg = formatDiscardResponse(e.reasonCode === 'no-push-access' ? e : { reasonCode: undefined, reason: e.message }, resp);
+        if (msg) {
+          alert(msg);
         }
-        alert('Discard failed: ' + e.message);
+        // Keep the card in place and re-enable the button so the user sees the failure in context.
+        discardBtn.disabled = false;
+        discardBtn.textContent = 'Discard';
         await renderBranchesTab();
       }
     };
