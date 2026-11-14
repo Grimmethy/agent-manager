@@ -61,18 +61,13 @@ async function setMachinePause(scope, paused) {
   return true;
 }
 
-async function renderMachinePauseBar(root) {
-  if (!root || typeof root.querySelector !== 'function' || typeof root.insertAdjacentHTML !== 'function') return;
-  let status = null;
-  try {
-    const res = await fetch('/api/pause');
-    if (res.ok) status = await res.json();
-  } catch (e) {
-    return; // fail soft: no bar when the status cannot be read
-  }
+// The bar as it was last drawn. renderWorkers() replaces all of #main on every workers event, which throws the bar away; the bar is put back from this at once, before /api/pause
+// answers, so it does not vanish and reappear on every redraw (2026-11-13: the Workers tab redrew every ~1.7 s while the lanes cycled and the bar flickered each time).
+let machinePauseLastHtml = '';
+
+function paintMachinePauseBar(root, html) {
   const old = root.querySelector('.machine-pause-bar');
   if (old) old.remove();
-  const html = buildMachinePauseHtml(status);
   if (!html) return;
   root.insertAdjacentHTML('afterbegin', html);
   root.querySelectorAll('.machine-pause-btn').forEach((btn) => {
@@ -82,4 +77,20 @@ async function renderMachinePauseBar(root) {
       setMachinePause(btn.dataset.scope, btn.dataset.nextPaused === 'true');
     };
   });
+}
+
+async function renderMachinePauseBar(root) {
+  if (!root || typeof root.querySelector !== 'function' || typeof root.insertAdjacentHTML !== 'function') return;
+  const shown = machinePauseLastHtml;
+  if (shown) paintMachinePauseBar(root, shown);
+  let status = null;
+  try {
+    const res = await fetch('/api/pause');
+    if (res.ok) status = await res.json();
+  } catch (e) {
+    return; // fail soft: the bar stays as drawn (none when there was none), no error
+  }
+  const html = buildMachinePauseHtml(status);
+  machinePauseLastHtml = html;
+  if (html !== shown || !root.querySelector('.machine-pause-bar')) paintMachinePauseBar(root, html);
 }

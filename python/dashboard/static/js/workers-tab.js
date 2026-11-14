@@ -191,6 +191,19 @@ async function refreshNewestCompletedTasks() {
   }
 }
 
+// The Workers tab's top bar: the view toggle and the Pause Claude checkbox (moved out of renderWorkers to keep it under its size-ratchet cap).
+function buildWorkersFilterBarHtml(workerModels) {
+  return `
+    <div class="worker-filter-bar" style="margin-bottom:12px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px">
+      ${typeof workersViewToggleHtml === 'function' ? workersViewToggleHtml('cards') : '<div></div>'}
+      <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
+        <input type="checkbox" id="claude-pause-toggle" style="margin:0" ${workerModels.claudePaused ? 'checked' : ''}>
+        Pause Claude (preserve subscription tokens)
+      </label>
+    </div>
+  `;
+}
+
 // isPoll (2026-09-07, Grimmethy: "please fix the dropdown reset on poll thing, that
 // is extraordinarily irritating and has bit me several times"): the 5s refresh()
 // cycle (index.html's renderMain(), 'workers' branch) used to call this unconditionally,
@@ -292,15 +305,12 @@ async function renderWorkers(isPoll) {
       delete pendingWorkerAssign[inst.instanceId];
     }
   });
-  const filterBar = `
-    <div class="worker-filter-bar" style="margin-bottom:12px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px">
-      ${typeof workersViewToggleHtml === 'function' ? workersViewToggleHtml('cards') : '<div></div>'}
-      <label style="display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
-        <input type="checkbox" id="claude-pause-toggle" style="margin:0" ${workerModels.claudePaused ? 'checked' : ''}>
-        Pause Claude (preserve subscription tokens)
-      </label>
-    </div>
-  `;
+  // Nothing shown has changed since the last draw (only ages): a poll/event-driven redraw would rebuild the same page, so leave it alone (workers-render-signature.js).
+  const renderSignature = typeof workersRenderSignature === 'function' ? workersRenderSignature(
+    { instances, workerModels, costSummary, recentTasks, cloudMeter, stalledWorker, verifierWorker, needsworkWorker, contextMapWorker, contextMemoryWorker, contextImpactWorker, pipelineOpsWorkers, assignableByInstance },
+    { expanded: expandedWorkerId, pinned: pendingWorkerAssign, chosen: selectedWorkerTaskType, completed: completedTasksLog.length, newest: completedTasksLog[0] ? (completedTasksLog[0].taskId || completedTasksLog[0].id || completedTasksLog[0].endedAt || null) : null }) : '';
+  if (typeof workersCanSkipRender === 'function' && workersCanSkipRender(renderSignature, isPoll, main)) return;
+  const filterBar = buildWorkersFilterBarHtml(workerModels);
   const shown = instances;
   if (isStale()) return;
   if (instances.length === 0) { main.innerHTML = '<div class="empty">No instances found -- is the pipeline running?</div>'; return; }
@@ -340,6 +350,7 @@ async function renderWorkers(isPoll) {
       </div>` : ''}
     </div>
   `).join('')) + (typeof renderCloudSpendSection === 'function' ? renderCloudSpendSection(cloudMeter) : '') + (typeof renderStalledWorkerSection === 'function' ? renderStalledWorkerSection(stalledWorker) : '') + (typeof renderVerifierWorkerSection === 'function' ? renderVerifierWorkerSection(verifierWorker) : '') + (typeof renderNeedsworkWorkerSection === 'function' ? renderNeedsworkWorkerSection(needsworkWorker) : '') + (typeof renderContextWorkerSection === 'function' ? renderContextWorkerSection(contextMapWorker, contextMemoryWorker, Date.now(), contextImpactWorker) : '') + (typeof renderPipelineOpsWorkersSection === 'function' ? renderPipelineOpsWorkersSection(pipelineOpsWorkers) : '') + renderCompletedTasksSection();
+  if (typeof rememberWorkersSignature === 'function') rememberWorkersSignature(renderSignature);
   window.scrollTo(0, scrollY);
   setupCompletedTasksObserver();
   if (!completedTasksLog.length && !completedTasksLoading && !completedTasksExhausted) {

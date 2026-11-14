@@ -170,3 +170,86 @@ test('renderMachinePauseBar: a root that can insert HTML but cannot querySelecto
   await vm.runInContext('renderMachinePauseBar(__root)', ctx);
   assert.equal(calls.fetch.length, 0);
 });
+
+// A root that keeps the bar the way a page does: insertAdjacentHTML puts one in, remove() takes it out, a fresh root (a redrawn #main) starts with none.
+function pageRoot() {
+  const r = { bar: null, inserts: [], removes: 0, btns: [] };
+  r.querySelector = (sel) => (sel === '.machine-pause-bar' && r.bar ? { remove: () => { r.removes += 1; r.bar = null; } } : null);
+  r.insertAdjacentHTML = (pos, html) => { r.bar = html; r.inserts.push(html); };
+  r.querySelectorAll = () => r.btns;
+  return r;
+}
+const pausedStatus = { node: pauseMarker(), global: null, workers: [] };
+
+test('renderMachinePauseBar: a redraw puts the last bar back BEFORE /api/pause answers, so the bar never blanks, and does not repaint when nothing changed', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let n = 0;
+  const { ctx } = load({ fetch: async () => { n += 1; if (n > 1) await gate; return { ok: true, status: 200, json: async () => idleStatus }; } });
+  const first = pageRoot();
+  ctx.__root = first;
+  await vm.runInContext('renderMachinePauseBar(__root)', ctx);
+  assert.equal(first.inserts.length, 1);
+  const second = pageRoot();                               // #main was replaced: a fresh root with no bar
+  ctx.__root = second;
+  const pending = vm.runInContext('renderMachinePauseBar(__root)', ctx);
+  assert.equal(second.inserts.length, 1, 'painted at once from the last known bar');
+  assert.equal(second.inserts[0], first.inserts[0]);
+  release();
+  await pending;
+  assert.equal(second.inserts.length, 1, 'the answer is the same, so it is not painted again');
+  assert.equal(second.removes, 0);
+});
+
+test('renderMachinePauseBar: a changed status replaces the bar that was painted from memory', async () => {
+  let status = idleStatus;
+  const { ctx } = load({ fetch: async () => ({ ok: true, status: 200, json: async () => status }) });
+  const a = pageRoot(); ctx.__root = a;
+  await vm.runInContext('renderMachinePauseBar(__root)', ctx);
+  status = pausedStatus;
+  const b = pageRoot(); ctx.__root = b;
+  await vm.runInContext('renderMachinePauseBar(__root)', ctx);
+  assert.equal(b.inserts.length, 2);
+  assert.equal(b.removes, 1);
+  assert.match(b.bar, /This machine paused/);
+  assert.doesNotMatch(b.inserts[0], /This machine paused/);
+});
+
+test('renderMachinePauseBar: when the status can no longer be read the last bar stays, with no toast; with nothing remembered there is none', async () => {
+  let ok = true;
+  const { ctx, calls } = load({ fetch: async () => { if (!ok) throw new Error('down'); return { ok: true, status: 200, json: async () => idleStatus }; } });
+  const a = pageRoot(); ctx.__root = a;
+  await vm.runInContext('renderMachinePauseBar(__root)', ctx);
+  ok = false;
+  const b = pageRoot(); ctx.__root = b;
+  await vm.runInContext('renderMachinePauseBar(__root)', ctx);
+  assert.equal(b.inserts.length, 1);
+  assert.ok(b.bar, 'the remembered bar is still on the page');
+  assert.equal(calls.toasts.length, 0);
+  const fresh = load({ fetch: async () => { throw new Error('down'); } });
+  const c = pageRoot(); fresh.ctx.__root = c;
+  await vm.runInContext('renderMachinePauseBar(__root)', fresh.ctx);
+  assert.equal(c.inserts.length, 0);
+});
+
+test('renderMachinePauseBar: a status that is no longer usable removes the remembered bar', async () => {
+  let usable = true;
+  const { ctx } = load({ fetch: async () => (usable ? { ok: true, status: 200, json: async () => idleStatus } : { ok: false, status: 500, json: async () => ({}) }) });
+  const a = pageRoot(); ctx.__root = a;
+  await vm.runInContext('renderMachinePauseBar(__root)', ctx);
+  usable = false;
+  const b = pageRoot(); ctx.__root = b;
+  await vm.runInContext('renderMachinePauseBar(__root)', ctx);
+  assert.equal(b.bar, null);
+});
+
+test('renderMachinePauseBar: the buttons of a bar painted from memory are wired', async () => {
+  const { ctx } = load();
+  const a = pageRoot(); ctx.__root = a;
+  await vm.runInContext('renderMachinePauseBar(__root)', ctx);
+  const b = pageRoot(); const btn = { dataset: { scope: 'node', nextPaused: 'true' }, disabled: false, onclick: null };
+  b.btns = [btn]; ctx.__root = b;
+  const pending = vm.runInContext('renderMachinePauseBar(__root)', ctx);
+  assert.equal(typeof btn.onclick, 'function');
+  await pending;
+});
