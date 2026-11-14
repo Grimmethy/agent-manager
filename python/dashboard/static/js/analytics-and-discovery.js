@@ -74,7 +74,7 @@ async function renderDeepDiveTab() {
       <td>${p.clonedAt ? new Date(p.clonedAt).toLocaleString() : ''}</td>
     </tr>
   `).join('');
-  main.innerHTML = bar + `<table><thead><tr><th>Hot</th><th>Project</th><th>Scouted for</th><th>Why it matters there</th><th>Source</th><th>Communities Reviewed</th><th>Action Items</th><th>Cloned</th></tr></thead><tbody>${rows}</tbody></table>`;
+  main.innerHTML = bar + `<div class="table-scroll"><table><thead><tr><th>Hot</th><th>Project</th><th>Scouted for</th><th>Why it matters there</th><th>Source</th><th>Communities Reviewed</th><th>Action Items</th><th>Cloned</th></tr></thead><tbody>${rows}</tbody></table></div>`;
   wireDeepDiveAddBar();
   wireToggle();
   main.querySelectorAll('tr.clickable').forEach(row => {

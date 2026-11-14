@@ -102,8 +102,8 @@ update the previous round's file rather than duplicating.
 
 ## 5. Record each verdict on its card (always, after verifying)
 
-Every verified branch gets a verdict recorded so its border color changes in the tab: green = merge, yellow = needs-work, red = discard,
-grey = unverified or stale. Mapping from step 4: **merge -> "merge"**, **hold / fix first -> "needs-work"**, **discard (redundant, superseded, recurring, already on master) -> "discard"**.
+Every verified branch gets a verdict recorded so its border color changes in the tab: green = merge, yellow = needs-work, blue = hold, red = discard,
+grey = unverified or stale, blue = hold. Mapping from step 4: **merge -> "merge"**, **hold (sound, waiting on its hub or a sibling) -> "hold"**, **fix first (a defect) -> "needs-work"**, **discard (redundant, superseded, recurring, already on master) -> "discard"**.
 
 ```bash
 # headSha comes from the API (the branch head you actually verified); sending it makes a moved branch a 409 instead of a wrong verdict

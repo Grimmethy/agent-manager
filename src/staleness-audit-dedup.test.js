@@ -8,7 +8,7 @@ const assert = require('node:assert/strict');
 
 const {
   findDuplicateTask, normalizeTaskTokens, dupSimilarityThreshold,
-  relatedAsHubAndChild, namesDisjointFiles,
+  relatedAsHubAndChild, relatedAsSiblings, namesDisjointFiles,
 } = require('./staleness-audit-dedup.js');
 
 // --- HUB0133-01 vs HUB0134-01 (live-observed 2026-10-17 false positive) -------------
@@ -167,3 +167,71 @@ test('namesDisjointFiles: false when either side names no file, false when they 
   const noFile = { id: 't-nofiles', title: 'Fix the deploy script', promptContext: { rawText: 'Fix the deploy script for the dashboard.' } };
   assert.ok(!namesDisjointFiles(noFile, decomposeHubA()), 'one side names no file -> not disjoint');
 });
+
+// --- sibling pieces of one stacked hub chain (live-observed 2026-11-01, questforge HUB0029) -----------------------
+// Every piece of a contract-first hub repeats the same shared CONTRACT paragraph, so any two pieces overlap by ~90%.
+const CONTRACT_TEXT = 'CONTRACT exact names copy them never rename shorten or add the service returns day views and report results for every subject '
+  + 'with quests progress streak savers and milestones stored events are replayed in order and the store is subject first with the host bound once';
+
+function piece(id, over = {}) {
+  return {
+    id, title: `Piece ${id}`, state: 'done', source: 'manual',
+    promptContext: { rawText: `${CONTRACT_TEXT} piece text for ${id}` },
+    ...over,
+  };
+}
+
+test('sibling check: same stacked.branch -> NOT a duplicate', () => {
+  const a = piece('HUB0029-04', { stacked: { branch: 'agent/chain-x', seq: 4, total: 8 } });
+  const b = piece('HUB0029-07', { stacked: { branch: 'agent/chain-x', seq: 7, total: 8 } });
+  assert.equal(findDuplicateTask(b, [a]), null);
+  assert.equal(findDuplicateTask(a, [b]), null);
+});
+
+test('sibling check: the same text with DIFFERENT stacked.branch values IS still a duplicate', () => {
+  const a = piece('one', { stacked: { branch: 'agent/chain-x' } });
+  const b = piece('two', { stacked: { branch: 'agent/chain-y' } });
+  assert.ok(findDuplicateTask(b, [a]), 'different chains: not siblings');
+});
+
+test('sibling check: one stacked and one unstacked twin with identical text IS a duplicate', () => {
+  const a = piece('chained', { stacked: { branch: 'agent/chain-x' } });
+  const b = piece('loose');
+  assert.ok(findDuplicateTask(b, [a]));
+  assert.ok(findDuplicateTask(a, [b]));
+});
+
+test('sibling check: same decomposedFrom and no stacked -> NOT a duplicate', () => {
+  const a = piece('child-a', { promptContext: { rawText: `${CONTRACT_TEXT} a`, decomposedFrom: 'HUB0030' } });
+  const b = piece('child-b', { promptContext: { rawText: `${CONTRACT_TEXT} b`, decomposedFrom: 'HUB0030' } });
+  assert.equal(findDuplicateTask(b, [a]), null);
+});
+
+test('sibling check: different decomposedFrom values are not siblings', () => {
+  const a = piece('child-a', { promptContext: { rawText: `${CONTRACT_TEXT} a`, decomposedFrom: 'HUB0030' } });
+  const b = piece('child-b', { promptContext: { rawText: `${CONTRACT_TEXT} b`, decomposedFrom: 'HUB0031' } });
+  assert.ok(findDuplicateTask(b, [a]));
+});
+
+test('sibling check: a real duplicate outside the chain is still found', () => {
+  const chained = piece('HUB0029-04', { stacked: { branch: 'agent/chain-x' } });
+  const outsider = piece('some-older-twin');
+  const found = findDuplicateTask(chained, [outsider]);
+  assert.ok(found);
+  assert.equal(found.id, 'some-older-twin');
+});
+
+test('relatedAsSiblings: missing records, missing stacked and empty branches are false', () => {
+  assert.equal(relatedAsSiblings(null, piece('x')), false);
+  assert.equal(relatedAsSiblings(piece('x'), undefined), false);
+  assert.equal(relatedAsSiblings(piece('x', { stacked: {} }), piece('y', { stacked: {} })), false);
+  assert.equal(relatedAsSiblings(piece('x', { stacked: 'agent/b' }), piece('y', { stacked: 'agent/b' })), false);
+});
+
+test('sibling check: the test-only switch turns the guard off (mutation proof)', () => {
+  const a = piece('HUB0029-04', { stacked: { branch: 'agent/chain-x' } });
+  const b = piece('HUB0029-07', { stacked: { branch: 'agent/chain-x' } });
+  assert.ok(findDuplicateTask(b, [a], { siblingCheck: false }), 'with the guard off the contract overlap reads as a duplicate');
+  assert.equal(findDuplicateTask(b, [a]), null);
+});
+

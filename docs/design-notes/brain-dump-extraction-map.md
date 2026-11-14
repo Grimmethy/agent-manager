@@ -1,0 +1,262 @@
+# Brain Dump in agent-manager: shape and extraction map
+
+Status: reference (brain dump) · Written 2026-09-20 from a code read of `master` at `97b4bee` · Companion: `docs/design-notes/hub-tasks-extraction-map.md`
+(the same exercise for hub tasks) · Related: `docs/adr/0022-core-is-a-platform-plugins-define-the-work.md` (open question 1 is about
+`brain_dump_sort`), `docs/agents/codebase-map.md` rows "Brain Dump" and "Filed Findings".
+
+**Why this exists.** Brain Dump is to become its own repo: a standard item that can be dropped into any project. Today it is not a
+module. It is a JSON file plus a dashboard tab plus a task source plus a set of sweeps, spread across ~179 tracked files
+(most of them tests and comments) in two runtimes (Node pipeline, Python dashboard). This is the map of every part, the shape of the
+records it moves, and the seams where it is entangled with the rest of the pipeline.
+
+Vocabulary: **entry** = one record in `brain-dump.json`. **capture** = create an entry (human or machine). **sort** = the
+`brain_dump_sort` task that classifies a `captured` entry. **filed note** = the Second Brain vault note a sort writes.
+**queued task** = a task a sort (or Prioritize) creates from an entry. **machine-raised** = an entry with `raisedBy`.
+**side finding** = a `SIDE-FINDING:` block a model emits mid-response. Not to be confused with the **Second Brain** (the Obsidian-style
+vault under `SECOND_BRAIN_DIR`): it is the sort's *destination*, a neighbouring system with its own routes/UI, not part of Brain Dump.
+
+---
+
+## 0. Decisions so far (Grimmethy, 2026-09-20)
+
+| # | Question (section 8) | Status |
+|---|---|---|
+| 1 | Single owner for `brain-dump.json` | **Being clarified, not decided.** Meaning: exactly one component reads and writes the file and everything else asks it (call / HTTP / CLI), so two programs can never overwrite each other's change. Section 8 has the failure it prevents. |
+| 2 | Is the sorter part of the repo? | **Yes.** The sorter (`brain_dump_sort`, classifier, prompts, apply) moves with Brain Dump. This settles ADR 0022 open question 1 *for Brain Dump*: its allowlist exemption and the hardcoded `brain_dump_sort` handling in `getNextTask()` become properties of the repo's own registration, not of core. |
+| 3 | Delivery: library, plugin, or separate service | **Plugin (decided, confirmed 2026-09-20).** In this system "plugin" covers an in-process `register.js` plugin *and* a slot plugin that runs as its own service (section 9). With hosts outside agent-manager (row 6) the plugin has **two halves**: a host-side half and an agent-manager-side half (section 10). |
+| 4 | Vault and project-registry adapters | **Not sure yet.** Left open. |
+| 5 | The UI | **Part of the repo**, with the rest of the code. The open work is a defined contract for how the UI talks to its host (section 7, Seam B). |
+| 6 | Which hosts, and what for | **Any project with a user-facing dashboard, starting with PF-Client-Portal.** The purpose is to quickly and easily acquire **user feedback** that the system can process. This widens the goal from an operator's capture tool to an end-user feedback intake (section 10). |
+| 7 | Who submits | **Anyone**, but feedback is **account-linked**: a submission is tied to the submitter's account on the host. The operator has an account of their own. |
+| 8 | What happens to user feedback | **Human-gated after an initial sort, with no direct way to be automatically turned into a task.** The sorter classifies and files; only a human action promotes anything toward a task. |
+| 9 | Sorting | Feedback is **sorted by user account**: the sorter must be programmed to expect the account on every incoming user-feedback entry. |
+| 10 | Transport | Agent-manager's machine has **Tailscale access to the tower** (the host's machine), so the natural direction is agent-manager **pulling** over Tailscale. Proposed, to confirm. |
+| 11 | Is the operator's own account trusted | **Yes (decided 2026-09-20).** Submissions from the operator's account keep today's behaviour: the sorter may queue a task from them. Every other account stays behind the human gate (row 8). |
+| 12 | PF already has its own support desk | **Found 2026-09-20 (PF `main` `e055814`):** PF-Client-Portal now has a client-facing ticket desk (kind, status, replies, page context) and its admin API answers on the tailnet. This corrects section 10's earlier claim that PF had no feedback intake. **Proposed, to confirm:** the first host adapter is an *importer* from PF's desk, not a new widget. Whether the plugin's host-side half is later *extracted from* PF's desk is open (section 10). |
+
+## 1. The loop
+
+```
+  human: dashboard "+ Brain Dump" (any tab) ─────────────────────────────┐
+  model: SIDE-FINDING: block in any response ─> queue/side-findings-inbox/ ─(watchdog tick)─> side-finding-sweep ─┤
+  pipeline sources (debrief, forensics, change_review, ...) raise via the same inbox (raisedBy.source)           ▼
+                                                                                           brain-dump.json  status:'captured'
+                                                                                                         │
+                             brain_dump_sort (task source, priority 42, cheap local model, DETERMINISTIC review)
+                                                                                                         ▼
+                              status:'sorted'  (a note filed into the vault: sort.secondBrainPath/tags/rationale)
+                              status:'actioned' (a task queued in the origin project: queuedTaskId; or researched / hand-closed)
+                                                                                                         │
+                      apply of the queued task ──> closeOriginatingBrainDumpEntry ──> resolvedAt / resolvedNote
+```
+
+## 2. Inventory by layer
+
+| Layer | Files | Owns |
+|---|---|---|
+| **Store** | `<pipelineDir>/brain-dump.json` (`{"entries":[…]}`); override `AGENT_MANAGER_BRAIN_DUMP_PATH` | the whole state. One file **per project pipeline dir** (agent-manager 1,311 entries / 1.9 MB; five other projects have their own). The path default is computed twice, independently: `python/dashboard/app.py` `brain_dump_path()` and `src/config.js` `brainDumpPath` ("no other link between them") |
+| **Store access, Python** | `app.py`: `read_brain_dump_entries` / `write_brain_dump_entries` (whole-file rewrite), `_assign_brain_dump_serials` (the `#N` handle), `_brain_dump_entries_with_task_status` (joins each entry to its queued task's live queue state), `_brain_dump_needs_attention_count`, `BRAIN_DUMP_NEEDS_ATTENTION_STATES` | dashboard-side reads/writes |
+| **Store access, Node** | `apply-group-a-brain-dump.js`: `loadBrainDump`, `findEntry`, `recoverableSortSkip`, `closeBrainDumpEntryResolved`; `writeJsonAtomicSync` (`atomic-write.js`) | pipeline-side reads/writes |
+| **Dashboard API** | `routes/brain_dump.py` (300 lines): `GET /api/brain-dump`, `GET /api/filed-findings`, `POST /api/brain-dump/capture`, `PUT /api/brain-dump/<id>`, `POST …/suppress`, `DELETE …`, `POST …/prioritize` ("Process this now": injects the entry straight into `queue/adhoc/`, **bypassing the sort**, and marks it `actioned`), `GET …/discuss/latest`, `POST …/discuss/start`; `is_filed_note` splits the human view from filed notes | the tab's back end. Also `routes/shared_misc.py` (summary badge `counts["brain-dump"]`, needs-attention, hides suppressed/filed), `routes/task_anywhere_1_more.py` (a Discuss session ending appends its summary to the entry's `rawText`), `discuss_sessions.py` + `chat_sessions.py` (per-entry Discuss; storage dir is passed in by the caller) |
+| **Dashboard UI** | `static/js/brain-dump-and-second-brain.js` (1,113 lines; the Brain Dump half is ~L1-520 and L962-1000, the Second Brain browser is L519-960 in the **same file**), `core-ui.js` (global capture modal, badge), `templates/index.html` (tab, `#global-brain-dump-btn`), `branches-joblist-hardware-tabs.js` | the tab, the "+ Brain Dump" button available on every tab, Filed Findings tab |
+| **Sort pipeline** | `task-sources.js`: `registerTaskSource('brain_dump_sort', …)` (L1518), `nextBrainDumpSortTask`, `brainDumpSortTaskId`, `brainDumpSortReviewValidate`; `brain-dump-sort-classify.js` (323 lines: parse, `validateSecondBrainPath`, `CANONICAL_TOP_LEVEL`); `apply-group-a-brain-dump.js` (513 lines: `applyBrainDumpSort`); `lib/prompt-planning.js` `brainDumpSortPlanPrompt`, `lib/prompt-implementation.js` `brainDumpSortImplementPrompt`, `prompts.js` `brainDumpDirective`; `reject-retry-check.js` `stampBrainDumpSortExhausted` (`sortAttempt`); `scripts/migrate-brain-dump-sort-backlog.js`; `python/dspy_brain_dump_sort_pilot.py` (pilot) | classify -> file a note, or queue a task in the origin project (`research/`, `derived/` or `adhoc/`) |
+| **Intake, machine** | `side-finding.js` (marker convention, `injectSideFindingInstruction` / `extractSideFindings` / `writeSideFindingInbox`), hooked at three model-client chokepoints (`local-client.js`, `claude-client.js`, `local-tool-client.js`); `side-finding-sweep.js` (watchdog one-shot from `queue-watcher.sh`: drains `queue/side-findings-inbox/`, dedupes by Jaccard against machine-raised entries only, bumps `count`/`lastSeenAt`/`seenIn`); `incident-amplification.js` + marker | how the rest of the system files findings without knowing Brain Dump exists |
+| **Loop closing** | `lib/apply-core.js` `closeOriginatingBrainDumpEntry`, called from `apply-task.js` (4 sites) and `lib/apply-main-batch.js` (3 sites); `staleness-audit.js` (sweeps queued tasks a human resolved by hand) | marks an entry resolved when its task lands |
+| **Vault (neighbour)** | `SECOND_BRAIN_DIR` (`config.js` `getSecondBrainDir`), `app.py` `second_brain_dir()`, `routes/second_brain.py` | the sort's destination; out of scope but the hardest coupling |
+| **Docs / tests** | `README.md` task-source rows, `AGENTS.md` (side-finding section), `docs/agents/codebase-map.md` (route list "not yet itemized": this file itemizes it), ADR 0022 | tests: `brain-dump-sort-classify.test.js`, `test_brain_dump_routes.py`, `side-finding*.test.js`, `incident-amplification*.test.js`, plus large BD sections in `apply-group-a.test.js` (207 refs), `task-sources.test.js` (114), `apply-task.test.js` (37) |
+
+## 3. Record shape
+
+Core (every entry): `id` (slug, `bd-<epoch-ms>-<slug>`), `serial` (stable `#N`, assigned in `capturedAt` order by the dashboard), `capturedAt`,
+`rawText`, `status` (`captured` -> `sorted` | `actioned`; live counts 201 / 517 / 593).
+
+| Field(s) | Written by | Meaning |
+|---|---|---|
+| `raisedBy {source, taskId, repoRoot, …}`, `count`, `lastSeenAt`, `seenIn` (958 entries) | `side-finding-sweep.js` | machine-raised; the dedupe counter. `raisedBy.repoRoot` says which project's pipeline raised it |
+| `sort {secondBrainPath, tags, actionable, rationale, category?}`, `sortedAt` (517) | `applyBrainDumpSort` | classification + where the note was filed |
+| `queuedTaskId`, `queuedAt` (579) | `applyBrainDumpSort`, Prioritize | the task made from this entry (the join key for live status in the UI) |
+| `resolvedAt`, `resolvedNote` (169) | `closeBrainDumpEntryResolved` | the queued task landed |
+| `suppressed`, `suppressedReason`, `suppressedAt` (150) | `POST …/suppress` | hidden from every list and from dedupe matching; reversible |
+| `sortAttempt`, `duplicateGateAttempts`, `rerouted` | sort retry / duplicate gate | bounded-retry bookkeeping |
+| `editedAt`, `reopenedAt/Note`, `note`, `actionedAt`, `sourceUrl`, `sourceVerifiedAt` | dashboard | edits, reopen, research provenance |
+
+Who files entries (live counts): 353 human-typed (no `raisedBy`); machine-raised by `raisedBy.source`: `manual` 308 (side findings emitted while a
+manual/adhoc task was being worked), `pipeline_debrief` 268, `change_review` 61, `concept-research` 49, `pipeline_forensics` 46 + `pipeline_forensics_fix` 28,
+`observability_fix` 23, and a tail of research sweeps (`chat_context_research`, `blocked_task_classification_research`, ...).
+
+Statuses are few and the file is a plain list, but nothing enforces the shape: two runtimes read and write it directly.
+
+## 4. Where Brain Dump leaks into non-Brain-Dump modules (the entanglement)
+
+| Module | Touchpoint |
+|---|---|
+| `task-sources.js` (83 refs) | the `brain_dump_sort` registration and its **allowlist exemption** (always active "above any single project"; ADR 0022 Q1), routing into `derived_task` / `research_task`, `brainDumpSortReviewValidate` |
+| `review-task.js`, `reject-retry-check.js` | the deterministic-review branch for this one source; sort exhaustion stamping (`stampBrainDumpSortExhausted`) |
+| `apply-task.js`, `lib/apply-core.js`, `lib/apply-main-batch.js`, `apply-group-a.js` | `brainDumpPath` threaded through every apply path; `closeOriginatingBrainDumpEntry` at seven call sites; the sort apply lives in the "Group A" apply family |
+| `local-client.js`, `claude-client.js`, `local-tool-client.js` | side-finding inject/extract/write at every model call (the chokepoints that make Brain Dump "ambient") |
+| `local-draft.js`, `prompts.js`, `lib/prompt-*.js`, `fact-checker.js`, `path-prefetch.js` | sort prompts and `brainDumpDirective`; `path-prefetch.js` `resolveAnchors` is imported by the sort apply |
+| `apply-group-a-brain-dump.js` <- `projects.json` | cross-project routing: `readProjectRegistry`, `originProjectFor`, `deriveBelongsToProject` decide which project's queue a queued task lands in |
+| `scripts/queue-watcher.sh` | runs `side-finding-sweep` (L289) each watchdog tick; `context-log-sweep` (L300) is adjacent but **deliberately not routed through Brain Dump** |
+| `concepts.js`, `concepts.json` | `conceptId` on side findings; Incident Amplification files its "silent siblings" as side findings, and concept research raises entries too (`raisedBy.source: concept-research`) |
+| `local-worker.ps1`, `config.js`, `build_graph.py` | the Windows worker's priority-tier bucket and single-JSON-output handling for the sort source; env/paths; graph nodes. (`single-flight-lock.js`, `system-report.js`, `needs-clarification-triage.js` only *cite* Brain Dump ids or the cheap sort model in comments: no coupling) |
+| dashboard `app.py` (55 refs), `shared_misc.py`, `core-ui.js`, `index.html` (49 refs) | badge counts, needs-attention, global capture modal, tab wiring |
+
+## 5. Operational surface
+
+* **Env:** `AGENT_MANAGER_BRAIN_DUMP_PATH` (same name in both runtimes on purpose), `SECOND_BRAIN_DIR`, `AGENT_MANAGER_SIDE_FINDING_SWEEP=false` (kill switch), `AGENT_MANAGER_PROJECTS_REGISTRY_PATH`.
+* **Dirs:** `queue/side-findings-inbox/`, `queue/derived/`, `queue/research/`, the vault, and each project's own `brain-dump.json`.
+* **Model profile:** `brain-dump-cheap-local` (a small local model; `brain_dump_sort` is the highest-volume task type).
+
+## 6. Contracts with other repos
+
+* **agent-manager-hygiene:** no code dependency. `git grep` finds only comments citing brain-dump ids. The plugin's work reaches Brain Dump
+  *indirectly*: models emit `SIDE-FINDING:` blocks and the core files them. So the inbound contract is the marker + the inbox directory
+  + the `raisedBy` shape, nothing else.
+* **Other projects:** each has its own pipeline dir and its own `brain-dump.json`; only the sort source, the vault, and the project
+  registry are shared.
+* **Second Brain:** the vault path, the `CANONICAL_TOP_LEVEL` taxonomy, and `is_filed_note` (which separates filed notes from human entries in the UI).
+
+## 7. Extraction guidance
+
+**Seam A: the kernel (this is the drop-in).** Store + record schema + serials + the capture / edit / suppress / delete / read-with-task-status
+API + counts. The first job is a **single owner** for the file: today Python and Node each implement the same JSON contract.
+
+**Seam B: the UI (in the repo, decided).** The tab, Filed Findings, and the global "+ Brain Dump" capture move with the code. Split them out of the
+Second Brain JS file first. What has to be designed is the **host contract**, because today the UI reaches into agent-manager freely. The touchpoints
+to turn into an explicit interface: (1) where and how it mounts (a tab, a global capture button on every tab); (2) the summary badge / needs-attention
+counts the host shows elsewhere (`counts["brain-dump"]`); (3) the join from an entry's `queuedTaskId` to the host's live task state
+(`_brain_dump_entries_with_task_status`); (4) per-entry Discuss sessions, which today use the host's chat/discuss machinery; (5) which project's store
+the UI is looking at (the host's active project); (6) styling/theme, auth and session, and the fetch base URL, none of which the UI should assume.
+
+**Seam C: the sorter (in the repo, decided).** The `brain_dump_sort` source, classifier, prompts and apply. It still depends on host services that
+must become adapters: a vault (destination), a project registry (routing), a model profile, **and**, the part that is easy to miss, the pipeline
+machinery it runs on today: a task queue, a worker lane, the GPU/model lock, deterministic review and the apply stage. Inside the repo it needs a
+"schedule this work" and "make a cheap model call" contract.
+
+**Seam D: intake.** `side-finding.js` + the sweep + the inbox. The model-client chokepoints stay in the host; they only need the marker
+functions and an inbox writer.
+
+**Seam E: loop closing.** Replace the seven direct `closeOriginatingBrainDumpEntry` calls with one "task resolved" hook the host fires.
+
+**Suggested first step (same as the hub map):** plan first. Then add the hook interfaces (a store adapter, a sort-destination adapter, a
+project-registry adapter, a task-resolved hook) to the source registry and `docs/PLUGIN_API.md` with the **current behaviour as the default
+implementation**, keep the full suite green at every step, and only then move code behind them. Do not change Brain Dump behaviour while extracting.
+
+**Invariants to keep (each is visible in the code today):**
+1. The dedupe only ever merges a machine finding into another **machine-raised** entry, never into a human-typed note (`side-finding-sweep.js`).
+2. Machine intake writes only to the inbox; **one** sweep does the batched read-modify-write, not the hot model-call chokepoints.
+3. Sort review is **deterministic** (parse + validate + tracked-label check), never an LLM vote.
+4. Every entry keeps a stable `serial`; `id` stays a slug; `serial` assignment is oldest-first and never reassigns.
+5. A suppressed entry is hidden everywhere and never matched or counted; suppress is reversible.
+6. Closing the loop is best-effort and must never fail an apply.
+7. Machine-written report dirs and chat context logs are never routed through Brain Dump or the sorter.
+8. A machine-raised finding belongs to the project that raised it (`originProjectFor`), not to the classifier's guess.
+9. `{"entries":[…]}` and `AGENT_MANAGER_BRAIN_DUMP_PATH` are a shared contract between the two runtimes.
+
+## 8. Known gaps and open questions
+
+* **Two runtimes, one JSON file, no lock (decision 1).** Python rewrites the whole file; Node writes atomically; the code calls the race "theoretical and already
+  accepted". The failure it allows is a lost update: the dashboard reads the file, the pipeline appends an entry, the dashboard writes its copy back, and the
+  pipeline's entry is gone, with no error. A repo dropped into many projects cannot inherit that. Whether it has ever actually lost an entry here was not checked.
+* **Whole-file rewrite** of a 1.9 MB file on every change.
+* **The sorter is in the repo (decided), but it runs on agent-manager's task pipeline today.** A host without that pipeline needs the sorter to bring its own runner, or a contract for one. Also still open: the vault and the project registry (decision 4).
+* **Per-project store vs shared vault.** A project's entries are its own; the vault and the always-on sort are shared, and routing a queued task to *another* project's queue reads `projects.json`. A standalone repo needs an explicit project-registry contract.
+* **The UI shares a file with the Second Brain browser**, and `is_filed_note` couples the two views. The UI is in the repo (decided); its host contract is section 7, Seam B.
+* **`getNextTask()` hardcodes `brain_dump_sort` as allowlist-exempt.**
+* **Line numbers here are as of `97b4bee`.** `docs/agents/codebase-map.md` still says the route list is not itemized; update it when this lands.
+
+## 9. Delivery options compared (decision 3)
+
+This system already ships all three shapes, so each option has a working precedent.
+
+| | **A. In-process plugin** | **B. Separate service** | **C. Library (npm + pip)** |
+|---|---|---|---|
+| Precedent here | `agent-manager-hygiene`: `register.js` loaded into the pipeline via `AGENT_MANAGER_REGISTER_PATH`, contract in `docs/PLUGIN_API.md`, one-way dependency, `plugin-api.test.js` | `agent-manager-chat-plugin` and the hardware plugin: own repo, own Flask app and port (7441/7442), declared in `plugins.json` with `slot`, `url`, `process`, optional `proxy {prefix, sse}`; PromptForge/AdForge/ScriptForge are standalone apps embedded as tabs | none as such (hygiene deep-imports core: "no `exports` map" is a listed wart) |
+| How the host uses it | shares the Node process and the filesystem; registers task sources, calls core helpers | host launches/lists it and proxies `/api/<prefix>/*`; the plugin can call back into the host (`internal_api_client.py` in the chat plugin) | host imports it in each runtime |
+| **Single owner of the file** (decision 1) | only if every reader goes through the plugin's module; the Python dashboard cannot, so a second implementation remains | **natural**: the service is the only thing that touches the file; everyone else uses its HTTP API | needs one implementation per language, which recreates today's two-writer problem |
+| **UI in the repo** (decision 5) | awkward: the host must serve the plugin's static files itself | **natural**: the service serves its own UI; the host embeds it (tab, sidebar slot, or a small script for the global capture button) | the host must bundle and mount it |
+| **Sorter in the repo** (decision 2) | natural in agent-manager (it *is* a task source, as today); nothing for a host with no pipeline | needs its own runner or a "schedule work / model call" contract with the host. Precedent: the chat plugin keeps worker-kill and GPU-lock authority **host-side** and reaches it over HTTP (`internal_api_client.py` -> the core dashboard's internal chat API) | same problem as A |
+| Works in a host that is **not** agent-manager | no: it depends on agent-manager's registry and queue | **yes**, if the host contract is small (mount, counts, task-status join) | only in the same language |
+| Cost | cheapest to build; tightest coupling; core internals become API | a process to run, port, health and upgrade per project; latency; a versioned HTTP contract to keep stable | two packages to release in lockstep |
+| Failure mode | a core refactor silently breaks the plugin (the contract test is the only guard) | the service is down: capture and the tab fail while the pipeline keeps running | version skew between the two language libraries |
+
+**Where this leaned before the hosts answer (superseded by the plugin decision and section 10).** Decisions 1, 2 and 5 together (the repo owns the store, the sorter *and* the UI) fit **B**, with a thin in-process piece
+in the host for the parts that must live in the pipeline (registering the sorter as a task source, the model-client side-finding hooks, the watchdog sweeps,
+closing the loop when a task lands). That is the same split the chat plugin already uses (a service plus a `proxy` block plus a callback client), combined with
+hygiene's `register.js`. The question that settles it: **which hosts is "any project" meant to include?** Projects that agent-manager already manages (each
+already has its own `brain-dump.json`), or arbitrary applications with no agent-manager at all (PF-Client-Portal's React app, for example)? Only the second
+needs the host-agnostic UI and the runner-for-the-sorter answers above.
+
+## 10. Hosts and end-user feedback (direction decided, details open)
+
+**What the hosts answer changes.** Until now Brain Dump has been the *operator's* tool: the person running agent-manager captures a note. With
+PF-Client-Portal and any future user-facing project as hosts, the input becomes **feedback from the host's own users**, and the output is still the
+existing loop: an entry, sorted, filed or turned into a task in that project's pipeline.
+
+**The two halves of the plugin.**
+
+| Half | Lives in | Owns |
+|---|---|---|
+| **Host side** | the host app (PF-CP is a React/Vite SPA over the TaxHarvest Node/Express/Prisma backend) | an embeddable feedback widget (the UI, decision 5) and an intake endpoint; page/user/version context; the host contract from section 7 Seam B |
+| **Agent-manager side** | agent-manager (`register.js`-style plugin, plus a slot service if needed) | the store (the single owner, decision 1), the sorter (decision 2), task-source registration, side-finding/intake sweeps, closing the loop |
+
+**What is true of PF today (read from PF `main` at `e055814`, 2026-09-20).** This section first said PF had no in-app feedback intake; that was true of the
+commit I read and is no longer true.
+* **PF has a client-facing support desk** (commits `5dabdf2` .. `efd4e17`). Client side: `src/api/client.ts` (the ticket API), `FeedbackView.tsx` (a "Feedback & Support"
+  tab) and `FeedbackModal.tsx` (a small draggable, resizable window, also reachable from the top bar). A **ticket** is `{id, kind: issue | feature | feedback, subject, body,
+  status: new | open | planned | resolved | declined, pageUrl, createdAt, updatedAt, closedAt, replies[]}`; a reply is `{body, fromAdmin, createdAt, clientReadAt,
+  author: {name}}` (an admin's email is never sent to a client). Create is `POST /client/support` with `context {view, propertyAddress, propertyId}` filled in by the form
+  (what the person was looking at) and duplicate detection (`{id, duplicate?}`); also list (with an unread count), reply, and mark-read. `SupportView.tsx` is unrelated: it is the billing / supporter page.
+* **The admin half lives in the internal app** and is not in the repository I can read (the client code says so). I have **not** seen the admin endpoints, how they authenticate, or
+  whether an admin ticket record carries the submitter's account id.
+* **Topology.** `backend-public` (a trimmed app: `/auth`, `/client`, `/sync`) sits behind a Cloudflare tunnel with no open ports; `backend-internal` (the full app, port 3001) serves the
+  admin UI. Commit `ae9d9b2` gives `backend-internal` a **second binding on the tailnet interface only** (not the LAN; the address is configurable in PF's `.env`), so a machine on the tailnet
+  can reach the admin API, subject to its authentication. All of that runs on the tower. Agent-manager runs on a different machine that is on the same tailnet. **Nothing today carries a
+  ticket from PF's database to a `brain-dump.json`.**
+
+**What this changes.** PF's host-side half already exists, built by PF, and it does more than the plugin's first version needed: authenticated submitters, page context,
+duplicate detection, statuses, and two-way replies (which is "closing the loop with the user", previously deferred). So for PF the first piece of work is on the agent-manager side:
+**an importer that pulls tickets from PF's admin API over Tailscale**, turns each into a Brain Dump entry, and sorts it. The widget for *other* hosts is still the long-term goal,
+and PF's `FeedbackModal` / `FeedbackView` are a working reference for it.
+
+| PF ticket field | Brain Dump entry (proposed) |
+|---|---|
+| `id` | `origin.hostSubmissionId` (the idempotency key for the import) |
+| `kind` (`issue` / `feature` / `feedback`) | `origin.ticketKind`, an input to the sort |
+| `subject` + `body` | `rawText`, treated as untrusted text (quoted or fenced when a model reads it) |
+| `pageUrl`, `context {view, propertyAddress, propertyId}` | `origin.context` |
+| submitter account | `origin.accountId` (needs the admin API to expose it: **not verified**) |
+| `status`, `replies` | stay in PF; Brain Dump does not copy or drive them |
+
+**Answered (2026-09-20).**
+1. **Who submits?** Anyone, but every submission is linked to an account; the operator has their own. So the host must authenticate the submitter, and an entry carries the account identity.
+2. **Gate before processing.** User feedback is **human-gated after an initial sort**, and there is **no direct or automatic path from a feedback entry to a task**. Today the sorter can queue a task from an entry (`applyBrainDumpSort` -> `queue/derived/` or `queue/adhoc/`); for user feedback that branch must not exist.
+3. **Sorting by account.** The sorter must expect an account on every incoming feedback entry and sort by it.
+4. **Transport.** The agent-manager machine reaches the tower over Tailscale (checked with `tailscale status` from this machine), so a **pull** from agent-manager needs no inbound exposure of agent-manager. The endpoint is now visible: PF's admin API on `backend-internal` is bound to the tailnet (commit `ae9d9b2`). Still to verify: the admin ticket-list endpoint and how a non-human importer authenticates to it.
+5. **The operator's own account is trusted (decision 11).** Their submissions keep today's behaviour. See "How trust is decided" below.
+
+**Still open.**
+1. **What "sorted by account" produces.** Grouping in the store and an account view in the UI, filing under the account in the vault, or both. Account identifiers in vault notes are personal data (see 3).
+2. **Privacy.** Where feedback and account identifiers are stored, for how long, and that only a local model reads them (the sorter uses one today).
+3. **Raw-submission store.** For PF this is settled by PF's own design: the tickets live in PF's database and agent-manager would import them (idempotently, by ticket id). For a future host with no desk it is still open.
+4. **Closing the loop with the user.** For PF this already exists (statuses and replies in PF's desk). What is left is optional write-back: when a task promoted from a ticket ships, mark the ticket resolved.
+5. **What is PF's desk to Brain Dump?** (a) Brain Dump **imports from** PF's desk and PF stays the desk (least disruption, immediate value; my proposal for now), (b) PF's desk is **generalised into the plugin's host-side half** so every host, PF included, uses one widget and one ticket model (a larger change to something PF just built), or (c) both, in that order: (a) now, (b) when a second host appears.
+6. **Where is the human gate?** PF's admin desk already has human triage (`new` -> `open` -> `planned` / `declined`). Is that desk *the* gate (an imported entry is sorted and shown, and only a human action, such as marking a ticket `planned`, may promote it), or does Brain Dump keep its own review inbox on top? Either way the rule stands: no automatic path from a ticket to a task.
+
+**Effect on the seams (section 7).** Seam B (UI) becomes the host-side widget and must work in a React host and, ideally, any web host. Seam A's single owner is
+naturally the agent-manager-side half; the host-side half only ever calls it. A new **Seam F: the host-side intake** (widget + endpoint + transport). For PF the widget and endpoint now exist (PF's desk); what does not exist for any host is the **pull importer** on the agent-manager side. For a future host with no desk, the widget and endpoint are still to build.
+
+**What the sorter (Seam C) must change for user feedback.** (a) **A new input:** the entry carries `origin {kind: "user-feedback", host, accountId, hostSubmissionId}`
+and the sorter is written to expect it. (b) **A new output rule:** the sort result groups by account. (c) **No task branch:** for `origin.kind === "user-feedback"` (every account except the operator's, below)
+`applyBrainDumpSort`'s queue-a-task branch is unreachable, enforced structurally in the apply code and not by a field the model's output can set; the only route
+toward a task is a human action by an authenticated operator, and the resulting task records where it came from (`concept-task-provenance`). (d) **Untrusted text is
+data:** whenever a model reads it, it is quoted or fenced as user-provided content, never presented as an instruction.
+
+**How trust is decided (decision 11).** Trust is decided **on the agent-manager side, at import**, by matching the host's `accountId` against an operator
+allowlist kept in agent-manager's own configuration (per host). It is never a field in the submission and never something a model's output can set, so nothing a
+submitter sends can claim it. A trusted entry is stamped `origin.kind: "operator"` and takes today's path (the sorter may queue a task, and it is still sorted by
+account); every other account is `user-feedback`. **The one new risk:** the trusted path is only as safe as the operator's account on the host. Whoever takes over that
+account can queue tasks, so strong authentication on it is part of the host-side half's job.
+
+**Invariants added for feedback** (in addition to section 7's nine): (10) no user-feedback entry becomes a task automatically, with one exception: an account on agent-manager's operator allowlist, decided at import and never by the submitter; (11) every user-feedback entry keeps its account
+identity, its host and the host's own submission id; (12) the import from a host is idempotent; (13) a human-promoted task keeps the provenance of the feedback it came from.

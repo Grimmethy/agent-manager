@@ -5,7 +5,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { KNOWN_FIXED, _setEndpointProbe } = require('./known-fixed-failures.js');
+const { KNOWN_FIXED, _setEndpointProbe, entryAppliesToScope } = require('./known-fixed-failures.js');
 
 const entry = KNOWN_FIXED.find((e) => e.id === 'ungrounded-field-new-env-var');
 const BLOCK = (name) => `Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ungrounded-field: ${name}. This fact-check flag is high-precision`;
@@ -47,6 +47,47 @@ test('ungrounded-field-test-fixture: re-admits only when every flagged name is o
   assert.equal(fx.applies({ blockedReason: BLOCK('SENTINEL_THOUGHT'), implementResponse: alsoProd }), false, 'production code uses it too');
   assert.equal(fx.applies({ blockedReason: 'something else', implementResponse: task1891.implementResponse }), false);
   assert.equal(fx.applies({}), false);
+});
+
+// --- ungrounded-field-own-declarations-and-platform-constants (2026-11-02) --------------------------------------------------------------------
+test('ungrounded-field-own-declarations-and-platform-constants: re-admits only when none of the flagged names is still flagged', () => {
+  const e = KNOWN_FIXED.find((x) => x.id === 'ungrounded-field-own-declarations-and-platform-constants');
+  assert.ok(e, 'entry registered');
+  assert.deepEqual(e.dirs, ['blocked', 'needs-clarification']);
+  const draft = DIFF(['+RULE_TABLE: dict[str, bool] = {', '+ExecStart=@BACKUP_TARGET@/run --family=AF_INET', '+DIR="$(dirname "${BASH_SOURCE[0]}")"']);
+  const blocked = (...names) => ({ title: 'T', promptContext: { rawText: 'unrelated' }, implementResponse: draft, blockedReason: names.map(BLOCK).join('\n') });
+  assert.equal(e.applies(blocked('RULE_TABLE', 'BACKUP_TARGET', 'AF_INET', 'BASH_SOURCE')), true);
+  assert.equal(e.applies(blocked('RULE_TABLE', 'MADE_UP_KEY')), false, 'a flagged name that is not in the stored draft cannot be re-checked, so it stays parked');
+  const invented = { ...blocked('RULE_TABLE', 'INVENTED_KEY'), implementResponse: `${draft}\n+if (INVENTED_KEY) {}` };
+  assert.equal(e.applies(invented), false, 'one invented name keeps it parked');
+  assert.equal(e.applies({ ...blocked('RULE_TABLE'), blockedReason: 'something else' }), false, 'no ungrounded-field name');
+  assert.equal(e.applies({ blockedReason: BLOCK('RULE_TABLE') }), false, 'no draft');
+  assert.equal(e.applies({}), false);
+});
+
+// --- agentic-empty-forced-summary-parked-as-design-question (2026-11-02) ----------------------------------------------------------------------
+test('agentic-empty-forced-summary-parked-as-design-question: re-admits only a task whose sole question is the ran-out-of-turns placeholder', () => {
+  const e = KNOWN_FIXED.find((x) => x.id === 'agentic-empty-forced-summary-parked-as-design-question');
+  assert.ok(e, 'entry registered');
+  assert.deepEqual(e.dirs, ['needs-clarification']);
+  const placeholder = '(the agentic implement pass ran out of turns before reaching a conclusion; see its recorded tool activity for what it had investigated)';
+  assert.equal(e.applies({ needsClarification: { reason: 'design-decision', openQuestions: placeholder } }), true);
+  assert.equal(e.applies({ needsClarification: { reason: 'design-decision', openQuestions: 'Should the gate call Stripe live, or stub it?' } }), false, 'a real question stays with the human');
+  assert.equal(e.applies({ needsClarification: { openQuestions: `Which DB?\n${placeholder}` } }), false, 'the placeholder must be the whole question');
+  assert.equal(e.applies({}), false);
+});
+
+// --- docs-only-gate-created-document-deliverable (2026-11-02) ----------------------------------------------------------------------------
+test('docs-only-gate-created-document-deliverable: re-admits a document-creating task, not one that also declares a code file', () => {
+  const e = KNOWN_FIXED.find((x) => x.id === 'docs-only-gate-created-document-deliverable');
+  assert.ok(e, 'entry registered');
+  assert.deepEqual(e.dirs, ['blocked', 'needs-clarification']);
+  const raw = 'Create docs/audit-x.md. It must contain a table with a row for src/product-spec-to-hub.js / fileHub(). Include a sentence stating the throttle in task-sources.js does not cover batch fan-out.';
+  const block = 'Agentic implement pass produced a diff that is not a real implementation -- diff only touches documentation (docs/audit-x.md) -- the task asks for a code change';
+  assert.equal(e.applies({ source: 'manual', promptContext: { rawText: raw }, blockedReason: block }), true);
+  assert.equal(e.applies({ source: 'manual', promptContext: { rawText: `${raw}\nFiles: docs/audit-x.md, src/product-spec-to-hub.js` }, blockedReason: block }), false, 'a declared code file keeps it parked');
+  assert.equal(e.applies({ promptContext: { rawText: raw }, blockedReason: 'something else' }), false);
+  assert.equal(e.applies({}), false);
 });
 
 // --- lane-endpoint-outage-parked (2026-10-23) -----------------------------------------------------------------------------------------------
@@ -185,4 +226,48 @@ test('stacked-sibling-missing-from-tree: the failure pattern matches the wording
     'the sibling piece is not merged',
   ]) assert.equal(re.test(t), true, t);
   for (const t of ['expected 2 but got 1', 'the sibling merged cleanly and the tests pass', 'The draft claims `# pass 97` but the real output shows `# pass 96`']) assert.equal(re.test(t), false, t);
+});
+
+// --- entryAppliesToScope (2026-10-30, HUB0191 · 1/6) --------------------------------------------------------------
+// Infrastructure: the appliesScope field lets a registry entry declare whether it
+// drains parked tasks, done-but-not-yet-merged-branch tasks, or both. Default is
+// 'parked' so existing entries keep their prior behavior.
+
+test('entryAppliesToScope: absent appliesScope defaults to "parked"', () => {
+  const noScope = { id: 'ghost-entry' };
+  assert.equal(entryAppliesToScope(noScope, 'parked'), true);
+  assert.equal(entryAppliesToScope(noScope, 'done-unmerged-branch'), false);
+});
+
+test('entryAppliesToScope: appliesScope "both" matches either scope', () => {
+  const both = { id: 'dual-entry', appliesScope: 'both' };
+  assert.equal(entryAppliesToScope(both, 'parked'), true);
+  assert.equal(entryAppliesToScope(both, 'done-unmerged-branch'), true);
+  assert.equal(entryAppliesToScope(both, 'bogus'), false);
+});
+
+test('entryAppliesToScope: appliesScope "done-unmerged-branch" matches only that scope', () => {
+  const dunb = { id: 'dunb-entry', appliesScope: 'done-unmerged-branch' };
+  assert.equal(entryAppliesToScope(dunb, 'parked'), false);
+  assert.equal(entryAppliesToScope(dunb, 'done-unmerged-branch'), true);
+});
+
+test('entryAppliesToScope: undefined appliesScope is treated as "parked"', () => {
+  const undef = { id: 'undef-entry', appliesScope: undefined };
+  assert.equal(entryAppliesToScope(undef, 'parked'), true);
+  assert.equal(entryAppliesToScope(undef, 'done-unmerged-branch'), false);
+});
+
+test('entryAppliesToScope: existing entries without appliesScope behave as "parked" only', () => {
+  // Pick an entry known not to carry appliesScope (the first one is the canonical example).
+  const existing = KNOWN_FIXED[0];
+  assert.equal(entryAppliesToScope(existing, 'parked'), true);
+  assert.equal(entryAppliesToScope(existing, 'done-unmerged-branch'), false);
+});
+
+test('entryAppliesToScope: guards against null/undefined entry and non-string scope', () => {
+  assert.equal(entryAppliesToScope(null, 'parked'), false);
+  assert.equal(entryAppliesToScope(undefined, 'parked'), false);
+  assert.equal(entryAppliesToScope({}, null), false);
+  assert.equal(entryAppliesToScope({}, 42), false);
 });

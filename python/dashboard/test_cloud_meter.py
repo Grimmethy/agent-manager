@@ -74,6 +74,60 @@ class BuildCloudMeterTest(unittest.TestCase):
         self.assertFalse(out["available"])
 
 
+class SwitchedOffTest(unittest.TestCase):
+    """2026-11-02: a cloud lane whose worker is switched off (the Workers-tab Turn off button) and whose gateway is stopped on purpose is not an error."""
+    def refuse(self, url, timeout):
+        raise ConnectionRefusedError("[Errno 111] Connection refused")
+
+    def test_switched_off_and_gateway_down_is_flagged_switched_off_not_just_unreachable(self):
+        out = cloud_meter.build_cloud_meter([CLOUD], self.refuse, disabled=lambda: {"worker-cloud"})
+        self.assertEqual((out["cloudLane"], out["available"], out["switchedOff"], out["laneId"]), (True, False, True, "worker-cloud"))
+        self.assertIn("Connection refused", out["error"])
+
+    def test_not_switched_off_and_gateway_down_keeps_the_plain_error(self):
+        for disabled in (lambda: set(), lambda: {"worker-rx580"}, None):
+            out = cloud_meter.build_cloud_meter([CLOUD], self.refuse, disabled=disabled)
+            self.assertEqual((out["available"], "switchedOff" in out), (False, False))
+
+    def test_switched_off_but_the_gateway_answers_shows_the_real_meter(self):
+        out = cloud_meter.build_cloud_meter([CLOUD], lambda url, t: dict(METER), disabled=lambda: {"worker-cloud"})
+        self.assertEqual((out["available"], "switchedOff" in out, out["monthToDate"]["calls"]), (True, False, 3))
+
+    def test_the_switch_is_only_looked_up_when_the_meter_could_not_be_read(self):
+        calls = []
+        cloud_meter.build_cloud_meter([CLOUD], lambda url, t: dict(METER), disabled=lambda: calls.append(1) or set())
+        self.assertEqual(calls, [])
+        cloud_meter.build_cloud_meter([CLOUD], self.refuse, disabled=lambda: calls.append(1) or set())
+        self.assertEqual(calls, [1])
+
+    def test_a_broken_switch_lookup_means_not_switched_off(self):
+        def boom():
+            raise RuntimeError("node missing")
+        out = cloud_meter.build_cloud_meter([CLOUD], self.refuse, disabled=boom)
+        self.assertEqual((out["available"], "switchedOff" in out), (False, False))
+
+    def test_the_other_unavailable_cases_are_flagged_too(self):
+        off = lambda: {"worker-cloud"}  # noqa: E731
+        self.assertTrue(cloud_meter.build_cloud_meter([CLOUD], lambda u, t: ["x"], disabled=off)["switchedOff"])
+        no_endpoint = {**CLOUD, "env": {}}
+        out = cloud_meter.build_cloud_meter([no_endpoint], self.refuse, disabled=off)
+        self.assertEqual((out["switchedOff"], out["error"]), (True, "the cloud lane has no endpoint"))
+
+    def test_a_lane_without_an_id_is_never_switched_off(self):
+        out = cloud_meter.build_cloud_meter([{**CLOUD, "id": None}], self.refuse, disabled=lambda: {None, "worker-cloud"})
+        self.assertNotIn("switchedOff", out)
+
+    def test_the_route_passes_the_switch_lookup_and_flags_the_payload(self):
+        client = app.app.test_client()
+        with mock.patch.object(app, "worker_lane_defs", return_value=[CLOUD]), mock.patch.object(cloud_meter, "_http_get_json", side_effect=ConnectionRefusedError("refused")), \
+                mock.patch("worker_switch.disabled_workers", return_value={"worker-cloud"}):
+            body = client.get("/api/cloud-meter").get_json()
+        self.assertEqual((body["available"], body["switchedOff"]), (False, True))
+        with mock.patch.object(app, "worker_lane_defs", return_value=[CLOUD]), mock.patch.object(cloud_meter, "_http_get_json", side_effect=ConnectionRefusedError("refused")), \
+                mock.patch("worker_switch.disabled_workers", return_value=set()):
+            self.assertNotIn("switchedOff", client.get("/api/cloud-meter").get_json())
+
+
 class CloudMeterRouteTest(unittest.TestCase):
     def setUp(self):
         self.client = app.app.test_client()

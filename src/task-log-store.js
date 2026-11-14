@@ -29,6 +29,8 @@
 const fs = require('fs');
 const path = require('path');
 
+const { getTaskCompute } = require('./task-compute.js');
+
 const TASK_LOG_DIR = 'task-logs';
 
 function taskLogRelPath(taskId) {
@@ -50,7 +52,7 @@ function taskLogAbsPath(repoRoot, taskId) {
 // (2026-09-12, Grimmethy). Every field here is either already append-only (history) or a
 // terminal snapshot (the LAST known value of a field that only ever gets set once per
 // stage, e.g. blockedReason at the moment of apply -- there is no earlier value to lose).
-function buildTaskLogRecord(task) {
+function buildTaskLogRecord(task, { compute } = {}) {
   const record = {
     id: task.id,
     title: task.title,
@@ -73,6 +75,8 @@ function buildTaskLogRecord(task) {
   ]) {
     if (task[key] !== undefined) record[key] = task[key];
   }
+  // HUB0280-04: the per-task model compute rollup (src/task-compute.js), display-only; absent when there is none so an old record is unchanged.
+  if (compute && typeof compute === 'object') record.compute = compute;
   return record;
 }
 
@@ -80,12 +84,21 @@ function buildTaskLogRecord(task) {
 // the task log file at repoRoot/task-logs/<id>.json. Returns the repoRoot-relative path,
 // the same shape apply-task.js's other artifact.file entries use, so callers can push it
 // straight onto filesToAdd without any path translation.
-function writeTaskLogFile(repoRoot, task) {
+function writeTaskLogFile(repoRoot, task, { compute } = {}) {
   const relPath = taskLogRelPath(task.id);
   const absPath = taskLogAbsPath(repoRoot, task.id);
   fs.mkdirSync(path.dirname(absPath), { recursive: true });
-  fs.writeFileSync(absPath, JSON.stringify(buildTaskLogRecord(task), null, 2) + '\n', 'utf8');
+  fs.writeFileSync(absPath, JSON.stringify(buildTaskLogRecord(task, { compute }), null, 2) + '\n', 'utf8');
   return relPath;
 }
 
-module.exports = { TASK_LOG_DIR, taskLogRelPath, taskLogAbsPath, buildTaskLogRecord, writeTaskLogFile };
+// The compute rollup to stamp on a task's log at apply, or null (no database, no pipelineDir, no recorded calls for the task, any failure): a log
+// without it is just the old record.
+function taskComputeForLog(pipelineDir, taskId) {
+  try {
+    const c = getTaskCompute(pipelineDir, taskId);
+    return c && c.calls > 0 ? c : null;
+  } catch { return null; }
+}
+
+module.exports = { taskComputeForLog, TASK_LOG_DIR, taskLogRelPath, taskLogAbsPath, buildTaskLogRecord, writeTaskLogFile };

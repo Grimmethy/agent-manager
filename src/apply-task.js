@@ -25,7 +25,7 @@ const { createRealGitRunner } = require('./git-runner.js');
 const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { isNoopApplyDetail } = require('./task-disposition.js');
-const { writeTaskLogFile } = require('./task-log-store.js');
+const { writeTaskLogFile, taskComputeForLog } = require('./task-log-store.js');
 const { requeueBlockedTasksForSignature } = require('./blocked-drain.js');
 
 // Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
@@ -188,6 +188,29 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
         return { skipped: true, reason: result.reason };
       }
       return { succeeded: true, doneMarker: `closed brain-dump entry ${entryId}` };
+    }
+
+    // brain_dump_resolution_check records a verdict on ONE brain-dump entry (HUB0274-05). Same non-git shape as brain_dump_disposition: its target is
+    // brain-dump.json under brainDumpPath, not a repo file. FLAG ONLY: it stamps entry.resolutionCheck (and entry.possiblyResolved for a validated yes)
+    // and never changes status, suppressed or rawText. An entry that is gone or whose text changed since the task was drafted is a safe skip.
+    if (task.domain === 'brain_dump_resolution_check') {
+      const { parseVerdictResponse, recordResolutionVerdict } = require('./brain-dump-resolution-check.js');
+      const { validateResolutionVerdict } = require('./validate-resolution.js');
+      const { loadBrainDump } = require('./apply-group-a-brain-dump.js');
+      const { writeJsonAtomicSync } = require('./atomic-write.js');
+      const ctx = task.promptContext || {};
+      const data = loadBrainDump(brainDumpPath);
+      const entry = data.entries.find((e) => e && e.id === ctx.brainDumpEntryId);
+      if (!entry) return { skipped: true, reason: `brain_dump_resolution_check: entry ${ctx.brainDumpEntryId} is gone -- nothing recorded` };
+      if (entry.rawText !== ctx.rawText) return { skipped: true, reason: `brain_dump_resolution_check: entry ${entry.id} changed since this check was drafted -- nothing recorded` };
+      const parsed = parseVerdictResponse(task.implementResponse);
+      const checked = validateResolutionVerdict(parsed, parsed.evidence, ctx.evidencePack);
+      recordResolutionVerdict({
+        entries: data.entries, entryId: entry.id, verdict: checked.resolved, evidence: checked.evidence,
+        masterSha: ctx.masterSha, citedShas: ctx.citedShas,
+      });
+      writeJsonAtomicSync(brainDumpPath, data);
+      return { succeeded: true, doneMarker: `resolution check ${entry.id}: ${checked.resolved}` };
     }
 
     // project_search's target (UsefulProjectIndex/INDEX.md) lives OUTSIDE any project's
@@ -382,6 +405,25 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     }
 
     if (artifact && artifact.skipped) {
+      // HUB0306 2/2 / HUB0308 1/2: a stacked hub child whose diff came back empty
+      // must NOT be silently marked done, abandoned, or have its originating brain
+      // dump entry closed — it needs a human to decide whether to drop the piece,
+      // reschedule, or merge it away. Return a { succeeded:false, status:'needs-clarification' }
+      // outcome so the downstream pipeline routes it to queue/awaiting-confirm/ with
+      // a clear reason, same as any other human-gated hold. Plain (non-stacked)
+      // empty-diff tasks keep the old "succeeded:true" behavior: they are standalone
+      // no-ops, not hub pieces that freeze the chain.
+      if (artifact.emptyDiff === true && task && task.stacked) {
+        // HUB0308 1/2: stacked hub child with empty diff must NOT be silently
+        // abandoned or closed — return a needs-clarification outcome so the
+        // human decides whether to drop/reschedule/merge. Do NOT call
+        // abandonBranch() or closeOriginatingBrainDumpEntry() here.
+        return {
+          succeeded: false,
+          reason: 'empty diff on a stacked hub piece: nothing landed',
+          status: 'needs-clarification',
+        };
+      }
       abandonBranch();
       closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
       return { succeeded: true, doneMarker: artifact.reason };
@@ -424,7 +466,8 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // rawText/implementResponse/planResponse verbatim, which for a brain_dump-derived
     // task is the user's own free-typed personal/business note content -- no longer
     // staged/committed/pushed, written to disk only.
-    writeTaskLogFile(repoRoot, task);
+    // HUB0280-04: stamp the task's recorded model compute (tokens, model time) on the log; a missing database or any failure just leaves it off.
+    writeTaskLogFile(repoRoot, task, { compute: taskComputeForLog(pipelineDir, task.id) });
     gitRunner.add(filesToAdd);
 
     const msgPath = path.join(require('os').tmpdir(), `apply-commit-msg-${task.id}.txt`);

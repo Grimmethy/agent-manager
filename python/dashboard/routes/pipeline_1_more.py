@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import json
-import subprocess
+import subprocess, drain_registry   # drain_registry: the detached plugin drains (python/dashboard/drain_registry.py); edits here stay line-neutral, the functions below are size-ratcheted
 
 # The app.py helpers these views call (ENV_FILE_PATH, _COMMIT_LOG_FIELD_SEP, _COMMIT_LOG_RECORD_SEP, _TASK_TRAILER_RE, _acquire_apply_lock, _archive_task_file, _find_task_log_anywhere, _find_task_record_anywhere, _invalidate_branch_cache, _pipeline_running, _pipeline_stoppable, _release_apply_lock, _run_git, _start_pipeline, _stop_pipeline, _summarize_task_record, _sync_live_checkout, get_active_repo_root, get_hub_data_provider, get_pipeline_dir, list_unmerged_branches, logger, queue_dir, read_env_file, read_json_safe) are
 # imported lazily inside each view: app.py imports THIS module to register the
@@ -15,7 +15,7 @@ import subprocess
 # runs, app.py is fully initialised and the import is just a dict lookup. (Same
 # pattern as routes/concepts.py, routes/second_brain.py, routes/reports.py.)
 
-pipeline_1_more_bp = Blueprint("pipeline-1-more-bp", __name__)
+pipeline_1_more_bp = Blueprint("pipeline-1-more-bp", __name__); import forge_mode; forge_mode.register(pipeline_1_more_bp)   # adds GET/POST /api/pipeline/forge-mode (python/dashboard/forge_mode.py); one line so the size-ratcheted functions here stay as they are
 
 
 def _get_project_tests_command(repo_root: Path) -> str | None:
@@ -339,12 +339,12 @@ def api_pipeline_status():
     running = _pipeline_running()
     return jsonify({
         "activeRepoRoot": get_active_repo_root(),
-        "running": running,
+        "running": running, "drains": drain_registry.running_drains(),
         # "stoppable" is looser than "running": true whenever a real daemon process
         # exists, even if every heartbeat says otherwise. The frontend gates its Stop
         # control on (running || stoppable) so a wrong "running" can never hide the only
         # way to stop a live pipeline from the UI (2026-08-30 incident).
-        "stoppable": True if running else _pipeline_stoppable(),
+        "stoppable": True if running else (_pipeline_stoppable() or bool(drain_registry.running_drains())),
         # Which job types actually run is no longer a bundled "mode" -- see /api/job-types.
         # includeApply/skipPush are the two run-specific safety toggles that used to be
         # implied by mode; they're per-repoRoot and persisted the same way REPO_ROOT is.
@@ -388,14 +388,22 @@ def api_pipeline_stop():
     from app import _stop_pipeline
     body = request.get_json(silent=True) or {}
     force = bool(body.get("force", False))
-    return jsonify({"stopped": _stop_pipeline(force=force)})
+    return jsonify({"drains_stopped": [d["name"] for d in drain_registry.running_drains()], "stopped": _stop_pipeline(force=force)})   # drains first: stop.sh is about to end them
 
 
 @pipeline_1_more_bp.route("/api/git/unmerged-branches")
 def api_git_unmerged_branches():
     # Served from the cache (stale-while-revalidate, see app.list_unmerged_branches): the forced full recompute took ~37 s under load, past the tab's 30 s timeout.
-    from app import _branch_cache, _branch_cache_lock, list_unmerged_branches
-    branches = list_unmerged_branches(force=False)
+    from app import _branch_cache, _branch_cache_lock, _invalidate_branch_cache, branch_list_refreshing, list_unmerged_branches
+    if request.args.get("kick") == "1":
+        # The page was told that something that feeds the list happened (a task finished, a verdict, a merge): start the background refresh NOW instead of waiting for the
+        # TTL, and still answer from the last good list. The refresh announces branch-list-changed when it finds a difference, and the page reads the list again.
+        # At most one kick per window does the work (python/dashboard/branch_kick.py): the page sends one for every counts or branches event, ~6 a minute, and each used to restart the
+        # recompute of all 47 projects (a git fetch per repo and ~7 git processes a second). A kick inside the window is coalesced into one trailing honour, never dropped.
+        import branch_kick
+        import branch_projects
+        branch_kick.kick(lambda: _invalidate_branch_cache(refetch=True), branch_projects.expire_all if request.args.get("projects") == "all" else None)
+    branches = list_unmerged_branches(force=False, stale_ok=True)   # never recomputes inside the request: last good list now, refresh in the background
     with _branch_cache_lock:
         filled = _branch_cache["at"]
     pending = []
@@ -408,10 +416,11 @@ def api_git_unmerged_branches():
     resp = jsonify(branches)
     resp.headers["X-Branch-Cache-Age"] = str(max(0, int(time.time() - filled))) if filled else "0"
     resp.headers["X-Branch-Projects-Pending"] = ",".join(pending)
+    resp.headers["X-Branch-Refreshing"] = "1" if branch_list_refreshing() else "0"
     # The tab polls this every 15 s and the ~140 KB list is almost always unchanged: tag it so an unchanged list is answered with a body-less 304 (the browser revalidates by itself
     # under no-cache). The pending header is part of the tag because the tab reads it (branchProjectsPending); the cache-age header changes every call and is left out.
     resp.headers["Cache-Control"] = "no-cache"
-    resp.set_etag(hashlib.sha256(resp.get_data() + b"\0" + resp.headers["X-Branch-Projects-Pending"].encode()).hexdigest())
+    resp.set_etag(hashlib.sha256(resp.get_data() + b"\0" + resp.headers["X-Branch-Projects-Pending"].encode() + b"\0" + resp.headers["X-Branch-Refreshing"].encode()).hexdigest())
     return resp.make_conditional(request)
 
 
@@ -419,7 +428,7 @@ def api_git_unmerged_branches():
 def api_git_held_hub_branches():
     """Hubs with built-but-unlisted children, so the tab can say what each is waiting on."""
     from app import list_held_hub_groups
-    return jsonify(list_held_hub_groups())
+    return jsonify(list_held_hub_groups(include_other_projects=request.args.get("projects") == "all"))
 
 
 @pipeline_1_more_bp.route("/api/git/branches/<path:branch>/commits")
@@ -527,7 +536,7 @@ def _validate_and_authorize_merge(repo_root, branch, force, scope=None):
     Returns the context dict the later helpers consume: {"match", "main_branch", "repo_root"}.
     Raises LookupError if the branch is not in a fresh list, PermissionError (the endpoint
     answers 409) if a gate blocks and the caller did not force."""
-    from app import list_unmerged_branches
+    from app import _branch_cache_lock, _branch_fetch_state, list_unmerged_branches
 
     # Never trust a caller-supplied branch string as a raw git ref beyond what THIS
     # process already enumerated itself -- re-derive the current list (cheap: cached
@@ -536,8 +545,11 @@ def _validate_and_authorize_merge(repo_root, branch, force, scope=None):
     if scope:
         import branch_projects
         branches = branch_projects.refresh_branches(scope)  # another project: gate on ITS list as it is right now
+        fetched_at = time.time()  # refresh_branches raises when its fetch fails, so reaching here means it fetched
     else:
         branches = list_unmerged_branches(force=True)
+        with _branch_cache_lock:
+            fetched_at = _branch_fetch_state["at"]  # set only by a fetch that finished: a timed-out fetch leaves the old time and the merge fetches again
     match = next((b for b in branches if b["branch"] == branch), None)
     if not match:
         raise LookupError(f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
@@ -577,7 +589,7 @@ def _validate_and_authorize_merge(repo_root, branch, force, scope=None):
             '{"force": true} only if you have verified the branch is actually complete.'
         )
 
-    return {"match": match, "main_branch": match["mainBranch"], "repo_root": repo_root, "scope": scope}
+    return {"match": match, "main_branch": match["mainBranch"], "repo_root": repo_root, "scope": scope, "fetchedAt": fetched_at}
 
 
 def _merge_conflict_error(match, main_branch, merge_err):
@@ -646,7 +658,9 @@ def _execute_git_merge(context):
     except RuntimeError as exc:
         raise MergeLockBusy(str(exc)) from exc
     try:
-        _run_git(["fetch", "origin"], repo_root)
+        from app import _ACTION_FETCH_REUSE_SECONDS, _ACTION_FETCH_TIMEOUT_SECONDS
+        if time.time() - (context.get("fetchedAt") or 0) > _ACTION_FETCH_REUSE_SECONDS:  # the check just before this fetched already: do not pay for a second one under the lock
+            _run_git(["fetch", "origin"], repo_root, timeout=_ACTION_FETCH_TIMEOUT_SECONDS)
         # Brain-dump #1740: what this merged branch held (commits + candidate headings + the verdict on its card), recorded with the merged row
         # below. No ref is pinned -- the commits land on the main branch. Best-effort: never stops the merge.
         snapshot = {}
@@ -698,8 +712,39 @@ def _apply_post_merge_side_effects(context):
         if os.path.realpath(str(scope["repoPath"])) != os.path.realpath(str(PACKAGE_ROOT)):
             return {"skipped": "not the dashboard's own repo"}
         return _sync_live_checkout(context["main_branch"])
-    _invalidate_branch_cache()
+    _invalidate_branch_cache(drop_branch=(context.get("match") or {}).get("branch"))
     return _sync_live_checkout(context["main_branch"])
+
+
+def _emit_branch_merged(qdir, branch, task_id):
+    """Announce a merge in the queue-events journal (ADR-0024). Best-effort and silent on failure: the merge already happened and must not be reported as failed
+    because of the journal. AGENT_MANAGER_QUEUE_EVENTS=off makes the writer skip it."""
+    try:
+        from queue_events import append_event
+        append_event(os.path.dirname(os.path.abspath(str(qdir))), {"type": "branch_merged", "branch": branch, "taskId": task_id})
+    except Exception as exc:  # noqa: BLE001 -- never let the journal break a merge
+        import logging
+        logging.getLogger(__name__).warning("queue-events: branch_merged not journaled for %s: %s", branch, exc)
+
+
+def _guarded_post_merge_step(step, warnings, action):
+    """Run one step that happens AFTER a merge landed on origin. A git timeout, a git failure or a write error is
+    appended to `warnings` as a plain sentence and None is returned; it never propagates (the merge is done, a 500 would
+    tell the owner it failed). Returns the step's own result otherwise."""
+    from app import logger
+
+    try:
+        result = action()
+    except subprocess.TimeoutExpired as exc:
+        reason = f"Git did not answer in time while {step} (took longer than {exc.timeout:g} s; the machine is busy). The merge itself is on origin."
+        logger.warning("Post-merge step timed out (non-fatal): %s", reason)
+    except (RuntimeError, OSError) as exc:
+        reason = f"Problem while {step}: {exc}. The merge itself is on origin."
+        logger.warning("Post-merge step failed (non-fatal): %s", reason, exc_info=True)
+    else:
+        return result
+    warnings.append(reason)
+    return None
 
 
 def _record_merge_in_task_file(branch, main_branch, qdir=None):
@@ -748,6 +793,7 @@ def _record_merge_in_task_file(branch, main_branch, qdir=None):
                 except OSError as exc:
                     logger.error("Failed to persist merge-state for branch %r to %s: %s", branch, candidate, exc)
                     raise
+                _emit_branch_merged(qdir, branch, task_id)    # announced only after the merge-state write succeeded
             break
 
 
@@ -789,6 +835,15 @@ def _record_merge_in_task_log(repo_root, branch, main_branch, qdir=None):
         logger.warning("Non-fatal: could not record merge disposition in task-logs/%s.json: %s", task_id, exc)
 
 
+def _git_busy_response(step, exc, changed):
+    """A git command outlasted its limit because the host is busy: a retryable 503 that says what happened, never a bare 500. A timeout while checking changed nothing; one
+    during the merge may have stopped anywhere, so that message sends the caller to the branch list before another try."""
+    cmd = " ".join(exc.cmd[:3]) if isinstance(exc.cmd, (list, tuple)) else str(exc.cmd)
+    after = "The merge may or may not have completed: look at the branch list before trying again." if changed else "Nothing was changed: try again in a minute."
+    return jsonify({"succeeded": False, "retryable": True,
+                    "reason": f"Git did not answer in time while {step} (`{cmd}` took longer than {exc.timeout:g} s; the machine is busy). {after}"}), 503
+
+
 @pipeline_1_more_bp.route("/api/git/branches/<path:branch>/merge", methods=["POST"])
 def api_git_merge_branch(branch):
     from app import get_active_repo_root
@@ -813,18 +868,27 @@ def api_git_merge_branch(branch):
         abort(404, description=str(e))
     except PermissionError as e:
         return jsonify({"succeeded": False, "reason": str(e)}), 409
+    except subprocess.TimeoutExpired as e:
+        return _git_busy_response("checking the branch", e, changed=False)
 
     try:
         _execute_git_merge(context)
     except MergeLockBusy:
         abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
+    except subprocess.TimeoutExpired as e:
+        return _git_busy_response("merging the branch", e, changed=True)
     except RuntimeError as e:
         return jsonify({"succeeded": False, "reason": str(e)}), 500
 
-    live_sync = _apply_post_merge_side_effects(context)
+    # The merge is already on origin here, so nothing below may turn the response into a failure: each step is guarded on its own, a
+    # failure becomes a warning, and the later steps still run (the task record must be stamped even when the live-checkout sync was too slow).
+    warnings = []
     qdir = scope["qdir"] if scope else None
-    _record_merge_in_task_file(branch, context["main_branch"], qdir)
-    _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir)
+    live_sync = _guarded_post_merge_step("syncing the dashboard checkout", warnings, lambda: _apply_post_merge_side_effects(context))
+    if live_sync is None:
+        live_sync = {"synced": False, "reason": warnings[-1]}
+    _guarded_post_merge_step("stamping the task record", warnings, lambda: _record_merge_in_task_file(branch, context["main_branch"], qdir))
+    _guarded_post_merge_step("closing the task log", warnings, lambda: _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir))
 
     # Check which plugins are behind after merge (if the merged repo is a plugin's repo).
     # Mirrors the pattern in routes/plugins.py: iterate manifest, call behind_checkout,
@@ -849,6 +913,7 @@ def api_git_merge_branch(branch):
         "branch": branch,
         "mainBranch": context["main_branch"],
         "liveSync": live_sync,
+        "warnings": warnings,
         "restartNeeded": restart_needed,
     })
 
@@ -868,7 +933,7 @@ def api_git_discard_branch(branch):
     Mirrors api_git_merge_branch for the parts that overlap (the same-list re-validation
     gate, the apply-lock, the two-location task lookup) minus the merge/checkout/push-to-
     main steps this doesn't need."""
-    from app import _acquire_apply_lock, _archive_task_file, _delete_local_branch, _invalidate_branch_cache, _release_apply_lock, _run_git, get_active_repo_root, list_unmerged_branches, logger, queue_dir, read_json_safe
+    from app import _acquire_apply_lock, _release_apply_lock, get_active_repo_root, list_unmerged_branches
     repo_root = get_active_repo_root()
     if not repo_root:
         abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
@@ -884,7 +949,6 @@ def api_git_discard_branch(branch):
         abort(404, description=str(e))
     if scope:
         repo_root = scope["repoPath"]
-    qdir_for = (lambda: scope["qdir"]) if scope else queue_dir
 
     # Same "only act on what we ourselves already offered" gate api_git_merge_branch/
     # api_task_archive/api_task_requeue all already use (another project: ITS list, recomputed now).
@@ -898,41 +962,10 @@ def api_git_discard_branch(branch):
     except RuntimeError:
         abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
 
-    local_branch = {"deleted": False, "reason": "not attempted"}
-
-    # Brain-dump #1740: capture WHAT this branch holds (commits, the candidate headings it added, the verdict recorded on its card) and
-    # pin its head under refs/discarded/ BEFORE the remote delete below, so a discarded batch is no longer just "discarded via the
-    # dashboard" and stays recoverable once both the remote and local branch are gone. Best-effort: nothing in this block may stop the discard.
-    snapshot, reason = {}, ""
+    # The effect itself lives in branch_discard.discard_branch, shared with the Discard-all batch route below.
+    from branch_discard import discard_branch
     try:
-        from branch_removals import snapshot_branch
-        snapshot = snapshot_branch(_run_git, repo_root, match.get("mainBranch") or "main", branch, match.get("headSha"), qdir_for(), keep_ref=True)
-        body = request.get_json(silent=True)
-        reason = str(body.get("reason") or "").strip() if isinstance(body, dict) else ""
-        if not reason:
-            default_reasons = (snapshot.get("verdict") or {}).get("reasons") or []
-            reason = str(default_reasons[0]) if default_reasons else ""
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Non-fatal: could not snapshot %r before discarding it: %s", branch, exc)
-
-    try:
-        try:
-            _run_git(["push", "origin", "--delete", branch], repo_root)
-        except RuntimeError as e:
-            # A delete failing because the ref is already gone (deleted by hand, or a
-            # duplicate click) means the actual goal -- this branch not existing on origin
-            # -- is already achieved; only a REAL git failure (auth, network, etc.) should
-            # surface as an error. Same "remote ref does not exist" shape git itself uses
-            # for this case.
-            if "remote ref does not exist" not in str(e) and "unable to delete" not in str(e).lower():
-                raise
-        from branch_removals import record_branch_removal
-        record_branch_removal(qdir_for(), branch, "discarded", task_id=branch.removeprefix("agent/"),
-                              detail="discarded via the dashboard Unmerged Branches tab", actor="dashboard-discard",
-                              reason=reason or None, snapshot=snapshot or None)
-        # Also drop the LOCAL copy (only reached when the remote delete succeeded or the ref was
-        # already gone) -- see _delete_local_branch for why leaving it is a real hazard.
-        local_branch = _delete_local_branch(repo_root, branch)
+        payload = discard_branch(branch, match, repo_root, scope, reason=body_in.get("reason"))
     except RuntimeError as e:
         err_text = str(e)
         if any(m in err_text.lower() for m in ('permission', 'denied', '403', 'authentication failed')):
@@ -945,48 +978,18 @@ def api_git_discard_branch(branch):
         return jsonify({"succeeded": False, "reason": trimmed}), 500
     finally:
         _release_apply_lock(lock_fd)
+    return jsonify(payload)
 
-    # Archive the matching task record, same 2-location lookup api_git_merge_branch's own
-    # mergedAt-stamping step already does. Best-effort: no task record found (a branch
-    # pushed with nothing matching in done/) is not an error, just nothing to reconcile;
-    # already-archived (a human archived it by hand first, or a duplicate click) is a
-    # silent no-op, not a 409 -- the branch delete above is the part that mattered.
-    task_archived = False
-    qdir = qdir_for()
-    if qdir:
-        task_id = branch.removeprefix("agent/")
-        done_path = qdir / "done" / f"{task_id}.json"
-        archived_path = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
-        if done_path.is_file():
-            data = read_json_safe(done_path)
-            if data is not None:
-                now_iso = datetime.now(timezone.utc).isoformat()
-                if data.get("terminalDisposition") != "dismissed":
-                    hist = data.get("history")
-                    if not isinstance(hist, list):
-                        hist = data["history"] = []
-                    hist.append({
-                        "stage": "dismissed",
-                        "at": now_iso,
-                        "detail": f"branch {branch} discarded via the dashboard Unmerged Branches tab -- not merging this",
-                    })
-                    data["terminalDisposition"] = "dismissed"
-                try:
-                    done_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-                except OSError as exc:
-                    logger.error("Failed to persist dismissed-state for branch %r to %s: %s", branch, done_path, exc)
-                    raise
-            try:
-                _archive_task_file(qdir, done_path)
-                task_archived = True
-            except FileExistsError:
-                pass
-        elif archived_path.is_file():
-            task_archived = True  # already archived (e.g. by hand) -- nothing more to do
 
-    if scope:
-        branch_projects.after_action(scope)
-    else:
-        _invalidate_branch_cache()
-    return jsonify({"succeeded": True, "branch": branch, "taskArchived": task_archived, "localBranch": local_branch,
-                    "snapshotRef": (snapshot or {}).get("snapshotRef")})
+@pipeline_1_more_bp.route("/api/git/branches/discard-batch", methods=["POST"])
+def api_git_discard_batch():
+    """Discard every listed branch whose CURRENT verdict is discard (the Unmerged Branches tab's "Discard all" button, owner request 2026-10-31).
+
+    Body: {"branches": [{"branch", "project", "sha"}], "includeTriage": false}. Each item repeats the single route's effects by calling the same helper
+    (branch_discard.discard_branch) and is refused unless the verdict the owner saw still stands (see branch_discard.refusal). One apply lock for the whole
+    batch: busy -> 409 and nothing deleted. Per-item results; one failure does not stop the rest."""
+    from branch_discard import discard_batch
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    status, payload = discard_batch(body.get("branches"), include_triage=bool(body.get("includeTriage")))
+    return jsonify(payload), status

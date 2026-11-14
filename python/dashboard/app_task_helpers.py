@@ -73,7 +73,8 @@ def task_summary(data: dict, filename: str) -> dict:
 _LANE_IDS_CACHE: dict = {"at": 0.0, "ids": []}
 
 
-_LANE_IDS_TTL_S = 60.0
+# The slow reconcile age of the lane caches (swr_cache.py): the cache is really invalidated by what lanes.js reads changing, this only bounds how long an unnoticed change can last.
+_LANE_IDS_TTL_S = 600.0
 
 
 _LANE_DEFS_CACHE: dict = {"at": 0.0, "lanes": []}
@@ -410,7 +411,7 @@ def _archive_task_file(qdir, src):
 
 
 # States whose archive means "we are giving up on this task" (as opposed to the Done tab's tidy-up of finished work).
-_GIVE_UP_ARCHIVE_STATES = ("blocked", "needs-clarification", "awaiting-confirm")
+_GIVE_UP_ARCHIVE_STATES = ("blocked", "needs-clarification", "awaiting-confirm", "adhoc", "pending")
 
 
 # Repeated-blocker guard (2026-08-24, pipeline hardening, Grimmethy: "no 'repeated

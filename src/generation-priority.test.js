@@ -66,3 +66,29 @@ test('two in-flight hub-tier tasks fill every lane slot: a priority-30 source is
   assert.ok(!queued.includes('probe_high-task.json'), `hub-tier work (-1000) must count against a priority-30 source:\n${out}`);
   assert.match(out, /pending\/ already has work queued, not adding another task/);
 });
+
+// 2026-10-30: production task-selection.js:128 calls source.next() with NO argument for every registered source.
+// brain_dump_resolution_check.next() must tolerate this (no options parameter) -- a throw here would crash
+// the entire generation walk (no try/catch around source.next() in the normal path).
+test('brain_dump_resolution_check.next() accepts zero arguments without throwing', () => {
+  const { next } = require('./brain-dump-resolution-check.js');
+  // Set required env vars so getConfig() doesn't throw. No brain-dump file exists, so next() should return null.
+  const origRepoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  const origPipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR;
+  const origBrainDumpPath = process.env.AGENT_MANAGER_BRAIN_DUMP_PATH;
+  process.env.AGENT_MANAGER_REPO_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'brain-dump-test-'));
+  process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_BRAIN_DUMP_PATH = path.join(process.env.AGENT_MANAGER_REPO_ROOT, 'brain-dump.json');
+  try {
+    // No brain-dump file exists, so next() should return null (not throw).
+    assert.equal(next(), null, 'next() with no brain-dump file must return null, not throw');
+  } finally {
+    // Restore env vars
+    if (origRepoRoot !== undefined) process.env.AGENT_MANAGER_REPO_ROOT = origRepoRoot;
+    else delete process.env.AGENT_MANAGER_REPO_ROOT;
+    if (origPipelineDir !== undefined) process.env.AGENT_MANAGER_PIPELINE_DIR = origPipelineDir;
+    else delete process.env.AGENT_MANAGER_PIPELINE_DIR;
+    if (origBrainDumpPath !== undefined) process.env.AGENT_MANAGER_BRAIN_DUMP_PATH = origBrainDumpPath;
+    else delete process.env.AGENT_MANAGER_BRAIN_DUMP_PATH;
+  }
+});

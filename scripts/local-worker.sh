@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # loc
 readonly INSTANCE_ID="${1:-worker-0}"                                              # allow override via argv; default to 'worker-0' matching PowerShell's $env:INSTANCE_ID if undefined (same convention across all 4 daemons so operator can grep logs for specific loop instance).
 export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so local-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
 
-# --once (2026-09-20, docs/idle-pool-borrowing.md): ONE tick, then exit with 10 (did work), 11 (did work, infra-shaped failure) or 0 (found
+# --once (2026-09-20, docs/design-notes/idle-pool-borrowing.md): ONE tick, then exit with 10 (did work), 11 (did work, infra-shaped failure) or 0 (found
 # nothing). It is how an idle lane BORROWS a tick from another suite project: the lane's daemon runs this same script again as a child under
 # that project's env (scripts/../src/pool-projects.js --env-args), heartbeating into the lane's HOME instances dir. The child must not look like a
 # second daemon, so it skips the duplicate-instance check, the "starting" heartbeat and the startup reclaim, and it never sleeps or borrows.
@@ -204,6 +204,8 @@ process_drafting_file() {
   # queue/needs-clarification/ instead of review/, same "nothing here for an automatic
   # reviewer to verify" reasoning local-draft.js's own comment documents.
   draft_needs_clarification="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.needsClarification?"true":"false")}catch(e){console.log("false")}')"
+  # recorded (2026-11-02): a script-handled source (src/script-handler-registry.js) finished its work and left the result on the task; nothing for a reviewer to verify.
+  draft_recorded="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.recorded?"true":"false")}catch(e){console.log("false")}')"
 
   if [[ "$draft_succeeded" == "true" && "$draft_blocked" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/blocked" >/dev/null 2>&1
@@ -213,6 +215,16 @@ process_drafting_file() {
     mkdir -p "${QUEUE_DIR}/needs-clarification" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/needs-clarification/${name}"
     printf '[worker-%s] %s needs a human decision -- moved to needs-clarification/\n' "$INSTANCE_ID" "$task_id" >&2
+  elif [[ "$draft_succeeded" == "true" && "$draft_recorded" == "true" ]]; then
+    mkdir -p "${QUEUE_DIR}/done" >/dev/null 2>&1
+    mv -n "$wpath" "${QUEUE_DIR}/done/${name}"
+    printf '[worker-%s] recorded %s -- script handler finished, no review needed: moved to done/\n' "$INSTANCE_ID" "$task_id" >&2
+  elif [[ "$draft_succeeded" == "true" ]] && node "${PACKAGE_SRC_DIR}/node-outbox.js" is-node; then
+    # Multi-node (piece 7b): a worker on a NODE (AGENT_MANAGER_NODE_ID set and not wok) stops after the draft. The drafted record waits in queue/node-outbox/ for
+    # src/node-package-send.js to ship it to wok, whose own queue/review/ runs the ordinary review, apply, verifier and merge. A wok worker never takes this branch.
+    mkdir -p "${QUEUE_DIR}/node-outbox" >/dev/null 2>&1
+    mv -n "$wpath" "${QUEUE_DIR}/node-outbox/${name}"
+    printf '[worker-%s] draft complete on a node, ready to send to wok: %s\n' "$INSTANCE_ID" "$task_id" >&2
   elif [[ "$draft_succeeded" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/review" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/review/${name}"
@@ -488,8 +500,12 @@ fi
 CONSECUTIVE_INFRA_FAILURES=0
 SWITCHED_OFF_TICKS=0                                                     # consecutive ticks this worker has been switched off by the operator (worker_switched_off); only used to print one line on each transition
 ENDPOINT_DOWN_TICKS=0                                                    # consecutive ticks the lane's Ollama endpoint did not answer (see the circuit breaker in the main loop)
+LAST_WAKE=""                                                            # how the last idle wait ended: event | timeout | sleep (see wait_for_queue_change)
+WAKE_RECONCILE_HITS=0                                                    # timeout wakes that then found work: a producer changed state without announcing it in a queue directory (ADR-0024 rule 6)
+LAST_TICK_START=0                                                        # epoch seconds when the current tick began (the minimum gap between idle ticks is measured from it)
+LAST_TICK_START_MS=0                                                     # the same moment in ms: the waiter reports any queue entry that arrived after it (catch-up)
 
-# Borrow a tick from another suite project (docs/idle-pool-borrowing.md). Called only when this lane's OWN project had nothing to do this tick.
+# Borrow a tick from another suite project (docs/design-notes/idle-pool-borrowing.md). Called only when this lane's OWN project had nothing to do this tick.
 # Walks the pool in least-recently-borrowed order; the first project that yields work ends the walk. A borrowed tick does exactly ONE item (its
 # task runs to the end of the pass, so active-project work arriving meanwhile waits for that one task -- the other lane can take it), then the
 # lane re-checks its home project immediately -- no sleep beyond the loop's usual 1s after work -- before borrowing again. A project that had nothing is skipped for a few minutes
@@ -517,6 +533,8 @@ borrow_from_pool() {
   done
   return 0
 }
+
+source "${SCRIPT_DIR}/wake-common.sh"                                        # wait_for_queue_change (the idle wait; ADR-0024 S3), shared with review-runner.sh and apply-loop.sh
 
 # The pause at the end of a tick, shared by the normal tick and a tick that ended on a premium borrow (it reads did_work and
 # TICK_HAD_INFRA_FAILURE and maintains CONSECUTIVE_INFRA_FAILURES, exactly as when it was inline at the bottom of the loop).
@@ -548,10 +566,15 @@ end_of_tick_pause() {
     sleep "${backoff_secs}.$(printf '%03d' "$jitter_ms")"
   elif "$did_work"; then
     CONSECUTIVE_INFRA_FAILURES=0
+    if [[ "$LAST_WAKE" == "timeout" ]]; then
+      WAKE_RECONCILE_HITS=$((WAKE_RECONCILE_HITS + 1))
+      printf '[worker-%s] wake reconcile: found work after a TIMEOUT wake (hit %s) -- a queue change was not announced in a watched directory.\n' "$INSTANCE_ID" "$WAKE_RECONCILE_HITS" >&2
+    fi
+    LAST_WAKE=""
     sleep 1
   else
     CONSECUTIVE_INFRA_FAILURES=0
-    sleep "${ORC_TICK_SECS:-60}"                                                   # wait between polls (default: 60s) — same delay PowerShell uses via its `Start-Sleep -Seconds $env:TICK_INTERVAL` inside main daemon loop body (we read from ORC_TICK_SECS env var so user can customize per-instance without editing the script; bash ${VAR:-default} form is exactly that kind of fallback assignment which matches what PowerShell's `$interval = if ($null -ne $env:INTERVAL) { $env:INTERVAL } else { 60}` does for same purpose.
+    wait_for_queue_change
   fi
 }
 
@@ -588,6 +611,7 @@ borrow_premium_from_projects() {
 }
 
 while :; do                                                                     # `while :; do` is bash idiom for 'true/forever' loop — equivalent of PowerShell's `while ($true)` syntax we're matching here. Bash doesn't have boolean literals natively so ':' (the POSIX-no-op command that always returns 0=success) serves as the true condition in loops like this one; identical semantic meaning in practice to while-true block we use elsewhere.
+  LAST_TICK_START="$(date +%s)"; LAST_TICK_START_MS="$(date +%s%3N)"
   did_work=false                                                                 # tracks whether this tick actually processed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment). Reset fresh every tick.
   TICK_HAD_INFRA_FAILURE=false                                                   # set by process_drafting_file (a global, not a subshell -- it's called directly) when this tick's draft call failed on an apparent infra outage. Drives the backoff decision below, separate from did_work.
 
@@ -619,10 +643,12 @@ while :; do                                                                     
   # Yield this tick while PromptForge holds the GPU (comfyui-lease).
   if comfyui_lease_held "${OLLAMA_URL:-http://localhost:11434}"; then
     printf '[worker-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+    lane_note_gpu_pause "$INSTANCE_ID" "$HEARTBEAT_MODEL" "$STARTED_AT"   # heartbeat says "paused" (Workers tab) and remembers to warm the model up afterwards
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
     continue
   fi
+  lane_warm_after_pause "$INSTANCE_ID" "$HEARTBEAT_MODEL" "$STARTED_AT"   # no-op unless the lease was just released: reload the model before claiming
 
   # Endpoint circuit breaker (2026-10-23, Grimmethy: the rx580 lane sat idle for 12 h after grimm hard-reset and its Ollama never came back; "this is a recurring
   # event"). While this lane's Ollama endpoint does not answer, claim and resume NOTHING: every draft would fail identically, burn the task's infra requeue
@@ -681,7 +707,21 @@ while :; do                                                                     
   # A premium-only borrowed tick seeds only when this project's adhoc/ or derived/ holds premium work (task-selection.js then generates it
   # first), so borrowing a premium tick never generates regular work in another project.
   if ! "$PREMIUM_ONLY" || node "${PACKAGE_SRC_DIR}/pool-projects.js" --has-premium "$PIPELINE_DIR" worker-seed 2>>"$LOG_FILE"; then
-    node "${PACKAGE_SRC_DIR}/task-sources.js" >>"$LOG_FILE" 2>&1 || true
+    # Several lanes tick on one project and each one walked the whole generation ladder (a node start with its module load, about 0.14 CPU-s, plus three git probes of the
+    # candidate docs) a few seconds after the last: 13 runs in 75 s for ONE idle lane, ~100 child processes a minute (CPU analysis 2026-11-07). A run that another lane (or this one)
+    # finished for the same pipeline within AGENT_MANAGER_TASK_SOURCES_DEDUPE_SECS (default 5, 0 = off) has nothing new to find, so this tick skips it. The stamp is a file holding the
+    # epoch of the last run, read with builtins only (no fork); a missing or unreadable stamp runs it, so the worst case is today's behaviour.
+    ts_window="${AGENT_MANAGER_TASK_SOURCES_DEDUPE_SECS:-5}"
+    ts_stamp="${AGENT_MANAGER_STATE_DIR:-$HOME/.local/state/agent-manager}/task-sources-stamps/${PIPELINE_DIR//\//_}"
+    ts_now=0 ts_last=0
+    printf -v ts_now '%(%s)T' -1
+    [[ "$ts_window" =~ ^[0-9]+$ ]] || ts_window=5
+    if (( ts_window > 0 )) && [[ -r "$ts_stamp" ]]; then read -r ts_last < "$ts_stamp" 2>/dev/null || ts_last=0; fi
+    [[ "$ts_last" =~ ^[0-9]+$ ]] || ts_last=0
+    if (( ts_window == 0 || ts_now - ts_last >= ts_window )); then
+      if (( ts_window > 0 )); then mkdir -p "${ts_stamp%/*}" 2>/dev/null && printf '%s\n' "$ts_now" > "$ts_stamp" 2>/dev/null; fi
+      node "${PACKAGE_SRC_DIR}/task-sources.js" >>"$LOG_FILE" 2>&1 || true
+    fi
   fi
 
   # Resume any task already sitting in THIS instance's own drafting/ folder before claiming
@@ -898,7 +938,7 @@ while :; do                                                                     
     if "$did_work"; then exit 10; fi
     exit 0
   fi
-  # Nothing to do in the home project this tick -> work another suite project NOW rather than idle (docs/idle-pool-borrowing.md).
+  # Nothing to do in the home project this tick -> work another suite project NOW rather than idle (docs/design-notes/idle-pool-borrowing.md).
   if ! "$did_work" && ! "$TICK_HAD_INFRA_FAILURE"; then borrow_from_pool; fi
 
   end_of_tick_pause

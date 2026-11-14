@@ -443,6 +443,27 @@ test('editFileTool errors, without editing, when "find" matches more than once',
   });
 });
 
+test('runBashTool starts in the primary root: pwd is the first root, even with a second root registered', () => {
+  withFixtureRepo((mod, dir) => {
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'run-bash-other-'));
+    const result = mod.runBashTool([dir, other], { command: 'pwd' });
+    if (result.error) {
+      assert.match(result.error, /sandbox \(bwrap\) is not available/);
+    } else {
+      assert.equal(result.stdout.trim(), fs.realpathSync(dir));
+    }
+  });
+});
+
+test('run_bash write-tool description tells the model it already starts in the checkout and not to cd to it', () => {
+  const mod = require('./local-tool-client.js');
+  const bash = mod.WRITE_TOOLS.find((t) => t.function.name === 'run_bash');
+  assert.ok(bash, 'run_bash is in WRITE_TOOLS');
+  assert.match(bash.function.description, /START in the primary repo root/);
+  assert.match(bash.function.description, /never begin a command with `cd /);
+  assert.match(bash.function.description, /`cd` only to reach a DIFFERENT repo/);
+});
+
 test('runBashTool runs a real command in the repo root and captures stdout', () => {
   withFixtureRepo((mod, dir) => {
     fs.writeFileSync(path.join(dir, 'marker.txt'), 'present\n');
@@ -603,11 +624,13 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
 // all for Chat, queue_reviewed_task is the only way to make a real change), not a
 // prompt-level "please prefer queuing" ask.
 
-test('CHAT_TOOLS declares exactly the thirteen chat-safe tools -- no write_file/edit_file', () => {
+test('CHAT_TOOLS declares exactly the nineteen chat-safe tools (thirteen plus the six read-only GitHub tools) -- no write_file/edit_file', () => {
   withFixtureRepo((mod) => {
     const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
     assert.deepEqual(names, [
-      'answer_task_clarification', 'chat_status', 'check_branch', 'list_projects', 'list_unverified_branches', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
+      'answer_task_clarification', 'chat_status', 'check_branch',
+      'github_list_contents', 'github_read_file', 'github_recent_commits', 'github_repo_overview', 'github_search_code', 'github_search_repos',
+      'list_projects', 'list_unverified_branches', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
       'record_branch_verdict', 'requeue_blocked_task', 'resolve_task_clarification', 'run_bash', 'withdraw_task',
     ]);
   });
@@ -710,8 +733,9 @@ test('chat_status handler reports the union of TOOLS + CHAT_TOOLS (not just TOOL
     assert.ok(toolNames.includes('queue_reviewed_task'), 'must include queue_reviewed_task from CHAT_TOOLS');
     // Must include chat_status itself
     assert.ok(toolNames.includes('chat_status'), 'must include chat_status');
-    // Total: 6 (TOOLS) + 13 (CHAT_TOOLS) = 19
-    assert.equal(result.tools.length, 19, 'must report all 19 tools (6 shared + 13 chat)');
+    assert.ok(toolNames.includes('github_search_repos'), 'must include the GitHub tools registered in CHAT_TOOLS');
+    // Total: 6 (TOOLS) + 19 (CHAT_TOOLS: 13 + 6 read-only GitHub tools) = 25
+    assert.equal(result.tools.length, 25, 'must report all 25 tools (6 shared + 19 chat)');
   });
 });
 
@@ -924,7 +948,7 @@ function withMockedChat(scriptedTurns, fn, { killSwitch = null, localCallRespons
     postJsonStream: async () => { throw new Error('streaming path not exercised in this test'); },
   });
   stub('./single-flight-lock.js', { withLock: (_dir, f) => f() });
-  stub('./local-client.js', { call: async () => ({ response: localCallResponse }), KEEP_ALIVE: '30m' });
+  stub('./local-client.js', { call: async () => ({ response: localCallResponse }), KEEP_ALIVE: '8760h' });
   try {
     const mod = require('./local-tool-client.js');
     return fn(mod, dir, { sentBodies });
@@ -977,7 +1001,7 @@ test('every /api/chat turn carries keep_alive (the exported local-client KEEP_AL
     await mod.runPlanWithTools({ prompt: 'go' });
     assert.ok(sentBodies.length >= 2, 'both turns hit /api/chat');
     for (const body of sentBodies) {
-      assert.equal(body.keep_alive, '30m', 'keep_alive is sent on every turn, not just the first');
+      assert.equal(body.keep_alive, '8760h', 'keep_alive is sent on every turn, not just the first');
       assert.equal(body.options.num_ctx, require('./gpu-capacity.js').PINNED_NUM_CTX);
     }
   });
@@ -1640,6 +1664,48 @@ test('nudgeToEditEarly defaults off: a normal run gets no nudge', async () => {
   });
 });
 
+// --- End-of-budget warning (TURNS_LEFT_WARNING) ------------------------------------------
+
+async function runBudgetWarning({ withEdit, nudgeToEditEarly = true, maxTurns = 10, steps = 8 }) {
+  const prevO = process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
+  const prevW = process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING;
+  process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = '2';
+  process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING = '3';
+  try {
+    const explore = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+    const edit = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'x', replace: 'y' } } }] };
+    const finish = { role: 'assistant', content: 'RESOLUTION: implemented\ndid it' };
+    const script = [withEdit ? edit : explore, ...Array(steps).fill(explore), finish];
+    let count = 0;
+    await withMockedChat(script, async (mod, dir, { sentBodies }) => {
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+      await mod.runPlanWithTools({ prompt: 'go', maxTurns, nudgeToEditEarly, primaryRoot: dir });
+      const msgs = sentBodies[sentBodies.length - 1].messages;
+      count = msgs.filter((m) => m.role === 'user' && /Budget warning: \d+ turns remain/.test(m.content || '')).length;
+    });
+    return count;
+  } finally {
+    if (prevO === undefined) delete process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS; else process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = prevO;
+    if (prevW === undefined) delete process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING; else process.env.AGENT_MANAGER_AGENTIC_TURNS_LEFT_WARNING = prevW;
+  }
+}
+
+test('turns-left warning: a run that has edited gets exactly one warning near the end of its budget', async () => {
+  assert.equal(await runBudgetWarning({ withEdit: true }), 1);
+});
+
+test('turns-left warning: no warning when the run made no edit (the early nudges cover that)', async () => {
+  assert.equal(await runBudgetWarning({ withEdit: false }), 0);
+});
+
+test('turns-left warning: no warning without nudgeToEditEarly (chat and other callers)', async () => {
+  assert.equal(await runBudgetWarning({ withEdit: true, nudgeToEditEarly: false }), 0);
+});
+
+test('turns-left warning: no warning when maxTurns is not greater than the window', async () => {
+  assert.equal(await runBudgetWarning({ withEdit: true, maxTurns: 3, steps: 1 }), 0);
+});
+
 test('leafMustEdit: a firmer "final warning" fires when a leaf still has not edited after the soft nudge', async () => {
   const prev = process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
   process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = '2';
@@ -1769,7 +1835,7 @@ function withMockedStreamingChat(turnsOfLines, fn) {
     },
   });
   stub('./single-flight-lock.js', { withLock: (_dir, f) => f() });
-  stub('./local-client.js', { call: async () => ({ response: 'fallback' }), KEEP_ALIVE: '30m' });
+  stub('./local-client.js', { call: async () => ({ response: 'fallback' }), KEEP_ALIVE: '8760h' });
   try {
     const mod = require('./local-tool-client.js');
     return fn(mod, dir);
@@ -2374,6 +2440,75 @@ test('tool-loop audit: AGENT_MANAGER_TOOL_LOOP_AUDIT=off writes no audit file an
     if (prev === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
     else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prev;
   }
+});
+
+// --- garbled tool-name repair ---------------------------------------------------------------
+
+function toolCallTurn(name, args = { path: '.' }) {
+  return { role: 'assistant', content: '', tool_calls: [{ function: { name, arguments: args } }] };
+}
+
+async function runWithName(name) {
+  let toolMsg = null;
+  let audit = [];
+  await withMockedChat([toolCallTurn(name), { role: 'assistant', content: 'done' }], async (mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+    const r = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 5, primaryRoot: dir, taskId: 'repair-t' });
+    toolMsg = r.toolCallLog ? r.toolCallLog[0] : null;
+    audit = readAuditLines(dir).filter((e) => e.type === 'repaired-name');
+  });
+  return { toolMsg, audit };
+}
+
+test('tool-name repair: real garbled grep_codebase names from the ornith trajectories resolve to grep_codebase', async () => {
+  for (const bad of ['grep_codecode', 'grep_codeome', 'grep_codease', 'grep_codeuse', 'grep_codeise', 'grep_codeace', 'grep_code']) {
+    const { toolMsg, audit } = await runWithName(bad);
+    assert.ok(toolMsg, bad);
+    assert.equal(toolMsg.tool, 'grep_codebase', bad);
+    assert.equal(toolMsg.repairedFrom, bad);
+    assert.ok(!/unknown tool/.test(JSON.stringify(toolMsg.result)), `${bad}: ran the real tool`);
+    assert.equal(audit.length, 1, bad);
+    assert.equal(audit[0].tool, 'grep_codebase');
+    assert.equal(audit[0].nameChars, bad.length);
+    assert.ok(!Object.values(audit[0]).includes(bad), 'the garbled name itself is not logged');
+  }
+});
+
+test('tool-name repair: names that are not close to exactly one tool keep the unknown-tool error', async () => {
+  for (const bad of ['list_files', 'grep_code_codebase', 'frobnicate_everything', 'edit', 'x']) {
+    const { toolMsg, audit } = await runWithName(bad);
+    assert.ok(toolMsg, bad);
+    assert.equal(toolMsg.tool, bad, bad);
+    assert.match(toolMsg.result.error, /unknown tool/, bad);
+    assert.equal(audit.length, 0, bad);
+  }
+});
+
+test('tool-name repair: resolveToolName length and ambiguity guards (direct)', () => {
+  const { resolveToolName } = require('./local-tool-client.js');
+  const names = ['read_file', 'grep_codebase', 'edit_file', 'list_directory', 'run_bash'];
+  assert.equal(resolveToolName('grep_codecode', names), 'grep_codebase');
+  assert.equal(resolveToolName('grep_co', names), null, 'shorter than 8 characters is never repaired');
+  assert.equal(resolveToolName('edit_f', names), null, 'shorter than 8 characters is never repaired');
+  assert.equal(resolveToolName('read_file', names.filter((n) => n !== 'read_file')), null, 'one registered candidate away is a 6-char-prefix match only when close enough: read_file has no registered neighbour');
+  // two candidates sharing the first 6 characters, both close: ambiguous, no repair
+  assert.equal(resolveToolName('search_fileX', ['search_files', 'search_filer']), null);
+  assert.equal(resolveToolName('search_filesX', ['search_files', 'search_filexyz']), 'search_files', 'a clear winner (distance 1 vs 3) still repairs');
+  assert.equal(resolveToolName(undefined, names), null);
+  assert.equal(resolveToolName('x'.repeat(60), names), null);
+});
+
+test('tool-name repair: an exact tool name is untouched (no repairedFrom, no audit line)', async () => {
+  const { toolMsg, audit } = await runWithName('list_directory');
+  assert.equal(toolMsg.tool, 'list_directory');
+  assert.equal(toolMsg.repairedFrom, undefined);
+  assert.equal(audit.length, 0);
+});
+
+test('tool-name repair: a RESOLUTION line sent as a tool name gets an instruction, not a tool list', async () => {
+  const { toolMsg } = await runWithName('RESOLUTION: needs-human-decision\n</parameter=1');
+  assert.match(toolMsg.result.error, /belongs in your final message/);
+  assert.ok(!/Available tools/.test(toolMsg.result.error));
 });
 
 test('tool-loop audit: executeToolCalls keeps its 5-parameter declaration (outcomes are classified from toolCallLog in the loop instead)', () => {
