@@ -439,7 +439,7 @@ process_drafting_file() {
           console.log("requeue");
         } else if (laneAttributable === true) {
           // Lane-attributable infra failure: record it against the failing lane and requeue
-          // without charging this task's infraRequeueCount.
+          // without charging the task infraRequeueCount.
           try { if (laneRecorder) laneRecorder(process.argv[6], { reason: draftResult, instancesDir: process.argv[8] }); } catch (e) { /* best-effort */ }
           o.draftFailureCount = 0;
           o.history.push({
