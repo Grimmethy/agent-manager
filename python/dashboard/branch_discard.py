@@ -43,6 +43,14 @@ def discard_branch(branch, match, repo_root, scope, reason=None):
         # A delete failing because the ref is already gone (deleted by hand, or a duplicate click) means the actual goal -- this branch not existing on
         # origin -- is already achieved; only a REAL git failure (auth, network, etc.) should surface as an error.
         if "remote ref does not exist" not in str(e) and "unable to delete" not in str(e).lower():
+            # Classify permission failures (no-push-access) vs unclassified failures
+            err_str = str(e)
+            if "permission denied" in err_str.lower() or "403" in err_str or "forbidden" in err_str.lower():
+                # Permission failure: mark as undiscardable and record history event
+                _record_discard_failure(branch, "no-push-access", err_str, qdir_for())
+                raise
+            # Unclassified failure: still raise but mark for history
+            _record_discard_failure(branch, "unknown", err_str, qdir_for())
             raise
     from branch_removals import record_branch_removal
     record_branch_removal(qdir_for(), branch, "discarded", task_id=branch.removeprefix("agent/"),
@@ -90,7 +98,42 @@ def discard_branch(branch, match, repo_root, scope, reason=None):
     else:
         _invalidate_branch_cache(drop_branch=branch)
     return {"succeeded": True, "branch": branch, "taskArchived": task_archived, "localBranch": local_branch,
-            "snapshotRef": (snapshot or {}).get("snapshotRef")}
+            "snapshotRef": (snapshot or {}).get("snapshotRef"), "undiscardable": False}
+
+
+def _record_discard_failure(branch, reason_code, error_msg, qdir):
+    """Record a history event for a failed discard attempt.
+
+    reason_code: 'no-push-access' for permission failures, 'unknown' for unclassified.
+    """
+    if not qdir:
+        return
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # Try to append to the task's history if we can find it
+    task_id = branch.removeprefix("agent/")
+    done_path = qdir / "done" / f"{task_id}.json"
+    if done_path.is_file():
+        try:
+            import json
+            from app import read_json_safe
+            data = read_json_safe(done_path)
+            if data is not None:
+                hist = data.get("history")
+                if not isinstance(hist, list):
+                    hist = data["history"] = []
+                hist.append({
+                    "stage": "discard_failed",
+                    "at": now_iso,
+                    "detail": f"branch {branch} discard failed: {reason_code} -- {error_msg}",
+                    "reason": reason_code,
+                })
+                try:
+                    done_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                except OSError:
+                    pass  # best-effort
+        except Exception:
+            pass  # best-effort, don't let history recording break the discard
 
 
 def refusal(match, sha, include_triage, branch):
@@ -162,10 +205,14 @@ def discard_batch(items, include_triage=False):
                 continue
             try:
                 out = discard_branch(it["branch"], match, repo_root, scope)
-                res.update({"succeeded": True, "taskArchived": out["taskArchived"], "snapshotRef": out["snapshotRef"]})
+                res.update({"succeeded": True, "taskArchived": out["taskArchived"], "snapshotRef": out["snapshotRef"], "undiscardable": False})
             except Exception as e:  # noqa: BLE001
                 logger.warning("Batch discard of %r failed (the rest continue): %s", it["branch"], e)
                 res["reason"] = str(e)
+                # Check if this was a classified permission failure (undiscardable)
+                err_str = str(e)
+                if "no-push-access" in err_str or "permission denied" in err_str.lower() or "403" in err_str or "forbidden" in err_str.lower():
+                    res["undiscardable"] = True
     finally:
         _release_apply_lock(lock_fd)
     done = sum(1 for r in results if r["succeeded"])
