@@ -100,6 +100,23 @@ function citedIdentifier(symbol) {
   return FILE_EXT_SEGMENT_RE.test(last) && parts.length > 1 ? parts[parts.length - 2] : last;
 }
 
+// A package initializer (`pkg/__init__.py`) is grounded when fetched structure establishes the
+// package: (a) the exact path is in the fetched listing, (b) a fetched file is a direct child of
+// that package directory, or (c) a fetched file imports the package by its dotted name.
+function packageInitEstablished(symbol, files, combined) {
+  const pkgDir = symbol.replace(/\/?__init__\.py$/, '');
+  const pathOf = (f) => String(f.path || f.file || f.name || '');
+  if (files.some((f) => pathOf(f) === symbol || pathOf(f).endsWith(`/${symbol}`))) return true;
+  if (files.some((f) => {
+    const p = pathOf(f);
+    const idx = p.lastIndexOf('/');
+    return pkgDir ? idx !== -1 && p.slice(0, idx) === pkgDir : idx === -1;
+  })) return true;
+  if (!pkgDir) return false;
+  const dotted = escapeRe(pkgDir.replace(/\//g, '.'));
+  return new RegExp(`\\b(?:from|import)\\s+${dotted}\\b`).test(combined);
+}
+
 function checkFabricatedSymbols(task, implementResponse) {
   const files = realFilesOf(task);
   if (!files.length) return [];
@@ -126,6 +143,13 @@ function checkFabricatedSymbols(task, implementResponse) {
   while ((m = PATH_SHAPED_SYMBOL_RE.exec(implementResponse))) {
     const symbol = m[1];
     if (isKnownExternalPath(symbol, task)) continue;
+    if (/(^|\/)__init__\.py$/.test(symbol)) {
+      // Never the substring test: any `def __init__` in any file would vouch for every package.
+      if (!packageInitEstablished(symbol, files, combined)) {
+        flag('import', symbol, `the draft cites \`${symbol}\`, but that package initializer is not established by any fetched file listing or import (no fetched path or import names the package)`);
+      }
+      continue;
+    }
     const finalSegment = citedIdentifier(symbol);
     if (!combined.includes(symbol) && !combined.includes(finalSegment)) {
       flag('import', symbol, `the draft cites \`${symbol}\`, but neither that path nor its final segment (\`${finalSegment}\`) appears anywhere in the real fetched content of any file in this community`);
