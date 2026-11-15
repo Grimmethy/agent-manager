@@ -4,8 +4,11 @@
 // (src/lease-ledger.js) and stamps leasedTo on wok's own record (same shape as lendTask in src/lend-task.js).
 // Event-driven: each claimNext call is one claim attempt. Nothing here polls, sets timers or spawns processes.
 //
-// Defaults: nodeId = AGENT_MANAGER_NODE_ID; classes absent = no class filter; settle absent = no-op;
-// readRemote is accepted for the shared contract and is not used by this claim path yet.
+// Defaults: claimant = nodeId = AGENT_MANAGER_NODE_ID; classes absent = no class filter; settle absent = no-op;
+// readRemote = readRemoteUrl (src/remote-url.js), its result is kept on repo.remoteUrl ('' on failure).
+// The unleased pool is ranked by pickClaimableTasks with the LEDGER OWNER as the worker (not the claimant), the same
+// id claimableOnNode uses. A candidate that isHubBlocked (src/hub-stickiness.js) or that cannot be lent is skipped and
+// recorded in the skipped array; the scan continues with the next candidate.
 
 const fs = require('fs');
 const path = require('path');
@@ -14,6 +17,9 @@ const { isDependencySatisfied } = require('./task-sources.js');
 const { findRecordFile } = require('./lend-task.js');
 const { lendLease, cancelLease, expireLeases, listLeases } = require('./lease-ledger.js');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
+const { isHubBlocked } = require('./hub-stickiness.js');
+const { readRemoteUrl } = require('./remote-url.js');
+const { workerNode } = require('./node-affinity.js');
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
@@ -24,9 +30,10 @@ function taskClassOf(task) {
   return task.taskClass || task.class || null;
 }
 
-function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, classes, pipelineDirs = [], env = process.env, now = Date.now(), settle, readRemote } = {}) {
-  void readRemote;
-  if (!nodeId) return null;
+function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = nodeId, classes, pipelineDirs = [], env = process.env, now = Date.now(), settle, readRemote = readRemoteUrl, skipped = [] } = {}) {
+  if (!claimant) return null;
+  // Same owner id claimableOnNode uses: AGENT_MANAGER_NODE_ID, or 'wok' when unset.
+  const ownerId = workerNode(env.AGENT_MANAGER_NODE_ID);
 
   // Overdue leases go back to the pool through settle (expireLeases marks them expired and returns them).
   const expired = expireLeases({ now, env });
@@ -34,16 +41,20 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, classes, pipeli
 
   const live = listLeases(env).filter((l) => l && l.state === 'lent' && Date.parse(l.expiresAt) > now);
   const leasedIds = new Set(live.map((l) => l.taskId));
-  // Hub stickiness: branches of tasks this node already holds, so a stacked branch keeps going to the same node.
-  // Lease rows hold only taskId/nodeId/expiresAt (lendLease does not store the task), so the branch is read from the held task's record.
+  const readRecord = (taskId) => {
+    for (const pipelineDir of pipelineDirs) {
+      const file = findRecordFile(pipelineDir, taskId);
+      if (file) return readJson(file);
+    }
+    return null;
+  };
+  // Hub stickiness: branches of tasks this claimant already holds, so a stacked branch keeps going to the same node.
+  // Lease rows hold only taskId/nodeId/expiresAt, so the branch is read from the held task's record.
   const stickyBranches = new Set();
   for (const l of live) {
-    if (l.nodeId !== nodeId) continue;
-    for (const pipelineDir of pipelineDirs) {
-      const file = findRecordFile(pipelineDir, l.taskId);
-      const held = file ? readJson(file) : null;
-      if (held && held.stacked && held.stacked.branch) { stickyBranches.add(held.stacked.branch); break; }
-    }
+    if (l.nodeId !== claimant) continue;
+    const held = readRecord(l.taskId);
+    if (held && held.stacked && held.stacked.branch) stickyBranches.add(held.stacked.branch);
   }
 
   const candidates = [];
@@ -51,8 +62,8 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, classes, pipeli
   for (const pipelineDir of pipelineDirs) {
     for (const sub of ['pending', 'adhoc']) {
       const dir = path.join(pipelineDir, 'queue', sub);
-      // Ranked by pickClaimableTasks with this node as the claimer (pinned-to-node first, then priority and age).
-      const names = pickClaimableTasks(dir, nodeId, { nodeId });
+      // Ranked by pickClaimableTasks with the ledger owner as the worker (pinned first, then priority and age).
+      const names = pickClaimableTasks(dir, ownerId, { nodeId: ownerId });
       for (const name of names) {
         const task = readJson(path.join(dir, name));
         if (!task || typeof task !== 'object') continue;
@@ -60,7 +71,7 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, classes, pipeli
         if (seen.has(taskId)) continue;
         seen.add(taskId);
         if (leasedIds.has(taskId)) continue; // leased (unexpired)
-        if (task.pinnedWorker && task.pinnedWorker !== nodeId) continue; // pinned to another worker
+        if (task.pinnedWorker && task.pinnedWorker !== claimant) continue; // pinned to another worker
         if (Array.isArray(task.dependsOn) && task.dependsOn.some((dep) => !isDependencySatisfied(pipelineDir, dep))) continue;
         if (Array.isArray(classes) && !classes.includes(taskClassOf(task))) continue;
         const sticky = Boolean(task.stacked && task.stacked.branch && stickyBranches.has(task.stacked.branch));
@@ -73,22 +84,32 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, classes, pipeli
   candidates.sort((a, b) => (b.sticky ? 1 : 0) - (a.sticky ? 1 : 0));
 
   for (const c of candidates) {
-    const lease = lendLease(c.taskId, nodeId, { ttlMs: 3600000, now, env });
-    if (!lease) continue; // lost the race to another claimer
+    if (isHubBlocked(c.task, claimant, now, { leases: listLeases(env), readRecord, env })) {
+      skipped.push({ taskId: c.taskId, reason: 'hub-blocked' });
+      continue;
+    }
+    const lease = lendLease(c.taskId, claimant, { ttlMs: 3600000, now, env });
+    if (!lease) {
+      skipped.push({ taskId: c.taskId, reason: 'already-leased' }); // lost the race to another claimer
+      continue;
+    }
 
     const file = findRecordFile(c.pipelineDir, c.taskId);
     const record = file ? readJson(file) : null;
     if (!record || typeof record !== 'object') {
       cancelLease(c.taskId, { env });
+      skipped.push({ taskId: c.taskId, reason: 'record-unreadable' });
       continue;
     }
     try {
-      writeJsonAtomicSync(file, { ...record, leasedTo: nodeId });
+      writeJsonAtomicSync(file, { ...record, leasedTo: claimant });
     } catch (e) {
       cancelLease(c.taskId, { env });
+      skipped.push({ taskId: c.taskId, reason: 'stamp-failed' });
       continue;
     }
-    return { task: { ...record, leasedTo: nodeId }, lease, repo: c.pipelineDir };
+    const remoteUrl = readRemote(c.pipelineDir);
+    return { task: { ...record, leasedTo: claimant }, lease, repo: { root: c.pipelineDir, remoteUrl }, skipped };
   }
   return null;
 }
