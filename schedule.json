@@ -1,0 +1,24 @@
+{
+  "entries": [
+    {
+      "id": "morning-standup",
+      "cadence": { "time": "09:00", "days": ["mon", "tue", "wed", "thu", "fri"] },
+      "replaceWith": "standup-slack"
+    },
+    {
+      "id": "weekend-check",
+      "cadence": { "time": "10:00", "days": ["sat", "sun"] },
+      "replaceWith": "weekend-report"
+    },
+    {
+      "id": "daily-backup",
+      "cadence": { "time": "23:59", "days": ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] },
+      "replaceWith": "backup-service"
+    },
+    {
+      "id": "midday-break",
+      "cadence": { "time": "12:30", "days": ["mon", "wed", "fri"] },
+      "replaceWith": "break-room"
+    }
+  ]
+}
