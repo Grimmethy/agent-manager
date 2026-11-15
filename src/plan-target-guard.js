@@ -149,6 +149,9 @@ function extractExplicitTypes(planText) {
   return types;
 }
 
+// Local wrapper over the existing create-intent check (the shared contract's name for it).
+const isCreateIntent = (planText, targetPath, taskText) => isDeclaredCreateTarget(planText, targetPath, taskText);
+
 function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef = null) {
   let targets = [];
   try { targets = extractDeclaredTargets(task, planText); } catch { targets = []; }
@@ -194,7 +197,7 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
     // Explicit type 'create' exempts the target
     if (explicitTypes.get(entry.claimedPath) === 'create') return false;
     // Heuristic fallback: isDeclaredCreateTarget for backward compatibility
-    if (isDeclaredCreateTarget(planText, entry.claimedPath, taskTextOf(task))) return false;
+    if (isCreateIntent(planText, entry.claimedPath, taskTextOf(task))) return false;
     return true;
   });
 
@@ -228,7 +231,15 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
   const candidateNote = ambiguous.length
     ? ' -- ambiguous, candidate paths: ' + ambiguous.map((e) => e.claimedPath + ' => ' + e.candidates.map((c) => c.split(repoRoot.replace(/\/$/, '') + '/').join('')).join(' | ')).join('; ')
     : '';
-  const feedback = ' -- mark as a create target (e.g. "create `' + paths[0] + '`)") or correct the path' + candidateNote;
+  const nearMatches = Array.isArray(task && task.nearMatches) ? task.nearMatches : [];
+  const nearNote = nearMatches.length ? ' -- near matches: ' + nearMatches.join(', ') : '';
+  const offers = paths.map((p) => 'mark ' + p + ' as create').join(' or ');
+  const feedback = ' -- mark as a create target (' + offers + ') or correct the path to an existing file' + candidateNote + nearNote;
+  // First attempt for this task: hand back a revise outcome so the caller can ask for a corrected plan. Second attempt blocks as before.
+  const revisionCount = Number.isFinite(task && task.revisionCount) ? task.revisionCount : 0;
+  if (revisionCount === 0) {
+    return { blocked: false, revise: { feedback: 'plan cites missing-file target(s): ' + paths.join(', ') + feedback, revisionCount: 1 } };
+  }
   
   return {
     blocked: true,
