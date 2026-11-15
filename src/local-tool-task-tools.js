@@ -146,11 +146,6 @@ function searchTasksTool(pipelineDir, { query, state, includeArchived, similar =
   if (typeof query !== 'string' || !query.trim()) {
     return { error: 'search_tasks requires a non-empty "query" argument' };
   }
-  // TODO(HUB0261-2/3): replace this guard with the similar:true ranking path once HUB0262 lands src/task-similarity.js.
-  // Replacement: const ranked = rankTasks(query, candidates, { limit: 15 }) from ./task-similarity.js, attaching score, matchedOn and state to each hit,
-  // and adding note:'no close match' to the top hit when its score < DUPLICATE_SCORE. The require is added at that point, not before.
-  // Until then, refuse explicitly instead of silently falling back to lexical matching.
-  if (similar) return { error: 'search_tasks similar:true needs src/task-similarity.js (HUB0262), which has not landed yet' };
   const validStates = ['drafting', 'adhoc', ...QUEUE_STATES];
   let candidates = [];
   if (state != null) {
@@ -170,6 +165,27 @@ function searchTasksTool(pipelineDir, { query, state, includeArchived, similar =
     ];
   }
   if (includeArchived) candidates = [...candidates, ...archivedTaskFiles(pipelineDir)];
+
+  // similar mode: rank ALL candidates first, then cap, so a late/archived/body-only match is not dropped by file order.
+  if (similar === true) {
+    const { rankTasks, DUPLICATE_SCORE } = require('./task-similarity.js');
+    const docs = [];
+    const byKey = new Map();
+    for (const { fullPath, foundState } of candidates) {
+      let data;
+      try { data = JSON.parse(fs.readFileSync(fullPath, 'utf8')); } catch { continue; }
+      const fallbackId = path.basename(fullPath, '.json');
+      const id = data.id || fallbackId;
+      if (byKey.has(id)) continue;
+      const summary = { ...taskSummary(data, fallbackId), foundState };
+      byKey.set(id, summary);
+      docs.push({ id, title: data.title || '', promptContext: data.promptContext, state: foundState });
+    }
+    const ranked = rankTasks(query, docs, { limit: MAX_SEARCH_TASK_RESULTS });
+    const results = ranked.map((r) => ({ ...byKey.get(r.id), score: r.score, matchedOn: r.matchedOn }));
+    if (results.length > 0 && results[0].score < DUPLICATE_SCORE) results[0].note = 'no close match';
+    return { results };
+  }
 
   const results = [];
   for (const { fullPath, foundState } of candidates) {

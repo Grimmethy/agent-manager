@@ -25,12 +25,26 @@ test('searchTasksTool similar:false deep-equals the call without the arg', () =>
   assert.equal(omitted.results[0].id, 'fixture-task-1');
 });
 
-test('searchTasksTool similar:true refuses until src/task-similarity.js lands', () => {
+test('similar:true returns ranked results with score and matchedOn', () => {
   const dir = makePipeline();
-  const r = searchTasksTool(dir, { query: 'widget', similar: true });
-  assert.ok(r.error && r.error.includes('task-similarity'));
+  const r = searchTasksTool(dir, { query: 'widget renderer', similar: true });
+  assert.ok(!r.error);
+  assert.equal(r.results[0].id, 'fixture-task-1');
+  assert.equal(typeof r.results[0].score, 'number');
+  assert.equal(typeof r.results[0].matchedOn, 'string');
 });
 
-test('similar:true returns ranked results with score and matchedOn', { skip: 'blocked on HUB0262' }, () => {});
-test('similar:true finds a body-only match', { skip: 'blocked on HUB0262' }, () => {});
-test('similar:true adds a no-close-match note when the best score is below DUPLICATE_SCORE', { skip: 'blocked on HUB0262' }, () => {});
+test('similar:true finds a body-only match', () => {
+  const dir = makePipeline();
+  fs.writeFileSync(path.join(dir, 'queue', 'pending', 'fixture-task-3.json'), JSON.stringify({ id: 'fixture-task-3', title: 'Misc chore', status: 'pending', promptContext: { rawText: 'frobnicate the gizmo' } }));
+  const r = searchTasksTool(dir, { query: 'frobnicate', similar: true });
+  assert.equal(r.results[0].id, 'fixture-task-3');
+  assert.equal(r.results[0].matchedOn, 'body');
+});
+
+test('similar:true adds a no-close-match note when the best score is below DUPLICATE_SCORE', () => {
+  const dir = makePipeline();
+  const r = searchTasksTool(dir, { query: 'widget', similar: true });
+  assert.equal(r.results[0].note, 'no close match');
+  assert.equal(r.results[1].note, undefined);
+});
