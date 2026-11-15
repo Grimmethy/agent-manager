@@ -67,14 +67,21 @@ function storePackage(pipelineDir, pkg) {
 }
 
 // The leased original on wok (queue/pending or queue/adhoc, the file named after the task id), or null when it is missing or is not that task's record.
-function findOriginal(pipelineDir, taskId) {
-  const file = findRecordFile(pipelineDir, taskId);
-  if (!file) return null;
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf8')).id === taskId ? file : null;
-  } catch (e) {
-    return null;
+// extraDirs are the other pipelines the registry hands tasks out of (AGENT_MANAGER_NODE_PIPELINE_DIRS): the original may sit in any of them, the draft always lands in pipelineDir's queue/review.
+function findOriginal(pipelineDir, taskId, extraDirs = []) {
+  for (const dir of [pipelineDir, ...extraDirs]) {
+    const file = findRecordFile(dir, taskId);
+    if (!file) continue;
+    try {
+      if (JSON.parse(fs.readFileSync(file, 'utf8')).id === taskId) return file;
+    } catch (e) { /* an unreadable record is not the original: try the next pipeline */ }
   }
+  return null;
+}
+
+// AGENT_MANAGER_NODE_PIPELINE_DIRS: a comma separated list of pipeline directories (blanks and empty entries dropped).
+function nodePipelineDirs(env) {
+  return String(env.AGENT_MANAGER_NODE_PIPELINE_DIRS || '').split(',').map((d) => d.trim()).filter((d) => d.length > 0);
 }
 
 // Files the node's drafted record in wok's queue/review/ under the original's file name, then removes the original (write first, so a crash never loses the task).
@@ -114,7 +121,7 @@ function createServer({ env = process.env, now = () => Date.now(), send: sendNot
       const lease = leaseFor(pkg.taskId, env);
       if (!lease || lease.nodeId !== nodeId) return send(res, 409, { ok: false, error: 'no lease for this task on this node' });
 
-      const original = pkg.version === RECORD_PACKAGE_VERSION ? findOriginal(pipelineDir, pkg.taskId) : null;
+      const original = pkg.version === RECORD_PACKAGE_VERSION ? findOriginal(pipelineDir, pkg.taskId, nodePipelineDirs(env)) : null;
       if (pkg.version === RECORD_PACKAGE_VERSION && !original) return send(res, 409, { ok: false, error: 'no original record for this task' });
       storePackage(pipelineDir, pkg);
       if (original) replaceWithDraft(pipelineDir, original, pkg, now());
@@ -142,4 +149,4 @@ if (require.main === module) {
   server.listen(port, host, () => process.stdout.write(`package intake listening on ${host}:${port}\n`));
 }
 
-module.exports = { createServer, refusal, storePackage, findOriginal, replaceWithDraft, MAX_BODY_BYTES };
+module.exports = { createServer, refusal, storePackage, findOriginal, nodePipelineDirs, replaceWithDraft, MAX_BODY_BYTES };
