@@ -504,3 +504,44 @@ test('ensureGpuHeadroom: a GPU endpoint is unchanged by the cloud bypass (still 
   assert.equal(result.checked, true);
   assert.equal(result.starved, false);
 });
+
+// ---- script endpoints (provider 'script'): the service behind a script lane is not a GPU either ----
+function scriptRegistryEnv() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gpu-guard-script-lanes-'));
+  const file = path.join(dir, 'lanes.json');
+  fs.writeFileSync(file, JSON.stringify([
+    { gpu: 'rx580', ollamaUrl: 'http://100.96.112.78:11434', model: 'qwen3-vl:8b-instruct' },
+    { gpu: 'tuner', provider: 'script', ollamaUrl: 'http://127.0.0.1:7449', taskClasses: ['tuning_experiment'] },
+  ]));
+  return { AGENT_MANAGER_LOCAL_GPU: '3090', AGENT_MANAGER_LANES_PATH: file };
+}
+
+test('leaseHeldFor: a Forge lease never holds a script lane endpoint, but still holds GPU endpoints', () => {
+  const now = new Date().toISOString();
+  const env = scriptRegistryEnv();
+  withLeaseFile({ holder: 'promptforge', acquiredAt: now, refreshedAt: now }, (p) => {
+    assert.equal(leaseHeldFor('http://100.96.112.78:11434', p, env), true);
+    assert.equal(leaseHeldFor('http://127.0.0.1:7449', p, env), false, 'the script endpoint is never held');
+    assert.equal(leaseHeldFor('http://127.0.0.1:7449/', p, env), false, 'trailing slash too');
+  });
+});
+
+test('ensureGpuHeadroom: the default bypass covers a script endpoint (no VRAM read, no /free, no TheAgent call)', async () => {
+  const env = scriptRegistryEnv();
+  const saved = { gpu: process.env.AGENT_MANAGER_LOCAL_GPU, path: process.env.AGENT_MANAGER_LANES_PATH };
+  Object.assign(process.env, { AGENT_MANAGER_LOCAL_GPU: env.AGENT_MANAGER_LOCAL_GPU, AGENT_MANAGER_LANES_PATH: env.AGENT_MANAGER_LANES_PATH });
+  try {
+    let touched = false;
+    const result = await ensureGpuHeadroom({
+      ollamaUrl: 'http://127.0.0.1:7449',
+      readFreeVram: () => { touched = true; return 10; },
+      fetchJsonFn: async () => { touched = true; return { ok: true }; },
+    });
+    assert.equal(touched, false);
+    assert.equal(result.checked, false);
+    assert.equal(result.starved, false);
+    assert.match(result.note, /no GPU to guard/);
+  } finally {
+    for (const [k, v] of [['AGENT_MANAGER_LOCAL_GPU', saved.gpu], ['AGENT_MANAGER_LANES_PATH', saved.path]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});

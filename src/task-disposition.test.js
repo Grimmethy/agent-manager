@@ -252,7 +252,7 @@ test('a superseded tail is respected as terminal -- the sweep never re-opens it'
 
 test('TERMINAL_STAGES is the closed vocabulary', () => {
   // 'aged-out' (2026-09-24): a QUEUED task retired unworked by expiry-sweep.js -- deliberately not 'abandoned' ("work lost").
-  assert.deepEqual([...TERMINAL_STAGES].sort(), ['abandoned', 'aged-out', 'applied-direct', 'dismissed', 'filed', 'merged', 'noop', 'pending-merge', 'superseded']);
+  assert.deepEqual([...TERMINAL_STAGES].sort(), ['abandoned', 'aged-out', 'applied-direct', 'dismissed', 'filed', 'merged', 'noop', 'pending-merge', 'recorded', 'superseded']);
 });
 
 // --- realGit / buildShipContext against REAL git (2026-09-14 root-cause) --------------
@@ -531,4 +531,10 @@ test('resolveDisposition: a branch apply whose name contains a no-op word is cla
   const gone = resolveDisposition(rec, { ctx: ctx() });
   assert.notEqual(gone.stage, 'noop');
   assert.equal(gone.stage, 'abandoned');
+});
+
+test("'recorded' (a script-handled task) is terminal and stable, so the reconcile sweep never re-opens it", () => {
+  const { STABLE_TERMINAL_STAGES } = require('./task-disposition.js');
+  assert.ok(TERMINAL_STAGES.has('recorded'));
+  if (STABLE_TERMINAL_STAGES) assert.ok(STABLE_TERMINAL_STAGES.has('recorded'));
 });

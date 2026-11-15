@@ -1,5 +1,5 @@
 """Tests for GET /api/plugins/<name>/ui/<filename> and its resolver, app._resolve_plugin_ui_asset
-(Docs/hub-tasks-extraction-plan.md section 5, piece 2: the core-served plugin UI file route).
+(docs/design-notes/hub-tasks-extraction-plan.md section 5, piece 2: the core-served plugin UI file route).
 
 Piece 1 (test_plugins_manifest.py) built the tab schema; this piece serves the .js/.css
 files a declared tab points at, from the plugin's own ui/ directory, refusing anything for

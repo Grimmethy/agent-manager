@@ -1,6 +1,6 @@
 'use strict';
 
-// local-worker.sh --once + the borrow loop (docs/idle-pool-borrowing.md), run for real in a sandbox: two throwaway projects (A = the lane's
+// local-worker.sh --once + the borrow loop (docs/design-notes/idle-pool-borrowing.md), run for real in a sandbox: two throwaway projects (A = the lane's
 // home, B = a pool project), a private HOME and instances dir, and an Ollama URL that refuses connections so nothing ever touches a model.
 // Run: node --test scripts/local-worker-borrow.test.js
 

@@ -531,3 +531,175 @@ test('if the cache layer itself breaks, hasPremium reads the stage directly and 
   assert.equal(hasPremium(path.join(os.tmpdir(), `no-such-pipeline-${process.pid}-${Date.now()}`), { role: 'worker' }), false);
 });
 
+
+// ---- stalled reviews: a record waiting in review/ with nobody reviewing it is made visible (2026-11-10) ----
+const { stalledReviews, noteStalledReviews } = require('./pool-projects.js');
+const HISTORY_FILE = path.join('instances', 'pipeline-history.log');
+
+function stallWorld() {
+  const fx = fixture([{ name: 'home' }, { name: 'other' }]);
+  const home = fx.list[0].pipelineDir; const other = fx.list[1].pipelineDir;
+  const put = (pipe, name, rec, ageMin) => {
+    const dir = path.join(pipe, 'queue', 'review'); fs.mkdirSync(dir, { recursive: true });
+    const f = path.join(dir, name); fs.writeFileSync(f, JSON.stringify(rec));
+    const t = new Date(Date.now() - ageMin * 60000); fs.utimesSync(f, t, t);
+  };
+  const claimDir = path.join(fx.root, 'claims'); fs.mkdirSync(claimDir, { recursive: true });
+  const events = (pipe) => { try { return fs.readFileSync(path.join(pipe, HISTORY_FILE), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+  return { ...fx, home, other, put, claimDir, events, stateFile: path.join(fx.root, 'stalled.json') };
+}
+
+test('stalledReviews lists records waiting 10+ minutes in the home and every registered project, flags premium, and skips young ones', () => {
+  const w = stallWorld();
+  w.put(w.other, 'old-premium.json', { premiumPriority: true }, 22);
+  w.put(w.other, 'old-regular.json', { title: 'x' }, 15);
+  w.put(w.other, 'young.json', { premiumPriority: true }, 3);
+  w.put(w.home, 'home-old.json', {}, 40);
+  const r = stalledReviews({ homePipelineDir: w.home, projectsPath: w.projectsPath, claimDir: w.claimDir });
+  assert.deepEqual(r.map((x) => [x.label, x.file, x.premium]).sort(), [['home', 'home-old.json', false], ['other', 'old-premium.json', true], ['other', 'old-regular.json', false]]);
+  assert.ok(r.every((x) => x.ageMs >= 10 * 60000));
+});
+
+test('stalledReviews skips a record a live reviewer has claimed but lists one whose claim owner is dead; a missing review dir or bad projects file never throws', () => {
+  const w = stallWorld();
+  w.put(w.other, 'claimed.json', {}, 30); w.put(w.other, 'abandoned.json', {}, 30);
+  fs.mkdirSync(path.join(w.claimDir, 'claimed.json.d')); fs.writeFileSync(path.join(w.claimDir, 'claimed.json.d', 'owner'), `${process.pid} reviewer\n`);
+  fs.mkdirSync(path.join(w.claimDir, 'abandoned.json.d')); fs.writeFileSync(path.join(w.claimDir, 'abandoned.json.d', 'owner'), '2147483646 reviewer\n');
+  assert.deepEqual(stalledReviews({ projectsPath: w.projectsPath, claimDir: w.claimDir }).map((x) => x.file), ['abandoned.json']);
+  assert.deepEqual(stalledReviews({ projectsPath: path.join(w.root, 'nope.json'), claimDir: w.claimDir }), []);
+  fs.writeFileSync(path.join(w.root, 'bad.json'), 'not json');
+  assert.deepEqual(stalledReviews({ projectsPath: path.join(w.root, 'bad.json') }), []);
+});
+
+test('noteStalledReviews writes ONE review-stalled event per stalled record on THAT record\'s project with the reason, then stays quiet for an hour', () => {
+  const w = stallWorld();
+  w.put(w.other, 'old-premium.json', { premiumPriority: true }, 22);
+  w.put(w.home, 'home-old.json', {}, 40);
+  const lines = [];
+  const base = { homePipelineDir: w.home, projectsPath: w.projectsPath, claimDir: w.claimDir, stateFile: w.stateFile, log: (m) => lines.push(m) };
+  const first = noteStalledReviews({ ...base, reason: 'host memory pressure (critical), so reviewers are yielding their ticks' });
+  assert.equal(first.length, 2);
+  const ev = w.events(w.other);
+  assert.equal(ev.length, 1);
+  assert.deepEqual([ev[0].type, ev[0].file, ev[0].premium, ev[0].project, ev[0].reason], ['review-stalled', 'old-premium.json', true, 'other', 'host memory pressure (critical), so reviewers are yielding their ticks']);
+  assert.ok(ev[0].ageMinutes >= 22);
+  assert.equal(w.events(w.home).length, 1);
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /^\[review-stalled\] (other|home): .* has waited \d+ min for a review.*; reason: host memory pressure/);
+  // the same records again within the hour: nothing new
+  assert.equal(noteStalledReviews({ ...base, reason: 'again' }).length, 0);
+  assert.equal(w.events(w.other).length, 1);
+  // an hour later the same still-stalled record is noted again
+  assert.equal(noteStalledReviews({ ...base, reason: 'later', now: new Date(Date.now() + 61 * 60000) }).length, 2);
+  assert.equal(w.events(w.other).length, 2);
+});
+
+test('noteStalledReviews forgets a record that left review/, so a later stall of the same file is noted again; it never moves or edits a record', () => {
+  const w = stallWorld();
+  w.put(w.other, 'r.json', { premiumPriority: true }, 30);
+  const before = fs.readFileSync(path.join(w.other, 'queue', 'review', 'r.json'), 'utf8');
+  const base = { projectsPath: w.projectsPath, claimDir: w.claimDir, stateFile: w.stateFile, log: () => {} };
+  assert.equal(noteStalledReviews({ ...base, reason: 'a' }).length, 1);
+  assert.equal(fs.readFileSync(path.join(w.other, 'queue', 'review', 'r.json'), 'utf8'), before);
+  fs.rmSync(path.join(w.other, 'queue', 'review', 'r.json'));
+  assert.equal(noteStalledReviews({ ...base, reason: 'b' }).length, 0);
+  w.put(w.other, 'r.json', { premiumPriority: true }, 30);
+  assert.equal(noteStalledReviews({ ...base, reason: 'c' }).length, 1);
+});
+
+test('the stalled-review note is independent of the premium-reach kill switch, which still turns reach off', () => {
+  const w = stallWorld();
+  w.put(w.other, 'p.json', { premiumPriority: true }, 30);
+  const saved = process.env.AGENT_MANAGER_PREMIUM_REACH;
+  process.env.AGENT_MANAGER_PREMIUM_REACH = 'false';
+  try {
+    assert.equal(require('./pool-projects.js').premiumReachEnabled(), false);
+    assert.equal(noteStalledReviews({ projectsPath: w.projectsPath, claimDir: w.claimDir, stateFile: w.stateFile, log: () => {}, reason: 'x' }).length, 1);
+  } finally { if (saved === undefined) delete process.env.AGENT_MANAGER_PREMIUM_REACH; else process.env.AGENT_MANAGER_PREMIUM_REACH = saved; }
+});
+
+// ---- premium reviews under tight memory pressure (owner decision 2026-11-10; critical still yields) ----
+const { premiumMayRunUnderPressure } = require('./pool-projects.js');
+
+test('premiumMayRunUnderPressure: tight with a premium review waiting runs; tight without one yields; critical yields even with premium; ok is never changed', () => {
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: {} }), true);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: false, env: {} }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'critical', hasPremiumReview: true, env: {} }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'critical', hasPremiumReview: false, env: {} }), false);
+  // ok is not a pressure state: the shell never asks, and the function does not turn it into an override
+  assert.equal(premiumMayRunUnderPressure({ state: 'ok', hasPremiumReview: true, env: {} }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: undefined, hasPremiumReview: true, env: {} }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: 'yes', env: {} }), false, 'only a real true counts');
+});
+
+test('premiumMayRunUnderPressure: AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT=false restores the old answer (always yield); any other value keeps the new behaviour', () => {
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: 'false' } }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: 'FALSE' } }), false);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: 'true' } }), true);
+  assert.equal(premiumMayRunUnderPressure({ state: 'tight', hasPremiumReview: true, env: { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: '' } }), true);
+});
+
+test('--premium-under-pressure: exit 0 only for tight with a premium review in the home review/ or another registered project; critical, no premium and the kill switch exit 1', () => {
+  const w = stallWorld();
+  const cli = path.join(__dirname, 'pool-projects.js');
+  const env = (extra = {}) => ({ ...process.env, AGENT_MANAGER_PROJECTS_PATH: w.projectsPath, AGENT_MANAGER_POOL_STATE_PATH: w.stateFile, ...extra });
+  const code = (state, e) => { try { execFileSync('node', [cli, '--premium-under-pressure', w.home, state], { env: env(e), stdio: 'pipe' }); return 0; } catch (err) { return err.status; } };
+  assert.equal(code('tight'), 1, 'nothing waiting anywhere: yield');
+  w.put(w.other, 'p.json', { id: 'p', premiumPriority: true, status: 'needs-review' }, 1);
+  assert.equal(code('tight'), 0, 'a premium review waits in another registered project');
+  assert.equal(code('critical'), 1, 'critical still yields');
+  assert.equal(code('tight', { AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT: 'false' }), 1, 'kill switch');
+  w.put(w.home, 'h.json', { id: 'h', premiumPriority: true, status: 'needs-review' }, 1);
+  assert.equal(code('tight'), 0, 'a premium review waits in the home review/');
+});
+
+test('review-runner.sh asks premiumMayRunUnderPressure before it yields, limits the tick to premium items and reviews one item per tick, and still yields otherwise', () => {
+  const sh = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'review-runner.sh'), 'utf8');
+  const guard = sh.indexOf('if mem_pressure_high; then');
+  const ask = sh.indexOf('--premium-under-pressure "$PIPELINE_DIR" "$mem_state"');
+  const yieldMsg = sh.indexOf('yielding this tick -- host RAM pressure');
+  assert.ok(guard > 0 && ask > guard && yieldMsg > ask, 'the question is asked inside the pressure block, before the yield');
+  assert.match(sh, /TICK_PREMIUM_ONLY=true; UNDER_PRESSURE=true/);
+  assert.match(sh, /elif "\$TICK_PREMIUM_ONLY"; then ls -1tr/, 'the item list uses the per-tick premium-only flag');
+  assert.equal((sh.match(/(^|[\s;])PREMIUM_ONLY=/gm) || []).length, 2, 'PREMIUM_ONLY is assigned only at the top of the script (false, then true for a borrowed child), never inside the loop, so the per-tick copy cannot carry a stale value');
+  assert.match(sh, /tight memory pressure: reviewing premium item %s anyway/);
+  assert.match(sh, /if "\$ONCE" \|\| "\$UNDER_PRESSURE"; then break; fi/, 'one item per tick under pressure');
+  // the premium-only borrowed tick re-enters the same block, so it is allowed under tight pressure too; critical reaches the review code only through the node-draft exception (src/node-draft-pressure.test.js)
+  assert.match(sh, /if "\$ONCE" && \[\[ "\$\{AGENT_MANAGER_PREMIUM_ONLY_TICK:-\}" == "true" \]\]; then PREMIUM_ONLY=true; fi/);
+});
+
+// ---- the once-per-hour stalled note is atomic across reviewer daemons (2026-11-10: two daemons ticking together wrote the same event twice) ----
+test('two reviewer processes noting the same stalled record at the same moment write exactly ONE review-stalled event', async () => {
+  const { execFile } = require('child_process');
+  const poolFile = path.join(__dirname, 'pool-projects.js');
+  const child = `
+    const [t, poolFile, projectsPath, claimDir, stateFile, home] = process.argv.slice(1);
+    const { noteStalledReviews } = require(poolFile);
+    while (Date.now() < Number(t)) { /* start together */ }
+    noteStalledReviews({ projectsPath, claimDir, stateFile, homePipelineDir: home, reason: 'race', log: () => {} });
+  `;
+  for (let trial = 0; trial < 4; trial++) {
+    const w = stallWorld();
+    w.put(w.other, 'p.json', { premiumPriority: true }, 30);
+    const t = String(Date.now() + 700);
+    const run = () => new Promise((resolve, reject) => execFile('node', ['-e', child, t, poolFile, w.projectsPath, w.claimDir, w.stateFile, w.home], { env: { ...process.env, AGENT_MANAGER_QUEUE_CACHE_DIR: CACHE_ROOT } }, (err) => (err ? reject(err) : resolve())));
+    await Promise.all([run(), run()]);
+    assert.equal(w.events(w.other).length, 1, `trial ${trial}: exactly one event for the one stalled record`);
+  }
+});
+
+test('the stalled note keeps one claim per record: a fresh claim blocks a second note, a claim older than the hour is replaced once, and claims of records that left review/ are removed', () => {
+  const w = stallWorld();
+  w.put(w.other, 'a.json', { premiumPriority: true }, 30);
+  w.put(w.other, 'b.json', {}, 30);
+  const base = { projectsPath: w.projectsPath, claimDir: w.claimDir, stateFile: w.stateFile, log: () => {} };
+  const claims = path.join(path.dirname(w.stateFile), 'stalled-reviews');
+  assert.equal(noteStalledReviews({ ...base, reason: '1' }).length, 2);
+  assert.equal(fs.readdirSync(claims).length, 2, 'one claim per stalled record');
+  assert.equal(noteStalledReviews({ ...base, reason: '2', now: new Date(Date.now() + 59 * 60000) }).length, 0, 'a claim under an hour old blocks a second note');
+  assert.equal(noteStalledReviews({ ...base, reason: '3', now: new Date(Date.now() + 61 * 60000) }).length, 2, 'older than the hour: replaced and noted again');
+  assert.equal(fs.readdirSync(claims).length, 2, 'replacing leaves no stray directory behind');
+  fs.rmSync(path.join(w.other, 'queue', 'review', 'b.json'));
+  noteStalledReviews({ ...base, reason: '4', now: new Date(Date.now() + 62 * 60000) });
+  assert.equal(fs.readdirSync(claims).length, 1, 'the claim of the record that left review/ is removed');
+});

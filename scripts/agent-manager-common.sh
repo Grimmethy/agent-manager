@@ -114,10 +114,19 @@ gpu_broker_url() {
 # connection is refused, times out or the host is unreachable. A lane worker asks this once per tick (local-worker.sh) BEFORE it claims or resumes
 # anything: with the endpoint down every draft fails the same way, burns the task's retry rounds and parks it in blocked/ (2026-10-23: grimm hard-reset,
 # its Ollama stayed down for 12 h, 540 failed ticks, six tasks parked). Seconds: AGENT_MANAGER_ENDPOINT_PROBE_TIMEOUT_S (default 3).
+# An endpoint that answers is also asked about its token budget (src/gateway-budget.js, the cloud-providers gateway's /meter): exit 1 when that budget is
+# spent, so a cloud lane waits for the reset instead of failing a draft per tick (455 of them in the lane's log). It fails open: no /meter, no node, any
+# other answer is "reachable". AGENT_MANAGER_BUDGET_PROBE=off turns that part off.
 ollama_endpoint_reachable() {
   local url="${1:-http://localhost:11434}" code
   code="$(curl -s -m "${AGENT_MANAGER_ENDPOINT_PROBE_TIMEOUT_S:-3}" -o /dev/null -w '%{http_code}' "${url%/}/api/version" 2>/dev/null)" || true
-  [[ -n "$code" && "$code" != "000" ]]
+  [[ -n "$code" && "$code" != "000" ]] || return 1
+  [[ "${AGENT_MANAGER_BUDGET_PROBE:-on}" != "off" ]] || return 0
+  local budget_js budget_rc=0
+  budget_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/gateway-budget.js"
+  [[ -f "$budget_js" ]] || return 0
+  node "$budget_js" check "$url" >/dev/null 2>&1 || budget_rc=$?
+  [[ "$budget_rc" -ne 3 ]]
 }
 
 # ComfyUI GPU lease (2026-08-30, Grimmethy: "If I run a generation, prompt forge should
@@ -231,11 +240,83 @@ lane_warm_after_pause() {
 
 
 # Host-RAM headroom (2026-10-12 freeze: RAM + all swap exhausted by ComfyUI + the P40 VM +
-# Ollama's runner, kernel thrashed until power-cycled). mem-guard.js measures MemAvailable /
-# SwapFree, asks ComfyUI to unload if short, and exits 3 only when pressure remains. Any
-# other outcome (ok, node missing, the check itself crashing) fails open.
-# mem_pressure_high -> exit 0 if the lane should yield this tick, 1 otherwise.
+# Ollama's runner, kernel thrashed until power-cycled; 2026-11-01: the same shape, found by disk stall rather than
+# by MemAvailable). Primary signal since 2026-11-02: the gpu-broker's classifier writes ok|tight|critical to
+# /dev/shm/agent-manager-mem-pressure.json on every kernel pressure event (and on its slow reconcile), so a lane reads one tiny file here
+# instead of launching `node mem-guard.js` on every tick. Fallback, exactly as before: when the marker is missing, unreadable, malformed or
+# older than AGENT_MANAGER_MEM_MARKER_MAX_AGE_S (default 330 s = the broker's 300 s reconcile + slack; the broker rewrites it at least that
+# often, so 120 s would make a healthy idle marker look stale), run mem-guard.js (MemAvailable / SwapFree, asks ComfyUI to unload, exit 3
+# only when pressure remains). AGENT_MANAGER_MEM_MARKER=off ignores the marker. Any other outcome fails open.
+# mem_marker_state -> prints ok|tight|critical and returns 0 when the marker is fresh and valid, returns 1 otherwise.
+mem_marker_state() {
+  [[ "${AGENT_MANAGER_MEM_MARKER:-on}" == "off" ]] && return 1
+  local f="${AGENT_MANAGER_MEM_PRESSURE_MARKER:-/dev/shm/agent-manager-mem-pressure.json}"
+  local max="${AGENT_MANAGER_MEM_MARKER_MAX_AGE_S:-330}"
+  [[ "$max" =~ ^[0-9]+$ ]] || max=330
+  local mtime now age state
+  mtime="$(stat -c %Y "$f" 2>/dev/null)" || return 1
+  now="${AGENT_MANAGER_MEM_MARKER_NOW:-$(date +%s)}"      # the override is a test seam: it fixes "now" so the age boundary can be tested exactly
+  age=$(( now - mtime ))
+  (( age >= 0 && age <= max )) || return 1
+  state="$(sed -n 's/.*"state": *"\(ok\|tight\|critical\)".*/\1/p' "$f" 2>/dev/null | head -n 1)"
+  [[ -n "$state" ]] || return 1
+  printf '%s\n' "$state"
+}
+
+# sweep_gate_skips <project <pipelineDir> | global-redo> -> exit 0 only when src/sweep-gate.js answers exactly `skip` (nothing the sweep reads has changed). Any other answer, a crash or a
+# missing script means run: the gate fails open, exactly as before it existed (ADR-0024).
+sweep_gate_skips() {
+  local answer
+  answer="$(node "${PACKAGE_SRC_DIR}/sweep-gate.js" "$@" 2>/dev/null)" || return 1
+  [[ "$answer" == "skip" ]]
+}
+
+# mem_marker_num <key> -> prints a number from the marker's "numbers" block, or nothing when absent or not numeric (same file, freshness and spacing rules as mem_marker_state).
+mem_marker_num() {
+  local f="${AGENT_MANAGER_MEM_PRESSURE_MARKER:-/dev/shm/agent-manager-mem-pressure.json}"
+  sed -n "s/.*\"$1\": *\(-\?[0-9][0-9.]*\).*/\1/p" "$f" 2>/dev/null | head -n 1
+}
+
+# mem_tight_stalls -> exit 0 when a TIGHT marker shows real trouble and the lane should still yield; exit 1 when it is tight only on paper (swap nearly
+# full with plenty of RAM and no stall, observed 2026-11-10: every lane idle for hours with 5.4 GB available). Yield when memory stall some >=
+# AGENT_MANAGER_TIGHT_YIELD_MEM_SOME (5), io stall some >= AGENT_MANAGER_TIGHT_YIELD_IO_SOME (20), io stall full >= AGENT_MANAGER_TIGHT_YIELD_IO_FULL (5)
+# or available RAM < AGENT_MANAGER_TIGHT_YIELD_AVAILABLE_MB (2048). A number that is missing from the marker counts as stall (fail closed to the old behaviour).
+mem_tight_stalls() {
+  local key lim val
+  for key in mem_some io_some io_full available_mb; do
+    val="$(mem_marker_num "$key")"
+    [[ -n "$val" ]] || return 0
+    case "$key" in
+      mem_some) lim="${AGENT_MANAGER_TIGHT_YIELD_MEM_SOME:-5}" ;;
+      io_some) lim="${AGENT_MANAGER_TIGHT_YIELD_IO_SOME:-20}" ;;
+      io_full) lim="${AGENT_MANAGER_TIGHT_YIELD_IO_FULL:-5}" ;;
+      available_mb) lim="${AGENT_MANAGER_TIGHT_YIELD_AVAILABLE_MB:-2048}" ;;
+    esac
+    [[ "$lim" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+    if [[ "$key" == available_mb ]]; then
+      awk -v a="$val" -v b="$lim" 'BEGIN{exit !(a+0 < b+0)}' && return 0
+    else
+      awk -v a="$val" -v b="$lim" 'BEGIN{exit !(a+0 >= b+0)}' && return 0
+    fi
+  done
+  return 1
+}
+
+# mem_pressure_high -> exit 0 if the lane should yield this tick, 1 otherwise. Critical always yields; tight yields only while mem_tight_stalls says so.
+# The yield line carries the marker's reason and numbers, so a swap-only block is obvious from the worker log.
 mem_pressure_high() {
+  local state reason
+  if state="$(mem_marker_state)"; then
+    case "$state" in
+      critical|tight)
+        if [[ "$state" == tight ]] && ! mem_tight_stalls; then return 1; fi
+        reason="$(sed -n 's/.*"reason": *"\([^"]*\)".*/\1/p' "${AGENT_MANAGER_MEM_PRESSURE_MARKER:-/dev/shm/agent-manager-mem-pressure.json}" 2>/dev/null | head -n 1)"
+        printf '[common] host memory pressure %s (broker marker): %s; avail %s MB, mem some %s%%, io some %s%%, io full %s%%\n' "$state" "${reason:-no reason}" \
+          "$(mem_marker_num available_mb)" "$(mem_marker_num mem_some)" "$(mem_marker_num io_some)" "$(mem_marker_num io_full)" >>"${LOG_FILE:-/dev/null}" 2>&1
+        return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
   node "${PACKAGE_SRC_DIR}/mem-guard.js" >>"${LOG_FILE:-/dev/null}" 2>&1
   [[ $? -eq 3 ]]
 }
@@ -537,7 +618,7 @@ write_heartbeat_file() {
       lastHeartbeat: now, stateSince,
     };
     if (startedAt) hb.startedAt = startedAt;
-    // Borrowed-project label (docs/idle-pool-borrowing.md): set only while this lane runs a task of another suite project.
+    // Borrowed-project label (docs/design-notes/idle-pool-borrowing.md): set only while this lane runs a task of another suite project.
     if (process.env.AGENT_MANAGER_BORROWING_FROM) hb.project = process.env.AGENT_MANAGER_BORROWING_FROM;
     fs.writeFileSync(hbPath, JSON.stringify(hb, null, 2));
   ' "$hb_path" "$instance_id" "$status" "$model" "$task_id" "$pass" "$started_at" "${AGENT_MANAGER_DAEMON_PID:-$$}"
@@ -658,5 +739,40 @@ check_instance_liveness() {
       "$instance_id" "$instance_id" "$other_pid" "$hb_path" >&2
     return 1
   fi
+  return 0
+}
+
+# reload_lane_rules [instance_id] -> re-reads this lane's taskClasses and reviewer daemon from src/lanes.js --env (one node spawn), so a lanes.json
+# edit reaches a running worker without a restart. Gated on a bash -nt test: node runs only when lanes.json is newer than LANE_RULES_STAMP, so an
+# unchanged registry costs no spawn. Sets LANE_RULES_TASK_CLASSES and LANE_RULES_REVIEWS. A failed call or missing keys keeps the last good values.
+# The stamp is touched on every path inside the gate, so a failing call is not retried until lanes.json changes again. Logs one line only when a value
+# changes. No timer or loop here: the caller's tick is the trigger.
+reload_lane_rules() {
+  local id="${1:-${AGENT_MANAGER_INSTANCE_ID:-}}"
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local lanes_json="${AGENT_MANAGER_LANES_PATH:-${here}/../lanes.json}"
+  local lanes_js="${here}/../src/lanes.js"
+  local stamp="${LANE_RULES_STAMP:-${TEMP_DIR:-/tmp}/lane-rules.stamp}"
+  [[ -n "$id" && -f "$lanes_js" ]] || return 0
+  [[ "$lanes_json" -nt "$stamp" ]] || return 0
+
+  local out rc=0
+  out="$(node "$lanes_js" --env "$id" 2>/dev/null)" || rc=$?
+  # Touched before the verdict: a failed call must not be retried every tick until lanes.json changes.
+  touch "$stamp" 2>/dev/null || true
+  [[ $rc -eq 0 ]] || return 0
+
+  printf '%s\n' "$out" | grep -q '^LANE_TASK_CLASSES=' || return 0
+  printf '%s\n' "$out" | grep -q '^LANE_REVIEWS=' || return 0
+  local classes reviews
+  classes="$(printf '%s\n' "$out" | sed -n 's/^LANE_TASK_CLASSES=//p' | head -n 1)"
+  reviews="$(printf '%s\n' "$out" | sed -n 's/^LANE_REVIEWS=//p' | head -n 1)"
+
+  if [[ "${LANE_RULES_TASK_CLASSES-__unset__}" != "$classes" || "${LANE_RULES_REVIEWS-__unset__}" != "$reviews" ]]; then
+    printf '[%s] lane rules: taskClasses=%s reviews=%s\n' "$id" "${classes:-any}" "${reviews:-none}" >&2
+  fi
+  LANE_RULES_TASK_CLASSES="$classes"
+  LANE_RULES_REVIEWS="$reviews"
   return 0
 }

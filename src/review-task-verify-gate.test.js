@@ -44,6 +44,21 @@ describe('extended verification gate (HUB0184 4/4)', () => {
     assert.deepEqual(forPerf, forAdhoc);
   });
 
+  it('downgrades to advisory when mode is advisory', () => {
+    const forAdvisory = { blocked: true, reason: executedVerificationBlockReason(failingEvent, { mode: 'advisory' }) };
+    assert.equal(forAdvisory.reason, null, 'advisory mode must downgrade to advisory');
+  });
+
+  it('downgrades to advisory when isTestOnlyDiff is true (refactor escape)', () => {
+    const forRefactor = { blocked: true, reason: executedVerificationBlockReason(failingEvent, { isTestOnlyDiff: true }) };
+    assert.equal(forRefactor.reason, null, 'refactor escape must downgrade to advisory');
+  });
+
+  it('blocks when mode is block and not test-only diff', () => {
+    const forBlock = { blocked: true, reason: executedVerificationBlockReason(failingEvent, { mode: 'block', isTestOnlyDiff: false }) };
+    assert.ok(forBlock.reason, 'block mode must produce a reason');
+  });
+
   it('does not block a clean diff on a performance_fix task', () => {
     assert.equal(extractTaskDiff({ ...perfFixTask, rawDiff: '' }), null, 'an empty diff must not reach the gate');
     assert.equal(extractTaskDiff(perfFixTask) === null, false, 'a real diff reaches the gate and is judged on its own result');

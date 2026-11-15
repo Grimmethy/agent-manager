@@ -107,7 +107,6 @@ function loadDashboardScripts(overrides = {}) {
     counts: {},
     CORE_TABS: [{ key: 'adhoc', label: 'Adhoc' }, { key: 'models', label: 'Models' }],
     renderModelsTab: async () => {},
-    leaveProjectTab() {}, leaveBrainDumpTab() {}, leaveBranchesTab() {}, leaveHygieneTab() {},
     enterProjectTab() {}, enterBrainDumpTab() {}, enterBranchesTab() {}, enterHygieneTab() {},
     renderNav() {},
     escapeHtml: (s) => String(s == null ? '' : s),
@@ -116,7 +115,7 @@ function loadDashboardScripts(overrides = {}) {
     ...overrides,
   };
   vm.createContext(ctx);
-  for (const f of ['core-ui.js', 'concepts-and-adhoc-tab.js', 'branches-joblist-hardware-tabs.js']) {
+  for (const f of ['core-ui.js', 'concepts-and-adhoc-tab.js', 'live-updates.js', 'branches-joblist-hardware-tabs.js']) {
     vm.runInContext(fs.readFileSync(path.join(jsDir, f), 'utf8'), ctx, { filename: f });
   }
   ctx.renderNav = () => {}; // real one builds DOM nodes; not under test here

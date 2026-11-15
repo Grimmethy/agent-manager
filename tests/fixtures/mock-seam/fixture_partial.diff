@@ -1,0 +1,44 @@
+diff --git a/lib/scoring.py b/lib/scoring.py
+--- a/lib/scoring.py
++++ b/lib/scoring.py
+@@ -5,3 +5,12 @@
+ import math
+ 
++def calculateScore(base, multiplier):
++    """Calculate a weighted score with a log bonus.
++
++    Falls back to zero multiplier if negative values are passed.
++    """
++    if multiplier is None or multiplier < 0:
++        multiplier = 0
++    return base * multiplier + math.log(multiplier + 1)
++
+diff --git a/tests/test_scoring.py b/tests/test_scoring.py
+--- a/tests/test_scoring.py
++++ b/tests/test_scoring.py
+@@ -1,5 +1,20 @@
++from unittest.mock import patch
+ import unittest
+ import math
++from scoring import calculateScore
+ 
++@patch('scoring.calculateScore')
+ class TestScoringFast(unittest.TestCase):
+-    def test_placeholder(self):
+-        pass
++    def test_zero_multiplier(self, mock_cs):
++        mock_cs.return_value = 0
++        result = calculateScore(10, 0)
++        self.assertEqual(result, 0)
++        mock_cs.assert_called_once_with(10, 0)
++
++
++class TestScoringReal(unittest.TestCase):
++    def test_positive_multiplier(self):
++        result = calculateScore(10, 2)
++        expected = 10 * 2 + math.log(3)
++        self.assertAlmostEqual(result, expected, places=5)
++
++    def test_none_multiplier(self):
++        result = calculateScore(5, None)
++        self.assertGreater(result, 0)

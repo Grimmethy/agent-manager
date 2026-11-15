@@ -18,6 +18,16 @@ STATE_DIR="${HOME}/.local/state/agent-manager"
 PID_DIR="${STATE_DIR}/pids"
 GRACE_SEC="${AGENT_MANAGER_STOP_GRACE_SEC:-90}"
 
+# The pipeline-stopped marker exists exactly while the pipeline is stopped (launch.sh removes it at the start of a launch). Detached plugin DRAINS (the pipeline-ops
+# and context-ops workers, which write drain-<name>.pid into the pids folder and are stopped by the pidfile loop below like any daemon) read it at the top of every tick and
+# exit, and the watchdog trigger starts none while it exists. It is created right after the daemons have been signalled, and on the 'nothing to do' paths too:
+# the pipeline is stopped in all of those cases.
+MARKER="${STATE_DIR}/pipeline-stopped"
+mark_stopped() {
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  : > "$MARKER" 2>/dev/null
+}
+
 # --keep-dashboard: skip dashboard.pid. Used when the dashboard's own /api/pipeline/stop
 # handler shells out to this script -- without it, "Stop Pipeline" would SIGTERM the very
 # Flask process handling that request (dashboard.pid is written by launch.sh same as every
@@ -100,6 +110,7 @@ sweep_orphans() {
 
 
 if [[ ! -d "$PID_DIR" ]]; then
+  mark_stopped
   sweep_orphans
   printf '[stop] nothing to do: %s does not exist.\n' "$PID_DIR"
   exit 0
@@ -110,6 +121,7 @@ pidfiles=("$PID_DIR"/*.pid)
 shopt -u nullglob
 
 if [[ ${#pidfiles[@]} -eq 0 ]]; then
+  mark_stopped
   sweep_orphans
   printf '[stop] nothing else to do: no pidfiles in %s.\n' "$PID_DIR"
   exit 0
@@ -122,6 +134,7 @@ for pidfile in "${pidfiles[@]}"; do
     printf '[stop] skipping dashboard (--keep-dashboard)\n'
     continue
   fi
+  # Only plugin-<name>.pid files are plugin servers. A drain-<name>.pid is a pipeline worker (a detached drain started by a watchdog trigger): --keep-plugins must never skip it.
   if [[ "$name" == plugin-* && "$KEEP_PLUGINS" == true ]]; then
     printf '[stop] skipping %s (--keep-plugins)\n' "$name"
     continue                                    # BEFORE the rm -f below: the pidfile must survive too
@@ -145,6 +158,9 @@ for pidfile in "${pidfiles[@]}"; do
   fi
   rm -f "$pidfile"
 done
+
+# Every daemon has been signalled: the pipeline is stopped. Drains see the marker at the top of their next tick.
+mark_stopped
 
 # Poll for actual exit instead of trusting the signal alone.
 deadline=$(( $(date +%s) + GRACE_SEC ))

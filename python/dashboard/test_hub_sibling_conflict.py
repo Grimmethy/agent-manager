@@ -28,6 +28,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 import app  # noqa: E402
 
 
+def _reset_cache():
+    """A fresh dashboard: no cached list at all (an invalidated cache keeps its last list for the stale-while-revalidate listing, see app.list_unmerged_branches)."""
+    t = app._branch_fetch_state.get("thread")
+    if t is not None:
+        t.join(5)
+    with app._branch_cache_lock:
+        app._branch_cache.update({"at": 0.0, "branches": []})
+        app._branch_cache.pop("filled", None)
+        app._branch_fetch_state["refreshing"] = False
+
+
 def _git(args, cwd):
     subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True)
 
@@ -85,13 +96,13 @@ def make_repo_with_conflicting_siblings():
 
 class TestHubSiblingConflict(unittest.TestCase):
     def setUp(self):
-        app._invalidate_branch_cache()
+        _reset_cache()
         self._sync_patch = mock.patch.object(app, "_sync_live_checkout", return_value={"synced": False})
         self._sync_patch.start()
-        self.client = app.app.test_client()
+        self.client = __import__("gate_test_support").client(self)
 
     def tearDown(self):
-        app._invalidate_branch_cache()
+        _reset_cache()
         self._sync_patch.stop()
 
     def _patches(self, repo_root):
@@ -171,6 +182,13 @@ class TestHubSiblingConflict(unittest.TestCase):
             # b touch the same lines), which is a pre-existing, already-correct signal --
             # this test only asserts the SIBLING gate itself no longer fires for a branch
             # that has already left the unmerged list.
+            # The listing never recomputes inside the request (2026-11-02): the merged card is dropped at once, and the other sibling's conflict flag is updated by the
+            # background refresh that this first read starts.
+            first = {b["taskId"]: b for b in self.client.get("/api/git/unmerged-branches").get_json()}
+            self.assertNotIn(task_a, first, "the merged card leaves the list at once")
+            t = app._branch_fetch_state.get("thread")
+            if t is not None:
+                t.join(30)
             res2 = self.client.get("/api/git/unmerged-branches")
             branches = {b["taskId"]: b for b in res2.get_json()}
             self.assertNotIn(task_a, branches, "a is merged now -- gone from the unmerged list")

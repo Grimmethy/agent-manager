@@ -12,6 +12,7 @@ from graph_constants import MATCH_EXTENSIONS
 from collections import Counter
 from pathlib import Path
 import json
+import os
 import urllib.request
 
 from graph_constants import _GENERIC_DIR_NAMES
@@ -65,6 +66,22 @@ def name_community_heuristic(files: list[str]) -> str:
     return "/".join(common) + "/(" + ",".join(basenames) + ")"
 
 
+# 2026-11-07 (owner: never unload, never swap a model). A request whose num_ctx differs from the loaded model's restarts Ollama's runner (a 21 GB reload) and a per-request
+# keep_alive overrides the server's never-expire. This script runs outside the dashboard, so the 6-line helper from python/dashboard/ollama_client.py is repeated here: the pipeline's
+# pinned context (AGENT_MANAGER_LANE_NUM_CTX, else 49152; src/gpu-capacity.js) and "8760h" (src/keep-alive.js).
+# io-ok: this is the pipeline's pinned context (src/gpu-capacity.js PINNED_NUM_CTX) mirrored for python, not a caller choosing its own
+DEFAULT_PINNED_NUM_CTX = 49152
+KEEP_ALIVE = "8760h"
+
+
+def pinned_num_ctx() -> int:
+    try:
+        n = int(os.environ.get("AGENT_MANAGER_LANE_NUM_CTX", ""))
+    except ValueError:
+        return DEFAULT_PINNED_NUM_CTX
+    return n if n > 0 else DEFAULT_PINNED_NUM_CTX
+
+
 def name_community_ornith(files: list[str], ollama_url: str, ornith_model: str) -> str | None:
     prompt = (
         "These files form one tightly-connected cluster in a codebase's import graph:\n"
@@ -77,7 +94,8 @@ def name_community_ornith(files: list[str], ollama_url: str, ornith_model: str) 
         "prompt": prompt,
         "think": False,
         "stream": False,
-        "options": {"num_predict": 30, "temperature": 0.3},
+        "keep_alive": KEEP_ALIVE,
+        "options": {"num_predict": 30, "temperature": 0.3, "num_ctx": pinned_num_ctx()},
     }).encode("utf-8")
     req = urllib.request.Request(
         f"{ollama_url}/api/generate", data=body, headers={"Content-Type": "application/json"}, method="POST"

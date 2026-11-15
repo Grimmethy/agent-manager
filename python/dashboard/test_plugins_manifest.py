@@ -116,7 +116,7 @@ class ResolvePluginRootTest(unittest.TestCase):
 
 
 class ValidatePluginTabTest(unittest.TestCase):
-    """Docs/hub-tasks-extraction-plan.md section 5: a plugins.json entry may carry
+    """docs/design-notes/hub-tasks-extraction-plan.md section 5: a plugins.json entry may carry
     `tab: {key, label, description?, group?, kind:'script', script:'ui/<file>.js',
     replaces?}` so its dashboard tab is served from the plugin's own repo. This is the
     schema gate every later piece (static-file route, tab-bar merge, renderer dispatch)

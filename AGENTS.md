@@ -407,7 +407,7 @@ The `observability_*`, `performance_*`, `function_length_*`, `arch_*` and `unuse
 task sources moved (2026-08-27) into the out-of-tree **agent-manager-hygiene** plugin,
 loaded via `AGENT_MANAGER_REGISTER_PATH` (comma-separated for more than one plugin;
 `src/config.js` `ensureRegistered()` `require()`s each once). The live `agent-manager.env`
-points it at `/media/wok/model-cache/agent-manager-hygiene/register.js`.
+points it at `/media/model-cache/github/agent-manager-hygiene/register.js`.
 
 - **`docs/PLUGIN_API.md` is the contract** for what a plugin may `require` from
   `agent-manager/src/*`. `src/plugin-api.test.js` fails in THIS repo's CI if one of those

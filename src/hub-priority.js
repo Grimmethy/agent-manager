@@ -16,7 +16,7 @@
 // two can never disagree about which hub is "next":
 //
 //   1. hubs with an explicit numeric hubPriority, ascending by that number
-//   2. then hubs with no hubPriority, oldest-first by `createdAt`
+//   2. then hubs with no hubPriority: fewest unbuilt pieces first (closest to done), then oldest-first by `createdAt`
 //      (FIFO -- directly answers "new hubs being worked before old hubs are finished")
 //
 // A hub child inherits its owning hub's key. The child -> hub link is already plumbed
@@ -58,14 +58,22 @@ function hubIdForTask(task) {
   return null;
 }
 
-// { found, rank, createdAt } for a hub id. `found` is false when no live coordinating
+// Pieces of a hub not yet built (progress.total - progress.built), or null when the record does not say. Closest-to-done ordering (owner 2026-11-06):
+// finishing a hub takes it off the held list, so among hubs of equal rank the one with the fewest unbuilt pieces is worked first.
+function remainingPieces(hub) {
+  const p = hub && hub.progress;
+  if (!p || !Number.isFinite(p.total) || !Number.isFinite(p.built)) return null;
+  return Math.max(0, p.total - p.built);
+}
+
+// { found, rank, createdAt, remaining } for a hub id. `found` is false when no live coordinating
 // record exists (the hub already completed and left coordinating/, or the id is a plain
 // adhoc parent that never became a hub) -- callers use that to decide whether a child
 // still counts as "hub work" for prioritisation.
 function readHubOrderKey(pipelineDir, hubId, cache) {
-  if (!hubId) return { found: false, rank: UNRANKED_HUB_PRIORITY, createdAt: null };
+  if (!hubId) return { found: false, rank: UNRANKED_HUB_PRIORITY, createdAt: null, remaining: null };
   if (cache && cache.has(hubId)) return cache.get(hubId);
-  let key = { found: false, rank: UNRANKED_HUB_PRIORITY, createdAt: null };
+  let key = { found: false, rank: UNRANKED_HUB_PRIORITY, createdAt: null, remaining: null };
   try {
     const raw = fs.readFileSync(path.join(pipelineDir, 'queue', 'coordinating', `${hubId}.json`), 'utf8');
     const hub = JSON.parse(raw);
@@ -74,6 +82,7 @@ function readHubOrderKey(pipelineDir, hubId, cache) {
       found: true,
       rank: norm === null ? UNRANKED_HUB_PRIORITY : norm,
       createdAt: typeof hub.createdAt === 'string' ? hub.createdAt : null,
+      remaining: remainingPieces(hub),
     };
   } catch { /* no live hub record -- leave the not-found default */ }
   if (cache) cache.set(hubId, key);
@@ -85,13 +94,16 @@ function readHubOrderKey(pipelineDir, hubId, cache) {
 // ordinary ordering.
 function hubOrderKeyForTask(pipelineDir, task, cache) {
   const key = readHubOrderKey(pipelineDir, hubIdForTask(task), cache);
-  return { isHubChild: key.found, rank: key.rank, createdAt: key.createdAt };
+  return { isHubChild: key.found, rank: key.rank, createdAt: key.createdAt, remaining: key.remaining };
 }
 
 // -1 / 0 / 1 comparing two { rank, createdAt } hub keys by the ordering rule above.
 // A missing createdAt sorts last within the same rank.
 function compareHubKeys(a, b) {
   if (a.rank !== b.rank) return a.rank - b.rank;
+  const ar = Number.isFinite(a.remaining) ? a.remaining : Infinity;
+  const br = Number.isFinite(b.remaining) ? b.remaining : Infinity;
+  if (ar !== br) return ar < br ? -1 : 1;
   const ac = a.createdAt || '￿';
   const bc = b.createdAt || '￿';
   if (ac < bc) return -1;

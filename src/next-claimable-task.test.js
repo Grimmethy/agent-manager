@@ -24,6 +24,7 @@ const { resolveSourceName } = require('./task-source-registry.js');
 // The claim path reads its task files through the RAM cache (queue-cache.js). Keep this file's cache files out of the real /dev/shm location.
 const CACHE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'next-claimable-task-cache-'));
 process.env.AGENT_MANAGER_QUEUE_CACHE_DIR = CACHE_ROOT;
+delete process.env.AGENT_MANAGER_PRIORITY_MODE; // these tests assume the flat order unless a test sets the mode itself, even when the shell env turns the switch on
 process.on('exit', () => { try { fs.rmSync(CACHE_ROOT, { recursive: true, force: true }); } catch (_) { /* best-effort */ } });
 
 function setupPending() {
@@ -142,6 +143,20 @@ test('within a source-priority band, the higher-priority hub\'s child sorts firs
 
   const items = pickClaimableTasks(pendingDir, 'worker-reasoning');
   assert.deepEqual(items, ['child-of-hub-low.json', 'child-of-hub-high.json', 'child-of-unranked.json']);
+});
+
+test('within one source-priority band the child of the hub with the fewest unbuilt pieces is claimed first, even when that hub is newer', () => {
+  const pendingDir = setupPending();
+  const coordDir = path.join(pendingDir, '..', 'coordinating');
+  fs.mkdirSync(coordDir, { recursive: true });
+  fs.writeFileSync(path.join(coordDir, 'hub-far.json'),
+    JSON.stringify({ id: 'hub-far', status: 'coordinating', createdAt: '2026-08-01T00:00:00Z', progress: { built: 1, total: 8 } }));
+  fs.writeFileSync(path.join(coordDir, 'hub-near.json'),
+    JSON.stringify({ id: 'hub-near', status: 'coordinating', createdAt: '2026-09-20T00:00:00Z', progress: { built: 5, total: 6 } }));
+  writeTask(pendingDir, 'child-of-far', { source: 'adhoc', parentHub: 'hub-far' });
+  writeTask(pendingDir, 'child-of-near', { source: 'adhoc', parentHub: 'hub-near' });
+  const items = pickClaimableTasks(pendingDir, 'worker-reasoning');
+  assert.deepEqual(items, ['child-of-near.json', 'child-of-far.json']);
 });
 
 test('a hub child sorts ahead of an unrelated task at the same source priority; a non-hub task keeps its place otherwise', () => {
@@ -1185,3 +1200,110 @@ test('local-worker.sh claim loop: a blank line is skipped and a line without a f
   fs.rmSync(stubDir, { recursive: true, force: true });
 });
 
+
+// --- claim order by the authored group order (HUB0332 W-F2): AGENT_MANAGER_PRIORITY_MODE=group, off by default ---
+
+// Runs fn with the mode env and a temp workflow file (config: object or raw string written to the file, or undefined for NO file); mode undefined removes the variable. Both variables are restored in finally.
+function withClaimMode(mode, config, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claim-mode-'));
+  const file = path.join(dir, 'workflow.json');
+  if (config !== undefined) fs.writeFileSync(file, typeof config === 'string' ? config : JSON.stringify(config));
+  const prev = { mode: process.env.AGENT_MANAGER_PRIORITY_MODE, file: process.env.AGENT_MANAGER_WORKFLOW_PATH };
+  if (mode === undefined) delete process.env.AGENT_MANAGER_PRIORITY_MODE; else process.env.AGENT_MANAGER_PRIORITY_MODE = mode;
+  process.env.AGENT_MANAGER_WORKFLOW_PATH = file;
+  try { return fn(); } finally {
+    if (prev.mode === undefined) delete process.env.AGENT_MANAGER_PRIORITY_MODE; else process.env.AGENT_MANAGER_PRIORITY_MODE = prev.mode;
+    if (prev.file === undefined) delete process.env.AGENT_MANAGER_WORKFLOW_PATH; else process.env.AGENT_MANAGER_WORKFLOW_PATH = prev.file;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+const claimGrp = (id, ...children) => ({ id, label: id, children, collapsed: false });
+// trouble_log (registered 20) in the FIRST group, adhoc (registered 10) in the SECOND: the group order is the opposite of the flat order.
+const OPPOSITE = { schemaVersion: 1, groups: [claimGrp('group:first', 'source:trouble_log'), claimGrp('group:second', 'source:adhoc', 'source:derived_task')], edges: [], labels: {} };
+const HUMAN_ADHOC = { source: 'adhoc', humanQueued: true };
+const TROUBLE = { source: 'trouble_log' };
+
+test('group mode: without the mode the rank is the registered priority, also when a workflow file with groups exists', () => {
+  for (const mode of [undefined, 'flat', 'GROUP', '']) {
+    withClaimMode(mode, OPPOSITE, () => {
+      assert.equal(rankPriorityOfTask(HUMAN_ADHOC), 10, String(mode));
+      assert.equal(rankPriorityOfTask(TROUBLE), 20, String(mode));
+      assert.equal(rankPriorityOfTask({ source: 'derived_task', domain: 'adhoc' }), 48, String(mode));
+    });
+  }
+});
+
+test('group mode: a task ranks by group index times 1000 plus its registered priority, so the group order beats the flat order', () => {
+  withClaimMode('group', OPPOSITE, () => {
+    assert.equal(rankPriorityOfTask(TROUBLE), 20);
+    assert.equal(rankPriorityOfTask(HUMAN_ADHOC), 1010);
+    assert.ok(rankPriorityOfTask(TROUBLE) < rankPriorityOfTask(HUMAN_ADHOC), 'trouble_log (flat 20) now ranks ahead of adhoc (flat 10)');
+  });
+});
+
+test('group mode: a source in no group ranks after the last group (group count times 1000 plus its priority)', () => {
+  withClaimMode('group', OPPOSITE, () => {
+    assert.equal(rankPriorityOfTask({ source: 'brain_dump_sort' }), 2042);
+  });
+});
+
+test('group mode: the bot-adhoc penalty is still added on top of the banded base', () => {
+  withClaimMode('group', OPPOSITE, () => {
+    assert.equal(rankPriorityOfTask({ source: 'adhoc' }), 1000 + 10 + BOT_ADHOC_PRIORITY_PENALTY);
+  });
+});
+
+test('group mode: derived_task ranks by its own registered priority banded by its group', () => {
+  withClaimMode('group', OPPOSITE, () => {
+    assert.equal(rankPriorityOfTask({ source: 'derived_task', domain: 'adhoc' }), 1048);
+  });
+  withClaimMode('group', { schemaVersion: 1, groups: [claimGrp('group:a', 'source:trouble_log')], edges: [], labels: {} }, () => {
+    assert.equal(rankPriorityOfTask({ source: 'derived_task', domain: 'adhoc' }), 1048, 'ungrouped: after the one group');
+  });
+  withClaimMode('group', { schemaVersion: 1, groups: [claimGrp('group:d', 'source:derived_task'), claimGrp('group:a', 'source:adhoc')], edges: [], labels: {} }, () => {
+    assert.equal(rankPriorityOfTask({ source: 'derived_task', domain: 'adhoc' }), 48, 'looked up under its own name, not under adhoc');
+  });
+});
+
+test('group mode: premiumPriority still ranks -Infinity and the hub tier still ranks ahead of every band', () => {
+  withClaimMode('group', OPPOSITE, () => {
+    assert.equal(rankPriorityOfTask({ source: 'adhoc', premiumPriority: true }), -Infinity);
+    assert.equal(rankPriorityOfTask({ source: 'adhoc' }, { hubTier: true }), HUB_TIER_PRIORITY);
+    assert.equal(rankPriorityOfTask({ source: 'derived_task', domain: 'adhoc' }, { hubTier: true }), HUB_TIER_PRIORITY);
+    assert.equal(rankPriorityOfTask({ source: 'derived_task', domain: 'adhoc', premiumPriority: true }, { hubTier: true }), -Infinity);
+    assert.equal(rankPriorityOfTask({ source: 'no_such_source' }), Infinity);
+    assert.equal(rankPriorityOfTask(null), Infinity);
+  });
+});
+
+test('group mode: an absent, invalid or group-less workflow file ranks exactly as the flat order', () => {
+  for (const config of [undefined, '{not json', '[]', { schemaVersion: 1, groups: [], edges: [], labels: {} }]) {
+    withClaimMode('group', config, () => {
+      assert.equal(rankPriorityOfTask(HUMAN_ADHOC), 10, JSON.stringify(config));
+      assert.equal(rankPriorityOfTask(TROUBLE), 20, JSON.stringify(config));
+    });
+  }
+});
+
+test('group mode: a group that holds only an unregistered source shifts every ranked source by the same band, so the order is the flat order', () => {
+  withClaimMode('group', { schemaVersion: 1, groups: [claimGrp('group:x', 'source:nothing_registered')], edges: [], labels: {} }, () => {
+    assert.equal(rankPriorityOfTask(HUMAN_ADHOC), 1010);
+    assert.equal(rankPriorityOfTask(TROUBLE), 1020);
+  });
+});
+
+test('group mode: pickClaimableTasks claims in the group order, flat mode in the flat order, same pending tasks', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'mine', { source: 'adhoc', humanQueued: true });
+  writeTask(pendingDir, 'fix', { source: 'trouble_log' });
+  const flat = withClaimMode(undefined, OPPOSITE, () => pickClaimableTasks(pendingDir, 'worker-1', { graceMs: 0 }));
+  assert.deepEqual(flat, ['mine.json', 'fix.json']);
+  const grouped = withClaimMode('group', OPPOSITE, () => pickClaimableTasks(pendingDir, 'worker-1', { graceMs: 0 }));
+  assert.deepEqual(grouped, ['fix.json', 'mine.json']);
+  const back = withClaimMode(undefined, OPPOSITE, () => pickClaimableTasks(pendingDir, 'worker-1', { graceMs: 0 }));
+  assert.deepEqual(back, ['mine.json', 'fix.json'], 'switching the mode off again restores the flat order');
+});
+
+test('group mode: the variables the helper sets are restored after each test', () => {
+  assert.equal(process.env.AGENT_MANAGER_PRIORITY_MODE, undefined);
+});

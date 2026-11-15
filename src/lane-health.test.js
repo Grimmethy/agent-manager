@@ -72,7 +72,7 @@ test('the probe request matches the lane\'s own calls (same num_ctx / num_batch 
   await H.probeEndpoint({ url: 'http://x', model: 'm', numCtx: 16384, numBatch: 1024, keepAlive: '30m', post: async (u, b) => { body = b; return { eval_count: 40, eval_duration: 1e9 }; } });
   assert.equal(body.options.num_ctx, 16384);
   assert.equal(body.options.num_batch, 1024);
-  assert.equal(body.keep_alive, '30m');
+  assert.equal(body.keep_alive, '8760h');
   await H.probeEndpoint({ url: 'http://x', model: 'm', post: async (u, b) => { body = b; return { eval_count: 40, eval_duration: 1e9 }; } });
   assert.equal(body.options.num_ctx, 49152, 'default lanes use the pinned 49152');
   assert.equal(body.options.num_batch, undefined);
@@ -84,7 +84,7 @@ test('the probe request matches the lane\'s own calls (same num_ctx / num_batch 
   await H.runDueProbes({ lanes: [{ id: 'worker-rx580', model: 'small:8b', numCtx: 16384, numBatch: 1024, env: { OLLAMA_URL: 'http://g:11434' } }], instancesDir: dir, pipelineDir: dir, env: {}, now, probe: async (a) => { args = a; return { ok: true, tps: 25, totalMs: 1 }; } });
   assert.equal(args.numCtx, 16384);
   assert.equal(args.numBatch, 1024);
-  assert.equal(args.keepAlive, '30m');
+  assert.equal(args.keepAlive, '8760h');
 });
 
 test('runDueProbes: a leased card is not probed (a probe would reload the model the lease holder evicted); the other lanes still are', async () => {
@@ -120,6 +120,23 @@ test('runDueProbes: a cloud lane is never probed (no tokens/s to judge, and each
   assert.deepEqual(probed, ['http://g:11434']);
   assert.deepEqual(out.map((r) => r.lane), ['worker-rx580']);
   assert.equal(H.laneDegraded(dir, 'worker-cloud'), false, 'a cloud lane with no samples is never degraded');
+});
+
+test('runDueProbes: a script lane is never probed (it has no model); GPU lanes still are', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-health-script-'));
+  const now = Date.now();
+  const hb = (id) => fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ status: 'idle', lastHeartbeat: new Date(now).toISOString() }));
+  hb('worker-tuner'); hb('worker-rx580');
+  const lanes = [
+    { id: 'worker-tuner', script: true, provider: 'script', model: 'script', env: { OLLAMA_URL: 'http://127.0.0.1:7449' } },
+    { id: 'worker-rx580', model: 'small:8b', env: { OLLAMA_URL: 'http://g:11434' } },
+  ];
+  const probed = [];
+  const probe = async (a) => { probed.push(a.url); return { ok: true, tps: 20, totalMs: 500, error: null }; };
+  const out = await H.runDueProbes({ lanes, instancesDir: dir, pipelineDir: dir, env: {}, now, probe });
+  assert.deepEqual(probed, ['http://g:11434']);
+  assert.deepEqual(out.map((r) => r.lane), ['worker-rx580']);
+  assert.equal(H.laneDegraded(dir, 'worker-tuner'), false);
 });
 
 // --- 2026-10-27: a dashboard model override must be what the probe judges, and a model swap must not read as a dead lane ------------------------------

@@ -187,6 +187,33 @@ function buildCliArgs({ prompt, model, effort, maxTurns, allowedTools, permissio
   return args;
 }
 
+// Builds the failure detail for a failed `claude -p` execFileSync call (2026-11-02, a Chat
+// turn died with an empty-output failure and the saved error was ~2000 characters of
+// prompt). Node's execFileSync error message is 'Command failed: <bin> <argv>' and argv
+// carries the whole prompt, so slicing e.message hid the real cause. This reports the exit
+// status, the signal, the error code, then the TAIL of stderr (stdout when stderr is empty),
+// and drops any message that carries the command line. Pure, so it is testable without a
+// process.
+const FAILURE_TAIL_CHARS = 1500;
+function describeSpawnFailure(e) {
+  const err = e || {};
+  const text = (v) => (v == null ? '' : v.toString()).trim();
+  const parts = [`exit=${err.status == null ? null : err.status}`, `signal=${err.signal == null ? null : err.signal}`];
+  if (err.code) parts.push(`code=${err.code}`);
+  const stderr = text(err.stderr);
+  const stdout = text(err.stdout);
+  // Both tails are kept when both exist: the CLI writes its turn-limit failure to stdout, and the
+  // caller's turn-limit check reads this text.
+  if (stderr) parts.push(`stderr: ${stderr.slice(-FAILURE_TAIL_CHARS)}`);
+  if (stdout) parts.push(`stdout: ${stdout.slice(-FAILURE_TAIL_CHARS)}`);
+  if (!stderr && !stdout) parts.push('(no stderr, no stdout)');
+  const message = text(err.message);
+  if (message && message.length < 300 && !message.includes('\n') && !message.startsWith('Command failed:')) {
+    parts.push(`message: ${message}`);
+  }
+  return parts.join(' ');
+}
+
 // Spawns the `claude -p` process and collects its stdout -- the I/O boundary of
 // callOnce extracted so it's mockable in tests (stub execFileSync) without a real
 // CLI: wraps the command via wrapWithSandbox when `sandbox` is truthy (failing OPEN
@@ -233,7 +260,7 @@ function spawnAndCollect(workDir, args, { timeoutMs, sandbox, effectiveMaxTurns 
       env: buildChildEnv(),
     });
   } catch (e) {
-    const detail = (e.stdout || e.stderr || e.message || '').toString().slice(0, 2000);
+    const detail = describeSpawnFailure(e);
     // Non-zero exit whose output mentions the turn limit (the CLI's own
     // "Reached maximum number of turns (N)" failure, confirmed live 2026-08-16)
     // -- surface it as the same structured error as the JSON-parsed path below
@@ -466,7 +493,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, majorityVote, detectDegenerate, assertSubscriptionAuthAvailable };
+module.exports = { call, callOnce, majorityVote, detectDegenerate, assertSubscriptionAuthAvailable, describeSpawnFailure };
 
 // CLI: node claude-client.js <request.json>
 // request.json: { prompt, model, maxTurns, allowedTools, permissionMode, maxRetries,

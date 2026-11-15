@@ -22,8 +22,8 @@ function brainDumpChipsHtml(entry, escapeHtml) {
   if (resolved && typeof resolved === 'object') {
     const evidence = bdChipClip(resolved.evidence, 300);
     chips.push(
-      `<span class="badge warn" style="margin-left:6px" title="${bdChipEscape('Possibly already fixed on master (not closed, check it): ' + evidence)}">possibly resolved</span>`
-      + (evidence ? `<span class="muted" style="font-size:11px;margin-left:4px">${text(evidence)}</span>` : ''),
+      `<span class="badge warn chip-gap" title="${bdChipEscape('Possibly already fixed on master (not closed, check it): ' + evidence)}">possibly resolved</span>`
+      + (evidence ? `<span class="muted chip-note">${text(evidence)}</span>` : ''),
     );
   }
   const target = entry.targetCheck;
@@ -31,8 +31,8 @@ function brainDumpChipsHtml(entry, escapeHtml) {
     const raw = Array.isArray(target.reasons) ? target.reasons.join('; ') : target.reasons;
     const reasons = bdChipClip(raw, 300);
     chips.push(
-      `<span class="badge warn" style="margin-left:6px" title="${bdChipEscape('Held back from queueing by the target check: ' + reasons)}">target check</span>`
-      + (reasons ? `<span class="muted" style="font-size:11px;margin-left:4px">${text(reasons)}</span>` : ''),
+      `<span class="badge warn chip-gap" title="${bdChipEscape('Held back from queueing by the target check: ' + reasons)}">target check</span>`
+      + (reasons ? `<span class="muted chip-note">${text(reasons)}</span>` : ''),
     );
   }
   return chips.join('');

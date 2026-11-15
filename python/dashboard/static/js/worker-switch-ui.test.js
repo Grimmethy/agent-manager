@@ -143,3 +143,14 @@ test('wiring: workers-tab.js has the three guarded hooks and index.html loads wo
   assert.ok(a > -1 && b > a, 'worker-switch-ui.js is loaded after workers-tab.js');
   assert.match(html, /\.worker-card\.worker-off \{ opacity: \.65; \}/);
 });
+
+test('wireWorkerSwitchButtons asks the machine pause bar to draw when machine-pause-bar.js is loaded, and works without it', () => {
+  const seen = [];
+  const { ctx } = load({ renderMachinePauseBar: (root) => seen.push(root) });
+  ctx.__root = { querySelectorAll: () => [] };
+  vm.runInContext('wireWorkerSwitchButtons(__root)', ctx);
+  assert.deepEqual(seen, [ctx.__root]);
+  const bare = load();
+  bare.ctx.__root = { querySelectorAll: () => [] };
+  assert.doesNotThrow(() => vm.runInContext('wireWorkerSwitchButtons(__root)', bare.ctx));
+});

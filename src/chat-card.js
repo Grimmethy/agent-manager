@@ -29,7 +29,7 @@ function laneUrl(lane, hostUrl) {
 // lockKey = the GPU arbiter's key for the card's Ollama endpoint (what chat_preempt cancels the lane's draft by).
 function chooseChatCard({ lanes, preferred, hostUrl, isHeld }) {
   // Chat cards are GPUs. A cloud lane is never leased, so left in it would silently catch chat whenever the real cards are held, and it is paid.
-  const all = (lanes || []).filter((l) => l && l.id && !l.cloud);
+  const all = (lanes || []).filter((l) => l && l.id && !l.cloud && !l.script);
   const host = all.find((l) => l.local) || null;
   const want = preferred ? String(preferred).trim() : '';
   if (want && !all.some((l) => l.id === want)) {

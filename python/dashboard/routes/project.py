@@ -2,6 +2,8 @@ from flask import Blueprint, abort, jsonify, request
 
 from pathlib import Path
 import threading
+
+import event_stream
 import os
 import subprocess
 import json
@@ -75,6 +77,7 @@ def api_project_build():
         if _build_state.get(raw_path, {}).get("running"):
             return jsonify({"started": False, "reason": "a build is already running for this path"})
         _build_state[raw_path] = {"running": True, "log": [], "error": None}
+    event_stream.announce("project-build-changed", path=raw_path)
 
     thread = threading.Thread(target=_run_build, args=(raw_path, grep_dirs), daemon=True)
     thread.start()

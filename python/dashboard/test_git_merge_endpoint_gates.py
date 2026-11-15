@@ -46,7 +46,7 @@ def _unfinished_hub():
 
 class TestMergeEndpointGates(unittest.TestCase):
     def setUp(self):
-        self.client = app.app.test_client()
+        self.client = __import__("gate_test_support").client(self)
         self._patches = []
 
     def tearDown(self):

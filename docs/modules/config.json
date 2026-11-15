@@ -1,0 +1,162 @@
+{
+  "schema": {
+    "module": {
+      "id": "string",
+      "title": "string",
+      "covers": ["globs"],
+      "ignore": ["globs"],
+      "smallDiff": {
+        "files": "number",
+        "lines": "number"
+      }
+    },
+    "functions": {
+      "validateDoc": "returns {violations: [{line, message}]}",
+      "diffToModules": "returns {affected:[{id, files, lines, action}], uncoveredFiles}",
+      "queryByFiles": "returns {ids, paths, stale}",
+      "discoverCoverage": "returns {fileToModule, uncovered, multiplyCovered}"
+    }
+  },
+  "modules": [
+    {
+      "id": "hub-index",
+      "title": "Hub Index Management",
+      "covers": ["python/dashboard/hub_index.py", "python/dashboard/hub_index*.py"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "queue",
+      "title": "Queue Event System",
+      "covers": ["python/dashboard/queue_events.py", "python/dashboard/queue_events_status.py"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "dashboard",
+      "title": "Dashboard Core Application",
+      "covers": ["python/dashboard/app.py", "python/dashboard/app_*.py"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**", "python/dashboard/queue_events*.py", "python/dashboard/hub_index*.py"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "dashboard-routes",
+      "title": "Dashboard HTTP Routes",
+      "covers": ["python/dashboard/routes/*.py"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "dashboard-static",
+      "title": "Dashboard Static Assets",
+      "covers": ["python/dashboard/static/**/*", "python/dashboard/templates/**/*"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "chat",
+      "title": "Chat Interface",
+      "covers": ["python/dashboard/chat_*.py", "python/dashboard/discuss_sessions.py", "python/dashboard/grill_sessions.py"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "gpu",
+      "title": "GPU Management",
+      "covers": ["python/dashboard/memory_status.py", "python/dashboard/plugin_process_manager.py", "python/dashboard/single_flight_lock.py"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "task-sources",
+      "title": "Task Source Topology",
+      "covers": ["python/dashboard/task_source_topology_fallback.json", "python/dashboard/requeue_attribution_client.py"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "branch-management",
+      "title": "Branch Operations",
+      "covers": ["python/dashboard/branch_*.py"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "pipeline-core",
+      "title": "Pipeline Core Logic",
+      "covers": ["src/pipeline_*.js", "src/branch-check-*.js", "src/candidate-*.js"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "agent-manager-core",
+      "title": "Agent Manager Core",
+      "covers": ["src/agent-manager-core/*.js", "src/config.js", "src/claude-client.js"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "llm-tuner",
+      "title": "LLM Model Selection",
+      "covers": ["src/ab-model-select.js", "src/anthropic-pricing.js", "src/model-override*.js"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "plugin-system",
+      "title": "Plugin System",
+      "covers": ["src/plugin-*.js", "src/install-skills.sh", "src/provision-plugin-repo.sh"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "review",
+      "title": "Review Workflow",
+      "covers": ["src/review-*.js", "src/auto-confirm-review.js"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "apply",
+      "title": "Apply Workflow",
+      "covers": ["src/apply-*.js", "src/apply-group-*.js"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "decompose",
+      "title": "Task Decomposition",
+      "covers": ["src/decompose-*.js"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "test-framework",
+      "title": "Test Framework",
+      "covers": ["src/test-*.js", "scripts/*test.js"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "graph-build",
+      "title": "Graph Construction",
+      "covers": ["python/graph_*.py", "python/build_note_graph.py", "python/visualize_graph.py"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "local-tools",
+      "title": "Local Tool Integration",
+      "covers": ["python/dashboard/local_tool_client.py", "python/dashboard/grep_fetch_client.py", "python/dashboard/ollama_client.py"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**"],
+      "smallDiff": {"files": 5, "lines": 200}
+    },
+    {
+      "id": "scripts",
+      "title": "Utility Scripts",
+      "covers": ["scripts/*.sh", "scripts/*.js"],
+      "ignore": ["**/test_*.py", "**/*.test.js", "**/node_modules/**", "scripts/*test.js"],
+      "smallDiff": {"files": 5, "lines": 200}
+    }
+  ]
+}

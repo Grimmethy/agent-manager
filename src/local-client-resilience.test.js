@@ -36,7 +36,9 @@ function withServer(handler, fn) {
     const server = http.createServer((req, res) => {
       if (req.method === 'GET' && req.url === '/api/ps') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end('{"models":[]}');
+        // 2026-11-06: local-client.js DOES ask /api/ps again, through the residency gate (src/model-resident.js). Report the model resident so the
+        // gate sends no warm-up POST and these tests' request-count expectations keep measuring only the real calls.
+        res.end(JSON.stringify({ models: [{ name: process.env.LOCAL_MODEL }] }));
         return;
       }
       handler(req, res);
@@ -447,7 +449,7 @@ test('majorityVote() stops calling once 2 of 3 votes already agree -- the 3rd ca
 // no way to actually reach a vote, since majorityVote is the only caller of call() review
 // uses. Proves the override actually reaches the real HTTP request body, not just that the
 // param is accepted without erroring.
-test('majorityVote() forwards model/numCtx/numPredict overrides into the real request body', async () => {
+test('majorityVote() forwards model/numPredict overrides into the real request body but never a numCtx other than the pinned one (a different context restarts the runner)', async () => {
   let capturedBody = null;
   await withServer(
     (req, res) => {
@@ -467,7 +469,7 @@ test('majorityVote() forwards model/numCtx/numPredict overrides into the real re
         model: 'qwen2.5:3b', numCtx: 8192, numPredict: 400,
       });
       assert.equal(capturedBody.model, 'qwen2.5:3b', 'must override the module-level LOCAL_MODEL default');
-      assert.equal(capturedBody.options.num_ctx, 8192, 'must override PINNED_NUM_CTX');
+      assert.equal(capturedBody.options.num_ctx, require('./gpu-capacity.js').PINNED_NUM_CTX, 'a caller numCtx is replaced by PINNED_NUM_CTX (owner rule 2026-11-07: never swap the model)');
       assert.equal(capturedBody.options.num_predict, 400);
     }
   );
@@ -839,4 +841,47 @@ test('call(): a truncation of the capped first call ends the ladder after that o
     assert.equal(sent.length, 1, 'nothing bigger than the fit exists to escalate to');
     assert.ok(sent[0] < 6000, 'and that one call carried the capped budget');
   });
+});
+
+test('residency gate: callOnce warms a non-resident model first, and a slow load never counts against the work request timeout', async () => {
+  const order = [];
+  let resident = false;
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/api/ps') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ models: resident ? [{ name: 'test-model' }] : [] }));
+      return;
+    }
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw);
+      const isWarm = body.prompt === 'hi' && body.options && body.options.num_predict === 1;
+      order.push(isWarm ? 'warm' : 'work');
+      if (isWarm) {
+        // a load slower than the 1000 ms work timeout configured below
+        setTimeout(() => { resident = true; res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(generateResponse('')); }, 1500);
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(generateResponse('done'));
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-resident-gate-test-'));
+  try {
+    process.env.OLLAMA_URL = `http://127.0.0.1:${server.address().port}`;
+    process.env.LOCAL_MODEL = 'test-model';
+    process.env.ORNITH_TIMEOUT_MS = '1000';
+    process.env.AGENT_MANAGER_REPO_ROOT = dir;
+    process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+    delete require.cache[require.resolve('./local-client.js')];
+    delete require.cache[require.resolve('./model-resident.js')];
+    const { callOnce } = require('./local-client.js');
+    const out = await callOnce({ prompt: 'x', think: false });
+    assert.equal(out.response, 'done');
+    assert.deepEqual(order, ['warm', 'work'], 'the warm-up goes first, then exactly one work request');
+  } finally {
+    server.close();
+  }
 });

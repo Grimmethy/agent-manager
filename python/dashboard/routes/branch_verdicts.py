@@ -1,10 +1,12 @@
 from flask import Blueprint, abort, jsonify, request
 
+import main_push_gate
+
 # Records a verdict for an Unmerged Branches card (see branch_verdicts.py for the store and why). This
 # endpoint only RECORDS -- it never merges or discards. app.py imports this module to register the blueprint,
 # so app.py's helpers are imported lazily inside the view (same circular-import rule as routes/pipeline_1_more.py).
 
-branch_verdicts_bp = Blueprint("branch-verdicts-bp", __name__)
+branch_verdicts_bp = main_push_gate.attach(Blueprint("branch-verdicts-bp", __name__))  # attach: the main-push gate runs before the merge routes
 
 
 @branch_verdicts_bp.route("/api/git/branches/<path:branch>/verdict", methods=["POST"])
@@ -43,7 +45,7 @@ def api_git_record_branch_verdict(branch):
 
     # Only branches this process itself lists are accepted -- same gate as the merge/discard endpoints (another project: its cached list).
     if scope:
-        real, match = branch_projects.find_other_project_branch(scope["repoRoot"], branch)
+        real, match = branch_projects.find_or_refresh_other_project_branch(scope, branch)
     else:
         match = next((b for b in list_unmerged_branches(force=False) if b["branch"] == branch), None)
     if not match:
@@ -153,7 +155,7 @@ def api_git_record_branch_verdicts_batch():
 
         # Check if the branch exists in the cached list
         if scope:
-            real, match = branch_projects.find_other_project_branch(scope["repoRoot"], branch)
+            real, match = branch_projects.find_or_refresh_other_project_branch(scope, branch)
         else:
             match = next((b for b in list_unmerged_branches(force=False) if b["branch"] == branch), None)
 

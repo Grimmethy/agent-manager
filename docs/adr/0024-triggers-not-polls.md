@@ -75,12 +75,20 @@ cross-process: node, python and bash writers append; consumers drain from their 
   `done/`. Interim: HUB0295 piece 5 gates the pool sweep on a cheap change signature with a counted
   reconcile (the same shape, built from stats). The event code takes the clock and filesystem as
   arguments and imports nothing from agent-manager, so it can move into the triggers repo unchanged.
+- **Interim hook (2026-11-02).** Plugins declare `watchdogScripts` in `plugins.json` and the watchdog runs them once per tick (`docs/PLUGIN_API.md`, "Watchdog scripts"), so a new plugin trigger registers with the one clock instead of adding a timer or a hardcoded block. Each such script is a cheap edge check that the journal's events will replace.
+- **Pool sweep gate (2026-11-03).** The interim gate above is now `src/sweep-gate.js`, wired in `scripts/queue-watcher.sh` through `sweep_gate_skips` (`scripts/agent-manager-common.sh`). Measured that day: one tick ran the defect, conflict and redo sweeps for each of 41 pool projects, and the global redo sweep alone read 10,825 task files (7 to 13 s of disk time) 41 times. Now a project's defect and conflict sweeps run only when its `done/`, verdict file or remote refs changed, a sweep is waiting for its second sighting, or the 30 minute safety net is due; the global redo sweep runs once per tick behind its own gate. It fails open and `AGENT_MANAGER_SWEEP_GATE=off` restores the old behaviour. Still a signature comparison, not an event: the journal-driven version stays S1.
 - **S2 — measure, then migrate by cost.** Time each of the 31 watchdog scripts for one idle tick; convert
   the most expensive ones first.
 - **S3 — lane wake-up.** Replace the idle `sleep` loops with a wake on change (node `fs.watch`, which
   works on the queue directories here, or a sequence counter in `/dev/shm`).
 - **S4 — extract.** Move the proven Node implementation into the triggers repo once a second consumer
   exists (Elementals' own components passing the conformance scenarios counts).
+
+## S2 measurement (2026-11-03)
+
+`scripts/idle-cost-audit.py` is the repeatable form of the S2 measurement: it samples `/proc` and prints node/python/git launches per minute by the lane or daemon that started them, plus the shared disk's IOPS, MB/s and busy percent. Counts are a lower bound (a process that starts and exits between two samples is missed); compare runs at the same `--interval`.
+
+Baseline, 150 s sample, the owner's box: `sdb` 100% busy with ~4,600 write IOPS and ~83 read IOPS (about 1 MB/s read); launches per minute: other Claude sessions' test runs ~234, lanes ~160 (worker-tuner 48, worker-uiconf 40, worker-rx580 35, review-runner 10, apply-loop 10, worker-p40 6, worker-3090 4), dashboard ~30 (`git fetch origin` ~7/min), queue-watcher ~14. Every lane tick repeats `pool-projects.js` (~40/min across lanes), `worker-switch.js`, `gpu-guard.js`, `next-claimable-task.js` and `task-sources.js`.
 
 ## Alternatives considered
 
@@ -102,11 +110,13 @@ cross-process: node, python and bash writers append; consumers drain from their 
 - A hub's piece list is fixed at decomposition, so a corrective piece cannot yet be gated on (tracked as
   its own task); until then a follow-up piece needs a hold on the hub's branch card.
 
+## S1 status (2026-11-03)
+
+The queue-events journal is built (hub HUB0330): `src/queue-events.js` (the journal), `python/dashboard/queue_events.py` (its Python writer), the two producers in the dashboard (`record_verdict` emits `verdict_recorded`, the merge route emits `branch_merged`) and three sweeps converted to read it instead of rescanning `queue/done` on every tick: `src/redo-supersede-sweep.js`, `src/branch-defect-readmit-sweep.js` and `src/branch-conflict-readmit-sweep.js`. Each keeps a slow, counted reconcile pass; the count is shown as `queueEvents` in `/api/summary`. `scripts/sweep-idle-cost.js` measures one idle pass of each sweep with the journal on and off. How to use and extend it: `docs/agents/queue-events.md`.
+
 ## Open questions
 
-- Where the journal lives: tmpfs (`/dev/shm`, lost on reboot, healed by reconcile) or a file under
-  `queue/` (durable, on the HDD).
-- Wake primitive for bash lanes: a small node waiter on `fs.watch` or a sequence counter; `inotifywait`
-  is not installed here.
-- How python and bash writers emit (one shared helper, or a thin CLI).
-- Whether the dashboard should push (server-sent events) instead of polling `/api/summary` every 5 s.
+- ~~Where the journal lives.~~ Answered by S1: a durable file under the pipeline directory but OUTSIDE `queue/` (`<pipelineDir>/queue-events/journal.jsonl`). Durable because a lost journal would only be healed by the slow reconcile, and outside `queue/` because appending to it must not move the queue directory mtimes that `src/pool-projects.js` and `src/queue-cache.js` read.
+- ~~Wake primitive for bash lanes.~~ Answered by `src/wait-for-change.js`: a small node waiter on `fs.watch` with a fallback timeout (`inotifywait` is not installed here).
+- ~~How python and bash writers emit.~~ Answered by S1: one line format, two writers. Node and bash use the CLI `node src/queue-events.js emit ...`; Python uses `append_event` in `python/dashboard/queue_events.py`. A committed test has Python write and the real Node module read.
+- ~~Whether the dashboard should push (server-sent events) instead of polling `/api/summary` every 5 s.~~ Answered 2026-11-04 (owner): yes. `GET /api/stream` (python/dashboard/event_stream.py, routes/event_stream.py) is the dashboard's event channel: ONE shared watcher announces `counts-changed`, `workers-changed` (an edge on status / currentPass / currentTaskId / stateSince, never on the heartbeat time), `branches-changed` (the queue-events journal grew), `plugins-changed` and `project-changed`; a new client gets a `snapshot` and `Last-Event-ID` replays what it missed. The watcher stats a handful of directories once a second only while a client is connected (Python has no inotify in its standard library; queue writers are bash `mv`, node and python), and a counted reconcile every 60 s re-derives the facts and reports what no event announced in `/api/summary` `eventStream.corrections`. Measured 2026-11-04 under 90% I/O pressure: one pass over the instances directory took 5 to 9 s, so the watcher is a single thread that sleeps AFTER each pass (it lags, it never piles up). Facts the hub cannot derive from directories are registered as PROVIDERS (`Hub(providers={'<name>-changed': fact})`, `event_stream.json_file_fact`): a provider is read on every pass (its file only when its stat key moved) and announces when its value changes; `memory-changed` is the first one (the header memory chip's state and reason from the gpu-broker's marker file; the numbers inside the marker deliberately do not fire). `AGENT_MANAGER_EVENT_STREAM=off` turns it off. The page still polls until the next pieces of the build move it onto the stream.

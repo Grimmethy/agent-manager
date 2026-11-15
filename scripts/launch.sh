@@ -23,6 +23,10 @@ LOG_DIR="${STATE_DIR}/logs"
 PID_DIR="${STATE_DIR}/pids"
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
+# A launch ends the stopped state: scripts/stop.sh leaves the pipeline-stopped marker, which detached plugin drains read to know the pipeline is stopped (they exit at the top of
+# a tick and the watchdog triggers start none while it exists). Removed before anything starts, so a started pipeline never reads as stopped.
+rm -f "${STATE_DIR}/pipeline-stopped"
+
 # Starting the pipeline by hand is an explicit "GPU work now" signal -- it stomps any
 # ComfyUI GPU lease PromptForge left behind (see comfyui_lease_held in
 # agent-manager-common.sh). An in-flight generation loses this round (gpu-guard.js will
@@ -51,6 +55,39 @@ echo "[launch] Repo root: $REPO_DIR"
 export MODEL_URL="${MODEL_URL:-$REPO_DIR/model.example}"
 export HOME_LOGS="${HOME_LOGS:-$LOG_DIR}"
 
+# Snapshot file for queue tick sharing: --snapshot-file CLI flag wins, then
+# QUEUE_SNAPSHOT_FILE env var, then a default path built from
+# AGENT_MANAGER_INSTANCE_ID. Exported so every child daemon (workers,
+# review-runner, queue-watcher, apply-loop) inherits it without per-script
+# re-parsing. liveSiblingsOnBranch in src/lib/shared-branch.js reads it via
+# process.env.QUEUE_SNAPSHOT_FILE when provided.
+_SNAPSHOT_FILE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --snapshot-file)
+      if [[ -n "${2:-}" ]]; then
+        _SNAPSHOT_FILE="$2"
+        shift 2
+      else
+        echo "[launch] --snapshot-file requires a path argument" >&2
+        shift
+      fi
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [[ -z "$_SNAPSHOT_FILE" && -n "${QUEUE_SNAPSHOT_FILE:-}" ]]; then
+  _SNAPSHOT_FILE="$QUEUE_SNAPSHOT_FILE"
+elif [[ -z "$_SNAPSHOT_FILE" && -n "${AGENT_MANAGER_INSTANCE_ID:-}" ]]; then
+  _SNAPSHOT_FILE="/dev/shm/agent-manager-queue-tick-${AGENT_MANAGER_INSTANCE_ID}.json"
+fi
+if [[ -n "$_SNAPSHOT_FILE" ]]; then
+  export QUEUE_SNAPSHOT_FILE="$_SNAPSHOT_FILE"
+  printf '[launch] QUEUE_SNAPSHOT_FILE=%s\n' "$_SNAPSHOT_FILE"
+fi
+
 is_running() {
   local pidfile="$1"
   [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null
@@ -66,6 +103,14 @@ start_bg() {
   echo $! > "$pidfile"
   printf '[launch] started %s (pid %s), logging to %s\n' "$name" "$!" "$logfile"
 }
+
+# --- required plugins (begin) ---
+# config/required-plugins.json lists the plugins Agent Manager cannot run without (src/required-plugins.js; docs/PLUGIN_API.md "Required plugins"). A missing or
+# out-of-range one is a LOUD failure, never skipped silently: the status goes to stdout like the rest of this script, the error to stderr, no pipeline daemon is started (the dashboard still is, so its status can show
+# what is wrong) and this script exits with the check's code (3 unmet, 2 unusable config) after everything else has run.
+_REQUIRED_PLUGINS_RC=0
+node "${REPO_DIR}/src/required-plugins.js" || _REQUIRED_PLUGINS_RC=$?
+# --- required plugins (end) ---
 
 # --- TokenFold (optional token-compression proxy, github.com same-owner tokenfold repo) ---
 # When a TokenFold checkout is present (default: a sibling of this repo) and not disabled
@@ -134,7 +179,9 @@ elif [[ "${AGENT_MANAGER_TOKENFOLD:-true}" != "false" ]]; then
   printf '[launch] No usable TokenFold source found (vendor/tokenfold missing?) -- running direct to Ollama.\n'
 fi
 
-if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; then
+if [[ "$_REQUIRED_PLUGINS_RC" -ne 0 ]]; then
+  printf '[launch] ERROR: required plugins are unmet (see above) -- the pipeline daemons are NOT started. Fix the plugin, then launch again.\n' >&2
+elif [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; then
   printf '[launch] Repo root: %s\n' "$AGENT_MANAGER_REPO_ROOT"
 
   # (2026-09-20: the small qwen2.5:3b utility model this comment describes is gone -- every call now uses this one model; the pre-warm
@@ -277,3 +324,4 @@ if [[ "${1:-}" == "--open-browser" ]]; then
 fi
 
 printf '[launch] done. Stop everything with: %s/stop.sh\n' "$SCRIPT_DIR"
+exit "$_REQUIRED_PLUGINS_RC"

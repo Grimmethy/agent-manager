@@ -50,6 +50,20 @@ function relatedAsHubAndChild(a, b) {
   return false;
 }
 
+// 2026-11-01 (questforge hub HUB0029): two pieces of ONE stacked hub chain are siblings by construction. A contract-first hub repeats the same
+// large shared CONTRACT paragraph at the top of every piece (inside the first 600 characters normalizeTaskTokens reads), so any two siblings
+// overlapped by ~90% and HUB0029-07 got 'duplicate-of (high, retire) -- overlaps HUB0029-04' although the two were different deliverables. Same
+// stacked.branch, or the same promptContext.decomposedFrom, means siblings: never a duplicate of each other (only of something OUTSIDE the chain).
+function relatedAsSiblings(a, b) {
+  if (!a || !b) return false;
+  const branchA = a.stacked && typeof a.stacked === 'object' ? a.stacked.branch : null;
+  const branchB = b.stacked && typeof b.stacked === 'object' ? b.stacked.branch : null;
+  if (branchA && branchB && branchA === branchB) return true;
+  const fromA = a.promptContext && a.promptContext.decomposedFrom;
+  const fromB = b.promptContext && b.promptContext.decomposedFrom;
+  return Boolean(fromA && fromB && fromA === fromB);
+}
+
 // Both tasks name at least one real source file, and the two named sets share NONE:
 // the token overlap is shared boilerplate (a decompose hub's "Decompose
 // <path> (N module(s))" title and prompt scaffolding), not shared subject matter --
@@ -67,9 +81,9 @@ function namesDisjointFiles(a, b) {
   return !fb.some((p) => setA.has(p));
 }
 
-// `opts.relationCheck` / `opts.fileDisjointCheck` are test-only switches (default on):
+// `opts.relationCheck` / `opts.siblingCheck` / `opts.fileDisjointCheck` are test-only switches (default on):
 // a mutation test flips them off to prove the new guards are what suppress the pair.
-function findDuplicateTask(task, corpus, { relationCheck = true, fileDisjointCheck = true } = {}) {
+function findDuplicateTask(task, corpus, { relationCheck = true, siblingCheck = true, fileDisjointCheck = true } = {}) {
   const mine = normalizeTaskTokens(task);
   if (mine.size < 4) return null;
   const myLineage = bdLineage(task.id);
@@ -80,6 +94,7 @@ function findDuplicateTask(task, corpus, { relationCheck = true, fileDisjointChe
     if (/(^|-)(brain-dump-sort|product-spec-outline)-/.test(other.id)) continue;
     if (myLineage && bdLineage(other.id) === myLineage) continue; // same lineage, not a dup
     if (relationCheck && relatedAsHubAndChild(task, other)) continue; // hub/child, not a dup
+    if (siblingCheck && relatedAsSiblings(task, other)) continue; // pieces of one hub chain share the contract text, not the work
     if (fileDisjointCheck && namesDisjointFiles(task, other)) continue; // different files, boilerplate overlap
     const sim = jaccard(mine, normalizeTaskTokens(other));
     if (sim >= threshold && (!best || sim > best.sim)) {
@@ -89,4 +104,4 @@ function findDuplicateTask(task, corpus, { relationCheck = true, fileDisjointChe
   return best;
 }
 
-module.exports = { normalizeTaskTokens, dupSimilarityThreshold, bdLineage, findDuplicateTask, relatedAsHubAndChild, namesDisjointFiles };
+module.exports = { normalizeTaskTokens, dupSimilarityThreshold, bdLineage, findDuplicateTask, relatedAsHubAndChild, relatedAsSiblings, namesDisjointFiles };

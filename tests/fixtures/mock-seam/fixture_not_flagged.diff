@@ -1,0 +1,48 @@
+diff --git a/src/validator.js b/src/validator.js
+--- a/src/validator.js
++++ b/src/validator.js
+@@ -3,3 +3,12 @@
+ const helpers = require('./helpers');
+ 
++function validateInput(data) {
++    if (!data || typeof data !== 'object') {
++        throw new Error('validateInput: expected an object');
++    }
++    if (Object.keys(data).length === 0) {
++        throw new Error('validateInput: object must not be empty');
++    }
++    return helpers.normalize(data);
++}
++
+ module.exports = { validateInput };
+diff --git a/tests/test_validator.test.js b/tests/test_validator.test.js
+--- a/tests/test_validator.test.js
++++ b/tests/test_validator.test.js
+@@ -1,7 +1,18 @@
+ const { describe, it, beforeEach, afterEach } = require('node:test');
+ const assert = require('node:assert');
++const { stub } = require('sinon');
+ const { validateInput } = require('../src/validator');
++const helpers = require('../src/helpers');
+ 
+ describe('validateInput', () => {
++    let normalizeStub;
++    beforeEach(() => {
++        normalizeStub = stub(helpers, 'normalize').returns({});
++    });
++    afterEach(() => {
++        normalizeStub.restore();
++    });
++
+     it('throws on non-object input', () => {
+-        assert.throws(() => validateInput(null));
++        assert.throws(() => validateInput(null));
++        assert.ok(normalizeStub.notCalled, 'normalize should not be called before validation');
+     });
++
++    it('delegates to helpers.normalize for valid input', () => {
++        const result = validateInput({ a: 1 });
++        assert.strictEqual(result, {});
++        assert.ok(normalizeStub.calledOnce);
+     });
+ });

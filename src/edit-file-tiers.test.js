@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { editFileTool, unescapeJsonText } = require('./local-tool-fs-tools.js');
+const { editFileTool, unescapeJsonText, editTiersEnabled, closestMatchHint } = require('./local-tool-fs-tools.js');
 const { buildToolOutcomeEntries, buildSummary } = require('./tool-loop-audit.js');
 
 function withTiers(value, fn) {
@@ -51,7 +51,7 @@ test('on: indentation difference -> flexible-strip, replacement re-indented to t
 test('on: CRLF file keeps CRLF line endings', () => {
   const f = fixture(SRC.replace(/\n/g, '\r\n'));
   const r = withTiers('on', () => editFileTool(f.roots, { path: 'f.js', find: 'return 1;\nXX', replace: 'y' }));
-  assert.equal(r.error, NOT_FOUND, 'a non-matching second line still misses');
+  assert.ok(r.error.startsWith(NOT_FOUND), 'a non-matching second line still misses');
   const r2 = withTiers('on', () => editFileTool(f.roots, { path: 'f.js', find: '      return 1;', replace: 'return 12;' }));
   assert.equal(r2.matchStrategy, 'flexible-strip');
   assert.equal(f.read(), 'function a() {\r\n  if (x) {\r\n    return 12;\r\n  }\r\n  return 2;\r\n}\r\n');
@@ -80,25 +80,79 @@ test('on: an ambiguous or absent fallback leaves the file untouched with the exi
   assert.equal(g.read(), SRC);
 });
 
-test('off (default): file untouched, model-visible result identical to today, non-enumerable matchProbe set', () => {
+test('off: file untouched, model-visible result identical to the old message, non-enumerable matchProbe set', () => {
   const f = fixture(SRC);
-  const r = withTiers(undefined, () => editFileTool(f.roots, { path: 'f.js', find: '      return 1;', replace: 'return 13;' }));
+  const r = withTiers('off', () => editFileTool(f.roots, { path: 'f.js', find: '      return 1;', replace: 'return 13;' }));
   assert.equal(f.read(), SRC);
   assert.equal(JSON.stringify(r), JSON.stringify({ error: NOT_FOUND }));
   assert.deepEqual(Object.keys(r), ['error']);
   assert.equal(r.matchProbe, 'flexible-strip');
-  for (const v of ['off', '0', 'false', '']) {
+  for (const v of ['off', '0', 'false', 'OFF']) {
     const g = fixture(SRC);
     withTiers(v, () => editFileTool(g.roots, { path: 'f.js', find: '      return 1;', replace: 'x' }));
     assert.equal(g.read(), SRC, v);
   }
 });
 
+test('default (unset or empty) is ON since 2026-11-10: an indentation miss is applied', () => {
+  for (const v of [undefined, '', 'on']) {
+    assert.equal(withTiers(v, () => editTiersEnabled()), true, String(v));
+  }
+  const f = fixture(SRC);
+  const r = withTiers(undefined, () => editFileTool(f.roots, { path: 'f.js', find: '      return 1;', replace: 'return 13;' }));
+  assert.equal(r.edited, true);
+  assert.equal(r.matchStrategy, 'flexible-strip');
+});
+
+const BIG = 'const alpha = 1;\nfunction computeTotal(items, taxRate) {\n  const sum = items.reduce((a, b) => a + b.price, 0);\n  return sum * (1 + taxRate);\n}\nmodule.exports = { computeTotal };\n';
+
+test('miss hint: a near-miss gets the closest lines with numbers, original sentence first', () => {
+  const f = fixture(BIG);
+  const r = withTiers('on', () => editFileTool(f.roots, { path: 'f.js', find: 'function computeTotals(items, taxrate) {', replace: 'x' }));
+  assert.ok(r.error.startsWith(NOT_FOUND), 'existing wording stays the first sentence');
+  assert.match(r.error, /Closest text in the file \(line 2 is the best match/);
+  assert.match(r.error, /2\| function computeTotal\(items, taxRate\) \{/);
+  assert.equal(f.read(), BIG, 'no edit made');
+});
+
+test('miss hint: an unrelated find gets no hint', () => {
+  const f = fixture(BIG);
+  const r = withTiers('on', () => editFileTool(f.roots, { path: 'f.js', find: 'completely different words about databases', replace: 'x' }));
+  assert.equal(r.error, NOT_FOUND);
+});
+
+test('miss hint: capped at 600 characters of file text and 6 lines, long lines cut', () => {
+  const line = 'const longName = someFunction(' + 'param, '.repeat(18) + ');';
+  const content = (line + '\n').repeat(20);
+  const find = line.replace('param', 'parm');
+  const h = closestMatchHint(content, find);
+  const rows = h.split('\n').filter((l) => /^\d+\| /.test(l));
+  assert.ok(rows.length >= 1 && rows.length <= 6, `rows ${rows.length}`);
+  assert.ok(rows.join('\n').length <= 600, `row text ${rows.join('\n').length}`);
+  assert.ok(rows.length < 6, 'the character cap, not the line cap, stopped it');
+  const huge = closestMatchHint(('x'.repeat(300) + ' marker_line_here\n').repeat(3), 'x'.repeat(300) + ' marker_line_here');
+  assert.ok(huge.split('\n').every((l) => l.length <= 165 + 5 || !/^\d+\|/.test(l)), 'long lines are cut to 160 chars');
+});
+
+test('miss hint: anchored on the first non-blank line of a multi-line find, and works on CRLF files', () => {
+  const crlf = BIG.replace(/\n/g, '\r\n');
+  const f = fixture(crlf);
+  const r = withTiers('on', () => editFileTool(f.roots, { path: 'f.js', find: '\n\nfunction computeTotals(items, taxrate) {\n  return 0;\n}', replace: 'x' }));
+  assert.match(r.error, /line 2 is the best match/);
+  assert.ok(!r.error.includes('\r'), 'no carriage returns leak into the hint');
+});
+
+test('miss hint: switched off with AGENT_MANAGER_EDIT_FILE_TIERS=off', () => {
+  const f = fixture(BIG);
+  const r = withTiers('off', () => editFileTool(f.roots, { path: 'f.js', find: 'function computeTotals(items, taxrate) {', replace: 'x' }));
+  assert.equal(r.error, NOT_FOUND);
+});
+
 test('tool-loop audit records matchStrategy and matchProbe, and buildSummary counts them', () => {
   const f = fixture(SRC);
   const applied = withTiers('on', () => editFileTool(f.roots, { path: 'f.js', find: '      return 1;', replace: 'return 14;' }));
   const g = fixture(SRC);
-  const missed = withTiers(undefined, () => editFileTool(g.roots, { path: 'f.js', find: '      return 2;', replace: 'return 20;' }));
+  const missed = withTiers('off', () => editFileTool(g.roots, { path: 'f.js', find: '      return 2;', replace: 'return 20;' }));
   const exact = withTiers(undefined, () => editFileTool(g.roots, { path: 'f.js', find: 'return 2;', replace: 'return 21;' }));
   const ctx = { lane: 'worker-3090', model: 'm', turn: 0 };
   const entries = buildToolOutcomeEntries(ctx, [
