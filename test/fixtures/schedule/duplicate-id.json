@@ -1,0 +1,4 @@
+[
+  {"id":"a","cadence":{"time":"09:00","days":["mon"]},"replaceWith":"x"},
+  {"id":"a","cadence":{"time":"10:00","days":["tue"]},"replaceWith":"y"}
+]
