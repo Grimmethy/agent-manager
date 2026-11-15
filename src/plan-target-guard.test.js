@@ -6,7 +6,47 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { planTargetGuard, isDeclaredCreateTarget } = require('./plan-target-guard.js');
+const { planTargetGuard: guardOutcome, isDeclaredCreateTarget } = require('./plan-target-guard.js');
+// Most tests below pin the BLOCK outcome, which now happens on a task's second attempt (revisionCount 1). A first attempt returns `revise`;
+// that outcome is tested directly in the revise tests below. The assertions in the older tests are unchanged.
+const planTargetGuard = (task, ...rest) => guardOutcome({ ...task, revisionCount: 1 }, ...rest);
+
+test('first attempt on a missing non-create target returns revise, not block', () => {
+  const repo = tmpRepo();
+  const r = guardOutcome({ title: 'Edit src/phantom.js' }, 'EDIT `src/phantom.js` to add the guard.', repo, ['src']);
+  assert.equal(r.blocked, false);
+  assert.equal(r.revise.revisionCount, 1);
+  assert.match(r.revise.feedback, /^plan cites missing-file target\(s\): src\/phantom\.js/);
+  assert.match(r.revise.feedback, /mark src\/phantom\.js as create/);
+  assert.match(r.revise.feedback, /correct the path to an existing file/);
+});
+
+test('second attempt on the same missing target blocks', () => {
+  const repo = tmpRepo();
+  const r = guardOutcome({ title: 'Edit src/phantom.js', revisionCount: 1 }, 'EDIT `src/phantom.js` to add the guard.', repo, ['src']);
+  assert.equal(r.blocked, true);
+  assert.equal(r.revise, undefined);
+});
+
+test('two missing paths: feedback names both and offers both suggestions', () => {
+  const repo = tmpRepo();
+  // Explicit type declarations: extractDeclaredTargets reads only one backticked path from prose, but the guard merges every explicit {type, path} entry.
+  const plan = 'Edit {type: "modify", path: "src/a-phantom.js"} and also edit {type: "modify", path: "src/b-phantom.js"}.';
+  const r = guardOutcome({ title: 'Edit two files' }, plan, repo, ['src']);
+  assert.equal(r.blocked, false);
+  assert.match(r.revise.feedback, /src\/a-phantom\.js/);
+  assert.match(r.revise.feedback, /src\/b-phantom\.js/);
+  assert.match(r.revise.feedback, /mark src\/a-phantom\.js as create/);
+  assert.match(r.revise.feedback, /mark src\/b-phantom\.js as create/);
+  assert.match(r.revise.feedback, /correct the path to an existing file/);
+});
+
+test('nearMatches entries appear in the revise feedback', () => {
+  const repo = tmpRepo();
+  const r = guardOutcome({ title: 'Edit src/phantom.js', nearMatches: ['src/lib/phantom.js'] }, 'EDIT `src/phantom.js`.', repo, ['src']);
+  assert.equal(r.blocked, false);
+  assert.match(r.revise.feedback, /src\/lib\/phantom\.js/);
+});
 const { PLAN_TARGET_REASON_RE } = require('./lib/gate-readmit.js');
 
 function tmpRepo() {
