@@ -594,12 +594,6 @@ function renderNav() {
   if (typeof navNotchUpdate === 'function') navNotchUpdate(nav);
 }
 
-function fmtPct(x) { return x == null ? '-' : Math.round(x * 100) + '%'; }
-
-function fmtNum(x, digits) { return x == null ? '-' : Number(x).toFixed(digits); }
-
-function fmtUsd(x) { return x == null ? '-' : '$' + Number(x).toFixed(4); }
-
 function renderBarCell(value, max, colorVar, fmt) {
   const label = fmt(value);
   if (value == null || !max) return label;
