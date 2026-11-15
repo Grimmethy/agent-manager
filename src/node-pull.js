@@ -198,5 +198,6 @@ function startDaemon({ env = process.env, deps = {} } = {}) {
 module.exports = { pullOnce, makeState, startDaemon, DEBOUNCE_MS, BACKOFF_FIRST_MS, BACKOFF_CAP_MS };
 
 if (require.main === module && process.argv.includes('--daemon')) {
-  startDaemon({ env: process.env, deps: {} });
+  // The real dependencies (repo on demand, one claimed task at a time, pause marker, class filter) live in src/node-pull-entry.js.
+  startDaemon({ env: process.env, deps: require('./node-pull-entry.js').buildDaemonDeps(process.env) });
 }
