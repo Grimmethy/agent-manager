@@ -161,6 +161,14 @@ test('a genuine bare-colon file:line citation (no "line" keyword) still fires no
   assert.equal(result.findings[0].relPath, 'src/gone-in-a-later-decompose.js');
 });
 
+test('a legitimate path.js:22 citation still matches after the bare key:digits guard', () => {
+  const task = { promptContext: { decomposedFrom: 'p', rawText: 'Fix the bug at src/gone-in-a-later-decompose.js:22.' } };
+  const result = detectStaleDecomposePremise(task, { repoRoot: '/repo', lineCountFn: () => null });
+  assert.ok(result, 'a real "path.js:22" citation must still be caught');
+  assert.equal(result.findings[0].kind, 'missing-file');
+  assert.equal(result.findings[0].relPath, 'src/gone-in-a-later-decompose.js');
+});
+
 test('kill switch: AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK=false disables the check entirely', () => {
   const prev = process.env.AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK;
   process.env.AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK = 'false';
