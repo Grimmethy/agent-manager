@@ -117,7 +117,9 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
   }
 
   // Global order across directories: sticky first, then rank priority, then mtime (see mergeCandidateLists).
-  const candidates = mergeCandidateLists(lists);
+  // Stable partition: every sticky candidate moves to the front; merged order is kept within each group.
+  const merged = mergeCandidateLists(lists);
+  const candidates = [...merged.filter((c) => c.sticky), ...merged.filter((c) => !c.sticky)];
 
   for (const c of candidates) {
     if (isHubBlocked(c.task, claimant, now, { leases: listLeases(env), readRecord, env })) {
