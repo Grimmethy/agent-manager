@@ -7,7 +7,9 @@
 // Defaults: claimant = nodeId = AGENT_MANAGER_NODE_ID; classes absent = no class filter; settle absent = no-op;
 // readRemote = readRemoteUrl (src/remote-url.js), its result is kept on repo.remoteUrl ('' on failure).
 // The unleased pool is ranked by pickClaimableTasks with the LEDGER OWNER as the worker (not the claimant), the same
-// id claimableOnNode uses. A candidate that isHubBlocked (src/hub-stickiness.js) or that cannot be lent is skipped and
+// id claimableOnNode uses. Each pipeline dir's pending and adhoc lists keep their own pickClaimableTasks order, and
+// those lists are merged globally by rankPriorityResolved (src/rank-priority.js), ties broken by file mtime then by
+// list order. A candidate that isHubBlocked (src/hub-stickiness.js) or that cannot be lent is skipped and
 // recorded in the skipped array; the scan continues with the next candidate.
 
 const fs = require('fs');
@@ -20,14 +22,44 @@ const { writeJsonAtomicSync } = require('./atomic-write.js');
 const { isHubBlocked } = require('./hub-stickiness.js');
 const { readRemoteUrl } = require('./remote-url.js');
 const { workerNode } = require('./node-affinity.js');
+const { rankPriorityResolved } = require('./rank-priority.js');
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
 }
 
+function mtimeOf(file) {
+  try { return fs.statSync(file).mtimeMs; } catch (e) { return Infinity; }
+}
+
 // The class of a task record. ASSUMPTION: the record carries taskClass or class; not yet verified against existing records.
 function taskClassOf(task) {
   return task.taskClass || task.class || null;
+}
+
+// Orders two candidates: sticky first, then lower rank priority, then older mtime. Negative = a is claimed first.
+function compareCandidates(a, b) {
+  if (a.sticky !== b.sticky) return a.sticky ? -1 : 1;
+  if (a.rank !== b.rank) return a.rank < b.rank ? -1 : 1;
+  if (a.mtimeMs !== b.mtimeMs) return a.mtimeMs < b.mtimeMs ? -1 : 1;
+  return 0;
+}
+
+// Merges ordered per-directory lists into one list. Each list keeps its own order: only list heads are compared,
+// and on a full tie the earlier list wins.
+function mergeCandidateLists(lists) {
+  const queues = lists.map((list) => list.slice());
+  const out = [];
+  for (;;) {
+    let best = -1;
+    for (let i = 0; i < queues.length; i++) {
+      if (queues[i].length === 0) continue;
+      if (best < 0 || compareCandidates(queues[i][0], queues[best][0]) < 0) best = i;
+    }
+    if (best < 0) break;
+    out.push(queues[best].shift());
+  }
+  return out;
 }
 
 function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = nodeId, classes, pipelineDirs = [], env = process.env, now = Date.now(), settle, readRemote = readRemoteUrl, skipped = [] } = {}) {
@@ -57,15 +89,18 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
     if (held && held.stacked && held.stacked.branch) stickyBranches.add(held.stacked.branch);
   }
 
-  const candidates = [];
+  // One ordered list per pipeline dir and sub-directory. pickClaimableTasks keeps its own order within each list.
+  const lists = [];
   const seen = new Set();
   for (const pipelineDir of pipelineDirs) {
     for (const sub of ['pending', 'adhoc']) {
       const dir = path.join(pipelineDir, 'queue', sub);
       // Ranked by pickClaimableTasks with the ledger owner as the worker (pinned first, then priority and age).
       const names = pickClaimableTasks(dir, ownerId, { nodeId: ownerId });
+      const list = [];
       for (const name of names) {
-        const task = readJson(path.join(dir, name));
+        const file = path.join(dir, name);
+        const task = readJson(file);
         if (!task || typeof task !== 'object') continue;
         const taskId = name.replace(/\.json$/, '');
         if (seen.has(taskId)) continue;
@@ -75,13 +110,14 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
         if (Array.isArray(task.dependsOn) && task.dependsOn.some((dep) => !isDependencySatisfied(pipelineDir, dep))) continue;
         if (Array.isArray(classes) && !classes.includes(taskClassOf(task))) continue;
         const sticky = Boolean(task.stacked && task.stacked.branch && stickyBranches.has(task.stacked.branch));
-        candidates.push({ taskId, pipelineDir, task, sticky });
+        list.push({ taskId, pipelineDir, task, sticky, rank: rankPriorityResolved(task), mtimeMs: mtimeOf(file) });
       }
+      lists.push(list);
     }
   }
 
-  // Sticky candidates first; the stable sort keeps the pickClaimableTasks order within each group.
-  candidates.sort((a, b) => (b.sticky ? 1 : 0) - (a.sticky ? 1 : 0));
+  // Global order across directories: sticky first, then rank priority, then mtime (see mergeCandidateLists).
+  const candidates = mergeCandidateLists(lists);
 
   for (const c of candidates) {
     if (isHubBlocked(c.task, claimant, now, { leases: listLeases(env), readRecord, env })) {

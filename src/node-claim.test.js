@@ -1,10 +1,9 @@
 'use strict';
 
-// Tests for src/node-claim.js claimNext(): ranking, no double claim, class filter,
-// dependsOn gate, hub stickiness, stamped leasedTo with one ledger row, remote URL,
-// and an empty queue returning null. Uses node:test / node:assert with a temp HOME
-// and state dirs from fs.mkdtempSync. Injects now, settle and readRemote; opens no
-// sockets, no child_process, no timers.
+// Tests for src/node-claim.js claimNext(): global ranking across pending and adhoc, same-directory order,
+// no double claim, class filter, dependsOn gate, hub stickiness, stamped leasedTo with one ledger row,
+// remote URL, and an empty queue returning null. Uses node:test / node:assert with a temp dir per test.
+// Injects now and readRemote; opens no sockets, no child_process, no timers.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -13,6 +12,7 @@ const os = require('os');
 const path = require('path');
 const { claimNext } = require('./node-claim.js');
 const { listLeases } = require('./lease-ledger.js');
+const { pickClaimableTasks } = require('./next-claimable-task.js');
 
 function setup() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'node-claim-'));
@@ -135,4 +135,36 @@ test('remote URL: the claim reports the URL from the injected reader, and readRe
   fs.mkdirSync(nonRepo, { recursive: true });
   assert.strictEqual(readRemoteUrl(nonRepo), '');
   fs.rmSync(nonRepo, { recursive: true, force: true });
+});
+
+test('ranks by priority globally: a human-queued adhoc task beats an older trouble_log task in pending', () => {
+  const { pipe, pending, adhoc, env } = setup();
+  const now = Date.now();
+  writeTask(pending, 'low-task', { source: 'trouble_log' }, 500);
+  writeTask(adhoc, 'high-task', { source: 'adhoc', humanQueued: true }, 10);
+  const r = claimNext({ claimant: 'node-a', pipelineDirs: [pipe], env, now, readRemote: () => '' });
+  assert.ok(r);
+  assert.strictEqual(r.task.id, 'high-task', 'human-queued adhoc must be claimed before trouble_log in pending');
+});
+
+test('same directory: two tasks keep the pickClaimableTasks order', () => {
+  const { pipe, pending, env } = setup();
+  const now = Date.now();
+  writeTask(pending, 'first-task', {}, 200);
+  writeTask(pending, 'second-task', {}, 100);
+  const expected = pickClaimableTasks(pending, 'wok', { nodeId: 'wok' }).map((n) => n.replace(/\.json$/, ''));
+  const r1 = claimNext({ claimant: 'node-a', pipelineDirs: [pipe], env, now, readRemote: () => '' });
+  const r2 = claimNext({ claimant: 'node-b', pipelineDirs: [pipe], env, now: now + 1, readRemote: () => '' });
+  assert.ok(r1 && r2);
+  assert.deepStrictEqual([r1.task.id, r2.task.id], expected.slice(0, 2));
+});
+
+test('premiumPriority: a premium adhoc task beats a normal pending task', () => {
+  const { pipe, pending, adhoc, env } = setup();
+  const now = Date.now();
+  writeTask(pending, 'normal-task', {}, 500);
+  writeTask(adhoc, 'premium-task', { source: 'adhoc', premiumPriority: true }, 10);
+  const r = claimNext({ claimant: 'node-a', pipelineDirs: [pipe], env, now, readRemote: () => '' });
+  assert.ok(r);
+  assert.strictEqual(r.task.id, 'premium-task');
 });
