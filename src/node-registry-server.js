@@ -26,7 +26,8 @@ const http = require('http');
 const { verifyToken, recordHeartbeat, loadNodes, sweepStale } = require('./node-registry.js');
 const { readPause } = require('./worker-switch.js');
 const { claimNext } = require('./node-claim.js');
-const { leaseFor, returnLease } = require('./lease-ledger.js');
+const { leaseFor, returnLease, settleExpired } = require('./lease-ledger.js');
+const { makeAskNode } = require('./node-status-client.js');
 
 const MAX_BODY_BYTES = 8 * 1024;
 const RETRY_AFTER_SEC = 60;
@@ -72,7 +73,9 @@ function createServer({
   returnLease: release = returnLease,
   leaseFor: lookupLease = leaseFor,
   pipelineDirs = [],
+  settleAskNode: settleAskNodeOpt,
 } = {}) {
+  const settleAskNode = settleAskNodeOpt ?? makeAskNode({env});
   const handleHeartbeat = async (res, payload) => {
     try {
       recordHeartbeat(payload, env, now());
@@ -89,6 +92,9 @@ function createServer({
   const handleClaim = async (res, payload, registered) => {
     const idle = () => send(res, 200, { ok: true, task: null, retryAfterSec: RETRY_AFTER_SEC });
     if (registered && registered.paused) return idle();
+    try {
+      await settleExpired({ askNode: settleAskNode, pipelineDirs, now: now(), env });
+    } catch (e) { /* settle is best effort: a failed settlement must not fail the claim */ }
     const result = claim({ nodeId: payload.id, claimant: payload.id, classes: payload.classes, pipelineDirs, env, now: now() });
     if (!result || !result.task) return idle();
     return send(res, 200, { ok: true, task: result.task, lease: result.lease, repo: result.repo });
