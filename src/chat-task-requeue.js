@@ -274,9 +274,7 @@ function repeatedBlockerMatch(task) {
 // Mirrors api_task_requeue, task.py:188-367 (state ∈ blocked/done/archived -> pending),
 // the most complex of the four -- repeated-blocker guard, superseded-branch abandonment,
 // and the exact fresh-record field allowlist, all ported.
-// keepPriority (2026-10-30, branch-defect-readmit-sweep.js): also carry humanQueued / premiumPriority / premiumSetBy / premiumSetAt over to the fresh
-// record. Off by default so the Chat tool and the dashboard-mirroring callers behave as before; the sweep sets it so a re-admitted premium task stays premium.
-async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force = false, keepPriority = false } = {}) {
+async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force = false } = {}) {
   if (typeof taskId !== 'string' || !taskId.trim()) {
     return { ok: false, error: 'taskId is required' };
   }
@@ -363,10 +361,8 @@ async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force 
   for (const key of ['stacked', 'dependsOn', 'prerequisiteHubs', 'atomic', 'noDecompose']) {
     if (key in data) fresh[key] = data[key];
   }
-  if (keepPriority) {
-    for (const key of ['humanQueued', 'premiumPriority', 'premiumSetBy', 'premiumSetAt']) {
-      if (key in data) fresh[key] = data[key];
-    }
+  for (const key of ['humanQueued', 'premiumPriority', 'premiumSetBy', 'premiumSetAt']) {
+    if (key in data) fresh[key] = data[key];
   }
 
   writeAndUnlink(destPath, fresh, srcPath);
