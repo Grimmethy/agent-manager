@@ -25,27 +25,6 @@ async function loadProjectHistory() {
   if (list) list.innerHTML = projectHistory.map((p) => `<option value="${escapeAttr(p)}">`).join('');
 }
 
-async function loadProjectDropdown() {
-  const select = document.getElementById('project-select');
-  if (!select) return;
-  let projects = [];
-  try {
-    const data = await fetchJson('/api/second-brain/projects');
-    projects = data.projects || [];
-  } catch (e) { /* Second Brain not configured -- leave the dropdown at just the placeholder */ }
-  let matched = !projectPath;
-  let html = '<option value="">Select a project...</option>';
-  for (const p of projects) {
-    const selected = p.path === projectPath;
-    if (selected) matched = true;
-    html += `<option value="${escapeAttr(p.path)}"${selected ? ' selected' : ''}>${escapeHtml(p.name)}</option>`;
-  }
-  // Current path isn't a known Second Brain project (e.g. picked via Browse) -- keep it
-  // visible and selected rather than silently falling back to the placeholder.
-  if (!matched) html += `<option value="${escapeAttr(projectPath)}" selected>${escapeHtml(projectPath)}</option>`;
-  select.innerHTML = html;
-}
-
 function renderHistoryPanel() {
   const panel = document.getElementById('history-panel');
   if (!panel) return;

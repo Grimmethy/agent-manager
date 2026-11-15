@@ -114,9 +114,35 @@ async function enterProjectTab() {
   document.getElementById('sync-btn').onclick = triggerSync;
 
   await loadProjectHistory();
-  await loadProjectDropdown();
+  await renderProjectOptions(document.getElementById('project-select'));
   await refreshPipelineStatus();
   await refreshProjectStatus();
+}
+
+// Fills #project-select from the registered projects (status.registeredProjects) plus Second Brain's referenced projects, merged by buildProjectOptions (project-options.js). One-shot per call, no timer.
+async function renderProjectOptions(select) {
+  if (!select) return;
+  let extras = [];
+  try {
+    const data = await fetchJson('/api/second-brain/projects');
+    extras = (data.projects || []).map((p) => ({ label: p.name, repoRoot: p.path }));
+  } catch (e) { /* Second Brain not configured -- extras stay empty */ }
+  let registered = [];
+  let serverRoot = '';
+  try {
+    const status = await fetchJson('/api/pipeline/status');
+    registered = status.registeredProjects || [];
+    serverRoot = status.activeRepoRoot || '';
+  } catch (e) { /* status unavailable -- Second Brain entries only */ }
+  // Selection follows the browser's current path. On tab entry enterProjectTab() has already synced projectPath to the server's activeRepoRoot, so the two agree there.
+  const options = buildProjectOptions(registered, extras, projectPath || serverRoot);
+  let html = '<option value="">Select a project...</option>';
+  for (const o of options) {
+    html += `<option value="${escapeAttr(o.path)}"${o.selected ? ' selected' : ''}>${escapeHtml(o.label || o.path)}</option>`;
+  }
+  select.innerHTML = html;
+  const chosen = options.find((o) => o.selected);
+  select.value = chosen ? chosen.path : '';
 }
 
 // Detached plugin drains still alive after a stop (status.drains, from python/dashboard/drain_registry.py) keep the pipeline from reading as stopped: name them.
@@ -304,7 +330,7 @@ async function loadBrowsePanel() {
         panel.style.display = 'none';
         document.getElementById('project-select').style.display = '';
         document.getElementById('project-path-input').style.display = 'none';
-        loadProjectDropdown();  // reflects the freshly-browsed path, even if it's not a known Second Brain project
+        renderProjectOptions(document.getElementById('project-select'));  // reflects the freshly-browsed path, even if it's not a known Second Brain project
         refreshProjectStatus();
       };
     });
