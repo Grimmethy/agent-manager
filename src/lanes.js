@@ -69,6 +69,7 @@ const LANE_ID_RE = /^worker-[a-z0-9]+$/;
 const PREEMPT_MODES = ['always', 'age-gated', 'never'];
 const PROVIDERS = ['ollama', 'cloud', 'script'];
 
+let registryError = false; // set when the registry file exists but cannot be read or parsed (the --env CLI refuses to print a lane then)
 let detectedGpu; // cached per process
 const warned = new Set();
 
@@ -112,16 +113,16 @@ function readRegistry(env = process.env) {
   try {
     text = fs.readFileSync(file, 'utf8');
   } catch (e) {
-    if (e && e.code !== 'ENOENT') warnOnce(`cannot read ${file}: ${e.message}`);
+    if (e && e.code !== 'ENOENT') { registryError = true; warnOnce(`cannot read ${file}: ${e.message}`); }
     return [];
   }
   try {
     const parsed = JSON.parse(text);
     const entries = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.lanes) ? parsed.lanes : null);
-    if (!entries) { warnOnce(`${file} must be a JSON array of lanes (or {"lanes": [...]}); ignoring it`); return []; }
+    if (!entries) { registryError = true; warnOnce(`${file} must be a JSON array of lanes (or {"lanes": [...]}); ignoring it`); return []; }
     return entries;
   } catch (e) {
-    warnOnce(`${file} is not valid JSON (${e.message}); ignoring it`);
+    registryError = true; warnOnce(`${file} is not valid JSON (${e.message}); ignoring it`);
     return [];
   }
 }
@@ -337,9 +338,13 @@ if (require.main === module) {
     })), null, 2));
   } else if (flag === '--env') {
     // KEY=VALUE lines for one lane, for `env "${lane_env[@]}" bash local-worker.sh <id>`.
+    if (registryError) { console.error(`lanes registry ${lanesRegistryPath()} is unreadable or malformed; refusing to print lane env`); process.exit(1); }
     const lane = lanes.find((l) => l.id === arg);
     if (!lane) { console.error(`unknown lane: ${arg}`); process.exit(1); }
     for (const [k, v] of Object.entries(lane.env)) console.log(`${k}=${v}`);
+    // The lane's claim allowlist and reviewer daemon, so the worker can re-read them each tick. Empty = claims any source / no reviewer.
+    console.log(`LANE_TASK_CLASSES=${lane.taskClasses ? lane.taskClasses.join(',') : ''}`);
+    console.log(`LANE_REVIEWS=${lane.reviewer ? lane.reviewerId : ''}`);
   } else {
     console.log(JSON.stringify(lanes));
   }

@@ -741,3 +741,38 @@ check_instance_liveness() {
   fi
   return 0
 }
+
+# reload_lane_rules [instance_id] -> re-reads this lane's taskClasses and reviewer daemon from src/lanes.js --env (one node spawn), so a lanes.json
+# edit reaches a running worker without a restart. Gated on a bash -nt test: node runs only when lanes.json is newer than LANE_RULES_STAMP, so an
+# unchanged registry costs no spawn. Sets LANE_RULES_TASK_CLASSES and LANE_RULES_REVIEWS. A failed call or missing keys keeps the last good values.
+# The stamp is touched on every path inside the gate, so a failing call is not retried until lanes.json changes again. Logs one line only when a value
+# changes. No timer or loop here: the caller's tick is the trigger.
+reload_lane_rules() {
+  local id="${1:-${AGENT_MANAGER_INSTANCE_ID:-}}"
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local lanes_json="${AGENT_MANAGER_LANES_PATH:-${here}/../lanes.json}"
+  local lanes_js="${here}/../src/lanes.js"
+  local stamp="${LANE_RULES_STAMP:-${TEMP_DIR:-/tmp}/lane-rules.stamp}"
+  [[ -n "$id" && -f "$lanes_js" ]] || return 0
+  [[ "$lanes_json" -nt "$stamp" ]] || return 0
+
+  local out rc=0
+  out="$(node "$lanes_js" --env "$id" 2>/dev/null)" || rc=$?
+  # Touched before the verdict: a failed call must not be retried every tick until lanes.json changes.
+  touch "$stamp" 2>/dev/null || true
+  [[ $rc -eq 0 ]] || return 0
+
+  printf '%s\n' "$out" | grep -q '^LANE_TASK_CLASSES=' || return 0
+  printf '%s\n' "$out" | grep -q '^LANE_REVIEWS=' || return 0
+  local classes reviews
+  classes="$(printf '%s\n' "$out" | sed -n 's/^LANE_TASK_CLASSES=//p' | head -n 1)"
+  reviews="$(printf '%s\n' "$out" | sed -n 's/^LANE_REVIEWS=//p' | head -n 1)"
+
+  if [[ "${LANE_RULES_TASK_CLASSES-__unset__}" != "$classes" || "${LANE_RULES_REVIEWS-__unset__}" != "$reviews" ]]; then
+    printf '[%s] lane rules: taskClasses=%s reviews=%s\n' "$id" "${classes:-any}" "${reviews:-none}" >&2
+  fi
+  LANE_RULES_TASK_CLASSES="$classes"
+  LANE_RULES_REVIEWS="$reviews"
+  return 0
+}
