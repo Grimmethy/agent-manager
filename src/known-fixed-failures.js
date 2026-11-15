@@ -431,6 +431,26 @@ const KNOWN_FIXED = [
     dirs: ['blocked', 'needs-clarification'],
     applies: siblingNowReachableOnStackedBranch,
   },
+  {
+    // A parked sub-task whose recorded failure is "sub-task premise may be stale": re-admit it only when the CURRENT decompose-premise check no longer flags its stored rawText.
+    id: 'decompose-premise-stale-now-fresh',
+    fixedIn: 'HUB0161 decompose-premise-check fix',
+    description: 'a sub-task parked as "sub-task premise may be stale" whose cited premise the current decompose-premise check no longer flags as stale',
+    dirs: ['blocked', 'needs-clarification'],
+    appliesScope: 'parked',
+    applies: (task) => {
+      if (!task || typeof task.blockedReason !== 'string' || !task.blockedReason.startsWith('sub-task premise may be stale')) return false;
+      const rawText = task.promptContext && task.promptContext.rawText;
+      if (typeof rawText !== 'string') return false;
+      try {
+        const path = require('path');
+        const repoRoot = path.resolve(require('./config.js').getConfig().repoRoot);
+        const { detectStaleDecomposePremise } = require('./decompose-premise-check.js');
+        const r = detectStaleDecomposePremise(task, { repoRoot });
+        return r === null || r === undefined || r === '' || (Array.isArray(r) && r.length === 0);
+      } catch { return false; }
+    },
+  },
 ];
 
 // Pure helper: does this entry apply to the given scope? Defaults to 'parked' when the entry has no appliesScope.

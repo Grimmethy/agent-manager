@@ -316,6 +316,7 @@ function adhocPlanPrompt(task) {
     ...decomposeMoveDirective,
     ...skipPathDirective(task, 'plan'),
     'Write a numbered, actionable PLAN.',
+    'PATH RULES: For every NEW file the plan will create, label it as a create target in the exact form ``create `<path>` `` (for example ``create `src/new-module.js` ``). Before citing any EXISTING path in the plan, confirm that the path exists in the repository; if it does not exist, label it as a create target instead of citing it as existing.',
     GIT_OWNERSHIP_RULE,
     POLL_PLAN_LINES,
     IO_PLAN_LINES,

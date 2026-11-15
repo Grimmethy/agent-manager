@@ -20,6 +20,13 @@ const SECRET_KEY_RE = /token|secret|password/i;
 const SEND_TIMEOUT_MS = 15000;
 const SHA_RE = /^[0-9a-f]{40}$/;
 
+// A decompose parent (the node split the task): no diff of its own, its work is the sub-task proposals, each with a title and a rawText.
+function isDecomposeParent(record) {
+  const subs = record.subTaskProposals;
+  return record.adhocResolution === 'decompose' && Array.isArray(subs) && subs.length > 0 &&
+    subs.every((p) => !!p && typeof p === 'object' && typeof p.title === 'string' && !!p.title && typeof p.rawText === 'string' && !!p.rawText);
+}
+
 // Deep copy of value without the secret-looking keys (at every depth, inside arrays too).
 function scrub(value) {
   if (Array.isArray(value)) return value.map(scrub);
@@ -54,7 +61,7 @@ function validatePackage(pkg) {
   if (typeof pkg.nodeId !== 'string' || !pkg.nodeId) return { ok: false, reason: 'nodeId is missing' };
   if (pkg.version === RECORD_PACKAGE_VERSION) {
     if (pkg.kind !== 'record') return { ok: false, reason: "kind must be 'record'" };
-    if (typeof pkg.record.rawDiff !== 'string' || !pkg.record.rawDiff) return { ok: false, reason: 'record.rawDiff must be a non-empty string' };
+    if (typeof pkg.record.rawDiff !== 'string' || (pkg.record.rawDiff === '' && !isDecomposeParent(pkg.record))) return { ok: false, reason: 'record.rawDiff must be a non-empty string' };
     return { ok: true, reason: '' };
   }
   if (typeof pkg.sha !== 'string' || !SHA_RE.test(pkg.sha)) return { ok: false, reason: 'sha must be 40 hex characters' };

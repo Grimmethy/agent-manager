@@ -8,6 +8,15 @@
 //   401 missing or wrong token, 403 the request does not come from AGENT_MANAGER_LENDER_ADDRESS (when that is set), 404 any other path,
 //   405 any other method on /lend, 409 a record with that id is already in queue/adhoc/ (it is never overwritten).
 //
+//   POST /status Authorization: Bearer <lender token>, JSON {taskIds: [...]} -> 200 {ok: true, tasks: {<id>: 'in-progress'|'merged'|'unknown'}}
+//   400 bad or oversized body, taskIds not an array, more than 50 ids, any id not matching TASK_ID_RE,
+//   401 missing or wrong token, 403 the request does not come from AGENT_MANAGER_LENDER_ADDRESS (when that is set), 404 any other path,
+//   405 any other method on /status.
+//
+// The /status endpoint answers where a task is in the pipeline without modifying anything. 'in-progress' means the record is in queue/adhoc, pending,
+// drafting, review, approved, node-outbox or coordinating. 'merged' means the record is in queue/done with a mergedAt, or its history has an 'applied' stage
+// and its branch is an ancestor of origin/<base> (checked via an injectable git function, default git merge-base --is-ancestor). Anything else is 'unknown'.
+//
 // The record is written, stamped with `leasedTo: <lease.nodeId>`, atomically into <AGENT_MANAGER_PIPELINE_DIR>/queue/adhoc/<id>.json.
 // Settings: AGENT_MANAGER_LENDER_TOKEN_FILE (a file, mode 600, holding the lender token; never read from the environment; a missing or empty file means the
 // server refuses to start, exit 2), AGENT_MANAGER_LENDER_ADDRESS (the one address allowed to lend; unset = any address that holds the token),
@@ -71,6 +80,86 @@ function isObject(v) {
   return Boolean(v) && typeof v === 'object';
 }
 
+const MAX_STATUS_IDS = 50;
+
+// Validates the body for POST /status. Returns {ok: true} or {ok: false, status: 400, error: '<reason>'}.
+function validateStatusBody(body) {
+  if (!isObject(body)) return { ok: false, status: 400, error: 'body must be a JSON object' };
+  const taskIds = body.taskIds;
+  if (!Array.isArray(taskIds)) return { ok: false, status: 400, error: 'taskIds must be an array' };
+  if (taskIds.length > MAX_STATUS_IDS) return { ok: false, status: 400, error: 'too many taskIds' };
+  for (const id of taskIds) {
+    if (typeof id !== 'string' || !TASK_ID_RE.test(id)) return { ok: false, status: 400, error: 'invalid taskId' };
+  }
+  return { ok: true };
+}
+
+// Detects where a task is in the pipeline without modifying anything.
+// 'in-progress' = record is in queue/adhoc, pending, drafting, review, approved, node-outbox or coordinating.
+// 'merged' = record is in queue/done with mergedAt, OR history has applied stage and branch is ancestor of origin/<base>.
+// 'unknown' = anything else.
+function detectTaskState(taskId, pipelineDir, gitFn, repoDir = process.cwd(), { env = process.env, baseGitFn = defaultBaseGitFn } = {}) {
+  const queueDir = path.join(pipelineDir, 'queue');
+  const inProgressStates = ['adhoc', 'pending', 'drafting', 'review', 'approved', 'node-outbox', 'coordinating'];
+  for (const state of inProgressStates) {
+    const file = path.join(queueDir, state, `${taskId}.json`);
+    if (fs.existsSync(file)) return 'in-progress';
+  }
+  // Read-only lookup of a task that is not live: done, blocked, needs-clarification or awaiting-confirm.
+  let record = null;
+  let recordState = '';
+  for (const state of ['done', 'blocked', 'needs-clarification', 'awaiting-confirm']) {
+    const file = path.join(queueDir, state, `${taskId}.json`);
+    if (!fs.existsSync(file)) continue;
+    recordState = state;
+    try { record = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { record = null; }
+    break;
+  }
+  if (recordState === 'done' && record && record.mergedAt) return 'merged';
+  // The applied stage's detail is the task branch; it counts as merged when that branch is an ancestor of origin/<base> in the node repo.
+  const applied = record && Array.isArray(record.history) ? record.history.find((h) => h && h.stage === 'applied') : null;
+  if (applied && typeof applied.detail === 'string' && applied.detail && typeof gitFn === 'function') {
+    // The repo is the one the task was applied in (the record's generatedForRepoRoot), not the server's own checkout.
+    const recorded = record && typeof record.generatedForRepoRoot === 'string' ? record.generatedForRepoRoot.trim() : '';
+    const repo = recorded || repoDir;
+    if (!repo || !fs.existsSync(repo) || !fs.statSync(repo).isDirectory()) return 'unknown';
+    const base = resolveBase(repo, env, baseGitFn);
+    try { if (gitFn(applied.detail, `origin/${base}`, repo)) return 'merged'; } catch (e) { /* not merged */ }
+  }
+  return 'unknown';
+}
+
+// Runs one read-only git command in repoDir and returns its trimmed stdout, or '' when git fails. Never fetches, checks out or writes.
+function defaultBaseGitFn(repoDir, args) {
+  const { execFileSync } = require('child_process');
+  try {
+    return String(execFileSync('git', ['-C', repoDir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10000 })).trim();
+  } catch (e) {
+    return '';
+  }
+}
+
+// The base branch the merged check uses for one repo: AGENT_MANAGER_MERGED_BASE when set, else origin/HEAD's branch, else master when origin/master exists, else main.
+function resolveBase(repoDir, env = process.env, runGit = defaultBaseGitFn) {
+  const override = String(env.AGENT_MANAGER_MERGED_BASE || '').trim();
+  if (override) return override;
+  const head = runGit(repoDir, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']);
+  if (head) return head.replace(/^origin\//, '');
+  if (runGit(repoDir, ['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/master'])) return 'master';
+  return 'main';
+}
+
+// Default git function: checks if the task's branch is an ancestor of the given base using git merge-base --is-ancestor.
+function defaultGitFn(branch, base, repoDir) {
+  const { execFileSync } = require('child_process');
+  try {
+    execFileSync('git', ['merge-base', '--is-ancestor', branch, base], { cwd: repoDir, stdio: 'ignore', timeout: 10000 });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 // Writes the record into queue/adhoc/ without ever replacing a file that is there. Returns false when the id is already taken.
 function writeAdhoc(pipelineDir, record) {
   const dir = path.join(pipelineDir, 'queue', 'adhoc');
@@ -89,15 +178,44 @@ function writeAdhoc(pipelineDir, record) {
   }
 }
 
-function createServer({ env = process.env } = {}) {
+function createServer({ env = process.env, gitFn, repoDir = process.cwd() } = {}) {
   const token = readToken(env);
   const pipelineDir = String(env.AGENT_MANAGER_PIPELINE_DIR || '').trim();
   if (!pipelineDir) throw new Error('AGENT_MANAGER_PIPELINE_DIR must be set');
   const lender = String(env.AGENT_MANAGER_LENDER_ADDRESS || '').trim();
+
+  const handleLend = async (res, payload) => {
+    const task = isObject(payload) ? payload.task : null;
+    const lease = isObject(payload) ? payload.lease : null;
+    if (!isObject(task) || !isObject(lease)) return send(res, 400, { ok: false, error: 'body needs a task object and a lease object' });
+    if (typeof task.id !== 'string' || !TASK_ID_RE.test(task.id)) return send(res, 400, { ok: false, error: 'task id is not valid' });
+    if (lease.taskId !== task.id || typeof lease.nodeId !== 'string' || !lease.nodeId.trim()) return send(res, 400, { ok: false, error: 'lease does not match the task' });
+
+    if (!writeAdhoc(pipelineDir, { ...task, leasedTo: lease.nodeId.trim() })) return send(res, 409, { ok: false, error: 'a task with that id is already queued' });
+    return send(res, 200, { ok: true, taskId: task.id });
+  };
+
+  const handleStatus = async (res, payload) => {
+    const validation = validateStatusBody(payload);
+    if (!validation.ok) return send(res, validation.status, { ok: false, error: validation.error });
+    const git = typeof gitFn === 'function' ? gitFn : defaultGitFn;
+    const tasks = {};
+    for (const taskId of payload.taskIds) {
+      tasks[taskId] = detectTaskState(taskId, pipelineDir, git, repoDir, { env });
+    }
+    return send(res, 200, { ok: true, tasks });
+  };
+
+  const routes = {
+    '/lend': handleLend,
+    '/status': handleStatus,
+  };
+
   return http.createServer(async (req, res) => {
     try {
       const url = String(req.url || '').split('?')[0];
-      if (url !== '/lend') return send(res, 404, { ok: false, error: 'not found' });
+      const route = Object.prototype.hasOwnProperty.call(routes, url) ? routes[url] : null;
+      if (!route) return send(res, 404, { ok: false, error: 'not found' });
       if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'POST only' });
       if (!sameToken(bearer(req.headers.authorization), token)) return send(res, 401, { ok: false, error: 'bad or missing token' });
       if (lender && normalizeIp(req.socket.remoteAddress) !== lender) return send(res, 403, { ok: false, error: 'request does not come from the lender address' });
@@ -109,14 +227,8 @@ function createServer({ env = process.env } = {}) {
         if (e.status) res.once('finish', () => req.destroy());
         return send(res, 400, { ok: false, error: e.status ? e.message : 'body must be JSON' }, e.status ? { Connection: 'close' } : {});
       }
-      const task = isObject(payload) ? payload.task : null;
-      const lease = isObject(payload) ? payload.lease : null;
-      if (!isObject(task) || !isObject(lease)) return send(res, 400, { ok: false, error: 'body needs a task object and a lease object' });
-      if (typeof task.id !== 'string' || !TASK_ID_RE.test(task.id)) return send(res, 400, { ok: false, error: 'task id is not valid' });
-      if (lease.taskId !== task.id || typeof lease.nodeId !== 'string' || !lease.nodeId.trim()) return send(res, 400, { ok: false, error: 'lease does not match the task' });
-
-      if (!writeAdhoc(pipelineDir, { ...task, leasedTo: lease.nodeId.trim() })) return send(res, 409, { ok: false, error: 'a task with that id is already queued' });
-      return send(res, 200, { ok: true, taskId: task.id });
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return send(res, 400, { ok: false, error: 'body must be a JSON object' });
+      return await route(res, payload);
     } catch (e) {
       return send(res, 500, { ok: false, error: 'internal error' });
     }
@@ -136,4 +248,4 @@ if (require.main === module) {
   server.listen(port, host, () => process.stdout.write(`node intake listening on ${host}:${port}\n`));
 }
 
-module.exports = { createServer, normalizeIp, bearer, sameToken, writeAdhoc, TASK_ID_RE, MAX_BODY_BYTES };
+module.exports = { createServer, normalizeIp, bearer, sameToken, writeAdhoc, TASK_ID_RE, MAX_BODY_BYTES, validateStatusBody, detectTaskState, defaultGitFn, resolveBase, defaultBaseGitFn };

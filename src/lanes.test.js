@@ -138,7 +138,7 @@ test('CLI: --ids and --env print the registry lane for launch.sh', () => {
   const ids = execFileSync('node', [path.join(__dirname, 'lanes.js'), '--ids'], { env, encoding: 'utf8' }).trim().split('\n');
   assert.deepEqual(ids, ['worker-3090', 'worker-rx580']);
   const lines = execFileSync('node', [path.join(__dirname, 'lanes.js'), '--env', 'worker-rx580'], { env, encoding: 'utf8' }).trim().split('\n');
-  assert.deepEqual(lines, ['OLLAMA_URL=http://100.96.112.78:11434', 'LOCAL_MODEL=qwen3-vl:8b-instruct', 'AGENT_MANAGER_GPU_YIELD_APPS=']);
+  assert.deepEqual(lines, ['OLLAMA_URL=http://100.96.112.78:11434', 'LOCAL_MODEL=qwen3-vl:8b-instruct', 'AGENT_MANAGER_GPU_YIELD_APPS=', 'LANE_TASK_CLASSES=', 'LANE_REVIEWS=']);
 });
 
 test('slow: a registry lane may be marked slow (true/false only); the P40 always is; the host never is', () => {
@@ -235,13 +235,64 @@ test('cloud: an entry with a taskClasses allowlist becomes a bounded lane carryi
   assert.deepEqual(lane.env, { OLLAMA_URL: 'http://127.0.0.1:7450', LOCAL_MODEL: 'claude-haiku-5-5', AGENT_MANAGER_GPU_YIELD_APPS: '' });
 });
 
-test('cloud: fail closed -- no allowlist (absent, null, empty or not an array) drops the lane, siblings survive', () => {
+test('cloud: taskClasses may be absent or null -- the lane carries null (any task source); an array stays an allowlist', () => {
   const { taskClasses, ...bare } = CLOUD;
-  assert.deepEqual(idsOf([bare]), ['worker-3090']);
-  assert.deepEqual(idsOf([{ ...CLOUD, taskClasses: null }]), ['worker-3090']);
+  const lane = getLanes(withRegistry([bare]))[1];
+  assert.equal(lane.id, 'worker-cloud');
+  assert.equal(lane.taskClasses, null);
+  assert.equal(getLanes(withRegistry([{ ...CLOUD, taskClasses: null }]))[1].taskClasses, null);
+  assert.deepEqual(getLanes(withRegistry([CLOUD]))[1].taskClasses, ['adhoc'], 'an allowlist is unchanged');
+  assert.deepEqual(idsOf([bare, RX580]), ['worker-3090', 'worker-cloud', 'worker-rx580']);
+});
+
+test('cloud: an empty or non-array taskClasses still drops the lane, siblings survive', () => {
   assert.deepEqual(idsOf([{ ...CLOUD, taskClasses: [] }]), ['worker-3090']);
   assert.deepEqual(idsOf([{ ...CLOUD, taskClasses: 'adhoc' }]), ['worker-3090']);
-  assert.deepEqual(idsOf([bare, RX580]), ['worker-3090', 'worker-rx580']);
+  assert.deepEqual(idsOf([{ ...CLOUD, taskClasses: [] }, RX580]), ['worker-3090', 'worker-rx580']);
+});
+
+test('script: a script lane without a taskClasses allowlist is still dropped', () => {
+  const script = { gpu: 'tuner', provider: 'script', ollamaUrl: 'http://127.0.0.1:7449' };
+  assert.deepEqual(idsOf([script]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...script, taskClasses: null }]), ['worker-3090']);
+});
+
+test('cloud: reviewer:true is still refused', () => {
+  assert.deepEqual(idsOf([{ ...CLOUD, reviewer: true }]), ['worker-3090']);
+});
+
+test('reviews: a cloud lane defaults to true and accepts true or false', () => {
+  assert.equal(getLanes(withRegistry([CLOUD]))[1].reviews, true);
+  assert.equal(getLanes(withRegistry([{ ...CLOUD, reviews: true }]))[1].reviews, true);
+  assert.equal(getLanes(withRegistry([{ ...CLOUD, reviews: false }]))[1].reviews, false);
+});
+
+test('reviews: a non-boolean value drops the cloud entry with a warning', () => {
+  const realWrite = process.stderr.write;
+  let captured = '';
+  process.stderr.write = (chunk) => { captured += String(chunk); return true; };
+  try {
+    assert.deepEqual(idsOf([{ ...CLOUD, gpu: 'badrev', reviews: 'yes' }]), ['worker-3090']);
+  } finally {
+    process.stderr.write = realWrite;
+  }
+  assert.match(captured, /reviews must be true or false/);
+});
+
+test('reviews: absent on script lanes', () => {
+  const lane = getLanes(withRegistry([{ gpu: 'tuner', provider: 'script', ollamaUrl: 'http://127.0.0.1:7449', taskClasses: ['tuning_experiment'] }]))[1];
+  assert.equal('reviews' in lane, false);
+});
+
+const LIVE_REGISTRY = path.join(__dirname, '..', 'lanes.json');
+test('real lanes.json (read-only): exactly 24 enabled cloud lanes, each allowlisted to adhoc', { skip: !fs.existsSync(LIVE_REGISTRY) && 'no lanes.json in this checkout' }, () => {
+  const raw = JSON.parse(fs.readFileSync(LIVE_REGISTRY, 'utf8'));
+  const entries = Array.isArray(raw) ? raw : raw.lanes;
+  const cloudEntries = entries.filter((e) => e && e.provider === 'cloud' && e.enabled !== false);
+  const cloudLanes = getLanes({ AGENT_MANAGER_LANES_PATH: LIVE_REGISTRY, AGENT_MANAGER_LOCAL_GPU: '3090' }).filter((l) => l.cloud);
+  assert.equal(cloudEntries.length, 24);
+  assert.equal(cloudLanes.length, 24);
+  for (const l of cloudLanes) assert.deepEqual(l.taskClasses, ['adhoc'], l.id);
 });
 
 test('cloud: preempt other than never, a reviewer daemon, or an unknown provider drops the entry', () => {
