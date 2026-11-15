@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "entries": [
+    {
+      "id": "example-at-queue-task",
+      "cadence": {
+        "kind": "at",
+        "time": "03:00",
+        "weekday": "monday"
+      },
+      "job": {
+        "kind": "queue-task",
+        "pipeline": "example-pipeline",
+        "task": "example-task"
+      },
+      "replaceWith": "none yet"
+    },
+    {
+      "id": "example-every-run-command",
+      "cadence": {
+        "kind": "every",
+        "intervalSeconds": 3600
+      },
+      "job": {
+        "kind": "run-command",
+        "command": "example-command",
+        "args": ["--example"]
+      },
+      "replaceWith": "none yet"
+    },
+    {
+      "id": "example-rule-queue-task",
+      "cadence": {
+        "kind": "rule",
+        "name": "example-rule"
+      },
+      "job": {
+        "kind": "queue-task",
+        "task": "example-task"
+      },
+      "replaceWith": "none yet"
+    },
+    {
+      "id": "example-migrated",
+      "cadence": {
+        "kind": "every",
+        "intervalSeconds": 86400
+      },
+      "job": {
+        "kind": "run-command",
+        "command": "example-command"
+      },
+      "replaceWith": "example-replacement",
+      "migratedFrom": "example-legacy-job"
+    }
+  ]
+}
