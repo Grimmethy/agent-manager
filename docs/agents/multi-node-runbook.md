@@ -75,6 +75,18 @@ Machine-to-machine traffic uses the wired LAN address, with the tailnet address 
 5. On the Workers tab: are the cloud lane and grimm's workers in the state you left them?
 6. On the node: `ls <node pipeline dir>/queue/node-outbox`. Records still there were drafted and not sent; run `node src/node-package-send.js`.
 
+## 6a. Node systemd units
+
+`scripts/provision-node.sh` writes three systemd user units into the target directory it is given. They are written only and never enabled or started: nothing enables or starts them. Enabling and starting them is an operator step. Until the unit-writing step of `provision-node.sh` is merged, these units are documented ahead of implementation.
+
+- **`am-node-pull.service`** runs `node src/node-pull.js --daemon`. It is the pull daemon that claims work for a free worker. It has no periodic timer: it reacts to changes in `queue/adhoc/` (an `fs.watch` with a 2000 ms debounce). A failed claim backs off from 30 s, doubling, up to a 600 s cap.
+- **`am-node-send.path`** watches `<pipeline>/queue/node-outbox` with `PathChanged` and activates `am-node-send.service`.
+- **`am-node-send.service`** runs `src/node-package-send.js`, which packages and sends the outbox records. It is started by the path unit, not by a schedule. `docs/agents/node-send-timer.md` is the older poll-based example (a 2-minute timer); the path unit is the event-driven replacement, and that file is left unchanged.
+
+**Scheduling priority.** All node units set `Nice=19`, `IOSchedulingClass=idle` and `CPUSchedulingPolicy=idle`, so node work yields to interactive use of the machine.
+
+**Environment.** `node.env` holds commented examples of `AGENT_MANAGER_CLAIM_URL`, `AGENT_MANAGER_NODE_TOKEN_FILE` and `AGENT_MANAGER_NODE_REPOS_DIR`. They are commented out by default; uncomment and set them on the node. The token is read from the token file by path and is not placed in the environment.
+
 ## 7. Not built yet
 
 - A loop that applies a ramp decision to the workers: today the owner reads the decision and changes the workers.

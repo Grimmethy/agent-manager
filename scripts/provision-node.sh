@@ -2,13 +2,15 @@
 # Provisions the pipeline directory of a NODE (multi-node plan, piece 7d): the machine that drafts tasks for wok. Run it on the node. It starts NOTHING (no worker,
 # server or timer) and never writes a token (tokens live in files the owner creates, mode 600, see docs/agents/nodes.md).
 #
-# Usage: scripts/provision-node.sh <node-id> <pipeline-dir> <node-repo-dir>
+# Usage: scripts/provision-node.sh <node-id> <pipeline-dir> <node-repo-dir> [unit-dir]
+#   [unit-dir] is optional and defaults to $HOME/.config/systemd/user (the systemd user unit directory).
 #
 # Creates (and keeps whatever already exists):
 #   <pipeline-dir>/queue/{pending,adhoc,drafting,review,blocked,needs-clarification,done,node-outbox,node-sent}
 #   <pipeline-dir>/task-domains.json  every standard domain (scripts/ensure-task-domains.sh: written when missing, missing domains added when present)
 #   <pipeline-dir>/lanes.json         ONE lane, the cloud lane of lanes.example.json, DISABLED; an existing lanes.json is never overwritten
-#   <pipeline-dir>/node.env           AGENT_MANAGER_NODE_ID, AGENT_MANAGER_PIPELINE_DIR, AGENT_MANAGER_REPO_ROOT, AGENT_MANAGER_DOMAINS_PATH, AGENT_MANAGER_LANES_PATH (rewritten identically)
+#   <pipeline-dir>/node.env           AGENT_MANAGER_NODE_ID, AGENT_MANAGER_PIPELINE_DIR, AGENT_MANAGER_REPO_ROOT, AGENT_MANAGER_DOMAINS_PATH, AGENT_MANAGER_LANES_PATH (rewritten identically; the commented AGENT_MANAGER_CLAIM_URL, AGENT_MANAGER_NODE_TOKEN_FILE and AGENT_MANAGER_NODE_REPOS_DIR lines are appended)
+#   [unit-dir]/am-node-pull.service, am-node-send.path, am-node-send.service (written only, never enabled or started)
 # Exit 2 (nothing created) for a missing argument, an extra one, the id 'wok', an id that is not lowercase letters, digits and dashes (1 to 31 characters, not
 # starting with a dash, the rule of src/node-registry.js), or a directory that is not an absolute path of plain characters (node.env is sourced by shells).
 set -euo pipefail
@@ -18,11 +20,11 @@ PACKAGE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 refuse() { printf 'provision-node: %s\n' "$1" >&2; exit 2; }
 
-[[ $# -eq 3 ]] || refuse "usage: scripts/provision-node.sh <node-id> <pipeline-dir> <node-repo-dir>"
-NODE_ID="$1"; PIPELINE_DIR="$2"; REPO_DIR="$3"
+[[ $# -ge 3 && $# -le 4 ]] || refuse "usage: scripts/provision-node.sh <node-id> <pipeline-dir> <node-repo-dir> [unit-dir]"
+NODE_ID="$1"; PIPELINE_DIR="$2"; REPO_DIR="$3"; UNIT_DIR="${4:-$HOME/.config/systemd/user}"
 [[ "$NODE_ID" != "wok" ]] || refuse "the node id 'wok' is the ledger owner, not a node"
 [[ "$NODE_ID" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || refuse "the node id must be lowercase letters, digits and dashes (1 to 31 characters, not starting with a dash)"
-for dir in "$PIPELINE_DIR" "$REPO_DIR"; do
+for dir in "$PIPELINE_DIR" "$REPO_DIR" "$UNIT_DIR"; do
   [[ "$dir" =~ ^/[A-Za-z0-9._/@+:-]*$ ]] || refuse "a directory must be an absolute path of letters, digits and . _ / @ + : - only: $dir"
 done
 
@@ -46,9 +48,56 @@ else
   printf 'created %s (the cloud lane, disabled)\n' "$LANES"
 fi
 
+# The three units are written, never enabled or started. The pull and send services run from the package root.
+mkdir -p "$UNIT_DIR"
+cat > "$UNIT_DIR/am-node-pull.service" <<EOF
+[Unit]
+Description=Agent Manager node pull (asks wok for work when a worker is free)
+
+[Service]
+WorkingDirectory=$PACKAGE_ROOT
+ExecStart=node src/node-pull.js --daemon
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+EOF
+printf 'wrote   %s\n' "$UNIT_DIR/am-node-pull.service"
+
+cat > "$UNIT_DIR/am-node-send.path" <<EOF
+[Unit]
+Description=Agent Manager node send trigger (watches queue/node-outbox)
+
+[Path]
+PathChanged=$PIPELINE_DIR/queue/node-outbox
+Unit=am-node-send.service
+
+[Install]
+WantedBy=default.target
+EOF
+printf 'wrote   %s\n' "$UNIT_DIR/am-node-send.path"
+
+cat > "$UNIT_DIR/am-node-send.service" <<EOF
+[Unit]
+Description=Agent Manager node send (ships queue/node-outbox to wok)
+
+[Service]
+Type=oneshot
+WorkingDirectory=$PACKAGE_ROOT
+ExecStart=node src/node-package-send.js
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+EOF
+printf 'wrote   %s\n' "$UNIT_DIR/am-node-send.service"
+
 printf 'AGENT_MANAGER_NODE_ID=%s\nAGENT_MANAGER_PIPELINE_DIR=%s\nAGENT_MANAGER_REPO_ROOT=%s\nAGENT_MANAGER_DOMAINS_PATH=%s\nAGENT_MANAGER_LANES_PATH=%s\n' \
   "$NODE_ID" "$PIPELINE_DIR" "$REPO_DIR" "$PIPELINE_DIR/task-domains.json" "$LANES" > "$PIPELINE_DIR/node.env"
+printf '# AGENT_MANAGER_CLAIM_URL=\n# AGENT_MANAGER_NODE_TOKEN_FILE=\n# AGENT_MANAGER_NODE_REPOS_DIR=\n' >> "$PIPELINE_DIR/node.env"
 printf 'wrote   %s\n' "$PIPELINE_DIR/node.env"
 
 [[ -d "$REPO_DIR" ]] || printf 'note: %s does not exist yet (the node repo is cloned separately)\n' "$REPO_DIR"
-printf 'Nothing was started: no worker, server or timer. Source node.env and start the node workers yourself.\n'
+printf 'Nothing was started: the units were written but not enabled or started, and no worker, server or timer runs. Source node.env and start the node workers yourself.\n'
