@@ -164,7 +164,8 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
     }
   }
   
-  if (!targets.length || !repoRoot) return { blocked: false };
+  if (!targets.length) return { blocked: false };
+  if (!repoRoot) return { blocked: true, reason: 'plan cites target(s) but no repo root is available to verify them: ' + targets.join(', '), blockerType: 'plan-question', missing: targets };
 
   const checked = checkFilePaths(targets.join(', '), repoRoot, extraRoots);
   
@@ -194,10 +195,8 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
   const missing = checked.filter((entry) => {
     if (entry.exists !== false) return false;
     if (existsOnBranch(existsAtRef, entry.claimedPath)) return false;
-    // Explicit type 'create' exempts the target
-    if (explicitTypes.get(entry.claimedPath) === 'create') return false;
-    // Heuristic fallback: isDeclaredCreateTarget for backward compatibility
-    if (isCreateIntent(planText, entry.claimedPath, taskTextOf(task))) return false;
+    // Declared create target: exempt only when a plan and a repo root are present and the plan/task declares it a create target.
+    if (planText && repoRoot && isDeclaredCreateTarget(planText, entry.claimedPath, taskTextOf(task))) return false;
     return true;
   });
 
@@ -236,15 +235,13 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
   const offers = paths.map((p) => 'mark ' + p + ' as create').join(' or ');
   const feedback = ' -- mark as a create target (' + offers + ') or correct the path to an existing file' + candidateNote + nearNote;
   // First attempt for this task: hand back a revise outcome so the caller can ask for a corrected plan. Second attempt blocks as before.
-  const revisionCount = Number.isFinite(task && task.revisionCount) ? task.revisionCount : 0;
-  if (revisionCount === 0) {
-    return { blocked: false, revise: { feedback: 'plan cites missing-file target(s): ' + paths.join(', ') + feedback, revisionCount: 1 } };
-  }
+  // Undeclared missing targets block on every attempt as plan-question; clean-retry routing belongs to sibling 3/3.
   
   return {
     blocked: true,
     reason: 'plan cites missing-file target(s): ' + paths.join(', ') + feedback + (hasHumanDecision(task) ? HUMAN_DECISION_HINT : ''),
     missing: paths,
+    blockerType: 'plan-question',
     targetSummary: { create: createPaths, modify: modifyPaths },
   };
 }
