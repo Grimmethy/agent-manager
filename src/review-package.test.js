@@ -162,3 +162,25 @@ test('a version 1 package still needs its sha and branch, and a version 2 packag
   assert.equal('sha' in v2 || 'branch' in v2, false);
   assert.equal(validatePackage(v2).ok, true);
 });
+
+test('a decompose parent with two proposals and an empty rawDiff is ok; the same parent with no proposals, another adhocResolution, or a proposal without rawText is refused', () => {
+  const proposals = [{ title: 'a', rawText: 'do a' }, { title: 'b', rawText: 'do b' }];
+  const parent = { ...DRAFT, rawDiff: '', adhocResolution: 'decompose', subTaskProposals: proposals };
+  const pkg = buildRecordPackage({ record: parent, nodeId: 'grimm', now: T0 });
+  assert.deepEqual(validatePackage(pkg), { ok: true, reason: '' });
+  const refused = [
+    { ...parent, subTaskProposals: [] },
+    { ...parent, adhocResolution: 'other' },
+    { ...parent, subTaskProposals: [{ title: 'a', rawText: 'do a' }, { title: 'b' }] },
+  ];
+  for (const record of refused) {
+    const r = validatePackage({ ...pkg, record: { ...pkg.record, ...record, rawDiff: '' } });
+    assert.equal(r.ok, false, JSON.stringify(record).slice(0, 60));
+    assert.match(r.reason, /rawDiff/);
+  }
+});
+
+test('a normal record with a non-empty rawDiff still passes validation', () => {
+  const pkg = buildRecordPackage({ record: { ...DRAFT, adhocResolution: 'decompose', subTaskProposals: [{ title: 'a', rawText: 'x' }] }, nodeId: 'grimm', now: T0 });
+  assert.deepEqual(validatePackage(pkg), { ok: true, reason: '' });
+});
