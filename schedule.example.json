@@ -1,0 +1,21 @@
+{
+  "_doc": "Schedule file format. Top-level object with an 'entries' array. Each entry is an object with exactly three keys: 'id' (string, unique per schedule), 'cadence' (object), and 'replaceWith' (string). 'cadence.time' is 24-hour HH:MM (00:00-23:59). 'cadence.days' is a non-empty array of one or more lowercase weekday abbreviations: sun, mon, tue, wed, thu, fri, sat. The SCHEDULE_PATH environment variable, when set, overrides the filePath argument passed to loadSchedule.",
+  "entries": [
+    {
+      "id": "example-weekday",
+      "cadence": {
+        "time": "07:30",
+        "days": ["mon", "tue", "wed", "thu", "fri"]
+      },
+      "replaceWith": "example-replacement-a"
+    },
+    {
+      "id": "example-weekend",
+      "cadence": {
+        "time": "09:00",
+        "days": ["sat", "sun"]
+      },
+      "replaceWith": "example-replacement-b"
+    }
+  ]
+}
