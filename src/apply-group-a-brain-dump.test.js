@@ -245,6 +245,52 @@ test('applyBrainDumpSort target check: targetCheckOverride and the kill switch b
   } finally { delete process.env.AGENT_MANAGER_BRAIN_DUMP_TARGET_CHECK; fx.restore(); }
 });
 
+// 2026-10-31: duplicate pre-queue check (brain-dump-duplicate-check.js) wired into applyBrainDumpSort.
+function sortEntryOf(fx, entries, id) {
+  const brainDumpPath = writeBrainDump(fx.dir, entries);
+  const rawText = entries.find((e) => e.id === id).rawText;
+  const task = { promptContext: { brainDumpEntryId: id, rawText } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: 'fixture-project' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(fx.dir, 'sb'), pipelineDir: fx.pipelineDir });
+  return { result, data: JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')) };
+}
+
+test('applyBrainDumpSort duplicate check: two filings of one defect queue exactly ONE task (the first), the second is parked with duplicateOf', () => {
+  const fx = targetCheckFixture('apply-bd-dup-pair-');
+  try {
+    const text = 'Fix a defect in `src/real.js` function `doThing` that returns the wrong value';
+    const entries = [brainDumpEntry({ id: 'bd-a', rawText: text }), brainDumpEntry({ id: 'bd-b', rawText: text })];
+    const first = sortEntryOf(fx, entries, 'bd-a');
+    assert.equal(first.result.duplicateCheck, undefined, 'the first filing is queued');
+    assert.equal(fs.readdirSync(path.join(fx.pipelineDir, 'queue', 'adhoc')).length, 1);
+    const second = sortEntryOf(fx, entries, 'bd-b');
+    assert.equal(second.result.skipped, true);
+    assert.equal(second.result.duplicateCheck, true);
+    assert.equal(second.result.linkedTo, 'bd-a');
+    assert.equal(fs.readdirSync(path.join(fx.pipelineDir, 'queue', 'adhoc')).length, 1, 'no second task');
+    assert.equal(second.data.entries.find((e) => e.id === 'bd-b').duplicateOf, 'bd-a');
+    assert.ok(second.data.entries.find((e) => e.id === 'bd-b').sortAttempt >= 3, 'parked so it is not picked again');
+  } finally { fx.restore(); }
+});
+
+test('applyBrainDumpSort duplicate check: a pushed branch for the same file and symbol parks the entry (the repo root reaches the check)', () => {
+  const fx = targetCheckFixture('apply-bd-dup-branch-');
+  try {
+    const run = (cwd, ...a) => require('child_process').execFileSync('git', ['-C', cwd, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', ...a], { stdio: 'ignore' });
+    const origin = path.join(fx.dir, 'origin.git'); fs.mkdirSync(origin); run(origin, 'init', '-q', '--bare', '-b', 'main');
+    run(fx.repoRoot, 'branch', '-M', 'main'); run(fx.repoRoot, 'remote', 'add', 'origin', origin);
+    fs.writeFileSync(path.join(fx.repoRoot, 'src', 'real.js'), 'function doThing() { return 1 }\n'); run(fx.repoRoot, 'commit', '-q', '-am', 'real'); run(fx.repoRoot, 'push', '-q', 'origin', 'main');
+    run(fx.repoRoot, 'checkout', '-q', '-b', 'agent/earlier'); fs.writeFileSync(path.join(fx.repoRoot, 'src', 'real.js'), 'function doThing() { return 2 }\n');
+    run(fx.repoRoot, 'commit', '-q', '-am', 'fix'); run(fx.repoRoot, 'push', '-q', 'origin', 'agent/earlier'); run(fx.repoRoot, 'checkout', '-q', 'main'); run(fx.repoRoot, 'fetch', '-q', 'origin');
+    const text = 'Fix a defect in `src/real.js` function `doThing` that returns the wrong value';
+    const { result, data } = sortEntryOf(fx, [brainDumpEntry({ id: 'bd-x', rawText: text })], 'bd-x');
+    assert.equal(result.duplicateCheck, true);
+    assert.equal(result.linkedTo, 'agent/earlier');
+    assert.equal(data.entries[0].duplicateOf, 'agent/earlier');
+    assert.equal(fs.existsSync(path.join(fx.pipelineDir, 'queue', 'adhoc')), false, 'no task queued');
+  } finally { fx.restore(); }
+});
+
 // HUB0195 3/4: infra attribution gate on recoverableSortSkip.
 // When the skip reason is infrastructure-attributed (detected via blockedReason or
 // reason-string markers like "timeout", "ECONNRESET", "502"), the entry's sortAttempt

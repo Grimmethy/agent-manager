@@ -82,7 +82,7 @@ MAX_HARNESS_QUERIES = 3
 MIN_EXPANDED_WORD_LEN = 4
 MAX_HARNESS_GREP_TERMS = 15
 # Well under arch-import-fetch.js's own 12000-char MAX_CONTENT_CHARS cap -- THIS budget
-# shares ollama_client.py's fixed num_ctx=8192 window with the note text, the whole
+# shares ollama_client.py's pinned context window (pinned_num_ctx(), 49152 by default) with the note text, the whole
 # conversation so far, and this turn's own reply, none of which arch_import's dedicated
 # implement pass has to compete with.
 MAX_HARNESS_CONTEXT_CHARS = 3000

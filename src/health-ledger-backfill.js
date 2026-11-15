@@ -2,7 +2,7 @@
 
 // health-ledger-backfill.js -- one-shot backfill of the daily health ledger for days that have no row yet.
 //
-// Why (C4 of Docs/tuning-loops-design.md): the ledger (src/health-ledger-schema.js) only starts filling when a loop first writes, so the days
+// Why (C4 of docs/design-notes/tuning-loops-design.md): the ledger (src/health-ledger-schema.js) only starts filling when a loop first writes, so the days
 // before that have no row to compare against. The facts for those days still exist in two places: model-stats.db (table model_calls, one row
 // per model call) and the pipeline history log (<pipelineDir>/instances/pipeline-history.log, src/pipeline-history.js). This reads both,
 // read-only, and appends ONE row per missing day through the real schema's appendRow (never rewrites, never touches a day that has any row).

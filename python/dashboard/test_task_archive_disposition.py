@@ -95,8 +95,8 @@ class TestArchiveDisposition(unittest.TestCase):
         self.assertNotIn("terminalDisposition", src)
 
     def test_rejects_non_archivable_states(self):
-        self.put("pending", "p-1")
-        self.assertEqual(self.client.post("/api/task/pending/p-1/archive").status_code, 400)
+        self.put("approved", "p-1")   # in flight (an apply loop may hold it); adhoc and pending became archivable on 2026-11-10, see test_task_archive_unstarted
+        self.assertEqual(self.client.post("/api/task/approved/p-1/archive").status_code, 400)
 
     def test_an_archived_dependency_now_releases_its_dependent_through_the_real_gate(self):
         """The whole point: node's isDependencySatisfied agrees the archived task is resolved."""

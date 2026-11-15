@@ -8,6 +8,7 @@
 const BRANCHES_URL = '/api/git/unmerged-branches?projects=all';
 // Labels of registered projects the server has not finished scanning yet (response header); the tab's own poll picks them up.
 let branchProjectsPending = [];
+let branchListRefreshing = false;     // X-Branch-Refreshing: the served list is the last good one while the server recomputes it in the background
 
 function _bpEscape(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -23,17 +24,29 @@ function branchRowKey(b) {
 }
 
 // Same label -> same color every time and on every page (a hash, not a palette index that shifts when a project is added).
+// The repos opened every day are pinned so they never clash (hues at least 26 degrees apart, clear of the danger red);
+// every other repo keeps its hashed color. The pins mirror `project.pins` in uiforge's brands/agent-manager/tokens.json.
+const BRANCH_PROJECT_PINS = {
+  questforge: 133, 'agent-manager': 253, tokenfold: 186, 'pf-backend': 221, uiforge: 279, 'agent-manager-chat-plugin-am': 160,
+  'lead-call-desk': 71, 'pf-admin-ui': 107, 'taxharvest-scrapers': 305, 'trade-calculator': 331, uxforge: 15,
+};
+
 function branchProjectHue(label) {
+  if (Object.prototype.hasOwnProperty.call(BRANCH_PROJECT_PINS, label)) return BRANCH_PROJECT_PINS[label];
   let h = 0;
   for (const ch of String(label || '')) h = (h * 31 + ch.charCodeAt(0)) % 360;
   return h;
 }
 
+// Lightness 30 (was 32): white text on this background reaches 4.5:1 for every hue; at 32 five repo labels fell just below.
+function branchProjectColorCss(label) {
+  return `hsl(${branchProjectHue(label)} 55% 30%)`;
+}
+
 function branchProjectChipHtml(b) {
   const p = (b && b.project) || null;
   if (!p) return '';
-  const hue = branchProjectHue(p.label);
-  return `<span class="badge" data-project-chip="${_bpEscape(p.label)}" style="background:hsl(${hue} 55% 32%);color:#fff;font-weight:600"`
+  return `<span class="badge" data-project-chip="${_bpEscape(p.label)}" style="background:${branchProjectColorCss(p.label)};color:#fff;font-weight:600"`
     + ` title="Project: ${_bpEscape(p.label)}${p.active ? ' (active project)' : ''}\n${_bpEscape(p.repoRoot)}">${_bpEscape(p.label)}${p.active ? ' ● active' : ''}</span>`;
 }
 
@@ -51,12 +64,11 @@ function groupBranchesByProject(branches) {
 
 function branchProjectHeaderHtml(group) {
   const p = group.project;
-  const hue = branchProjectHue(p.label);
   const n = group.branches.length;
-  return `<div data-project-header="${_bpEscape(p.label)}" style="margin:18px 0 8px;padding:6px 10px;border-radius:6px;background:hsl(${hue} 55% 32%);color:#fff;display:flex;gap:10px;align-items:baseline">`
+  return `<div data-project-header="${_bpEscape(p.label)}" style="margin:16px 0 8px;padding:8px 12px;border-radius:6px;background:${branchProjectColorCss(p.label)};color:#fff;display:flex;gap:10px;align-items:baseline">`
     + `<strong>${_bpEscape(p.label)}</strong>${p.active ? '<span>● active project</span>' : ''}`
     + `<span style="opacity:.8">${n} branch${n === 1 ? '' : 'es'}</span>`
-    + `<span style="opacity:.6;font-family:monospace;font-size:11px;margin-left:auto">${_bpEscape(p.repoRoot)}</span></div>`;
+    + `<span style="opacity:.6;font-family:monospace;font-size:12px;margin-left:auto">${_bpEscape(p.repoRoot)}</span></div>`;
 }
 
 // Headers only earn their space when more than one project is on screen.
@@ -69,7 +81,13 @@ function branchListWithProjectHeadersHtml(branches, cardHtml) {
 function branchProjectsPendingHtml(pending) {
   const list = Array.isArray(pending) ? pending.filter(Boolean) : [];
   if (!list.length) return '';
-  return `<div class="meta" data-projects-pending style="margin:0 0 10px">Still scanning ${list.length} other project${list.length === 1 ? '' : 's'} for branches: ${list.map(_bpEscape).join(', ')} -- they appear here as each finishes.</div>`;
+  return `<div class="meta" data-projects-pending style="margin:0 0 8px">Still scanning ${list.length} other project${list.length === 1 ? '' : 's'} for branches: ${list.map(_bpEscape).join(', ')} -- they appear here as each finishes.</div>`;
+}
+
+// The list is served at once from the cache; while it is being recomputed (after a merge, discard or verdict, or on a cold start) say so instead of looking stuck.
+function branchListRefreshingHtml(refreshing) {
+  if (!refreshing) return '';
+  return '<div class="meta" data-list-refreshing style="margin:0 0 8px">Refreshing the branch list -- showing the last result; it updates by itself.</div>';
 }
 
 // Merge/discard/verdict act on the card's OWN project: the buttons carry the project's repoRoot (empty for the active project) and the request appends
@@ -93,12 +111,12 @@ function branchConfirmWithProject(message, btn) {
 }
 
 // Same as fetchJson (core-ui.js) but also reads which projects the server is still scanning.
-async function fetchBranchList() {
+async function fetchBranchList({ kick = false } = {}) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 30000);
   let r;
   try {
-    r = await fetch(BRANCHES_URL, { signal: controller.signal });
+    r = await fetch(kick ? BRANCHES_URL + '&kick=1' : BRANCHES_URL, { signal: controller.signal });
   } catch (e) {
     if (e.name === 'AbortError') throw new Error(BRANCHES_URL + ' -> timed out after 30s');
     throw e;
@@ -107,7 +125,8 @@ async function fetchBranchList() {
   }
   if (!r.ok) throw new Error(BRANCHES_URL + ' -> ' + r.status);
   branchProjectsPending = (r.headers.get('X-Branch-Projects-Pending') || '').split(',').filter(Boolean);
+  branchListRefreshing = r.headers.get('X-Branch-Refreshing') === '1';
   return r.json();
 }
 
-if (typeof module !== 'undefined') module.exports = { branchIsActiveProject, branchRowKey, branchProjectHue, branchProjectChipHtml, groupBranchesByProject, branchProjectHeaderHtml, branchListWithProjectHeadersHtml, branchProjectsPendingHtml, branchProjectRequestRoot, branchActionUrl, branchConfirmWithProject };
+if (typeof module !== 'undefined') module.exports = { branchListRefreshingHtml, branchIsActiveProject, branchRowKey, BRANCH_PROJECT_PINS, branchProjectHue, branchProjectColorCss, branchProjectChipHtml, groupBranchesByProject, branchProjectHeaderHtml, branchListWithProjectHeadersHtml, branchProjectsPendingHtml, branchProjectRequestRoot, branchActionUrl, branchConfirmWithProject };

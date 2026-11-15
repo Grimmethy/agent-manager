@@ -1,0 +1,202 @@
+'use strict';
+
+// Core reconciliation module for brain-dump entries (2026-10-24).
+//
+// Reads the brain-dump JSON (same path as python/dashboard/routes/brain_dump.py's
+// brain_dump_path()), iterates entries, and for each entry either:
+//   - marks it actioned (status='actioned', queuedTaskId, queuedAt) when an existing
+//     task already covers the work (mirrors api_brain_dump_prioritize in brain_dump.py ~line 200), or
+//   - marks it possibly-resolved (status='possibly-resolved') when every cited path
+//     is missing from the target repo.
+//
+// Edge cases:
+//   - Empty array returns zero counts, no write.
+//   - findExistingWorkForEntry / checkEntryTargets throw: log and skip.
+//   - JSON parse error: throw with path.
+//   - Write failure: log then throw.
+//   - dryRun: log + record changes but do not write.
+
+const fs = require('fs');
+const path = require('path');
+const { findExistingWorkForEntry } = require('./brain-dump-existing-work.js');
+const { checkEntryTargets } = require('./brain-dump-target-check.js');
+const { writeJsonAtomicSync } = require('./atomic-write.js');
+
+// Tolerant reader for the brain-dump JSON file. The real shape is
+//   { "entries": [...], <other-top-level-keys> }
+// but older fixtures / unit tests may still ship a bare array. Accept both:
+//   - object with an `entries` array  -> use result
+//   - bare array                      -> wrap in { entries: <array> }
+//   - anything else                   -> throw
+function readBrainDumpRaw(filePath) {
+  const raw = fs.readFileSync(filePath, 'utf8');
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`brain-dump JSON parse error at ${filePath}: ${err.message}`);
+  }
+  if (Array.isArray(parsed)) {
+    // Legacy bare-array shape: keep entries, remember we should write back as bare array.
+    return { entries: parsed, _shape: 'bare-array' };
+  }
+  if (parsed && typeof parsed === 'object' && Array.isArray(parsed.entries)) {
+    // Real wrapper shape: keep the full object so extra top-level keys survive a write.
+    return { entries: parsed.entries, _shape: 'wrapped', _full: parsed };
+  }
+  throw new Error(`brain-dump JSON at ${filePath} does not contain an array`);
+}
+
+// Mirror python/dashboard/app.py's brain_dump_path() logic (line 689):
+//   1. AGENT_MANAGER_BRAIN_DUMP_PATH env var (highest priority)
+//   2. AGENT_MANAGER_BRAIN_DUMP_PATH from env file (fallback)
+//   3. get_pipeline_dir() / "brain-dump.json"
+// The JS side cannot read the Python env file directly, so we honor the env var and
+// fall back to a pipeline-dir-relative path. Callers that need the env-file fallback
+// should set the env var themselves before invoking this module.
+function getBrainDumpPath() {
+  if (process.env.AGENT_MANAGER_BRAIN_DUMP_PATH) {
+    return process.env.AGENT_MANAGER_BRAIN_DUMP_PATH;
+  }
+  // Try to get pipeline dir from config (if available)
+  try {
+    const config = require('./config.js');
+    const cfg = config.getConfig ? config.getConfig() : config;
+    if (cfg && cfg.pipelineDir) {
+      return path.join(cfg.pipelineDir, 'brain-dump.json');
+    }
+  } catch {
+    // config not available, fall through
+  }
+  // Last resort: current working directory
+  return path.join(process.cwd(), 'brain-dump.json');
+}
+
+// Entries in these statuses have not been decided yet; everything else is left alone.
+const CANDIDATE_STATUSES = new Set(['captured', 'sorted']);
+
+function reconcileBrainDumpEntries(options) {
+  const opts = options || {};
+  const dryRun = opts.dryRun === true;
+  const logger = opts.logger || console;
+
+  if (typeof logger.info !== 'function' || typeof logger.warn !== 'function') {
+    throw new Error('reconcileBrainDumpEntries: logger must have .info and .warn methods');
+  }
+
+  const brainDumpPath = getBrainDumpPath();
+  if (!brainDumpPath) {
+    throw new Error('Cannot determine brain-dump path: no active project configured');
+  }
+
+  // 1. Read and parse JSON -- tolerant of { "entries": [...] } or bare array
+  const store = readBrainDumpRaw(brainDumpPath);
+  const entries = store.entries;
+
+  const counts = { actioned: 0, possiblyResolved: 0, checked: 0, skipped: 0 };
+  const changes = [];
+
+  // Collect pipeline dirs for findExistingWorkForEntry, and the project's REPO root for the target check (git runs there, never in the
+  // pipeline dir and never in the cwd: both were "not a git repository").
+  let pipelineDirs = [];
+  let repoRoot = opts.repoRoot || null;
+  try {
+    const config = require('./config.js');
+    const cfg = config.getConfig ? config.getConfig() : config;
+    if (cfg && cfg.pipelineDir) {
+      pipelineDirs = [cfg.pipelineDir];
+    }
+    if (!repoRoot && cfg && cfg.repoRoot) repoRoot = cfg.repoRoot;
+  } catch {
+    // config not available
+  }
+  if (!repoRoot) {
+    logger.warn('No repo root known (pass repoRoot or set AGENT_MANAGER_REPO_ROOT): cited-path existence is not checked this run');
+  }
+
+  // 2. Iterate entries
+  for (const entry of entries) {
+    // Only entries still waiting for a decision are candidates. An entry that is already actioned (or possibly-resolved, suppressed, ...) is left
+    // untouched: re-stamping it would rewrite queuedAt on every run.
+    if (!entry || !CANDIDATE_STATUSES.has(entry.status)) {
+      counts.skipped++;
+      continue;
+    }
+    counts.checked++;
+    const entryId = entry.id;
+    if (!entryId) {
+      logger.warn(`Skipping entry with no id`);
+      continue;
+    }
+    const entryText = entry.rawText || '';
+
+    // 3. Try findExistingWorkForEntry -- log and skip on throw
+    let taskId = null;
+    try {
+      if (pipelineDirs.length === 0) {
+        logger.warn(`No pipeline dir available for entry ${entryId}, skipping`);
+        continue;
+      }
+      const result = findExistingWorkForEntry(pipelineDirs, entry);
+      if (result && result.taskId) {
+        taskId = result.taskId;
+      }
+    } catch (err) {
+      logger.warn(`findExistingWorkForEntry failed for entry ${entryId}: ${err.message}`);
+      continue;
+    }
+
+    // 4. If a task exists, action it (mirrors api_brain_dump_prioritize field assignments)
+    if (taskId) {
+      if (!dryRun) {
+        entry.status = 'actioned';
+        entry.queuedTaskId = taskId;
+        entry.queuedAt = new Date().toISOString();
+      }
+      counts.actioned++;
+      changes.push({ entryId, action: 'actioned', taskId });
+      continue;
+    }
+
+    // 5. Otherwise, check targets -- log and skip on throw
+    let isSuspect = false;
+    let targetCheck = null;
+    try {
+      targetCheck = checkEntryTargets(entryText, { repoRoot });
+      if (targetCheck && targetCheck.verdict === 'suspect') {
+        isSuspect = true;
+      }
+    } catch (err) {
+      logger.warn(`checkEntryTargets failed for entry ${entryId}: ${err.message}`);
+      continue;
+    }
+
+    // 6. If suspect (every cited path missing, or archived, or hub-sequencing), mark possibly-resolved
+    if (isSuspect) {
+      if (!dryRun) {
+        entry.status = 'possibly-resolved';
+      }
+      counts.possiblyResolved++;
+      // Include the first cited path as the "symbol" that doesn't exist, or the entry text if none cited
+      const cited = (targetCheck && targetCheck.cited && targetCheck.cited.length > 0) ? targetCheck.cited[0] : entryText;
+      changes.push({ entryId, action: 'possibly-resolved', symbol: cited });
+    }
+  }
+
+  // 7. Write back atomically when not dryRun (only if there were changes)
+  //    Preserve the original top-level shape: wrapped objects keep all keys,
+  //    legacy bare arrays stay as bare arrays (existing tests expect this).
+  if (!dryRun && changes.length > 0) {
+    try {
+      const payload = store._shape === 'wrapped' ? store._full : entries;
+      writeJsonAtomicSync(brainDumpPath, payload);
+    } catch (err) {
+      logger.warn(`Failed to write brain-dump JSON to ${brainDumpPath}: ${err.message}`);
+      throw new Error(`brain-dump write failure at ${brainDumpPath}: ${err.message}`);
+    }
+  }
+
+  return { counts, changes };
+}
+
+module.exports = { reconcileBrainDumpEntries, CANDIDATE_STATUSES };

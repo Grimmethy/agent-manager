@@ -1,6 +1,6 @@
 'use strict';
 
-// Piece 3 of the manifest-driven dashboard tab (Docs/hub-tasks-extraction-plan.md section
+// Piece 3 of the manifest-driven dashboard tab (docs/design-notes/hub-tasks-extraction-plan.md section
 // 5): mergePluginTabs()/isValidPluginTab() in python/dashboard/static/js/core-ui.js fold a
 // plugin's declared `tab` into the nav's TABS array, on top of the hardcoded CORE_TABS row
 // set. There is no browser-JS test harness in this repo (the design doc's own finding);

@@ -74,15 +74,18 @@ test('a redo that is not merged, has no redoOf, or has an empty redoOf retires n
   assert.equal(s.recorded, 0);
 });
 
+// Sweeps ONE project twice with the card changed in between; under the queue-events journal a clean second run is (correctly) idle, so this per-card guard test runs
+// with the journal switched off, i.e. the old full scan on every run.
+const OFF = { AGENT_MANAGER_QUEUE_EVENTS: 'off' };
 test('a card that is already discard is skipped; a card with a merge verdict is kept and reported', async () => {
   const p = project('a', { 'redo-1': merged('old-task-1') });
   const logs = [];
   let req = fakeRequest([card(p, { verdict: 'discard' })]);
-  let s = await sweep({ projects: [p], request: req, env: {}, log: quiet });
+  let s = await sweep({ projects: [p], request: req, env: OFF, log: quiet });
   assert.equal(req.posts.length, 0);
   assert.equal(s.skipped['already-discard'], 1);
   req = fakeRequest([card(p, { verdict: 'merge' })]);
-  s = await sweep({ projects: [p], request: req, env: {}, log: (l) => logs.push(l) });
+  s = await sweep({ projects: [p], request: req, env: OFF, log: (l) => logs.push(l) });
   assert.equal(req.posts.length, 0);
   assert.equal(s.skipped['has-merge-verdict'], 1);
   assert.ok(logs.some((l) => /kept, it carries a merge verdict/.test(l)));
@@ -202,4 +205,88 @@ test('the watchdog tick runs the sweep with the same log convention, and the scr
   assert.match(text, /node "\$\{PACKAGE_SRC_DIR\}\/redo-supersede-sweep\.js" 2>>"\$\{HOME_LOGS\}\/redo-supersede-sweep\.log"/);
   assert.match(text, /\[watchdog\] redo-supersede-sweep: %s/);
   assert.equal(spawnSync('bash', ['-n', sh]).status, 0);
+});
+
+
+// ---- ADR-0024: driven by the queue-events journal (HUB0330 piece 4) ----
+const queueEvents = require('./queue-events.js');
+const T0 = Date.parse('2026-11-03T12:00:00Z');
+const MIN = 60 * 1000;
+function countingFs() {
+  const readdirs = [];
+  const impl = { ...fs, readdirSync: (p, ...rest) => { readdirs.push(String(p)); return fs.readdirSync(p, ...rest); } };
+  return { impl, doneListings: () => readdirs.filter((d) => /queue[\\/]done$/.test(d)).length };
+}
+const addRedo = (p, id, redoOf) => fs.writeFileSync(path.join(p.pipelineDir, 'queue', 'done', `${id}.json`), JSON.stringify({ id, ...merged(redoOf) }));
+
+test('journal mode: the first run does the full scan, a clean second run with no events lists nothing and asks the dashboard nothing', async () => {
+  const p = project('j1', { 'redo-1': merged('old-task-1') });
+  const c = countingFs();
+  const req = fakeRequest([card(p)]);
+  let s = await sweep({ projects: [p], request: req, env: {}, log: quiet, fsImpl: c.impl, now: T0 });
+  assert.deepEqual([s.redos, s.recorded, s.journal.fullScans], [1, 1, 1]);
+  assert.equal(c.doneListings(), 1);
+  let calls = 0;
+  s = await sweep({ projects: [p], request: async () => { calls += 1; return { status: 200, json: [] }; }, env: {}, log: quiet, fsImpl: c.impl, now: T0 + 5 * MIN });
+  assert.deepEqual([s.redos, s.journal.idle, s.journal.fullScans], [0, 1, 0]);
+  assert.equal(c.doneListings(), 1, 'the idle run made ZERO readdirSync calls on done/');
+  assert.equal(calls, 0, 'and no dashboard request');
+});
+
+test('journal mode: a branch_merged event for a new redo triggers exactly one examination, without listing done/', async () => {
+  const p = project('j2', { 'redo-1': merged('old-task-1') });
+  const c = countingFs();
+  await sweep({ projects: [p], request: fakeRequest([card(p)]), env: {}, log: quiet, fsImpl: c.impl, now: T0 });
+  addRedo(p, 'redo-2', 'old-task-2');
+  addRedo(p, 'redo-3', 'old-task-3');                                            // merged too, but NOT announced: must not be examined by an event run
+  queueEvents.append(p.pipelineDir, { type: 'branch_merged', branch: 'agent/redo-2', taskId: 'redo-2' });
+  const req = fakeRequest([card(p), card(p, { branch: 'agent/old-branch-2', taskId: 'old-task-2', headSha: 'def456' }), card(p, { branch: 'agent/old-branch-3', taskId: 'old-task-3', headSha: 'ghi789' })]);
+  const s = await sweep({ projects: [p], request: req, env: {}, log: quiet, fsImpl: c.impl, now: T0 + 5 * MIN });
+  assert.deepEqual([s.redos, s.journal.eventRuns, s.recorded], [1, 1, 1]);
+  assert.match(req.posts[0].url, /old-branch-2/);
+  assert.equal(c.doneListings(), 1, 'still only the first run listed done/');
+});
+
+test('journal mode: the reconcile pass revisits done/, and a supersede no event announced is counted as a correction (the first run counts none)', async () => {
+  const p = project('j3', { 'redo-1': merged('old-task-1') });
+  let s = await sweep({ projects: [p], request: fakeRequest([card(p)]), env: {}, log: quiet, now: T0 });
+  assert.equal(s.journal.corrections, 0, 'the first run is the catch-up, not a reconcile');
+  addRedo(p, 'redo-9', 'old-task-9');                                            // merged without any event: a producer forgot to emit
+  s = await sweep({ projects: [p], request: fakeRequest([card(p, { branch: 'agent/ob9', taskId: 'old-task-9', headSha: 'z9' })]), env: {}, log: quiet, now: T0 + 31 * MIN });
+  assert.deepEqual([s.journal.fullScans, s.recorded, s.journal.corrections], [1, 1, 1]);
+  assert.deepEqual(queueEvents.readCorrections(p.pipelineDir).byConsumer, { 'redo-supersede': 1 });
+});
+
+test('journal mode: an announced redo found by the reconcile pass is NOT a correction', async () => {
+  const p = project('j4', { 'redo-1': merged('old-task-1') });
+  await sweep({ projects: [p], request: fakeRequest([card(p)]), env: {}, log: quiet, now: T0 });
+  addRedo(p, 'redo-9', 'old-task-9');
+  queueEvents.append(p.pipelineDir, { type: 'branch_merged', branch: 'agent/redo-9', taskId: 'redo-9' });
+  const s = await sweep({ projects: [p], request: fakeRequest([card(p, { branch: 'agent/ob9', taskId: 'old-task-9', headSha: 'z9' })]), env: {}, log: quiet, now: T0 + 31 * MIN });
+  assert.deepEqual([s.recorded, s.journal.corrections], [1, 0]);
+});
+
+test('journal mode: unfinished work is retried (a 409 or a refused listing keeps the events and the scan pending); a dry-run never advances state', async () => {
+  const p = project('j5', { 'redo-1': merged('old-task-1') });
+  let s = await sweep({ projects: [p], request: fakeRequest([card(p)], { status: 409 }), env: {}, log: quiet, now: T0 });
+  assert.equal(s.skipped['head-moved-retry-later'], 1);
+  s = await sweep({ projects: [p], request: fakeRequest([card(p)]), env: {}, log: quiet, now: T0 + MIN });
+  assert.deepEqual([s.journal.fullScans, s.recorded], [1, 1], 'the full scan ran again and the retry succeeded');
+  const q = project('j6', { 'redo-1': merged('old-task-1') });
+  await sweep({ projects: [q], request: fakeRequest([card(q)]), env: { AGENT_MANAGER_REDO_SUPERSEDE: 'dry-run' }, log: quiet, now: T0 });
+  s = await sweep({ projects: [q], request: fakeRequest([card(q)]), env: {}, log: quiet, now: T0 + MIN });
+  assert.deepEqual([s.journal.fullScans, s.recorded], [1, 1], 'a dry-run did not mark the scan done');
+  const r = project('j7', { 'redo-1': merged('old-task-1') });
+  queueEvents.append(r.pipelineDir, { type: 'branch_merged', branch: 'agent/redo-1', taskId: 'redo-1' });
+  s = await sweep({ projects: [r], request: async () => { throw new Error('ECONNREFUSED'); }, env: {}, log: quiet, now: T0 });
+  assert.match(s.error, /did not answer/);
+  assert.equal(queueEvents.drain(r.pipelineDir, 'redo-supersede').events.length, 1, 'the event was not consumed by the failed run');
+});
+
+test('AGENT_MANAGER_QUEUE_EVENTS=off is the old behaviour: a full listing every run and no journal files written', async () => {
+  const p = project('j8', { 'redo-1': merged('old-task-1') });
+  const c = countingFs();
+  for (let i = 0; i < 3; i++) await sweep({ projects: [p], request: fakeRequest([]), env: OFF, log: quiet, fsImpl: c.impl, now: T0 + i * MIN });
+  assert.equal(c.doneListings(), 3);
+  assert.equal(fs.existsSync(path.join(p.pipelineDir, 'queue-events')), false);
 });

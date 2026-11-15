@@ -1,8 +1,9 @@
 # CLAUDE.md
 
 Repo-specific guidance for Claude Code working in `agent-manager`. This complements
-(does not replace) the `F:\GitHub\CLAUDE.md` architect-role instructions that apply
-across every project in `F:\GitHub`.
+(does not replace) the cross-project architect-role instructions that applied across every
+project under `/media/model-cache/github` (written as `F:\GitHub\CLAUDE.md` in the Windows era;
+that file is not present on this Linux host, so this file is the only repo-level guidance here).
 
 ## First principle: build the mechanism, don't hand-fix the instance
 
@@ -36,6 +37,12 @@ Single-context — one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/
 
 `act-as-local-agent` and `verify-unmerged-branches` ship in `docs/agents/skills/` (`.claude/` is
 gitignored). Run `scripts/install-skills.sh` once to link them into `~/.claude/skills`.
+
+### Triggers, not polls
+
+Before adding a sweep, tick, poll or timer, read the Fourth principle in `AGENTS.md` and
+`docs/adr/0024-triggers-not-polls.md`: announce the change at the writer, register interest once, keep a
+counted slow reconcile, and measure the idle cost. Language-neutral spec: the private repo `Grimmethy/triggers`.
 
 ### Codebase map
 

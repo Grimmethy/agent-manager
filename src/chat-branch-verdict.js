@@ -183,12 +183,53 @@ async function recordBranchVerdictTool(args = {}, opts = {}) {
   }
   const json = res.json;
   if (res.status === 200 && json && json.succeeded) {
+    if (json.pending) {
+      return {
+        ok: true, project: row.project && row.project.label, branch, headSha: json.headSha || row.headSha, verdict: json.verdict || args.verdict,
+        written: json.written, pending: true, verified: false,
+        message: 'Stored as a pending verdict: the branch is not on the listing yet and the verdict applies once it is.',
+      };
+    }
+    const reFetch = await fetchRows(request);
+    if (reFetch.error) {
+      return {
+        ok: true, project: row.project && row.project.label, branch, headSha: json.headSha || row.headSha, verdict: json.verdict || args.verdict,
+        written: json.written, verified: false,
+        message: `Recorded; the branch card does not show it yet (the listing may be cached or the head moved); read the tab before saying it is recorded. (listing failed: ${reFetch.error})`,
+      };
+    }
+    if (!reFetch.rows || !reFetch.rows.length) {
+      return {
+        ok: true, project: row.project && row.project.label, branch, headSha: json.headSha || row.headSha, verdict: json.verdict || args.verdict,
+        written: json.written, verified: false,
+        message: 'Recorded; the branch card does not show it yet (the listing may be cached or the head moved); read the tab before saying it is recorded.',
+      };
+    }
+    const reMatches = reFetch.rows.filter((r) => r.branch === branch && (!wanted || projectMatches(r, wanted)));
+    if (!reMatches.length) {
+      return {
+        ok: true, project: row.project && row.project.label, branch, headSha: json.headSha || row.headSha, verdict: json.verdict || args.verdict,
+        written: json.written, verified: false,
+        message: 'Recorded; the branch card does not show it yet (the listing may be cached or the head moved); read the tab before saying it is recorded.',
+      };
+    }
+    const reRow = reMatches[0];
+    const listedVerdict = reRow.verdict;
+    const listedSha = String(reRow.headSha || '').toLowerCase();
+    const recordedSha = String(json.headSha || row.headSha || '').toLowerCase();
+    const verdictMatches = listedVerdict === args.verdict;
+    const shaMatches = listedSha && listedSha.startsWith(recordedSha);
+    if (verdictMatches && shaMatches) {
+      return {
+        ok: true, project: row.project && row.project.label, branch, headSha: json.headSha || row.headSha, verdict: json.verdict || args.verdict,
+        written: json.written, verified: true, shownVerdict: listedVerdict, shownSha: reRow.headSha,
+        message: 'Recorded and read back; the branch card shows this verdict.',
+      };
+    }
     return {
       ok: true, project: row.project && row.project.label, branch, headSha: json.headSha || row.headSha, verdict: json.verdict || args.verdict,
-      written: json.written, pending: !!json.pending,
-      message: json.pending
-        ? 'Stored as a pending verdict: the branch is not on the listing yet and the verdict applies once it is.'
-        : 'Recorded; the branch card now shows this verdict.',
+      written: json.written, verified: false, shownVerdict: listedVerdict, shownSha: reRow.headSha,
+      message: 'Recorded; the branch card does not show it yet (the listing may be cached or the head moved); read the tab before saying it is recorded.',
     };
   }
   const why = (json && (json.reason || json.error)) || `HTTP ${res.status}`;

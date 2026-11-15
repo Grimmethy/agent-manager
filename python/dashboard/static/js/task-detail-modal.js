@@ -445,30 +445,35 @@ function renderTaskDetailModal(task) {
 }
 
 function stopTaskDetailAutoRefresh() {
-  if (taskDetailPoll) { clearInterval(taskDetailPoll); taskDetailPoll = null; }
+  taskDetailWatch = null;
 }
 
 function armTaskDetailAutoRefresh(task) {
   stopTaskDetailAutoRefresh();
   const state = task._foundState || '';
   if (!TASK_DETAIL_LIVE_STATES.has(state)) return;
-  const id = task.id;
-  let lastSig = `${state}:${(task.history || []).length}`;
-  taskDetailPoll = setInterval(async () => {
-    const backdrop = document.getElementById('modal-backdrop');
-    if (!backdrop || !backdrop.classList.contains('open')) { stopTaskDetailAutoRefresh(); return; }
-    let fresh;
-    try {
-      fresh = await fetchJson(`/api/task-anywhere/${encodeURIComponent(id)}`);
-    } catch (e) {
-      return; // transient -- try again next tick
-    }
-    const sig = `${fresh._foundState || ''}:${(fresh.history || []).length}`;
-    if (sig !== lastSig) {
-      lastSig = sig;
-      renderTaskDetailModal(fresh); // re-arms (or stops, if it landed in a terminal state)
-    }
-  }, 4000);
+  taskDetailWatch = { id: task.id, sig: `${state}:${(task.history || []).length}` };
+}
+
+// Called by the page when the pipeline says a task record or a queue state changed (live-updates.js: task-records-changed, counts-changed, snapshot). Does nothing, and
+// fetches nothing, unless the open modal is watching a task in a live state; then it re-reads that task and re-renders only when its state or history length moved.
+async function refreshTaskDetailModal() {
+  const watch = taskDetailWatch;
+  if (!watch) return;
+  const backdrop = document.getElementById('modal-backdrop');
+  if (!backdrop || !backdrop.classList.contains('open')) { stopTaskDetailAutoRefresh(); return; }
+  let fresh;
+  try {
+    fresh = await fetchJson(`/api/task-anywhere/${encodeURIComponent(watch.id)}`);
+  } catch (e) {
+    return; // transient -- the next announcement tries again
+  }
+  if (taskDetailWatch !== watch) return;     // the modal was closed or moved to another task while the fetch was in flight
+  const sig = `${fresh._foundState || ''}:${(fresh.history || []).length}`;
+  if (sig !== watch.sig) {
+    watch.sig = sig;
+    renderTaskDetailModal(fresh); // re-arms (or stops, if it landed in a terminal state)
+  }
 }
 
 function renderDesignDecisionPicker(task) {
@@ -488,7 +493,7 @@ function renderDesignDecisionPicker(task) {
     html += `<div style="margin-top:10px"><strong>Pick one:</strong></div>`;
     html += `<div style="margin-top:6px;display:flex;flex-direction:column;gap:6px">`;
     html += nc.options.map((o, i) => `
-      <button type="button" class="secondary clarify-answer-option-btn" data-answer="${escapeAttr(`${o.label}: ${o.description}`)}" style="text-align:left;padding:8px 10px">
+      <button type="button" class="secondary clarify-answer-option-btn" data-answer="${escapeAttr(`${o.label}: ${o.description}`)}" style="text-align:left;padding:8px 12px">
         <strong>${escapeHtml(o.label)}</strong><br><span class="meta">${escapeHtmlBright(o.description)}</span>
       </button>`).join('');
     html += `</div>`;

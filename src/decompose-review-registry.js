@@ -1,7 +1,7 @@
 'use strict';
 
 // Deterministic-review hook (S4a of the hub-tasks extraction, 2026-09-24,
-// Docs/hub-tasks-extraction-plan.md section 3). review-task.js used to require
+// docs/design-notes/hub-tasks-extraction-plan.md section 3). review-task.js used to require
 // script-extract.js / decompose-one-pass.js / decompose-node-module.js /
 // decompose-flask-blueprint.js DIRECTLY to re-derive a deterministic decompose draft
 // and byte-compare it, rather than just checking a boolean like S3's

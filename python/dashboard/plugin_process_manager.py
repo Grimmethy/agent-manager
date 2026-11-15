@@ -277,7 +277,7 @@ class PluginProcessManager:
         try:
             result = subprocess.run(
                 ["git", "log", "-1", "--format=%ct"],
-                cwd=entry.get("cwd") or os.getcwd(),
+                cwd=entry.get("cwd") or (entry.get("process") or {}).get("cwd") or os.getcwd(),
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -305,7 +305,7 @@ class PluginProcessManager:
         try:
             result = subprocess.run(
                 ["git", "diff", "--name-only", f"@{started_at}"],
-                cwd=entry.get("cwd") or os.getcwd(),
+                cwd=entry.get("cwd") or (entry.get("process") or {}).get("cwd") or os.getcwd(),
                 capture_output=True,
                 text=True,
                 timeout=5,

@@ -28,7 +28,6 @@ const MAX_GAPS = 5;
 // model name, so this call already correctly took turns with the main draft lane before
 // this change; this fix only removes the swap cost, not a locking gap.)
 const CRITIQUE_MODEL = process.env.AGENT_MANAGER_PLAN_CRITIQUE_MODEL;
-const CRITIQUE_NUM_CTX = 8192;
 
 function clip(s, n) {
   const str = String(s || '');
@@ -115,7 +114,7 @@ async function runPlanCritique(task, { call = localCall, maybeLockedOn } = {}) {
   if (det.length) return { verdict: 'gaps', gaps: det.slice(0, MAX_GAPS), viaModel: false };
 
   const prompt = buildPlanCritiquePrompt(task);
-  const fn = () => call({ prompt, model: CRITIQUE_MODEL, numCtx: CRITIQUE_NUM_CTX, think: false, temperature: 0.2, numPredict: 500, source: task.source });
+  const fn = () => call({ prompt, model: CRITIQUE_MODEL, think: false, temperature: 0.2, numPredict: 500, source: task.source });
   let result;
   try {
     result = maybeLockedOn ? await maybeLockedOn(CRITIQUE_MODEL, fn, 'plan-critique') : await fn();

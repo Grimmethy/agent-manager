@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Per-project housekeeping for a BORROWED project (docs/idle-pool-borrowing.md, step 4). queue-watcher.sh runs its sweeps against the ACTIVE
+# Per-project housekeeping for a BORROWED project (docs/design-notes/idle-pool-borrowing.md, step 4). queue-watcher.sh runs its sweeps against the ACTIVE
 # project only; a project whose tasks lanes borrow also needs them, or a borrowed task that blocks is never retried, a borrowed hub is never
 # reconciled and a borrowed needs-clarification pile is never triaged. queue-watcher.sh runs this once per pool project (in the background, at most
 # every AGENT_MANAGER_POOL_SWEEP_INTERVAL_SECS, default 300) under that project's env (pool-projects.js --env-args).
@@ -36,6 +36,28 @@ for d in blocked needs-clarification coordinating awaiting-confirm approved revi
 done
 if ! "$active" && compgen -G "${QUEUE_DIR}/drafting/*/*.json" >/dev/null; then active=true; fi
 if ! "$active"; then exit 0; fi
+
+# A project whose queue did not change since its last pass has nothing new for ~20 node startups to find (CPU analysis 2026-11-07: 39 of 42 pool projects counted as "active" because
+# some blocked or needs-clarification file sits there, yet about half had not changed for hours or days, and each still paid the whole pass every interval). So the pass is skipped when
+# the fingerprint of the stages housekeeping acts on (file names, modification times and sizes) equals the one stored by the last pass. Some sweeps act on
+# TIME (retries, expiry, staleness), so an unchanged project is still swept at least every AGENT_MANAGER_POOL_SWEEP_MAX_IDLE_SECS (default 1800; 0 turns the skip off). POOL_SWEEPS_FORCE
+# always sweeps. The stamp is written BEFORE the pass: a pass that changes the queue shows a different fingerprint next time and is swept once more, then settles. Costs one stat, no node.
+FP_FILE="${AGENT_MANAGER_PIPELINE_DIR}/instances/.pool-sweeps-fingerprint"   # line 1: epoch of the last pass; the rest: the fingerprint it saw
+max_idle="${AGENT_MANAGER_POOL_SWEEP_MAX_IDLE_SECS:-1800}"
+[[ "$max_idle" =~ ^[0-9]+$ ]] || max_idle=1800
+if [[ "${POOL_SWEEPS_FORCE:-}" != "true" ]]; then
+  fp_now="$(stat -c '%n %Y %s' "${QUEUE_DIR}"/{blocked,needs-clarification,coordinating,awaiting-confirm,approved,review}/*.json "${QUEUE_DIR}"/drafting/*/*.json 2>/dev/null)"
+  fp_last=0 fp_prev=""
+  if [[ -r "$FP_FILE" ]]; then
+    fp_prev="$(<"$FP_FILE")"
+    fp_last="${fp_prev%%$'\n'*}"
+    fp_prev="${fp_prev#*$'\n'}"
+  fi
+  [[ "$fp_last" =~ ^[0-9]+$ ]] || fp_last=0
+  (( fp_last > now )) && fp_last=0      # a stamp from the future (clock step, garbage) must not skip passes until then
+  if [[ -n "$fp_now" && "$fp_now" == "$fp_prev" ]] && (( now - fp_last < max_idle )); then exit 0; fi
+  { printf '%s\n' "$now"; printf '%s' "$fp_now"; } > "$FP_FILE" 2>/dev/null || true
+fi
 
 # Order matters the same way it does in queue-watcher.sh: retries and reconciliation first, triage after.
 SWEEPS=(

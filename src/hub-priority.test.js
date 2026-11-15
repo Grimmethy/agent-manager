@@ -53,7 +53,7 @@ test('readHubOrderKey reads hubPriority + createdAt from a live coordinating rec
   const dir = makePipeline();
   writeHub(dir, { id: 'hub-1', hubPriority: 7, createdAt: '2026-09-09T00:00:00Z' });
   const key = readHubOrderKey(dir, 'hub-1');
-  assert.deepEqual(key, { found: true, rank: 7, createdAt: '2026-09-09T00:00:00Z' });
+  assert.deepEqual(key, { found: true, rank: 7, createdAt: '2026-09-09T00:00:00Z', remaining: null });
 });
 
 test('readHubOrderKey treats a hub with no hubPriority as unranked (rank = UNRANKED_HUB_PRIORITY)', () => {
@@ -87,13 +87,36 @@ test('hubOrderKeyForTask flags isHubChild only when a live hub backs the link', 
   writeHub(dir, { id: 'hub-live', hubPriority: 2, createdAt: '2026-09-08T00:00:00Z' });
 
   const live = hubOrderKeyForTask(dir, { parentHub: 'hub-live' });
-  assert.deepEqual(live, { isHubChild: true, rank: 2, createdAt: '2026-09-08T00:00:00Z' });
+  assert.deepEqual(live, { isHubChild: true, rank: 2, createdAt: '2026-09-08T00:00:00Z', remaining: null });
 
   const orphan = hubOrderKeyForTask(dir, { promptContext: { decomposedFrom: 'hub-gone' } });
   assert.equal(orphan.isHubChild, false);
 
   const nohub = hubOrderKeyForTask(dir, { id: 'plain-task' });
   assert.equal(nohub.isHubChild, false);
+});
+
+test('readHubOrderKey reports the unbuilt pieces (progress.total - progress.built), null when the record does not say', () => {
+  const dir = makePipeline();
+  writeHub(dir, { id: 'hub-a', createdAt: '2026-09-09T00:00:00Z', progress: { done: 1, built: 5, total: 7 } });
+  writeHub(dir, { id: 'hub-b', createdAt: '2026-09-09T00:00:00Z', progress: { built: 9, total: 7 } });
+  writeHub(dir, { id: 'hub-c', createdAt: '2026-09-09T00:00:00Z', progress: { built: 'x', total: 7 } });
+  assert.equal(readHubOrderKey(dir, 'hub-a').remaining, 2);
+  assert.equal(readHubOrderKey(dir, 'hub-b').remaining, 0, 'never negative');
+  assert.equal(readHubOrderKey(dir, 'hub-c').remaining, null);
+});
+
+test('compareHubKeys: at equal rank the hub with fewer unbuilt pieces comes first, before createdAt; an unknown count sorts last; an explicit rank still wins', () => {
+  const R = UNRANKED_HUB_PRIORITY;
+  const nearDone = { rank: R, createdAt: '2026-09-09T00:00:00Z', remaining: 1 };
+  const farOlder = { rank: R, createdAt: '2026-01-01T00:00:00Z', remaining: 6 };
+  const unknownOlder = { rank: R, createdAt: '2026-01-01T00:00:00Z', remaining: null };
+  assert.ok(compareHubKeys(nearDone, farOlder) < 0, 'fewer unbuilt pieces beats an older hub');
+  assert.ok(compareHubKeys(farOlder, nearDone) > 0);
+  assert.ok(compareHubKeys(nearDone, unknownOlder) < 0, 'an unknown count sorts after a known one');
+  const sameCountOlder = { rank: R, createdAt: '2026-01-01T00:00:00Z', remaining: 1 };
+  assert.ok(compareHubKeys(sameCountOlder, nearDone) < 0, 'equal counts fall back to the older hub');
+  assert.ok(compareHubKeys({ rank: 1, createdAt: '2026-09-09T00:00:00Z', remaining: 9 }, nearDone) < 0, 'an explicit hubPriority still wins');
 });
 
 test('compareHubKeys: explicit priority ascending, then createdAt ascending, missing createdAt last', () => {
@@ -169,10 +192,10 @@ test('hubHasUnmergedEarlierSibling: true when an earlier sibling is pending-merg
       { id: 'update-fact-checker-tests-2', status: 'in-progress' },
     ],
   });
-  const task = { id: 'update-fact-checker-tests-2', parentHub: 'hub-fact-checker' };
+  const task = { id: 'update-fact-checker-tests-2', parentHub: 'hub-fact-checker', dependsOn: ['emit-warning-flag-0'] };
   const result = hubHasUnmergedEarlierSibling(dir, task);
   assert.equal(result.blocked, true);
-  // Reports the FIRST (lowest-indexed) unmerged sibling, not just "something" is unmerged.
+  // Reports the FIRST (lowest-indexed) unmerged sibling that the child depends on, not just "something" is unmerged.
   assert.equal(result.blockingSiblingId, 'emit-warning-flag-0');
   assert.equal(result.blockingSiblingStatus, 'pending-merge');
 });
@@ -233,7 +256,7 @@ test('hubHasUnmergedEarlierSibling: "pending-merge" is the one terminal status t
       { id: 'child-1', status: 'in-progress' },
     ],
   });
-  const task = { id: 'child-1', parentHub: 'hub-1' };
+  const task = { id: 'child-1', parentHub: 'hub-1', dependsOn: ['child-0'] };
   const result = hubHasUnmergedEarlierSibling(dir, task);
   assert.equal(result.blocked, true);
   assert.equal(result.blockingSiblingStatus, 'pending-merge');
@@ -248,7 +271,7 @@ test('hubHasUnmergedEarlierSibling: a "blocked" earlier sibling still blocks the
       { id: 'child-1', status: 'in-progress' },
     ],
   });
-  const task = { id: 'child-1', parentHub: 'hub-1' };
+  const task = { id: 'child-1', parentHub: 'hub-1', dependsOn: ['child-0'] };
   const result = hubHasUnmergedEarlierSibling(dir, task);
   assert.equal(result.blocked, true);
   assert.equal(result.blockingSiblingId, 'child-0');
@@ -263,7 +286,7 @@ test('hubHasUnmergedEarlierSibling: resolves the hub via promptContext.decompose
       { id: 'child-1', status: 'in-progress' },
     ],
   });
-  const task = { id: 'child-1', promptContext: { decomposedFrom: 'hub-1' } };
+  const task = { id: 'child-1', promptContext: { decomposedFrom: 'hub-1' }, dependsOn: ['child-0'] };
   assert.equal(hubHasUnmergedEarlierSibling(dir, task).blocked, true);
 });
 
@@ -275,7 +298,7 @@ function stackedHub(dir, { p1Status = 'pending-merge', p1Stacked = { branch: 'ag
   writeHub(dir, { id: 'hub-x', subTasks: [{ id: 'p1', status: p1Status }, { id: 'p2', status: 'in-progress' }] });
   if (writeP1) fs.writeFileSync(path.join(dir, 'queue', 'done', 'p1.json'), JSON.stringify({ id: 'p1', terminalDisposition: 'pending-merge', ...(p1Stacked ? { stacked: p1Stacked } : {}) }));
 }
-const p2 = (stacked) => ({ id: 'p2', promptContext: { decomposedFrom: 'hub-x' }, ...(stacked ? { stacked } : {}) });
+const p2 = (stacked, deps) => ({ id: 'p2', promptContext: { decomposedFrom: 'hub-x' }, ...(stacked ? { stacked } : {}), ...(deps ? { dependsOn: deps } : {}) });
 const SAME = { branch: 'agent/decompose-hub-x', seq: 2, total: 2 };
 
 test('hubHasUnmergedEarlierSibling: a STACKED child is not held by an earlier sibling that is pending-merge on the SAME branch', () => {
@@ -287,7 +310,7 @@ test('hubHasUnmergedEarlierSibling: a STACKED child is not held by an earlier si
 test('hubHasUnmergedEarlierSibling: the #340 shape still holds -- a NON-stacked child waits for a pending-merge sibling', () => {
   const dir = makePipeline();
   stackedHub(dir);
-  const r = hubHasUnmergedEarlierSibling(dir, p2(null));
+  const r = hubHasUnmergedEarlierSibling(dir, p2(null, ['p1']));
   assert.equal(r.blocked, true);
   assert.equal(r.blockingSiblingId, 'p1');
   assert.equal(r.blockingSiblingStatus, 'pending-merge');
@@ -296,7 +319,7 @@ test('hubHasUnmergedEarlierSibling: the #340 shape still holds -- a NON-stacked 
 test('hubHasUnmergedEarlierSibling: a stacked child on a DIFFERENT branch than its pending-merge sibling still waits', () => {
   const dir = makePipeline();
   stackedHub(dir);
-  assert.equal(hubHasUnmergedEarlierSibling(dir, p2({ branch: 'agent/decompose-some-other-hub', seq: 2, total: 2 })).blocked, true);
+  assert.equal(hubHasUnmergedEarlierSibling(dir, p2({ branch: 'agent/decompose-some-other-hub', seq: 2, total: 2 }, ['p1'])).blocked, true);
 });
 
 test('hubHasUnmergedEarlierSibling: the exemption is ONLY for pending-merge -- a stacked child still waits for a sibling that has not finished', () => {
@@ -310,10 +333,10 @@ test('hubHasUnmergedEarlierSibling: the exemption is ONLY for pending-merge -- a
 test('hubHasUnmergedEarlierSibling: a pending-merge sibling that is NOT stacked (or whose record is missing) still holds a stacked child', () => {
   const noStack = makePipeline();
   stackedHub(noStack, { p1Stacked: null });
-  assert.equal(hubHasUnmergedEarlierSibling(noStack, p2(SAME)).blocked, true);
+  assert.equal(hubHasUnmergedEarlierSibling(noStack, p2(SAME, ['p1'])).blocked, true);
   const missing = makePipeline();
   stackedHub(missing, { writeP1: false });
-  assert.equal(hubHasUnmergedEarlierSibling(missing, p2(SAME)).blocked, true);
+  assert.equal(hubHasUnmergedEarlierSibling(missing, p2(SAME, ['p1'])).blocked, true);
 });
 
 test('hubHasUnmergedEarlierSibling: in a 3-piece chain, a stacked piece 3 is released only when BOTH earlier pieces are pending-merge on its branch', () => {
@@ -322,7 +345,7 @@ test('hubHasUnmergedEarlierSibling: in a 3-piece chain, a stacked piece 3 is rel
   writeHub(dir, { id: 'hub-x', subTasks: [{ id: 'p1', status: 'pending-merge' }, { id: 'p2', status: 'in-progress' }, { id: 'p3', status: 'in-progress' }] });
   const branch = 'agent/decompose-hub-x';
   fs.writeFileSync(path.join(dir, 'queue', 'done', 'p1.json'), JSON.stringify({ id: 'p1', stacked: { branch, seq: 1, total: 3 } }));
-  const p3 = { id: 'p3', promptContext: { decomposedFrom: 'hub-x' }, stacked: { branch, seq: 3, total: 3 } };
+  const p3 = { id: 'p3', promptContext: { decomposedFrom: 'hub-x' }, stacked: { branch, seq: 3, total: 3 }, dependsOn: ['p1', 'p2'] };
   assert.equal(hubHasUnmergedEarlierSibling(dir, p3).blockingSiblingId, 'p2', 'p2 has not finished yet');
   writeHub(dir, { id: 'hub-x', subTasks: [{ id: 'p1', status: 'pending-merge' }, { id: 'p2', status: 'pending-merge' }, { id: 'p3', status: 'in-progress' }] });
   fs.writeFileSync(path.join(dir, 'queue', 'done', 'p2.json'), JSON.stringify({ id: 'p2', stacked: { branch, seq: 2, total: 3 } }));

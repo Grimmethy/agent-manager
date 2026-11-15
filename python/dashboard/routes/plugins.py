@@ -337,7 +337,7 @@ def api_plugins_update():
 @plugins_bp.route("/api/plugins/<name>/ui/<path:filename>")
 def api_plugin_ui_asset(name, filename):
     """Serves a .js/.css asset out of a plugin's own ui/ directory (piece 2 of the
-    manifest-driven dashboard tab; Docs/hub-tasks-extraction-plan.md section 5). This is
+    manifest-driven dashboard tab; docs/design-notes/hub-tasks-extraction-plan.md section 5). This is
     how a plugin's tab content reaches the browser without an iframe: the tab-bar merge
     (a later piece) points the dashboard at this route for `tab.script`, and a plugin may
     load further same-origin assets (additional scripts, a stylesheet) from here too.

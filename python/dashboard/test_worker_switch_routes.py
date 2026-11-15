@@ -114,6 +114,13 @@ class WorkerSwitchRoutesTest(unittest.TestCase):
         with mock.patch.object(app, "worker_lane_ids", return_value=[]):
             self.assertEqual(self._set("worker-cloud", {"enabled": False}).status_code, 200)
 
+    def test_listing_the_workers_never_starts_node(self):
+        self._set("worker-cloud", {"enabled": False})
+        with mock.patch.object(worker_switch, "_run", _never_called("node (worker_switch._run)")):
+            got = self._instances()
+        self.assertIs(got["worker-cloud"]["disabled"], True)
+        self.assertIs(got["worker-3090"]["disabled"], False)
+
     def test_a_broken_switch_never_hides_the_workers_tab(self):
         with mock.patch.object(worker_switch, "_run", side_effect=OSError("node missing")):
             got = self._instances()
@@ -128,6 +135,67 @@ class WorkerSwitchRoutesTest(unittest.TestCase):
         node = lambda *a: subprocess.run(["node", str(worker_switch.SWITCH_JS), *a], capture_output=True, text=True, env=os.environ.copy())
         self.assertEqual(node("is-disabled", "worker-cloud").returncode, 0)
         self.assertEqual(json.loads(node("list").stdout), ["worker-cloud"])
+
+
+class WorkerSwitchListingTest(unittest.TestCase):
+    """disabled_workers() reads the marker directory in-process (no node start); src/worker-switch.js stays the one rule (parity) and does every write."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name) / "disabled-workers"
+        self.dir.mkdir()
+        env = mock.patch.dict(os.environ, {"AGENT_MANAGER_DISABLED_WORKERS_DIR": str(self.dir)})
+        env.start()
+        self.addCleanup(env.stop)
+        run = mock.patch.object(worker_switch, "_run", _never_called("node (worker_switch._run)"))
+        run.start()
+        self.addCleanup(run.stop)
+
+    def test_lists_the_valid_worker_markers_without_starting_node(self):
+        for name in ("worker-3090", "worker-cloud", "worker-p40"):
+            (self.dir / name).write_text("{}")
+        self.assertEqual(worker_switch.disabled_workers(), {"worker-3090", "worker-cloud", "worker-p40"})
+
+    def test_ignores_names_that_are_not_worker_lanes(self):
+        for name in ("reviewer", "watchdog", "worker-", "Worker-1", "worker-a.json", "worker-a b", "worker-é", ".hidden", "worker-ok"):
+            (self.dir / name).write_text("{}")
+        self.assertEqual(worker_switch.disabled_workers(), {"worker-ok"})
+
+    def test_a_name_with_a_trailing_newline_is_not_a_worker(self):
+        (self.dir / "worker-nl\n").write_text("{}")
+        self.assertEqual(worker_switch.disabled_workers(), set())
+        self.assertFalse(worker_switch.is_switchable("worker-nl\n"))
+        self.assertTrue(worker_switch.is_switchable("worker-nl"))
+
+    def test_a_missing_or_unreadable_directory_is_an_empty_set(self):
+        with mock.patch.dict(os.environ, {"AGENT_MANAGER_DISABLED_WORKERS_DIR": str(self.dir / "nope")}):
+            self.assertEqual(worker_switch.disabled_workers(), set())
+        (self.dir / "afile").write_text("x")
+        with mock.patch.dict(os.environ, {"AGENT_MANAGER_DISABLED_WORKERS_DIR": str(self.dir / "afile")}):
+            self.assertEqual(worker_switch.disabled_workers(), set())
+
+    def test_the_default_directory_is_under_home_and_a_blank_override_means_the_default(self):
+        home = Path(self._tmp.name) / "home"
+        default = home / ".local" / "state" / "agent-manager" / "disabled-workers"
+        default.mkdir(parents=True)
+        (default / "worker-home").write_text("{}")
+        with mock.patch.dict(os.environ, {"AGENT_MANAGER_DISABLED_WORKERS_DIR": "   ", "HOME": str(home)}):
+            self.assertEqual(worker_switch.switch_dir(), str(default))
+            self.assertEqual(worker_switch.disabled_workers(), {"worker-home"})
+        with mock.patch.dict(os.environ, {"AGENT_MANAGER_DISABLED_WORKERS_DIR": str(self.dir)}):
+            self.assertEqual(worker_switch.switch_dir(), str(self.dir))
+
+    def test_agrees_with_the_node_list_command_the_worker_rule_lives_in(self):
+        import shutil
+        import subprocess
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+        for name in ("worker-3090", "worker-cloud", "reviewer", "worker-", "worker-X", "worker-a1"):
+            (self.dir / name).write_text("{}")
+        out = subprocess.run(["node", str(worker_switch.SWITCH_JS), "list"], capture_output=True, text=True, env=os.environ.copy(), timeout=20).stdout
+        self.assertEqual(worker_switch.disabled_workers(), set(json.loads(out)))
+        self.assertEqual(worker_switch.switch_dir(), subprocess.run(["node", str(worker_switch.SWITCH_JS), "dir"], capture_output=True, text=True, env=os.environ.copy(), timeout=20).stdout.strip())
 
 
 if __name__ == "__main__":

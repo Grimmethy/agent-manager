@@ -48,7 +48,7 @@ try {
     throw new Error("top level is not an object");
   }
 } catch (e) {
-  console.error(`[ensure-task-domains] ${target} is not a valid domains file (${e.message}); left untouched`, file: process.stderr);
+  console.error(`[ensure-task-domains] ${target} is not a valid domains file (${e.message}); left untouched`);
   process.exit(1);
 }
 
