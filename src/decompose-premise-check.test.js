@@ -7,6 +7,11 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// TODO(HUB0160 2/4): the HUB0135-01 rawText was NOT retrievable (read_task: "not found";
+// search_tasks returns only the title). Paste the verbatim rawText here; until then the
+// HUB0135-01 test below is skipped rather than run against a fabricated string.
+const HUB0135_01_RAW_TEXT = null;
+
 // --- detectStaleDecomposePremise (2026-09-15, brain-dump bd-1789433484305, "pipeline
 // hardening 3/5") -- root-caused live against the real sub-task that cited src/local-
 // draft.js line 2178 after decompose #226 had already shrunk that file to 1327 lines. ---
@@ -533,4 +538,32 @@ test('error message distinguishes missing to-be-created paths from missing pre-e
     !result.reason.includes('expected to be created'),
     `error message must not claim "expected to be created" for a truly stale case, got: ${result.reason}`,
   );
+});
+
+// --- HUB0160 2/4: create-verb guard and overshoot/missing-file regression cases ---
+
+test('HUB0135-01 rawText: no stale premise is flagged', { skip: HUB0135_01_RAW_TEXT === null ? 'TODO HUB0160: HUB0135-01 rawText not supplied' : false }, () => {
+  const task = { promptContext: { decomposedFrom: 'p', rawText: HUB0135_01_RAW_TEXT } };
+  const r = detectStaleDecomposePremise(task, { repoRoot: '/r', lineCountFn: () => null, resolveFn: () => ({ status: 'none' }) });
+  assert.ok(!r || r.stale === false, 'HUB0135-01 must not be flagged');
+});
+
+test('create-verb variant: a file introduced by Create is not reported as missing-file', () => {
+  const task = { promptContext: { decomposedFrom: 'p', rawText: 'Create src/new-thing.js (~line 10), mirroring the pattern in see existing.js:900.' } };
+  const r = detectStaleDecomposePremise(task, { repoRoot: '/r', lineCountFn: () => null, resolveFn: () => ({ status: 'none' }) });
+  assert.ok(!r || r.findings.every((f) => f.kind !== 'missing-file'), 'new-thing.js is being created, so it must not be missing-file');
+});
+
+test('existing file cited past its real length still flags line-overshoot', () => {
+  const task = { promptContext: { decomposedFrom: 'p', rawText: 'In src/existing-thing.js at line 5000, fix it.' } };
+  const r = detectStaleDecomposePremise(task, { repoRoot: '/r', lineCountFn: () => 100, resolveFn: () => ({ status: 'none' }) });
+  assert.ok(r);
+  assert.equal(r.findings[0].kind, 'line-overshoot');
+});
+
+test('nonexistent file that is NOT being created still flags missing-file', () => {
+  const task = { promptContext: { decomposedFrom: 'p', rawText: 'In src/never-created.js line 10, fix it.' } };
+  const r = detectStaleDecomposePremise(task, { repoRoot: '/r', lineCountFn: () => null, resolveFn: () => ({ status: 'none' }) });
+  assert.ok(r);
+  assert.equal(r.findings[0].kind, 'missing-file');
 });
