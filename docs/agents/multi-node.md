@@ -24,6 +24,18 @@ Wok (the machine that owns the ledger, review, verification and merge) can lend 
 | Branch relay | `src/branch-relay.js` | wok | `branch-relay.md`; not used for node work |
 | Notifier | `src/notify.js` | every machine | `notifier.md` |
 
+## Pull model (default)
+
+The pull model is the default path for node work. A node **pulls** its own tasks: a worker on the node asks wok for the next piece of work, wok stamps a one-hour lease on it, and the node owns the whole pipeline from draft through merge. The lend-and-package path below is kept only until the trial of the grimm-as-a-node entry passes.
+
+1. **Claim.** The node's pull daemon sends `POST /claim` (body `{id, classes?}`) to wok's registry server (`src/node-registry-server.js`). Wok first runs `settleExpired()` lazily on any lease that has passed its `expiresAt`, then picks the next task the node is allowed to claim (no `leasedTo`, or `leasedTo` equal to the node's id, and not already claimed elsewhere). Wok stamps a lease row in `leases.json` (`lendLease`) with a one-hour TTL and returns `{task, lease, repo}`. The claim is a one-hour lease; two machines never get the same task because a live lease beats any later claim.
+2. **Expiry check (merged or in-progress).** When the hour is up, wok asks the node (`POST /status` on the node's intake, or the injected `askNode` callback) whether the task is **merged**, **in-progress**, or **unknown**. Merged closes the lease; in-progress renews it for another TTL; unknown returns the task to the pool (the lease becomes `expired`, the record's `leasedTo` is cleared by `reclaimExpired`). Settlement is lazy: it runs on the next claim request, with no timer.
+3. **Events.** The node posts one event per pipeline stage (`POST /event` on the registry server): `drafted`, `reviewed`, `applied`, `merged`, `blocked`, `failed`. Wok records it on the lease row (`lastEvent`, `lastEventAt`); `merged` closes the lease. The heartbeat is presence only.
+4. **Hub stickiness.** Hubs are sticky: the node that holds the first claim on a task keeps getting later pieces addressed to that hub. This is enforced by the lease row's `nodeId` and the node affinity check in `next-claimable-task.js`.
+5. **Pull daemon.** A small loop on the node that calls `POST /claim` whenever a worker is idle (triggered by the worker becoming free, not by a timer). When wok is unreachable the daemon stops pulling; running stages finish; events and merge notices queue in the outbox.
+6. **Repo on demand.** The node clones a task's repo on first use and `git fetch`es at every claim (GitHub is the shared truth). The clone directory is `AGENT_MANAGER_NODE_REPOS_DIR` (default `$HOME/.local/state/agent-manager/repos`).
+7. **Low priority units.** Node workers run at nice 19 and idle IO class. Caps stay at concurrency 3, load 3.0 and free RAM 3 GB until a stress test raises them. A site visitor stops new claims and new stages at once; a running stage finishes; resume after 5 idle minutes.
+
 ## How a task travels (the default: the record is the package)
 
 The stock pipeline makes a branch only when `scripts/apply-task.sh` applies an approved record's `rawDiff`, so a node does not build a branch: it stops after the draft and ships the drafted record, which already carries the diff.
@@ -48,6 +60,8 @@ The version 1 branch package and the relay stay in the code and keep working, bu
 6. **Relay.** `relayBranch({branch, sha, nodeUrl, repoRoot})` fetches the node's `agent/` branch over the LAN and pushes it to origin, only when its head is exactly the package's sha. From there the dashboard, verifier and merge route work as always.
 7. **Expiry.** As above.
 
+**Legacy status.** The lend-and-package path (this section) is **legacy**: it stays in the code and keeps working, but it is only the bootstrap for the pull model. It is used until the trial of the grimm-as-a-node entry passes; once the trial passes the pull model takes over entirely and this path is retired.
+
 ## Settings (all environment variables)
 
 | Variable | Used by | Default |
@@ -60,6 +74,9 @@ The version 1 branch package and the relay stay in the code and keep working, bu
 | `AGENT_MANAGER_INTAKE_BIND`, `AGENT_MANAGER_INTAKE_PORT` | node intake | `127.0.0.1`, 7472 |
 | `AGENT_MANAGER_PACKAGE_BIND`, `AGENT_MANAGER_PACKAGE_PORT` | package intake | `127.0.0.1`, 7473 |
 | `AGENT_MANAGER_PIPELINE_DIR` | node intake (where `queue/adhoc/` is), package intake (where `queue/node-packages/` is) | required |
+| `AGENT_MANAGER_CLAIM_URL` | pull daemon (`POST /claim`) | required (wok's registry URL) |
+| `AGENT_MANAGER_NODE_TOKEN_FILE` | node auth (heartbeat, claim, event) | file required (exit 2 without it) |
+| `AGENT_MANAGER_NODE_REPOS_DIR` | repo on demand (clone + fetch target) | `$HOME/.local/state/agent-manager/repos` |
 
 Tokens are read from files, never from the environment, never printed and never in a repository. Every server binds loopback until the owner sets its `..._BIND` to the machine's LAN address.
 
