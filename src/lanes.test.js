@@ -138,7 +138,7 @@ test('CLI: --ids and --env print the registry lane for launch.sh', () => {
   const ids = execFileSync('node', [path.join(__dirname, 'lanes.js'), '--ids'], { env, encoding: 'utf8' }).trim().split('\n');
   assert.deepEqual(ids, ['worker-3090', 'worker-rx580']);
   const lines = execFileSync('node', [path.join(__dirname, 'lanes.js'), '--env', 'worker-rx580'], { env, encoding: 'utf8' }).trim().split('\n');
-  assert.deepEqual(lines, ['OLLAMA_URL=http://100.96.112.78:11434', 'LOCAL_MODEL=qwen3-vl:8b-instruct', 'AGENT_MANAGER_GPU_YIELD_APPS=']);
+  assert.deepEqual(lines, ['OLLAMA_URL=http://100.96.112.78:11434', 'LOCAL_MODEL=qwen3-vl:8b-instruct', 'AGENT_MANAGER_GPU_YIELD_APPS=', 'LANE_TASK_CLASSES=', 'LANE_REVIEWS=']);
 });
 
 test('slow: a registry lane may be marked slow (true/false only); the P40 always is; the host never is', () => {
