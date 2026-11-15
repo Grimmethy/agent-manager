@@ -74,11 +74,13 @@ async function pullOnce({ env = process.env, deps = {}, state = makeState() } = 
       return failure(d, state, 'cannot read node token file');
     }
 
+    // An absent classes key means "no class filter" on the claim side; an empty array would filter out every task, so it is never sent.
     const classes = Array.isArray(d.classes) ? d.classes : [];
+    const requestBody = classes.length > 0 ? { id, classes } : { id };
     const res = await d.fetch(claimUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ id, classes }),
+      body: JSON.stringify(requestBody),
     });
     if (!res || !res.ok) {
       return failure(d, state, `claim request failed with HTTP ${res ? res.status : 'no response'}`);
