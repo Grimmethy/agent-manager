@@ -23,6 +23,9 @@ _Avoid_: source
 **Claim**:
 A task file that has been moved into a per-instance drafting folder, marking it as owned by that instance.
 
+**Claim (node)**:
+A one-hour lease granted by wok's `POST /claim` that assigns a task to a node; settled at expiry by asking the node whether the task is merged (close it), still in progress (renew it) or unknown (return it to the pool), checked lazily when a claim request arrives, with no timer. Two machines never get the same task because a live lease beats any later claim. See `docs/agents/multi-node.md`, "Pull model (default)".
+
 **Orphaned claim**:
 A claim whose owning process is confirmed dead. Recovered automatically at the next worker startup (crash-resume).
 _Avoid_: stranded claim (a different failure state, see below)
@@ -34,9 +37,15 @@ _Avoid_: orphaned claim
 **Instance**:
 One running process identified by an `instanceId` (a worker lane named for its GPU such as `worker-3090` or `worker-p40`, `reviewer`, `queue-watchdog`), which owns exactly one heartbeat file.
 
+**Node**:
+A machine registered with wok (LAN address, cores, RAM, GPU, allowed providers, concurrency cap) that pulls work via `POST /claim`. The node owns the whole record of a task it pulled and runs the whole pipeline: draft, three Haiku review votes (the loop-quality-audit checks the reviewers), verification and merge with its own copies of the verifier, Needs-Work, merger and hub drains. Hubs are sticky: later pieces go to the node that holds the first. See `docs/agents/multi-node.md`, "Pull model (default)".
+
 **Lane**:
 One worker process pinned to one GPU endpoint, named for the GPU (`worker-3090`, `worker-p40`, `worker-rx580`). Lanes are data, not code: the host lane, the legacy P40 lane and every entry of the lanes registry file (`lanes.json`, see `docs/agents/lanes.md`) are turned into lane definitions by `src/lanes.js`, the single definition `launch.sh`, the watchdog's restart rule, the claim loop and the dashboard all read. A lane may declare a `taskClasses` allowlist (only those task sources are offered to it), `preempt` (whether an interactive chat turn may kill its call) and `slow` (longer timeouts for a categorically slower endpoint) and `numCtx` (the lane's one pinned context window, for cards smaller than the 24 GB ones).
 _Avoid_: worker type, tier (the old reasoning/worker split is gone)
+
+**Lease**:
+The wok-side row (`leases.json`) tracking which task is lent to which node and until when; states: `lent`, `returned`, `expired`, `merged`. One row per claimed task, fed by node events (`POST /event`); the heartbeat is presence only. Settled at expiry by asking the node whether the task is merged, still in progress or unknown. See `docs/agents/leases.md`.
 
 **Cloud lane**:
 A lane whose endpoint is the cloud-providers gateway (an Ollama-compatible service on `127.0.0.1:7450` that forwards to Claude Haiku) instead of a GPU: a `lanes.json` entry with `"provider": "cloud"` and a mandatory `taskClasses` allowlist, conventionally `["adhoc"]`. It exists only for extra throughput on adhoc tasks. It is explicit and bounded: it is never an overflow path for tasks that fail locally, hygiene scan sources stay off it, it never changes claim order or throttles local lanes, and the GPU-only logic (Forge lease yield, host VRAM headroom, lane-health probes, chat cards) skips it. Billing is the API key by default; the subscription adapter is owner-confirmed. See `docs/agents/cloud-lane.md`.

@@ -348,3 +348,29 @@ test('the default request really claims a task through claimNext, while an empty
   fs.rmSync(path.join(nodesDir, 'leases.json'), { force: true });
   assert.equal(claimNext({ nodeId: body.id, claimant: body.id, classes: [], pipelineDirs: [pipe], env, now: Date.now(), readRemote: () => '' }), null);
 });
+
+// --- idle and took-task logging (wok idle answers were silent before) ---
+
+test('an idle answer with retryAfterSec 60 logs exactly one idle line', async (t) => {
+  const { env } = setup(t);
+  const lines = [];
+  const server = await claimServer(t, [{ body: { ok: true, task: null, retryAfterSec: 60 } }]);
+  await pullOnce({ env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url }, deps: { log: (m) => lines.push(m), ensureRepo: async () => {} } });
+  assert.deepEqual(lines, ['node-pull: idle; wok asked to retry in 60 s']);
+});
+
+test('an idle answer without retryAfterSec logs the line with unknown', async (t) => {
+  const { env } = setup(t);
+  const lines = [];
+  const server = await claimServer(t, [{ body: { ok: true, task: null } }]);
+  await pullOnce({ env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url }, deps: { log: (m) => lines.push(m), ensureRepo: async () => {} } });
+  assert.deepEqual(lines, ['node-pull: idle; wok asked to retry in unknown s']);
+});
+
+test('a task answer logs only the took-task line, never the idle line', async (t) => {
+  const { env } = setup(t);
+  const lines = [];
+  const server = await claimServer(t, [{ body: { ok: true, task: { id: 't-log' }, repo: { remoteUrl: 'https://example.invalid/r.git' } } }]);
+  await pullOnce({ env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url }, deps: { log: (m) => lines.push(m), ensureRepo: async () => {} } });
+  assert.deepEqual(lines, ['node-pull: took task t-log']);
+});
