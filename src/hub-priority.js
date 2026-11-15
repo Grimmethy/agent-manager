@@ -26,6 +26,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { QUEUE_STATES } = require('./task-anywhere.js');
 
 // A hub with no explicit priority sorts AFTER every explicitly-ranked hub. Kept finite so
 // callers can do plain arithmetic sorts without special-casing Infinity.
@@ -127,12 +128,13 @@ function compareHubKeys(a, b) {
 // A single dependsOn edge is also only as complete as whoever authored the decompose
 // remembered to declare -- sub-task 2 here named only ONE of its two real prerequisites.
 //
-// This is a coarser, more conservative safety net that doesn't depend on either of those
-// being right: a hub's own subTasks array is already an ordered checklist (decompose
-// naturally produces build -> wire -> test sequences), so a child should not be drafted
-// while an EARLIER-ordered sibling in the SAME hub hasn't actually landed on main yet --
-// regardless of whether a fine-grained dependsOn edge names it. It sits alongside
-// dependsOn, not in place of it; either one blocking is enough to hold a candidate.
+// Dependency-gated: a child should not be drafted while an EARLIER-ordered sibling in the
+// SAME hub hasn't actually landed on main yet, but only when the child's `dependsOn` names
+// that sibling, or the child is on a stacked branch and the sibling sits on the same
+// branch (so the draft/review can see it). It sits alongside the fine-grained dependsOn
+// check in task-sources.js, not in place of it; either one blocking is enough to hold a
+// candidate. The pending-merge-on-same-stack exception remains: a sibling approved and
+// applied to the same branch is already visible to the child's review environment.
 //
 // Resolved = no code from this sibling will EVER land on main, so there's nothing left
 // to wait for. This is the full TERMINAL_STAGES set from task-disposition.js minus
@@ -164,11 +166,11 @@ const SIBLING_RESOLVED_STATUSES = new Set([
 // with dependsOn satisfied, this check the only thing left). A non-stacked sibling, or one on a different branch, still holds.
 function siblingIsOnStackedBranch(pipelineDir, siblingId, branch) {
   if (!siblingId || !branch) return false;
-  for (const dir of ['done', path.join('done', '_archived_no_action'), 'coordinating']) {
+  for (const state of QUEUE_STATES) {
     try {
-      const rec = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', dir, `${siblingId}.json`), 'utf8'));
-      return !!(rec && rec.stacked && rec.stacked.branch === branch);
-    } catch { /* not in this dir */ }
+      const rec = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', state, `${siblingId}.json`), 'utf8'));
+      if (rec && rec.stacked && rec.stacked.branch === branch) return true;
+    } catch { /* not in this state */ }
   }
   return false;
 }
@@ -198,12 +200,19 @@ function hubHasUnmergedEarlierSibling(pipelineDir, task, hubRecord = null) {
   if (myIndex <= 0) return { blocked: false }; // not listed, or first in order
 
   const myBranch = task && task.stacked && task.stacked.branch ? task.stacked.branch : null;
+  const myDeps = Array.isArray(task.dependsOn) ? task.dependsOn : [];
   for (let i = 0; i < myIndex; i += 1) {
     const sib = subTasks[i];
     if (!sib || !sib.status) continue;
     if (!SIBLING_RESOLVED_STATUSES.has(sib.status)) {
+      // Pending-merge on the same stacked branch is visible to this child -- skip.
       if (myBranch && sib.status === 'pending-merge' && siblingIsOnStackedBranch(pipelineDir, sib.id, myBranch)) continue;
-      return { blocked: true, blockingSiblingId: sib.id, blockingSiblingStatus: sib.status };
+      // Block only when the child depends on this sibling, or the child is stacked and
+      // this sibling sits on the same branch (so the child's draft/review can see it).
+      const onSameStack = myBranch && siblingIsOnStackedBranch(pipelineDir, sib.id, myBranch);
+      if (myDeps.includes(sib.id) || onSameStack) {
+        return { blocked: true, blockingSiblingId: sib.id, blockingSiblingStatus: sib.status };
+      }
     }
   }
   return { blocked: false };
