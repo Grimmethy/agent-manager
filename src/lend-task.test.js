@@ -38,7 +38,7 @@ test('a successful lend posts task and lease with the bearer token, stamps lease
   assert.equal(seen[0].headers.Authorization, `Bearer ${TOKEN}`);
   assert.equal(seen[0].timeout, 15000);
   assert.deepEqual(seen[0].body.task, { id: 't1', title: 't1', pad: 1 });
-  assert.deepEqual(seen[0].body.lease, { taskId: 't1', nodeId: 'grimm', expiresAt: '2026-11-11T18:00:00.000Z' });
+  assert.deepEqual(seen[0].body.lease, { taskId: 't1', nodeId: 'grimm', expiresAt: '2026-11-11T13:00:00.000Z' });
   assert.equal(read(f).leasedTo, 'grimm');
   assert.equal(read(f).pad, 1);
   assert.equal(leaseFor('t1', w.env).state, 'lent');

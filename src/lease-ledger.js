@@ -9,7 +9,10 @@ const path = require('path');
 const { nodesDir } = require('./node-registry.js');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
 
-const DEFAULT_TTL_MS = 6 * 60 * 60 * 1000;
+// One hour: a node's claim lasts an hour, then wok asks the node whether the task is merged, still in progress or unknown (settleExpired).
+const DEFAULT_TTL_MS = 60 * 60 * 1000;
+// The events a node posts about a task it pulled (POST /event); anything else is refused.
+const EVENTS = ['drafted', 'reviewed', 'applied', 'merged', 'blocked', 'failed'];
 
 function leasesFile(env = process.env) {
   return path.join(nodesDir(env), 'leases.json');
@@ -84,6 +87,65 @@ function expireLeases({ now = Date.now(), env = process.env } = {}) {
   return expired;
 }
 
+// Records one node event on the task's lease row (lastEvent, lastEventAt). 'merged' closes the lease (state 'merged').
+// Returns the row, or null when the task has no lease row. An event outside EVENTS throws.
+function recordEvent(taskId, event, { now = Date.now(), env = process.env } = {}) {
+  if (!EVENTS.includes(event)) throw new Error(`event must be one of ${EVENTS.join(', ')}`);
+  const leases = load(env);
+  const lease = leases[taskId];
+  if (!lease) return null;
+  lease.lastEvent = event;
+  lease.lastEventAt = new Date(now).toISOString();
+  if (event === 'merged') {
+    lease.state = 'merged';
+    lease.mergedAt = lease.lastEventAt;
+  }
+  save(leases, env);
+  return lease;
+}
+
+// Settles every 'lent' lease that is past expiresAt by asking the node: askNode(nodeId, taskId) answers 'merged', 'in-progress' or
+// 'unknown' (a throw or any other answer counts as unknown). merged closes the lease, in-progress renews it for another ttl, unknown
+// puts the task back in the pool (the lease row becomes 'expired' and the record's leasedTo is cleared by lend-task's reclaimExpired,
+// once per directory in pipelineDirs). Returns { merged, renewed, released } with the rows.
+async function settleExpired({ askNode, pipelineDirs = [], now = Date.now(), env = process.env } = {}) {
+  const due = listLeases(env).filter((l) => l && l.state === 'lent' && !(Date.parse(l.expiresAt) > now));
+  const answers = new Map();
+  for (const lease of due) {
+    let answer = 'unknown';
+    try { answer = await askNode(lease.nodeId, lease.taskId); } catch (e) { answer = 'unknown'; }
+    answers.set(lease.taskId, answer === 'merged' || answer === 'in-progress' ? answer : 'unknown');
+  }
+  const result = { merged: [], renewed: [], released: [] };
+  const leases = load(env);
+  for (const lease of due) {
+    const row = leases[lease.taskId];
+    if (!row || row.state !== 'lent' || row.expiresAt !== lease.expiresAt) continue; // changed while we asked: leave it
+    const answer = answers.get(lease.taskId);
+    if (answer === 'merged') {
+      row.state = 'merged';
+      row.mergedAt = new Date(now).toISOString();
+      result.merged.push(row);
+    } else if (answer === 'in-progress') {
+      row.expiresAt = new Date(now + defaultTtlMs(env)).toISOString();
+      row.renewedAt = new Date(now).toISOString();
+      result.renewed.push(row);
+    }
+  }
+  if (result.merged.length || result.renewed.length) save(leases, env);
+  if (due.some((l) => answers.get(l.taskId) === 'unknown')) {
+    const { reclaimExpired } = require('./lend-task.js'); // lazy: lend-task requires this file
+    const released = [];
+    for (const dir of pipelineDirs.length ? pipelineDirs : [null]) {
+      const rows = dir ? reclaimExpired({ pipelineDir: dir, now, env }) : expireLeases({ now, env });
+      for (const r of rows) if (!released.some((x) => x.taskId === r.taskId)) released.push(r);
+      if (!dir) break;
+    }
+    result.released = released;
+  }
+  return result;
+}
+
 function leaseFor(taskId, env = process.env) {
   return load(env)[taskId] || null;
 }
@@ -112,4 +174,4 @@ function main(argv, env = process.env, out = (s) => process.stdout.write(`${s}\n
 
 if (require.main === module) process.exitCode = main(process.argv.slice(2));
 
-module.exports = { leasesFile, defaultTtlMs, lendLease, returnLease, cancelLease, expireLeases, leaseFor, listLeases, main, DEFAULT_TTL_MS };
+module.exports = { leasesFile, defaultTtlMs, lendLease, returnLease, cancelLease, expireLeases, recordEvent, settleExpired, leaseFor, listLeases, main, DEFAULT_TTL_MS, EVENTS };
