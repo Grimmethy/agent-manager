@@ -28,6 +28,11 @@ for dir in "$PIPELINE_DIR" "$REPO_DIR" "$UNIT_DIR"; do
   [[ "$dir" =~ ^/[A-Za-z0-9._/@+:-]*$ ]] || refuse "a directory must be an absolute path of letters, digits and . _ / @ + : - only: $dir"
 done
 
+# The retry unit runs the absolute node binary, so resolve it before any write. A missing node is an environment failure (exit 1), not a usage refusal (exit 2).
+NODE_BIN="$(command -v node || true)"
+[[ -n "$NODE_BIN" ]] || { printf 'provision-node: node is not on PATH; install node first\n' >&2; exit 1; }
+case "$NODE_BIN" in /*) ;; *) printf 'provision-node: node path is not absolute: %s\n' "$NODE_BIN" >&2; exit 1 ;; esac
+
 NODE_QUEUES=(pending adhoc drafting review blocked needs-clarification done node-outbox node-sent)
 for q in "${NODE_QUEUES[@]}"; do
   if [[ -d "$PIPELINE_DIR/queue/$q" ]]; then printf 'kept    %s\n' "$PIPELINE_DIR/queue/$q"; else mkdir -p "$PIPELINE_DIR/queue/$q"; printf 'created %s\n' "$PIPELINE_DIR/queue/$q"; fi
@@ -93,6 +98,38 @@ IOSchedulingClass=idle
 CPUSchedulingPolicy=idle
 EOF
 printf 'wrote   %s\n' "$UNIT_DIR/am-node-send.service"
+
+# Writes a unit only when the file is absent; an existing file (or symlink/directory at the path) is kept, never overwritten.
+write_unit_if_absent() {
+  local path="$1"
+  if [[ -e "$path" ]]; then printf 'kept    %s\n' "$path"; return 0; fi
+  cat > "$path"
+  printf 'wrote   %s\n' "$path"
+}
+
+# The retry pair is written, never enabled or started. No [Install] section: the path unit is triggered by the path watch alone.
+write_unit_if_absent "$UNIT_DIR/am-node-retry.service" <<EOF
+[Unit]
+Description=Agent Manager node reject-retry sweep (requeues rejected continuations)
+
+[Service]
+Type=oneshot
+WorkingDirectory=$REPO_DIR
+ExecStart=$NODE_BIN src/reject-retry-check.js
+EnvironmentFile=$PIPELINE_DIR/node.env
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+EOF
+
+write_unit_if_absent "$UNIT_DIR/am-node-retry.path" <<EOF
+[Unit]
+Description=Agent Manager node reject-retry trigger (watches queue/blocked)
+
+[Path]
+PathChanged=$PIPELINE_DIR/queue/blocked
+Unit=am-node-retry.service
+EOF
 
 printf 'AGENT_MANAGER_NODE_ID=%s\nAGENT_MANAGER_PIPELINE_DIR=%s\nAGENT_MANAGER_REPO_ROOT=%s\nAGENT_MANAGER_DOMAINS_PATH=%s\nAGENT_MANAGER_LANES_PATH=%s\n' \
   "$NODE_ID" "$PIPELINE_DIR" "$REPO_DIR" "$PIPELINE_DIR/task-domains.json" "$LANES" > "$PIPELINE_DIR/node.env"
