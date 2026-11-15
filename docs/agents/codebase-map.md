@@ -18,6 +18,8 @@ for X," nothing else.
 file in another repo is not backticked at all, because the test only knows this tree.
 `src/codebase-map-freshness.test.js` knows both shorthand rules.
 
+Design docs (not code maps) that sit alongside this one: `docs/agents/research-loop.md` covers how 'look into X' entries and concept links would become sourced research briefs, and where that loop should live.
+
 A citation like `app.py:6276-6679` only promises the FILE exists and the feature was
 there as of when the row was written — the freshness test checks that mechanically on
 every run. It does **not** promise the line range or function name is still accurate;
