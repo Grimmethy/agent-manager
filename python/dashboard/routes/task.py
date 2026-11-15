@@ -727,6 +727,19 @@ def api_task_requeue(state, task_id):
         fresh["atomic"] = data["atomic"]
     if "noDecompose" in data:
         fresh["noDecompose"] = data["noDecompose"]
+    # Premium / human-queue fields (2026-11-15, mirrors chat-task-requeue.js:134-141):
+    # these are set by Chat / CLI / execute.js and must survive the reset. Losing them
+    # on requeue was silently downgrading priority for tasks that a human or a
+    # premium-priority path had explicitly marked -- the same bug the JS path already
+    # fixed.
+    if "humanQueued" in data:
+        fresh["humanQueued"] = data["humanQueued"]
+    if "premiumPriority" in data:
+        fresh["premiumPriority"] = data["premiumPriority"]
+    if "premiumSetBy" in data:
+        fresh["premiumSetBy"] = data["premiumSetBy"]
+    if "premiumSetAt" in data:
+        fresh["premiumSetAt"] = data["premiumSetAt"]
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual",
