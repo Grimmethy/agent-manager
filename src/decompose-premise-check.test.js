@@ -561,6 +561,29 @@ test('existing file cited past its real length still flags line-overshoot', () =
   assert.equal(r.findings[0].kind, 'line-overshoot');
 });
 
+// HUB0035 4/5: a repeated cited path must attribute a later line ref to the nearest preceding
+// occurrence, not to an earlier, stripped path mentioned mid-text.
+test('two-path repeated-line-ref: a late line ref attaches to its own file, not a stale earlier path', () => {
+  const rawText = 'First, src/local-tool-client.js is the client. '
+    + 'Then ./lib/implement-critique.js handles critique. '
+    + 'Finally src/local-tool-client.js line 22 needs the fix.';
+  const task = { promptContext: { decomposedFrom: 'p', rawText } };
+  const r = detectStaleDecomposePremise(task, {
+    repoRoot: '/r',
+    lineCountFn: () => null,
+    resolveFn: () => ({ status: 'none' }),
+  });
+  assert.ok(r, 'the line 22 citation to an absent file must be reported');
+  assert.equal(r.stale, true);
+  assert.equal(r.findings.length, 1, 'only the late line ref produces a finding');
+  assert.equal(r.findings[0].kind, 'missing-file');
+  assert.equal(r.findings[0].relPath, 'src/local-tool-client.js', 'line 22 must attach to src/local-tool-client.js');
+  assert.ok(
+    r.findings.every((f) => !String(f.relPath).includes('implement-critique')),
+    'no finding may name the stripped lib/implement-critique.js path',
+  );
+});
+
 test('nonexistent file that is NOT being created still flags missing-file', () => {
   const task = { promptContext: { decomposedFrom: 'p', rawText: 'In src/never-created.js line 10, fix it.' } };
   const r = detectStaleDecomposePremise(task, { repoRoot: '/r', lineCountFn: () => null, resolveFn: () => ({ status: 'none' }) });
