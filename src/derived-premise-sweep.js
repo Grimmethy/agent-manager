@@ -18,6 +18,7 @@
 // Kill switch: AGENT_MANAGER_DERIVED_PREMISE_SWEEP=false. CLI: node derived-premise-sweep.js [--dry-run]
 
 const fs = require('fs');
+const { fetchIfDue } = require('./lib/fetch-throttle.js');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const gate = require('./derived-gate.js');
@@ -29,13 +30,13 @@ const FETCH_TTL_MS = 60_000;
 
 function writeJson(p, data) { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, JSON.stringify(data, null, 2)); }
 
-// Best-effort, rate-limited: a stale origin/<main> would make a brand-new file look "missing", so refresh it (at most once a minute) first.
-function refreshMain(repoRoot, mainBranch, markerPath, now) {
+// Best-effort, rate-limited: a stale origin/<main> would make a brand-new file look "missing", so refresh it first. 2026-11-03 (ADR-0024): through the shared
+// per-repository throttle (src/lib/fetch-throttle.js) so this and task-log-reconcile.js share ONE full `git fetch origin` per watchdog tick instead of one each;
+// it is a FULL fetch now (not main-only) because a stamp must mean "every ref is fresh". `markerPath` is kept for callers and is no longer used. `run` is injectable.
+function refreshMain(repoRoot, mainBranch, markerPath, now, run) {
   try {
-    const last = fs.existsSync(markerPath) ? fs.statSync(markerPath).mtimeMs : 0;
-    if (now - last < FETCH_TTL_MS) return;
-    execFileSync('git', ['fetch', '-q', 'origin', mainBranch], { cwd: repoRoot, stdio: 'ignore', timeout: 30_000 });
-    fs.writeFileSync(markerPath, String(now));
+    const doFetch = run || (() => execFileSync('git', ['fetch', '-q', 'origin'], { cwd: repoRoot, stdio: 'ignore', timeout: 30_000 }));
+    fetchIfDue(repoRoot, { run: doFetch, now });
   } catch { /* offline / no origin: the check then uses what is already fetched, and the working tree */ }
 }
 

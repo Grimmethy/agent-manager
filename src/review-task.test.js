@@ -120,7 +120,7 @@ require('./task-sources.js');
   }
 }
 
-const { reviewTask, buildVerdictPrompt, renderImplementResponseForReview } = require('./review-task.js');
+const { reviewTask, buildVerdictPrompt, renderImplementResponseForReview, INERT_MAX_ITEMS } = require('./review-task.js');
 
 // A generic reviewable task that DOES go through the LLM majority vote. (brain_dump_sort
 // stopped doing that in 2026-09-03 -- it uses deterministicReview now, see
@@ -2626,7 +2626,7 @@ test('the inert finder is not called while its switch is off, or for a task that
   })();
 });
 
-test('end to end: an inert finding is recorded, noted in the history and shown to the voters, and it never blocks', withInertCheck(async () => {
+test('end to end: an inert finding is recorded, noted in the history and shown to the voters, and it never blocks (shadow default)', withInertCheck(async () => {
   const { repoRoot, domainsPath } = makeFixture();
   const task = adhocImplementedTask({ id: 'inert-e2e' });
   const captured = [];
@@ -2638,7 +2638,8 @@ test('end to end: an inert finding is recorded, noted in the history and shown t
   assert.equal(seen.repoRoot, repoRoot);
   assert.equal(task.inertAdditions.total, 2);
   assert.equal(task.inertAdditions.hubChild, false);
-  assert.match(task.history.find((h) => h.stage === 'advisory' && /inert-addition check/.test(h.detail)).detail, /2 unreferenced addition\(s\) \(orphanHelper, new-lib\.js\)$/);
+  // Shadow default: history event says "would block (shadow):" but never blocks.
+  assert.match(task.history.find((h) => h.stage === 'advisory' && /would block \(shadow\):/.test(h.detail)).detail, /would block \(shadow\): 2 unreferenced addition\(s\): orphanHelper, new-lib\.js$/);
   assert.match(captured[0], /Unreferenced additions \(deterministic check; advisory\)/);
   assert.match(captured[0], /Nothing in this task wires them in/);
 }));
@@ -2685,6 +2686,147 @@ test('replay: the real inert check, against a real git remote, tells the voters 
 }));
 
 
+
+// --- inert block modes: shadow / on / off (brain dump #1665 slice 3) ---------------------------------------------------------------------------------
+test('shadow default never blocks and records the would-block line', withInertCheck(async () => {
+  delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK;  // ensure default
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'inert-shadow' });
+  const captured = [];
+  await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+  assert.equal(task.history.some((h) => /would block \(shadow\):/.test(h.detail)), true, 'shadow appends the would-block line');
+  assert.equal(captured.length, 1, 'shadow never blocks the vote');
+}));
+
+test('on mode blocks a non-exempt standalone task with a clear reason', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-on-block' });
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(result.verdict, 'blocked');
+    assert.ok(task.blockedReason, 'blockedReason is set');
+    assert.match(task.blockedReason, /Blocked: 2 unreferenced addition\(s\)/);
+    assert.match(task.blockedReason, /orphanHelper/);
+    assert.match(task.blockedReason, /new-lib\.js/);
+    assert.match(task.blockedReason, /Fix: add the caller in this change, or put "foundation only" in the task text/);
+    assert.equal(task.history.some((h) => h.stage === 'blocked' && /inert addition blocked/.test(h.detail)), true);
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('on mode does not block a hub child', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-hub-on', dependsOn: ['HUB0001-01-a'] });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'hub child still votes');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('on mode does not block a stacked task', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-stacked-on', stacked: { branch: 'agent/x', seq: 2, total: 3 } });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'stacked task still votes');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('on mode does not block a task with "foundation only" in prompt', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-foundation', promptContext: { rawText: 'Add a foundation only helper' } });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'foundation only still votes');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('on mode does not block a task with "inert until" in prompt', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-inert-until', promptContext: { rawText: 'This is inert until the next slice' } });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'inert until still votes');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('on mode does not block a task with "no caller yet" in prompt', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-no-caller', promptContext: { rawText: 'Add this with no caller yet' } });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'no caller yet still votes');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('off mode behaves exactly as today (advisory only)', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'off';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-off' });
+    const captured = [];
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+    assert.equal(captured.length, 1, 'off mode still votes');
+    assert.equal(task.history.some((h) => /would block \(shadow\):/.test(h.detail)), false, 'off mode does not append shadow line');
+    assert.equal(task.history.some((h) => /inert-addition check:/.test(h.detail)), true, 'off mode appends advisory history');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('AGENT_MANAGER_REVIEW_INERT_CHECK=false changes nothing', async () => {
+  delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK;
+  process.env.AGENT_MANAGER_REVIEW_INERT_CHECK = 'false';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-check-off' });
+    let calls = 0;
+    const finder = () => { calls += 1; return INERT_FOUND; };
+    const captured = [];
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: finder });
+    assert.equal(calls, 0, 'finder not called');
+    assert.equal(captured.length, 1, 'vote still happens');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_CHECK; }
+});
+
+test('no inert additions never blocks', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'inert-clean' });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => ({ considered: 2, unknown: 0, inert: [] }) });
+    assert.equal(result.verdict, 'approved');
+    assert.equal(captured.length, 1, 'clean task still votes');
+    assert.equal(task.history.some((h) => /inert addition blocked/.test(h.detail)), false, 'no blocked history');
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
+
+test('blockedReason lists at most INERT_MAX_ITEMS names', withInertCheck(async () => {
+  process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const manyInert = { considered: 10, unknown: 0, inert: Array.from({ length: 12 }, (_, i) => ({ kind: 'function', name: `orphan${i}`, file: 'src/a.js', line: i })) };
+    const task = adhocImplementedTask({ id: 'inert-many' });
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {}, findInertFn: () => manyInert });
+    assert.equal(result.verdict, 'blocked');
+    const inertItems = task.inertAdditions.inert;
+    assert.ok(inertItems.length <= INERT_MAX_ITEMS, `blockedReason lists at most ${INERT_MAX_ITEMS} items, got ${inertItems.length}`);
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_INERT_BLOCK; }
+}));
 
 // --- the voters are told when a diff adds a skip / dismiss / early-exit path (brain dump #1667) ---------------------------------------------------------
 function withSkipPathRule(fn) {
@@ -3087,4 +3229,107 @@ test('hit-count gate: reviewTask counts the draft post-image (a correct draft re
       assert.equal(captured.length, 1, 'a correct draft reaches the vote');
     }
   }
+});
+
+// ---- comment-only diffs close as a no-op instead of an applied branch (2026-10-31, discard analysis) ----------------------------------------------------
+// src/review-comment-only.js decides; review-task.js acts before any vote. Real reviewTask and real applyAdhocDiff, only the vote is faked.
+
+const COMMENT_ONLY_DIFF = [
+  'diff --git a/test/schedule.test.js b/test/schedule.test.js', '--- a/test/schedule.test.js', '+++ b/test/schedule.test.js', '@@ -10,3 +10,4 @@',
+  '   const defs = makeDefs()', '+  // intentional: deep clone for immutability check -- not a hot path', '   const original = JSON.parse(JSON.stringify(defs))', '   dueDefs(defs, day)', '',
+].join('\n');
+const CODE_AND_COMMENT_DIFF = COMMENT_ONLY_DIFF.replace('   dueDefs(defs, day)', '-  dueDefs(defs, day)\n+  dueDefs(defs, day + 1)');
+
+function brainDumpFix(overrides = {}) {
+  return adhocImplementedTask({ id: 'co-fix', promptContext: { brainDumpEntryId: 'bd-1793403711417-schedule', rawText: 'a brain-dump finding' }, rawDiff: COMMENT_ONLY_DIFF, ...overrides });
+}
+async function reviewWithVote(task) {
+  const { repoRoot, domainsPath } = makeFixture();
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  return { result, captured, repoRoot };
+}
+
+test('a comment-only brain-dump fix is approved with NO vote, its diff is kept, and it becomes a no-change task', async () => {
+  const task = brainDumpFix();
+  const original = task.rawDiff;
+  const { result, captured } = await reviewWithVote(task);
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 0, 'no model vote');
+  assert.equal(task.reviewProvider, 'deterministic-comment-only');
+  assert.equal(task.rawDiff, '', 'nothing left to apply as a branch');
+  assert.equal(task.adhocResolution, 'no-changes-needed');
+  assert.equal(task.commentOnlyDiff, original, 'the original diff stays on the record');
+  assert.deepEqual(task.commentOnly.files, [{ path: 'test/schedule.test.js', removed: 0, added: 1 }]);
+  assert.match(task.implementResponse, /^Comment-only change, no behavior: test\/schedule\.test\.js/);
+  assert.match(task.history.at(-1).detail, /deterministic-comment-only: 1 file\(s\) with only comment or docstring changes; closed as a no-op, no branch will be applied/);
+});
+
+test('apply then records it as a skipped no-op (terminalDisposition noop), never a branch', async () => {
+  const task = brainDumpFix({ id: 'co-apply' });
+  const { repoRoot } = await reviewWithVote(task);
+  const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
+  const applied = applyAdhocDiff({ task, repoRoot, pipelineDir: repoRoot, exec: () => { throw new Error('apply must not run git for a no-op'); } });
+  assert.equal(applied.skipped, true);
+  assert.match(applied.reason, /^no code change needed: Comment-only change, no behavior/);
+  assert.equal(require('./task-disposition.js').isNoopApplyDetail(applied.reason), true, 'the disposition logic reads it as a no-op');
+});
+
+test('a diff that changes code as well as comments still goes to the vote', async () => {
+  const task = brainDumpFix({ id: 'co-mixed', rawDiff: CODE_AND_COMMENT_DIFF });
+  const { result, captured } = await reviewWithVote(task);
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 1, 'the vote happened');
+  assert.notEqual(task.reviewProvider, 'deterministic-comment-only');
+  assert.equal(task.adhocResolution, 'implemented');
+  assert.equal(task.rawDiff, CODE_AND_COMMENT_DIFF);
+});
+
+test('only brain-dump-derived, non-hub adhoc fixes are short-circuited', async () => {
+  for (const [label, overrides] of [
+    ['no brainDumpEntryId', { promptContext: { rawText: 'a task someone filed' } }],
+    ['a hub slice (stacked)', { stacked: { branch: 'agent/decompose-hub-x', seq: 2, total: 3 } }],
+    ['a hub slice (dependsOn)', { dependsOn: ['HUB0001-01-a'] }],
+    ['not an implemented draft', { adhocResolution: 'no-changes-needed' }],
+  ]) {
+    const task = brainDumpFix({ id: `co-skip-${label.replace(/\W+/g, '-')}`, ...overrides });
+    await reviewWithVote(task);
+    assert.notEqual(task.reviewProvider, 'deterministic-comment-only', label);
+    assert.equal(task.commentOnlyDiff, undefined, label);
+  }
+});
+
+test('the kill switch AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK=false sends a comment-only diff to the vote', async () => {
+  process.env.AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK = 'false';
+  try {
+    const task = brainDumpFix({ id: 'co-off' });
+    const { captured } = await reviewWithVote(task);
+    assert.equal(captured.length, 1);
+    assert.notEqual(task.reviewProvider, 'deterministic-comment-only');
+    assert.equal(task.rawDiff, COMMENT_ONLY_DIFF);
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_COMMENT_ONLY_CHECK; }
+});
+
+// 2026-11-02 stalled-task loop: a function_length_review Solution that NAMES the extracted pieces is concrete without a code fence -----------------------------------------
+test('namesExtractedPieces: two or more named new identifiers in the Solution count, prose-only does not', () => {
+  const { namesExtractedPieces } = require('./review-task.js');
+  assert.equal(namesExtractedPieces('### AC-1\nProblem: long.\nSolution: Extract `buildPlanContext(params)` and `postProcessResponse(response, opts)` from the loop.\n\nBenefits:\nTestable.'), true);
+  assert.equal(namesExtractedPieces('Solution: Extract five subfunctions: `_validate_input`, `_map_timestamps`, `_wrap_text`.\n\nBenefits: x'), true);
+  assert.equal(namesExtractedPieces('Solution: split it into three smaller helper functions, one per responsibility, and call each in turn.\n\nBenefits: x'), false);
+  assert.equal(namesExtractedPieces('Solution: Extract `buildContext` only, keep the rest.\n\nBenefits: x'), false, 'one name is not a decomposition');
+  assert.equal(namesExtractedPieces('Problem: the old buildPlanContext and postProcessResponse are long.\nSolution: split it up.\n\nBenefits: x'), false, 'names outside the Solution section do not count');
+  assert.equal(namesExtractedPieces('Solution: call `do_it` then `go_on` and use it_is here.\n\nBenefits: x'), false, 'short snake_case words are not named pieces');
+  assert.equal(namesExtractedPieces(''), false);
+});
+
+test('reviewTask lets a function_length_review draft that names its extracted pieces through to the vote instead of the missing-code-diff block', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({
+    domain: 'default', source: 'function_length_review',
+    implementResponse: '### AC-9\nProblem: runPlanWithTools is 492 lines and stacks four concerns.\nSolution: Extract `buildPlanContext(params)` for the setup block and `postProcessResponse(response, opts)` for the marker dispatch; the tool-calling loop stays.\n\nBenefits:\nEach piece is testable.',
+  });
+  const captured = [];
+  await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  assert.notEqual(task.reviewProvider, 'deterministic-missing-code-diff');
+  assert.equal(captured.length, 1, 'reaches a real vote');
 });

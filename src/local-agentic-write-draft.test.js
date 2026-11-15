@@ -165,6 +165,98 @@ test('detectExternalDependency ignores the plan echo and code spans/fences (clas
   assert.equal(classifyExternalDependency({ title: 'add the API key to config' }).severity, 'soft');
 });
 
+// 2026-10-30: a task that WRITES FILES may describe what a guide should say. The exact sentence that blocked the questforge deploy kit twice.
+const DEPLOY_KIT_TEXT = [
+  'REPO RULES: ES modules.',
+  'WHAT: create deploy/install.sh, deploy/healthcheck.sh, Docs/DEPLOY.md and test/deploy.test.js ONLY.',
+  '4. env.example: the QUESTFORGE_* variables with comments and safe defaults.',
+  "5. Docs/DEPLOY.md: what the service is, prerequisites, step by step: copy the app (git clone or rsync of bin/ server/ src/ is the owner's choice), dry run, apply.",
+  'DO NOT: run systemctl or ssh in tests.',
+].join('\n');
+
+test('detectExternalDependency does NOT block on a git clone that only describes what a guide the task writes should say', () => {
+  const { detectExternalDependency, classifyExternalDependency } = freshModule();
+  const task = { title: 'Deploy kit for a private Linux host', promptContext: { rawText: DEPLOY_KIT_TEXT } };
+  assert.equal(detectExternalDependency(task, { mode: 'block' }), null);
+  assert.equal(detectExternalDependency(task, { mode: 'advisory' }), null);
+  assert.equal(classifyExternalDependency(task), null);
+});
+
+test('detectExternalDependency still blocks a real git push in a task that also writes files', () => {
+  const { detectExternalDependency } = freshModule();
+  const task = { title: 'Edit the loader', promptContext: { rawText: 'Files: src/loader.js\nEdit src/loader.js, then git push origin main after the edit.' } };
+  assert.equal(detectExternalDependency(task, { mode: 'advisory' }), 'a git remote operation');
+});
+
+test('detectExternalDependency still blocks creating a new repo even when the task declares files to create', () => {
+  const { detectExternalDependency } = freshModule();
+  const task = { title: 'Set up the plugin', promptContext: { rawText: 'WHAT: create src/a.js ONLY.\nAlso create a new repo for the plugin.' } };
+  assert.equal(detectExternalDependency(task, { mode: 'advisory' }), 'creating a new repo');
+});
+
+test('detectExternalDependency behaves as before when the task declares no files to create', () => {
+  const { detectExternalDependency } = freshModule();
+  const task = { promptContext: { rawText: '5. Docs/DEPLOY.md: step by step: copy the app (git clone or rsync).' } };
+  assert.equal(detectExternalDependency(task, { mode: 'advisory' }), 'a git remote operation');
+});
+
+test('detectExternalDependency still blocks a genuine git push that comes AFTER a guide-content mention', () => {
+  const { detectExternalDependency } = freshModule();
+  const rawText = 'WHAT: create Docs/DEPLOY.md ONLY.\n5. Docs/DEPLOY.md: step by step: copy the app (git clone or rsync).\nFinally git push the branch to the remote.';
+  assert.equal(detectExternalDependency({ title: 'Deploy guide', promptContext: { rawText } }, { mode: 'advisory' }), 'a git remote operation');
+});
+
+test('isDocContentMention needs both a files-to-create declaration and a document-description line', () => {
+  const { isDocContentMention, taskDeclaresFilesToCreate } = freshModule();
+  const line = '5. Docs/DEPLOY.md: step by step: git clone it';
+  assert.equal(taskDeclaresFilesToCreate('Files: a.js'), true);
+  assert.equal(taskDeclaresFilesToCreate('nothing declared'), false);
+  assert.equal(isDocContentMention('WHAT: create Docs/DEPLOY.md ONLY.\n' + line, ('WHAT: create Docs/DEPLOY.md ONLY.\n' + line).indexOf('git clone')), true);
+  assert.equal(isDocContentMention(line, line.indexOf('git clone')), false);
+  const plain = 'Files: a.js\nRun git clone now.';
+  assert.equal(isDocContentMention(plain, plain.indexOf('git clone')), false);
+});
+
+// 2026-10-30 (HUB0256-01): 'git push' as the subject of a RESULT noun describes handling the command's output, not running it.
+const HUB0256_SENTENCE = "In api_git_discard_branch (python/dashboard/routes/pipeline_1_more.py), map git push --delete errors containing 'Permission to', 'denied', '403', or 'Authentication failed' to a clear message.";
+
+test('detectExternalDependency does NOT block on a git push that only names the errors a route must map (HUB0256-01)', () => {
+  const { detectExternalDependency } = freshModule();
+  const task = { title: 'Add permission-error handling to discard route', promptContext: { rawText: HUB0256_SENTENCE } };
+  assert.equal(detectExternalDependency(task, { mode: 'block' }), null);
+  assert.equal(detectExternalDependency(task, { mode: 'advisory' }), null);
+});
+
+test('detectExternalDependency exempts a git marker followed by a result noun (errors, output, failures)', () => {
+  const { detectExternalDependency } = freshModule();
+  for (const rawText of ['parse git clone output into a dict', 'handle git push failures gracefully', 'log the git push stderr to the audit file', 'show git push --delete errors in the card']) {
+    assert.equal(detectExternalDependency({ promptContext: { rawText } }, { mode: 'block' }), null, rawText);
+  }
+});
+
+test('detectExternalDependency still blocks git push and git clone used as instructions', () => {
+  const { detectExternalDependency } = freshModule();
+  for (const rawText of ['run git push origin main after the edit', 'git push the branch', 'then git clone the remote', 'git push --force']) {
+    assert.equal(detectExternalDependency({ promptContext: { rawText } }, { mode: 'advisory' }), 'a git remote operation', rawText);
+  }
+});
+
+test('detectExternalDependency still blocks a genuine git push that comes AFTER a result-handling mention', () => {
+  const { detectExternalDependency } = freshModule();
+  const rawText = 'map git push errors to a 403 message, and finally git push origin main to publish it';
+  assert.equal(detectExternalDependency({ promptContext: { rawText } }, { mode: 'advisory' }), 'a git remote operation');
+});
+
+test('isResultHandlingMention: flags and up to three words may sit between the marker and the result noun', () => {
+  const { isResultHandlingMention } = freshModule();
+  const at = (text) => { const m = /\bgit\s+(?:remote|push|clone)\b/i.exec(text); return isResultHandlingMention(text, m.index, m[0].length); };
+  assert.equal(at('map git push --delete errors'), true);
+  assert.equal(at('map git push to remote errors'), true);
+  assert.equal(at('map git push to the remote origin errors'), false);
+  assert.equal(at('git push origin main'), false);
+  assert.equal(at('git push'), false);
+});
+
 test('detectExternalDependency modes: hard markers block unless off; soft markers block only in block mode', () => {
   const { detectExternalDependency, externalDependencyAdvisory } = freshModule();
   const hard = { title: 'Create a new repo for the plugin' };

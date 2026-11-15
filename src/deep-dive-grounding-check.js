@@ -40,7 +40,6 @@ const { builtinModules } = require('module');
 // undefined falls through to LOCAL_MODEL; AGENT_MANAGER_DEEP_DIVE_GROUNDING_MODEL still
 // opts a genuinely separate model back in.
 const GROUNDING_CHECK_MODEL = process.env.AGENT_MANAGER_DEEP_DIVE_GROUNDING_MODEL;
-const GROUNDING_CHECK_NUM_CTX = 8192;
 
 function isEnabled() {
   return process.env.AGENT_MANAGER_DEEP_DIVE_GROUNDING_CHECK !== 'false';
@@ -297,7 +296,7 @@ async function runGroundingCheck(task, implementResponse = (task && (task.implem
 
   const prompt = buildGroundingCheckPrompt(task, text);
   const fn = () => call({
-    prompt, model: GROUNDING_CHECK_MODEL, numCtx: GROUNDING_CHECK_NUM_CTX,
+    prompt, model: GROUNDING_CHECK_MODEL,
     think: false, temperature: 0.2, numPredict: 300, source: task.source,
   });
   let result;

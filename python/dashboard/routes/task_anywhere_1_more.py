@@ -83,10 +83,19 @@ def api_task_set_premium_priority(task_id):
     drafting, adhoc, ...) -- an operator flagging a task that's mid-retry-cycle (like the
     file-decompose move this feature was built for, which was cycling blocked <-> pending
     for hours) needs to be able to set this BEFORE it's back in pending/, not only once
-    it happens to be there. Body: {"enabled": true|false}, defaults to true."""
+    it happens to be there. Body: {"enabled": true|false}, defaults to true.
+
+    Provenance (display only, claim order never reads it): setting records premiumSetBy
+    ("operator-ui" by default; the body may say "by": "operator-bulk") and premiumSetAt (ISO)
+    and drops any stale premiumClearedAt/By; clearing records premiumClearedAt/By and keeps
+    the last premiumSetBy/At. There is no bulk-premium route on master yet: when one lands it
+    must post here with "by": "operator-bulk"."""
     from app import _find_live_task_file, get_active_repo_root, queue_dir, read_json_safe
     body = request.get_json(silent=True) or {}
     enabled = bool(body.get("enabled", True))
+    by = body.get("by", "operator-ui")
+    if by not in ("operator-ui", "operator-bulk"):
+        abort(400, description='"by" must be "operator-ui" or "operator-bulk"')
 
     # Optional project (a registered repoRoot, query or body): look only in THAT project's queue. Absent = the active project, as before; unknown = 404, never a fallback.
     import branch_projects
@@ -105,16 +114,86 @@ def api_task_set_premium_priority(task_id):
     if not data:
         abort(500, description="could not read the task file")
 
+    now_iso = datetime.now(timezone.utc).isoformat()
     if enabled:
         data["premiumPriority"] = True
+        data["premiumSetBy"] = by
+        data["premiumSetAt"] = now_iso
+        data.pop("premiumClearedAt", None)
+        data.pop("premiumClearedBy", None)
     else:
         data.pop("premiumPriority", None)
+        data["premiumClearedAt"] = now_iso
+        data["premiumClearedBy"] = by
     data.setdefault("history", []).append({
-        "stage": "advisory", "at": datetime.now(timezone.utc).isoformat(),
-        "detail": f"premium priority {'set' if enabled else 'cleared'} by operator override",
+        "stage": "advisory", "at": now_iso,
+        "detail": f"premium priority {'set' if enabled else 'cleared'} by operator override ({by})",
     })
     target.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return jsonify({"id": task_id, "premiumPriority": enabled})
+
+
+# Link kinds a worker may record between two task records (owner order 2026-11-06: a fix filed for a needs-work branch must be traceable from BOTH records).
+TASK_LINK_KINDS = ("replaced-by", "replaces", "repaired-by", "repairs", "redrafted-as", "cherry-picked-by")
+
+
+@task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>/link", methods=["POST"])
+def api_task_link(task_id):
+    """Record a typed link from this task's record to another task (and its branch), wherever the record sits (any queue state, done included).
+
+    Body: {"kind": one of TASK_LINK_KINDS, "taskId": "<the other task's id>", "branch": "<its branch, optional>", "by": "<who, optional>", "note": "<short, optional>"}.
+    Appends {kind, taskId, branch, by, note, at} to the record's `links` list and one history event, in place. Idempotent: the same (kind, taskId) is never added twice and the
+    call answers 200 with added=false. The Needs-Work worker calls it on the OLD task when it files a replacement/repair/redraft and on the NEW task for the reverse link, so the
+    two records can be followed in both directions (before this the only link was the worker's own registry file). Pass ?project=<repoRoot> to reach another registered project's queue."""
+    from app import _find_live_task_file, get_active_repo_root, queue_dir, read_json_safe
+    body = request.get_json(silent=True) or {}
+    kind = body.get("kind")
+    other = body.get("taskId")
+    if kind not in TASK_LINK_KINDS:
+        abort(400, description=f'"kind" must be one of: {", ".join(TASK_LINK_KINDS)}')
+    if not isinstance(other, str) or not other.strip() or "/" in other or other.strip() == task_id:
+        abort(400, description='"taskId" must be the id of a different task')
+    branch = body.get("branch")
+    if branch is not None and (not isinstance(branch, str) or len(branch) > 300):
+        abort(400, description='"branch" must be a short string')
+    by = str(body.get("by") or "operator")[:60]
+    note = str(body.get("note") or "")[:300]
+
+    import branch_projects
+    try:
+        scope = branch_projects.resolve_scope(request.args.get("project") or body.get("project"), get_active_repo_root())
+    except LookupError as e:
+        abort(404, description=str(e))
+    qdir = scope["qdir"] if scope else queue_dir()
+    if not qdir:
+        abort(404)
+    target = _find_live_task_file(qdir, task_id)
+    if not target:
+        abort(404, description=f"'{task_id}' not found in any queue state")
+    data = read_json_safe(target)
+    if not data:
+        abort(500, description="could not read the task file")
+
+    links = data.get("links")
+    if not isinstance(links, list):
+        links = []
+    other = other.strip()
+    if any(isinstance(l, dict) and l.get("kind") == kind and l.get("taskId") == other for l in links):
+        return jsonify({"id": task_id, "added": False, "links": links})
+    now_iso = datetime.now(timezone.utc).isoformat()
+    entry = {"kind": kind, "taskId": other, "at": now_iso, "by": by}
+    if branch:
+        entry["branch"] = branch
+    if note:
+        entry["note"] = note
+    links.append(entry)
+    data["links"] = links
+    data.setdefault("history", []).append({
+        "stage": "advisory", "at": now_iso,
+        "detail": f"linked: {kind} {other}" + (f" ({branch})" if branch else "") + f" by {by}",
+    })
+    target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return jsonify({"id": task_id, "added": True, "links": links})
 
 
 @task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>/hub-priority", methods=["POST"])

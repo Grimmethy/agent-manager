@@ -15,10 +15,53 @@ import sys
 # pattern as routes/concepts.py, routes/second_brain.py, routes/reports.py.)
 
 instances_bp = Blueprint("instances-bp", __name__)
+from routes.pause import pause_bp  # noqa: E402  (machine pauses, nested here so app.py needs no change)
+instances_bp.register_blueprint(pause_bp)
+from routes.nodes import nodes_bp  # noqa: E402  (node registry list, nested here so app.py needs no change)
+instances_bp.register_blueprint(nodes_bp)
+
+
+def lane_fields_for(instance_id, lane_defs):
+    """Return the three lane-metadata keys that every /api/instances entry should carry.
+
+    Pure function: no I/O, no Flask, no import of app.  Used both by the route
+    (after a single call to worker_lane_defs() per request) and by tests.
+
+    provider:  "cloud" when lane.provider == "cloud" or lane.cloud is True;
+               "script" when lane.provider == "script" or lane.script is True;
+               otherwise "local".
+    taskClasses:  lane.taskClasses when it is a list, else None.
+    tierB:  lane.tier when it is a number, else None.
+
+    An instance_id with no matching lane (reviewers, watchdog, apply-loop,
+    unknown ids) and an empty lane_defs list both yield three Nones -- the
+    route never guesses when it has no lane definition to consult.
+    """
+    lane = None
+    if lane_defs:
+        for l in lane_defs:
+            if isinstance(l, dict) and l.get("id") == instance_id:
+                lane = l
+                break
+    if lane is None:
+        return {"provider": None, "taskClasses": None, "tierB": None}
+    provider = "local"
+    if lane.get("provider") == "cloud" or lane.get("cloud") is True:
+        provider = "cloud"
+    elif lane.get("provider") == "script" or lane.get("script") is True:
+        provider = "script"
+    task_classes = lane.get("taskClasses") if isinstance(lane.get("taskClasses"), list) else None
+    tier = lane.get("tier")
+    tier_b = tier if isinstance(tier, (int, float)) and not isinstance(tier, bool) else None
+    return {"provider": provider, "taskClasses": task_classes, "tierB": tier_b}
+
 
 @instances_bp.route("/api/instances")
 def api_instances():
-    from app import OTHER_STALE_SECONDS, WORKING_STALE_SECONDS, _expected_instance_ids, instances_dir, parse_hb_timestamp, read_json_safe
+    from app import (
+        OTHER_STALE_SECONDS, WORKING_STALE_SECONDS, _expected_instance_ids,
+        instances_dir, parse_hb_timestamp, read_json_safe, worker_lane_defs,
+    )
     results = []
     seen_ids = set()
     inst_dir = instances_dir()
@@ -76,7 +119,7 @@ def api_instances():
     for r in results:
         if not r.get("currentTaskId"):
             continue
-        # Which project the task belongs to (a lane can be running a borrowed suite project's task; docs/idle-pool-borrowing.md), and
+        # Which project the task belongs to (a lane can be running a borrowed suite project's task; docs/design-notes/idle-pool-borrowing.md), and
         # its hub looked up in THAT project's queue, not the active one's.
         project, borrowed, task_qdir = _worker_project_info(r, active_label, qdir)
         r["projectLabel"] = project
@@ -94,6 +137,14 @@ def api_instances():
         if is_switchable(r.get("instanceId")):
             r["switchable"] = True
             r["disabled"] = r["instanceId"] in off
+    # Lane metadata (HUB0325 · 1/6): one call per request, cached for a few seconds
+    # by worker_lane_defs() -- no new subprocess per poll.
+    try:
+        lane_defs = worker_lane_defs()
+    except Exception:
+        lane_defs = []
+    for r in results:
+        r.update(lane_fields_for(r.get("instanceId"), lane_defs))
     results.sort(key=lambda r: r.get("instanceId") or "")
     return jsonify(results)
 
@@ -209,9 +260,13 @@ def api_instance_run_log(instance_id):
         state during the 2026-09-08 GPU-contention incident was dozens of back-to-back
         OLLAMA_TIMEOUTs that the terminal-state-only recent-tasks view had no way to
         show at all -- it just looked stale.
+      - every chat session this instance ran (only when instance_id='chat'), surfaced
+        as stage='chat' rows so the chat instance's own run log shows what it actually
+        did. Worker instances never see chat rows -- the chat instance is a dedicated
+        system instance, not a worker lane.
 
     Merged and sorted by timestamp, newest first."""
-    from app import _find_task_record_anywhere, _has_instance_id_column, _read_pipeline_history_events, instances_dir, model_stats_db_path, queue_dir
+    from app import _find_task_record_anywhere, _has_instance_id_column, _read_pipeline_history_events, CHAT_STORAGE_DIR, instances_dir, model_stats_db_path, queue_dir
     limit = min(max(request.args.get("limit", 30, type=int) or 30, 1), 100)
     qdir = queue_dir()
     db_path = model_stats_db_path()
@@ -249,6 +304,62 @@ def api_instance_run_log(instance_id):
             "model": ev.get("model"), "kind": "failed", "outcome": ev.get("code") or "error",
             "detail": ev.get("message"),
         })
+    # Chat sessions (instance_id='chat'): surface each chat session as a run-log row so
+    # the chat instance's own run log shows what it actually did, not just the
+    # model_calls rows (which record_call writes per-turn but don't group per-session).
+    # Worker instances never see chat rows -- the chat instance is a dedicated system
+    # instance, not a worker lane, so filtering on instance_id='chat' keeps the Workers
+    # tab clean.
+    if instance_id == "chat":
+        from datetime import datetime, timezone
+        from pathlib import Path
+        import chat_sessions
+        storage_dir = CHAT_STORAGE_DIR if isinstance(CHAT_STORAGE_DIR, Path) else Path(CHAT_STORAGE_DIR)
+        if storage_dir.is_dir():
+            sessions_file = chat_sessions.chat_sessions_path(storage_dir)
+            if sessions_file.is_file():
+                try:
+                    sessions = json.loads(sessions_file.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    sessions = {}
+                for sid, session in sessions.items():
+                    if session.get("status") not in ("active", "ended"):
+                        continue
+                    started_at = session.get("startedAt") or ""
+                    ended_at = session.get("endedAt")
+                    transcript = session.get("transcript") or []
+                    turns_used = len(transcript)
+                    duration_ms = None
+                    if started_at and ended_at:
+                        try:
+                            start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                            end_dt = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+                            duration_ms = int((end_dt - start_dt).total_seconds() * 1000)
+                        except (ValueError, TypeError):
+                            pass
+                    elif started_at:
+                        try:
+                            start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                            duration_ms = int((datetime.now(timezone.utc) - start_dt).total_seconds() * 1000)
+                        except (ValueError, TypeError):
+                            pass
+                    title = None
+                    for turn in transcript:
+                        if turn.get("role") == "user" and turn.get("text"):
+                            title = turn["text"][:100]
+                            break
+                    runs.append({
+                        "at": started_at,
+                        "taskId": sid,
+                        "stage": "chat",
+                        "model": session.get("model"),
+                        "kind": "chat",
+                        "outcome": "chat turn",
+                        "session_id": sid,
+                        "duration": duration_ms,
+                        "turns_used": turns_used,
+                        "title": title,
+                    })
     runs.sort(key=lambda r: r.get("at") or "", reverse=True)
     return jsonify({"runs": runs[:limit]})
 

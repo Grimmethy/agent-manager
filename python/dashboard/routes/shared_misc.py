@@ -421,7 +421,7 @@ def _cached_verdict(kind, path, compute, seen):
     key = (kind, str(path), st.st_mtime_ns, st.st_size)
     seen.add(key)
     if key not in _verdict_cache:
-        _verdict_cache[key] = bool(compute(read_json_safe(path)))
+        _verdict_cache[key] = bool(compute(rec if isinstance(rec := read_json_safe(path), dict) else None))  # a stray list/string/null file is not a record
     return _verdict_cache[key]
 
 
@@ -519,26 +519,49 @@ def _compute_summary_counts(qdir):
     return counts
 
 
+def _with_memory(counts, qdir=None):
+    """The cached queue counts plus the host-memory state for the header chip, and the queue-events journal counter. Computed per call, NOT cached with the counts:
+    each is one tiny file read (see memory_status.py and queue_events_status.py) and the chip must show a pressure change on the very next refresh."""
+    import memory_status
+    import event_stream
+    import queue_events_status
+    return {**dict(counts), "memory": memory_status.memory_status(), "queueEvents": queue_events_status.queue_events_status(qdir), "eventStream": event_stream.hub_status()}
+
+
+@shared_misc_bp.route("/api/memory/unload-ollama", methods=["POST"])
+def api_memory_unload_ollama():
+    """The header chip's owner-only button: ask the gpu-broker to unload its Ollama models. The broker refuses (403) unless it was started with
+    AGENT_MANAGER_MEM_RELIEF_OLLAMA=owner, and a broker without the route answers 404; both are passed through so the page can hide the button."""
+    import memory_status
+    status, body = memory_status.unload_ollama(who="dashboard")
+    return jsonify(body), status
+
+
 @shared_misc_bp.route("/api/summary")
 def api_summary():
     from app import queue_dir
     qdir = queue_dir()
     key = str(qdir) if qdir else None
 
+    import event_stream
+
     def fresh_value():
+        # The 3 s cache is also dropped when the event stream announced a queue change since the payload was computed: a page told "counts changed" must get the new counts.
         entry = _summary_state["entry"]
-        if entry and entry[0] == key and time.monotonic() - entry[1] < _SUMMARY_TTL_S:
+        if entry and entry[0] == key and time.monotonic() - entry[1] < _SUMMARY_TTL_S and _summary_state.get("gen") == event_stream.generation("counts-changed"):
             return entry[2]
         return None
 
     def recompute():
+        gen = event_stream.generation("counts-changed")      # read BEFORE computing: a change announced while computing must still invalidate this payload
         value = _compute_summary_counts(qdir)
         _summary_state["entry"] = (key, time.monotonic(), value)
+        _summary_state["gen"] = gen
         return value
 
     value = fresh_value()
     if value is not None:
-        return jsonify(dict(value))
+        return jsonify(_with_memory(value, qdir))
     if _summary_lock.acquire(blocking=False):
         try:
             value = fresh_value()
@@ -546,16 +569,16 @@ def api_summary():
                 value = recompute()
         finally:
             _summary_lock.release()
-        return jsonify(dict(value))
+        return jsonify(_with_memory(value, qdir))
     # Another poll is already recomputing: serve the last good payload for this project
     # (flagged stale) rather than stacking behind it; only a caller with nothing to serve waits.
     entry = _summary_state["entry"]
     if entry and entry[0] == key:
-        return jsonify({**entry[2], "stale": True})
+        return jsonify(_with_memory({**entry[2], "stale": True}, qdir))
     with _summary_lock:
         entry = _summary_state["entry"]
         value = entry[2] if entry and entry[0] == key else recompute()
-    return jsonify(dict(value))
+    return jsonify(_with_memory(value, qdir))
 
 
 @shared_misc_bp.route("/api/browse")

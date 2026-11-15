@@ -1,0 +1,42 @@
+# ModelForge Data Schema
+# Defines the structure for 3D models, their formats, sources, and associated assets.
+# Used by ModelForge to validate and serialize 3D model definitions.
+
+model:
+  name:
+    type: string
+    required: true
+    description: Human-readable model identifier (e.g. "player_character", "sword_prop").
+  format:
+    type: string
+    required: true
+    description: >
+      3D model file format.
+      Allowed values: "glTF", "OBJ", "FBX".
+  source:
+    type: string
+    required: true
+    description: >
+      Origin of the model data — the tool, pipeline stage, or asset library it was produced by.
+      Examples: "Blender", "Mixamo", "asset_library", "procedural_generator".
+  mesh_reference:
+    type: string
+    required: true
+    description: >
+      Reference to the mesh asset — a SceneForge scene ID, file path, or asset URI
+      that identifies the geometry data for this model.
+  texture_map_reference:
+    type: string
+    required: false
+    description: >
+      Reference to the texture map asset — a file path, asset URI, or SceneForge
+      texture ID that provides the surface textures for this model.
+
+# Example model:
+#
+# model:
+#   name: "knight_armor"
+#   format: "glTF"
+#   source: "Blender"
+#   mesh_reference: "sceneforge://scenes/knight_armor_mesh"
+#   texture_map_reference: "asset_library://textures/medieval_armor_01.pbr"

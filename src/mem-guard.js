@@ -26,6 +26,9 @@
 const fs = require('fs');
 
 const MIN_AVAILABLE_MB = Number(process.env.AGENT_MANAGER_MIN_AVAILABLE_RAM_MB) || 2048;
+// Swap floor: a last-resort BACKSTOP, not the primary signal. Since 2026-11-02 the primary signal is kernel pressure-stall information, classified by the
+// gpu-broker and read by the lanes from /dev/shm/agent-manager-mem-pressure.json (scripts/agent-manager-common.sh mem_pressure_high); this guard runs only when
+// that marker is missing or stale. Code default 512 MB; the live agent-manager.env sets 128 (on or before 2026-10-16, the reason was not recorded).
 const MIN_SWAP_FREE_MB = Number(process.env.AGENT_MANAGER_MIN_SWAP_FREE_MB) || 512;
 const COMFY_URL = process.env.AGENT_MANAGER_COMFY_URL || process.env.COMFY_URL || 'http://127.0.0.1:8188';
 const EXIT_PRESSURE = 3;

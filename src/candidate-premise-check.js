@@ -37,7 +37,6 @@ const path = require('path');
 const { isForgePause } = require('./gpu-guard.js');
 
 const PREMISE_CHECK_MODEL = process.env.AGENT_MANAGER_CANDIDATE_PREMISE_MODEL;
-const PREMISE_CHECK_NUM_CTX = 8192;
 
 function isEnabled() {
   return process.env.AGENT_MANAGER_CANDIDATE_PREMISE_CHECK !== 'false';
@@ -299,7 +298,7 @@ async function runPremiseCheck(task, { call, maybeLockedOn, repoRoots } = {}) {
 
   const prompt = buildPremiseCheckPrompt(task);
   const fn = () => call({
-    prompt, model: PREMISE_CHECK_MODEL, numCtx: PREMISE_CHECK_NUM_CTX,
+    prompt, model: PREMISE_CHECK_MODEL,
     think: false, temperature: 0.2, numPredict: 300, source: task.source,
   });
   let result;

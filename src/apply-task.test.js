@@ -122,14 +122,14 @@ test.after(() => {
   fs.rmSync(REPO_ROOT, { recursive: true, force: true });
 });
 
-test('happy path: fetch/reset/(delete stale branch)/branch/add/commit/push/checkout in order, succeeds', () => {
+test('happy path: fetch/quarantine/assertCleanTree/reset/(delete stale branch)/branch/add/commit/push/checkout in order, succeeds', () => {
   const gitRunner = createFakeGitRunner();
   const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
   assert.equal(result.succeeded, true);
   assert.equal(result.branch, 'agent/test-task-1');
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
 });
 
 // Regression, 2026-08-25: root-caused live via apply-task-loop.log -- a real task
@@ -161,7 +161,7 @@ test('skipPush ("Implement" mode): still pushes the branch (durability), but sta
   const names = gitRunner.calls.map((c) => c.name);
   // push happens either way now; skipPush's only remaining effect is no checkoutMain
   // afterward, so the branch stays checked out for local inspection.
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push']);
 });
 
 test('happy path (push enabled) reports pushed: true', () => {
@@ -184,7 +184,7 @@ test('push failure after a successful commit keeps the branch instead of deletin
   // the failure: the branch and its real commit are deliberately left in place, not
   // discarded. The one deleteBranch call present is the defensive pre-cleanup BEFORE
   // createBranch, unconditional and unrelated to this test's own push failure.
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push']);
 });
 
 test('artifact write failure rolls back the branch before any add/commit/push', () => {
@@ -198,7 +198,7 @@ test('artifact write failure rolls back the branch before any add/commit/push', 
   // First deleteBranch is the defensive pre-cleanup before createBranch; second is the
   // real rollback after the artifact write failure.
   // The trailing resetToMain (2026-09-24) clears the partial write abandonBranch() leaves uncommitted in the working tree.
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'checkoutMain', 'deleteBranch', 'resetToMain']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'deleteBranch', 'createBranch', 'checkoutMain', 'deleteBranch', 'resetToMain']);
 });
 
 // Regression, 2026-08-22: an empty implementResponse (several Group B sources are
@@ -353,7 +353,7 @@ test('a registered source whose artifact has neither file nor files throws "no t
   const names = gitRunner.calls.map((c) => c.name);
   // Branch created, then the guard throws before writeArtifact ever gets to filesToAdd/add
   // -- crucially never reaches add/commit/push with the bad [undefined] pathspec.
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'deleteBranch', 'createBranch']);
   assert.ok(!names.includes('add'), 'must never call git add with an undefined pathspec');
 });
 
@@ -431,7 +431,7 @@ ungatedTest('arch_discovery: commits straight to main, no branch, pushes immedia
   assert.equal(result.branch, gitRunner.mainBranch);
   const names = gitRunner.calls.map((c) => c.name);
   // No createBranch, no checkoutMain, no deleteBranch -- pushMain instead of push(branch).
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'add', 'commit', 'pushMain']);
 });
 
 ungatedTest('a source with `directToMain: true` on its registration takes the direct-to-main path even without a DIRECT_TO_MAIN_SOURCES literal entry', () => {
@@ -453,7 +453,7 @@ ungatedTest('a source with `directToMain: true` on its registration takes the di
 
   assert.equal(result.succeeded, true);
   assert.equal(result.branch, gitRunner.mainBranch);
-  assert.deepEqual(gitRunner.calls.map((c) => c.name), ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
+  assert.deepEqual(gitRunner.calls.map((c) => c.name), ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'add', 'commit', 'pushMain']);
 });
 
 ungatedTest('arch_discovery: still pushes even when skipPush is true -- an unpushed direct-to-main commit would be destroyed by the next resetToMain()', () => {
@@ -475,7 +475,7 @@ ungatedTest('arch_discovery: push failure keeps the commit local instead of roll
   assert.match(result.reason, /remote: connection reset/);
   const names = gitRunner.calls.map((c) => c.name);
   // commit already happened and is deliberately left in place -- no checkoutMain/deleteBranch.
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'add', 'commit', 'pushMain']);
 });
 
 ungatedTest('arch_discovery: artifact write failure resets main instead of trying to delete a branch that was never created', () => {
@@ -488,7 +488,7 @@ ungatedTest('arch_discovery: artifact write failure resets main instead of tryin
   // the *skipped* path, distinct from the write-throws path covered by the next test.
   assert.equal(result.succeeded, true);
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'resetToMain']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain']);
 });
 
 ungatedTest('arch_import: a genuinely thrown write error resets main again for cleanup (called twice: once up front, once in the catch)', () => {
@@ -502,7 +502,7 @@ ungatedTest('arch_import: a genuinely thrown write error resets main again for c
 
   assert.equal(result.succeeded, false);
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'resetToMain']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'resetToMain']);
 });
 
 // --- candidateSplitProposals: a task judged too large for one atomic edit writes its
@@ -531,7 +531,7 @@ test('candidateSplitProposals: writes both sub-candidates into ARCH_REVIEW_CANDI
   assert.equal(result.succeeded, true);
   assert.equal(result.branch, 'agent/test-task-1');
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
 
   const doc = fs.readFileSync(path.join(REPO_ROOT, 'Docs', 'ARCH_REVIEW_CANDIDATES.md'), 'utf8');
   assert.match(doc, /# Architecture Review Candidates/);
@@ -550,7 +550,7 @@ test('candidateSplitProposals: throws (rolls back the branch) when the resolved 
   assert.match(result.reason, /no registered candidatesPath/);
   const names = gitRunner.calls.map((c) => c.name);
   // The trailing resetToMain (2026-09-24) clears the partial write abandonBranch() leaves uncommitted in the working tree.
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'checkoutMain', 'deleteBranch', 'resetToMain']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'deleteBranch', 'createBranch', 'checkoutMain', 'deleteBranch', 'resetToMain']);
 });
 
 ungatedTest('arch_import: same direct-to-main shape as arch_discovery (both sources share DIRECT_TO_MAIN_SOURCES)', () => {
@@ -574,7 +574,7 @@ ungatedTest('arch_import: same direct-to-main shape as arch_discovery (both sour
   assert.equal(result.succeeded, true);
   assert.equal(result.pushed, true);
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'add', 'commit', 'pushMain']);
 });
 
 // Regression, 2026-08-21: real observability_review/performance_review tasks -- like
@@ -601,7 +601,7 @@ ungatedTest('observability_review: real task shape (domain: default, source: obs
   assert.equal(result.succeeded, true);
   assert.equal(result.pushed, true);
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'add', 'commit', 'pushMain']);
 });
 
 ungatedTest('performance_review: same direct-to-main shape (domain: default, source: performance_review)', () => {
@@ -623,7 +623,7 @@ ungatedTest('performance_review: same direct-to-main shape (domain: default, sou
   assert.equal(result.succeeded, true);
   assert.equal(result.pushed, true);
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'add', 'commit', 'pushMain']);
 });
 
 // --- applyDirectToMainBatch: N directToMain triage tasks -> ONE fetch/reset/commit/push
@@ -682,6 +682,59 @@ test('applyDirectToMainBatch: never stages task-logs/ (gitignored, disk-only) --
   // the log is still written to disk for the user's own local reference
   assert.ok(fs.existsSync(path.join(REPO_ROOT, 'task-logs', 'tl1.json')), 'task-logs/tl1.json should still exist on disk');
   assert.ok(gitRunner.calls.some((c) => c.name === 'commit'), 'the batch still commits');
+});
+
+// HUB0280-04: the log written at apply carries the task's recorded model compute (from model-stats.db in the pipeline dir); no database or no rows for
+// the task leaves the log without a `compute` key.
+test('applyTask (single-task path): the task log carries compute from model-stats.db when the task has recorded calls', () => {
+  const { DatabaseSync } = require('node:sqlite');
+  const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-compute-single-'));
+  const dbPath = path.join(dbDir, 'model-stats.db');
+  const db = new DatabaseSync(dbPath);
+  db.exec('CREATE TABLE model_calls (call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, stage TEXT, model TEXT, started_at TEXT, latency_ms INTEGER, prompt_eval_count INTEGER, eval_count INTEGER)');
+  db.prepare('INSERT INTO model_calls VALUES (?,?,?,?,?,?,?,?)').run('c1', 'single-compute-1', 'plan', 'm', 'x', 1200, 300, 40);
+  db.close();
+  const saved = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH;
+  process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH = dbPath;
+  try {
+    const result = applyTask(baseTask({ id: 'single-compute-1' }), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner: createFakeGitRunner() });
+    assert.equal(result.succeeded, true);
+    const log = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'task-logs', 'single-compute-1.json'), 'utf8'));
+    assert.equal(log.compute.calls, 1);
+    assert.equal(log.compute.promptTokens, 300);
+    fs.writeFileSync(path.join(REPO_ROOT, 'foo.js'), 'a'); // the first apply already edited it
+    const other = applyTask(baseTask({ id: 'single-compute-2' }), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner: createFakeGitRunner() });
+    assert.equal(other.succeeded, true);
+    const log2 = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'task-logs', 'single-compute-2.json'), 'utf8'));
+    assert.equal('compute' in log2, false);
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH; else process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH = saved;
+  }
+});
+
+test('applyDirectToMainBatch: the task log carries compute from model-stats.db, and omits it when the task has no recorded calls', () => {
+  const { DatabaseSync } = require('node:sqlite');
+  const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-compute-'));
+  const dbPath = path.join(dbDir, 'model-stats.db');
+  const db = new DatabaseSync(dbPath);
+  db.exec('CREATE TABLE model_calls (call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, stage TEXT, model TEXT, started_at TEXT, latency_ms INTEGER, prompt_eval_count INTEGER, eval_count INTEGER)');
+  db.prepare('INSERT INTO model_calls VALUES (?,?,?,?,?,?,?,?)').run('c1', 'cp1', 'plan', 'm', 'x', 2500, 700, 60);
+  db.close();
+  const saved = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH;
+  process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH = dbPath;
+  try {
+    const out = applyDirectToMainBatch([batchTriageTask('cp1'), batchTriageTask('cp2')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner: createFakeGitRunner() });
+    assert.equal(out.results.cp1.succeeded, true);
+    assert.equal(out.results.cp2.succeeded, true);
+    const log1 = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'task-logs', 'cp1.json'), 'utf8'));
+    const log2 = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'task-logs', 'cp2.json'), 'utf8'));
+    assert.equal(log1.compute.calls, 1);
+    assert.equal(log1.compute.promptTokens, 700);
+    assert.equal(log1.compute.modelMs, 2500);
+    assert.equal('compute' in log2, false);
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH; else process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH = saved;
+  }
 });
 
 ungatedTest('applyDirectToMainBatch: refuses a non-directToMain source instead of batching it', () => {
@@ -781,7 +834,7 @@ test('deleteConfirmedAt lets a previously-held delete batch proceed for real', (
   assert.equal(result.succeeded, true);
   assert.equal(result.branch, 'agent/test-task-1');
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
   assert.equal(fs.existsSync(path.join(REPO_ROOT, 'foo.js')), false);
 });
 
@@ -1394,7 +1447,7 @@ test('stacked seq 1: creates the shared decompose branch off main (reset first)'
   assert.equal(result.succeeded, true);
   assert.equal(result.branch, 'agent/decompose-x');
   assert.deepEqual(gitRunner.calls.map((c) => c.name),
-    ['fetchMain', 'remoteHasUnmergedWork', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+    ['fetchMain', 'remoteHasUnmergedWork', 'quarantineDirtyTree', 'assertCleanTree', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
 });
 
 // 2026-09-20 (PF HUB0003-01): a nested hub's first child was numbered seq 1, so this path deleted and recreated a branch that already
@@ -1467,12 +1520,25 @@ test('stacked seq 2 on a dirty apply clone: fails ONCE up front with the stable 
   assert.equal(isInfraApplyFailure({ blockedStage: 'apply', blockedReason: result.reason }), true);
 });
 
-test('a normal (non-stacked) apply is unchanged: resetToMain already clears stray content, so no extra pre-flight calls', () => {
+test('a normal (non-stacked) apply: quarantine + assertCleanTree run before resetToMain', () => {
   const gitRunner = createFakeGitRunner();
   applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
   const names = gitRunner.calls.map((c) => c.name);
-  assert.ok(!names.includes('assertCleanTree') && !names.includes('quarantineDirtyTree'));
-  assert.equal(names[1], 'resetToMain');
+  assert.deepEqual(names.filter((n) => ['quarantineDirtyTree', 'assertCleanTree'].includes(n)), ['quarantineDirtyTree', 'assertCleanTree'], 'self-heal is attempted first, then the assert');
+  assert.ok(names.indexOf('assertCleanTree') !== -1 && names.indexOf('assertCleanTree') < names.indexOf('resetToMain'));
+});
+
+test('normal apply on a dirty apply clone: fails ONCE at the pre-flight with the stable message', () => {
+  const { DIRTY_CLONE_ERROR_PREFIX } = require('./git-runner.js');
+  const { isInfraApplyFailure } = require('./apply-retry-check.js');
+  const gitRunner = createFakeGitRunner({ dirtyTree: 'Docs/ARCH_REVIEW_CANDIDATES.md' });
+  const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(result.succeeded, false);
+  assert.ok(result.reason.startsWith(DIRTY_CLONE_ERROR_PREFIX) && /ARCH_REVIEW_CANDIDATES\.md/.test(result.reason), result.reason);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree'], 'self-heal is attempted first, then the assert -- and nothing after it');
+  // The message must land where apply-retry-check treats it as INFRASTRUCTURE (held, no retry burned, released once clean), not a draft failure.
+  assert.equal(isInfraApplyFailure({ blockedStage: 'apply', blockedReason: result.reason }), true);
 });
 
 // --- Gated default (2026-09-19): nothing reaches main without a human merge ----------------------

@@ -445,6 +445,7 @@ function getConfig() {
     defaultDomain, taskSourceAllowlist, taskPriorityOverrides,
     approvalModeOverrides, defaultApprovalMode,
     taskTierOverrides,
+    reviewMockSeamCheck: process.env.AGENT_MANAGER_REVIEW_MOCK_SEAM_CHECK || 'advisory',
   };
 }
 

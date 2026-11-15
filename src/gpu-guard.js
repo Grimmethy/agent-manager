@@ -37,7 +37,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { isCloudEndpoint } = require('./lanes.js');
+const { isCloudEndpoint, isScriptEndpoint } = require('./lanes.js');
 
 // ComfyUI GPU lease (2026-08-30). PromptForge writes this file only when starting
 // ComfyUI would collide with the resident local model on a single GPU. While it's held
@@ -102,7 +102,7 @@ function leaseCovers(lease, endpointUrl) {
 // Is the GPU behind `endpointUrl` leased right now? Same freshness rules as comfyuiLeaseHeld; scoped leases hold only their own endpoints.
 // A cloud lane's endpoint is not a GPU, so a Forge lease never holds it (it must keep working while a render owns the cards).
 function leaseHeldFor(endpointUrl, leasePath = COMFY_LEASE_PATH, env = process.env) {
-  if (isCloudEndpoint(endpointUrl, env)) return false;
+  if (isCloudEndpoint(endpointUrl, env) || isScriptEndpoint(endpointUrl, env)) return false;
   const lease = readFreshLease(leasePath);
   return lease !== null && leaseCovers(lease, endpointUrl);
 }
@@ -241,7 +241,7 @@ async function ensureGpuHeadroomCore({
   readFreeVram = readFreeVramMb,
   fetchJsonFn = fetchJson,
   leaseHeld = comfyuiLeaseHeld,
-  isCloud = isCloudEndpoint,
+  isCloud = (u) => isCloudEndpoint(u) || isScriptEndpoint(u),
 } = {}) {
   // A cloud lane's calls go to the cloud-providers gateway: there is no GPU to keep clear for it, and freeing ComfyUI or stopping an app would be pointless.
   if (isCloud(ollamaUrl)) {

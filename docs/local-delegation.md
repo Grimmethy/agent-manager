@@ -35,6 +35,18 @@ when the pattern changes — this is a living doc, not a one-time writeup.
   array back into Claude's own context has tripped the usage-policy classifier and hard-blocked
   a turn — a big numeric blob reads like obfuscated content. Strip `context` before reading.)
 
+### KV-cache quantization (`OLLAMA_KV_CACHE_TYPE`) — not yet enabled
+
+Controls the quantization of Ollama's KV cache — e.g. `q8_0` halves (and `q4_0` quarters)
+the per-token context-window memory footprint (see `docs/agents/lanes.md`). It is
+**not yet enabled** on this machine: `agent-manager.env.example` ships it commented out
+with the instruction to keep it disabled until a quality/accuracy evaluation confirms
+acceptable output. That's the right gate — a quantized cache is a *quality* change (it can
+shift token-level outputs), so before flipping it on we need a before/after comparison on
+a representative review-critical task set (the Plan → review → Implement passes above) to
+confirm no regression. When it does get enabled, set it as an environment variable on the
+Ollama server process — it is a server-side knob, not a per-request option.
+
 ### Constrained (grammar) decoding for pure-data output — set `format`, and it REQUIRES `think:false`
 
 When a pass must emit pure structured data (e.g. the `state_targets` implement pass drafting an

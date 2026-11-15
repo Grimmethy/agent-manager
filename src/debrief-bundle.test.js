@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 
 const {
-  MIN_WINDOW_TASKS, collectDoneWindow, collectContrastTasks, buildDebriefBundle,
+  MIN_WINDOW_TASKS, MAX_CONTEXT_SECTION_CHARS, MAX_CONTEXT_STRATA, collectDoneWindow, collectContrastTasks, buildDebriefBundle, renderContextEffectiveness,
 } = require('./debrief-bundle.js');
 
 function makePipeline() {
@@ -227,4 +227,114 @@ test('buildDebriefBundle: a no-op-dominant window still produces a bundle, frame
 test('taskDidShip: an unstamped record applied to a branch whose name contains a no-op word still shipped', () => {
   assert.equal(taskDidShip({ history: [{ stage: 'applied', detail: 'agent/adhoc-premium-head-of-line-starvation-rotate-repeatedly-blocked-premium-tasks-behind-fresh-ones-and-avoid-lanes-a-task-degenerated-on-1792061032268' }] }), true);
   assert.equal(taskDidShip({ history: [{ stage: 'applied', detail: 'no candidates in implement response -- nothing to apply' }] }), false);
+});
+
+// ---- the context-effectiveness section (piece P3 of the context-impact loop) ----
+const STAMP = { v: 1, anchorFileCount: 1, grepHitFileCount: 0, orientRan: true, priorRejectionCount: 0 };
+function stampedWindow(dir, n, source = 'adhoc') {
+  for (let i = 0; i < n; i++) {
+    const at = `2026-09-0${1 + (i % 9)}T0${i % 9}:00:00Z`;
+    writeTask(dir, 'done', { ...doneTask(`stamped-${i}`, at, source), contextProvenance: STAMP });
+  }
+}
+const SECTION = 'CONTEXT EFFECTIVENESS';
+
+test('buildDebriefBundle: stamped tasks in the window add the context-effectiveness section right after the framing, as bounded plain counts with the caveats', () => {
+  const dir = makePipeline();
+  stampedWindow(dir, MIN_WINDOW_TASKS);
+  const bundle = buildDebriefBundle({ pipelineDir: dir, dbPath: path.join(dir, 'model-stats.db') });
+  const text = bundle.evidenceText;
+  assert.ok(text.includes(SECTION));
+  assert.ok(text.indexOf('PIPELINE DETERMINISM AUDIT') < text.indexOf(SECTION));
+  assert.ok(text.indexOf(SECTION) < text.indexOf('COMPLETED 1'));
+  assert.equal(bundle.stats.contextStamped, MIN_WINDOW_TASKS);
+  assert.ok(bundle.stats.contextSectionChars > 0 && bundle.stats.contextSectionChars <= MAX_CONTEXT_SECTION_CHARS);
+  const section = text.slice(text.indexOf(SECTION), text.indexOf('COMPLETED 1'));
+  assert.ok(section.includes('stamped 12, unstamped 0'));
+  assert.ok(section.includes('descriptive correlations, not effects'));
+  assert.ok(section.includes('anchorFileCount -- 1-2: n=12 first-pass='));
+  for (const word of ['because', 'causes', 'improves', 'recommend', 'should', 'better', 'worse', 'helps']) assert.equal(section.toLowerCase().includes(word), false, word);
+});
+
+test('buildDebriefBundle: without stamped tasks the section is ABSENT, not an error, and the rest of the bundle is unchanged', () => {
+  const dir = makePipeline();
+  fillWindow(dir, MIN_WINDOW_TASKS);
+  const bundle = buildDebriefBundle({ pipelineDir: dir, dbPath: path.join(dir, 'model-stats.db') });
+  assert.equal(bundle.evidenceText.includes(SECTION), false);
+  assert.equal(bundle.stats.contextStamped, 0);
+  assert.equal(bundle.stats.contextSectionChars, 0);
+  assert.equal(/(^|\n)null(\n|$)/.test(bundle.evidenceText), false, 'an absent section leaves nothing behind, not even the word null');
+  assert.ok(bundle.evidenceText.includes('COMPLETED 1'));
+});
+
+test('buildDebriefBundle: the section covers the SAME window (a stamped task just after the window end is not counted) and the join gets exactly that window', () => {
+  const dir = makePipeline();
+  stampedWindow(dir, MIN_WINDOW_TASKS);
+  writeTask(dir, 'done', { ...doneTask('after-window', '2026-09-09T20:00:00Z'), contextProvenance: STAMP });
+  const bundle = buildDebriefBundle({ pipelineDir: dir, dbPath: path.join(dir, 'model-stats.db'), maxWindow: MIN_WINDOW_TASKS });
+  assert.equal(bundle.stats.windowCount, MIN_WINDOW_TASKS);
+  assert.equal(bundle.stats.contextStamped, MIN_WINDOW_TASKS);
+  const calls = [];
+  buildDebriefBundle({ pipelineDir: dir, dbPath: path.join(dir, 'model-stats.db'), maxWindow: MIN_WINDOW_TASKS, joinFn: (args) => { calls.push(args); return { counts: { stamped: 0 } }; } });
+  assert.equal(calls.length, 1);
+  const start = Date.parse(bundle.windowStart);
+  const end = Date.parse(bundle.windowEnd);
+  assert.deepEqual([calls[0].pipelineDir, calls[0].sinceMs, calls[0].nowMs, calls[0].untilMs], [dir, end - start, end, end]);
+});
+
+test('buildDebriefBundle: a join that throws leaves the section out and the bundle built', () => {
+  const dir = makePipeline();
+  stampedWindow(dir, MIN_WINDOW_TASKS);
+  const bundle = buildDebriefBundle({ pipelineDir: dir, dbPath: path.join(dir, 'model-stats.db'), joinFn: () => { throw new Error('queue unreadable'); } });
+  assert.ok(bundle.evidenceText.includes('COMPLETED 1'));
+  assert.equal(bundle.evidenceText.includes(SECTION), false);
+  assert.equal(bundle.stats.contextStamped, 0);
+});
+
+test('buildDebriefBundle: the bundle stays inside its size cap with the section present (the existing hard truncation still applies)', () => {
+  const dir = makePipeline();
+  stampedWindow(dir, MIN_WINDOW_TASKS);
+  const budgetChars = 2500;
+  const bundle = buildDebriefBundle({ pipelineDir: dir, dbPath: path.join(dir, 'model-stats.db'), budgetChars });
+  assert.ok(bundle.evidenceText.length <= budgetChars + 80, `${bundle.evidenceText.length}`);
+  assert.ok(bundle.stats.droppedForBudget.includes('hard-truncate'));
+});
+
+const cellOf = (over = {}) => ({ n: 12, approvedFirstPass: 9, blockedOrNeedsClarification: 3, medianHistoryStages: 8, ...over });
+const reportOf = (strata, over = {}) => ({ minCellN: 10, counts: { shipped: 20, blocked: 2, needsClarification: 1, stamped: 15, unstamped: 5 }, strata, caveats: ['c1', 'c2'], ...over });
+
+test('renderContextEffectiveness: null for no report and for no stamped task; cells render as counts or insufficient; strata with no stamp are left out', () => {
+  assert.equal(renderContextEffectiveness(null), null);
+  assert.equal(renderContextEffectiveness({}), null);
+  assert.equal(renderContextEffectiveness(reportOf({}, { counts: { stamped: 0 } })), null);
+  const text = renderContextEffectiveness(reportOf({
+    adhoc: { stamped: 15, stuck: 3, unstamped: { n: 4, insufficient: true }, cells: { orientRan: { true: cellOf(), false: { n: 3, insufficient: true } }, anchorFileCount: {} } },
+    brain_dump_sort: { stamped: 0, stuck: 0, unstamped: cellOf(), cells: {} },
+  }));
+  assert.ok(text.includes('tasks in window: shipped 20, stuck 3; stamped 15, unstamped 5; a cell under 10 tasks reports insufficient.'));
+  assert.ok(text.includes('adhoc: stamped 15, stuck 3, unstamped baseline insufficient(n=4)'));
+  assert.ok(text.includes('orientRan -- true: n=12 first-pass=9 stuck=3 median-stages=8 | false: insufficient(n=3)'));
+  assert.equal(text.includes('anchorFileCount'), false);
+  assert.equal(text.includes('brain_dump_sort'), false);
+  assert.ok(text.endsWith('caveats: c1; c2'));
+});
+
+test('renderContextEffectiveness: at most MAX_CONTEXT_STRATA strata, largest stamped first, and a long report is cut to MAX_CONTEXT_SECTION_CHARS with a marker', () => {
+  const strata = {};
+  for (let i = 0; i < 9; i++) strata[`source_${i}`] = { stamped: 10 + i, stuck: 0, unstamped: cellOf(), cells: { orientRan: { true: cellOf(), false: cellOf() } } };
+  const text = renderContextEffectiveness(reportOf(strata));
+  const listed = Object.keys(strata).filter((k) => text.includes(`${k}: stamped`));
+  assert.equal(MAX_CONTEXT_STRATA, 4);
+  assert.deepEqual(listed.sort(), ['source_5', 'source_6', 'source_7', 'source_8']);
+  const big = {};
+  for (let i = 0; i < 4; i++) big[`${'long_source_name_'.repeat(8)}${i}`] = { stamped: 50, stuck: 0, unstamped: cellOf(), cells: Object.fromEntries(['a', 'b', 'c', 'd', 'e', 'f'].map((f) => [`${f}Feature`, { x: cellOf(), y: cellOf(), z: cellOf() }])) };
+  const cut = renderContextEffectiveness(reportOf(big));
+  assert.equal(cut.length, MAX_CONTEXT_SECTION_CHARS);
+  assert.ok(cut.endsWith('...[context section truncated]'));
+  assert.equal(renderContextEffectiveness(reportOf(big), 50).length, 50);
+});
+
+test('the section budget is 1600 characters and 4 strata (the debrief shares one 28000 character budget with its evidence)', () => {
+  assert.equal(MAX_CONTEXT_SECTION_CHARS, 1600);
+  assert.equal(MAX_CONTEXT_STRATA, 4);
 });

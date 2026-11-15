@@ -30,7 +30,8 @@ const crypto = require('crypto');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
-const { classifyBlockedTask, findClassifier, hasInvalidPremise } = require('./blocked-task-classifiers.js');
+const { classifyBlockedTask, findClassifier, hasInvalidPremise, isInfraError } = require('./blocked-task-classifiers.js');
+const { writeJsonAtomicSync } = require('./atomic-write.js');
 const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { acquire, release, taskMoveLockKey } = require('./single-flight-lock.js');
@@ -75,6 +76,7 @@ require('./task-sources.js');
 try { ensureRegistered(); } catch { /* no live config (e.g. a unit test) -- fine, nothing to register */ }
 
 const MAX_LOCAL_REJECT_RETRIES = 2;
+const MAX_INFRA_SORT_ATTEMPTS = 10;
 
 // Fields wiped when a task is re-admitted with a CLEAN SLATE (not a blind redraft, which
 // keeps priorRejectionFeedback + increments localRejectCount). Kept deliberately in sync
@@ -157,6 +159,11 @@ function isAdhocTask(task) {
 // entry's sortAttempt -- so nextBrainDumpSortTask regenerates the sort under a fresh id
 // (…-aN) instead of the entry being stuck 'captured' forever behind this blocked record.
 // Mirrors stampDeepDiveExhausted's "advance the source's own cursor" role.
+// HUB0196 2/3: infra-attributed failures (isInfraError) do NOT consume the content
+// sort-attempt budget (entry.sortAttempt) -- they get their own tracked counter
+// (entry.infraSortAttemptCount) bounded by MAX_INFRA_SORT_ATTEMPTS. Once that counter
+// exceeds the cap the entry is marked infraSortExhausted and becomes ineligible for
+// further sort attempts regardless of its content sortAttempt value.
 function stampBrainDumpSortExhausted(task, brainDumpPath) {
   if (task.source !== 'brain_dump_sort') return;
   const entryId = task.promptContext && task.promptContext.brainDumpEntryId;
@@ -164,10 +171,82 @@ function stampBrainDumpSortExhausted(task, brainDumpPath) {
   try {
     const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
     const entry = Array.isArray(data.entries) && data.entries.find((e) => e && e.id === entryId);
-    if (entry) {
-      entry.sortAttempt = (entry.sortAttempt || 0) + 1;
-      fs.writeFileSync(brainDumpPath, JSON.stringify(data, null, 2));
+    if (!entry) return;
+
+    const ts = new Date().toISOString();
+    const blockedReason = task.blockedReason || '';
+    const endpoint = task.endpoint || null;
+    const sortAttemptBefore = entry.sortAttempt || 0;
+    if (!Array.isArray(data.sortBudgetEvents)) data.sortBudgetEvents = [];
+
+    if (isInfraError(task)) {
+      // Infra path: do NOT touch entry.sortAttempt.
+      if (!Array.isArray(entry.infraSortAttempts)) entry.infraSortAttempts = [];
+      entry.infraSortAttempts.push({ ts, endpoint, blockedReason, category: 'infra-error' });
+      entry.infraSortAttemptCount = (entry.infraSortAttemptCount || 0) + 1;
+      const capHit = entry.infraSortAttemptCount > MAX_INFRA_SORT_ATTEMPTS;
+      // Explicit boolean so the field is well-defined even on the non-cap-hit path
+      // (an infra-skip leaves it false, not undefined -- consumers can rely on
+      // entry.infraSortExhausted === true as the sole eligibility gate either way).
+      entry.infraSortExhausted = capHit;
+      const sortAttemptAfter = entry.sortAttempt || 0; // unchanged: before === after
+      data.sortBudgetEvents.push({
+        ts,
+        action: capHit ? 'infra-cap-hit' : 'infra-skip',
+        endpoint,
+        blockedReason,
+        entryId,
+        sortAttemptBefore,
+        sortAttemptAfter,
+        category: 'infra-error',
+      });
+    } else {
+      // Content path: increment sortAttempt exactly as before.
+      // Eligibility: only bump if the entry is still eligible (not already exhausted
+      // via content attempts or infra exhaustion).
+      if (sortAttemptBefore >= 3) {
+        // Already ineligible on content budget -- record the event but do not bump further.
+        data.sortBudgetEvents.push({
+          ts,
+          action: 'content-cap-hit',
+          endpoint,
+          blockedReason,
+          entryId,
+          sortAttemptBefore,
+          sortAttemptAfter: sortAttemptBefore,
+          category: 'content-error',
+        });
+        writeJsonAtomicSync(brainDumpPath, data);
+        return;
+      }
+      if (entry.infraSortExhausted === true) {
+        // Ineligible due to infra exhaustion -- no further content bumps.
+        data.sortBudgetEvents.push({
+          ts,
+          action: 'content-skip-infra-exhausted',
+          endpoint,
+          blockedReason,
+          entryId,
+          sortAttemptBefore,
+          sortAttemptAfter: sortAttemptBefore,
+          category: 'content-error',
+        });
+        writeJsonAtomicSync(brainDumpPath, data);
+        return;
+      }
+      entry.sortAttempt = sortAttemptBefore + 1;
+      data.sortBudgetEvents.push({
+        ts,
+        action: 'content-skip',
+        endpoint,
+        blockedReason,
+        entryId,
+        sortAttemptBefore,
+        sortAttemptAfter: entry.sortAttempt,
+        category: 'content-error',
+      });
     }
+    writeJsonAtomicSync(brainDumpPath, data);
   } catch (e) {
     console.warn('[reject-retry-check] brain-dump sortAttempt bump failed:', e.message);
   }
@@ -721,6 +800,63 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         }
       }
 
+      // 2026-11-09 (task R12, confirmed live: a decompose parent with blockedStage
+      // 'review' sat in queue/blocked/ for 5 minutes after review rejected the plan,
+      // then was replaced by hand). The entry gate (line ~670) lets it in because
+      // isReviewRejection() returns true for blockedStage:'review', but classifyBlockedTask
+      // then classifies it as non-retryable (e.g. 'unreliable-grounding' because the
+      // sub-task proposals cite files that don't exist yet — they're PROPOSED, not real)
+      // and escalates it to needs-clarification instead of requeueing. A decompose plan
+      // rejection is genuinely a review rejection: the reviewer said "no" to the split,
+      // the next pass needs to know why (priorRejectionFeedback), and the parent should
+      // redraft. Treat it like any other genuine review rejection: same localRejectCount
+      // cap, same feedback path, same pending/ destination.
+      if (task.adhocResolution === 'decompose' && task.blockedStage === 'review' && Array.isArray(task.subTaskProposals) && task.subTaskProposals.length) {
+        // Bypass classifyBlockedTask for this shape -- it's a review rejection, not a
+        // fault-side classification. Carry the rejection reasons into priorRejectionFeedback
+        // so the next plan pass knows what to avoid.
+        const retryCount = Number(task.localRejectCount) || 0;
+        if (retryCount >= MAX_LOCAL_REJECT_RETRIES) {
+          // Exhaustion policy: same as any other genuine review rejection that burns
+          // its blind-redraft budget.
+          if (needsClarificationDir) {
+            const alreadyEscalated = alreadyEscalatedSinceLastReadmission(task);
+            if (!alreadyEscalated) {
+              task.needsClarification = {
+                reason: 'design-decision',
+                openQuestions: `The decompose plan was rejected by review ${MAX_LOCAL_REJECT_RETRIES + 1} times: ${[...new Set([...(Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : []), task.blockedReason].filter(Boolean))].join('; ')}. Decide whether to redraft, narrow the scope, or split differently.`,
+              };
+              appendHistoryEvent(task, 'needs-clarification', 'decompose parent exhausted retries -- escalated to human');
+              if (ghostRoot) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'reject-retry-check:decompose-exhausted', pipelineDir: ghostRoot });
+              fs.mkdirSync(needsClarificationDir, { recursive: true });
+              writeTaskAndUnlinkOld(instancesDir, task, path.join(needsClarificationDir, name), filePath);
+              summary.exhausted++;
+              continue;
+            }
+          }
+        }
+        const rejectionReasons = [];
+        if (task.blockedReason) rejectionReasons.push(String(task.blockedReason));
+        if (Array.isArray(task.priorRejectionFeedback)) {
+          for (const r of task.priorRejectionFeedback) {
+            if (r && !rejectionReasons.includes(r)) rejectionReasons.push(r);
+          }
+        }
+        if (rejectionReasons.length) {
+          task.priorRejectionFeedback = rejectionReasons;
+        }
+        task.localRejectCount = retryCount + 1;
+        task.blockedStage = 'queue';
+        task.blockedReason = '';
+        appendHistoryEvent(task, 'requeued', `decompose plan rejected (attempt ${task.localRejectCount}/${MAX_LOCAL_REJECT_RETRIES}) -- requeued for redraft`);
+        const destDir = pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
       // Unified fault-side escalation (src/blocked-task-classifiers.js), replacing what
       // were two separate bespoke checks (AC-13b's external-dependency skip, AC-8's
       // unreliable-grounding gate). Runs BEFORE the retry-cap check below and regardless
@@ -995,7 +1131,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { selectFeedbackBranch, buildFeedbackString, isCritiqueDegenerateBlock, rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
+module.exports = { selectFeedbackBranch, buildFeedbackString, isCritiqueDegenerateBlock, rejectRetryCheck, stampBrainDumpSortExhausted, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
 
 if (require.main === module) {
   main();

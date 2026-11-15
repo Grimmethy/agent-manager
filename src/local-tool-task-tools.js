@@ -247,7 +247,7 @@ function queueReviewedTaskTool(pipelineDir, { title, description, project, depen
     // now, not a background-priority idea to triage eventually. See
     // queueAdhocTask()'s own header for what this field does.
     const { record } = queueAdhocTask(
-      { title, promptContext: { rawText: description, raisedFrom: 'chat' }, premiumPriority: true, dependsOn: Array.isArray(dependsOn) && dependsOn.length > 0 ? dependsOn : undefined, ...(target.label ? { project: target.label } : {}) },
+      { title, promptContext: { rawText: description, raisedFrom: 'chat' }, premiumPriority: true, premiumSetBy: 'chat-queue', dependsOn: Array.isArray(dependsOn) && dependsOn.length > 0 ? dependsOn : undefined, ...(target.label ? { project: target.label } : {}) },
       { pipelineDir: target.pipelineDir, domainsPath: target.domainsPath || opts.defaultDomainsPath || getConfig().domainsPath },
     );
     const where = target.label ? ` in project "${target.label}"` : '';

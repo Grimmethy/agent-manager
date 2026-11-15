@@ -16,9 +16,11 @@ Run: .venv/bin/python -m unittest python.dashboard.test_brain_dump_routes -v
 import json
 import os
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -273,6 +275,104 @@ class BrainDumpWriteRoutesTest(unittest.TestCase):
         resp = self.client.post("/api/brain-dump/capture", json={"text": "after nan"})
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
         self.assertEqual(resp.get_json()["serial"], 8)
+
+
+class PrioritizeTargetCheckTest(unittest.TestCase):
+    """'Process now' warns before queueing an entry the pre-queue target check calls suspect (HUB0274-08). The node check is stubbed:
+    subprocess.run is patched, so nothing here starts a process. The route fails open on any problem with the check."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_env_path = app.ENV_FILE_PATH
+        app.ENV_FILE_PATH = Path(self._tmp.name) / "agent-manager.env"
+        self._saved = {k: os.environ.get(k) for k in ("AGENT_MANAGER_REPO_ROOT", "AGENT_MANAGER_PIPELINE_DIR", "AGENT_MANAGER_BRAIN_DUMP_PATH")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+        self.pipeline_dir = Path(self._tmp.name) / "pipeline"
+        self.pipeline_dir.mkdir(parents=True, exist_ok=True)
+        app.ENV_FILE_PATH.write_text(f"AGENT_MANAGER_PIPELINE_DIR={self.pipeline_dir}\n", encoding="utf-8")
+        self.brain_dump = self.pipeline_dir / "brain-dump.json"
+        self.client = app.app.test_client()
+
+    def tearDown(self):
+        app.ENV_FILE_PATH = self._orig_env_path
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._tmp.cleanup()
+
+    def _seed(self, **extra):
+        self.brain_dump.write_text(json.dumps({"entries": [{"id": "bd-s", "serial": 1, "rawText": "see `src/gone.js`", "status": "sorted", **extra}]}), encoding="utf-8")
+
+    def _queued(self):
+        adhoc = self.pipeline_dir / "queue" / "adhoc"
+        return list(adhoc.glob("*.json")) if adhoc.exists() else []
+
+    def _verdict(self, stdout):
+        return mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr=""))
+
+    def test_a_suspect_verdict_is_a_409_with_the_reasons_and_queues_nothing(self):
+        self._seed()
+        with self._verdict('{"verdict": "suspect", "reasons": ["every cited path is missing from the target repo (src/gone.js)"]}\n') as run:
+            resp = self.client.post("/api/brain-dump/bd-s/prioritize")
+        self.assertEqual(resp.status_code, 409, resp.get_data(as_text=True))
+        text = resp.get_json()["description"]
+        self.assertIn("every cited path is missing", text)
+        self.assertIn('{"force": true}', text)
+        self.assertEqual(self._queued(), [])
+        entry = json.loads(self.brain_dump.read_text(encoding="utf-8"))["entries"][0]
+        self.assertEqual(entry["status"], "sorted")
+        sent = json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(sent["rawText"], "see `src/gone.js`")
+        self.assertEqual(run.call_args.kwargs["timeout"], 5)
+
+    def test_force_queues_the_same_entry_without_running_the_check(self):
+        self._seed()
+        with self._verdict('{"verdict": "suspect", "reasons": ["x"]}') as run:
+            resp = self.client.post("/api/brain-dump/bd-s/prioritize", json={"force": True})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        self.assertEqual(len(self._queued()), 1)
+        run.assert_not_called()
+        self.assertEqual(resp.get_json()["status"], "actioned")
+
+    def test_an_ok_verdict_queues(self):
+        self._seed()
+        with self._verdict('{"verdict": "ok", "reasons": []}'):
+            resp = self.client.post("/api/brain-dump/bd-s/prioritize")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(self._queued()), 1)
+
+    def test_the_check_failing_open_still_queues(self):
+        for failure in (
+            mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired(cmd="node", timeout=5)),
+            mock.patch.object(subprocess, "run", side_effect=FileNotFoundError("node")),
+            self._verdict("not json at all"),
+            self._verdict(""),
+        ):
+            for old in self._queued():
+                old.unlink()
+            self._seed()
+            with failure:
+                resp = self.client.post("/api/brain-dump/bd-s/prioritize")
+            self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+            self.assertEqual(len(self._queued()), 1)
+
+    def test_an_entry_with_targetcheckoverride_queues_without_running_the_check(self):
+        self._seed(targetCheckOverride=True)
+        with self._verdict('{"verdict": "suspect", "reasons": ["x"]}') as run:
+            resp = self.client.post("/api/brain-dump/bd-s/prioritize")
+        self.assertEqual(resp.status_code, 200)
+        run.assert_not_called()
+
+    def test_the_success_response_shape_is_unchanged(self):
+        self._seed()
+        with self._verdict('{"verdict": "ok", "reasons": []}'):
+            body = self.client.post("/api/brain-dump/bd-s/prioritize").get_json()
+        self.assertEqual(body["status"], "actioned")
+        self.assertTrue(body["queuedTaskId"].startswith("adhoc-brain-dump-"))
+        self.assertIn("queuedAt", body)
 
 
 if __name__ == "__main__":

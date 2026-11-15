@@ -46,6 +46,8 @@ const CONTRACT = {
   './local-client.js': { functions: ['call'] },
   './claude-client.js': { functions: ['call'] },
   './gpu-guard.js': { functions: ['leaseHeldFor', 'leaseCovers', 'normalizeEndpoint'] },
+  './script-handler-registry.js': { functions: ['registerScriptHandler', 'getScriptHandler'] },
+  './lib/task-priority.js': { functions: ['taskPriority'] },
 };
 
 // prompts.js/task-sources.js require AGENT_MANAGER_REPO_ROOT at load (getConfig()).
@@ -114,4 +116,23 @@ test('plugin API: the documented GPU lease example is honoured by gpu-guard.js l
 
   fs.writeFileSync(file, JSON.stringify(lease)); // the example's own 2026 timestamps: long expired
   assert.equal(leaseHeldFor(listed, file), false, 'an expired lease holds nothing');
+});
+
+// 2026-11-02: the llm-tuner plugin registers a script handler for its task source through this documented API. Exercise it, not only list it:
+// register on a clean registry, read it back, and see the duplicate refused.
+test('plugin API: a script handler registered through the documented API is readable and a duplicate is refused', () => {
+  const registry = require('./script-handler-registry.js');
+  registry._resetForTests();
+  try {
+    const fn = async () => ({ outcome: 'ok', summary: 's' });
+    registry.registerScriptHandler('plugin_api_probe', fn);
+    assert.equal(registry.getScriptHandler('plugin_api_probe'), fn);
+    assert.throws(() => registry.registerScriptHandler('plugin_api_probe', fn), /already registered/);
+  } finally {
+    registry._resetForTests();
+  }
+});
+
+test('plugin API: task-sources.js re-exports the very taskPriority that lib/task-priority.js defines (a plugin may use either)', () => {
+  assert.equal(require('./task-sources.js').taskPriority, require('./lib/task-priority.js').taskPriority);
 });

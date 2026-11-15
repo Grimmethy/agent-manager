@@ -11,6 +11,7 @@
 const fs = require('fs');
 const path = require('path');
 const { postJson } = require('./ollama-http.js');
+const { resolveKeepAlive } = require('./keep-alive.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { DEFAULT_PINNED_NUM_CTX } = require('./gpu-capacity.js');
 const gpuGuard = require('./gpu-guard.js');
@@ -93,11 +94,11 @@ function laneDegradedBetween(instancesDir, laneId, fromIso, toIso, cfg = healthC
 // The probe MUST look exactly like the lane's own calls: Ollama reloads a resident model when num_ctx changes, so a probe at a different context
 // would evict the lane's pinned model (a 27B reload is ~100 s, longer than the probe timeout) and make a healthy lane look dead and busy. Same
 // num_ctx / num_batch / keep_alive as the lane's real requests (src/gpu-capacity.js pins, lane registry numCtx/numBatch, LOCAL_KEEP_ALIVE).
-async function probeEndpoint({ url, model, numCtx = DEFAULT_PINNED_NUM_CTX, numBatch = null, keepAlive = '30m', post = postJson, timeoutMs = 90000 }) {
+async function probeEndpoint({ url, model, numCtx = DEFAULT_PINNED_NUM_CTX, numBatch = null, keepAlive, post = postJson, timeoutMs = 90000 }) {
   const started = Date.now();
   try {
     const r = await post(`${String(url).replace(/\/$/, '')}/api/generate`, {
-      model, prompt: PROBE_PROMPT, stream: false, think: false, keep_alive: keepAlive,
+      model, prompt: PROBE_PROMPT, stream: false, think: false, keep_alive: resolveKeepAlive(keepAlive),
       options: { num_predict: 48, temperature: 0, num_ctx: numCtx, ...(numBatch ? { num_batch: numBatch } : {}) },
     }, timeoutMs);
     const evalNs = Number(r && r.eval_duration);
@@ -139,7 +140,8 @@ async function runDueProbes({ lanes, instancesDir, pipelineDir, env = process.en
   const modelOverrides = overrides !== undefined ? overrides : (env === process.env ? readWorkerModelOverrides() : {});
   for (const lane of lanes || []) {
     // A cloud lane has no tokens/s to judge (the gateway reports no eval_duration, so every probe would read as a failure) and each probe would be a billed call.
-    if (lane.cloud) continue;
+    // A script lane has no model at all (its work is a script handler): nothing to probe.
+    if (lane.cloud || lane.script) continue;
     const url = (lane.env && lane.env.OLLAMA_URL) || hostUrl;
     const model = effectiveLaneModel(lane, modelOverrides);
     if (!model || !laneIdleNow(instancesDir, lane.id, now)) continue;
@@ -158,7 +160,7 @@ async function runDueProbes({ lanes, instancesDir, pipelineDir, env = process.en
       continue;
     }
     writeState(instancesDir, lane.id, { samples, probingSince: new Date(now).toISOString(), lastInconclusiveAt });
-    const r = await probe({ url, model, numCtx: lane.numCtx || DEFAULT_PINNED_NUM_CTX, numBatch: lane.numBatch || null, keepAlive: env.LOCAL_KEEP_ALIVE || env.ORNITH_KEEP_ALIVE || '30m', timeoutMs: cfg.timeoutMs });
+    const r = await probe({ url, model, numCtx: lane.numCtx || DEFAULT_PINNED_NUM_CTX, numBatch: lane.numBatch || null, keepAlive: resolveKeepAlive(env.LOCAL_KEEP_ALIVE, env.ORNITH_KEEP_ALIVE), timeoutMs: cfg.timeoutMs });
     // A probe that failed while its model was NOT resident (or was replaced mid-probe) measured a model load, not the lane's speed: inconclusive, no sample,
     // retried after the normal interval. A failure with the model resident, or with the endpoint unreachable, is still a real failure.
     if (!r.ok) {

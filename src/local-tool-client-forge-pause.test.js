@@ -41,7 +41,16 @@ function freshLocalToolClient(baseUrl, repoRoot) {
 
 function withServer(handler, fn) {
   return new Promise((resolve, reject) => {
-    const server = http.createServer(handler);
+    const server = http.createServer((req, res) => {
+      // The residency gate (src/model-resident.js) asks GET /api/ps before every call: report the stub model resident so it sends no warm-up POST
+      // and this test's request-count expectations keep measuring only the real turns.
+      if (req.method === 'GET' && req.url === '/api/ps') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ models: [{ name: 'test-model' }] }));
+        return;
+      }
+      handler(req, res);
+    });
     server.listen(0, '127.0.0.1', async () => {
       const base = `http://127.0.0.1:${server.address().port}`;
       try { await fn(base); resolve(); } catch (e) { reject(e); } finally { server.close(); }

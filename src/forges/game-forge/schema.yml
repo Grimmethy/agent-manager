@@ -1,0 +1,69 @@
+# GameForge stub schema. Status: stub, no implementation yet.
+version: 0.1
+status: stub
+
+integration_points:
+  - name: WorldForge
+    direction: inbound
+    provides: world geography, regions, and world-level constraints
+    consumes: nothing at stub stage
+    status: stub
+  - name: MechanicsForge
+    direction: inbound
+    provides: rule sets and simulation mechanics
+    consumes: nothing at stub stage
+    status: stub
+  - name: ModelForge
+    direction: inbound
+    provides: trained or generated model assets referenced by game content
+    consumes: nothing at stub stage
+    status: stub
+  - name: GameDesignForge
+    direction: inbound
+    provides: design documents, content specs, and progression plans
+    consumes: nothing at stub stage
+    status: stub
+
+game_state:
+  description: Stub shape of a single GameForge session state.
+  fields:
+    session_id:
+      type: string
+      description: Unique identifier for a game session.
+    tick:
+      type: integer
+      description: Current simulation tick.
+    world_ref:
+      type: string
+      description: Reference to the WorldForge output in use.
+    mechanics_ref:
+      type: string
+      description: Reference to the MechanicsForge output in use.
+    models_ref:
+      type: string
+      description: Reference to the ModelForge output in use.
+    design_ref:
+      type: string
+      description: Reference to the GameDesignForge output in use.
+    updated_at:
+      type: string
+      format: date-time
+      description: ISO 8601 timestamp of last update.
+
+asset_registry:
+  description: Stub registry of game assets, keyed by asset_id.
+  key: asset_id
+  entry:
+    asset_id:
+      type: string
+    type:
+      type: string
+    source_forge:
+      type: string
+      allowed: [WorldForge, MechanicsForge, ModelForge, GameDesignForge]
+    path:
+      type: string
+    checksum:
+      type: string
+    version:
+      type: string

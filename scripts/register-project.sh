@@ -21,8 +21,21 @@ PACKAGE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECTS_JSON="$PACKAGE_ROOT/projects.json"
 SECOND_BRAIN_DIR="${SECOND_BRAIN_DIR:-/media/wok/model-cache/SecondBrain}"
 
-echo "[register-project] making sure the pipeline lists every standard task domain"
-"$SCRIPT_DIR/ensure-task-domains.sh" "$PIPELINE_DIR"
+echo "[register-project] ensuring task-domains.json has every standard domain"
+# If the file exists, merge missing standard domains (preserve existing entries).
+# If it does not exist, write the full set from task-domains-registry.js.
+DOMAINS_PATH="$PIPELINE_DIR/task-domains.json"
+if [[ -f "$DOMAINS_PATH" ]]; then
+  "$SCRIPT_DIR/ensure-task-domains.sh" "$PIPELINE_DIR"
+else
+  node -e '
+    const { getStandardDomains } = require("'"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"'/src/task-domains-registry.js");
+    const fs = require("fs");
+    const domains = getStandardDomains();
+    fs.writeFileSync(process.argv[1], JSON.stringify(domains, null, 2) + "\n");
+  ' "$DOMAINS_PATH"
+  echo "[register-project] wrote $DOMAINS_PATH from task-domains-registry.js"
+fi
 
 echo "[register-project] registering in projects.json"
 python3 - "$PROJECTS_JSON" "$REPO_DIR" "$PIPELINE_DIR" "$NAME" <<'PYEOF'

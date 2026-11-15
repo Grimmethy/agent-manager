@@ -1,0 +1,43 @@
+diff --git a/src/local-draft.test.js b/src/local-draft.test.js
+index 3cf96e44..b4437164 100644
+--- a/src/local-draft.test.js
++++ b/src/local-draft.test.js
+@@ -1949,6 +1949,38 @@ test('parseCandidateSplit still returns null for malformed JSON that is NOT a sp
+   assert.equal(parseCandidateSplit('not json at all, and not truncated JSON either'), null);
+ });
+ 
++// 2026-11-04: test the new truncated-split recovery path (arch-review-ac-70, arch-review-ac-395).
++test('parseCandidateSplit returns truncated:true with recovered candidates when a split response has at least 2 complete sub-candidates before the cut', () => {
++  const { parseCandidateSplit } = require('./local-draft.js');
++  // Two complete sub-candidates followed by a cut-off third.
++  const truncated = '{"mode":"split","candidates":[{"title":"First","problem":"p1","solution":"s1","benefits":"b1"},{"title":"Second","problem":"p2","solution":"s2","benefits":"b2"},{"title":"Third","problem":"p3","solution":"s3","benefits"';
++  const result = parseCandidateSplit(truncated);
++  assert.equal(result.truncated, true, 'must flag truncated');
++  assert.equal(result.candidates.length, 2, 'must recover the two complete candidates');
++  assert.equal(result.candidates[0].title, 'First');
++  assert.equal(result.candidates[1].title, 'Second');
++  assert.match(result.reason, /truncated mid-JSON/);
++  assert.match(result.reason, /2 complete/);
++});
++
++test('parseCandidateSplit returns invalid:true (not truncated) when a split response has fewer than 2 complete sub-candidates before the cut', () => {
++  const { parseCandidateSplit } = require('./local-draft.js');
++  // Only one complete sub-candidate, then cut off.
++  const truncated = '{"mode":"split","candidates":[{"title":"Only one","problem":"p1","solution":"s1","benefits":"b1"},{"title":"Incomplete","problem":"p2","solution"';
++  const result = parseCandidateSplit(truncated);
++  assert.equal(result.invalid, true, 'must be invalid when can'\''t recover enough');
++  assert.equal(result.truncated, undefined, 'must NOT be flagged truncated');
++  assert.match(result.reason, /truncated or malformed/);
++});
++
++test('parseCandidateSplit returns invalid:true (not truncated) when a split response has zero complete sub-candidates', () => {
++  const { parseCandidateSplit } = require('./local-draft.js');
++  const truncated = '{"mode":"split","candidates":[{"title"';
++  const result = parseCandidateSplit(truncated);
++  assert.equal(result.invalid, true);
++  assert.equal(result.truncated, undefined);
++});
++
+ test('parseCandidateSplit returns null for anything that is not a split attempt (normal edit/create/delete/empty responses pass through untouched)', () => {
+   const { parseCandidateSplit } = require('./local-draft.js');
+   assert.equal(parseCandidateSplit(''), null);

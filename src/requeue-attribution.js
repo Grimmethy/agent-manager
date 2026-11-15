@@ -51,6 +51,41 @@ function _resetFallbackRateLimitForTests() {
   fallbackCallTimestamps = [];
 }
 
+// recordSuppression: writes a durable attribution record for a suppressed (zero-hit)
+// requeue event. Idempotency is keyed on taskId -- first write wins; a later distinct
+// event for the same task is intentionally NOT re-recorded (documented trade-off: the
+// dedup key is taskId, the stable identity of the suppressed case). Never throws.
+function recordSuppression({ taskId, signature, category, zeroHitGroupSize, reasonText, blockedStage, actor, repoRoot, now }) {
+  if (!taskId || !repoRoot) return null;
+
+  const dir = path.join(repoRoot, 'queue', 'suppression-attribution');
+  const file = path.join(dir, `suppressed-${taskId}.json`);
+
+  try {
+    if (fs.existsSync(file)) return { filed: false, deduped: true, file };
+  } catch (_) { /* existsSync can throw on bad paths; let the write attempt decide */ }
+
+  const record = {
+    status: 'suppressed',
+    taskId,
+    signature,
+    category,
+    zeroHitGroupSize,
+    reasonText,
+    blockedStage,
+    actor,
+    now,
+  };
+
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(record, null, 2) + '\n', 'utf8');
+    return { filed: true, deduped: false, file };
+  } catch (_) {
+    return { filed: false, deduped: false, file, error: true };
+  }
+}
+
 function normalizeReasonText(reasonHint) {
   if (Array.isArray(reasonHint)) return reasonHint.filter(Boolean).join('; ');
   return String(reasonHint || '');
@@ -251,6 +286,7 @@ module.exports = {
   normalizeReasonText,
   CAUSE_CATEGORIES,
   _resetFallbackRateLimitForTests,
+  recordSuppression,
 };
 
 // CLI: `node src/requeue-attribution.js classify <payloadPath>` -- so the Flask dashboard

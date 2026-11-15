@@ -62,7 +62,7 @@ function writeHeartbeatFile(instancesDir, instanceId, status, model, taskId, pas
   };
   if (startedAt) hb.startedAt = startedAt;
   if (daemonPid != null) hb.daemonPid = daemonPid;
-  // Set while this lane is running a borrowed project's task (docs/idle-pool-borrowing.md), so the Workers tab can say whose work it is.
+  // Set while this lane is running a borrowed project's task (docs/design-notes/idle-pool-borrowing.md), so the Workers tab can say whose work it is.
   if (process.env.AGENT_MANAGER_BORROWING_FROM) hb.project = process.env.AGENT_MANAGER_BORROWING_FROM;
   // Atomic (temp + fsync + rename): this file is the pipeline's only liveness source of
   // truth, and the liveness guard treats an unreadable heartbeat as an abandoned instance,

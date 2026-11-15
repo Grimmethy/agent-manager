@@ -33,6 +33,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
+const { fetchIfDue } = require('./lib/fetch-throttle.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { resolveDisposition, buildShipContext, STABLE_TERMINAL_STAGES, TERMINAL_STAGES, lastAppliedEvent } = require('./task-disposition.js');
 
@@ -193,6 +194,11 @@ function shipContextLooksBroken(ctx, { repoRoot, commitCountFn = realCommitCount
   return commitCountFn(repoRoot, ctx.mainBranch) >= MIN_COMMITS_FOR_SHIP_CONTEXT_SANITY_CHECK;
 }
 
+function fullFetch(repoRoot, { run, now } = {}) {
+  const doFetch = run || (() => execFileSync('git', ['-C', repoRoot, 'fetch', 'origin', '--quiet'], { stdio: 'ignore', timeout: 60000 }));
+  return fetchIfDue(repoRoot, { run: doFetch, now });
+}
+
 function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn, commitCountFn } = {}) {
   const report = argv.includes('--report');
   const reclassify = argv.includes('--reclassify');
@@ -222,7 +228,9 @@ function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn, commitCountFn } 
   const allowReopenFrom = reclassify ? new Set(['noop', 'abandoned']) : undefined;
 
   if (doFetch && repoRoot) {
-    const fetch = fetchFn || (() => execFileSync('git', ['-C', repoRoot, 'fetch', 'origin', '--quiet'], { stdio: 'ignore', timeout: 60000 }));
+    // An injected fetchFn always runs (tests, and the old contract). The real fetch goes through the shared per-repository throttle (ADR-0024, 2026-11-03):
+    // derived-premise-sweep.js in the same watchdog tick shares it, so this still sees refs at most one tick old, as the 2026-09-08 fix requires.
+    const fetch = fetchFn || (() => fullFetch(repoRoot));
     try { fetch(); } catch { /* offline -- use local refs */ }
   }
 
@@ -338,7 +346,7 @@ function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn, commitCountFn } 
   return summary;
 }
 
-module.exports = { reconcile, candidateRecords, loadState, deriveAmplificationRequestFromFix, shipContextLooksBroken };
+module.exports = { reconcile, fullFetch, candidateRecords, loadState, deriveAmplificationRequestFromFix, shipContextLooksBroken };
 
 if (require.main === module) {
   let cfg;

@@ -232,6 +232,7 @@ function renderTaskDetailModal(task) {
   html += `<div style="margin:8px 0 4px">`
     + `<button type="button" class="secondary" id="task-send-to-chat">Send to Chat</button> `
     + `<button type="button" class="${premiumOn ? 'action' : 'secondary'}" id="task-premium-priority" title="${premiumOn ? 'Currently claimed ahead of everything else in the queue, every pass, until turned off or the task completes. Click to turn off.' : 'Always claim this task first, every pass, regardless of source or age -- stays on until you turn it off or the task completes.'}">${premiumOn ? '★ Premium Priority (on)' : '☆ Set Premium Priority'}</button>`
+    + (premiumProvenanceText(task, Date.now()) ? ` <span class="muted" id="task-premium-provenance">${escapeHtml(premiumProvenanceText(task, Date.now()))}</span>` : '')
     + `</div>`;
   if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
   html += `<div><strong>${escapeHtmlBright(task.title || '')}</strong></div>`;
@@ -429,6 +430,10 @@ function renderTaskDetailModal(task) {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         showToast(nextEnabled ? 'Premium priority set -- claimed first every pass until you turn it off' : 'Premium priority cleared', 'info');
         task.premiumPriority = nextEnabled;
+        // mirror what the route just stamped so the in-place re-render shows who/when instead of "origin unknown"
+        const nowIso = new Date().toISOString();
+        if (nextEnabled) { task.premiumSetBy = 'operator-ui'; task.premiumSetAt = nowIso; delete task.premiumClearedAt; delete task.premiumClearedBy; }
+        else { task.premiumClearedBy = 'operator-ui'; task.premiumClearedAt = nowIso; }
         renderTaskDetailModal(task); // re-render in place so the button flips state immediately, no full reopen
       } catch (e) {
         showToast('Could not update premium priority: ' + e.message);
@@ -440,30 +445,35 @@ function renderTaskDetailModal(task) {
 }
 
 function stopTaskDetailAutoRefresh() {
-  if (taskDetailPoll) { clearInterval(taskDetailPoll); taskDetailPoll = null; }
+  taskDetailWatch = null;
 }
 
 function armTaskDetailAutoRefresh(task) {
   stopTaskDetailAutoRefresh();
   const state = task._foundState || '';
   if (!TASK_DETAIL_LIVE_STATES.has(state)) return;
-  const id = task.id;
-  let lastSig = `${state}:${(task.history || []).length}`;
-  taskDetailPoll = setInterval(async () => {
-    const backdrop = document.getElementById('modal-backdrop');
-    if (!backdrop || !backdrop.classList.contains('open')) { stopTaskDetailAutoRefresh(); return; }
-    let fresh;
-    try {
-      fresh = await fetchJson(`/api/task-anywhere/${encodeURIComponent(id)}`);
-    } catch (e) {
-      return; // transient -- try again next tick
-    }
-    const sig = `${fresh._foundState || ''}:${(fresh.history || []).length}`;
-    if (sig !== lastSig) {
-      lastSig = sig;
-      renderTaskDetailModal(fresh); // re-arms (or stops, if it landed in a terminal state)
-    }
-  }, 4000);
+  taskDetailWatch = { id: task.id, sig: `${state}:${(task.history || []).length}` };
+}
+
+// Called by the page when the pipeline says a task record or a queue state changed (live-updates.js: task-records-changed, counts-changed, snapshot). Does nothing, and
+// fetches nothing, unless the open modal is watching a task in a live state; then it re-reads that task and re-renders only when its state or history length moved.
+async function refreshTaskDetailModal() {
+  const watch = taskDetailWatch;
+  if (!watch) return;
+  const backdrop = document.getElementById('modal-backdrop');
+  if (!backdrop || !backdrop.classList.contains('open')) { stopTaskDetailAutoRefresh(); return; }
+  let fresh;
+  try {
+    fresh = await fetchJson(`/api/task-anywhere/${encodeURIComponent(watch.id)}`);
+  } catch (e) {
+    return; // transient -- the next announcement tries again
+  }
+  if (taskDetailWatch !== watch) return;     // the modal was closed or moved to another task while the fetch was in flight
+  const sig = `${fresh._foundState || ''}:${(fresh.history || []).length}`;
+  if (sig !== watch.sig) {
+    watch.sig = sig;
+    renderTaskDetailModal(fresh); // re-arms (or stops, if it landed in a terminal state)
+  }
 }
 
 function renderDesignDecisionPicker(task) {
@@ -483,7 +493,7 @@ function renderDesignDecisionPicker(task) {
     html += `<div style="margin-top:10px"><strong>Pick one:</strong></div>`;
     html += `<div style="margin-top:6px;display:flex;flex-direction:column;gap:6px">`;
     html += nc.options.map((o, i) => `
-      <button type="button" class="secondary clarify-answer-option-btn" data-answer="${escapeAttr(`${o.label}: ${o.description}`)}" style="text-align:left;padding:8px 10px">
+      <button type="button" class="secondary clarify-answer-option-btn" data-answer="${escapeAttr(`${o.label}: ${o.description}`)}" style="text-align:left;padding:8px 12px">
         <strong>${escapeHtml(o.label)}</strong><br><span class="meta">${escapeHtmlBright(o.description)}</span>
       </button>`).join('');
     html += `</div>`;

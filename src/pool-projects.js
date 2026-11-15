@@ -1,6 +1,6 @@
 'use strict';
 
-// pool-projects.js -- which suite projects an idle lane may borrow work from (docs/idle-pool-borrowing.md).
+// pool-projects.js -- which suite projects an idle lane may borrow work from (docs/design-notes/idle-pool-borrowing.md).
 //
 // A registered project (projects.json) opts in with `"pool": true`. This module answers "given the ACTIVE project, which pool projects are
 // there, in what order, and what env makes one invocation run in that project's context". The loops that use it (worker lanes, reviewer, apply
@@ -26,6 +26,8 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
+const { openQueueCache, readTaskCached } = require('./queue-cache.js');   // node built-ins only: safe to load from the bash-called CLI too
 const { unmetPrerequisiteHubs } = require('./hub-prerequisites.js');   // fs + path only: safe to load from the bash-called CLI
 
 const PROJECTS_PATH = process.env.AGENT_MANAGER_PROJECTS_PATH || path.join(__dirname, '..', 'projects.json');
@@ -57,9 +59,10 @@ function readProjects(projectsPath = PROJECTS_PATH) {
 function readState(file = statePath()) {
   try {
     const s = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!s || typeof s !== 'object') return { lastBorrowedAt: {}, emptyUntil: {} };
-    return { ...s, lastBorrowedAt: s.lastBorrowedAt && typeof s.lastBorrowedAt === 'object' ? s.lastBorrowedAt : {}, emptyUntil: s.emptyUntil && typeof s.emptyUntil === 'object' ? s.emptyUntil : {} };
-  } catch { return { lastBorrowedAt: {}, emptyUntil: {} }; }
+    if (!s || typeof s !== 'object') return { lastBorrowedAt: {}, emptyUntil: {}, emptySig: {}, emptyAt: {} };
+    const obj = (v) => (v && typeof v === 'object' ? v : {});
+    return { ...s, lastBorrowedAt: obj(s.lastBorrowedAt), emptyUntil: obj(s.emptyUntil), emptySig: obj(s.emptySig), emptyAt: obj(s.emptyAt) };
+  } catch { return { lastBorrowedAt: {}, emptyUntil: {}, emptySig: {}, emptyAt: {} }; }
 }
 
 // Records that a lane just borrowed from this project (drives the least-recently-borrowed ordering). Best-effort.
@@ -68,7 +71,12 @@ function markBorrowed(pipelineDir, { now = new Date(), file = statePath(), role 
     const state = readState(file);
     const key = roleKey(role, real(pipelineDir));
     state.lastBorrowedAt[key] = now.toISOString();
+    // A borrow that found WORK in a project whose queue signature had not changed since it was marked empty means the signature skip would have missed it
+    // (time-based eligibility, or a producer that did not touch a queue dir): count it, it is the health metric of the skip (ADR-0024 rule 6).
+    if (state.emptySig[key] && state.emptySig[key] === queueSignature(pipelineDir)) state.reconcileCorrections = (state.reconcileCorrections || 0) + 1;
     delete state.emptyUntil[key];
+    delete state.emptySig[key];
+    delete state.emptyAt[key];
     writeState(file, state);
   } catch { /* ordering is a nicety; never break a lane over it */ }
 }
@@ -80,10 +88,41 @@ function emptyBackoffMs() {
   return Number.isFinite(n) && n >= 0 ? n * 1000 : 5 * 60 * 1000;
 }
 
+// ADR-0024: once a project has been found empty it stays skipped while its queue has not CHANGED, not just for a flat 5 minutes. The signature is the
+// name + mtime of every direct sub-directory of <pipelineDir>/queue (a task file added, removed or renamed changes its directory's mtime; one stat each).
+// Over-sensitivity is the safe direction (a changed signature just means the old behaviour, a visit), so no directory is excluded. A counted reconcile
+// (AGENT_MANAGER_POOL_EMPTY_RECONCILE_SECS, default 1800, 0 turns the signature skip off) revisits a quiet project anyway to catch time-based eligibility.
+function reconcileMs() {
+  const n = Number(process.env.AGENT_MANAGER_POOL_EMPTY_RECONCILE_SECS);
+  return Number.isFinite(n) && n >= 0 ? n * 1000 : 30 * 60 * 1000;
+}
+
+function queueSignature(pipelineDir) {
+  try {
+    const qdir = path.join(pipelineDir, 'queue');
+    const parts = [];
+    for (const name of fs.readdirSync(qdir).sort()) {
+      try {
+        const st = fs.statSync(path.join(qdir, name));
+        if (st.isDirectory()) parts.push(`${name}:${Math.round(st.mtimeMs)}`);
+      } catch { /* vanished between readdir and stat: the next signature differs anyway */ }
+    }
+    return parts.join('|');
+  } catch { return ''; }
+}
+
+// Premium reach keeps the plain timer: a premium task can become claimable through ANOTHER project's queue (hub dependencies), which this signature cannot see.
+const usesSignature = (role) => !String(role || '').startsWith('premium');
+
 function markEmpty(pipelineDir, { now = new Date(), file = statePath(), ttlMs = emptyBackoffMs(), role = 'worker' } = {}) {
   try {
     const state = readState(file);
-    state.emptyUntil[roleKey(role, real(pipelineDir))] = new Date(now.getTime() + ttlMs).toISOString();
+    const key = roleKey(role, real(pipelineDir));
+    state.emptyUntil[key] = new Date(now.getTime() + ttlMs).toISOString();
+    if (usesSignature(role) && reconcileMs() > 0) {
+      state.emptySig[key] = queueSignature(pipelineDir);
+      state.emptyAt[key] = now.toISOString();
+    }
     writeState(file, state);
   } catch { /* best-effort */ }
 }
@@ -133,7 +172,15 @@ function orderByLastBorrowed(entries, state, key) {
   return [...entries].sort((a, b) => last(a) - last(b) || a.index - b.index).map(stripProject);
 }
 
-const backedOff = (state, key, pipe, now) => Date.parse(state.emptyUntil[roleKey(key, pipe)]) > now.getTime();
+const backedOff = (state, key, pipe, now) => {
+  const k = roleKey(key, pipe);
+  if (Date.parse(state.emptyUntil[k]) > now.getTime()) return true;               // the flat timer, as before
+  const sig = state.emptySig && state.emptySig[k];
+  if (!sig || !usesSignature(key)) return false;
+  const at = Date.parse(state.emptyAt[k]);
+  if (!Number.isFinite(at) || now.getTime() - at >= reconcileMs()) return false;   // reconcile: visit it again
+  return queueSignature(pipe) === sig;                                             // unchanged since it was found empty: still empty
+};
 
 // -> [{ label, repoRoot, pipelineDir, domainsPath, applyRepoRoot, grepDirs }] in borrow order (pool:true projects only).
 function poolProjects({ projectsPath = PROJECTS_PATH, active, stateFile = statePath(), now = new Date(), includeBackedOff = false, role = 'worker' } = {}) {
@@ -230,29 +277,40 @@ function premiumTaskClaimable(pipelineDir, task) {
   return true;
 }
 
+// Is there a task in `dir` (one stage directory) with a top-level premiumPriority === true that a lane could claim? `names` are its .json files and `read`
+// turns a full path into { task }: the cached reader normally, a direct read when the cache layer itself broke.
+function stageHasPremium(pipelineDir, stage, dir, names, read) {
+  for (const name of names) {
+    const { task } = read(path.join(dir, name));
+    if (!task || task.premiumPriority !== true) continue;
+    if (GATED_PREMIUM_STAGES.has(stage) && !premiumTaskClaimable(pipelineDir, task)) continue;   // gated premium work does not hold the tie
+    return true;
+  }
+  return false;
+}
+
 // True when a task in one of the role's stages has a top-level premiumPriority === true -- the same test as lib/task-selection.js
 // hasPremiumPriorityInQueue (not required from there: that module loads the config and source registry, and this one is called from
-// bash every tick). Unreadable dirs and corrupt/partial files are skipped; never throws. A file whose text never mentions the field is not
-// parsed at all: measured on wok 2026-10-18 over 2213 worker-stage files (32 MB, 17 projects), warm cache, read+parse every file took
-// 232-275 ms and read+substring prefilter 157-173 ms (cold cache 2.7 s either way -- the read dominates). The parse still decides.
+// bash every tick). Unreadable dirs and corrupt/partial files are skipped; never throws. Each stage directory is read through the RAM cache
+// (queue-cache.js): a tick that finds the directory unchanged reads no task file. Measured on wok 2026-10-28: pending/ held 3576 files / 58 MB and a
+// cold-cache pass over them took 44 s. A task edited in place (rather than added or removed) is noticed within the cache's REVALIDATE_MS. If the cache
+// layer itself throws, that stage is read directly, as it was before the cache existed.
 function hasPremium(pipelineDir, { role = 'worker', lane = null } = {}) {
   if (!pipelineDir) return false;
   for (const stage of premiumStageDirs(role, lane)) {
     const dir = path.join(pipelineDir, 'queue', stage);
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
-    for (const e of entries) {
-      if (!e.isFile() || !e.name.endsWith('.json')) continue;
+    let found = false;
+    try {
+      const cache = openQueueCache(dir);
+      found = stageHasPremium(pipelineDir, stage, dir, cache.names(), (full) => readTaskCached(cache, full));
+      cache.save();
+    } catch {
       try {
-        const text = fs.readFileSync(path.join(dir, e.name), 'utf8');
-        if (!text.includes('"premiumPriority"')) continue;
-        const task = JSON.parse(text);
-        if (task && task.premiumPriority === true) {
-          if (GATED_PREMIUM_STAGES.has(stage) && !premiumTaskClaimable(pipelineDir, task)) continue;   // gated premium work does not hold the tie
-          return true;
-        }
-      } catch { /* corrupt or partial write: not a premium flag */ }
+        const names = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+        found = stageHasPremium(pipelineDir, stage, dir, names, (full) => readTaskCached(null, full));
+      } catch { found = false; }   // an unreadable stage holds no premium work
     }
+    if (found) return true;
   }
   return false;
 }
@@ -291,6 +349,102 @@ function markPremiumEmpty(pipelineDir, { role = 'worker', lane = null, now = new
   markEmpty(pipelineDir, { now, file, ttlMs, role: premiumRoleKey(role, lane) });
 }
 
+// ---- stalled reviews (2026-11-10) ----
+// A record can sit in some project's queue/review/ with nobody reviewing it: 2026-11-10 a premium pf-backend record waited 22+ minutes because every reviewer
+// daemon was yielding its tick to host memory pressure (the broker marker said tight/critical), and NOTHING said so. stalledReviews lists the records that have
+// waited at least `minAgeMs` (default 10 min) with no live review claim, in the home project and every registered one; noteStalledReviews writes ONE
+// 'review-stalled' history event on that record's project (with the reason the caller knows) and one log line per record per hour. It piggybacks on the reviewer
+// daemon's own tick (no timer of its own), never moves or edits a record, and never throws.
+const STALL_MIN_AGE_MS = 10 * 60 * 1000;
+const STALL_NOTE_EVERY_MS = 60 * 60 * 1000;
+
+function claimIsLive(claimDir, name) {
+  try {
+    const owner = fs.readFileSync(path.join(claimDir, `${name}.d`, 'owner'), 'utf8').trim().split(/\s+/)[0];
+    const pid = Number(owner);
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return !!(e && e.code === 'EPERM');   // the process exists but is not ours: still a live claim
+  }
+}
+
+function stalledReviews({ homePipelineDir = null, projectsPath = PROJECTS_PATH, claimDir = null, now = new Date(), minAgeMs = STALL_MIN_AGE_MS } = {}) {
+  const out = [];
+  try {
+    const projects = readProjects(projectsPath).filter((e) => e && e.pipelineDir).map((e) => ({ pipelineDir: e.pipelineDir, label: e.label || path.basename(e.pipelineDir) }));
+    if (homePipelineDir && !projects.some((e) => real(e.pipelineDir) === real(homePipelineDir))) projects.unshift({ pipelineDir: homePipelineDir, label: path.basename(homePipelineDir) });
+    const seen = new Set();
+    for (const proj of projects) {
+      const key = real(proj.pipelineDir);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const dir = path.join(proj.pipelineDir, 'queue', 'review');
+      let names = [];
+      try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { continue; }
+      for (const name of names) {
+        let ageMs;
+        try { ageMs = now.getTime() - fs.statSync(path.join(dir, name)).mtimeMs; } catch { continue; }
+        if (!(ageMs >= minAgeMs)) continue;
+        if (claimDir && claimIsLive(claimDir, name)) continue;
+        let premium = false;
+        try { premium = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')).premiumPriority === true; } catch { /* unreadable: still reported */ }
+        out.push({ pipelineDir: proj.pipelineDir, label: proj.label, file: name, ageMs: Math.round(ageMs), premium });
+      }
+    }
+  } catch { /* never throws */ }
+  return out;
+}
+
+function noteStalledReviews({ reason = 'unknown', homePipelineDir = null, projectsPath = PROJECTS_PATH, claimDir = null, stateFile = null, now = new Date(), minAgeMs = STALL_MIN_AGE_MS, noteEveryMs = STALL_NOTE_EVERY_MS, log = console.log } = {}) {
+  const noted = [];
+  try {
+    // The once-per-record-per-hour decision is a per-record CLAIM taken with an atomic mkdir in a stalled-reviews directory next to the state file (2026-11-10:
+    // two reviewer daemons ticking together both read the old JSON state and both wrote the event). A claim younger than noteEveryMs means another process
+    // already noted that record; an older one is replaced by renaming it away first (rename is atomic, so only one process wins the replacement).
+    const file = stateFile || path.join(path.dirname(statePath()), 'stalled-reviews.json');
+    const claims = path.join(path.dirname(file), 'stalled-reviews');
+    try { fs.mkdirSync(claims, { recursive: true }); } catch { /* the mkdir below fails and the record is skipped */ }
+    const stalled = stalledReviews({ homePipelineDir, projectsPath, claimDir, now, minAgeMs });
+    const claimName = (r) => crypto.createHash('sha1').update(`${real(r.pipelineDir)}/${r.file}`).digest('hex').slice(0, 24);
+    const live = new Set(stalled.map(claimName));
+    try {
+      for (const n of fs.readdirSync(claims)) if (!live.has(n) && !n.includes('.')) fs.rmSync(path.join(claims, n), { recursive: true, force: true });   // a record that moved on is forgotten, so a later stall is noted again
+    } catch { /* best-effort */ }
+    for (const r of stalled) {
+      const mine = path.join(claims, claimName(r));
+      let won = false;
+      try { fs.mkdirSync(mine); won = true; } catch (e) {
+        if (!e || e.code !== 'EEXIST') continue;
+        let ageMs = 0;
+        try { ageMs = now.getTime() - fs.statSync(mine).mtimeMs; } catch { continue; }
+        if (ageMs < noteEveryMs) continue;   // another process (or an earlier tick) noted it within the hour
+        const gone = `${mine}.old-${process.pid}-${Date.now()}`;
+        try { fs.renameSync(mine, gone); } catch { continue; }   // somebody else replaced it first
+        try { fs.rmSync(gone, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { fs.mkdirSync(mine); won = true; } catch { continue; }
+      }
+      if (!won) continue;
+      try { fs.utimesSync(mine, now, now); } catch { /* the claim still holds */ }
+      const minutes = Math.round(r.ageMs / 60000);
+      require('./pipeline-history.js').logPipelineEvent(r.pipelineDir, 'review-stalled', { file: r.file, ageMinutes: minutes, premium: r.premium, reason, project: r.label });
+      log(`[review-stalled] ${r.label}: ${r.file} has waited ${minutes} min for a review${r.premium ? ' (premium)' : ''}; reason: ${reason}`);
+      noted.push(r);
+    }
+  } catch { /* never throws */ }
+  return noted;
+}
+
+// Premium reviews under tight memory pressure (owner decision 2026-11-10: "premium reviews can run under tight pressure"). The reviewer daemon used to yield
+// its whole tick whenever the memory-pressure marker said tight or critical, so a premium review waited 77 minutes. Now a TIGHT marker (never critical) lets
+// the reviewer run when a premium review is waiting: premium items only, one per tick (scripts/review-runner.sh). Kill switch
+// AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT=false restores the old answer. Pure so it can be tested; the shell reaches it through --premium-under-pressure.
+function premiumMayRunUnderPressure({ state, hasPremiumReview, env = process.env } = {}) {
+  if (String((env || {}).AGENT_MANAGER_PREMIUM_REVIEW_UNDER_TIGHT || '').toLowerCase() === 'false') return false;
+  return state === 'tight' && hasPremiumReview === true;
+}
+
 // -> { set: {KEY: value}, unset: [KEY] } for running ONE invocation in `project`'s context from a lane whose home instances dir is
 // `homeInstancesDir`.
 function poolEnvFor(project, homeInstancesDir) {
@@ -316,6 +470,7 @@ function poolEnvArgs(project, homeInstancesDir) {
 module.exports = {
   enabled, poolProjects, poolEnvFor, poolEnvArgs, markBorrowed, markEmpty, readProjects, PROJECTS_PATH,
   registeredProjects, premiumReachEnabled, premiumStageDirs, hasPremium, premiumTaskClaimable, dependencyReleased, premiumProjects, markPremiumBorrowed, markPremiumEmpty,
+  stalledReviews, noteStalledReviews, STALL_MIN_AGE_MS, premiumMayRunUnderPressure,
 };
 
 if (require.main === module) {
@@ -349,10 +504,17 @@ if (require.main === module) {
     process.exit(hasPremium(a, { role: b || 'worker', lane: c || null }) ? 0 : 1);
   } else if (flag === '--mark-premium') {
     markPremiumBorrowed(a, { role: b || 'worker', homePipelineDir: c || null, lane: d || null });
+  } else if (flag === '--note-stalled-reviews') {
+    // node src/pool-projects.js --note-stalled-reviews <homePipelineDir> [reason]   one review-stalled event + log line per record waiting 10+ min with no live claim
+    noteStalledReviews({ homePipelineDir: a, reason: b || 'unknown', claimDir: process.env.AGENT_MANAGER_INSTANCES_DIR ? path.join(process.env.AGENT_MANAGER_INSTANCES_DIR, 'review-claims') : null });
+  } else if (flag === '--premium-under-pressure') {
+    // node src/pool-projects.js --premium-under-pressure <homePipelineDir> <state>   exit 0 when a premium review may run under that memory-pressure state
+    const waiting = hasPremium(a, { role: 'reviewer' }) || premiumProjects({ role: 'reviewer' }).length > 0;
+    process.exit(premiumMayRunUnderPressure({ state: b, hasPremiumReview: waiting }) ? 0 : 1);
   } else if (flag === '--mark-premium-empty') {
     markPremiumEmpty(a, { role: b || 'worker', lane: c || null });
   } else {
-    console.error('usage: pool-projects.js --list [role] | --labels [role] | --all | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir> [role] | --mark-empty <pipelineDir> [role] | --premium-projects <role> [lane] | --has-premium <pipelineDir> <role> [lane] | --mark-premium <pipelineDir> <role> <homePipelineDir> [lane] | --mark-premium-empty <pipelineDir> <role> [lane]');
+    console.error('usage: pool-projects.js --list [role] | --labels [role] | --all | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir> [role] | --mark-empty <pipelineDir> [role] | --premium-projects <role> [lane] | --has-premium <pipelineDir> <role> [lane] | --mark-premium <pipelineDir> <role> <homePipelineDir> [lane] | --mark-premium-empty <pipelineDir> <role> [lane] | --note-stalled-reviews <homePipelineDir> [reason] | --premium-under-pressure <homePipelineDir> <state>');
     process.exit(2);
   }
 }

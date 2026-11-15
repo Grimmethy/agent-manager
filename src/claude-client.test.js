@@ -756,3 +756,80 @@ test('call() returns a normal stop_reason end_turn response through the success 
     assert.equal(result.sessionId, 's1');
   });
 });
+
+// 2026-11-02: describeSpawnFailure -- a killed `claude -p` used to surface as ~2000 characters of
+// the prompt (execFileSync's 'Command failed: <bin> <argv>' message) with no exit status or signal.
+test('describeSpawnFailure reports the signal for a killed CLI and never the prompt', () => {
+  const { describeSpawnFailure } = requireFreshClaudeClient();
+  const e = new Error('Command failed: claude -p ' + 'PROMPT-MARKER '.repeat(2200));
+  e.status = null;
+  e.signal = 'SIGKILL';
+  e.stdout = '';
+  e.stderr = '';
+  const text = describeSpawnFailure(e);
+  assert.match(text, /exit=null signal=SIGKILL/);
+  assert.match(text, /\(no stderr, no stdout\)/);
+  assert.ok(text.length < 600, `expected a short detail, got ${text.length} characters`);
+  assert.doesNotMatch(text, /PROMPT-MARKER/);
+});
+
+test('describeSpawnFailure keeps stderr visible when stdout is long, and the exit status', () => {
+  const { describeSpawnFailure } = requireFreshClaudeClient();
+  const e = new Error('Command failed: claude -p x');
+  e.status = 1;
+  e.stdout = 'o'.repeat(5000);
+  e.stderr = 'auth error: token expired';
+  const text = describeSpawnFailure(e);
+  assert.match(text, /exit=1 signal=null/);
+  assert.match(text, /stderr: auth error: token expired/);
+  assert.ok(text.length < 3300);
+});
+
+test('describeSpawnFailure keeps a short spawn message such as ETIMEDOUT and the error code', () => {
+  const { describeSpawnFailure } = requireFreshClaudeClient();
+  const e = new Error('spawnSync claude ETIMEDOUT');
+  e.code = 'ETIMEDOUT';
+  const text = describeSpawnFailure(e);
+  assert.match(text, /code=ETIMEDOUT/);
+  assert.match(text, /message: spawnSync claude ETIMEDOUT/);
+});
+
+test('callOnce rejects a killed CLI with exit status and signal, without the prompt text', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    await withMockedClient(
+      (bin, args) => {
+        const e = new Error('Command failed: ' + bin + ' ' + args.join(' '));
+        e.status = null;
+        e.signal = 'SIGKILL';
+        throw e;
+      },
+      async ({ callOnce }) => {
+        await assert.rejects(
+          () => callOnce({ prompt: 'SECRET-PROMPT-TEXT '.repeat(500) }),
+          (err) => {
+            assert.match(err.message, /^claude -p failed: exit=null signal=SIGKILL/);
+            assert.doesNotMatch(err.message, /SECRET-PROMPT-TEXT/);
+            return true;
+          },
+        );
+      },
+    );
+  });
+});
+
+test('callOnce still maps a stdout turn-limit message to DRAFT_TURN_LIMIT_EXCEEDED when stderr is also present', async () => {
+  await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
+    await withMockedClient(
+      () => {
+        const e = new Error('Command failed: claude -p x');
+        e.status = 1;
+        e.stdout = "Error: max turns reached (1)";
+        e.stderr = 'some warning';
+        throw e;
+      },
+      async ({ callOnce }) => {
+        await assert.rejects(() => callOnce({ prompt: 'hi' }), (err) => err.code === 'DRAFT_TURN_LIMIT_EXCEEDED');
+      },
+    );
+  });
+});

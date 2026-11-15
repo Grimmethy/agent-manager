@@ -161,5 +161,52 @@ class TestPremiumPriorityProject(PremiumPriorityTestBase):
         self.assertEqual(res.status_code, 404)
 
 
+class TestPremiumProvenance(PremiumPriorityTestBase):
+    """premiumSetBy/premiumSetAt on set, premiumClearedBy/At on clear (display only; see the route's docstring)."""
+
+    def test_set_records_operator_ui_by_default_and_a_timestamp(self):
+        p = self._write("pending", "t1")
+        self.client.post("/api/task-anywhere/t1/premium-priority")
+        data = self._read(p)
+        self.assertEqual(data["premiumSetBy"], "operator-ui")
+        self.assertTrue(data["premiumSetAt"].startswith("20"))
+        self.assertIn("(operator-ui)", data["history"][0]["detail"])
+
+    def test_set_with_bulk_label(self):
+        p = self._write("pending", "t1")
+        res = self.client.post("/api/task-anywhere/t1/premium-priority", json={"by": "operator-bulk"})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(self._read(p)["premiumSetBy"], "operator-bulk")
+
+    def test_unknown_label_is_rejected_and_nothing_is_written(self):
+        p = self._write("pending", "t1")
+        res = self.client.post("/api/task-anywhere/t1/premium-priority", json={"by": "chat-queue"})
+        self.assertEqual(res.status_code, 400)
+        self.assertNotIn("premiumPriority", self._read(p))
+
+    def test_clear_records_who_and_when_and_keeps_the_last_set_info(self):
+        p = self._write("pending", "t1", {"premiumPriority": True, "premiumSetBy": "chat-queue", "premiumSetAt": "2026-10-29T00:00:00+00:00"})
+        self.client.post("/api/task-anywhere/t1/premium-priority", json={"enabled": False})
+        data = self._read(p)
+        self.assertNotIn("premiumPriority", data)
+        self.assertEqual(data["premiumSetBy"], "chat-queue")
+        self.assertEqual(data["premiumSetAt"], "2026-10-29T00:00:00+00:00")
+        self.assertEqual(data["premiumClearedBy"], "operator-ui")
+        self.assertTrue(data["premiumClearedAt"].startswith("20"))
+
+    def test_setting_again_drops_the_stale_cleared_fields(self):
+        p = self._write("pending", "t1", {"premiumClearedBy": "operator-ui", "premiumClearedAt": "2026-10-29T00:00:00+00:00"})
+        self.client.post("/api/task-anywhere/t1/premium-priority")
+        data = self._read(p)
+        self.assertNotIn("premiumClearedAt", data)
+        self.assertNotIn("premiumClearedBy", data)
+
+    def test_old_task_without_any_fields_can_still_be_set_and_cleared(self):
+        p = self._write("pending", "t1", {"premiumPriority": True})
+        res = self.client.post("/api/task-anywhere/t1/premium-priority", json={"enabled": False})
+        self.assertEqual(res.status_code, 200)
+        self.assertNotIn("premiumSetBy", self._read(p))
+
+
 if __name__ == "__main__":
     unittest.main()

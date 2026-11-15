@@ -33,29 +33,92 @@ _CONFLICT_LINE_RE = re.compile(r"^CONFLICT \([^)]+\):.*\bin (.+)$", re.MULTILINE
 
 
 def _check_merge_conflict(repo_root, main_branch, branch):
-    """Cheap, side-effect-free conflict preview: git merge-tree (2.38+) computes a real
-    3-way merge entirely against the object database -- no working tree or index touched,
-    nothing to clean up regardless of outcome -- and reports whether it WOULD conflict
-    without actually attempting one. Added after a real near-miss (2026-08-18): two
-    pushed-but-unmerged branches both independently created the same new file, and the
-    only way that surfaced was an opaque git error AFTER a merge was already attempted --
-    exactly the kind of surprise a 'one button' merge shouldn't produce. Best-effort: any
-    unexpected error here is reported as 'unknown', not 'safe' -- a staleness/conflict
-    check that silently says 'no conflict' on its own failure would be worse than no
-    check at all.
+    """Throwaway-worktree conflict preview: create a detached worktree on top of
+    ``origin/<branch>``, run ``git merge --no-commit --no-ff origin/<main_branch>`` in
+    it, and report the unmerged files. The worktree is removed in a ``finally`` block
+    regardless of outcome so this function leaves no trace on the host repo.
+
+    This replaces the prior ``git merge-tree`` approach (2026-08-18 -> 2026-10-XX)
+    because merge-tree honours merge drivers declared in .gitattributes, which means
+    its "no conflict" verdict can disagree with a real merge when a worktree-less
+    merge (the one the dashboard actually performs) does not see the same driver.
+    Forcing the merge through a real worktree makes the preview indistinguishable from
+    the production merge -- same index, same driver resolution, same conflict set.
+
+    Best-effort by design: any failure here (worktree creation, merge, cleanup,
+    timeout, OSErrors) is reported as ``willConflict: None`` rather than crashing or
+    silently saying "no conflict". A conflict check that lies on its own failure is
+    worse than no check at all.
+
+    Returns:
+        dict with keys:
+            willConflict (bool | None): True if the merge would produce a conflict,
+                False if it would succeed without conflicts, None if the check itself
+                failed (best-effort failure, not a "no conflict" verdict). This is the
+                source of truth for the preview's conflict detection -- callers should
+                treat None as "unknown" rather than "safe".
+            conflictFiles (list[str]): File paths that would conflict if merged.
+                Empty when willConflict is False or None. Populated only when
+                willConflict is True.
+            checked (bool): True if the check completed successfully (willConflict
+                is a real bool, not None), False if the check itself failed.
     """
-    result = subprocess.run(
-        ["git", "merge-tree", "--write-tree", f"origin/{main_branch}", f"origin/{branch}"],
-        cwd=str(repo_root), capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode == 0:
+    import shutil
+    import tempfile
+
+    worktree_path = None
+    try:
+        worktree_path = tempfile.mkdtemp(prefix="hub-merge-conflict-")
+        # Create a detached worktree on origin/<branch>; --detach means the working
+        # tree points at HEAD of that ref without creating a local branch -- nothing
+        # to track, nothing to leave behind beyond the directory itself.
+        add = subprocess.run(
+            ["git", "worktree", "add", "--detach", "--quiet", worktree_path, f"origin/{branch}"],
+            cwd=str(repo_root), capture_output=True, text=True, timeout=30,
+        )
+        if add.returncode != 0:
+            return {"willConflict": None, "conflictFiles": [], "checked": False}
+
+        # Attempt the merge in the throwaway worktree. --no-commit so we inspect the
+        # index without committing; --no-ff so git always creates a merge commit
+        # (and therefore always exercises the 3-way merge even when a fast-forward
+        # would succeed -- that's exactly the case merge-tree misses).
+        merge = subprocess.run(
+            ["git", "merge", "--no-commit", "--no-ff", f"origin/{main_branch}"],
+            cwd=worktree_path, capture_output=True, text=True, timeout=60,
+        )
+
+        # Pull the set of unmerged (conflicting) paths from the index. --diff-filter=U
+        # is what git itself uses for "unmerged" -- matches what `git status` reports
+        # under "both modified" / "both added" / etc.
+        diff = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=U"],
+            cwd=worktree_path, capture_output=True, text=True, timeout=15,
+        )
+        if diff.returncode == 0 and diff.stdout.strip():
+            files = [f for f in diff.stdout.strip().splitlines() if f]
+            return {"willConflict": True, "conflictFiles": files, "checked": True}
+
+        # Merge succeeded without conflicts (or was a no-op fast-forward that we
+        # forced into a merge commit). Either way: no conflict files in the index.
         return {"willConflict": False, "conflictFiles": [], "checked": True}
-    if result.returncode == 1:
-        files = _CONFLICT_LINE_RE.findall(result.stdout)
-        return {"willConflict": True, "conflictFiles": files, "checked": True}
-    # returncode > 1: merge-tree itself errored (not a conflict verdict) -- report
-    # "unknown" rather than guessing either way.
-    return {"willConflict": None, "conflictFiles": [], "checked": False}
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return {"willConflict": None, "conflictFiles": [], "checked": False}
+    finally:
+        # Always clean up: even if the merge timed out or worktree add failed partway,
+        # the directory (if created) must be removed so we don't leak on the host repo.
+        if worktree_path:
+            try:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", "--quiet", worktree_path],
+                    cwd=str(repo_root), capture_output=True, text=True, timeout=15,
+                )
+            except (subprocess.SubprocessError, OSError):
+                pass
+            try:
+                shutil.rmtree(worktree_path, ignore_errors=True)
+            except OSError:
+                pass
 
 
 def _check_sibling_conflict(repo_root, branch_a, branch_b):
@@ -342,6 +405,11 @@ def _summarize_hub(data, state):
     gate = data.get("integrationGate") or {}
     all_children_built = len(subs) > 0 and built_n == len(subs)
     gate_clear = gate.get("status") in (None, "passed", "skipped")
+    # An ABANDONED piece counts as finished for hub auto-completion (coordinator-sweep.js, on purpose), but it is not code that shipped: a hub whose wiring
+    # piece was abandoned is not ready to merge (pf-admin-ui HUB0001 read ready with piece 3/3 abandoned, so its sheet was never rendered). The hub record's
+    # `abandonedPiecesWaived: true` is the owner's explicit "merge it anyway".
+    abandoned = [st.get("id") for st in subs if st.get("status") == "abandoned"]
+    abandon_clear = not abandoned or data.get("abandonedPiecesWaived") is True
     return {
         "id": data.get("id"),
         "title": data.get("title"),
@@ -360,16 +428,19 @@ def _summarize_hub(data, state):
         "blockedReason": data.get("blockedReason"),
         # Ready to merge = every piece is BUILT (finished, committed, waiting on the merge -- not necessarily merged already) and the
         # integration gate has passed or was skipped. A hub already in done/ shipped.
-        "readyToMerge": bool(state == "done" or (all_children_built and gate_clear)),
+        "readyToMerge": bool(state == "done" or (all_children_built and gate_clear and abandon_clear)),
+        "abandonedPieces": abandoned,
     }
 
 
 # Hold unfinished hub children out of the Unmerged Branches pool (yellow hardening 8/8, 2026-10-02). A child of a model-decomposed hub is often the
 # first half of a feature: a helper nothing calls, or a test for code that is not there yet. Alone it can only ever be verified as "hold".
 # Its branch is still pushed (apply-task.js pushes every branch so no work lives only on one disk); it is just not LISTED until the hub is
-# readyToMerge, so the whole hub reaches verification together. Only hubs whose children a model decomposed are held: function-length,
-# change-review and other deterministic-source hubs, and any hub that owns a branch of its own, are listed as before.
-HOLDABLE_HUB_SOURCES = ("manual", "derived_task")
+# readyToMerge, so the whole hub reaches verification together. Held: hubs whose children a model decomposed (manual / derived_task, in ANY domain: a
+# hub filed with domain 'default' is just as unfinished) and change_review_fix hubs (their regression-test piece is the missing half). Still listed
+# as before: function-length, performance and arch-review hubs (independent behaviour-preserving pieces, each mergeable alone) and any hub that owns a
+# branch of its own.
+HOLDABLE_HUB_SOURCES = ("manual", "derived_task", "change_review_fix")
 
 
 def hold_unfinished_hub_children_enabled():
@@ -381,7 +452,7 @@ def hub_child_is_held(hub):
         return False
     if hub.get("state") != "coordinating" or hub.get("readyToMerge") or hub.get("branch"):
         return False
-    return hub.get("domain") == "adhoc" and hub.get("source") in HOLDABLE_HUB_SOURCES
+    return hub.get("source") in HOLDABLE_HUB_SOURCES
 
 
 def partition_held_hub_branches(branches):
@@ -403,12 +474,17 @@ def partition_held_hub_branches(branches):
     return listed, list(groups.values())
 
 
+def branch_trailer_ids(run_git, repo_root, main_branch, full_ref):
+    """The `Task:` trailer ids on the branch's commits. Raises when git fails (so a caller that remembers the answer never stores a failure as "no trailers")."""
+    return _TASK_TRAILER_RE.findall(run_git(["log", f"origin/{main_branch}..{full_ref}", "--format=%b"], repo_root))
+
+
 def branch_task_ids(run_git, repo_root, main_branch, full_ref, task_id):
     """The branch name's own id plus the `Task:` trailer ids on its commits. The branch NAME is not the sub-task id for a hub child
     (agent/decompose-<hub> carries HUB0113-01-...), so the trailers are what let the listing find the owning hub -- the same join
     branch_verdicts.resolve_owner uses. Without them a hub child had no hub in the listing and could not be held."""
     try:
-        trailers = _TASK_TRAILER_RE.findall(run_git(["log", f"origin/{main_branch}..{full_ref}", "--format=%b"], repo_root))
+        trailers = branch_trailer_ids(run_git, repo_root, main_branch, full_ref)
     except (RuntimeError, subprocess.SubprocessError, OSError):
         trailers = []
     return list(dict.fromkeys([task_id, *trailers]))

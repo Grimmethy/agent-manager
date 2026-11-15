@@ -235,14 +235,65 @@ function writeFileTool(a, b) {
 // indentation), then the same on JSON-unescaped text (models that send `\n` / `\"` literally). The harness's
 // regex tier is not ported. Every tier keeps the uniqueness rule: more than one hit is not applied.
 //
-// AGENT_MANAGER_EDIT_FILE_TIERS=on (or 1/true) enables applying a fallback; default OFF. Off, an exact miss still
+// Applying a fallback is ON by default since 2026-11-10; AGENT_MANAGER_EDIT_FILE_TIERS=off (or 0/false) disables it. Off, an exact miss still
 // runs the tiers as a SHADOW PROBE: the would-be strategy is attached to the error result as a non-enumerable
 // `matchProbe`, which the tool-loop audit records but JSON.stringify (what the model sees) leaves out. Measured
 // when this was written (tool-loop audit, 2026-10-18): 3 of 54 edit_file calls missed, cause unknown -- the probe
 // counts are what should decide switching the tiers on.
 function editTiersEnabled() {
   const v = String(process.env.AGENT_MANAGER_EDIT_FILE_TIERS || '').trim().toLowerCase();
-  return v === 'on' || v === '1' || v === 'true';
+  return !(v === 'off' || v === '0' || v === 'false');
+}
+
+// Closest-match hint for a miss no tier rescued (2026-11-10, ornith turn analysis: 7.7% of edit_file calls missed and
+// the model re-read the whole file after 59% of them, one wasted turn each; the tiers above rescue only ~14%). Ranks
+// the file's lines by bigram Dice similarity to the first non-blank line of `find` and returns up to HINT_LINES lines
+// around the best one, numbered, within HINT_MAX_CHARS. Returns '' when no line is similar enough (an unrelated edit
+// gets no hint). Pure text, no dependencies. AGENT_MANAGER_EDIT_FILE_TIERS=off also turns the hint off.
+const HINT_MIN_SIMILARITY = 0.6;
+const HINT_LINES = 6;
+const HINT_MAX_CHARS = 600;
+const HINT_LINE_CHARS = 160;
+
+function bigrams(text) {
+  const t = text.replace(/\s+/g, ' ').trim().slice(0, 400);
+  const out = new Map();
+  for (let i = 0; i < t.length - 1; i += 1) {
+    const g = t.slice(i, i + 2);
+    out.set(g, (out.get(g) || 0) + 1);
+  }
+  return { grams: out, size: Math.max(0, t.length - 1) };
+}
+
+function diceSimilarity(a, b) {
+  if (!a.size || !b.size) return 0;
+  let shared = 0;
+  for (const [g, n] of a.grams) shared += Math.min(n, b.grams.get(g) || 0);
+  return (2 * shared) / (a.size + b.size);
+}
+
+function closestMatchHint(content, find) {
+  const target = find.split(/\r?\n/).find((l) => l.trim());
+  if (!target || target.trim().length < 6) return '';
+  const want = bigrams(target);
+  const lines = content.split(/\r?\n/);
+  let best = -1;
+  let bestScore = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!lines[i].trim()) continue;
+    const score = diceSimilarity(want, bigrams(lines[i]));
+    if (score > bestScore) { bestScore = score; best = i; }
+  }
+  if (best < 0 || bestScore < HINT_MIN_SIMILARITY) return '';
+  const from = Math.max(0, best - 1);
+  const to = Math.min(lines.length, from + HINT_LINES);
+  let out = '';
+  for (let i = from; i < to; i += 1) {
+    const row = `${i + 1}| ${lines[i].slice(0, HINT_LINE_CHARS)}\n`;
+    if (out.length + row.length > HINT_MAX_CHARS) break;
+    out += row;
+  }
+  return out ? `\nClosest text in the file (line ${best + 1} is the best match; copy from here, do not re-read the whole file):\n${out.trimEnd()}` : '';
 }
 
 function splitKeepEnds(text) {
@@ -354,7 +405,8 @@ function editFileTool(a, b) {
       }
       return { path: relPath, edited: true, matchStrategy: fallback.strategy };
     }
-    const miss = { error: `"find" text not found verbatim in ${relPath} -- no change made. Re-read the file and match it exactly.` };
+    const hint = editTiersEnabled() ? closestMatchHint(content, find) : '';
+    const miss = { error: `"find" text not found verbatim in ${relPath} -- no change made. Re-read the file and match it exactly.${hint}` };
     // Shadow probe (see the tier block's header): audit-only, invisible to JSON.stringify and so to the model.
     if (fallback) Object.defineProperty(miss, 'matchProbe', { value: fallback.updated != null ? fallback.strategy : `${fallback.strategy}-ambiguous`, enumerable: false });
     return miss;
@@ -449,4 +501,4 @@ function runBashTool(a, b) {
   }
 }
 
-module.exports = { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, editTiersEnabled, tryFallbackTiers, unescapeJsonText, withApplyLock, runBashTool, LIST_DIR_MAX_ENTRIES, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS };
+module.exports = { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, editTiersEnabled, closestMatchHint, tryFallbackTiers, unescapeJsonText, withApplyLock, runBashTool, LIST_DIR_MAX_ENTRIES, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS };

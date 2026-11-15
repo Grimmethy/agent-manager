@@ -11828,3 +11828,3878 @@ No behavioural change: every `try/catch` boundary, every `continue`, every `summ
 
 Benefits:
 Each helper is unit-testable in isolation (feed a synthetic `parent` with a stuck child and assert the `coordinatorBlocked` shape without touching the filesystem or the full loop). The main loop reads top-to-bottom as a numbered pipeline, so the ordering invariant is visible at a glance rather than buried in 254 lines of interleaved `try/catch` blocks. New responsibilities get their own numbered step and helper instead of another 20-line block spliced into the middle of the loop. The `summary` object is passed explicitly, making data flow auditable in code review.
+
+### AC-197 · Draft adhoc orchestrator mixes five pre-flight gates, a scope sub-workflow, and an execution closure
+Strength: Strong
+Files: src/local-agentic-write-draft.js
+Symbol: draftAdhocViaLocalAgenticWrite
+Snippet:
+```
+ * @param {function} [deps.recordModelCall]
+ */
+async function draftAdhocViaLocalAgenticWrite(task, {
+  runPlan = runPlanWithTools,
+  runInWorktree,
+  recordModelCall = defaultRecordModelCall,
+} = {}) {
+  // A deliberately-disabled tier is a clean block for a human, not an infra failure to
+  // retry -- return the {succeeded:true, blocked:true} shape so draftAdhocBranch routes
+  // the task to queue/blocked/ with a legible reason.
+  if (!isEnabled()) {
+    return { succeeded: true, blocked: true, blockedReason: 'local write-agentic adhoc tier is disabled (AGENT_MANAGER_LOCAL_AGENTIC_WRITE=false) and the cheaper local tiers could not complete this task -- needs a human.' };
+  }
+  if (writeToolsDisabled()) {
+    return { succeeded: true, blocked: true, blockedReason: 'local write-agentic adhoc tier is disabled (queue/.chat-write-tools-disabled kill switch) and the cheaper local tiers could not complete this task -- needs a human.' };
+  }
+
+  // AC-13a: bail before spending a single turn on a task that's structurally impossible
+  // for this sandbox -- see EXTERNAL_DEP_MARKERS/detectExternalDependency's own header.
+  const extDep = detectExternalDependency(task);
+  if (extDep) {
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: `task requires external-state operation (${extDep}) that the local sandbox cannot perform -- needs a human to provision the resource first.`,
+      needsClarification: {
+        reason: 'external-dependency',
+        openQuestions: [`This task references an external resource (${extDep}). Please confirm: (a) the resource already exists and its URL/credentials, or (b) you want it created, in which case this must be handled outside the local sandbox.`],
+      },
+    };
+  }
+
+  // Contradictory-literal-acceptance gate (2026-09-15, brain-dump bd-1789433484492,
+  // "pipeline hardening 5/5"): a task can mandate an exact multi-line literal to write
+  // AND separately demand an exact-phrase grep check that the literal, as specified,
+  // structurally cannot satisfy (the phrase spans a line boundary the mandated text
+  // itself introduces) -- no draft attempt could ever pass. Root-caused live: burned 3
+  // real automated attempts on system-report.js's LESSONS-LEARNED comment task before a
+  // human caught it. See detectContradictoryLiteralAcceptance's own header.
+  const contradiction = detectContradictoryLiteralAcceptance(task);
+  if (contradiction) {
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: `task's own literal instructions are self-contradictory: ${contradiction.reason}`,
+      needsClarification: {
+        reason: 'contradictory-literal-acceptance',
+        openQuestions: [`${contradiction.reason} Please either drop the exact-phrase check, or rewrite the mandated literal text so "${contradiction.requiredPhrase}" appears unbroken on one line.`],
+      },
+    };
+  }
+
+  // Stale-decompose-premise gate (2026-09-15, brain-dump bd-1789433484305, "pipeline
+  // hardening 3/5"): a sub-task filed by an internal decompose can cite a specific line
+  // in a file that's since been restructured by a LATER, independent decompose -- the
+  // cited site cannot possibly still be there. Root-caused live: burned a real draft
+  // attempt on a local-draft.js sub-task citing line 2178 against a file decompose #226
+  // had already shrunk to 1327 lines. See detectStaleDecomposePremise's own header for
+  // what this does and (importantly) does not catch.
+  const staleDecompose = detectStaleDecomposePremise(task, { repoRoot: getConfig().repoRoot });
+  if (staleDecompose) {
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: `sub-task premise may be stale: ${staleDecompose.reason}`,
+      needsClarification: {
+        reason: 'stale-decompose-premise',
+        openQuestions: [`${staleDecompose.reason} Please confirm the real current location of what this sub-task is meant to change, or re-scope it.`],
+      },
+    };
+  }
+
+  // Scope-complexity gate (pre-plan, before the first model call): a task that is
+  // structurally too broad for one tier-3 pass (anchor app.py + 3+ endpoint paths or
+  // subsystems -- see scopeComplexityGate's own header) is decomposed up front instead of
+  // burning the full LOCAL_AGENTIC_WRITE_MAX_TURNS budget on read-only orientation and only
+  // landing in the post-exhaustion backstop below. Default-on kill switch, mirroring
+  // isEnabled(): opt out by setting the env var in the check below to the string 'false'.
+  if (process.env.AGENT_MANAGER_SCOPE_GATE !== 'false') {
+    const gate = scopeComplexityGate(task);
+    if (gate && gate.shouldDecompose) {
+      const split = await runDecomposePassIfAvailable(task, {
+        mode: 'preliminary',
+        priorAttemptBlock: gate.reason,
+      });
+      // >= 2 subTasks -> this is a real decompose, return the same shape the post-exhaustion
+      // backstop uses. A null split or a 0/1-subTask split means the split wasn't usable, so
+      // we deliberately fall through to the normal tier-3 path rather than misrouting.
+      if (split && split.subTasks && split.subTasks.length >= 2) {
+        task.adhocResolution = 'decompose';
+        task.subTaskProposals = split.subTasks;
+        task.implementResponse = `Scope-complexity gate: this task spans ${split.subTasks.length} independent pieces, so it was decomposed before any implementation attempt.\n\n${formatSubTaskProposalsForReview(split.subTasks)}`;
+        return { succeeded: true, blocked: false, resolution: 'decompose' };
+      }
+    }
+  }
+
+  // A retry that already has its own prior attempt's verified findings fed forward (see
+  // priorAttemptAnalysisBlock) gets a much shorter orientation window -- see
+  // RETRY_ORIENT_TURN_LIMIT's own header for why.
+  const orientTurnLimit = priorAttemptAnalysisBlock(task) ? RETRY_ORIENT_TURN_LIMIT : ORIENT_TURN_LIMIT;
+  const prompt = buildWriteAgenticPrompt(task, { orientTurnLimit });
+  const started = Date.now();
+
+  const doRun = runInWorktree || (async (worktreeDir, info) => {
+    // A continuation's prior edits are normally APPLIED to this worktree (agentic-draft-common.js applyPartialDiff) and the requeue note says
+    // so. When that failed, the note is wrong for this run: hand the model the diff as text and say the edits are NOT on disk.
+    const runPrompt = partialDiffFallbackPrompt(prompt, task, info);
+    const result = await runPlan({
+      prompt: runPrompt,
+      maxTurns: LOCAL_AGENTIC_WRITE_MAX_TURNS,
+      source: task.source,
+      taskId: task.id,
+      stage: 'agentic-write',
+      allowWrite: true,
+      primaryRoot: worktreeDir,
+      // On a cap-exhausted run, spend one more no-tools turn forcing a RESOLUTION line
+      // so resolveAgenticDraft has something to route on instead of a hard block.
+      forceSummaryOnCap: true,
+      // Edit-by-turn-N forcing function: this tier's whole job is to produce a diff, and
+      // it has repeatedly burned its entire budget on read-only orientation. If it hasn't
+      // edited anything by orientTurnLimit turns, runPlanWithTools pushes one firm
+      // "stop exploring, act now" message.
+      nudgeToEditEarly: true,
+      orientTurnLimit,
+      // A confirmed-atomic leaf (decomposedFrom / rescopedFromDecompose) that still hasn't
+      // edited a few turns after the soft nudge gets one firmer push: edit now or conclude
+      // needs-human-decision -- decompose is off the table for a leaf.
+      leafMustEdit: leafDecomposeLocked(task),
+    });
+    modelStatsSafe(recordModelCall, {
+      taskId: task.id, stage: 'implement', model: localDraftModelLabel(),
+      startedAt: new Date(started).toISOString(), latencyMs: Date.now() - started,
+      result, source: task.source,
+    });
+    return result;
+  });
+
+  try {
+    const verdict = await runAgenticDraftInWorktree(task, {
+      runInWorktree: doRun,
+      modelLabel: localDraftModelLabel(),
+    });
+    const giveUp = await runGiveUpSplit(task, verdict);
+    if (giveUp) return giveUp;
+    return verdict;
+```
+
+Problem:
+The 144-line `draftAdhocViaLocalAgenticWrite` function accretes at least four independently testable responsibilities that were added at different times (comments cite separate brain-dumps and dates). The five pre-flight gates each carry a distinct condition, a heterogeneous return shape (some embed `needsClarification.openQuestions`, the scope gate returns a wholly different `{resolution:'decompose'}` object), and their own domain-detection helpers. The `AGENT_MANAGER_SCOPE_GATE` block is a mini-state-machine with internal branching (call decompose, inspect result, either return or fall through), not a simple guard. The ~30-line `doRun` closure assembles execution configuration (prompt, turn limits, nudge flags, leaf-locked flag) and records model stats, coupling execution policy to orchestration. Because every gate is only reachable through the full function, unit-testing the contradictory-literal gate in isolation requires constructing a valid `task`, a valid `deps` object, and ensuring four prior gates all pass first. The next hardening pass will add another gate, pushing the function to ~170 lines with no structural change.
+
+Solution:
+Extract the five pre-flight checks into a `runPreFlightGates(task, deps)` function that returns `null` on pass or the appropriate block object on failure, with each gate as a small named helper (`checkTierEnabled`, `checkWriteToolsDisabled`, `checkExternalDependency`, `checkContradictoryLiteral`, `checkStaleDecomposePremise`, `checkScopeComplexity`). Pull the `doRun` closure into a `buildDoRunClosure(task, prompt, orientTurnLimit)` factory that returns the configured execution function. Move the post-execution routing (`runAgenticDraftInWorktree` call plus `runGiveUpSplit` verdict return) into an `executeAndRoute(task, doRun)` helper. The top-level `draftAdhocViaLocalAgenticWrite` then shrinks to roughly 25 lines: call `runPreFlightGates`, early-return if blocked, compute `orientTurnLimit` and `prompt`, call `buildDoRunClosure`, and delegate to `executeAndRoute`. Each extracted unit is 10–35 lines with a single purpose.
+
+Benefits:
+Each gate becomes independently testable with a focused fixture that exercises only its own condition and return shape, without constructing the full orchestrator context. The `doRun` closure can be unit-tested for correct option assembly (turn-limit arithmetic, nudge-flag propagation, leaf-locked flag) in isolation, and a change to `runPlan` options produces a diff in `buildDoRunClosure` rather than in the middle of the orchestrator. Reviewers can evaluate a new pre-flight gate as a small, self-contained addition to `runPreFlightGates` rather than scanning a 170+ line function for where the new gate was inserted and whether it interacts with the scope sub-workflow. The top-level function reads as a clear four-step pipeline, making the control flow immediately legible.
+
+### AC-198 · Decompose needsClarificationTriage into per-bucket functions with an explicit ordering caller
+Strength: Strong
+Files: src/needs-clarification-triage.js
+Symbol: needsClarificationTriage
+Snippet:
+```
+}
+
+async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote }) {
+  const summary = { checked: 0, requeued: 0, archived: 0, flagged: 0, leftForHuman: 0, errors: 0 };
+  const { KILL, VOTE_ENABLED, DRY_RUN, MAX_REQUEUES, MAX_VOTES, VOTE_MODEL } = cfgEnv();
+  if (KILL) return summary;
+  if (DRY_RUN) summary.dryRun = true;
+
+  const ncDir = path.join(pipelineDir, 'queue', 'needs-clarification');
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  const archiveDir = path.join(pipelineDir, 'queue', 'done', '_archived_no_action');
+
+  let names;
+  try {
+    names = fs.readdirSync(ncDir).filter((f) => f.endsWith('.json'));
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return summary; // no needs-clarification/ dir
+    }
+    console.error('[needs-clarification-triage] readdirSync failed on', ncDir, err);
+    summary.errors += 1;
+    return summary;
+  }
+
+  const now = new Date().toISOString();
+  let votesUsed = 0;
+
+  for (const name of names) {
+    const file = path.join(ncDir, name);
+    let task;
+    try {
+      task = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      summary.errors += 1;
+      continue;
+    }
+
+    // --- Bucket K: decompose-review-blind signature -> repair in place, send to review --
+    // Checked BEFORE the `nc.reason` allowlist below (and everything else in the loop,
+    // including the decompose-loop/oversized-file deferral) -- SECOND positioning fix,
+    // same day as the first: root-caused live 2026-09-16 running the sweep for real
+    // after the first fix landed -- 2 of the remaining un-recovered targets carry
+    // needsClarification.reason === 'infra-error', not 'design-decision', so the
+    // allowlist below (`if (reason !== 'design-decision' && ...) continue`) excluded
+    // them before Bucket K ever got a look, identical in shape to the oversized-file
+    // dead zone the first fix closed. Real incident: a task's SECOND draft attempt
+    // produced a genuine decompose (real subTaskProposals) that review correctly
+    // rejected for the rendering bug this bucket exists to fix; the requeued THIRD
+    // attempt then hit an unrelated infra-error and exhausted retries -- escalation
+    // reason reflects only the LAST failure, not the fact that a valid decomposition
+    // is still sitting on the task from an earlier attempt. Bucket K's own detection
+    // (a real >=2-item subTaskProposals with no evidence in implementResponse) is
+    // already a narrow, deterministic, reason-independent signal, so it belongs ahead
+    // of a filter meant for buckets that actually need a specific escalation reason to
+    // make sense (H/I key off the reason value itself; this one doesn't use it at all).
+    //
+    // Checked BEFORE the decompose-loop/oversized-file deferral immediately below --
+    // root-caused live 2026-09-16, hours after this bucket first shipped: EVERY one of
+    // its intended targets also carries stalenessFlag.reason === 'decompose-loop' (the
+    // same repeated-decompose history that triggered the give-up backstop this bucket
+    // exists to repair), and a large fraction of those target an oversized file (the
+    // very files -- local-draft.js, agentic-draft-common.js -- this pipeline's own
+    // decompose-related fixes live in). The line below silently `continue`s any
+    // decompose-loop task whose target is oversized ("autoroute owns it") with NO log
+    // line and NO bucket ever getting a chance to run -- including this one, and
+    // including Bucket D above it, though D's own signature rarely overlaps in
+    // practice. decompose-loop-autoroute.js's OWN precondition then declines anyway
+    // when that same file is "actively developed" (a real, separate safety guard), so
+    // the net effect was a permanent dead zone: deferred here, declined there, visible
+    // nowhere. This bucket's own concern (a decomposition that ALREADY happened and
+    // just needs its rendering repaired) has nothing to do with whether the target file
+    // is oversized -- there is nothing left for autoroute to do -- so it must run
+    // before that deferral, not after it, unlike every requeue bucket below which
+    // genuinely does need to yield to autoroute's oversized-file ownership.
+    //
+    // Unlike every other bucket here, this does NOT redraft: the task already has a
+    // valid, complete decomposition (task.subTaskProposals), just an implementResponse
+    // that (pre-PR-#230) never mentioned it. Regenerate implementResponse from the real
+    // sub-tasks and file straight to queue/review/ for a real vote -- see the top-of-file
+    // header comment for the full incident.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      const subTasks = Array.isArray(task.subTaskProposals) ? task.subTaskProposals : [];
+      const isDecompose = task.adhocResolution === 'decompose' && subTasks.length >= 2;
+      const hasEvidence = isDecompose && subTasks.some((s) => s && s.title
+        && String(task.implementResponse || '').includes(String(s.title).slice(0, 30)));
+      if (isDecompose && !hasEvidence && bucketAttempts(task, 'K') < MAX_REQUEUES) {
+        const reviewDir = path.join(pipelineDir, 'queue', 'review');
+        const reviewPath = path.join(reviewDir, `${id0}.json`);
+        if (fs.existsSync(reviewPath)) {
+          log(`${id0}: bucket K but ${id0}.json already in review/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'K') + 1;
+          log(`${id0}: bucket K (decompose-review-blind signature) -> repaired in place, sent to review ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            delete task.needsClarification;
+            delete task.localRejectCount;
+            delete task.retryableDraftBlock;
+            delete task.preDrafted;
+            delete task.priorRejectionFeedback;
+            delete task.blockedReason;
+            delete task.blockedStage;
+            delete task.claimedAt;
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            bumpBucketAttempts(task, 'K');
+            task.status = 'needs-review';
+            task.implementResponse = `Decomposed into ${subTasks.length} sub-task(s).\n\n${formatSubTaskProposalsForReview(subTasks)}`;
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: decompose-review-blind signature (a since-fixed rendering gap, PR #230, hid a genuinely valid decomposition from review) -- implementResponse regenerated from the existing subTaskProposals, sent straight to review ${attempt}/${MAX_REQUEUES}`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-K: decompose-review-blind signature', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(reviewDir, { recursive: true });
+              fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: repair-and-review move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket O: valid short change sets blocked by the deterministic non-implementation gate -> file to review ---
+    // Checked BEFORE the nc.reason allowlist, like K and N: these tasks escalate as 'design-decision' (deadcode_fix) but the
+    // signal here is the persisted reviewProvider stamp plus the response itself. review-task.js rejected any fence-free
+    // response under 80 characters as "a bare tool-call request or meta-commentary", which blocked the model's CORRECT
+    // `{"mode": "delete", "file": "<path>"}` (71-79 characters) three times with no model vote (9 TaxHarvest deadcode_fix
+    // tasks). The gate now exempts structurally valid change sets (lib/structured-change.js), so nothing needs redrafting:
+    // the draft was fine. Keep implementResponse exactly as written, clear the rejection state, and file it to review/.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if (task.reviewProvider === 'deterministic-non-implementation'
+        && isStructuredGroupBChange(String(task.implementResponse || '').trim())
+        && bucketAttempts(task, 'O') < MAX_REQUEUES) {
+        const reviewDir = path.join(pipelineDir, 'queue', 'review');
+        const reviewPath = path.join(reviewDir, `${id0}.json`);
+        if (fs.existsSync(reviewPath)) {
+          log(`${id0}: bucket O but ${id0}.json already in review/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'O') + 1;
+          log(`${id0}: bucket O (valid short change set blocked by the non-implementation length gate) -> filed to review ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of ['needsClarification', 'localRejectCount', 'retryableDraftBlock', 'priorRejectionFeedback', 'blockedReason',
+              'blockedStage', 'claimedAt', 'reviewProvider', 'reviewInconclusive', 'localVotes', 'voteErrors', 'ncTriageDecision', 'ncTriageReviewedAt']) delete task[f];
+            bumpBucketAttempts(task, 'O');
+            task.status = 'needs-review';
+            appendHistoryEvent(task, 'requeued',
+              'needs-clarification-triage: the draft is a structurally valid change set (the deterministic non-implementation gate rejected it on length alone, since fixed) -- implementResponse kept as written, rejection state cleared, filed to review for a real vote');
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-O: valid short change set blocked by the non-implementation length gate', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(reviewDir, { recursive: true });
+              fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: change-set repair-and-review move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket P: plan-target guard misfire (a call like `res.json()` read as a file, a create target called "absent") -> clean-state requeue ---
+    // Checked BEFORE the nc.reason allowlist, like K/N/O: the signal is the persisted guard reason plus a RE-RUN of the fixed guard on the task's own plan.
+    // adhoc-diff-sanity.js no longer reads a title call expression as a path, and plan-target-guard.js now honours the task's own "Create <file>" and an
+    // "is absent" acknowledgement. Only a task the CURRENT guard would let through is requeued; a genuinely fabricated target still blocks and stays here.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if (planTargetNoLongerBlocks(task, repoRoot) && bucketAttempts(task, 'P') < MAX_REQUEUES) {
+        const adhocPath = path.join(adhocDir, `${id0}.json`);
+        if (fs.existsSync(adhocPath)) {
+          log(`${id0}: bucket P but ${id0}.json already in adhoc/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'P') + 1;
+          log(`${id0}: bucket P (plan-target guard misfire, since fixed) -> requeue ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            resetStatusForFreshAdhocAttempt(task);
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            bumpBucketAttempts(task, 'P');
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: the plan-target guard blocked this on an illustrative token (a call expression read as a file, or a create target called absent); the fixed guard no longer blocks the stored plan -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-P: plan-target guard misfire', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+// ... [truncated for review: this function continues for 736 more line(s) not shown]
+```
+
+Problem:
+`needsClarificationTriage` spans 936 lines and interleaves ten or more triage buckets (K, O, P, and at least seven more in the truncated region), each with its own detection predicate, a distinct subset of task-state fields to clear, a different destination directory, and a unique `classifyRequeue` reasonHint. The buckets are not independent: a 40-line comment block above Bucket K exists solely to document why it must precede two other gates, and the shared `nc.reason` allowlist / decompose-loop deferral sits between buckets as a cross-cutting invariant. A developer adding a new bucket must scroll through the entire function, re-read every ordering comment, and confirm the insertion point does not violate a constraint that is invisible from the code structure. The per-bucket field-clearing lists are also styled inconsistently (individual `delete` calls, an inline array loop, and a shared `REQUEUE_STRIP_FIELDS` constant), which compounds the cognitive load because the reader cannot pattern-match on a uniform shape.
+
+Solution:
+Extract each bucket into a self-contained function that owns its detection predicate, its state-clearing list, its destination-directory move, and its reasonHint/history-event message, returning a small result object such as `{ action: 'requeued' | 'skipped' | 'deferred', attempt? }`. The shared `nc.reason` allowlist gate and the decompose-loop deferral become their own named functions (`sharedGate_ncReasonAllowlist`, `decomposeLoopDeferral`). The caller (`needsClarificationTriage`) then reduces to: read config, resolve directories, iterate task files, and for each task call `runTriageBuckets(task, ctx)` where `ctx` carries `pipelineDir`, `repoRoot`, `summary`, `DRY_RUN`, and `majorityVote`. `runTriageBuckets` is a short, linear list of roughly twelve `if (bucketX(task, ctx) !== 'skip') continue;` lines in the documented order, followed by the fall-through (archive / leftForHuman / error). Each bucket function is independently unit-testable: given a fixture task object, assert the correct action, the correct mutated state, and the correct file placement.
+
+Benefits:
+Readability improves because the ordering invariant is now a twelve-line list that a reviewer can verify in one glance, rather than a 900-line interleaving of predicates, deletes, and comment blocks. Testability improves because each bucket can be exercised in isolation with a minimal task fixture, and the ordering can be tested as a separate integration-level concern. Review-ability improves because a pull request adding Bucket Q touches one new file (or one new exported function) plus a single inserted line in the caller, making the diff small, the blast radius obvious, and the ordering constraint checkable by a reviewer who reads only the caller. The inconsistent field-clearing styles can also be normalized per-bucket without risk of accidentally altering another bucket's behavior.
+
+### AC-199 · Decompose applyDirectToMainBatchOnBranch into phase-scoped helpers
+Strength: Strong
+Files: src/lib/apply-main-batch.js
+Symbol: applyDirectToMainBatchOnBranch
+Snippet:
+```
+}
+
+function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBrainDir, brainDumpPath, gitRunner, state }) {
+  const results = {};
+  const eligible = [];
+  for (const task of tasks) {
+    const reg = getRegisteredSource(resolveSourceName(task));
+    if (reg && reg.directToMain === true) {
+      eligible.push(task);
+    } else {
+      results[task.id] = { succeeded: false, reason: 'source is not directToMain -- must be applied individually, not in the triage batch' };
+    }
+  }
+  if (eligible.length === 0) return { results, committed: false };
+
+  // Gated (default): append onto the rolling TRIAGE_BRANCH, never main -- see main-push-policy.js.
+  // prepareStackedBranch syncs it from origin if it exists (earlier unmerged batches stay on it),
+  // or starts it fresh off current main (also after a human merged + deleted it).
+  const gated = !ungatedMainPushAllowed();
+  gitRunner.fetchMain();
+  if (gated) {
+    // Pre-flight BEFORE entering the branch: a dirty apply clone aborts prepareStackedBranch's `checkout -B` / `rebase`
+    // (2026-09-23: ~266 change_review tasks blocked one-by-one on it). Self-heal a dedicated clone, else fail once, loudly.
+    if (typeof gitRunner.quarantineDirtyTree === 'function') gitRunner.quarantineDirtyTree();
+    if (typeof gitRunner.assertCleanTree === 'function') gitRunner.assertCleanTree();
+    state.enteredTriageBranch = true;
+    gitRunner.prepareStackedBranch(TRIAGE_BRANCH);
+    // Drop candidate blocks main already retracted that this branch still carries (the merge driver used to keep them; see
+    // src/lib/prune-retracted-candidates.js). Best-effort and never fatal: a failure here must not block the batch.
+    if (typeof gitRunner.pruneRetractedCandidates === 'function') {
+      try {
+        const pruned = gitRunner.pruneRetractedCandidates();
+        if (pruned && pruned.committed) console.error(`[apply-main-batch] pruned retracted candidate(s) from ${TRIAGE_BRANCH}: ${pruned.pruned.map((p) => `${p.doc} ${p.ids.map((i) => `AC-${i}`).join(',')}`).join('; ')}`);
+      } catch (e) { console.error(`[apply-main-batch] pruneRetractedCandidates failed (ignored): ${String(e && e.message).split('\n')[0].slice(0, 200)}`); }
+    }
+  } else gitRunner.resetToMain();
+
+  const staged = [];
+  for (const task of eligible) {
+    try {
+      const artifact = writeArtifact(task, repoRoot, pipelineDir);
+      // HUB0092 · 2/3: a source.apply that saw its source move past the approved draft
+      // (apply-group-a.js's stale guard: {skipped:true, stale:true, success:false}) used
+      // to be swallowed by the `artifact.skipped` branch below and recorded as
+      // succeeded:true -- the task landed in done/ as if the CURRENT file state had been
+      // reviewed and shipped, when in fact nothing was applied. (Sibling 1/3's guard in
+      // recordApplyOutcome was abandoned, so this inline check is the last gate before
+      // the success branch.) Route every stale artifact to the non-success shape the
+      // single-task path already uses for stale results (apply-group-a.js:51):
+      // succeeded:false, so recordApplyOutcome files it apply-failed, not applied.
+      if (artifact && artifact.stale === true) {
+        results[task.id] = { succeeded: false, stale: true, reason: artifact.reason || 'stale apply result -- source changed after approval, nothing applied' };
+        continue;
+      }
+      if (artifact && artifact.skipped) {
+        results[task.id] = { succeeded: true, doneMarker: artifact.reason };
+        closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
+        continue;
+      }
+      if (artifact && artifact.needsConfirmation) {
+        results[task.id] = artifact; // -> awaiting-confirm/, nothing staged for this one
+        continue;
+      }
+      const files = artifact.files || [artifact.file];
+      assertStageableFiles(task, files);
+      // 2026-09-16: task-logs/ is gitignored (see task-log-store.js's own 2026-09-15
+      // RE-EVALUATED header -- it can retain a task's full rawText/implementResponse
+      // verbatim, which for a brain_dump-derived task is the user's own free-typed
+      // personal/business note content, and this repo is public). apply-task.js's
+      // single-task path was updated to only write it to disk, never stage it -- this
+      // batch path was missed, so EVERY batched directToMain apply (arch_discovery,
+      // arch_review, observability_review, ...) started failing `git add` with "The
+      // following paths are ignored by one of your .gitignore files: task-logs" the
+      // moment a task whose artifact needed staging reached here, root-caused live via
+      // a real stuck task (arch-discovery-community-15) that got approved at review and
+      // then failed at apply with exactly this error, looping on requeue forever since
+      // the failure is deterministic. writeTaskLogFile still writes the file to disk
+      // (for the user's own local reference, and so the commit message's `Task-Log:`
+      // line below still points somewhere real); it just never joins `files` here.
+      const taskLogRel = writeTaskLogFile(repoRoot, task);
+      gitRunner.add(files);
+      staged.push({ task, files, taskLogRel });
+    } catch (e) {
+      // This task's append threw. Its file may carry a partial trailing line -- cosmetic
+      // in an append-only markdown candidate doc and visible in review; not worth a
+      // resetToMain here (that would discard every sibling's already-good append too).
+      results[task.id] = { succeeded: false, reason: `writeArtifact failed: ${e.message}` };
+    }
+  }
+
+  if (staged.length === 0) return { results, committed: false };
+
+  const msgPath = path.join(require('os').tmpdir(), `apply-batch-msg-${process.pid}.txt`);
+  const commitMessage = [
+    `Triage batch: ${staged.length} candidate-doc update(s)`,
+    '',
+    ...staged.map((s) => `- ${s.task.title} (task ${s.task.id})`),
+    '',
+    ...staged.map((s) => `Task-Log: ${s.taskLogRel}`),
+    '',
+    coAuthorTrailer(staged[0].task),
+  ].join('\n');
+  fs.writeFileSync(msgPath, commitMessage);
+  try {
+    gitRunner.commit(msgPath);
+  } finally {
+    fs.unlinkSync(msgPath);
+  }
+
+  if (gated) {
+    try {
+      gitRunner.push(TRIAGE_BRANCH);
+    } catch (pushErr) {
+      // 2026-09-24: an ordinary non-fast-forward rejection (origin moved between this run's
+      // fetch and its own push -- e.g. a different apply tick landed first) used to leave
+      // this commit orphaned for prepareStackedBranch's NEXT call to find as genuine
+      // two-sided divergence and refuse to touch until a human reconciled it by hand
+      // (confirmed live twice in two days: 2026-09-23, then four more times on 2026-09-24).
+      // Retry once via fetch+rebase+push -- these are simple appends to different lines of
+      // the same candidate doc, not real code, so a clean rebase is the common case -- before
+```
+
+Problem:
+The 157-line function interleaves four independent phases (eligibility filter, branch prep, per-task staging, commit-and-push-retry), each with distinct failure modes. Tracing any single phase requires scrolling through all four; a `pruneRetractedCandidates` regression, for instance, is buried mid-function with no visual boundary separating it from the staging loop.
+
+Solution:
+Extract three helpers so the top-level function becomes a ~12-line orchestrator:
+
+```js
+function filterEligible(tasks) { /* → { eligible, results } */ }
+function prepareBranch(gitRunner, state, gated) { /* quarantine → assert → prepareStackedBranch | resetToMain */ }
+function stageEligibleTasks(eligible, ctx, results) { /* writeArtifact loop, git add; returns staged[] */ }
+function commitAndPush(gitRunner, gated) { /* commit, push, non-FF rebase-retry */ }
+```
+
+`applyDirectToMainBatchOnBranch` calls them in order, returning early when `eligible` or `staged` is empty.
+
+Benefits:
+Each helper is unit-testable against a mock `gitRunner` with a two-task fixture, no full-pipeline exercise needed. Review diffs shrink to one phase. The orchestrator reads as a table of contents.
+
+### AC-200 · Extract queue-state branches into named helpers
+Strength: Strong
+Files: python/dashboard/routes/shared_misc.py
+Symbol: api_queue_state
+Snippet:
+```
+
+@shared_misc_bp.route("/api/queue/<state>")
+def api_queue_state(state):
+    """Returns {items: [...], total: N}. Incremental loading (2026-07-26, Grimmethy:
+    "long task lists take a while to load"): optional ?limit=N&offset=M page the result --
+    file METADATA is sorted first (cheap, no content read) and only the requested slice
+    ever gets read_json_safe'd, so a 200+-item done/ folder no longer means reading and
+    JSON-parsing every single file on every 5s poll, just the page actually being shown."""
+    from app import QUEUE_STATES, queue_dir, read_json_safe, task_summary
+    qdir = queue_dir()
+    if not qdir:
+        return jsonify({"items": [], "total": 0})
+
+    if state == "drafting":
+        # Never paginated -- an in-flight claim count is always small (bounded by worker
+        # count), nothing like done/'s unbounded historical backlog.
+        entries = []
+        drafting_root = qdir / "drafting"
+        if drafting_root.is_dir():
+            for sub in drafting_root.iterdir():
+                if not sub.is_dir():
+                    continue
+                for f in sub.glob("*.json"):
+                    data = read_json_safe(f)
+                    if data:
+                        s = task_summary(data, f.stem)
+                        s["claimedBy"] = sub.name
+                        entries.append(s)
+            for f in drafting_root.glob("*.json"):  # legacy: no subfolder
+                data = read_json_safe(f)
+                if data:
+                    entries.append(task_summary(data, f.stem))
+        return jsonify({"items": entries, "total": len(entries)})
+
+    if state not in QUEUE_STATES:
+        abort(404)
+
+    limit = request.args.get("limit", type=int)
+    offset = request.args.get("offset", default=0, type=int)
+    source_filter = (request.args.get("source") or "").strip()
+
+    if state == "coordinating":
+        # Never paginated before ordering -- hub counts are small (same "in-flight, bounded"
+        # reasoning the drafting branch above already uses), and a family tree can only be
+        # built correctly with every hub in hand at once. Builds a parent->children map on
+        # `parentHub` (see decompose-loop-autoroute.js / apply-task.js's recordApplyOutcome)
+        # and walks it pre-order so a child always renders immediately beneath its parent,
+        # tagging `hubDepth` for the frontend's indent -- then pages the flattened result.
+        state_dir = qdir / "coordinating"
+        by_id = {}
+        if state_dir.is_dir():
+            for f in state_dir.glob("*.json"):
+                data = read_json_safe(f)
+                if data and (not source_filter or data.get("source") == source_filter):
+                    by_id[data.get("id", f.stem)] = task_summary(data, f.stem)
+        explicit_parent = {}
+        for tid, entry in by_id.items():
+            parent = entry.get("parentHub")
+            # A dangling/self/foreign parentHub (parent not among today's coordinating
+            # records -- already resolved and moved on, or a cycle) is not used.
+            if parent and parent in by_id and parent != tid:
+                explicit_parent[tid] = parent
+        # Fallback: a hub id sitting in another hub's subTasks[] is ALSO a real parent link
+        # -- rewireCoordinatorParent() (src/decompose-loop-autoroute.js) has rewritten
+        # subTasks entries to point at a rescuing hub since before `parentHub` existed
+        # (2026-09-08), so real families already live in the data this way with no backfill
+        # needed; explicit `parentHub` wins when both are present.
+        derived_parent = {}
+        for tid, entry in by_id.items():
+            for st in entry.get("subTasks") or []:
+                sid = st.get("id") if isinstance(st, dict) else None
+                if sid and sid in by_id and sid != tid:
+                    derived_parent.setdefault(sid, tid)
+
+        children_of = {}
+        for tid in by_id:
+            parent = explicit_parent.get(tid) or derived_parent.get(tid)
+            children_of.setdefault(parent, []).append(tid)
+        for kids in children_of.values():
+            kids.sort(key=lambda tid: by_id[tid].get("createdAt") or "", reverse=True)
+
+        # Root-hub ordering (2026-09-09, Grimmethy: "I'd like the hubs to be sortable
+        # either alphabetically by name or by priority ... The highest priority hub should
+        # always be worked on next"). Only the ROOT list is reordered -- each family's
+        # subtree keeps its newest-first child order from the loop above, so families stay
+        # contiguous. `sort=priority` (default): explicit `hubPriority` ascending (LOWER =
+        # more urgent), then unranked hubs oldest-first by createdAt (FIFO -- the direct
+        # answer to "new hubs being worked before old hubs are finished"). `sort=name`:
+        # case-insensitive by title. The same rule the worker claim path uses for this
+        # hub's children (src/hub-priority.js), so the tab shows the real work order.
+        sort_mode = (request.args.get("sort") or "priority").strip().lower()
+        roots = children_of.get(None, [])
+        if sort_mode == "name":
+            roots.sort(key=lambda tid: (by_id[tid].get("title") or tid).casefold())
+        else:
+            def _root_key(tid):
+                hp = by_id[tid].get("hubPriority")
+                rank = hp if isinstance(hp, (int, float)) and not isinstance(hp, bool) else float("inf")
+                return (rank, by_id[tid].get("createdAt") or "￿")
+            roots.sort(key=_root_key)
+        children_of[None] = roots
+
+        ordered = []
+        visited = set()
+
+        def walk(tid, depth, family_label):
+            if tid in visited:
+                return
+            visited.add(tid)
+            entry = dict(by_id[tid])
+            entry["hubDepth"] = depth
+            # hubFamily: the topmost hub's own title, carried onto every descendant so the
+            # frontend can render a family-header row even on a page that doesn't include
+            # the root itself.
+            entry["hubFamily"] = family_label if depth > 0 else entry.get("title") or tid
+            ordered.append(entry)
+            for child_id in children_of.get(tid, []):
+                walk(child_id, depth + 1, entry["hubFamily"])
+
+        for root_id in children_of.get(None, []):
+            walk(root_id, 0, None)
+        # Any hub left unvisited only happens via a parentHub cycle -- append as a root so
+        # it still shows up instead of disappearing.
+        for tid in by_id:
+            if tid not in visited:
+                walk(tid, 0, None)
+
+        total = len(ordered)
+        page = ordered[offset:offset + limit] if limit is not None else ordered[offset:]
+        return jsonify({"items": page, "total": total})
+
+    entries = []
+    total = 0
+    state_dir = qdir / state
+    if state_dir.is_dir():
+        files = sorted(state_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if source_filter:
+            # Filtering by task type (Job Status > Done tab, 2026-08-17: "Done is getting
+            # huge, need to filter by task type") needs each file's own `source` field --
+            # unlike sorting, that's not derivable from the filename/mtime alone, so this
+            # reads every file in the state dir instead of just the requested page. Only
+            # pays that cost when a filter is actually selected; the default unfiltered
+            # request below keeps the cheap stat-only-sort-then-page-only-read behavior.
+            filtered = []
+            for f in files:
+                data = read_json_safe(f)
+                if data and data.get("source") == source_filter:
+                    filtered.append((f, data))
+            total = len(filtered)
+            page = filtered[offset:offset + limit] if limit is not None else filtered[offset:]
+            entries = [task_summary(data, f.stem) for f, data in page]
+        else:
+            total = len(files)
+            page = files[offset:offset + limit] if limit is not None else files[offset:]
+            for f in page:
+                data = read_json_safe(f)
+                if data:
+                    entries.append(task_summary(data, f.stem))
+    return jsonify({"items": entries, "total": total})
+```
+
+Problem:
+`api_queue_state` is 157 lines with three independent handlers (drafting, coordinating, generic) that have different data shapes, sorting, and edge cases. The coordinating branch embeds ~60 lines of parent-map and DFS logic that cannot be unit-tested without a full Flask request context.
+
+Solution:
+Extract the three branches into module-level helpers. The route becomes a short dispatch. No logic or response-shape changes.
+
+Benefits:
+Each helper is callable with a plain dict, enabling unittest without a request context. The tree-walk becomes testable in isolation. New states add one dispatch line instead of a 20-line mid-function block.
+
+```python
+@shared_misc_bp.route("/api/queue/<state>")
+def api_queue_state(state):
+    from app import QUEUE_STATES, queue_dir
+    qdir = queue_dir()
+    if not qdir:
+        return jsonify({"items": [], "total": 0})
+    if state == "drafting":
+        return _drafting_response(qdir)
+    if state not in QUEUE_STATES:
+        abort(404)
+    if state == "coordinating":
+        return _coordinating_response(qdir)
+    return _generic_state_response(qdir, state)
+
+
+def _drafting_response(qdir):
+    """Drafting queue state (body unchanged)."""
+    ...
+
+
+def _coordinating_response(qdir):
+    """Coordinating queue state (body unchanged)."""
+    ...
+
+
+def _generic_state_response(qdir, state):
+    """Remaining queue states (body unchanged)."""
+    ...
+```
+
+### AC-201 · Extract candidate gate guards into named helper
+Strength: Strong
+Files: src/sdk/lib/candidate-lifecycle.js
+Symbol: nextCandidateFulfillmentTask
+Snippet:
+```
+}
+
+function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
+  // lazy (see module header) -- task-sources.js is fully loaded by the time any
+  // next() poll calls this.
+  const { taskIdExistsInQueue, isDependencySatisfied } = require('../../task-sources.js');
+  const { defaultDomain, pipelineDir } = getConfig();
+  // Read the doc as it is on the DEFAULT BRANCH, not from whichever branch the checkout is on: only a
+  // candidate a human has merged may become a task (2026-09-19: arch-review-ac-2 was drafting content that
+  // existed only on the unmerged agent/arch-review-ac-1). Falls back to the working-tree file when git
+  // can't answer. See lib/candidate-doc-refs.js.
+  const text = require('../../lib/candidate-doc-refs.js').readCandidatesText(candidatesPath);
+  if (!text) return null;
+
+  const sections = [];
+  let pos = 0;
+  while (pos < text.length) {
+    const start = text.indexOf('### ', pos);
+    if (start === -1) break;
+
+    const nextH2 = text.indexOf('\n## ', start + 3);
+    const nextH3 = text.indexOf('\n### ', start + 3);
+    let end;
+    if (nextH2 !== -1 && nextH3 !== -1) {
+      end = Math.min(nextH2, nextH3);
+    } else if (nextH2 !== -1) {
+      end = nextH2;
+    } else if (nextH3 !== -1) {
+      end = nextH3;
+    } else {
+      end = -1;
+    }
+
+    const sectionText = end === -1 ? text.slice(start) : text.slice(start, end);
+    sections.push(sectionText);
+    pos = end === -1 ? text.length : end + 1;
+  }
+
+  for (const section of sections) {
+    const headingLine = section.split('\n')[0];
+
+    const idMatch = headingLine.match(/AC-\d+/);
+    if (!idMatch) continue;
+    const candidateId = idMatch[0];
+
+    // Depends-On: AC-NNN (2026-09-05, see prompts.js's candidateSplitInstructions for the
+    // incident: two sibling split candidates, one structurally depending on the other,
+    // both offered for drafting the same tick because nothing tracked the relationship).
+    // Reuses nextAdhocTask's own isDependencySatisfied -- "satisfied" means MERGED, not
+    // just done, same reasoning: a candidateFulfillment source without directToMain still
+    // drafts from a fresh worktree off origin/<mainBranch>, so a dependency only reached
+    // done/ (branch pushed, not yet merged) is not actually visible to this draft yet.
+    // Skips PAST this candidate (does not block the whole lane) so a later, independent
+    // one still gets picked up this same call.
+    const dependsOnMatch = section.match(/^Depends-On:\s*(AC-\d+)\s*$/m);
+    if (dependsOnMatch) {
+      const depTaskId = `${sourceName.replace(/_/g, '-')}-${dependsOnMatch[1].toLowerCase()}`;
+      if (!isDependencySatisfied(pipelineDir, depTaskId)) continue;
+    }
+
+    const strengthMatch = section.match(/^Strength:\s*(.+)$/m);
+    if (!strengthMatch || strengthMatch[1].trim() !== 'Strong') continue;
+
+    if (candidateGuardSize(section) > MAX_ARCH_REVIEW_TASK_CHARS) continue;
+
+    // 2026-08-24 -- caught live: a real task (arch-review-ac-10, "AC-10 · Example
+    // candidate", Files: foo.js) sat permanently un-completable for weeks, repeatedly
+    // bulk-requeued on the assumption it was a "crash-bug casualty" rather than ever
+    // having its own content re-examined -- its Problem/Solution sections were literally
+    // "Problem: ...\nSolution: ..." (an unfilled template placeholder), not a real
+    // finding. Traced to a real, if narrow, gap: this function has always trusted ANY
+    // "Strength: Strong" section as actionable with no check that its content is real.
+    // Deliberately NOT rejecting on "no referenced files exist" (see fetchedFiles'
+    // own comment below -- a candidate proposing a genuinely NEW file is a valid,
+    // intended shape, not a stale one) -- an ellipsis-only Problem/Solution body is a
+    // much more specific, unambiguous signal: no real LLM-drafted finding ever produces
+    // literally just "..." as its entire problem or solution description, regardless of
+    // whether the files it names exist yet.
+    const problemMatch = section.match(/^Problem:\s*\n?([\s\S]*?)(?=\n(?:Solution|Benefits):|$)/m);
+    const solutionMatch = section.match(/^Solution:\s*\n?([\s\S]*?)(?=\nBenefits:|$)/m);
+    const isPlaceholderBody = (m) => !m || m[1].trim() === '' || /^\.{3,}$/.test(m[1].trim());
+    if (isPlaceholderBody(problemMatch) || isPlaceholderBody(solutionMatch)) continue;
+
+    const taskId = sourceName.replace(/_/g, '-') + '-' + candidateId.toLowerCase();
+    if (taskIdExistsInQueue(taskId)) continue;
+
+    const titleMatch = headingLine.match(/AC-\d+\s*·\s*(.+)/);
+    const titleText = (titleMatch ? titleMatch[1] : headingLine.replace(/^###\s*/, '')).trim();
+
+    let filesArray = [];
+    const filesMatch = section.match(/^Files:\s*(.+)$/m);
+    if (filesMatch) {
+      filesArray = filesMatch[1].split(',').map((f) => f.trim());
+    }
+    // Resolve each declared entry with the SAME resolver the discovery-time check uses, so a bare
+    // basename or an extension-less entry (`SearchView`, `SearchView.tsx`) fetches the real file
+    // instead of nothing (2026-09-19, PropertyForager arch-review-ac-1: the drafter saw no code).
+    // An entry that resolves to no real file is kept as written (a candidate proposing a new file).
+    {
+      const { resolveCitedFile } = require('../../candidate-path-grounding.js');
+      const { repoRoot: resolveRoot, grepAllowedDirs } = getConfig();
+      filesArray = filesArray.map((f) => {
+        const r = resolveCitedFile(resolveRoot, f, grepAllowedDirs || []);
+        return (r.exists && r.isFile && r.relPath) ? r.relPath : f;
+      });
+    }
+
+    // 2026-09-02: the `Files:` line is frequently incomplete -- a candidate whose Solution
+    // says "call `buildPlanPrompt` with a second arg" needs prompts.js in view to see that
+    // function's real signature, but only lists local-draft.js (pipeline-forensics-fix-ac-7
+    // /-ac-14). Also read any repo-relative source path the Problem/Solution prose names
+    // into fetchedFiles (NOT into `files` -- those stay the candidate's declared edit
+    // targets, which the review/decompose gates count against), so the drafter can ground
+    // a cross-file change instead of editing blind or refusing.
+    // Files the prose names (src/-style paths, relative require/import specifiers, any-directory paths); see citedContextFiles. Declared files never repeat as context.
+    const contextFiles = require('../../candidate-path-grounding.js').citedContextFiles({ section, declaredFiles: filesArray, repoRoot: getConfig().repoRoot, max: 3 });
+
+    // Grounding fix (2026-08-21, confirmed live: observability-fix-ac-5 fabricated a
+    // plausible-but-wrong `find` string -- "catch { return []; }" -- that matched nothing
+    // in the real file, because this candidate's own implement pass was never shown real
+    // file content, only its own prose write-up from whenever the candidate was originally
+    // drafted, possibly hours or days earlier by a different pass entirely. Every OTHER
+    // fulfillment-style source (arch_import, pipeline_self_audit) grounds its implement
+    // pass in real, freshly-read file content; this generic consumer -- shared by
+    // arch_review, arch_import_review, observability_fix, performance_fix, and
+    // backlog_fulfillment all at once -- never did. Unlike arch_import's own harness
+    // grounding (which has to SEARCH for candidate files because it doesn't know them yet),
+    // this already knows exactly which files from the candidate's own "Files:" line, so no
+    // search step is needed -- just read them, best-effort. A file that doesn't exist
+    // (a candidate proposing a brand-new file, or a stale/illustrative path) is not an
+    // error -- see fetchedFiles' own promptContext field, which the implement prompt is
+    // told explicitly means "ground a create, or flag the mismatch, don't invent content."
+    const { repoRoot } = getConfig();
+    const readWindowed = (relPath, isContext) => {
+      try {
+        const full = path.resolve(repoRoot, relPath);
+        if (!full.startsWith(path.resolve(repoRoot) + path.sep) && full !== path.resolve(repoRoot)) return null;
+        const content = fs.readFileSync(full, 'utf8');
+        const windowed = windowFetchedFileContent(content, section);
+        const entry = { path: relPath, content: windowed.text, anchorConfidence: windowed.confidence };
+        if (isContext) entry.context = true; // referenced in prose, not a declared edit target
+        return entry;
+      } catch {
+        return null; // doesn't exist / unreadable -- not an error, see comment above
+      }
+    };
+    const declaredFetched = filesArray.map((p) => readWindowed(p, false)).filter(Boolean);
+    const contextFetched = contextFiles.map((p) => readWindowed(p, true)).filter(Boolean);
+    const fetchedFiles = [...declaredFetched, ...contextFetched];
+
+    // Pre-draft premise recheck (see this file's own header comment above
+    // staleSignatureReason/archiveStaleCandidate for the full incident): either check
+    // hitting skips a full plan/implement/review cycle entirely -- filed straight to
+    // done/_archived_no_action/, loop continues to the next candidate in the doc.
+    const staleReason = staleSignatureReason(pipelineDir, section);
+    const evidence = computePremiseEvidence({ promptContext: { body: section, fetchedFiles } });
+    const invalidPremiseReason = evidence.contradictions.length ? evidence.contradictions[0].detail : null;
+    if (staleReason || invalidPremiseReason) {
+      archiveStaleCandidate({
+        pipelineDir, taskId, domain: defaultDomain, sourceName, titleText, candidateId, section,
+        reason: staleReason || invalidPremiseReason,
+      });
+      continue;
+    }
+
+    // Path-hallucination guard (2026-08-26, Grimmethy: "Can we answer why it didn't get
+    // correct files to begin with?" -- arch-review-ac-7 investigation). Same shape as the
+    // isPlaceholderBody skip above (a real, precedented gap: arch-review-ac-10 sat
+    // permanently un-completable for weeks because this function trusted ANY
+    // "Strength: Strong" section as actionable with no check its content was real) but for
+    // the "Files:" line instead of the Problem/Solution body. Confirmed live: AC-7 listed
+    // 5 files (none with a directory prefix, two -- resolveGraphPath.js/getConfig.js --
+    // not real files at all, both actually live together in src/config.js) despite
+    // archReviewImplementPrompt's own explicit instruction to copy paths exactly as given
+    // -- the model just didn't follow it. Every one of the 5 silently failed to resolve
+    // above, leaving fetchedFiles empty, and the task was queued anyway, doomed to the same
+    // "no real implementation code" degenerate/blocked cycle every single pass. Deliberately
+    // NOT skipping on filesArray.length === 1 with zero fetchedFiles -- see this function's
+    // own comment above: a candidate proposing ONE genuinely brand-new file is a valid,
+    // intended shape (fetchedFiles' own promptContext meaning is "ground a create, or flag
+    // the mismatch"). Multiple listed files where NONE resolve is a much stronger signal --
+    // no real architectural finding proposes touching several already-existing-sounding
+    // files that are ALL, simultaneously, brand new.
+    if (filesArray.length >= 2 && declaredFetched.length === 0) continue;
+
+    // Deterministic, one-level candidate pre-split (2026-09-02). A candidate declaring >=2
+    // files, or laying out >=3 numbered edit steps in its Solution, is more than the local
+    // 27B reliably lands in a single diff (pipeline-forensics-fix-ac-1/-ac-14 blocked+
+    // exhausted exactly this way). `mustPreSplit` tells the implement pass to decompose it
+    // into single-concern sub-candidates FIRST. Every sub-candidate the split writes back
+    // carries `Split-Depth: 1`; this reader refuses to pre-split anything already at depth
+    // >= 1, a hard recursion stop that does NOT depend on the model's judgement (the earlier
+    // model-driven re-split went infinite -- AC-4..AC-12, 2026-09-01).
+    const depthMatch = section.match(/^Split-Depth:\s*(\d+)\s*$/m);
+    const splitDepth = depthMatch ? Number(depthMatch[1]) : 0;
+    // Count numbered steps off the raw section (the Solution-only capture above stops at
+    // the first end-of-line under /m, so it can't be used for this).
+    const solutionSlice = section.split(/^Solution:/m)[1] ? section.split(/^Solution:/m)[1].split(/^Benefits:/m)[0] : '';
+    const numberedSteps = (solutionSlice.match(/(?:^|\n)\s*\d+[.)]\s+\S/g) || []).length;
+    const mustPreSplit = splitDepth === 0 && (filesArray.length >= 2 || numberedSteps >= 3);
+
+    // "detect and label, never silently discard" (this function's existing placeholder/
+// ... [truncated for review: this function continues for 28 more line(s) not shown]
+```
+
+Problem:
+nextCandidateFulfillmentTask interleaves six independent skip-conditions (missing AC-ID, unsatisfied Depends-On, non-Strong strength, placeholder Problem/Solution, oversized guard, duplicate queue entry) inline in the main loop. Each guard has its own regex, failure mode, and test surface, yet none can be exercised without running the full 227-line function including file I/O and archive logic.
+
+Solution:
+Pull the six guards into a single pure function candidatePassesGate(section, ctx) that returns { skip, candidateId, taskId }. The caller loop shrinks to a two-line check.
+
+```js
+function candidatePassesGate(section, ctx) {
+  const idMatch = section.split('\n')[0].match(/AC-\d+/);
+  if (!idMatch) return { skip: true };
+  const { sourceName, pipelineDir, taskIdExistsInQueue, isDependencySatisfied } = ctx;
+  const dep = section.match(/^Depends-On:\s*(AC-\d+)\s*$/m);
+  if (dep && !isDependencySatisfied(pipelineDir,
+      sourceName.replace(/_/g,'-') + '-' + dep[1].toLowerCase()))
+    return { skip: true };
+  if (!/Strength:\s*Strong/.test(section)) return { skip: true };
+  if (candidateGuardSize(section) > MAX_ARCH_REVIEW_TASK_CHARS) return { skip: true };
+  const pb = section.match(/^Problem:\s*\n?([\s\S]*?)(?=\n(?:Solution|Benefits):|$)/m);
+  const sl = section.match(/^Solution:\s*\n?([\s\S]*?)(?=\nBenefits:|$)/m);
+  const isPh = m => !m || !m[1].trim() || /^\.{3,}$/.test(m[1].trim());
+  if (isPh(pb) || isPh(sl)) return { skip: true };
+  const taskId = sourceName.replace(/_/g,'-') + '-' + idMatch[0].toLowerCase();
+  if (taskIdExistsInQueue(taskId)) return { skip: true };
+  return { skip: false, candidateId: idMatch[0], taskId };
+}
+```
+
+Caller:
+```js
+const gate = candidatePassesGate(section, { sourceName, pipelineDir, taskIdExistsInQueue, isDependencySatisfied });
+if (gate.skip) continue;
+```
+
+Benefits:
+Each guard becomes independently testable with node:test (e.g. "Strength: Weak skips", "...-only Problem skips") without exercising the parser, file fetch, or archive path. The main loop drops from ~55 lines of inline regex to two lines, making the remaining phases (file resolution, premise recheck, pre-split) easier to read and to extract in a follow-up change.
+
+### AC-202 · Extract git-checkout fallback into _checkout_git_ref
+Strength: Strong
+Files: python/dashboard/routes/plugins.py
+Symbol: api_plugins_update
+Snippet:
+```
+
+@plugins_bp.route("/api/plugins/update", methods=["POST"])
+def api_plugins_update():
+    """Updates one installed plugin to the catalog's latest version: fetch/checkout the
+    new source revision (or npm update), re-run npm install, record the new version +
+    source in plugins.json, and restart the pipeline if it's running."""
+    from app import _pipeline_running, _plugins_install_dir, _read_plugin_catalog, _read_plugins_manifest, _restart_pipeline, _run_plugin_subprocess, _version_tuple, _write_plugins_manifest
+    body = request.get_json(silent=True) or {}
+    plugin_id = (body.get("id") or "").strip()
+    if not plugin_id:
+        abort(400, description="id is required")
+
+    doc, _err = _read_plugin_catalog()
+    catalog_entry = next(
+        (e for e in doc.get("plugins", []) if isinstance(e, dict) and e.get("id") == plugin_id),
+        None,
+    )
+    if catalog_entry is None:
+        abort(404, description=f"plugin '{plugin_id}' not in catalog")
+
+    manifest = _read_plugins_manifest()
+    entry = next(
+        (p for p in manifest if isinstance(p, dict) and p.get("name") == plugin_id),
+        None,
+    )
+    if entry is None:
+        abort(404, description=f"plugin '{plugin_id}' not installed")
+
+    installed_version = entry.get("version")
+    new_version = catalog_entry.get("version")
+    if not (new_version and _version_tuple(new_version) > _version_tuple(installed_version or "")):
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "reason": "no update available",
+            "installedVersion": installed_version,
+            "latestVersion": new_version,
+        })
+
+    plugin_dir = _plugins_install_dir() / plugin_id
+    if not plugin_dir.is_dir():
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "error": f"plugin checkout not found at {plugin_dir}",
+        }), 404
+
+    source = catalog_entry.get("source") or {}
+    if source.get("type") not in ("git", "npm"):
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "error": f"unsupported source.type: {source.get('type')!r}",
+        }), 400
+
+    try:
+        if source["type"] == "git":
+            _run_plugin_subprocess(["git", "fetch", "--tags", "--prune"], plugin_dir)
+            candidates = [c for c in (source.get("ref"), new_version) if c]
+            checked_out = False
+            for ref in candidates:
+                try:
+                    _run_plugin_subprocess(["git", "checkout", ref], plugin_dir)
+                    checked_out = True
+                    break
+                except subprocess.CalledProcessError:
+                    continue
+            if not checked_out:
+                # No usable ref/tag -- fall back to origin's default branch.
+                out, _ = _run_plugin_subprocess(
+                    ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], plugin_dir
+                )
+                default_ref = out.strip()
+                if not default_ref:
+                    raise subprocess.CalledProcessError(
+                        1, "git checkout",
+                        stderr="no source.ref, no version tag, and no origin/HEAD default",
+                    )
+                _run_plugin_subprocess(["git", "checkout", default_ref], plugin_dir)
+        else:  # npm
+            pkg = (source.get("url") or "").strip() or plugin_id
+            _run_plugin_subprocess(["npm", "update", pkg], plugin_dir)
+        _run_plugin_subprocess(["npm", "install"], plugin_dir)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        detail = (getattr(e, "stderr", None) or getattr(e, "stdout", None) or str(e)).strip()
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "error": "plugin update failed",
+            "detail": detail,
+        }), 500
+
+    entry["version"] = new_version
+    entry["source"] = source
+    _write_plugins_manifest(manifest)
+    restarted = False
+    if _pipeline_running():
+        _restart_pipeline()
+        restarted = True
+    return jsonify({
+        "id": plugin_id,
+        "updated": True,
+        "installedVersion": installed_version,
+        "latestVersion": new_version,
+        "restarted": restarted,
+    })
+```
+
+Problem:
+The update handler mixes git ref-resolution (fetch, multi-candidate checkout, symbolic-ref fallback) with npm install, manifest write, and pipeline restart in one 104-line body. The git branch is a nested try/except state machine that cannot be unit-tested without a live Flask request.
+
+Solution:
+Extract the `if source["type"] == "git":` block into `_checkout_git_ref(plugin_dir, candidates)`: fetch, try each candidate ref, fall back to origin/HEAD, raise RuntimeError on total failure.
+
+Benefits:
+Ref-fallback logic is testable in isolation with a temp repo; the handler loses ~20 lines; new ref strategies slot into the candidate list without touching the handler.
+
+```python
+def _checkout_git_ref(plugin_dir: str, candidates: list[str]) -> None:
+    """Fetch and check out the first candidate ref; fall back to origin/HEAD."""
+    subprocess.run(["git", "fetch", "--all"], cwd=plugin_dir, check=True,
+                   capture_output=True)
+    last_err = None
+    for ref in candidates:
+        try:
+            subprocess.run(["git", "checkout", ref], cwd=plugin_dir, check=True,
+                           capture_output=True)
+            return
+        except subprocess.CalledProcessError as e:
+            last_err = e
+    try:
+        subprocess.run(["git", "checkout", "origin/HEAD"], cwd=plugin_dir,
+                       check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"git checkout failed for all refs {candidates}: {last_err}") from e
+```
+
+```diff
+-    if source["type"] == "git":
+-        subprocess.run(["git", "fetch", "--all"], cwd=plugin_dir, check=True, ...)
+-        for ref in candidates:
+-            try:
+-                subprocess.run(["git", "checkout", ref], ...)
+-                break
+-            except subprocess.CalledProcessError:
+-                continue
+-        else:
+-            subprocess.run(["git", "checkout", "origin/HEAD"], ...)
++    if source["type"] == "git":
++        _checkout_git_ref(plugin_dir, candidates)
+```
+
+### AC-203 · Extract buildModelsTableHtml from renderModelsTab
+Strength: Strong
+Files: python/dashboard/static/js/models-tab.js
+Symbol: renderModelsTab
+Snippet:
+```
+// No require()/module.exports: the browser loads this with a plain <script src> tag, so every name below is a shared global.
+
+async function renderModelsTab() {
+  // Every fetch this tab needs -- including the benchmark panel's -- happens up front, in
+  // parallel, BEFORE any DOM write (2026-08-19, Grimmethy: "I refreshed and my screen
+  // still flashes"). The previous version wrote an EMPTY '<div id="benchmark-panel">'
+  // placeholder first and only populated it after its own separate await chain resolved
+  // (which itself wrote an empty '#benchmark-results' placeholder, populated by a THIRD
+  // await) -- a real collapse-then-expand on every single 5s background refresh, not just
+  // a scroll-offset problem (the earlier scrollY save/restore fix only corrected the
+  // FINAL position after that flash had already been visible). Fetching everything first
+  // and writing main.innerHTML exactly once eliminates the intermediate empty states
+  // entirely, so there is nothing left to flash.
+  const [models, usageRows, costSummary, settingsPanel, usagePanel, benchModels, benchCases, benchStatus, benchRuns] = await Promise.all([
+    fetchJson('/api/models'),
+    fetchJson('/api/models/usage'),
+    fetchJson('/api/models/cost-summary'),
+    renderClaudeSettingsPanel(),
+    renderClaudeUsagePanel(),
+    benchmarkModelsCache || fetchJson('/api/benchmark/models').then(r => { benchmarkModelsCache = r.ollamaModels || []; return benchmarkModelsCache; }),
+    benchmarkCasesCache || fetchJson('/api/benchmark/cases').then(r => { benchmarkCasesCache = r; return r; }),
+    fetchJson('/api/benchmark/status'),
+    fetchJson('/api/benchmark/runs'),
+  ]);
+  if (benchmarkSelectedModels.size === 0 && benchmarkSelectedCases.size === 0) {
+    benchModels.forEach(m => benchmarkSelectedModels.add(m));
+    benchCases.forEach(c => benchmarkSelectedCases.add(c.id));
+  }
+  // Default to the combined view across every saved run (2026-08-24, Grimmethy: "results
+  // should default to All Runs (combined)") -- was defaulting to just the single most
+  // recent run, which is also why the radar chart (aggregate-only per the same request
+  // earlier today) wasn't visible without a manual dropdown click.
+  const viewingRunId = benchmarkViewingRunId || (benchRuns.length > 0 ? BENCHMARK_ALL_RUNS_ID : null);
+  const benchResultsHtml = await buildBenchmarkResultsHtml(viewingRunId, benchRuns);
+  const benchmarkPanelHtml = buildBenchmarkPanelHtml(benchModels, benchCases, benchStatus, benchRuns, viewingRunId, benchResultsHtml);
+
+  const main = document.getElementById('main');
+
+  const sorted = models.slice().sort((a, b) => {
+    const av = a[modelsSortKey], bv = b[modelsSortKey];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;   // nulls last regardless of direction
+    if (bv == null) return -1;
+    if (av < bv) return modelsSortDir === 'asc' ? -1 : 1;
+    if (av > bv) return modelsSortDir === 'asc' ? 1 : -1;
+    return 0;
+  });
+
+  const maxApprove = Math.max(...models.map(m => m.approveRate ?? 0), 0);
+  const maxTokS = Math.max(...models.map(m => m.avgTokensPerSec ?? 0), 0);
+
+  const headCells = MODELS_COLUMNS.map(col => {
+    if (!col.sortable) return `<th>${col.label}</th>`;
+    const arrow = modelsSortKey === col.key ? (modelsSortDir === 'asc' ? ' ▲' : ' ▼') : '';
+    return `<th class="sortable" data-key="${col.key}">${col.label}${arrow}</th>`;
+  }).join('');
+
+  const rows = sorted.map((m, i) => `
+    <tr class="${i === 0 ? 'top-row' : ''}">
+      <td>${m.model}</td>
+      <td>${m.callCount}</td>
+      <td>${renderBarCell(m.approveRate, maxApprove, 'ok', fmtPct)}</td>
+      <td>${renderBarCell(m.avgTokensPerSec, maxTokS, 'accent', (v) => fmtNum(v, 1))}</td>
+      <td>${fmtNum(m.minTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.maxTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.avgLatencyMs, 0)}</td>
+      <td>${m.degenerateCount}</td>
+      <td>${m.errorCount}</td>
+      <td>${fmtUsd(m.totalCostUsd)}</td>
+    </tr>
+  `).join('');
+
+  const implementTable = models.length === 0
+    ? '<div class="empty">No implement-pass stats yet -- set AGENT_MANAGER_CLAUDE_SOURCES or ORNITH_AB_MODELS to compare candidates.</div>'
+    : `<table><thead><tr>${headCells}</tr></thead><tbody>${rows}</tbody></table>`;
+
+  // Estimated Anthropic API Cost (2026-08-23, Grimmethy: "Do we have any way of knowing
+  // how much these tasks would cost using anthropic API?") -- claude-client.js's call()
+  // has always computed a real per-call cost estimate (Claude Code CLI's own
+  // total_cost_usd, against real Anthropic API pricing) but nothing stored or surfaced
+  // it until now. Explicitly labeled "estimate, not a bill" -- every real call here runs
+  // under a Claude subscription, never pay-per-token, so this is what the SAME work
+  // would have cost on the API, not what was actually charged.
+  const mostRecentDay = costSummary.byDay && costSummary.byDay[0] ? costSummary.byDay[0] : null;
+  // hypothetical (2026-08-23, Grimmethy: "Clarification on the anthropic costs. I'd like
+  // estimates for if we had used the API. Even if we used the local models.") -- unlike
+  // totalCostUsd above (real spend, only real Claude calls contribute), this covers
+  // EVERY call, local ones included (a token-based estimate via anthropic-pricing.js for
+  // those) -- see api_models_cost_summary's own docstring.
+  const hyp = costSummary.hypothetical || { totalCostUsd: 0, totalCalls: 0 };
+  const costWidget = `
+    <div class="grill-session" style="margin-bottom:16px">
+      <div class="field-label">Estimated Anthropic API Cost</div>
+      <div class="row" style="gap:24px;margin-top:6px">
+        <div class="stat" title="What every recorded Claude call would have cost on real Anthropic API pricing -- these calls actually ran under a subscription, never billed per-token. An estimate of avoided/equivalent cost, not a bill."><strong>${fmtUsd(costSummary.totalCostUsd)}</strong>real spend (all time)</div>
+        <div class="stat"><strong>${costSummary.callsWithCost}</strong>Claude calls</div>
+        <div class="stat" title="Local Ollama calls -- genuinely free, not just unbilled."><strong>${costSummary.freeCalls}</strong>free (local) calls</div>
+        ${mostRecentDay ? `<div class="stat"><strong>${fmtUsd(mostRecentDay.totalCost)}</strong>${escapeHtml(mostRecentDay.day)} (${mostRecentDay.calls} call(s))</div>` : ''}
+      </div>
+      <div class="row" style="gap:24px;margin-top:6px">
+        <div class="stat" title="What EVERY call this pipeline has ever made -- including the ones that ran locally, free -- would have cost had it gone through the Anthropic API instead. Real Claude calls use their real cost; local calls are a token-based estimate."><strong>${fmtUsd(hyp.totalCostUsd)}</strong>if every call had used the API (${hyp.totalCalls} call(s))</div>
+      </div>
+    </div>`;
+
+  const usageTableRows = usageRows.map(r => `
+    <tr>
+      <td>${escapeHtml(r.model)}</td>
+      <td>${escapeHtml(r.stage)}</td>
+      <td>${r.callCount}</td>
+      <td>${fmtNum(r.avgLatencyMs, 0)}</td>
+      <td>${r.lastUsedAt ? new Date(r.lastUsedAt).toLocaleString() : ''}</td>
+    </tr>
+  `).join('');
+  const usageTable = usageRows.length === 0 ? '' : `
+    <div class="field-label" style="margin-top:20px">All Calls (every stage, both providers)</div>
+    <table><thead><tr><th>Model</th><th>Stage</th><th>Calls</th><th>Avg Latency (ms)</th><th>Last Used</th></tr></thead>
+    <tbody>${usageTableRows}</tbody></table>`;
+
+  // Scroll-position preservation on top of the single-write fix above: the generic 5s
+  // refresh() cycle (see its own comment near setInterval(refresh, 5000)) still re-renders
+  // this whole tab on a timer regardless of what the user is doing on it, so restoring
+  // window.scrollY keeps their reading position stable across a background refresh they
+  // didn't ask for, even though the write itself no longer has an empty intermediate state.
+  const scrollY = window.scrollY;
+  main.innerHTML = settingsPanel + usagePanel + costWidget + '<div class="field-label">Implement-Pass Quality</div>' + implementTable + usageTable
+    + benchmarkPanelHtml;
+  wireClaudeSettingsPanel();
+  main.querySelectorAll('th.sortable').forEach(th => {
+    th.onclick = () => {
+      const key = th.dataset.key;
+      modelsSortDir = (modelsSortKey === key && modelsSortDir === 'desc') ? 'asc' : 'desc';
+      modelsSortKey = key;
+      renderModelsTab();
+    };
+  });
+  wireBenchmarkPanel(benchModels, benchCases);
+  window.scrollTo(0, scrollY);
+}
+```
+
+Problem:
+renderModelsTab (136 lines) mixes data fetching, three HTML builders, and DOM wiring. The models-table block—sorting, max-value computation, headCells, row assembly, implementTable—spans ~40 lines of pure string-building buried inside a function that also does network I/O and DOM mutation, making it untestable in isolation.
+
+Solution:
+Extract that block into a pure `buildModelsTableHtml(models)` that takes the fetched array and returns the table HTML string. renderModelsTab calls it and splices the result into its template literal. No other logic moves.
+
+Benefits:
+The builder is unit-testable with a plain array (node:test, no DOM). Adding a column touches one ~40-line function instead of 136 lines. renderModelsTab shrinks to ~95 lines and reads as: fetch → build three chunks → one innerHTML write → wire events.
+
+```diff
++ function buildModelsTableHtml(models) {
++   const sorted = [...models].sort((a, b) => b.approved - a.approved);
++   const maxA = Math.max(1, ...sorted.map(m => m.approved));
++   const maxT = Math.max(1, ...sorted.map(m => m.tokS));
++   const head = ["Model","Approved","tok/s","Latency","Cost"].map(h =>
++     `<th class="sortable" data-key="${h.toLowerCase().replace(/\s/g,'')}">${h}</th>`).join("");
++   const rows = sorted.map(m =>
++     `<tr><td>${m.name}</td><td><div class="bar" style="width:${(m.approved/maxA*100).toFixed(1)}%">${m.approved}</div></td><td>${m.tokS.toFixed(1)}</td><td>${m.latency}ms</td><td>$${m.cost.toFixed(4)}</td></tr>`).join("");
++   return `<table id="models-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
++ }
++
+  // inside renderModelsTab, replace the ~40-line inline block with:
+-   const sorted = [...models].sort((a,b) => b.approved - a.approved);
+-   const maxApprove = Math.max(1, ...sorted.map(m => m.approved));
+-   const maxTokS = Math.max(1, ...sorted.map(m => m.tokS));
+-   const headCells = ["Model","Approved","tok/s","Latency","Cost"].map(...).join("");
+-   const rows = sorted.map(m => `<tr>...</tr>`).join("");
+-   const implementTable = `<table id="models-table">...`;
++   const implementTable = buildModelsTableHtml(models);
+```
+
+### AC-204 · Extract per-card builder from renderWorkers
+Strength: Strong
+Files: python/dashboard/static/js/workers-tab.js
+Symbol: renderWorkers
+Snippet:
+```
+// === true) is skipped, and only when focus is currently inside one of this tab's own
+// selects, i.e. the operator is actively mid-choice. The next 5s tick tries again.
+async function renderWorkers(isPoll) {
+  const isStale = renderStaleCheck();
+  if (isPoll) {
+    const active = document.activeElement;
+    if (active && (active.classList.contains('worker-type-select') || active.classList.contains('worker-task-select'))) {
+      return;
+    }
+    // Top up the completed-tasks log with anything newer than what's already loaded --
+    // see refreshNewestCompletedTasks's own header note. Only on the real poll cycle,
+    // not every action-triggered re-render (assign-task, filter click, expand/collapse).
+    await refreshNewestCompletedTasks();
+  }
+  // run-log vs recent-tasks (2026-09-08, Grimmethy: "This looks like it's only showing
+  // fully completed tasks. I want to see a log of every time an agent is run and the
+  // outcome of that run."): a drafting worker's real activity includes attempts that
+  // never reach a terminal task state at all (a hard OLLAMA_TIMEOUT, mid-GPU-contention,
+  // never produces a usable response) -- /api/instances/<id>/run-log surfaces those too,
+  // merged with every model_calls row regardless of outcome. reviewer has no equivalent
+  // call-level data (review-task.js's majorityVote never calls recordCall, see that
+  // route's own docstring) so it keeps the existing terminal-state recent-tasks view.
+  const expandedIsWorker = !!(expandedWorkerId && expandedWorkerId.startsWith('worker'));
+  const [instances, workerModels, costSummary, recentTasks] = await Promise.all([
+    fetchJson('/api/instances'),
+    fetchJson('/api/worker-models'),
+    fetchJson('/api/models/cost-summary'),
+    // Only fetch for whichever card is currently expanded -- no point loading this for
+    // every instance on every 5s poll when at most one card shows it at a time.
+    expandedWorkerId
+      ? fetchJson(`/api/instances/${encodeURIComponent(expandedWorkerId)}/${expandedIsWorker ? 'run-log' : 'recent-tasks'}`)
+      : Promise.resolve(null),
+  ]);
+  // Candidate list for each worker's own "assign task" override dropdown (2026-09-07
+  // follow-up, Grimmethy after live-testing the override: "the only tasks I have
+  // access to... are pipeline debrief tasks. The task I want, autodecomp, is in
+  // drafting. I need access to the full list of available jobs, they should however be
+  // whats available for that specific worker type"). Per-instance now, not one shared
+  // list: /api/instances/<id>/assignable-tasks tier-filters for THAT lane and also
+  // surfaces tasks already claimed by other lanes (queue/drafting/<lane>/), not just
+  // queue/pending/ -- a plain worker-model-style shared list can't express either of
+  // those. Fetched only for worker-* instances (canAssignTask), in parallel.
+  const assignableByInstance = {};
+  await Promise.all(instances.filter(canAssignTask).map(async (inst) => {
+    try {
+      const r = await fetchJson(`/api/instances/${encodeURIComponent(inst.instanceId)}/assignable-tasks`);
+      assignableByInstance[inst.instanceId] = r.items || [];
+    } catch (e) {
+      assignableByInstance[inst.instanceId] = [];
+    }
+  }));
+  const overrides = workerModels.overrides || {};
+  // Per-instance cumulative estimated API cost (2026-08-23, "Where else would it make
+  // sense to track it?" -> Workers tab): AGENT_MANAGER_INSTANCE_ID is stamped onto every
+  // real model_calls row now (see model-stats-client.js's own recordCall) -- keyed here
+  // by instanceId so each worker-card can show its own running total, same "estimate,
+  // not a bill" framing as the Models tab's own widget.
+  const costByInstance = Object.fromEntries((costSummary.byInstance || []).map((i) => [i.instanceId, i.totalCost]));
+  const main = document.getElementById('main');
+  const fetchedAt = Date.now();
+  instances.forEach(i => { i._fetchedAtMs = fetchedAt; });
+  instancesForTimers = instances;
+  // Clear the optimistic pending-assign marker the moment real data confirms it --
+  // either the pin took (currentTaskId now matches) or the operator/pipeline moved on
+  // to something else for this instance since (a stale marker pointing at a taskId this
+  // instance is no longer even working toward would be actively misleading, worse than
+  // no marker at all).
+  instances.forEach((inst) => {
+    // Any real currentTaskId -- matching the pin (success) or not (moved on to
+    // something else meanwhile) -- means the "waiting to pick this up" state is over.
+    if (pendingWorkerAssign[inst.instanceId] && inst.currentTaskId) {
+      delete pendingWorkerAssign[inst.instanceId];
+    }
+  });
+  const filterBar = `
+    <div class="worker-filter-bar" style="margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
+      <div></div>
+      <label style="display:flex; align-items:center; gap:6px; font-size:0.9em; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
+        <input type="checkbox" id="claude-pause-toggle" ${workerModels.claudePaused ? 'checked' : ''}>
+        Pause Claude (preserve subscription tokens)
+      </label>
+    </div>
+  `;
+  const shown = instances;
+  if (isStale()) return;
+  if (instances.length === 0) { main.innerHTML = '<div class="empty">No instances found -- is the pipeline running?</div>'; return; }
+  // Preserve scroll position across the full innerHTML replace below -- same isPoll
+  // "don't yank state out from under the operator" reasoning as the dropdown guard
+  // above, needed here because the completed-tasks log (renderCompletedTasksSection)
+  // can push #main well past one screen, and a poll landing mid-scroll would otherwise
+  // silently reset the operator back to the top every 5s.
+  const scrollY = window.scrollY;
+  main.innerHTML = filterBar + (shown.length === 0
+    ? '<div class="empty">No workers match this filter.</div>'
+    : shown.map(inst => `
+    <div class="worker-card clickable" data-instance-id="${escapeAttr(inst.instanceId)}">
+      <div class="row">
+        <span class="id">${inst.instanceId}</span>
+        ${(() => {
+          const kind = modelKindForInstance(inst);
+          if (!kind) return '';
+          const current = overrides[inst.instanceId] || '';
+          const optionsFor = (label, values) => values.length
+            ? `<optgroup label="${escapeAttr(label)}">${values.map(m => `<option value="${escapeAttr(m.value)}" ${m.value === current ? 'selected' : ''}>${m.label}</option>`).join('')}</optgroup>`
+            : '';
+          let body;
+          if (kind === 'mixed') {
+            // Prefixed so local-worker.sh's refresh_active_model can tell which backend
+            // was picked -- see that function's own comment for why this is the fix for
+            // "reasoning only shows subscription models."
+            body = optionsFor('Claude (subscription)', (workerModels.claudeModels || []).map(m => ({ value: `claude:${m}`, label: m })))
+              + optionsFor('Local (Ollama)', (workerModels.ollamaModels || []).map(m => ({ value: `ollama:${m}`, label: m })));
+          } else {
+            body = (workerModels.ollamaModels || []).map(m => `<option value="${escapeAttr(m)}" ${m === current ? 'selected' : ''}>${m}</option>`).join('');
+          }
+          return `<select class="worker-model-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()"><option value="">(default)</option>${body}</select>`;
+        })()}
+        ${canAssignTask(inst) ? (() => {
+          const items = assignableByInstance[inst.instanceId] || [];
+          // Grouped by source (task TYPE) so the picker shows "pipeline_debrief (7)"
+          // etc first, rather than one flat list where a deep single-type backlog
+          // buries everything else (see selectedWorkerTaskType's own header comment).
+          const bySource = {};
+          items.forEach((t) => {
+            const key = t.source || 'unknown';
+            (bySource[key] = bySource[key] || []).push(t);
+          });
+          const sourceKeys = Object.keys(bySource).sort();
+          const selectedType = selectedWorkerTaskType[inst.instanceId] || '';
+          // Keep the previously-picked type visible even if its bucket happens to be
+          // empty on THIS particular poll (its last task just got claimed elsewhere, or
+          // this instance's own assignable-tasks fetch above hit its catch and fell back
+          // to [] for one cycle) -- 2026-09-07, same complaint as isPoll above: a
+          // transient empty bucket used to collapse the whole drill-down back to the
+          // type-only picker, which looked identical to "your selection got reset" even
+          // though selectedWorkerTaskType was never actually cleared.
+          if (selectedType && !sourceKeys.includes(selectedType)) sourceKeys.push(selectedType);
+          sourceKeys.sort();
+          const typeSelect = `<select class="worker-type-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Assign a specific task to this worker, overriding the automated priority/tier claim order -- includes tasks already claimed by other workers, tier-filtered for this worker type">
+            <option value="">(assign a task…)</option>
+            ${sourceKeys.map(k => `<option value="${escapeAttr(k)}" ${k === selectedType ? 'selected' : ''}>${escapeHtml(k)} (${(bySource[k] || []).length})</option>`).join('')}
+          </select>`;
+          if (!selectedType) return typeSelect;
+          const tasksOfSelectedType = bySource[selectedType] || [];
+          // A native <select> sizes itself to its widest <option> text -- an untruncated
+          // task title (adhoc/decompose titles especially routinely run 80-100+ chars)
+          // pushed this whole control off the right edge of the worker card (2026-09-07,
+          // Grimmethy: "when I open the manual task that has long task names it sets the
+          // selector to the size of the largest... names should be truncated"). Truncate
+          // what's SHOWN; the option's own `title` attribute (native hover tooltip) and
+          // `data-title` (read by setWorkerTask's confirm-dialog text) both still carry
+          // the full, untruncated title -- nothing is actually lost, just not rendered
+          // into the control's own width.
+          const OPTION_LABEL_MAX = 70;
+          const truncateLabel = (s) => (s.length > OPTION_LABEL_MAX ? `${s.slice(0, OPTION_LABEL_MAX - 1)}…` : s);
+          const optionLabel = (t) => {
+            // A hub member leads with its HUB#### slot (2026-09-20) so a hub in progress is recognisable in this list.
+            const rawTitle = t.title || t.id;
+            const base = t.hub && !/^HUB\d/.test(rawTitle) ? `${hubTag(t.hub)} · ${rawTitle}` : rawTitle;
+            // pinnedTo (2026-09-07, Grimmethy: "why do the 2 reasoning workers have
+            // different lists? they really should share the same task list") -- a task
+            // pending but already pinned to a SIBLING lane (same tier) now shows here
+            // too instead of being invisible; picking it just re-pins it to this lane
+            // instead (no kill needed, nothing is running on it yet, unlike the
+            // "⚠ running on" case below).
+            let full = base;
+            if (t.location && t.location !== 'pending') full = `⚠ running on ${t.location.replace(/^drafting:/, '')} — ${base}`;
+            else if (t.pinnedTo) full = `📌 pinned to ${t.pinnedTo} — ${base}`;
+            // premiumPriority (2026-09-07, Grimmethy: "I am getting tired of manually
+            // selecting it for the worker queue every pass") -- surfaces here so the
+            // operator can SEE this task is already set to always-claim-first and
+            // doesn't need to keep re-picking it via this very dropdown.
+            if (t.premiumPriority) full = `★ ${full}`;
+            return truncateLabel(full);
+          };
+          const taskSelect = `<select class="worker-task-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Pick a specific ${escapeAttr(selectedType)} task to assign to this worker">
+            <option value="">${tasksOfSelectedType.length ? `(choose a ${escapeHtml(selectedType)} task…)` : `(no ${escapeHtml(selectedType)} tasks right now)`}</option>
+            ${tasksOfSelectedType.map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}" data-source-lane="${escapeAttr(t.location && t.location !== 'pending' ? t.location.replace(/^drafting:/, '') : '')}" title="${escapeAttr(t.title || t.id)}">${escapeHtml(optionLabel(t))}</option>`).join('')}
+          </select>`;
+          return typeSelect + taskSelect;
+        })() : ''}
+        <div class="badge-col">
+          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
+          ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
+          <span class="state-timer" id="state-timer-${inst.instanceId}">${inst.stateAgeSeconds != null ? 'in this state ' + fmtDuration(inst.stateAgeSeconds) : ''}</span>
+        </div>
+      </div>
+      <div class="meta">
+        pid ${inst.pid ?? '-'} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
+        ${inst.currentTaskId && inst.projectLabel ? ' · <span class="badge ' + (inst.borrowed ? 'warn' : 'idle') + '" title="' + (inst.borrowed ? 'Borrowed: this lane is idle in the active project and is working a task of ' + escapeAttr(inst.projectLabel) + ' (idle-pool borrowing)' : 'This task belongs to the active project') + '">📁 ' + escapeHtml(inst.projectLabel) + (inst.borrowed ? ' (borrowed)' : '') + '</span>' : ''}
+        ${inst.currentTaskId && inst.hub ? ' · <span class="badge ok" title="This task belongs to hub ' + escapeAttr(inst.hub.label) + '" style="font-weight:700">🗂 ' + escapeHtml(hubTag(inst.hub)) + '</span>' : ''}
+        ${inst.currentTaskId ? ' · working on <strong><a href="#" data-open-task-anywhere="' + escapeAttr(inst.currentTaskId) + '">' + escapeHtml(inst.currentTaskId) + '</a></strong>' + (inst.currentPass ? ' (' + escapeHtml(inst.currentPass) + ')' : '') : ''}
+        ${pendingWorkerAssign[inst.instanceId] ? ' · <strong>📌 pinned, waiting for ' + escapeAttr(inst.instanceId) + ' to pick it up…</strong>' : ''}
+        ${costByInstance[inst.instanceId] ? ' · ' + fmtUsd(costByInstance[inst.instanceId]) + ' est. API cost' : ''}
+      </div>
+      ${expandedWorkerId === inst.instanceId ? `
+      <div class="worker-recent-tasks">
+        <div class="meta" style="margin-top:8px; font-weight:600">${inst.instanceId === 'reviewer' ? 'Last 10 reviewed tasks' : 'Recent runs (every attempt, including failures)'}</div>
+        ${recentTasks ? (recentTasks.runs ? renderRunLogList(recentTasks.runs) : renderRecentTasksList(recentTasks.tasks || [])) : '<div class="meta">Loading…</div>'}
+      </div>` : ''}
+    </div>
+  `).join('')) + renderCompletedTasksSection();
+// ... [truncated for review: this function continues for 43 more line(s) not shown]
+```
+
+Problem:
+The 243-line renderWorkers interleaves four concerns: poll-guard/state cleanup, parallel fetch orchestration, filter-bar HTML, and a ~120-line per-card map callback with nested IIFEs and 4+ branch conditionals (model-kind, task-type, optionLabel hub/pinned/premium). The per-card body is untestable in isolation and the optionLabel closure is buried inside the template literal.
+
+Solution:
+Extract the per-card map body into a single buildWorkerCard(inst, ctx) function that takes a plain context object and returns an HTML string. renderWorkers keeps poll-guard, fetch, state cleanup, and event binding.
+
+```js
+// renderWorkers: replace the ~120-line shown.map(...) body with:
+main.innerHTML = filterBar + shown.map(inst =>
+  buildWorkerCard(inst, { overrides, costByInstance,
+    assignableByInstance, recentTasks, workerModels, selectedWorkerTaskType })
+).join('') + renderCompletedTasksSection();
+
+// NEW — pure string builder, testable with a mock inst + ctx
+function buildWorkerCard(inst, ctx) {
+  return `<div class="worker-card clickable" data-instance-id="${escapeAttr(inst.instanceId)}">
+    <div class="row">
+      <span class="id">${inst.instanceId}</span>
+      ${buildModelSelect(inst, ctx)}
+      ${buildTaskAssignSelect(inst, ctx)}
+      ${buildStatusBadges(inst)}
+    </div>
+    <div class="meta">${buildMetaLine(inst, ctx)}</div>
+    ${buildExpandedSection(inst, ctx)}
+  </div>`;
+}
+```
+
+Benefits:
+renderWorkers drops from ~243 to ~100 lines. buildWorkerCard is a pure function of (inst, ctx) → string, unit-testable without a DOM. Reviewers can diff card markup changes in isolation from fetch/poll logic.
+
+### AC-205 · Extract task-archiving block from api_git_discard_branch
+Strength: Strong
+Files: python/dashboard/routes/pipeline_1_more.py
+Symbol: api_git_discard_branch
+Snippet:
+```
+
+@pipeline_1_more_bp.route("/api/git/branches/<path:branch>/discard", methods=["POST"])
+def api_git_discard_branch(branch):
+    """The Unmerged Branches tab's other action (2026-09-08, Grimmethy: "If we aren't
+    merging it we definitely need to archive it. It's still visible in my unmerged
+    branches tab... leaves us open to accidentally opening it back up in the future.") --
+    root-caused live via change-review-fix-ac-1: list_unmerged_branches is a pure git scan
+    (refs/remotes/origin/agent/* with ahead>0 vs. main), with zero awareness of task
+    disposition -- archiving a task record alone (api_task_archive) never removes its
+    branch from this list. This is the other half api_git_merge_branch's own delete-on-
+    success step never covers: a branch you've decided NOT to merge, which needs its
+    remote ref actually deleted plus its task archived, not just hidden.
+
+    Mirrors api_git_merge_branch for the parts that overlap (the same-list re-validation
+    gate, the apply-lock, the two-location task lookup) minus the merge/checkout/push-to-
+    main steps this doesn't need."""
+    from app import _acquire_apply_lock, _archive_task_file, _delete_local_branch, _invalidate_branch_cache, _release_apply_lock, _run_git, get_active_repo_root, list_unmerged_branches, logger, queue_dir, read_json_safe
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+    repo_root = Path(repo_root)
+
+    # Same "only act on what we ourselves already offered" gate api_git_merge_branch/
+    # api_task_archive/api_task_requeue all already use.
+    branches = list_unmerged_branches(force=True)
+    match = next((b for b in branches if b["branch"] == branch), None)
+    if not match:
+        abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
+
+    try:
+        lock_fd = _acquire_apply_lock()
+    except RuntimeError:
+        abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
+
+    local_branch = {"deleted": False, "reason": "not attempted"}
+
+    # Brain-dump #1740: capture WHAT this branch holds (commits, the candidate headings it added, the verdict recorded on its card) and
+    # pin its head under refs/discarded/ BEFORE the remote delete below, so a discarded batch is no longer just "discarded via the
+    # dashboard" and stays recoverable once both the remote and local branch are gone. Best-effort: nothing in this block may stop the discard.
+    snapshot, reason = {}, ""
+    try:
+        from branch_removals import snapshot_branch
+        snapshot = snapshot_branch(_run_git, repo_root, match.get("mainBranch") or "main", branch, match.get("headSha"), queue_dir(), keep_ref=True)
+        body = request.get_json(silent=True)
+        reason = str(body.get("reason") or "").strip() if isinstance(body, dict) else ""
+        if not reason:
+            default_reasons = (snapshot.get("verdict") or {}).get("reasons") or []
+            reason = str(default_reasons[0]) if default_reasons else ""
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Non-fatal: could not snapshot %r before discarding it: %s", branch, exc)
+
+    try:
+        try:
+            _run_git(["push", "origin", "--delete", branch], repo_root)
+        except RuntimeError as e:
+            # A delete failing because the ref is already gone (deleted by hand, or a
+            # duplicate click) means the actual goal -- this branch not existing on origin
+            # -- is already achieved; only a REAL git failure (auth, network, etc.) should
+            # surface as an error. Same "remote ref does not exist" shape git itself uses
+            # for this case.
+            if "remote ref does not exist" not in str(e) and "unable to delete" not in str(e).lower():
+                raise
+        from branch_removals import record_branch_removal
+        record_branch_removal(queue_dir(), branch, "discarded", task_id=branch.removeprefix("agent/"),
+                              detail="discarded via the dashboard Unmerged Branches tab", actor="dashboard-discard",
+                              reason=reason or None, snapshot=snapshot or None)
+        # Also drop the LOCAL copy (only reached when the remote delete succeeded or the ref was
+        # already gone) -- see _delete_local_branch for why leaving it is a real hazard.
+        local_branch = _delete_local_branch(repo_root, branch)
+    except RuntimeError as e:
+        return jsonify({"succeeded": False, "reason": str(e)}), 500
+    finally:
+        _release_apply_lock(lock_fd)
+
+    # Archive the matching task record, same 2-location lookup api_git_merge_branch's own
+    # mergedAt-stamping step already does. Best-effort: no task record found (a branch
+    # pushed with nothing matching in done/) is not an error, just nothing to reconcile;
+    # already-archived (a human archived it by hand first, or a duplicate click) is a
+    # silent no-op, not a 409 -- the branch delete above is the part that mattered.
+    task_archived = False
+    qdir = queue_dir()
+    if qdir:
+        task_id = branch.removeprefix("agent/")
+        done_path = qdir / "done" / f"{task_id}.json"
+        archived_path = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
+        if done_path.is_file():
+            data = read_json_safe(done_path)
+            if data is not None:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                if data.get("terminalDisposition") != "dismissed":
+                    hist = data.get("history")
+                    if not isinstance(hist, list):
+                        hist = data["history"] = []
+                    hist.append({
+                        "stage": "dismissed",
+                        "at": now_iso,
+                        "detail": f"branch {branch} discarded via the dashboard Unmerged Branches tab -- not merging this",
+                    })
+                    data["terminalDisposition"] = "dismissed"
+                try:
+                    done_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                except OSError as exc:
+                    logger.error("Failed to persist dismissed-state for branch %r to %s: %s", branch, done_path, exc)
+                    raise
+            try:
+                _archive_task_file(qdir, done_path)
+                task_archived = True
+            except FileExistsError:
+                pass
+        elif archived_path.is_file():
+            task_archived = True  # already archived (e.g. by hand) -- nothing more to do
+
+    _invalidate_branch_cache()
+    return jsonify({"succeeded": True, "branch": branch, "taskArchived": task_archived, "localBranch": local_branch,
+                    "snapshotRef": (snapshot or {}).get("snapshotRef")})
+```
+
+Problem:
+api_git_discard_branch (113 lines) mixes five responsibilities with three distinct error policies. The ~30-line task-archive block is pure file-state logic with no git dependency, yet it sits inside the lock-protected region, making the lock boundary hard to track and the block untestable without a live repo.
+
+Solution:
+Extract the task-archive block into a module-level helper; replace the inline block with a three-line call.
+
+```python
+def _archive_task_for_discarded_branch(qdir: Path, branch: str) -> bool:
+    task_id = branch.removeprefix("agent/")
+    done_path = qdir / "done" / f"{task_id}.json"
+    archived_path = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
+    if done_path.is_file():
+        data = read_json_safe(done_path)
+        if data is not None:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if data.get("terminalDisposition") != "dismissed":
+                hist = data.get("history")
+                if not isinstance(hist, list):
+                    hist = data["history"] = []
+                hist.append({"stage": "dismissed", "at": now_iso,
+                            "detail": f"branch {branch} discarded via dashboard"})
+                data["terminalDisposition"] = "dismissed"
+            try:
+                done_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except OSError as exc:
+                logger.error("Failed to persist dismissed-state for %r: %s", branch, exc)
+                raise
+        try:
+            _archive_task_file(qdir, done_path)
+        except FileExistsError:
+            pass
+        return True
+    elif archived_path.is_file():
+        return True
+    return False
+```
+
+Caller:
+```python
+    task_archived = False
+    qdir = queue_dir()
+    if qdir:
+        task_archived = _archive_task_for_discarded_branch(qdir, branch)
+```
+
+Benefits:
+Drops the function to ~83 lines, clearing the 100-line threshold. The helper is unit-testable in isolation (no git repo, no lock). Lock scope, git-delete, and snapshot blocks are untouched.
+
+### AC-206 · Extract maybeRetryOversized from runImplementPass
+Strength: Strong
+Files: src/local-draft.js
+Symbol: runImplementPass
+Snippet:
+```
+// a terminal outcome was reached (deterministic empty, degenerate block, or a candidate
+// split), else { done: false } so draftTask continues to critique + revision.
+async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
+  const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
+
+  // 2026-08-23, Grimmethy: "Investigate: arch_review/arch_import drafts hedge instead
+  // of grounding in real source" -- confirmed live: even with archImportImplementPrompt's
+  // explicit "if the searches found nothing... output the empty string" instruction,
+  // the model frequently fabricated a plausible-looking candidate anyway (invented
+  // file paths, classes, APIs) rather than reliably following it -- caught by fact-
+  // check/review every time (so nothing wrong ever shipped), but burning a real call
+  // and a full review cycle on a draft that was doomed from the moment harness search
+  // came back empty. Skipping the implement call entirely on a genuine zero-hit
+  // search removes the temptation altogether -- deterministic, not a prompt tweak the
+  // model can still ignore. The source opts in via `skipImplementWhenNoHarnessHits` on
+  // its registration (ADR-0022 Stage A4) and is also an emptyApproval source, so this
+  // empty implementResponse auto-approves with zero further local-model spend -- the
+  // exact outcome a compliant model would have produced anyway.
+  const skipImplementOnNoHits = getRegisteredSource(resolveSourceName(task))?.skipImplementWhenNoHarnessHits;
+  if (skipImplementOnNoHits && Array.isArray(task.promptContext.harnessHits) && task.promptContext.harnessHits.length === 0) {
+    task.implementResponse = '';
+    recordImplement(attempt, { note: 'deterministic empty (harness search found zero real matches)' });
+    appendHistoryEvent(task, 'implement-done', 'deterministic empty (harness search found zero real matches -- implement call skipped, not left to the model to follow the empty-string instruction)');
+    concludeDraft(task);
+    return { done: true, result: { succeeded: true, blocked: false } };
+  }
+
+  const implPrompt = buildImplementPrompt(task, task.planResponse);
+  const budget = computeImplementBudget(task, implPrompt);
+  const { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
+
+  // Bookend to 'implement-done' below -- same -started/-done pairing plan/critique/review
+  // have. A single implement call can legitimately run close to its timeout; with the
+  // persist hook this makes a draft killed mid-call show 'implement-started' rather than
+  // ending at 'plan-done'.
+  appendHistoryEvent(task, 'implement-started', hasFixedLiterals ? 'fixed-literals implement pass' : 'implement pass');
+  const implCallStartMs = Date.now();
+  let implResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget });
+  let implLatencyMs = Date.now() - implCallStartMs;
+
+  if (implResult.degenerate) {
+    const blockedReason = `Implement pass degenerate: ${implResult.degenerate}`;
+    recordImplement(attempt, { degenerate: implResult.degenerate, attempts: implResult.attempts });
+    appendHistoryEvent(task, 'blocked', blockedReason);
+    // 2026-09-21: this used to carry NO blockedStage -- invisible to reject-retry-check.js's entry gate, so the task sat in queue/blocked/ forever with zero automated retry
+    // (function-length-fix-ac-34 was stuck a day on "Implement pass degenerate: empty"). Same shape the plan-pass degenerate block had until 2026-09-17; see
+    // reject-retry-check.js's isImplementDegenerateBlock. 'implement' is deliberately none of 'review'/'apply'/'pre-critique'/'pre-implement'/'draft'/'plan'.
+    return { done: true, result: { succeeded: true, blocked: true, blockedReason, blockedStage: 'implement' } };
+  }
+  task.implementResponse = implResult.response;
+
+  // evalTok/latency cap routing (2026-09-08, brain-dump bd-1788725054994 "cap the
+  // implement-pass token/latency budget per draft and route oversized drafts to
+  // strict-cite retry"): computeImplementBudget's evalTokCap/latencyMsCap (added
+  // 2026-09-10) sat inert until now -- nothing ever read them, and prompts.js's
+  // strictCiteConstraintBlock (added alongside them) was never invoked either. A draft
+  // that blows well past the normal generation length or latency for an implement pass
+  // is usually not a legitimately large but correct change -- it is the model
+  // re-deriving or hedging on context it was already given. One bounded retry with the
+  // strict-cite prompt variant reins it back in without burning a second full free-form
+  // pass. Capped at exactly one retry -- oversizedImplementRetried guards against
+  // retrying the retry, so a second oversized result is left as-is and flows through the
+  // normal postImplementCheck/candidate-fulfillment/review path below unchanged.
+  const isOversized = (Number(implResult.eval_count) || 0) > budget.evalTokCap
+    || implLatencyMs > budget.latencyMsCap;
+  if (isOversized && !task.oversizedImplementRetried) {
+    task.oversizedImplementRetried = true;
+    const strictPrompt = buildImplementPrompt(task, task.planResponse, { strictCite: true });
+    const retryStartMs = Date.now();
+    const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt: strictPrompt, budget });
+    const retryLatencyMs = Date.now() - retryStartMs;
+    appendHistoryEvent(
+      task,
+      'implement-oversized',
+      `evalTok=${implResult.eval_count || 0} latencyMs=${implLatencyMs} (caps ${budget.evalTokCap}/${budget.latencyMsCap}ms) -- retried once with strict-cite, ${retryResult.degenerate ? `retry degenerate (${retryResult.degenerate}), keeping original` : `retry evalTok=${retryResult.eval_count || 0} latencyMs=${retryLatencyMs}`}`,
+    );
+    if (!retryResult.degenerate) {
+      implResult = retryResult;
+      implLatencyMs = retryLatencyMs;
+      task.implementResponse = retryResult.response;
+    }
+  }
+
+  // A source can register a `postImplementCheck(task, implementResponse, {call,
+  // maybeLockedOn})` -- generic, source-agnostic hook, same convention as premiseCheck
+  // above but for the implement pass's OWN output rather than a candidate-fulfillment
+  // split decision. Catches a draft that hallucinates a detail contradicting its own real
+  // grounding BEFORE it burns a full local review vote round on something already doomed
+  // to be rejected for exactly that reason (function-length-grounding-check.js in the
+  // hygiene plugin, 2026-09-05: 8 of 9 blocked function_length_review tasks shared this
+  // exact shape -- "proposes extracting X, but the grounding source shows Y"). Routes an
+  // ungrounded verdict into the SAME blockedStage:'review' path a real review rejection
+  // takes -- reject-retry-check.js's existing, already-proven redraft/priorRejectionFeedback/
+  // exhaustion machinery handles everything from here, unchanged; this hook only decides
+  // WHETHER a rejection happens; never invents a new one.
+  //
+  // 2026-09-06: also accepts verdict:'invalid-premise' (src/candidate-premise-check.js,
+  // wired onto pipeline_forensics_fix -- AC-16/AC-18 drafted a real, well-implemented
+  // guard against a prerequisite that was never actually built) -- a DISTINCT blockedReason
+  // prefix from 'ungrounded' (matching the wording finalizeCandidateFulfillment's own
+  // split-gated premiseCheck already uses) so blocked-task-classifiers.js can tell "the
+  // draft fabricated something" (model-side, worth a feedback-driven retry) apart from
+  // "the CANDIDATE itself rests on a false premise" (retrying redrafts against the exact
+  // same false premise every time -- structurally futile, not stochastically unlucky).
+  const postImplementEntry = getRegisteredSource(resolveSourceName(task));
+  // Write-time size gate (ADR-0023 S1): a directToMain candidate write-up over the fulfillment limit would be appended and then skipped
+  // forever, so it is bounced here with its measured size. Unlike the grounding gate below, this does NOT set reviewInconclusive: the
+  // violation is deterministic, so it goes through the normal reject-retry loop (feedback injected, MAX_LOCAL_REJECT_RETRIES, then
+  // needs-clarification). A throwing gate is advisory and never blocks a draft.
+  let sizeGate = null;
+  try {
+    sizeGate = require('./candidate-size-gate.js').checkCandidateSize(task, task.implementResponse, { entry: postImplementEntry });
+  } catch (e) {
+    sizeGate = null;
+  }
+  if (sizeGate && sizeGate.verdict === 'oversized') {
+    const blockedReason = `Oversized candidate: ${String(sizeGate.reason || '(no detail)')}`.slice(0, 500);
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: blockedReason });
+    appendHistoryEvent(task, 'blocked', blockedReason);
+    task.blockedStage = 'review';
+    task.blockedReason = blockedReason;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(blockedReason);
+    return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
+  }
+  if (postImplementEntry && typeof postImplementEntry.postImplementCheck === 'function') {
+    let grounding;
+    try {
+      grounding = await postImplementEntry.postImplementCheck(task, task.implementResponse, { call: resolvedLocalCall, maybeLockedOn: ctx.maybeLockedOn });
+    } catch (e) {
+      if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
+      grounding = null; // advisory -- a throwing check must never block a real draft
+    }
+    if (grounding && (grounding.verdict === 'ungrounded' || grounding.verdict === 'invalid-premise')) {
+      const prefix = grounding.verdict === 'invalid-premise' ? 'Invalid premise' : 'Ungrounded draft';
+      const blockedReason = `${prefix}: ${String(grounding.reason || '(no detail)')}`.slice(0, 500);
+      recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: blockedReason });
+      appendHistoryEvent(task, 'blocked', blockedReason);
+      task.blockedStage = 'review';
+      task.blockedReason = blockedReason;
+      // Stochastic harness gate, not a genuine reviewer rejection -- reject-retry-check.js's
+      // isReviewRejection() currently keys only on blockedStage:'review', which silently
+      // conflates a re-roll-worthy gate flake with a real REJECT verdict. This structured
+      // flag lets downstream consumers (retry, drain, self-audit) tell them apart without
+      // depending on blockedStage alone. Never set at a genuine review-time rejection site
+      // (see src/review-task.js's own blockedStage:'review' assignments, which do not set
+      // this) -- only here and postImplementCheck's sibling gate in implement-critique.js.
+      task.reviewInconclusive = true;
+      task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+      task.priorRejectionFeedback.push(blockedReason);
+      return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
+    }
+    // An 'ok' verdict may still carry `warnings`: things the check could not verify but that
+    // are not proof of a defect (e.g. a symbol not found by literal grep in the cited files).
+    // Kept on the task for review-task.js's buildVerdictPrompt so the votes can weigh them,
+    // instead of blocking a draft on a heuristic. Reset every pass so a redraft never
+    // inherits a stale warning.
+    delete task.groundingWarnings;
+    if (grounding && grounding.verdict === 'ok' && Array.isArray(grounding.warnings) && grounding.warnings.length) {
+      task.groundingWarnings = grounding.warnings.slice(0, 10).map((w) => String(w).slice(0, 300));
+      appendHistoryEvent(task, 'grounding-warning', task.groundingWarnings.join('; ').slice(0, 300));
+    }
+  }
+
+  // Deterministic find-verification retry (see findUnverifiedEdit's own header) --
+  // ONLY for the five candidate-fulfillment sources, which are the only ones with
+  // fetchedFiles to verify against. Bounded to a single retry, same "one real second
+  // chance, then let the existing downstream gates catch it" shape as the adhoc
+  // turn-budget retry -- a find string that's still wrong on a second, explicitly-
+  // warned attempt is a genuine mismatch (stale/truncated fetched content, a
+  // candidate whose Problem no longer matches current code, etc.), not something a
+  // third guess would likely fix either.
+  if (isCandidateFulfillmentSource(task.source)) {
+    return await finalizeCandidateFulfillment(task, ctx, {
+      implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt,
+    });
+  }
+  recordImplement(attempt, {
+    text: task.implementResponse,
+    attempts: implResult.attempts,
+    ...(task.oversizedImplementRetried ? { promptVariant: 'oversized-strict-cite' } : {}),
+  });
+  appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
+  if (!task.nonCompliantImplementRetried && !isImplementOutputCompliant(task, task.implementResponse)) {
+    task.nonCompliantImplementRetried = true;
+    console.warn(`[local-draft] non-compliant implement output (missing JSON and missing FALSE POSITIVE token) -- retrying once, task=${task.id}, source=${task.source}`);
+    const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget });
+    if (!retryResult.degenerate) {
+      task.implementResponse = retryResult.response;
+      canonicalizeImplementFinds(task);
+    }
+    appendHistoryEvent(task, 'implement-retry', 'non-compliant output (missing JSON and missing FALSE POSITIVE token) -- retried once before critique');
+  }
+  return { done: false };
+}
+```
+
+Problem:
+runImplementPass inlines six gate/retry branches in one 193-line body. The oversized-retry block is the only one carrying mutable state (task.oversizedImplementRetried), a prompt-variant switch (strictCite), and a result-swap of implResult/implLatencyMs. Testing it requires exercising the entire pass, making coverage brittle and slow.
+
+Solution:
+Extract that block into a standalone async helper maybeRetryOversized(task, ctx, { recordModelCall, implResult, implLatencyMs, budget }) that returns the (possibly swapped) pair. The call site collapses to one line:
+
+```diff
+-  const isOversized = (Number(implResult.eval_count)||0) > budget.evalTokCap
+-    || implLatencyMs > budget.latencyMsCap;
+-  if (isOversized && !task.oversizedImplementRetried) {
+-    task.oversizedImplementRetried = true;
+-    const strictPrompt = buildImplementPrompt(task, task.planResponse, { strictCite: true });
+-    const t0 = Date.now();
+-    const r = await callImplementModel(task, ctx, { recordModelCall, implPrompt: strictPrompt, budget });
+-    const rl = Date.now() - t0;
+-    appendHistoryEvent(task, 'implement-oversized', `evalTok=${implResult.eval_count||0} latencyMs=${implLatencyMs} ...`);
+-    if (!r.degenerate) { implResult = r; implLatencyMs = rl; task.implementResponse = r.response; }
+-  }
++  ({ implResult, implLatencyMs } = await maybeRetryOversized(task, ctx, { recordModelCall, implResult, implLatencyMs, budget }));
+```
+
+The helper owns the flag check, prompt build, model call, latency capture, history append, and degenerate fallback in roughly 15 lines.
+
+Benefits:
+The retry state machine is testable in isolation with a stubbed callImplementModel, without triggering the skip, degenerate, grounding, or non-compliant gates. Future changes to retry count, cap source, or prompt variant touch one small function. runImplementPass shrinks by ~15 lines and reads as a flat sequence of five simpler, stateless gates.
+
+### AC-207 · Decompose resolveDisposition into named sub-procedures
+Strength: Strong
+Files: src/task-disposition.js
+Symbol: resolveDisposition
+Snippet:
+```
+// calls (the fast path). Without it, falls back to a direct git probe per id (fine for a
+// single record, e.g. from the dashboard right after a merge).
+function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainOverride, ctx, allowReopenFrom, pipelineDir } = {}) {
+  if (!record || typeof record !== 'object') return null;
+  const history = record.history;
+  const applied = lastAppliedEvent(history);
+  if (!applied) return null; // never applied -- blocked/needs-clarification in done, not this sweep's job
+
+  const tail = lastEvent(history);
+  if (tail && STABLE_TERMINAL_STAGES.has(tail.stage)
+      && !(allowReopenFrom && allowReopenFrom.has(tail.stage))) {
+    return null; // already closed (unless the caller explicitly asked to re-resolve this stage)
+  }
+  // A 'pending-merge' tail IS re-resolved (the branch may have been merged since).
+
+  const detail = String(applied.detail || '').trim();
+  const taskId = record.id || '';
+  const mainBranch = (ctx && ctx.mainBranch) || mainOverride || (repoRoot ? detectDefaultBranch(repoRoot) : 'master');
+
+  // 0. Structured triage outcome, stamped by a *_review source's apply(). The authoritative
+  //    signal -- a dismissed review never has code on <main>, so this wins over every git
+  //    check below. `genuine` deliberately falls through (a candidate was filed; it becomes
+  //    `merged`/`filed`/`applied-direct` by the normal path, and can still ship later).
+  const rd = String(record.reviewDisposition || '').trim();
+  if (rd === 'dismissed') {
+    return { stage: 'dismissed', detail: `review dismissed a scanner false positive${detail ? `: ${detail}` : ''}`.slice(0, 200) };
+  }
+  if (rd === 'inconclusive') {
+    return { stage: 'noop', detail: `review reached a verdict but produced nothing: ${detail || '(no detail)'}`.slice(0, 200) };
+  }
+
+  // 1. Definitively on origin/<main>?
+  if (taskId) {
+    const sha = ctx
+      ? (ctx.onMainIds.get(taskId) || '')
+      : (repoRoot ? taskCommitOnMain(git, repoRoot, mainBranch, taskId) : '');
+    if (sha) {
+      return { stage: 'merged', detail: `on origin/${mainBranch} @ ${sha.slice(0, 12)} (commit-trailer)` };
+    }
+  }
+
+  // 2. directToMain source that says it committed straight to main, trailer not locatable
+  //    (batch commit older than the current message format, or origin not fetched).
+  if (DIRECT_RE.test(detail)) {
+    return { stage: 'applied-direct', detail: `directToMain apply: ${detail}`.slice(0, 200) };
+  }
+
+  // 3. An agent/<id> branch still around? A stacked file-decompose sub-task (see
+  //    file-decompose-to-hub.js) shares ONE branch across its whole move sequence --
+  //    record.stacked.branch, e.g. "agent/decompose-<plan-slug>" -- NOT agent/<own id>.
+  //    2026-09-08, root-caused live: this fell straight through to the 'abandoned'
+  //    verdict below for a real, still-open, reviewed stacked sub-task, because
+  //    buildShipContext's branchAhead map is keyed by the REAL branch name (shared
+  //    across the whole stack), which never matches an individual sub-task's own id --
+  //    `ctx.branchAhead.has(taskId)` was structurally guaranteed false for every stacked
+  //    sub-task that ever existed, not just this one. Prefer the real branch name when
+  //    the record carries one; fall back to agent/<taskId> for a normal (non-stacked)
+  //    apply, unchanged from before.
+  if (taskId) {
+    // A gated triage-batch task shares ONE rolling branch (agent/triage-queue), named in its apply
+    // note -- not agent/<own id>. Same shape as the stacked case above.
+    const detailBranch = (detail.match(/\bagent\/[A-Za-z0-9._\/-]+/) || [])[0];
+    const realBranch = (record.stacked && record.stacked.branch) || detailBranch;
+    const branchKey = realBranch ? realBranch.replace(/^agent\//, '') : taskId;
+    const branchLabel = realBranch || `agent/${taskId}`;
+    let exists = false;
+    let ahead = 0;
+    if (ctx) {
+      exists = ctx.branchAhead.has(branchKey);
+      ahead = ctx.branchAhead.get(branchKey) || 0;
+    } else if (repoRoot) {
+      ({ exists, ahead } = branchAheadCount(git, repoRoot, mainBranch, branchLabel));
+    }
+    if (exists && ahead > 0) {
+      const lost = realBranch && record.stacked ? stackedSiblingLost(git, repoRoot, mainBranch, realBranch.replace(/^origin\//, ''), record) : null;
+      if (lost && lost.onMain) {
+        return { stage: 'superseded', detail: `${branchLabel} exists but no longer carries this task's change; ${lost.onMain.present} of ${lost.onMain.checked} distinctive added lines are already on ${mainBranch}` };
+      }
+      if (lost) {
+        return { stage: 'abandoned', detail: `${branchLabel} exists but carries none of this task's change (${lost.present} of ${lost.checked} distinctive added lines present): its commit was lost from the shared branch, and it is not on ${mainBranch}` };
+      }
+      return { stage: 'pending-merge', detail: `${branchLabel} is ${ahead} commit(s) ahead of ${mainBranch}, not merged` };
+    }
+    if (exists && ahead === 0) {
+      return { stage: 'merged', detail: `${branchLabel} fully contained in ${mainBranch} (branch not ahead)` };
+    }
+  }
+
+  // 4. The apply wrote a doc / note -- nothing to merge.
+  if (FILED_RE.test(detail)) {
+    return { stage: 'filed', detail: `apply wrote a doc/note: ${detail}`.slice(0, 200) };
+  }
+
+  // 4a. pipeline_debrief's own apply -- see DEBRIEF_ARCHIVED_RE above. Archiving a window
+  //     of done/ tasks and filing Now-What findings is real terminal work, not a no-op.
+  if (DEBRIEF_ARCHIVED_RE.test(detail)) {
+    return { stage: 'filed', detail: `debrief archived its window + filed its findings: ${detail}`.slice(0, 200) };
+  }
+
+  // 4b. Records with no structured reviewDisposition (older plugin build, or a historical
+  //     backfill): a *_review whose verdict text reads "FALSE POSITIVE" is a clean dismissal,
+  //     not a bare no-op. For these records the verdict lives in implementResponse/
+  //     planResponse, not the apply detail (which is a generic "no candidates ..."). Gated to
+  //     triage-review sources so a stray "not a false positive" in some adhoc diff can't trip
+  //     it. Must run BEFORE NOOP_RE -- NOOP_RE also matches "false positive".
+  const isReviewSource = /_review(_digest)?$/.test(String(record.source || ''));
+  if (isReviewSource) {
+    const verdictText = `${detail}\n${record.implementResponse || ''}\n${record.planResponse || record.lastGoodPlan || ''}`;
+    if (DISMISSED_RE.test(verdictText)) {
+      return { stage: 'dismissed', detail: `${record.source} verdict: false-positive dismissal`.slice(0, 200) };
+    }
+  }
+
+  // 5. The apply was an explicit no-op verdict.
+  if (NOOP_RE.test(detail)) {
+    // "verdict", not "apply": noop is a triage/verdict outcome, not a change application. Records written before 2026-10-01 say "no-op apply"; nothing matches on the text.
+    return { stage: 'noop', detail: `no-op verdict: ${detail}`.slice(0, 200) };
+  }
+
+  // 6. The apply detail names an agent/<id> branch, but it is gone AND not on <main>:
+  //    the work was lost. The loud one.
+  //    Two facts soften the bare verdict (2026-09-21, throughput analysis: 20 tasks read "work lost", and of five checked by content three had their whole
+  //    diff on master already): (a) the task's own recorded diff may already be on <main> -- landed another way (a sibling task, a re-do, a squash merge
+  //    with no trailer) -- which is `superseded`, not lost; (b) branch-removal-ledger.js may know why the branch was deleted.
+  if (BRANCH_DETAIL_RE.test(detail)) {
+    const landed = diffAlreadyOnMain(git, repoRoot, mainBranch, record.rawDiff);
+    if (landed) {
+      return {
+        stage: 'superseded',
+        detail: `applied to ${detail} -- branch gone, but ${landed.present} of ${landed.checked} distinctive added lines (${landed.files} file(s)) are already on ${mainBranch}: the work landed another way`.slice(0, 240),
+      };
+    }
+    // A stacked sub-task's branch is the SHARED one on record.stacked.branch, which may differ from the branch its apply detail names (same resolution as step 3): try both.
+    const removal = pipelineDir
+      ? [record.stacked && record.stacked.branch, detail.split(/\s/)[0]].filter(Boolean).map((b) => lastRemoval(pipelineDir, b)).find(Boolean) || null
+      : null;
+    const why = removal
+      ? `removed ${String(removal.at || '').slice(0, 10)} by ${removal.actor || 'unknown'} (${removal.cause}${removal.detail ? `: ${removal.detail}` : ''})`
+      : 'no removal recorded -- deleted outside the pipeline';
+    return { stage: 'abandoned', detail: `applied to ${detail} -- branch gone, not on ${mainBranch}: work lost; ${why}`.slice(0, 320) };
+  }
+
+  // 7. Unclassifiable apply outcome from a non-branch source -- delegate to the
+  //    apply-outcome classifier, record a 'apply' history event, then return the
+  //    classified terminal stage.
+  const classified = classifyApplyOutcome({ task: record, detail, taskId, mainBranch, shipCtx: ctx, applied });
+  appendHistoryEvent(record, 'apply', classified.detail);
+  return { stage: classified.stage, detail: classified.detail };
+}
+```
+
+Problem:
+resolveDisposition is 147 lines and mixes six unrelated responsibilities—precondition checks, review-disposition short-circuits, git-state branching (merged / applied-direct / pending-merge / superseded / abandoned), detail-string regex matching, lost-branch recovery, and fallback classification—into one body. The git-state block alone is ~60 lines with nested conditionals and two probe paths. No branch can be unit-tested in isolation, and precedence rules (e.g. DISMISSED_RE before NOOP_RE) are implicit in line order.
+
+Solution:
+Replace the monolith with a thin dispatcher that calls six small, named helpers in fixed precedence order:
+
+```js
+function resolveDisposition(record, opts = {}) {
+  const pre    = validatePreconditions(record, opts);
+  if (!pre) return null;
+  const review = resolveReviewDisposition(record, opts);
+  if (review) return review;
+  const git    = resolveGitState(record, opts);
+  if (git) return git;
+  const detail = resolveDetailPatterns(record, opts);
+  if (detail) return detail;
+  const lost   = resolveLostBranch(record, opts);
+  if (lost) return lost;
+  return classifyAndRecord(record, opts);
+}
+```
+
+Each helper is 15–40 lines, independently testable, and owns exactly one decision branch.
+
+Benefits:
+Each sub-function can be tested with a single fixture (e.g. one merged-branch record for resolveGitState) without mocking the full ctx/repoRoot environment. Precedence is now explicit in call order. A reviewer can approve or reject one 30-line helper instead of scanning 147 lines.
+
+### AC-208 · Extract repeated re-admission blocks into a shared helper
+Strength: Strong
+Files: src/reject-retry-check.js
+Symbol: rejectRetryCheck
+Snippet:
+```
+}
+
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, repoRoot: repoRootOverride, recordModelOutcome = defaultRecordModelOutcome }) {
+  const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
+  // blockedDir is always <pipelineDir>/queue/blocked in every real caller -- this fallback
+  // only matters for tests that don't bother passing pipelineDir explicitly (it was never
+  // load-bearing before the move-lock existed); a real caller always passes it directly.
+  const instancesDir = sharedInstancesDir(pipelineDir || path.dirname(path.dirname(blockedDir)));
+  // Ghost-debt needs the pipeline root for its state file + the side-finding inbox.
+  // Derive it from needsClarificationDir (<pipelineDir>/queue/needs-clarification) when a
+  // caller (older tests) didn't pass it explicitly.
+  const ghostRoot = pipelineDir
+    || (needsClarificationDir ? path.dirname(path.dirname(needsClarificationDir)) : null);
+  // Lazy, best-effort (deterministicReviewRecoveryCheck below tolerates undefined) -- same
+  // "read env inside the sweep, never at module load, never let a missing config block a
+  // sweep tick" discipline every other watchdog sweep in this codebase already follows.
+  // Callers that pass approvedDir explicitly (tests) skip this derivation entirely.
+  const approvedDirResolved = approvedDir
+    || (ghostRoot ? path.join(ghostRoot, 'queue', 'approved') : null);
+  let recoveryConfig = {};
+  try { recoveryConfig = getConfig(); } catch { /* no live config (e.g. a unit test) -- recovery check just no-ops */ }
+  // repoRoot: an explicit caller/test override wins over the live config (the stale-premise re-admission below checks files against it).
+  const sweepRepoRoot = repoRootOverride || recoveryConfig.repoRoot;
+  const entries = discoverBlockedEntries({ blockedDir, adhocDir, derivedDir });
+
+  if (entries.length === 0) return summary;
+
+  for (const { dir: sourceDir, name } of entries) {
+    const filePath = path.join(sourceDir, name);
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      if (!raw) continue;
+      const task = JSON.parse(raw);
+      summary.checked++;
+
+      // A source can opt out of blind-redraft-and-retry entirely
+      // (registerTaskSource(name, { noAutoRetry: true })) -- e.g. wikiforge's
+      // wiki_transcript_extract/wiki_page_promote, where a full redraft costs a genuine
+      // 15-40min plan+implement+critique cycle and, running a large batch overnight, the
+      // operator would rather move on to the next item than spend that time re-attempting
+      // one that already failed once ("one attempt and done"). Checked before any of the
+      // eligibility classifiers below so it applies uniformly regardless of WHY the task
+      // blocked; the task is simply left as-is in blocked/ for a human to look at later,
+      // same as any task this sweep was never eligible to touch at all.
+      const noAutoRetryEntry = getRegisteredSource(resolveSourceName(task));
+      if (noAutoRetryEntry && noAutoRetryEntry.noAutoRetry === true) continue;
+
+      // Only a genuine review-stage rejection is eligible -- never an apply-stage failure
+      // that happens to still carry localVotes from an earlier, unrelated successful
+      // review (redrafting can't fix that; see agent-manager-common.sh's
+      // test_review_rejection, the bash equivalent of this exact check).
+      //
+      // 2026-09-01: also eligible -- an adhoc tier-3 draft-stage block that a redraft could
+      // plausibly fix (resolveAgenticDraft sets task.retryableDraftBlock):
+      //   - the model exhausted its turn budget without making a single edit
+      //     (task.turnBudgetExhausted) -- the redraft is NOT blind: plan + tier-2
+      //     investigation are folded into the prompt and the feedback below says "edit early".
+      //   - the model chose RESOLUTION: decompose but botched the sub-task JSON -- a redraft
+      //     can emit valid JSON or just implement the change; the feedback reminds it of the
+      //     format.
+      // Bounded by the same MAX_LOCAL_REJECT_RETRIES cap; on exhaustion it takes the same
+      // adhoc -> needs-clarification escalation as a stuck review rejection.
+      const retryableDraftBlock = isAdhocTask(task) && task.retryableDraftBlock === true;
+      const preCritiqueBlock = isPreCritiqueBlock(task);
+      const preImplementBlock = isPreImplementBlock(task);
+      const draftFailureBlock = isDraftFailureBlock(task);
+      const planDegenerateBlock = isPlanDegenerateBlock(task);
+      const implementDegenerateBlock = isImplementDegenerateBlock(task);
+      const critiqueDegenerateBlock = isCritiqueDegenerateBlock(task);
+      // An "Invalid premise:" verdict is recognized whatever its blockedStage (or lack of
+      // one) -- see invalidPremiseBeforeCheckExisted / hasInvalidPremise: it is either
+      // re-admitted once or escalated by the classifier below, never left invisible.
+      const invalidPremiseBlock = hasInvalidPremise(task);
+      // A "sub-task premise may be stale" block whose gate no longer fires (it used to call a monorepo
+      // sub-root file missing) is recognized whatever its stage -- re-admitted once below.
+      const stalePremiseFalsePositive = stalePremiseGateNoLongerFires(task, { repoRoot: sweepRepoRoot });
+      const externalDepFalsePositive = externalDepGateNoLongerBlocks(task);
+      const splitTooFewReadmit = splitTooFewStillRetryable(task);
+      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !implementDegenerateBlock && !critiqueDegenerateBlock && !invalidPremiseBlock && !stalePremiseFalsePositive && !externalDepFalsePositive && !splitTooFewReadmit) continue;
+
+      // A continuation (agentic-draft-common.js: the model ran out of turns mid-
+      // implementation, no real design question) is forward progress, not a failed
+      // redraft -- it has its OWN cap (MAX_AGENTIC_CONTINUATIONS, enforced there) and must
+      // not be gated by, or count against, the blind-redraft cap.
+      const isContinuation = retryableDraftBlock && task.isAgenticContinuation === true;
+
+      // A task already carrying ANY needsClarification (e.g. external-dependency,
+      // stamped at DRAFT time by AC-13a; or a design-decision left by some other
+      // mechanism) has already been triaged -- never overwrite or re-decide it, and
+      // never let a stale blockedStage:'review' from an earlier, unrelated rejection
+      // cycle re-enable a blind-retry loop for a task a human is already meant to be
+      // looking at. Generalizes AC-13b's original external-dependency-specific check
+      // (2026-09-06): once ANY prior mechanism flags a needed human decision, nothing
+      // here should ever re-decide it, regardless of which reason string it used.
+      if (task.needsClarification) continue;
+
+      // A source with deterministicReview (mechanical validate, no model judgment) that was
+      // blocked by that SAME validator -- re-run it against the existing implementResponse;
+      // if the underlying rule has since been fixed and it now passes, this is exactly the
+      // outcome a normal review pass would produce, so skip the wasted redraft and land it
+      // straight in queue/approved/ instead. See deterministicReviewRecoveryCheck's own
+      // header for the real incident this recovers. Checked before the forbidden-path
+      // readmit below since it's a distinct, unrelated signal, not a fallback to it.
+      if (deterministicReviewRecoveryCheck(task, { secondBrainDir: recoveryConfig.secondBrainDir, repoRoot: recoveryConfig.repoRoot })) {
+        task.reviewedAt = new Date().toISOString();
+        task.reviewProvider = 'deterministic-review-recovery';
+        task.localVerdict = 'Auto-approved on re-check: the deterministic rule that originally blocked this has since been fixed, and the existing (unchanged) classification now passes it -- no redraft needed.';
+        delete task.blockedReason;
+        delete task.blockedStage;
+        appendHistoryEvent(task, 'approved', 'reject-retry-check: deterministic-review-recovery -- re-validated against the existing implementResponse, now passes');
+        recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'watchdog', outcomeReason: 'deterministic-review-recovery' });
+        summary.recovered += 1;
+        if (approvedDirResolved) {
+          try {
+            fs.mkdirSync(approvedDirResolved, { recursive: true });
+            writeTaskAndUnlinkOld(instancesDir, task, path.join(approvedDirResolved, name), filePath);
+          } catch (e) {
+            console.warn(`[reject-retry-check] deterministic-review-recovery move to approved/ failed for ${task.id || name}:`, e.message);
+            summary.errors += 1;
+          }
+        }
+        continue;
+      }
+
+      // Re-admit a task the (now-fixed) forbidden-path gate bug wrongly ran to exhaustion:
+      // its block named one of its OWN declared edit targets, so no blind retry could ever
+      // have differed. The pipeline itself brings it back -- clean slate, retry budget
+      // reset -- exactly once (the forbiddenPathReadmitted stamp bounds it, so a task that
+      // somehow still fails this way after the fix is not re-admitted forever). This is the
+      // deterministic counterpart to an operator manually requeueing it.
+      if (!task.forbiddenPathReadmitted && forbiddenPathBlockNamesOwnTarget(task)) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.forbiddenPathReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior forbidden-path block named one of the task's own declared edit targets (adhoc-diff-sanity gate bug, since fixed) -- re-admitted with a clean slate, retry budget reset");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'forbidden-path-false-positive-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // Re-admit a task the (now-fixed) stale-premise gate wrongly blocked: it cited a file that
+      // exists under a monorepo sub-root and the gate called it missing. The re-check above already
+      // proved the gate no longer fires, so no blind retry is involved -- clean slate, exactly once
+      // (the stalePremiseReadmitted stamp is deliberately NOT in READMIT_CLEAN_SLATE_FIELDS, so a
+      // later clean-slate pass keeps the bound).
+      if (stalePremiseFalsePositive) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.stalePremiseReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior block was a stale-premise verdict from decompose-premise-check that called a cited file missing (it exists under a monorepo sub-root; resolved by path suffix since) -- re-admitted with a clean slate, exactly once");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'stale-premise-false-positive-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // Re-admit a task the (now-fixed) external-dependency gate wrongly blocked: it matched a
+      // credential/network word in prose, a code span, or the plan echo of an ordinary code edit.
+      // The re-check above proved the gate no longer blocks, so no blind retry is involved -- clean
+      // slate, exactly once (externalDepReadmitted is deliberately NOT in READMIT_CLEAN_SLATE_FIELDS).
+      if (externalDepFalsePositive) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.externalDepReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior block was the external-dependency gate matching credential/network vocabulary in prose, a code span, or the plan echo (code spans and the plan are no longer scanned, and soft markers only advise by default) -- re-admitted with a clean slate, exactly once");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'external-dep-false-positive-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // Re-admit a candidate whose split was rejected for having fewer than 2 usable sub-candidates before the in-draft retry existed
+      // (class C): clean slate, exactly once, so the draft's one corrective retry gets to run on it.
+      if (splitTooFewReadmit) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.splitTooFewReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          'reject-retry-check: prior block was a candidate split with fewer than 2 usable sub-candidates; the draft now retries that once with the one-file-per-piece rule spelled out -- re-admitted with a clean slate, exactly once');
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'split-too-few-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // 2026-09-06: candidate-premise-check.js's premise gate can reject a task whose
+// ... [truncated for review: this function continues for 295 more line(s) not shown]
+```
+
+Problem:
+The 495-line function contains four structurally-identical re-admission blocks (forbidden-path, stale-premise, external-dep, split-too-few) that differ only in a stamp field name and a message string. A typo in one stamp silently breaks the "exactly once" guard for that path, and any protocol change (e.g. adding a field to clear) must be replicated four times.
+
+Solution:
+Extract the shared re-admission sequence into one helper; each of the four blocks becomes a single call:
+
+```js
+function readmitCleanSlate(task, { stampField, reason, outcomeReason, ctx }) {
+  for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+  task[stampField] = true;
+  if (task.status === 'blocked') task.status = 'pending';
+  appendHistoryEvent(task, 'requeued', reason);
+  recordModelOutcome({ callId: task.abCallId, outcome: 'requeued',
+    outcomeStage: 'watchdog', outcomeReason });
+  const destDir = (task.source === 'derived_task' && ctx.derivedDir) ? ctx.derivedDir
+    : (isAdhocTask(task) && ctx.adhocDir) ? ctx.adhocDir : ctx.pendingDir;
+  fs.mkdirSync(destDir, { recursive: true });
+  writeTaskAndUnlinkOld(ctx.instancesDir, task, path.join(destDir, ctx.name), ctx.filePath);
+  ctx.summary.requeued++;
+}
+```
+
+Each call-site shrinks to:
+
+```js
+if (stalePremiseFalsePositive) {
+  readmitCleanSlate(task, { stampField: 'stalePremiseReadmitted',
+    reason: 'stale-premise false positive', outcomeReason: 'stale-premise-readmit', ctx });
+  continue;
+}
+```
+
+Benefits:
+~60 lines of duplication collapse into one helper. The stamp contract is visible in a single place, so a misspelled stamp is caught at the call-site rather than buried in a 15-line block. Each re-admission path becomes independently unit-testable by stubbing the helper.
+
+### AC-209 · Decompose renderPluginsTab into builders and handler wiring
+Strength: Strong
+Files: python/dashboard/static/js/plugins-tab.js
+Symbol: renderPluginsTab
+Snippet:
+```
+// No require()/module.exports: the browser loads this with a plain <script src> tag, so every name below is a shared global.
+
+async function renderPluginsTab() {
+  const main = document.getElementById('main');
+  let data;
+  try {
+    data = await fetchJson('/api/plugins');
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Could not load plugins: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  const slotted = plugins => plugins.filter((p) => p.slot);
+  const unslotted = plugins => plugins.filter((p) => !p.slot);
+  const allPlugins = data.plugins || [];
+  const rows = unslotted(allPlugins).map((p) => {
+    const enabled = p.enabled !== false;
+    return `
+      <div style="display:flex; align-items:flex-start; gap:12px; padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
+        <label style="display:flex; align-items:center; gap:8px; margin-top:2px; cursor:pointer;">
+          <input type="checkbox" class="plugin-toggle" data-name="${escapeAttr(p.name)}" ${enabled ? 'checked' : ''}>
+        </label>
+        <div style="flex:1; min-width:0;">
+          <div style="font-weight:600;">${escapeHtml(p.name)} ${enabled ? '' : '<span class="badge idle" style="margin-left:6px;">disabled</span>'}</div>
+          ${p.description ? `<div class="meta" style="margin-top:2px;">${escapeHtml(p.description)}</div>` : ''}
+          <div class="meta" style="margin-top:4px; word-break:break-all; font-family:monospace; font-size:11px; color:var(--muted);">${escapeHtml(p.registerPath || '(no path)')}</div>
+        </div>
+      </div>`;
+  }).join('');
+
+  // Slotted plugins (e.g. "hardware-tab") are mutually exclusive -- a radio group, not
+  // independent checkboxes, since exactly one (or none) actually runs at a time and
+  // switching genuinely starts/stops the underlying process (see /api/plugins/select-slot).
+  const slotGroups = {};
+  slotted(allPlugins).forEach((p) => { (slotGroups[p.slot] = slotGroups[p.slot] || []).push(p); });
+  const slotSections = Object.entries(slotGroups).map(([slot, members]) => {
+    const radioName = `slot-${slot}`;
+    const noneChecked = !members.some((m) => m.active) ? 'checked' : '';
+    const options = [`
+      <label style="display:flex; align-items:center; gap:8px; padding:8px 10px; cursor:pointer;">
+        <input type="radio" name="${escapeAttr(radioName)}" class="slot-radio" data-slot="${escapeAttr(slot)}" value="" ${noneChecked}>
+        <span>None (stop monitoring)</span>
+      </label>`, ...members.map((m) => {
+      const badge = m.running
+        ? '<span class="badge ok" style="margin-left:6px;">running</span>'
+        : '<span class="badge idle" style="margin-left:6px;">stopped</span>';
+      return `
+      <label style="display:flex; align-items:flex-start; gap:8px; padding:8px 10px; cursor:pointer;">
+        <input type="radio" name="${escapeAttr(radioName)}" class="slot-radio" data-slot="${escapeAttr(slot)}" value="${escapeAttr(m.name)}" ${m.active ? 'checked' : ''} style="margin-top:2px;">
+        <span>
+          <div style="font-weight:600;">${escapeHtml(m.name)}${badge}</div>
+          ${m.description ? `<div class="meta" style="margin-top:2px;">${escapeHtml(m.description)}</div>` : ''}
+        </span>
+      </label>`;
+    })];
+    return `
+      <div style="padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
+        <div class="field-label" style="margin-bottom:6px;">${escapeHtml(slot)} source</div>
+        <div style="display:flex; flex-direction:column; gap:2px;" id="slot-group-${escapeAttr(slot)}">${options.join('')}</div>
+        <div class="meta slot-status" style="margin-top:6px;"></div>
+      </div>`;
+  }).join('');
+
+  main.innerHTML = `
+    <h2 style="margin-top:0;">Plugins</h2>
+    ${slotSections}
+    <div class="meta" style="margin-bottom:14px;">
+      Only enabled plugins register their task sources. A change here restarts the pipeline if it is running so an
+      in-flight draft for a now-disabled source can't stall. Manifest: <span style="font-family:monospace;">${escapeHtml(data.manifestPath || 'plugins.json')}</span>
+    </div>
+    <div id="plugins-list">${rows || '<div class="empty">No plugins registered yet -- add one below.</div>'}</div>
+
+    <h3 style="margin-top:22px;">Add a plugin</h3>
+    <div style="display:flex; flex-direction:column; gap:8px; max-width:640px;">
+      <input type="text" id="plugin-add-path" placeholder="Absolute path to the plugin's register.js (e.g. /media/model-cache/github/agent-manager-imagegen/register.js)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+      <input type="text" id="plugin-add-name" placeholder="Name (optional -- defaults to the plugin folder name)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+      <input type="text" id="plugin-add-desc" placeholder="Description (optional)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+      <button class="action" id="plugin-add-btn" style="align-self:flex-start;">Add plugin</button>
+      <div id="plugin-add-msg" class="meta"></div>
+    </div>
+
+    <h3 style="margin-top:22px;">Available plugins</h3>
+    <div id="marketplace-note" class="meta" style="margin-bottom:10px;"></div>
+    <div id="marketplace-list"><div class="meta">Loading...</div></div>`;
+
+  main.querySelectorAll('.slot-radio').forEach((radio) => {
+    radio.onchange = async () => {
+      const slot = radio.dataset.slot;
+      const name = radio.value || null;
+      const group = main.querySelector(`#slot-group-${slot}`);
+      const statusEl = group ? group.closest('div').parentElement.querySelector('.slot-status') : null;
+      group.querySelectorAll('input').forEach((r) => { r.disabled = true; });
+      if (statusEl) statusEl.textContent = name ? `Starting ${name}...` : 'Stopping...';
+      try {
+        const r = await fetch('/api/plugins/select-slot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ slot, name }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.description || r.status);
+        if (name && !body.healthy) {
+          if (statusEl) statusEl.textContent = `${name} started but did not report healthy in time -- check its log.`;
+        }
+        await renderPluginsTab();
+      } catch (e) {
+        alert('Could not switch plugin: ' + e.message);
+        await renderPluginsTab();
+      }
+    };
+  });
+
+  main.querySelectorAll('.plugin-toggle').forEach((cb) => {
+    cb.onchange = async () => {
+      cb.disabled = true;
+      try {
+        const r = await fetch('/api/plugins/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: cb.dataset.name, enabled: cb.checked }),
+        });
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).description || r.status);
+        await syncPluginTabs();
+        renderNav();
+        await renderPluginsTab();
+      } catch (e) {
+        alert('Could not update plugin: ' + e.message);
+        cb.checked = !cb.checked;
+        cb.disabled = false;
+      }
+    };
+  });
+
+  const addBtn = main.querySelector('#plugin-add-btn');
+  addBtn.onclick = async () => {
+    const msg = main.querySelector('#plugin-add-msg');
+    const registerPath = main.querySelector('#plugin-add-path').value.trim();
+    const name = main.querySelector('#plugin-add-name').value.trim();
+    const description = main.querySelector('#plugin-add-desc').value.trim();
+    if (!registerPath) { msg.textContent = 'A register.js path is required.'; return; }
+    addBtn.disabled = true;
+    msg.textContent = 'Adding...';
+    try {
+      const r = await fetch('/api/plugins/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ registerPath, name, description }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.description || r.status);
+      await syncPluginTabs();
+      renderNav();
+      await renderPluginsTab();
+    } catch (e) {
+      msg.textContent = 'Could not add plugin: ' + e.message;
+      addBtn.disabled = false;
+    }
+  };
+
+  // Marketplace: fetch catalog entries annotated with install status and render
+  // Install / Update / Installed controls per entry. 402/403 surface via showToast.
+  (async () => {
+    const listEl = main.querySelector('#marketplace-list');
+    const noteEl = main.querySelector('#marketplace-note');
+    let mkt;
+    try {
+      mkt = await fetchJson('/api/plugins/marketplace');
+    } catch (e) {
+      listEl.innerHTML = '<div class="meta">Could not load marketplace: ' + escapeHtml(e.message) + '</div>';
+      return;
+    }
+    if (mkt.catalogError) {
+      noteEl.textContent = mkt.catalogError;
+    }
+    const entries = mkt.plugins || mkt.entries || [];
+    if (!entries.length) {
+      listEl.innerHTML = '<div class="meta">No plugins available in the catalog.</div>';
+      return;
+    }
+    listEl.innerHTML = entries.map((p) => {
+      const installed = p.installed === true;
+      const updateAvail = p.updateAvailable === true;
+      let priceText = '';
+      if (p.pricing && p.pricing.model && p.pricing.model !== 'free') {
+        const cur = p.pricing.currency || '';
+        const amt = p.pricing.amount_cents != null ? (p.pricing.amount_cents / 100) : 0;
+        const interval = p.pricing.interval || '';
+        priceText = escapeHtml(cur + ' ' + amt + (interval ? ' / ' + interval : ''));
+      }
+      let controlHtml = '';
+      if (installed && updateAvail) {
+        controlHtml = '<button class="action" data-mkt-action="update" data-id="' + escapeAttr(p.id) + '">Update</button>';
+      } else if (installed) {
+        controlHtml = '<span class="badge ok" style="margin-top:2px;">Installed</span>';
+      } else {
+        const isPaid = p.pricing && p.pricing.model && p.pricing.model !== 'free';
+        const paidStyle = isPaid ? ' style="opacity:0.7; border-style:dashed;" title="Paid plugin -- requires a license"' : '';
+        controlHtml = '<button class="action" data-mkt-action="install" data-id="' + escapeAttr(p.id) + '"' + paidStyle + '>Install</button>';
+      }
+      const versionLine = p.installedVersion
+        ? '<div class="meta" style="margin-top:2px; font-size:11px;">Installed: ' + escapeHtml(p.installedVersion) + (updateAvail ? ' <span class="badge idle" style="margin-left:4px;">update available</span>' : '') + '</div>'
+        : '';
+      return '<div style="display:flex; align-items:flex-start; gap:12px; padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">'
+// ... [truncated for review: this function continues for 40 more line(s) not shown]
+```
+
+Problem:
+renderPluginsTab is ~240 lines interleaving four independent responsibilities: building the unslotted-checkbox list, building slotted-radio sections, wiring three handler families (slot radios, toggles, add-button), and a self-contained marketplace IIFE with its own fetch, render, and install/update wiring. A bug in the marketplace pricing (amount_cents / 100) is invisible past 180 lines of unrelated HTML. The function is not a single linear flow; it contains ≥ 4 independent fetch/render/wire cycles.
+
+Solution:
+Extract named helpers in the same file, all operating on `document.getElementById('main')`:
+
+```js
+function buildUnslottedRows(plugins) { /* ~20 lines template */ }
+function buildSlotSections(plugins)  { /* ~35 lines template */ }
+function wireSlotRadios(main)        { /* querySelectorAll('.slot-radio') */ }
+function wirePluginToggles(main)     { /* querySelectorAll('.plugin-toggle') */ }
+function wireAddPluginBtn(main)      { /* #plugin-add-btn */ }
+async function loadMarketplace(main) { /* extracted IIFE, fetches /api/plugins/marketplace */ }
+
+async function renderPluginsTab() {
+  const main = document.getElementById('main');
+  // …fetch /api/plugins, error-early-return…
+  main.innerHTML = `…${buildSlotSections(slotted)}…${buildUnslottedRows(unslotted)}…`;
+  wireSlotRadios(main);
+  wirePluginToggles(main);
+  wireAddPluginBtn(main);
+  await loadMarketplace(main);
+}
+```
+
+Benefits:
+The marketplace IIFE becomes testable by mocking fetchJson('/api/plugins/marketplace') and asserting on #marketplace-list. The three handler families share a "disable → POST → re-render" shape; naming them makes the pattern visible. The template builders are pure functions of their input, enabling unit tests that assert exact HTML without a DOM. The orchestrator drops below 100 lines.
+
+### AC-210 · Extract retry idiom from finalizeCan
+Strength: Strong
+Files: src/local-draft.js
+Symbol: finalizeCandidateFulfillment
+Snippet:
+```
+}
+
+async function finalizeCandidateFulfillment(task, {
+  maybeLocked, maybeLockedOn, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
+}, { implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt }) {
+  let split = parseCandidateSplit(task.implementResponse);
+  // Too-few-sub-candidates retry (class C, arch-review-ac-180): the model said mode "split" but gave ONE child that restated the whole
+  // single-file candidate (and itself spanned two files, against the prompt's own one-file-per-piece rule). That is a fixable answer, not
+  // a dead end -- ask once, naming the rule, before blocking for a human. Any later failure blocks exactly as before. The flag is not a
+  // clean-slate field, so a re-admitted task is not retried forever.
+  if (split && split.invalid && split.tooFew && !task.splitTooFewRetried) {
+    task.splitTooFewRetried = true;
+    const correction = `Your previous answer was mode "split" but only ${split.usable} of ${split.proposed} sub-candidate(s) were usable. A split needs AT LEAST 2 sub-candidates, each with a title, problem and solution, each touching exactly ONE file, listed in the order they must be applied (use dependsOn when a later piece needs an earlier one). For example: (1) create the new module, then (2) rewire the original file to use it. Do not put the whole job in a single sub-candidate.`;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(correction);
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: `${implPrompt}\n\n${correction}`, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
+    if (!retryResult.degenerate) {
+      task.implementResponse = retryResult.response;
+      split = parseCandidateSplit(task.implementResponse);
+    }
+    appendHistoryEvent(task, 'implement-retry', `split had ${split && split.tooFew ? split.usable : 'too few'} usable sub-candidate(s) -- retried once asking for at least 2, one file each${retryResult.degenerate ? ' (retry degenerate, original answer kept)' : ''}`);
+  }
+  if (split) {
+    const pc = task.promptContext || {};
+    const atSplitCap = (pc.splitDepth || 0) >= 1;
+    // A noCandidateSplit source's candidate is already a decomposition, EXCEPT when the
+    // deterministic pre-split gate (nextCandidateFulfillmentTask) marked it too broad to
+    // land in one diff -- that split IS wanted. But a candidate already at Split-Depth >= 1
+    // is never re-split, whatever the source: the hard recursion stop.
+    const entry = getRegisteredSource(resolveSourceName(task));
+    const splitBlocked = atSplitCap || (entry && entry.noCandidateSplit && !pc.mustPreSplit);
+    // A source can register a `premiseCheck(task, {call, maybeLockedOn})` -- generic,
+    // source-agnostic hook, same convention as `noCandidateSplit` above -- run BEFORE a
+    // split is honored, never after: this is the fan-out point, so it's the cheapest place
+    // to stop a candidate whose Problem statement makes a checkable claim about the
+    // codebase that the fetched content contradicts (arch-import-premise-check.js in the
+    // hygiene plugin; see AC-8, which split into 3 children before anyone checked its
+    // premise was false). Skipped once splitBlocked is already true -- cheapest check first.
+    if (!splitBlocked && entry && typeof entry.premiseCheck === 'function') {
+      let premise;
+      try {
+        premise = await entry.premiseCheck(task, { call: resolvedLocalCall, maybeLockedOn });
+      } catch (e) {
+        if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
+        // AC-170: log the swallowed premiseCheck exception so operators can see it.
+        // entry.name / entry.sourceName are not confirmed present; fall back to constructor name.
+        console.error(`[premiseCheck] task=${task.id || task.name || 'unknown'} source=${entry.name || entry.sourceName || entry.constructor?.name || 'unknown-source'} error=${e?.message ?? String(e)}`, e?.stack);
+        premise = null; // advisory mechanism -- a throwing premiseCheck must never block a real split
+      }
+      if (premise && premise.verdict === 'invalid-premise') {
+        const reason = `Invalid premise: ${String(premise.reason || '(no detail)')}`.slice(0, 500);
+        recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: reason });
+        appendHistoryEvent(task, 'blocked', reason);
+        return { done: true, result: { succeeded: true, blocked: true, blockedReason: reason } };
+      }
+    }
+    // A blocked split used to stop here, "for a human to narrow the fix" -- PropertyForager function-length-fix-ac-2 (a candidate that
+    // proposed four extractions), arch-review-ac-6 (a Split-Depth 1 sub-candidate still too big). Agent-manager already has a system
+    // for work that is too big for one pass: a coordinator hub of ordered adhoc sub-tasks (see apply-adhoc-diff.js). Route the
+    // well-formed split there; the review pass judges it as it does any candidate split (coverage of the original), and apply
+    // (apply-core.js writeArtifact) queues the pieces. The doc-split's re-split loop cannot recur: children are adhoc tasks that
+    // produce real diffs and carry `decomposedFrom`, which marks them as leaves. AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB=false restores
+    // the old block.
+    if (splitBlocked && !split.invalid && candidateSplitToHubEnabled()) {
+      const childDepth = (pc.splitDepth || 0) + 1;
+      task.candidateSplitProposals = split.candidates.map((c) => ({ ...c, splitDepth: childDepth }));
+      task.candidateSplitRoute = 'hub';
+      const why = atSplitCap ? 'a Split-Depth >= 1 sub-candidate' : 'a source whose candidates are already decompositions';
+      recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: `too large for one pass (${why}) -- split into ${split.candidates.length} piece(s) routed to a coordinator hub` });
+      appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), too large for one pass (${why}) -- ${split.candidates.length} piece(s) routed to a coordinator hub: ${split.candidates.map((c) => c.title).join('; ')}`);
+      concludeDraft(task);
+      return { done: true, result: { succeeded: true, blocked: false } };
+    }
+    if (splitBlocked) {
+      const reason = atSplitCap
+        ? 'implement pass tried to split a sub-candidate that is already a one-level decomposition (Split-Depth >= 1) -- blocked for a human to narrow the fix'
+        : 'implement pass tried to split a candidate that must be implemented directly (this source does not allow re-splitting) -- blocked for a human to narrow the fix';
+      recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: reason });
+      appendHistoryEvent(task, 'blocked', reason);
+      return { done: true, result: { succeeded: true, blocked: true, blockedReason: reason } };
+    }
+    if (split.invalid) {
+      recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: `invalid candidate split: ${split.reason}` });
+      appendHistoryEvent(task, 'blocked', split.reason);
+      return { done: true, result: { succeeded: true, blocked: true, blockedReason: split.reason } };
+    }
+    const childDepth = (pc.splitDepth || 0) + 1;
+    task.candidateSplitProposals = split.candidates.map((c) => ({ ...c, splitDepth: childDepth }));
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: `split into ${split.candidates.length} sub-candidate(s)` });
+    appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), split into ${split.candidates.length} sub-candidate(s): ${split.candidates.map((c) => c.title).join('; ')}`);
+    concludeDraft(task);
+    return { done: true, result: { succeeded: true, blocked: false } };
+  }
+  canonicalizeImplementFinds(task);
+  const anchorSnippet = extractCandidateSnippet(task.promptContext && task.promptContext.body);
+  const unverified = findUnverifiedEdit(
+    task.implementResponse,
+    task.promptContext && task.promptContext.fetchedFiles,
+    { anchorSnippet, declaredFiles: (task.promptContext && task.promptContext.files) || [] },
+  );
+  if (unverified) {
+    let correction;
+    if (unverified.problem === 'files-incomplete') {
+      correction = `This candidate's "Files:" line names ${unverified.declared.length} files that all need changes: ${unverified.declared.join(', ')}. Your previous attempt only edits ${unverified.declared.filter((f) => !unverified.missing.includes(f)).join(', ') || '(none of them)'} and leaves ${unverified.missing.join(', ')} untouched. Add the edit(s) to ${unverified.missing.join(' and ')} that the Solution describes -- the change is not complete without them.`;
+    } else if (unverified.problem === 'helper-not-wired') {
+      correction = `Your previous attempt defines \`${unverified.helper}\` in ${unverified.file} but nothing ever calls it -- neither another edit in your diff nor the file's existing code. A new helper that is never invoked is a no-op. Add the edit that actually calls \`${unverified.helper}\` at the site the candidate's Solution describes (and, if the Solution says to, the edit that clears/resets any field it uses afterwards).`;
+    } else if (unverified.problem === 'duplicate-import') {
+      correction = `Your previous attempt for ${unverified.file} ADDS the line \`${unverified.duplicateLine}\`, but that line ALREADY EXISTS in the file's real content shown above. Do not add it again -- reuse the existing import/logger. If a module logger genuinely does not exist yet, add ONE line at the top of the file with the other imports, never inside a function.`;
+    } else if (unverified.problem === 'wrong-block') {
+      correction = `Your previous "find" string for ${unverified.file} matches the file -- but a DIFFERENT block than the one this candidate flagged. The flagged code is:\n\n${unverified.anchorSnippet}\n\nYour "find" must be a verbatim substring of THAT block (or the real file text immediately around it) -- not a similar-looking try/except/catch elsewhere in the file. Copy from the flagged block above.`;
+    } else {
+      correction = `Your previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;
+    }
+    // 2026-09-10, brain-dump bd-1788748625403 ("before spending a second implement
+    // attempt on an observability_fix requeue, feed the prior rejection reason"): this
+    // correction text was built for ONE inline retry here and then discarded -- if this
+    // candidate still gets rejected later (critique/review) and reject-retry-check.js
+    // redrafts it from scratch, the fresh attempt had no memory of this exact mistake and
+    // could easily reproduce it. Pushing it onto task.priorRejectionFeedback lets
+    // priorRejectionBlock() (prompts.js/lib/prompt-blocks.js) fold it into the next
+    // attempt's prompt as a hard constraint, same as every other rejection reason already
+    // does -- no signature changes, just one more caller of the existing mechanism.
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(correction);
+    const retryPrompt = `${implPrompt}\n\n${correction}`;
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
+    if (!retryResult.degenerate) {
+      task.implementResponse = retryResult.response;
+      canonicalizeImplementFinds(task);
+    }
+    const note = `retried once (${unverified.problem})`;
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note, promptVariant: 'strict-cite' });
+    appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars (${note})`);
+  } else {
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts });
+    appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
+  }
+  if (!task.nonCompliantImplementRetried && !isImplementOutputCompliant(task, task.implementResponse)) {
+    task.nonCompliantImplementRetried = true;
+    console.warn(`[local-draft] non-compliant implement output (missing JSON and missing FALSE POSITIVE token) -- retrying once, task=${task.id}, source=${task.source}`);
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
+    if (!retryResult.degenerate) {
+      task.implementResponse = retryResult.response;
+      canonicalizeImplementFinds(task);
+    }
+    appendHistoryEvent(task, 'implement-retry', 'non-compliant output (missing JSON and missing FALSE POSITIVE token) -- retried once before critique');
+  }
+```
+
+Problem:
+finalizeCan interleaves three responsibilities across 145 lines. The clearest duplication is a retry-with-correction idiom (build prompt → maybeLocked call → check degenerate → write back task.implementResponse) repeated three times for split-too-few, unverified-edit, and non-compliant-output retries. Each block is ~8 lines of identical shape parameterised only by the prompt string, so any contract change to maybeLocked must be patched in three places.
+
+Solution:
+Extract one helper, retryImplementOnce, that takes the task, a base prompt, an optional correction string, and the shared call options. It builds the combined prompt, performs the maybeLocked call with stage 'implement-retry', and writes back to task.implementResponse when the result is not degenerate. Each of the three inline blocks collapses to a single call-site:
+
+```js
+async function retryImplementOnce(task, { implPrompt, correction, ...opts }) {
+  const prompt = correction ? `${implPrompt}\n\n${correction}` : implPrompt;
+  const result = await maybeLocked(opts.isLocal, () => opts.localCall({
+    prompt,
+    think: opts.supportsThink && !opts.noThink,
+    temperature: RETRY_TEMPERATURE,
+    numPredict: opts.numPredict,
+    numCtx: opts.numCtx,
+    allowEmpty: opts.allowEmpty,
+    source: task.source,
+    taskId: task.id,
+    stage: 'implement-retry',
+    isDraft: true,
+  }), 'implement-retry');
+  if (!result.degenerate) task.implementResponse = result.response;
+  return result;
+}
+```
+
+Each call-site becomes:
+
+```js
+const r = await retryImplementOnce(task, { implPrompt, correction, ...sharedOpts });
+```
+
+Benefits:
+Removes ~24 lines of duplicated call-shape, gives a single place to adjust if the maybeLocked contract or retry parameters change, and makes the remaining split-decision tree and correction-text logic easier to scan because the retry noise is gone. No behaviour change; purely mechanical deduplication of an identical call shape.
+
+### AC-211 · Extract amplification-sweep side-effect from reconcile loop
+Strength: Strong
+Files: src/task-log-reconcile.js
+Symbol: reconcile
+Snippet:
+```
+}
+
+function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn, commitCountFn } = {}) {
+  const report = argv.includes('--report');
+  const reclassify = argv.includes('--reclassify');
+  const backfill = argv.includes('--backfill') || reclassify;
+  const dryRun = argv.includes('--dry-run');
+  // 2026-09-08, Grimmethy: root-caused live a false "abandoned -- branch gone, work
+  // lost" verdict on TWO separate, genuinely still-open agent/<id> branches. Both were
+  // real, reviewed, tested work -- confirmed alive on origin the whole time -- but this
+  // routine tick had never fetched, so buildShipContext()'s git for-each-ref only ever
+  // saw whatever refs/remotes/origin/agent/* happened to already be cached locally,
+  // which one sibling apply's own git operations on this SAME shared repoRoot can
+  // perturb between ticks (confirmed: one of the two read correctly as pending-merge on
+  // one tick, then flipped to abandoned 17 minutes later with no merge in between).
+  // `abandoned` is a STABLE_TERMINAL_STAGE -- once wrong, it never self-heals. Fetch is
+  // now unconditional on every tick (still cheap/bounded/best-effort, same as before) so
+  // the routine path is never working from a staler view of origin than a --backfill run
+  // would have used. `--no-fetch` is the explicit opt-out for a sandboxed/offline run
+  // that wants to trust local refs on purpose.
+  const doFetch = !argv.includes('--no-fetch');
+  const doneDir = path.join(pipelineDir, 'queue', 'done');
+  // Under --reclassify, records already closed as `noop` are re-resolved (a FALSE-POSITIVE
+  // dismissal recorded before the `dismissed` stage existed). `abandoned` reopens too, as
+  // of the same 2026-09-08 fix above -- a wrong "work lost" verdict deserves the same
+  // audit-triggered correction path noop already had; re-resolving it now runs against a
+  // freshly-fetched ctx, so a genuinely still-open branch reclassifies correctly instead
+  // of being re-confirmed as lost by the same stale-ref bug that produced it.
+  const allowReopenFrom = reclassify ? new Set(['noop', 'abandoned']) : undefined;
+
+  if (doFetch && repoRoot) {
+    const fetch = fetchFn || (() => execFileSync('git', ['-C', repoRoot, 'fetch', 'origin', '--quiet'], { stdio: 'ignore', timeout: 60000 }));
+    try { fetch(); } catch { /* offline -- use local refs */ }
+  }
+
+  const state = loadState(pipelineDir);
+  const ctx = repoRoot ? buildShipContext(repoRoot) : null;
+
+  if (shipContextLooksBroken(ctx, { repoRoot, commitCountFn })) {
+    console.error(`[task-log-reconcile] onMainIds is empty despite origin/${ctx.mainBranch} having real merge history -- buildShipContext likely failed silently (see task-disposition.js's own maxBuffer fix). Skipping this reconcile pass entirely rather than risk a false merged/abandoned verdict; will retry next tick.`);
+    return { scanned: 0, resolved: 0, merged: 0, 'applied-direct': 0, filed: 0, dismissed: 0, noop: 0, 'pending-merge': 0, abandoned: 0, errors: 0, skippedReason: 'onMainIds-empty' };
+  }
+
+  const summary = { scanned: 0, resolved: 0, merged: 0, 'applied-direct': 0, filed: 0, dismissed: 0, noop: 0, 'pending-merge': 0, abandoned: 0, errors: 0 };
+  const pendingList = [];
+  const abandonedList = [];
+
+  for (const { id, file } of candidateRecords(doneDir, { backfill, state })) {
+    const record = readJson(file);
+    if (record === null) { summary.errors += 1; continue; }
+    summary.scanned += 1;
+
+    // Taken BEFORE resolveDisposition: its rule 7 appends an `apply` event to this record in memory, which would otherwise be mistaken for the tail below.
+    const terminalBefore = lastTerminalStage(record.history);
+    let outcome;
+    try {
+      outcome = resolveDisposition(record, { repoRoot, ctx, allowReopenFrom, pipelineDir });
+    } catch (err) {
+      console.error(`task-log-reconcile: resolve failed for ${id}: ${err.message}`);
+      summary.errors += 1;
+      continue;
+    }
+    if (!outcome) {
+      // Stable states that need no further work: already carries a non-pending terminal
+      // event, OR the record was never applied at all (a blocked / needs-clarification task
+      // that reached done/). Remember either so it is not re-read every tick -- without this
+      // the ~2000 never-applied done records get a full readdir+parse pass forever.
+      const tail = Array.isArray(record.history) && record.history[record.history.length - 1];
+      const closed = tail && STABLE_TERMINAL_STAGES.has(tail.stage);
+      if (closed || !lastAppliedEvent(record.history)) {
+        state.resolvedIds.add(id); state.pendingIds.delete(id);
+      }
+      continue;
+    }
+
+    // Nothing to append or write when the resolved stage already IS the record's current terminal stage: the pending-merge re-check, and (under
+    // --reclassify) a noop record that stays noop because its verdict was inconclusive, not a false positive. Compared against the terminal stage
+    // captured before resolving, so neither an event appended after it nor the resolver's own in-memory `apply` event makes it look changed.
+    const tailUnchanged = terminalBefore === outcome.stage;
+    if (!tailUnchanged && !dryRun) {
+      appendHistoryEvent(record, outcome.stage, outcome.detail);
+      record.terminalDisposition = outcome.stage;
+      if (outcome.stage === 'merged' && !record.mergedAt) {
+        record.mergedAt = new Date().toISOString();
+        record.mergedAtSource = 'task-log-reconcile';
+      }
+      if ((outcome.stage === 'merged' || outcome.stage === 'applied-direct')
+        && (record.source === 'pipeline_self_audit' || record.source === 'pipeline_forensics_fix')) {
+        const req = deriveAmplificationRequestFromFix(record);
+        if (req) {
+          try {
+            runAmplificationSweep({
+              rootCauseSummary: req.rootCauseSummary, query: req.query, excludeFiles: req.excludeFiles,
+              root: repoRoot, pipelineDir, source: record.source, taskId: record.id, stage: 'task-log-reconcile',
+            });
+          } catch (e) { /* best-effort -- never break reconcile over an amplification sweep */ }
+        }
+      }
+      try {
+        fs.writeFileSync(file, JSON.stringify(record, null, 2));
+      } catch (err) {
+        console.error(`task-log-reconcile: write failed for ${id}: ${err.message}`);
+        summary.errors += 1;
+        continue;
+      }
+    }
+
+    if (!tailUnchanged) { summary.resolved += 1; summary[outcome.stage] = (summary[outcome.stage] || 0) + 1; }
+    if (outcome.stage === 'pending-merge') {
+      state.pendingIds.add(id); state.resolvedIds.delete(id);
+      pendingList.push(`${record.id} -- ${outcome.detail}`);
+    } else {
+      state.resolvedIds.add(id); state.pendingIds.delete(id);
+      if (outcome.stage === 'abandoned') abandonedList.push(`${record.id} -- ${outcome.detail}`);
+    }
+  }
+
+  // Re-check `abandoned` (a stable stage that never self-healed): correct the ones whose work is on <main>, restore hub siblings a requeue destroyed.
+  // Bounded and throttled (abandoned-recheck.js); never fatal to the sweep.
+  if (!dryRun && repoRoot && ctx) {
+    try {
+      const rc = require('./abandoned-recheck.js').recheckAbandoned({ pipelineDir, repoRoot, ctx });
+      summary.abandonedRechecked = rc.rechecked;
+      summary.abandonedCorrected = rc.corrected.length;
+      summary.siblingsRestored = rc.restored.length;
+      for (const c of rc.corrected) console.error(`[task-log-reconcile] abandoned-recheck: ${c.id} abandoned -> ${c.to}`);
+      for (const r of rc.restored) console.error(`[task-log-reconcile] shared-branch-restore: ${r.id} re-applying onto ${r.branch} (destroyed by the requeue of ${r.removedBy})`);
+    } catch (e) { console.error(`[task-log-reconcile] abandoned-recheck failed (ignored): ${e.message}`); }
+  }
+
+  if (!dryRun) saveState(pipelineDir, state);
+
+  if (report) {
+    if (pendingList.length) {
+      console.error(`\n[task-log-reconcile] ${pendingList.length} task(s) PENDING MERGE (agent/<id> branch ahead of main):`);
+      for (const l of pendingList) console.error(`  ${l}`);
+    }
+    if (abandonedList.length) {
+      console.error(`\n[task-log-reconcile] ${abandonedList.length} task(s) ABANDONED (applied, branch gone, not on main -- work lost):`);
+      for (const l of abandonedList) console.error(`  ${l}`);
+    }
+    if (!pendingList.length && !abandonedList.length) console.error('[task-log-reconcile] no pending-merge or abandoned tasks this pass.');
+  }
+
+  return summary;
+}
+```
+
+Problem:
+The per-record loop in `reconcile` interleaves a 9-line amplification-sweep block (stage/source guard, request derivation, `runAmplificationSweep` call, catch) directly between the resolve step and the `writeFileSync` step. That side-effect is unrelated to the core write path, makes the loop body hard to scan, and has no independent test surface.
+
+Solution:
+Extract the block into `maybeRunAmplificationSweep(record, outcome, { repoRoot, pipelineDir })`. It early-returns on non-matching stage or source, derives the request, calls `runAmplificationSweep`, and swallows errors. The loop body then reads as a linear resolve → sweep → write → tally sequence.
+
+```diff
+-      if ((outcome.stage === 'merged' || outcome.stage === 'applied-direct')
+-        && (record.source === 'pipeline_self_audit' || record.source === 'pipeline_forensics_fix')) {
+-        const req = deriveAmplificationRequestFromFix(record);
+-        if (req) {
+-          try {
+-            runAmplificationSweep({
+-              rootCauseSummary: req.rootCauseSummary, query: req.query, excludeFiles: req.excludeFiles,
+-              root: repoRoot, pipelineDir, source: record.source, taskId: record.id, stage: 'task-log-reconcile',
+-            });
+-          } catch (e) { /* best-effort */ }
+-        }
+-      }
++      maybeRunAmplificationSweep(record, outcome, { repoRoot, pipelineDir });
+```
+
+New function (append after `reconcile`):
+
+```js
+function maybeRunAmplificationSweep(record, outcome, { repoRoot, pipelineDir }) {
+  if (outcome.stage !== 'merged' && outcome.stage !== 'applied-direct') return;
+  if (record.source !== 'pipeline_self_audit' && record.source !== 'pipeline_forensics_fix') return;
+  const req = deriveAmplificationRequestFromFix(record);
+  if (!req) return;
+  try {
+    runAmplificationSweep({
+      rootCauseSummary: req.rootCauseSummary, query: req.query, excludeFiles: req.excludeFiles,
+      root: repoRoot, pipelineDir, source: record.source, taskId: record.id, stage: 'task-log-reconcile',
+    });
+  } catch { /* best-effort */ }
+}
+```
+
+Benefits:
+The loop body shrinks to a flat resolve → sweep → write → tally sequence. The sweep becomes independently unit-testable (merged + matching source → called; other stage/source → not called) without exercising the full reconcile path. Reviewers can assess the sweep's guard logic and error handling in isolation.
+
+### AC-212 · Extract advisory pre-filter gate from runCritiqueAndRevision
+Strength: Strong
+Files: src/lib/implement-critique.js
+Symbol: runCritiqueAndRevision
+Snippet:
+```
+}
+
+async function runCritiqueAndRevision(task, {
+  maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall,
+}) {
+  // Deliberate 2026-08-25 data-driven skip, NOT dead weight: advisory-prose sources
+  // (observability_review / performance_review et al.) produce short prose verdicts, not
+  // code diffs, and critique was a measurable no-op 90.9%/94.9% of the time across
+  // 1341+453 real runs (12.2 combined hours) while the same verdict already goes through
+  // the full independent majority-vote review immediately after. Full rationale with the
+  // measured data: src/local-draft.js:956-974 (this file's pre-extraction home).
+  if (isAdvisoryProseSource(resolveSourceName(task))) {
+    return;
+  }
+
+  // Advisory pre-critique fact-check on the IMPLEMENT RESPONSE (brain-dump
+  // bd-1788725054994): missingFileCheck (src/draft-file-guard.js -- a pure checkDraft
+  // wrapper) flags file paths the draft names that do not exist in the repo and are not
+  // its own create targets. Merged into task.preFilterFlags so buildCritiquePrompt
+  // surfaces them to the critic as leads. Deliberately NOT a hard block: checkFilePaths
+  // over-matches prose/example paths, which is exactly why review-task.js has always
+  // treated missing-file as a reviewer hint, never an auto-reject. Best-effort -- any
+  // failure leaves task.preFilterFlags untouched and critique proceeds unchanged.
+  try {
+    const cfg = getConfig();
+    const { missing } = require('../draft-file-guard.js').missingFileCheck(
+      task.implementResponse || '',
+      cfg.repoRoot,
+      Array.isArray(cfg.grepAllowedDirs) ? cfg.grepAllowedDirs : [],
+    );
+    if (Array.isArray(missing) && missing.length) {
+      const existing = Array.isArray(task.preFilterFlags) ? task.preFilterFlags : [];
+      const seen = new Set(existing.map((f) => `${f.type} ${f.detail}`));
+      const added = missing
+        .map((p) => ({ type: 'missing-file', detail: p }))
+        .filter((f) => !seen.has(`${f.type} ${f.detail}`));
+      if (added.length) task.preFilterFlags = [...existing, ...added];
+    }
+  } catch (err) {
+    console.warn('[local-draft] pre-critique missing-file check failed (advisory):', (err && err.message) || err);
+  }
+
+  // Advisory find-string uniqueness check (HUB0043): flags edit-mode items whose find
+  // string matches 0 times (would fail at apply time) or >1 times (ambiguous target).
+  // Same best-effort contract as the missing-file check above -- any failure leaves
+  // task.preFilterFlags untouched and critique proceeds unchanged.
+  try {
+    const findFlags = checkFindStrings(task.implementResponse || '', getConfig().repoRoot);
+    if (findFlags.length) {
+      const existing = Array.isArray(task.preFilterFlags) ? task.preFilterFlags : [];
+      const seen = new Set(existing.map((f) => `${f.type} ${f.detail}`));
+      const added = findFlags.filter((f) => !seen.has(`${f.type} ${f.detail}`));
+      if (added.length) task.preFilterFlags = [...existing, ...added];
+    }
+  } catch (err) {
+    console.warn('[local-draft] pre-critique find-string check failed (advisory):', (err && err.message) || err);
+  }
+
+  // Test-framework gate (lib/test-framework.js, 2026-10-08): a test file this change CREATES must be written for a framework its package can run. Three
+  // TaxHarvest drafts created jest / @testing-library tests in packages that have neither (the frontend has no runner at all); each was dead code that only a
+  // hand check caught. Deterministic and precise, so unlike the advisory pre-filters above it blocks the draft BEFORE the critique call, with the exact
+  // fix in the feedback the redraft sees. The same files blocked twice in a row downgrade to an advisory, so a false positive can never strand a task.
+  // AGENT_MANAGER_TEST_FRAMEWORK_GATE=block|advisory|off.
+  try {
+    const tfw = require('./test-framework.js');
+    const mode = tfw.gateMode();
+    if (mode !== 'off') {
+      let items = null;
+      try { items = parseJsonMaybeFenced(task.implementResponse || ''); } catch { items = null; }
+      if (items && !Array.isArray(items)) items = [items];
+      const { files, packageText } = tfw.inspectChangeSet(items || []);
+      const tfFlags = files.length ? tfw.checkNewTestFiles({ repoRoot: getConfig().repoRoot, files, packageText }) : [];
+      if (tfFlags.length) {
+        const names = tfFlags.map((f) => f.file).sort();
+        const repeat = Array.isArray(task.testFrameworkBlocked) && task.testFrameworkBlocked.join('|') === names.join('|');
+        const feedback = tfw.feedbackFor(tfFlags);
+        if (mode === 'advisory' || repeat) {
+          appendHistoryEvent(task, 'advisory', `test-framework gate (${repeat ? 'same files blocked before, not blocking again' : 'advisory mode'}): ${feedback}`.slice(0, 600));
+          delete task.testFrameworkBlocked;
+        } else {
+          const blockedReason = `Test framework not usable: ${feedback}`.slice(0, 700);
+          task.testFrameworkBlocked = names;
+          task.critiqueOutcome = 'test-framework-failed';
+          task.blockedStage = 'review';
+          task.blockedReason = blockedReason;
+          task.priorRejectionFeedback = [...(Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : []), blockedReason];
+          recordCritique(attempt, { outcome: 'test-framework-failed' });
+          appendHistoryEvent(task, 'critique-done', blockedReason);
+          return;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[local-draft] test-framework gate failed (advisory):', (err && err.message) || err);
+  }
+
+  const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
+  let startedAt = new Date().toISOString();
+  let startMs = Date.now();
+  const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: critiquePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 900, source: task.source, taskId: task.id, stage: 'critique' }), 'critique');
+  // Records the critique (and, when triggered, revise) call into model-stats.db -- see
+  // runPlanPass's own identical comment for the full incident this closes (2026-09-06,
+  // Grimmethy: "We need to fix cost tracking before we can even begin to properly work
+  // on this problem").
+  if (recordModelCall) {
+    recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: critiqueResult, source: task.source, stage: 'critique' });
+  }
+
+  // Gate critique-done on a grounding check: for sources whose drafts cite REAL code
+  // (deep_dive, or any registered source with its own postImplementCheck), an ungrounded
+  // draft must not reach the review queue -- block it right here, before any revise call
+  // or degenerate/no-issues assignment. Advisory: a throwing check never blocks a real
+  // draft (same contract as the postImplementCheck disposition in runImplementPass).
+  {
+    const src = resolveSourceName(task);
+    const regEntry = getRegisteredSource(src);
+    const realFiles = (task.promptContext && Array.isArray(task.promptContext.files))
+      ? task.promptContext.files.filter((f) => f && typeof f.content === 'string')
+      : [];
+    if (realFiles.length > 0 && (src === 'deep_dive' || (regEntry && typeof regEntry.postImplementCheck === 'function'))) {
+      let groundingVerdict = null;
+      try {
+        groundingVerdict = await require('../deep-dive-grounding-check.js').runGroundingCheck(task, task.implementResponse, { call: resolvedLocalCall });
+      } catch (e) {
+        console.warn('[local-draft] grounding check failed (advisory):', (e && e.message) || e);
+      }
+      // The generic check below was written for deep_dive write-ups. On the arch candidate
+      // generators (candidateDocFormat: arch_discovery/arch_import) it hard-blocked real drafts:
+      // it greps backticked filenames (`legalContent.tsx` -- TS imports omit the extension, so
+      // ".tsx" never appears in any file's content) and proposed class-shaped names against the
+      // fetched content (2026-09-19, PF arch-discovery-community-1). Same decision as their own
+      // postImplementCheck symbol check: warn (task.groundingWarnings -> the review votes), don't
+      // block. AGENT_MANAGER_SYMBOL_CHECK_BLOCKING=true restores the block.
+      if (groundingVerdict && groundingVerdict.verdict === 'ungrounded'
+          && regEntry && regEntry.candidateDocFormat && !symbolCheckBlocks()) {
+        const warning = `critique-time grounding check could not verify: ${String(groundingVerdict.reason || '(no detail)').slice(0, 250)}`;
+        task.groundingWarnings = [...(Array.isArray(task.groundingWarnings) ? task.groundingWarnings : []), warning].slice(0, 10);
+        appendHistoryEvent(task, 'grounding-warning', warning.slice(0, 300));
+      } else if (groundingVerdict && groundingVerdict.verdict === 'ungrounded') {
+        const blockedReason = `Ungrounded draft: ${String(groundingVerdict.reason || '(no detail)')}`.slice(0, 500);
+        task.critiqueOutcome = 'grounding-failed';
+        task.blockedStage = 'review';
+        task.blockedReason = blockedReason;
+        // Stochastic harness gate, not a genuine reviewer rejection -- see local-draft.js's
+        // sibling postImplementCheck gate for the full reasoning; this is its other real
+        // site (moved here from local-draft.js by the #226 decompose).
+        task.reviewInconclusive = true;
+        task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+        task.priorRejectionFeedback.push(blockedReason);
+        recordCritique(attempt, { outcome: 'grounding-failed' });
+        appendHistoryEvent(task, 'critique-done', blockedReason);
+        return;
+      }
+    }
+  }
+
+  // task.critiqueOutcome is a STRING enum, NOT an object: it has no `.facts` property.
+  // The only values it ever holds are the four outcome literals assigned just below
+  // ('no-issues' | 'grounding-failed' | 'critique-degenerate' | 'issues-flagged').
+  // Structured findings live in a SEPARATE field -- task.preFilterFlags (an
+  // Array<{ type: string, detail: string }>, populated by the pre-filter fact-check
+  // and the missingFileCheck advisory above) -- NOT on critiqueOutcome itself.
+  /** @type {'no-issues'|'grounding-failed'|'critique-degenerate'|'issues-flagged'} */
+  if (critiqueResult.degenerate) {
+    task.critiqueOutcome = 'critique-degenerate';
+    // 2026-09 (degenerate-as-skip): a degenerate critique response is a FAILURE of the
+    // critic call, not a completed critique pass -- falling through to the shared
+    // recordCritique() / 'critique-done' tail made it look like a pass signal downstream.
+    // Mirror the advisory-prose early-return above: mark the outcome, log the skip, and
+    // stop before the shared recordCritique / 'critique-done' tail.
+    //
+    // 2026-09-16 (degenerate-as-block, supersedes skip): skipping only stopped the
+    // pass SIGNAL -- the draft still flowed on to the review vote un-critiqued, i.e. a
+    // rubber-stamp (the flagged COMPLETED 5/6/8/11/12/14/20/22 cohort). So like the
+    // grounding-failed branch above, this stamps blockedStage/blockedReason (which
+    // local-draft.js's post-critique `if (task.blockedStage)` disposal turns into
+    // `{ succeeded: true, blocked: true }` BEFORE concludeDraft, so it never reaches
+    // the review queue) and files the recurring "degenerate draft" failure class via
+    // ghost-debt.js -- deduped by failure signature on the concept timeline instead of
+    // silently shipping. fileGhostDebt is best-effort and never throws (see its header:
+    // a telemetry write must never break a draft), so it is safe to call inline.
+    task.blockedStage = 'critique';
+    task.blockedReason = `Critique call degenerate (${String(critiqueResult.degenerate || 'unspecified')}) -- the draft never received a real critique pass; blocking rather than rubber-stamping it into review`.slice(0, 500);
+    appendHistoryEvent(task, 'critique-skipped', 'degenerate model response -- not a pass signal');
+    appendHistoryEvent(task, 'blocked', task.blockedReason);
+    try {
+      const { pipelineDir } = getConfig();
+      if (pipelineDir) {
+        fileGhostDebt({ task, reasonText: task.blockedReason, site: 'implement-critique:critique-degenerate', pipelineDir });
+      }
+    } catch { /* best-effort -- a ghost-debt filing must never break the draft block path */ }
+    return;
+  }
+  if (critiqueResult.response.trim() === 'NO ISSUES FOUND') {
+    task.critiqueOutcome = 'no-issues';
+  } else {
+    task.critiqueOutcome = 'issues-flagged';
+    // 2026-08-24 (pipeline hardening): only the OUTCOME enum used to survive past this
+    // function -- the actual critique text was discarded the moment the revision call
+    // finished, so review-task.js's buildVerdictPrompt had no way to show a reviewer
+    // what the critique actually found, even when a revision WAS applied and the
+    // reviewer might want to verify it really addressed those specific points.
+// ... [truncated for review: this function continues for 25 more line(s) not shown]
+```
+
+Problem:
+runCritiqueAndRevision (225 lines) inlines the missing-file and find-string advisory checks directly in the main body. These checks mutate task.preFilterFlags, carry their own try/catch handling, and are logically independent of the test-framework and grounding gates that follow. Because they share the same function scope, adding or reordering a pre-filter requires editing the middle of a 225-line body with no clear insertion point.
+
+Solution:
+Extract the two advisory checks into a single helper that mutates task.preFilterFlags in place. The main function calls it as the first step after the advisory-prose-source early return.
+
+```diff
++function runAdvisoryPreFilters(task) {
++  try {
++    const cfg = getConfig();
++    const { missing } = require('../draft-file-guard.js').missingFileCheck(
++      task.implementResponse || '', cfg.repoRoot,
++      Array.isArray(cfg.grepAllowedDirs) ? cfg.grepAllowedDirs : []);
++    if (Array.isArray(missing) && missing.length) {
++      const ex = Array.isArray(task.preFilterFlags) ? task.preFilterFlags : [];
++      const seen = new Set(ex.map((f) => `${f.type} ${f.detail}`));
++      const added = missing.map((p) => ({ type: 'missing-file', detail: p }))
++        .filter((f) => !seen.has(`${f.type} ${f.detail}`));
++      if (added.length) task.preFilterFlags = [...ex, ...added];
++    }
++  } catch (err) {
++    console.warn('[local-draft] missing-file check failed:', (err && err.message) || err);
++  }
++  try {
++    const ff = checkFindStrings(task.implementResponse || '', getConfig().repoRoot);
++    if (ff.length) {
++      const ex = Array.isArray(task.preFilterFlags) ? task.preFilterFlags : [];
++      const seen = new Set(ex.map((f) => `${f.type} ${f.detail}`));
++      const added = ff.filter((f) => !seen.has(`${f.type} ${f.detail}`));
++      if (added.length) task.preFilterFlags = [...ex, ...added];
++    }
++  } catch (err) {
++    console.warn('[local-draft] find-string check failed:', (err && err.message) || err);
++  }
++}
++
+  // in runCritiqueAndRevision, replace the inline block with:
++runAdvisoryPreFilters(task);
+```
+
+Benefits:
+The main function loses ~30 lines of inline validation. The helper is independently unit-testable (pass a mock task, assert preFilterFlags). Adding a third pre-filter is a one-line insertion inside the helper rather than a mid-function edit. No behavior change; purely structural.
+
+### AC-213 · Extract response-marker post-processing from call() retry loop
+Strength: Strong
+Files: src/local-client.js
+Symbol: call
+Snippet:
+```
+  return maxRetries + 1;
+}
+
+async function call(opts, maxRetries = 2) {
+  let lastDegenerate = null;
+  let lastError = null;
+  let gotAnyResponse = false;
+  let callOpts = opts;
+  let responses = 0;
+  let hardFailures = 0;
+  const maxHardFailures = hardFailureAllowance(maxRetries);
+  for (let attempt = 0; responses <= maxRetries && hardFailures < maxHardFailures; attempt++) {
+    let result;
+    try {
+      result = await callOnce(callOpts);
+    } catch (e) {
+      if (gpuGuard.isForgePause(e)) throw e;   // not a failure: no retry, no hard-failure audit (the lease is still held on every attempt)
+      lastError = e;
+      hardFailures += 1;
+      logHardFailureAudit({
+        source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
+        model: opts.model || MODEL, code: e.code || null, message: String(e.message || e).slice(0, 300),
+        timeoutMs: e.timeoutMs, statusCode: e.statusCode, nodeCode: e.nodeCode, think: callOpts.think,
+      });
+      continue;
+    }
+    gotAnyResponse = true;
+    responses += 1;
+    // Extract any SIDE-FINDING: block(s) BEFORE degenerate-detection judges the response,
+    // so a response that's otherwise degenerate/empty except for a stray finding isn't
+    // misjudged either way, and so the caller's own downstream RESOLUTION:/JSON parsing
+    // never sees the raw marker text.
+    if (opts.allowSideFindings !== false && result.response && result.response.includes('SIDE-FINDING:')) {
+      const { cleanText, findings } = extractSideFindings(result.response);
+      result = { ...result, response: cleanText };
+      if (findings.length) {
+        const pipelineDir = resolvePipelineDir();
+        for (const finding of findings) {
+          writeSideFindingInbox(finding, { source: opts.source, taskId: opts.taskId, stage: opts.stage, pipelineDir });
+        }
+      }
+    }
+    if (opts.allowAmplification && result.response && result.response.includes('AMPLIFY:')) {
+      const { cleanText, requests } = extractAmplificationRequests(result.response);
+      result = { ...result, response: cleanText };
+      if (requests.length) {
+        const pipelineDir = resolvePipelineDir();
+        for (const req of requests) {
+          runAmplificationSweep({
+            rootCauseSummary: req.rootCauseSummary, query: req.query, dir: req.dir,
+            excludeFiles: req.exclude, pipelineDir, source: opts.source, taskId: opts.taskId,
+          });
+        }
+      }
+    }
+    if (opts.conceptId && result.response && result.response.includes('CONCEPT-BUILD:')) {
+      const { cleanText, report } = extractConceptBuildReport(result.response);
+      result = { ...result, response: cleanText };
+      if (report) {
+        recordConceptBuildTally(resolvePipelineDir(), opts.conceptId, report.kind);
+      }
+    }
+    const degenerate = detectDegenerate(result.response, { allowEmpty: opts.allowEmpty, doneReason: result.done_reason, isDraft: opts.isDraft });
+    if (!degenerate) return { ...result, degenerate: null, attempts: attempt + 1 };
+    lastDegenerate = degenerate;
+    // Logged for THIS attempt, not just once the whole call gives up -- so a later
+    // investigation can see the retry PATTERN (e.g. all 3 attempts hit numPredict
+    // identically vs. attempt 1 empty then 2-3 truncated), not just the final verdict
+    // task.blockedReason alone preserves today.
+    logDegenerateAudit({
+      source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
+      model: opts.model || MODEL, numPredict: callOpts.numPredict, doneReason: result.done_reason,
+      degenerate, promptEvalCount: result.prompt_eval_count, evalCount: result.eval_count,
+      // Whether THIS attempt asked for reasoning: the think-off retry below could not be verified from the log before (2026-10-16: 3090 attempts 2
+      // and 3 still hit their ceiling with evalCount == numPredict and nothing recorded about think).
+      think: callOpts.think,
+    });
+    if (degenerate === 'truncated' && callOpts.numPredict) {
+      const escalated = Math.min(
+        Math.round(callOpts.numPredict * TRUNCATION_RETRY_MULTIPLIER),
+        TRUNCATION_RETRY_NUM_PREDICT_CEILING,
+      );
+      if (escalated > callOpts.numPredict) callOpts = { ...callOpts, numPredict: escalated };
+      // 2026-09-14, root-caused against a real blocked backlog (21 tasks, every one
+      // truncated with ZERO visible characters -- confirmed via model_calls: eval_count
+      // present, response empty): doneReason:'length' with no real content at all means
+      // <think> reasoning ate the WHOLE budget before any visible answer, not that a
+      // real answer got cut short partway. Escalating numPredict alone doesn't
+      // reliably fix this -- observability-fix-ac-37's own history shows numPredict
+      // already escalated 1400 -> 2800 -> 5600 across 3 attempts and STILL came back
+      // truncated at 0 chars, because a runaway reasoning chain just keeps consuming
+      // whatever budget it's given rather than converging. Mirrors the ALREADY-PROVEN
+      // implNoThink pattern (local-draft.js's computeImplementBudget: think disabled
+      // outright for pipeline_forensics/pipeline_debrief, sources where reasoning was
+      // found not to help) -- but scoped precisely to the confirmed failure signature
+      // (truncated + zero real content) rather than a blanket per-source list, so it
+      // only touches the exact case that needs it and never a partial-but-real
+      // truncation that might still be benefiting from the reasoning already spent.
+      if (callOpts.think && !(result.response || '').trim()) {
+        callOpts = { ...callOpts, think: false };
+      }
+    }
+  }
+  // Only propagate the hard error if NO attempt ever got a real response, degenerate or
+  // not -- a degenerate response on an earlier attempt followed by a hard failure on a
+  // later retry is still a real, legitimate degenerate outcome, not an infra failure.
+  if (!gotAnyResponse && lastError) throw lastError;
+  return { response: '', thinking: '', degenerate: lastDegenerate, attempts: responses + hardFailures };
+```
+
+Problem:
+The call() retry loop inlines three near-identical marker blocks (SIDE-FINDING, AMPLIFY, CONCEPT-BUILD), each roughly ten lines of check-extract-clean-dispatch. They are independent of retry state, duplicate the same shape, and force any unit test to drive the full retry path just to exercise one marker.
+
+Solution:
+Extract the three blocks into a single `processResponseMarkers(result, opts)` helper that checks each marker, cleans the response text, and fires the side-effect, then call it once in the loop body.
+
+```diff
+--- a/src/local-client.js
++++ b/src/local-client.js
+@@ call() loop body @@
+     gotAnyResponse = true;
+     responses += 1;
+-    if (opts.allowSideFindings !== false && result.response.includes('SIDE-FINDING:')) {
+-      const { cleanText, findings } = extractSideFindings(result.response);
+-      result = { ...result, response: cleanText };
+-      if (findings.length) { /* writeSideFindingInbox per finding */ }
+-    }
+-    if (opts.allowAmplification && result.response.includes('AMPLIFY:')) {
+-      const { cleanText, requests } = extractAmplificationRequests(result.response);
+-      result = { ...result, response: cleanText };
+-      if (requests.length) { /* runAmplificationSweep per request */ }
+-    }
+-    if (opts.conceptId && result.response.includes('CONCEPT-BUILD:')) {
+-      const { cleanText, report } = extractConceptBuildReport(result.response);
+-      result = { ...result, response: cleanText };
+-      if (report) recordConceptBuildTally(resolvePipelineDir(), opts.conceptId, report.kind);
+-    }
++    result = processResponseMarkers(result, opts);
+     const degenerate = detectDegenerate(result.response, { … });
+```
+
+Benefits:
+The loop body shrinks by roughly thirty lines. Because the helper takes `(result, opts)` and returns `result`, a node:test case can feed a synthetic response containing an `AMPLIFY:` marker and assert the sweep fired without entering the retry loop, and reviewers see one call site instead of three copy-pasted blocks.
+
+### AC-214 · Extract phase functions from verifyDiff
+Strength: Strong
+Files: src/review-verify.js
+Symbol: verifyDiff
+Snippet:
+```
+}
+
+function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, checkUnpinned = false, pipelineDir = null, checkReplay = false, deps = {} }) {
+  const d = {
+    prepare: prepareAdhocWorktree, applyDiff: applyPartialDiff, unapplyDiff: unapplyPartialDiff, cleanup: cleanupAdhocWorktree, run: runSandboxed,
+    relink: relinkExternalDependencies, provision: copyPackageNodeModules, resolvePy: resolvePython, findTests: findTestsWithSymbolFallback, replay: (args) => require('./gate-replay.js').replayGates(args), ...deps,
+  };
+  const result = { status: 'inconclusive', reasons: [], apply: null, tests: null, commands: [] };
+  const inconclusive = (reason) => { result.reasons.push(reason); return result; };
+  if (!String(rawDiff || '').trim()) return inconclusive('no diff to verify');
+  const { worktreeDir, branchName } = worktreePaths(taskId);
+  const deadline = Date.now() + budgetMs;
+  const py = d.resolvePy({ explicit: pythonBin, repoRoot });
+  let prepared = false;
+  try {
+    const prep = d.prepare(repoRoot, mainBranch, worktreeDir, branchName);
+    prepared = true;
+    if (!prep || !prep.ok) return inconclusive(`could not create a scratch worktree: ${(prep && prep.reason) || 'unknown'}`);
+    d.relink(repoRoot, worktreeDir);
+    const applied = d.applyDiff(worktreeDir, rawDiff);
+    result.apply = { applied: !!applied.applied, reason: applied.reason || null };
+    if (!applied.applied) return inconclusive(`the diff does not apply to ${mainBranch} (often a slice that depends on an unmerged earlier one): ${applied.reason || 'unknown'}`);
+
+    // 0. Do the changed files still parse? Decided before any test is spent on them.
+    const syn = checkChangedFilesSyntax({ worktreeDir, files: extractChangedFiles(rawDiff), rawDiff, run: d.syntaxRun || d.run, py, repoRoot, d, deadline });
+    result.syntax = { checked: syn.checked, skipped: syn.skipped, failed: syn.failed.map((f) => f.file), preexisting: syn.preexisting.map((f) => f.file) };
+    if (syn.restoreFailed) return inconclusive('the diff could not be re-applied after the syntax base check, so nothing further was run');
+    if (syn.unattributable.length) return inconclusive(`a changed file does not parse with the diff, but the diff could not be un-applied to tell whether the base already failed: ${syn.unattributable.map((f) => f.error).join('; ')}`);
+    if (syn.failed.length) {
+      result.status = 'failed';
+      result.reasons.push(...syn.failed.map((f) => `syntax error in a file the diff changes -- ${f.error} (the base version parses; fix the syntax before anything else)`));
+      return result;
+    }
+
+    let anyTimeout = false;
+    let sandboxMissing = false;
+    const notRunReasons = new Set();
+    let anyExecuted = false;
+    const failures = [];
+    const failedSuites = [];       // suites that failed WITH the diff, pending attribution against the base
+    const contradictedCmds = [];   // claimed-PASS commands that exited non-zero WITH the diff, pending attribution
+    const runOne = (bin, args, timeoutMs, { tolerateTimeout = false, cwd } = {}) => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 1000) { if (!tolerateTimeout) anyTimeout = true; return { ran: true, timedOut: true, exitCode: null, output: '' }; }
+      const r = d.run({ worktreeDir, bin, args, timeoutMs: Math.min(timeoutMs, remaining), pythonBin: py, mainRepoRoot: repoRoot, ...(cwd ? { cwd } : {}) });
+      if (!r.ran) { sandboxMissing = true; notRunReasons.add(r.reason || 'bwrap sandbox unavailable'); return r; }
+      anyExecuted = true;
+      if (r.timedOut && !tolerateTimeout) anyTimeout = true;
+      return r;
+    };
+
+    // 1. The tests that cover the changed files.
+    const changed = extractChangedFiles(rawDiff);
+    const found = d.findTests(worktreeDir, changed, rawDiff);
+    const tiers = splitCoveringTiers(changed, found);
+    const affected = tiers.primary;
+    const suites = [];
+    const depSuites = [];
+    const jsArgs = (files) => ['--test', ...files];
+    const pyArgs = (files) => ['-m', 'unittest', ...files.map((f) => f.replace(/\.py$/, '').replace(/\//g, '.'))];
+    // JS test files go to the runner their own package uses (lib/js-test-runner.js): node:test for plain .js, vitest for a package that declares it (.tsx!), and a
+    // stated 'no runner' skip otherwise -- node cannot execute a .tsx, so running it anyway only ever produced a spurious failure.
+    const jsPlan = partitionJsTests(worktreeDir, affected.js);
+    const depJsPlan = partitionJsTests(worktreeDir, tiers.dependents.js);
+    const vitestSuite = (pkgRel, files) => ({ label: 'vitest', bin: 'node', cwd: pkgRel || undefined, pkgRel, buildArgs: (fs2) => vitestArgs(pkgRel, fs2), files, parse: parseVitestFailures });
+    const noRunner = [...jsPlan.none, ...depJsPlan.none];
+    if (noRunner.length) { result.noRunner = noRunner.map((x) => ({ file: x.file, reason: x.reason })).slice(0, 12); }
+    if (jsPlan.nodeTest.length) suites.push({ label: 'js', bin: 'node', buildArgs: jsArgs, files: jsPlan.nodeTest, parse: parseNodeTestFailures });
+    for (const [pkgRel, files] of jsPlan.vitest) suites.push(vitestSuite(pkgRel, files));
+    if (affected.py.length) suites.push({ label: 'py', bin: 'python', buildArgs: pyArgs, files: affected.py, parse: parsePyTestFailures });
+    if (depJsPlan.nodeTest.length) depSuites.push({ label: 'js', bin: 'node', buildArgs: jsArgs, files: depJsPlan.nodeTest, parse: parseNodeTestFailures });
+    for (const [pkgRel, files] of depJsPlan.vitest) depSuites.push(vitestSuite(pkgRel, files));
+    if (tiers.dependents.py.length) depSuites.push({ label: 'py', bin: 'python', buildArgs: pyArgs, files: tiers.dependents.py, parse: parsePyTestFailures });
+    // A vitest suite needs its package's node_modules inside the sandbox worktree (copied on demand, size-capped). If it cannot be provided the files are
+    // reported as 'no runner' with the reason -- never as a failure of the diff.
+    const provisioned = new Map();
+    const ready = (s) => {
+      if (s.label !== 'vitest') return true;
+      if (!provisioned.has(s.pkgRel)) { let r; try { r = d.provision(repoRoot, worktreeDir, s.pkgRel); } catch (e) { r = { copied: false, reason: String((e && e.message) || e) }; } provisioned.set(s.pkgRel, r); }
+      const r = provisioned.get(s.pkgRel);
+      if (!r.copied) { result.noRunner = [...(result.noRunner || []), ...s.files.map((f) => ({ file: f, reason: `vitest cannot run: ${r.reason}` }))].slice(0, 12); return false; }
+      return true;
+    };
+    for (let i = suites.length - 1; i >= 0; i -= 1) if (!ready(suites[i])) suites.splice(i, 1);
+    for (let i = depSuites.length - 1; i >= 0; i -= 1) if (!ready(depSuites[i])) depSuites.splice(i, 1);
+    if (suites.length) {
+      result.tests = { ran: [], passed: true, failures: [], timedOut: false };
+      // 2026-10-08: every covering file runs in its OWN process (cheapest first) instead of one `node --test a b c d`. TaxHarvest-style incident: the four
+      // files covering the test-framework gate included src/local-draft.test.js, which alone takes ~9 minutes; in one process its timeout discarded the
+      // three fast files' passes too, and the reviewers rejected on "unverified". Now a slow file leaves only ITSELF unverified. For a file the diff adds
+      // named tests to, those tests run FIRST (seconds) and are recorded as partial evidence, so even a file that cannot finish whole says what ran.
+      const sizeOf = (f) => { try { return fs.statSync(path.join(worktreeDir, f)).size; } catch { return 0; } };
+      for (const s of suites) {
+        for (const file of [...s.files].sort((a, b) => sizeOf(a) - sizeOf(b))) {
+          const one = { ...s, files: [file] };
+          const added = (s.label === 'js' || s.label === 'vitest') ? addedTestNames(rawDiff, file) : [];
+          if (added.length) {
+            const pattern = added.map(escapeRegex).join('|');
+            // vitest: -t is its name filter; --passWithNoTests keeps the control run on the base (where the added tests do not exist) at exit 0, like node's.
+            const narrowed = s.label === 'vitest'
+              ? { ...s, files: [file], buildArgs: (files) => [...vitestArgs(s.pkgRel, files), '-t', pattern, '--passWithNoTests'] }
+              : { ...s, files: [file], buildArgs: (files) => ['--test', '--test-name-pattern', pattern, ...files] };
+            const n = runOne(s.bin, narrowed.buildArgs([file]), TEST_TIMEOUT_MS, { tolerateTimeout: true, cwd: s.cwd });
+            if (n.ran && !n.timedOut) {
+              (result.tests.partial = result.tests.partial || []).push({ file, tests: added.slice(0, 12), count: added.length, passed: n.exitCode === 0 });
+              if (n.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s: narrowed, names: s.parse(n.output), raw: n.output, missing: n.missingModules || [] }); }
+            }
+          }
+          const r = runOne(s.bin, one.buildArgs(one.files), TEST_TIMEOUT_MS, { cwd: s.cwd });
+          if (!r.ran) { result.tests = null; break; }
+          result.tests.ran.push(file);
+          if (r.timedOut) { result.tests.timedOut = true; if (result.tests.passed !== false) result.tests.passed = null; (result.tests.timedOutFiles = result.tests.timedOutFiles || []).push(file); continue; }
+          if (r.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s: one, names: s.parse(r.output), raw: r.output, missing: r.missingModules || [] }); }
+        }
+        if (!result.tests) break;
+      }
+      // Files that ran to completion and passed (the evidence the reviewers can lean on even when another file could not finish).
+      if (result.tests) {
+        const bad = new Set([...(result.tests.timedOutFiles || []), ...failedSuites.map((f) => f.s.files[0])]);
+        result.tests.passedFiles = result.tests.ran.filter((f) => !bad.has(f));
+      }
+    }
+
+    // 2. Re-run the commands the draft claims PASS on.
+    for (const ar of (acceptanceResults || []).slice(0, MAX_COMMANDS)) {
+      const cmds = extractRunnableCommands(ar.check);
+      for (const c of cmds) {
+        // A claimed command is re-run from the repo root. If its target does not exist there EVEN WITH the diff applied, the draft ran it from somewhere else
+        // (e.g. `python3 -m unittest test_x` from python/dashboard/) and the exit code from here says nothing about the diff -- confirmed live 2026-09-30, HUB0068-02's
+        // redraft. Skip it: neither a confirmation nor a contradiction.
+        const missing = commandTargets(c).filter((t) => !fs.existsSync(path.join(worktreeDir, t)));
+        if (missing.length) {
+          result.commands.push({ criterion: ar.criterion, command: c.text, claimedPass: !!ar.pass, outcome: 'skipped', detail: `target not found from the repo root even with the diff applied (${missing.join(', ')}); the draft probably ran it from another directory` });
+          continue;
+        }
+        const r = runOne(c.bin, c.args, COMMAND_TIMEOUT_MS);
+        if (!r.ran) { result.commands.push({ criterion: ar.criterion, command: c.text, claimedPass: !!ar.pass, outcome: 'skipped', detail: r.reason }); continue; }
+        let outcome;
+        if (r.timedOut) outcome = 'inconclusive';
+        else if (r.exitCode === 0) outcome = 'confirmed';
+        else outcome = ar.pass ? 'contradicted' : 'confirmed-fail';
+        const entry = { criterion: ar.criterion, command: c.text, claimedPass: !!ar.pass, outcome, exitCode: r.exitCode, detail: outcome === 'contradicted' ? r.output.slice(-800) : '' };
+        result.commands.push(entry);
+        if (outcome === 'contradicted') contradictedCmds.push({ entry, c });
+      }
+    }
+
+    // 2a. Dependent tier: tests that only import a changed module. Run with whatever budget is left; a timeout or exhausted budget is
+    // reported (result.tests.dependentsUnverified), never a reason for inconclusive. A real failure goes through the same base attribution.
+    if (result.tests && depSuites.length) {
+      for (const s of depSuites) {
+        const r = runOne(s.bin, s.buildArgs(s.files), TEST_TIMEOUT_MS, { tolerateTimeout: true, cwd: s.cwd });
+        if (!r.ran) continue;
+        result.tests.dependents = [...(result.tests.dependents || []), ...s.files];
+        if (r.timedOut) { result.tests.dependentsUnverified = [...(result.tests.dependentsUnverified || []), ...s.files]; continue; }
+        if (r.exitCode !== 0) failedSuites.push({ s, dependent: true, names: s.parse(r.output), raw: r.output, missing: r.missingModules || [] });   // result.tests.passed is only touched once the failure is attributed to the diff
+      }
+    }
+
+    // 2b. Gate replay (src/gate-replay.js, brain dump 7/8): while the diff is still applied (step 3 reverses it), replay any gate/guard/detector the diff adds or changes
+    // over tasks that already ran. Advisory data on the result; it never changes the status, and any failure here is swallowed.
+    if (checkReplay && pipelineDir && deadline - Date.now() > REPLAY_MIN_REMAINING_MS) {
+      try {
+        result.replay = d.replay({
+          rawDiff, worktreeDir, pipelineDir, mainBranch,
+          run: (a) => d.run({ ...a, pythonBin: py, mainRepoRoot: repoRoot, timeoutMs: Math.min(a.timeoutMs || REPLAY_TIMEOUT_MS, Math.max(1000, deadline - Date.now())) }),
+        });
+      } catch { /* advisory */ }
+    }
+
+    // 3. Differential check: a failure only counts against the diff if the SAME check passes on the base. Tests that already fail on the base inside
+    // this sandbox (a throwaway HOME with no ~/.local/state/..., no network, ...) say nothing about the diff -- confirmed live 2026-09-30, HUB0068-02: a
+    // good draft was blocked because python/dashboard/test_start_pipeline_apply_root.py fails on the untouched base in the review sandbox. The diff is
+    // reversed in this throwaway worktree and each failing check re-run; anything that also fails on the base is reported inconclusive, never a block.
+    const unattributable = [];
+    // A dependent-tier failure that cannot be pinned on the diff (it also fails on the base in this sandbox, cannot run, or cannot be re-checked)
+    // is reported unverified; only a primary-tier one makes the whole result inconclusive.
+    const unverifiedOrUnattributable = (f, msg) => {
+      if (!f.dependent) { unattributable.push(msg); return; }
+      const have = (result.tests && result.tests.dependentsUnverified) || [];
+      result.tests.dependentsUnverified = [...have, ...f.s.files.filter((x) => !have.includes(x))];
+    };
+    if (failedSuites.length || contradictedCmds.length) {
+      const back = d.unapplyDiff(worktreeDir, rawDiff);
+      if (!back || !back.applied) {
+        for (const f of failedSuites) unverifiedOrUnattributable(f, `covering ${f.s.label} tests failed, but the diff could not be reversed to check them against the base`);
+        for (const x of contradictedCmds) { x.entry.outcome = 'inconclusive'; unattributable.push(`\`${x.c.text}\` failed, but the diff could not be reversed to check it against the base`); }
+        if (result.tests && failedSuites.some((f) => !f.dependent)) result.tests.passed = null;
+      } else {
+        for (const f of failedSuites) {
+          const unresolved = f.s.label === 'js' ? sandboxUnresolvedDependency(f.missing, repoRoot) : null;
+          if (unresolved) {
+            unverifiedOrUnattributable(f, `covering ${f.s.label} tests (${f.s.files.join(', ')}) could not run: sandbox cannot resolve ${unresolved} (present on the host, missing in the review sandbox), so the failure says nothing about the diff`);
+            continue;
+          }
+          const baseFiles = f.s.files.filter((file) => fs.existsSync(path.join(worktreeDir, file)));
+          let attributable = f.names;
+          let baseTimedOut = false;
+          let allPreexisting = false;
+          if (baseFiles.length) {
+            const b = runOne(f.s.bin, f.s.buildArgs(baseFiles), TEST_TIMEOUT_MS, { tolerateTimeout: !!f.dependent, cwd: f.s.cwd });
+            if (b.ran && b.timedOut) baseTimedOut = true;
+// ... [truncated for review: this function continues for 67 more line(s) not shown]
+```
+
+Problem:
+verifyDiff spans 267 lines and interleaves six phases (worktree apply, syntax gate, suite construction, per-file execution, command re-verification, differential attribution) that share seven mutable variables and a deadline clock. No phase is unit-testable without mocking every d.* call across the full body.
+
+Solution:
+Extract the suite-construction block (extractChangedFiles → splitCoveringTiers → partitionJsTests → building suites/depSuites → d.provision loop) and the nested execution loop (for s of suites, per-file addedTestNames/escapeRegex, sizeOf sort) into named functions returning small result objects. The orchestrator merges them into result.
+
+```diff
+-  // ~40 lines: extractChangedFiles, splitCoveringTiers, partitionJsTests,
+-  // build suites/depSuites, d.provision loop (s.label === 'vitest')
+-  // ~50 lines: for (const s of suites) { for (const file of …) { … } }
++  const { suites, depSuites } = buildSuites(d, ctx);
++  const exec = executeSuites(d, ctx, suites);
++  result.ran = exec.ran;
++  failedSuites.push(...exec.failures);
++  anyTimeout ||= exec.timedOut;
+```
+
+Benefits:
+Each phase is independently testable with a mocked d and fixture rawDiff. Shared-mutable surface drops from seven threaded variables to explicit return objects. Reviewers evaluate one phase's contract in isolation.
+
+### AC-215 · Extract per-task eligibility filter pipeline from pickClaimableTasks
+Strength: Strong
+Files: src/next-claimable-task.js
+Symbol: pickClaimableTasks
+Snippet:
+```
+// (local-worker.sh) iterates this list attempting an atomic claim (mv -n) on each in
+// turn, same as it did with the old inline script's output.
+function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
+  let names;
+  try {
+    names = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json'));
+  } catch (_) {
+    return [];
+  }
+
+  // Side-effect requires: task-sources.js's registerTaskSource() calls populate
+  // task-source-registry.js's registry as a load-time side effect -- must be required
+  // before getRegisteredSource() can resolve anything (see local-worker.sh's own
+  // comment on this same gotcha, confirmed live 2026-08-17: requiring model-provider.js
+  // alone reported every source as 'low' every time).
+  loadSourceRegistry();
+  const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
+  const { DEFAULT_HUB_ORDER } = require('./hub-priority.js');
+
+  // <queue>/pending -> pipelineDir (hub-priority.js re-joins queue/coordinating itself).
+  const pipelineDir = path.join(pendingDir, '..', '..');
+  const hubKeyCache = new Map();
+  const noHubKey = { rank: Infinity, createdAt: null };
+
+  const { sourceEligibleHere, activeRepoIsCore } = require('./lib/source-scope.js');
+  const coreActive = activeRepoIsCore();
+  // Lane avoidance (premium-rotation.js): how many lanes exist decides whether a task may skip one. 0 on any error = never skip.
+  let laneCount = 0;
+  // This instance's own lane definition, for the task-class allowlist below (null for a non-lane instance, or on any error = unrestricted).
+  let thisLane = null;
+  // The whole lane list, kept for the lane-avoidance check below (is there anywhere ELSE this task can go?). [] on any error = never avoid.
+  let claimLanes = [];
+  try {
+    const allLanes = opts.lanes || require('./lanes.js').getLanes();
+    claimLanes = allLanes;
+    laneCount = allLanes.length;
+    thisLane = allLanes.find((l) => l.id === instanceId) || null;
+  } catch (_) { laneCount = 0; thisLane = null; claimLanes = []; }
+  const capRouting = require('./capability-routing.js');
+  const routing = {
+    cfg: capRouting.routingConfig(),
+    instancesDir: opts.instancesDir || sharedInstancesDir(pipelineDir),
+    _rows: null,
+    rows() { if (!this._rows) this._rows = opts.scorecard || capRouting.cachedScorecard(pipelineDir, this.cfg); return this._rows; },
+  };
+  let probesOffered = 0;
+  const pinned = [];
+  const rankable = [];
+  for (const name of names) {
+    const { task, mtimeMs } = readTaskSafe(path.join(pendingDir, name));
+    const pinnedWorker = task && task.pinnedWorker;
+    if (pinnedWorker && pinnedWorker !== instanceId) continue; // pinned to another instance -- not a candidate for this one
+    if (pinnedWorker === instanceId) {
+      pinned.push({ name, mtimeMs });
+      continue;
+    }
+
+    // A task that degenerated on THIS lane (task.avoidLanes, stamped by reject-retry-check.js) is left to another lane while one exists.
+    // An explicit pin to this lane was handled above and still wins.
+    // The skip only holds while another lane exists that is not avoided, is allowed this task's source and is alive (premium-rotation.js laneAvoided ctx),
+    // so avoidance can never leave a task that no lane will claim. The source and heartbeat lookups only happen for a task that actually names this lane.
+    if (task && Array.isArray(task.avoidLanes) && task.avoidLanes.includes(instanceId)) {
+      let avoidSource = null;
+      try { avoidSource = resolveSourceName(task); } catch (_) { avoidSource = null; }
+      // "Alive" here means "not known to be down": a lane whose heartbeat file exists but is stale or flagged degraded is down; a lane that has never written a
+      // heartbeat is unknown, and unknown counts as a place the task can go (avoidance still steers it there). Only evidence of death strands nothing.
+      const avoidAlive = (id) => {
+        if (opts.laneAlive) return opts.laneAlive(id);
+        if (!fs.existsSync(path.join(routing.instancesDir, `${id}.json`))) return true;
+        return capRouting.laneAliveFromHeartbeat(routing.instancesDir, id);
+      };
+      const avoidCtx = { lanes: claimLanes, source: avoidSource, alive: avoidAlive };
+      if (laneAvoided(task, instanceId, laneCount, process.env, avoidCtx)) continue;
+    }
+
+    // A lane with a taskClasses allowlist (lanes.js; e.g. an 8 GB GPU given only small bounded sources) is only offered tasks of
+    // those sources. Fail closed: a task whose source can't be resolved is not offered to a restricted lane. An operator pin to
+    // this lane was handled above and bypasses this, same as it bypasses lane avoidance.
+    if (task && thisLane && Array.isArray(thisLane.taskClasses)) {
+      let sourceName = null;
+      try { sourceName = resolveSourceName(task); } catch (_) { sourceName = null; }
+      if (!require('./lanes.js').laneAllowsSource(thisLane, sourceName)) {
+        // Probing (capability-routing.js): outside its allowlist, a small lane is still offered a deterministic fraction of eligible tasks of
+        // sources it has not proven. Shadow mode only logs; enforce lets ONE probe through per call.
+        let probe = false;
+        if (routing.cfg.mode !== 'off') {
+          try {
+            probe = capRouting.probeSelected({ task, source: sourceName, registered: getRegisteredSource(sourceName), lane: thisLane, lanes: opts.lanes || require('./lanes.js').getLanes(), rows: routing.rows(), cfg: routing.cfg, degraded: opts.laneDegraded ? opts.laneDegraded(thisLane.id) : require('./lane-health.js').laneDegraded(routing.instancesDir, thisLane.id) });
+          } catch (_) { probe = false; }
+        }
+        if (!probe) continue;
+        capRouting.auditReservation(pipelineDir, routing.instancesDir, {
+          mode: routing.cfg.mode, action: routing.cfg.mode === 'enforce' ? 'probe' : 'would-probe', taskId: task.id || name, source: sourceName, lane: thisLane.id, holder: thisLane.id, evidence: 'probe',
+        });
+        if (routing.cfg.mode !== 'enforce' || probesOffered >= 1) continue;
+        probesOffered += 1;
+      }
+    }
+
+    // Capability routing (src/capability-routing.js): a lane leaves a task to a lower-tier lane that has proven itself on its source, for a
+    // bounded grace. Shadow mode (default) only logs the decision. Human-queued / premium tasks and tasks that already failed on the
+    // holder (avoidLanes) are never held.
+    if (task && thisLane && routing.cfg.mode !== 'off' && !task.humanQueued && !task.premiumPriority) {
+      let srcName = null;
+      try { srcName = resolveSourceName(task); } catch (_) { srcName = null; }
+      const allLanes = opts.lanes || (() => { try { return require('./lanes.js').getLanes(); } catch (_) { return []; } })();
+      const decision = require('./capability-routing.js').decideReservation({
+        source: srcName, thisLane, lanes: allLanes, rows: routing.rows(), ageMs: (opts.now !== undefined ? opts.now : Date.now()) - mtimeMs, cfg: routing.cfg,
+        isAlive: (id) => (opts.laneAlive ? opts.laneAlive(id) : require('./capability-routing.js').laneAliveFromHeartbeat(routing.instancesDir, id)),
+        avoided: (id) => laneAvoided(task, id, allLanes.length),
+        probing: (l) => capRouting.probeSelected({ task, source: srcName, registered: getRegisteredSource(srcName), lane: l, lanes: allLanes, rows: routing.rows(), cfg: routing.cfg }),
+        isIdle: (id) => (opts.laneIdle ? opts.laneIdle(id) : capRouting.laneIdleFromHeartbeat(routing.instancesDir, id)),
+      });
+      if (decision) {
+        require('./capability-routing.js').auditReservation(pipelineDir, routing.instancesDir, {
+          mode: routing.cfg.mode, action: routing.cfg.mode === 'enforce' ? 'held' : 'would-hold', taskId: task.id || name, source: srcName, lane: thisLane.id,
+          holder: decision.holder, evidence: decision.evidence,
+        });
+        if (routing.cfg.mode === 'enforce') continue;
+      }
+    }
+
+    // A scope:'core' source (a pipeline self-audit) audits agent-manager itself; on any other project it is
+    // not claimable, even if one is already sitting in pending/ (src/lib/source-scope.js). An explicit
+    // operator pin (handled above) still wins.
+    try {
+      if (task && !sourceEligibleHere(getRegisteredSource(resolveSourceName(task)), coreActive)) continue;
+    } catch (_) { /* unresolvable source -- not gated */ }
+
+    // Within one source-priority band, order a live hub's children by their owning hub's
+    // key (explicit hubPriority asc, then hub createdAt asc) so this path can't contradict
+    // nextAdhocTask()'s hub ordering -- same "the two must never disagree" discipline this
+    // file's own header already documents for the tier split. Non-hub tasks get noHubKey
+    // (rank Infinity), so hub children sort ahead of unrelated work at the same priority.
+    // Resolved through the task's own registered source's `hubOrder` hook (S1 of the
+    // hub-tasks extraction, 2026-09-23; same derived_task-carries-domain-adhoc special case
+    // rankPriorityOfTask above already needs, so a derived_task-specific override stays
+    // reachable), falling back to hub-priority.js's default bundle -- today's behaviour --
+    // when a registration hasn't declared one.
+    const registeredName = task && task.source === 'derived_task' ? 'derived_task' : (task ? resolveSourceName(task) : null);
+    const registered = registeredName ? getRegisteredSource(registeredName) : null;
+    const hubOrder = (registered && registered.hubOrder) || DEFAULT_HUB_ORDER;
+    const oc = task ? hubOrder.orderCandidate(pipelineDir, task, hubKeyCache) : null;
+    const hk = oc ? oc.hubKey : { isHubChild: false };
+    const hubKey = hk.isHubChild ? { rank: hk.rank, createdAt: hk.createdAt } : noHubKey;
+    const hubTier = !!(oc && oc.isHubWork);
+    const rankedPriority = rankPriorityOfTask(task, { hubTier });
+    // A premium task that keeps getting blocked rotates behind fresh premium work, but still ahead of the hub tier and everything else.
+    const priority = (rankedPriority === -Infinity && rotationDemoted(task)) ? ROTATION_DEMOTED_PRIORITY : rankedPriority;
+    const naturalPriority = hubTier ? rankPriorityOfTask(task, { hubTier: false }) : priority;
+    rankable.push({ name, id: (task && task.id) || name.replace(/\.json$/, ''), hubId: hubIdForTask(task), priority, naturalPriority, hubTier, mtimeMs, hubKey });
+  }
+
+  pinned.sort((a, b) => a.mtimeMs - b.mtimeMs);
+  // Comparator itself stays on the DEFAULT bundle's compareKeys: this is a single global
+  // sort across tasks that may resolve to different sources, and every source's hub records
+  // share the same kernel/shape today, so there is exactly one meaningful way to compare a
+  // { rank, createdAt } pair regardless of which registration produced it. A per-task
+  // compareKeys override would only make sense once a hub-tasks plugin can register a
+  // genuinely different record shape -- not needed by S1.
+  rankable.sort((a, b) => (a.priority - b.priority) || DEFAULT_HUB_ORDER.compareKeys(a.hubKey, b.hubKey) || (a.mtimeMs - b.mtimeMs));
+  const instancesDir = opts.instancesDir || sharedInstancesDir(pipelineDir);
+  recordHubTierAudit(rankable, instancesDir);
+  // Leave the top-ranked task for an idle preferred lane (see lanePreferenceGraceMs above), while it is still fresh.
+  const now = opts.now !== undefined ? opts.now : Date.now();
+  const graceMs = opts.graceMs !== undefined ? opts.graceMs : lanePreferenceGraceMs();
+  if (graceMs > 0 && rankable.length > 0 && (now - rankable[0].mtimeMs) < graceMs) {
+    let lanes = opts.lanes;
+    if (!lanes) { try { lanes = require('./lanes.js').getLanes(); } catch (_) { lanes = []; } }
+    if (preferredLaneIsIdle({ instanceId, instancesDir, lanes, now })) rankable.shift();
+  }
+  return [...pinned.map((r) => r.name), ...rankable.map((r) => r.name)];
+}
+```
+
+Problem:
+pickClaimableTasks is 171 lines because its loop body inlines five independent eligibility checks (pinned-worker, lane-avoidance, task-class allowlist, capability-routing hold, source-scope), each with its own try/catch and a different module dependency, alongside a ~30-line setup block and a ~20-line post-loop sort/audit block. No check is a one-liner; each carries 8–20 lines of branching, making the function hard to review or test in isolation.
+
+Solution:
+Extract the five per-task filter stages into a new module src/claim-filters.js exposing applyEligibilityFilters(task, name, mtimeMs, ctx). The loop body shrinks to: read task, call the filter, skip or push a ranked entry. Setup and post-loop blocks stay in place.
+
+```js
+// NEW: src/claim-filters.js
+function applyEligibilityFilters(task, name, mtimeMs, ctx) {
+  if (task?.pinnedWorker && task.pinnedWorker !== ctx.instanceId)
+    return { skip: true };
+  if (task?.avoidLanes?.includes(ctx.instanceId)
+      && laneAvoided(task, ctx.instanceId, ctx.laneCount, process.env,
+                     buildAvoidCtx(task, ctx)))
+    return { skip: true };
+  if (task && ctx.thisLane?.taskClasses
+      && !passesAllowlistOrProbe(task, ctx))
+    return { skip: true };
+  if (task && ctx.thisLane && ctx.routing.cfg.mode !== 'off'
+      && !task.humanQueued && !task.premiumPriority
+      && shouldHoldForLowerTier(task, ctx))
+    return { skip: true };
+  if (task && !sourceEligibleHere(
+        ctx.getRegisteredSource(ctx.resolveSourceName(task)), ctx.coreActive))
+    return { skip: true };
+  return { skip: false };
+}
+```
+
+```js
+// IN src/next-claimable-task.js — loop body becomes:
+for (const name of names) {
+  const { task, mtimeMs } = readTaskSafe(path.join(pendingDir, name));
+  if (task?.pinnedWorker === instanceId) { pinned.push({ name, mtimeMs }); continue; }
+  const { skip } = applyEligibilityFilters(task, name, mtimeMs, ctx);
+  if (skip) continue;
+  rankable.push(computeRankedEntry(task, name, mtimeMs, ctx));
+}
+```
+
+Benefits:
+Each filter stage becomes independently unit-testable (e.g. "given avoidLanes ['lane-2'] and laneCount 3, does it skip?"). The orchestrator drops to ~80 lines. Reviewers evaluate one 5-line guard at a time instead of scanning 171 lines of interleaved logic.
