@@ -98,7 +98,7 @@ function validateStatusBody(body) {
 // 'in-progress' = record is in queue/adhoc, pending, drafting, review, approved, node-outbox or coordinating.
 // 'merged' = record is in queue/done with mergedAt, OR history has applied stage and branch is ancestor of origin/<base>.
 // 'unknown' = anything else.
-function detectTaskState(taskId, pipelineDir, gitFn, repoDir = process.cwd()) {
+function detectTaskState(taskId, pipelineDir, gitFn, repoDir = process.cwd(), { env = process.env, baseGitFn = defaultBaseGitFn } = {}) {
   const queueDir = path.join(pipelineDir, 'queue');
   const inProgressStates = ['adhoc', 'pending', 'drafting', 'review', 'approved', 'node-outbox', 'coordinating'];
   for (const state of inProgressStates) {
@@ -119,13 +119,37 @@ function detectTaskState(taskId, pipelineDir, gitFn, repoDir = process.cwd()) {
   // The applied stage's detail is the task branch; it counts as merged when that branch is an ancestor of origin/<base> in the node repo.
   const applied = record && Array.isArray(record.history) ? record.history.find((h) => h && h.stage === 'applied') : null;
   if (applied && typeof applied.detail === 'string' && applied.detail && typeof gitFn === 'function') {
-    const base = String(process.env.AGENT_MANAGER_MERGED_BASE || 'main');
-    try { if (gitFn(applied.detail, `origin/${base}`, repoDir)) return 'merged'; } catch (e) { /* not merged */ }
+    // The repo is the one the task was applied in (the record's generatedForRepoRoot), not the server's own checkout.
+    const recorded = record && typeof record.generatedForRepoRoot === 'string' ? record.generatedForRepoRoot.trim() : '';
+    const repo = recorded || repoDir;
+    if (!repo || !fs.existsSync(repo) || !fs.statSync(repo).isDirectory()) return 'unknown';
+    const base = resolveBase(repo, env, baseGitFn);
+    try { if (gitFn(applied.detail, `origin/${base}`, repo)) return 'merged'; } catch (e) { /* not merged */ }
   }
   return 'unknown';
 }
 
-// Default git function: checks if the task's branch is an ancestor of origin/main using git merge-base --is-ancestor.
+// Runs one read-only git command in repoDir and returns its trimmed stdout, or '' when git fails. Never fetches, checks out or writes.
+function defaultBaseGitFn(repoDir, args) {
+  const { execFileSync } = require('child_process');
+  try {
+    return String(execFileSync('git', ['-C', repoDir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10000 })).trim();
+  } catch (e) {
+    return '';
+  }
+}
+
+// The base branch the merged check uses for one repo: AGENT_MANAGER_MERGED_BASE when set, else origin/HEAD's branch, else master when origin/master exists, else main.
+function resolveBase(repoDir, env = process.env, runGit = defaultBaseGitFn) {
+  const override = String(env.AGENT_MANAGER_MERGED_BASE || '').trim();
+  if (override) return override;
+  const head = runGit(repoDir, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']);
+  if (head) return head.replace(/^origin\//, '');
+  if (runGit(repoDir, ['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/master'])) return 'master';
+  return 'main';
+}
+
+// Default git function: checks if the task's branch is an ancestor of the given base using git merge-base --is-ancestor.
 function defaultGitFn(branch, base, repoDir) {
   const { execFileSync } = require('child_process');
   try {
@@ -177,7 +201,7 @@ function createServer({ env = process.env, gitFn, repoDir = process.cwd() } = {}
     const git = typeof gitFn === 'function' ? gitFn : defaultGitFn;
     const tasks = {};
     for (const taskId of payload.taskIds) {
-      tasks[taskId] = detectTaskState(taskId, pipelineDir, git, repoDir);
+      tasks[taskId] = detectTaskState(taskId, pipelineDir, git, repoDir, { env });
     }
     return send(res, 200, { ok: true, tasks });
   };
@@ -224,4 +248,4 @@ if (require.main === module) {
   server.listen(port, host, () => process.stdout.write(`node intake listening on ${host}:${port}\n`));
 }
 
-module.exports = { createServer, normalizeIp, bearer, sameToken, writeAdhoc, TASK_ID_RE, MAX_BODY_BYTES, validateStatusBody, detectTaskState, defaultGitFn };
+module.exports = { createServer, normalizeIp, bearer, sameToken, writeAdhoc, TASK_ID_RE, MAX_BODY_BYTES, validateStatusBody, detectTaskState, defaultGitFn, resolveBase, defaultBaseGitFn };
