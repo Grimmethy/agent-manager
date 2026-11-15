@@ -184,6 +184,17 @@ test('mtime tie-break: among equal-rank non-sticky tasks, the older file is clai
   assert.strictEqual(r.task.id, 'older-task');
 });
 
+test('mtime tie-break across directories: equal rank, the older file wins over an earlier list', () => {
+  const { pipe, pending, adhoc, env } = setup();
+  const now = Date.now();
+  // Same source, so the same rank. The pending list comes first, so only the mtime compare can make the older adhoc task win.
+  writeTask(pending, 'pending-newer', { source: 'trouble_log' }, 10);
+  writeTask(adhoc, 'adhoc-older', { source: 'trouble_log' }, 500);
+  const r = claimNext({ claimant: 'node-a', pipelineDirs: [pipe], env, now, readRemote: () => '' });
+  assert.ok(r);
+  assert.strictEqual(r.task.id, 'adhoc-older');
+});
+
 test('premiumPriority: a premium adhoc task beats a normal pending task', () => {
   const { pipe, pending, adhoc, env } = setup();
   const now = Date.now();
