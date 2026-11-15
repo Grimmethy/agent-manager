@@ -177,6 +177,8 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     rows() { if (!this._rows) this._rows = opts.scorecard || capRouting.cachedScorecard(pipelineDir, this.cfg); return this._rows; },
   };
   let probesOffered = 0;
+  // Node this worker runs on (multi-node): opts.nodeId wins; absent = the AGENT_MANAGER_NODE_ID env, so existing callers behave the same.
+  const nodeId = opts.nodeId !== undefined ? opts.nodeId : process.env.AGENT_MANAGER_NODE_ID;
   const pinned = [];
   const rankable = [];
   for (const name of names) {
@@ -184,7 +186,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     const premium = !!(task && task.premiumPriority === true); // same test the shell side used to re-read every file for
     const pinnedWorker = task && task.pinnedWorker;
     if (pinnedWorker && pinnedWorker !== instanceId) continue; // pinned to another instance -- not a candidate for this one
-    if (!claimableOnNode(task, process.env.AGENT_MANAGER_NODE_ID)) continue; // leased to another node, or unleased and this worker is not on the ledger owner
+    if (!claimableOnNode(task, nodeId)) continue; // leased to another node, or unleased and this worker is not on the ledger owner
     if (pinnedWorker === instanceId) {
       pinned.push({ name, mtimeMs, premium });
       continue;
