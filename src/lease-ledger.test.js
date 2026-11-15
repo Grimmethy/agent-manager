@@ -24,19 +24,19 @@ test('lend creates a lent lease that expires after the ttl and is written to lea
   assert.equal(L.leaseFor('nope', env), null);
 });
 
-test('the default ttl is six hours and AGENT_MANAGER_LEASE_TTL_MS overrides it; junk falls back', () => {
+test('the default ttl is one hour and AGENT_MANAGER_LEASE_TTL_MS overrides it; junk falls back', () => {
   const { env } = tmp();
-  assert.equal(L.defaultTtlMs(env), 6 * 3600 * 1000);
-  assert.equal(L.lendLease('a', 'grimm', { now: T0, env }).expiresAt, '2026-11-11T18:00:00.000Z');
+  assert.equal(L.defaultTtlMs(env), 3600 * 1000);
+  assert.equal(L.lendLease('a', 'grimm', { now: T0, env }).expiresAt, '2026-11-11T13:00:00.000Z');
   assert.equal(L.defaultTtlMs({ ...env, AGENT_MANAGER_LEASE_TTL_MS: '1000' }), 1000);
-  assert.equal(L.defaultTtlMs({ ...env, AGENT_MANAGER_LEASE_TTL_MS: 'soon' }), 6 * 3600 * 1000);
-  assert.equal(L.defaultTtlMs({ ...env, AGENT_MANAGER_LEASE_TTL_MS: '-5' }), 6 * 3600 * 1000);
+  assert.equal(L.defaultTtlMs({ ...env, AGENT_MANAGER_LEASE_TTL_MS: 'soon' }), 3600 * 1000);
+  assert.equal(L.defaultTtlMs({ ...env, AGENT_MANAGER_LEASE_TTL_MS: '-5' }), 3600 * 1000);
 });
 
 test('a ttl that is not a positive number falls back to the default instead of producing a broken expiry', () => {
   const { env } = tmp();
   for (const [i, bad] of [-5, 0, NaN, 'soon'].entries()) {
-    assert.equal(L.lendLease('t' + i, 'grimm', { ttlMs: bad, now: T0, env }).expiresAt, '2026-11-11T18:00:00.000Z', String(bad));
+    assert.equal(L.lendLease('t' + i, 'grimm', { ttlMs: bad, now: T0, env }).expiresAt, '2026-11-11T13:00:00.000Z', String(bad));
   }
 });
 

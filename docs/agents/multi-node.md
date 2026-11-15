@@ -40,7 +40,7 @@ The stock pipeline makes a branch only when `scripts/apply-task.sh` applies an a
 
 The version 1 branch package and the relay stay in the code and keep working, but nothing in the node setup uses them. For reference:
 
-1. **Lend.** Wok records a lease (`src/lease-ledger.js`, `lendLease(taskId, nodeId)`, default 6 hours) and posts `{task, lease}` to the node's intake `POST /lend`. The node writes the record, stamped `leasedTo: <node id>`, into its own `queue/adhoc/`.
+1. **Lend.** Wok records a lease (`src/lease-ledger.js`, `lendLease(taskId, nodeId)`, default 1 hour) and posts `{task, lease}` to the node's intake `POST /lend`. The node writes the record, stamped `leasedTo: <node id>`, into its own `queue/adhoc/`.
 2. **Claim.** A worker claims only work for its own node: `claimableOnNode(task, nodeId)` in `src/node-affinity.js`. A worker's node is its `AGENT_MANAGER_NODE_ID`; with none set it is the ledger owner, `wok`. A task with no `leasedTo` is claimed only on wok, and a task leased to a node is never claimed anywhere else (a lease also beats an operator pin).
 3. **Build.** The node runs the ordinary pipeline on the task and pushes nothing to GitHub (this path needs a node pipeline that builds a branch).
 4. **Package.** `buildPackage({record, nodeId, branch, sha})` in `src/review-package.js` makes `{version: 1, taskId, nodeId, branch, sha, record, builtAt}`; the record loses `localVotes`, `history` and any key that looks like a token, secret or password. `sendPackage(pkg, {url, tokenFile})` POSTs it with the node's token to wok's package intake.
@@ -54,7 +54,7 @@ The version 1 branch package and the relay stay in the code and keep working, bu
 |---|---|---|
 | `AGENT_MANAGER_NODES_DIR` | registry, tokens, `leases.json` | `$HOME/.local/state/agent-manager/nodes` |
 | `AGENT_MANAGER_NODES_BIND`, `AGENT_MANAGER_NODES_PORT` | heartbeat intake | `127.0.0.1`, 7471 |
-| `AGENT_MANAGER_LEASE_TTL_MS` | lease ledger | 6 hours |
+| `AGENT_MANAGER_LEASE_TTL_MS` | lease ledger | 1 hour |
 | `AGENT_MANAGER_NODE_ID` | node affinity, heartbeat client | unset = `wok` |
 | `AGENT_MANAGER_LENDER_TOKEN_FILE`, `AGENT_MANAGER_LENDER_ADDRESS` | node intake | file required (exit 2 without it); address unset = any |
 | `AGENT_MANAGER_INTAKE_BIND`, `AGENT_MANAGER_INTAKE_PORT` | node intake | `127.0.0.1`, 7472 |
