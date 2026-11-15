@@ -6,30 +6,62 @@
 
 let lastWorkersSignature = '';
 
-// Keys that only say how old something is or when a heartbeat last landed: heartbeatAgeSeconds, stateAgeSeconds, endedAgeS, checkedAgeS, the plain ageS of every hold row, lastHeartbeat ...
-const WORKERS_VOLATILE_KEY = /(Age(S|Seconds|Ms)?|^age(S|Seconds|Ms)?|^lastHeartbeat|^_fetchedAtMs)$/;
+// Keys that only say how old something is (suffix Age, AgeS, AgeSeconds or AgeMs; case-sensitive) or when a heartbeat last landed.
+const WORKERS_VOLATILE_KEY = /(Age|AgeS|AgeSeconds|AgeMs)$|^age(S|Seconds|Ms)?$/;
+const WORKERS_VOLATILE_EXACT = new Set(['lastHeartbeat', '_fetchedAtMs']);
 
+function workersIsVolatileKey(key) {
+  return WORKERS_VOLATILE_KEY.test(key) || WORKERS_VOLATILE_EXACT.has(key);
+}
+
+// Returns a stripped deep copy; never mutates its input.
 function workersStripVolatile(value) {
   if (Array.isArray(value)) return value.map(workersStripVolatile);
   if (value && typeof value === 'object') {
     const out = {};
     for (const key of Object.keys(value)) {
-      if (!WORKERS_VOLATILE_KEY.test(key)) out[key] = workersStripVolatile(value[key]);
+      if (!workersIsVolatileKey(key)) out[key] = workersStripVolatile(value[key]);
     }
     return out;
   }
   return value;
 }
 
+// Creates window.workersRenderStats on first use (no-op outside a browser).
+function workersStats() {
+  if (typeof window === 'undefined') return null;
+  if (!window.workersRenderStats) window.workersRenderStats = { drawn: 0, skipped: 0, recentSkips: [] };
+  return window.workersRenderStats;
+}
+
 // parts: every payload the tab draws from; ui: the operator-side state that also changes the page (expanded card, pinned tasks, chosen task types, completed-task log size).
+// Returns '' when parts or ui is null/undefined, or when any top-level payload in parts is null/undefined (no skip is possible then).
 function workersRenderSignature(parts, ui) {
+  if (parts == null || ui == null) return '';
+  for (const key of Object.keys(parts)) {
+    if (parts[key] == null) return '';
+  }
   return JSON.stringify([workersStripVolatile(parts), ui]);
 }
 
 // mainEl must still hold the cards drawn last time (another tab may have replaced #main since).
 function workersCanSkipRender(signature, isPoll, mainEl) {
-  if (!isPoll || !signature || signature !== lastWorkersSignature) return false;
-  return !!(mainEl && typeof mainEl.querySelector === 'function' && mainEl.querySelector('.worker-filter-bar'));
+  if (!isPoll) return false;
+  if (!signature) return false;
+  if (signature !== lastWorkersSignature) return false;
+  const intact = !!(mainEl && typeof mainEl.querySelector === 'function' && mainEl.querySelector('.worker-filter-bar'));
+  if (!intact) return false;
+  const stats = workersStats();
+  if (stats) {
+    stats.skipped += 1;
+    stats.recentSkips = stats.recentSkips.concat([Date.now()]).slice(-20);
+  }
+  return true;
 }
 
-function rememberWorkersSignature(signature) { lastWorkersSignature = signature; }
+// Called after a real draw: remembers what was drawn and counts it.
+function rememberWorkersSignature(signature) {
+  lastWorkersSignature = signature;
+  const stats = workersStats();
+  if (stats) stats.drawn += 1;
+}
