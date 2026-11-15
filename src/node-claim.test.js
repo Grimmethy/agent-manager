@@ -159,6 +159,31 @@ test('same directory: two tasks keep the pickClaimableTasks order', () => {
   assert.deepStrictEqual([r1.task.id, r2.task.id], expected.slice(0, 2));
 });
 
+test('sticky-last: a sticky task at the end of its per-directory list is claimed before an equal-rank non-sticky head', () => {
+  const { lendLease } = require('./lease-ledger.js');
+  const { pipe, pending, env } = setup();
+  const now = Date.now();
+  // node-a holds a live lease on a task of branch 'feat', which makes 'feat' sticky for node-a.
+  writeTask(pending, 'held-feat', { stacked: { branch: 'feat' } }, 300);
+  lendLease('held-feat', 'node-a', { ttlMs: 3600000, now, env });
+  // Equal rank, but the non-sticky head is older, so the sticky task sits last in the directory list.
+  writeTask(pending, 'head-task', {}, 200);
+  writeTask(pending, 'sticky-task', { stacked: { branch: 'feat' } }, 100);
+  const r = claimNext({ claimant: 'node-a', pipelineDirs: [pipe], env, now, readRemote: () => '' });
+  assert.ok(r);
+  assert.strictEqual(r.task.id, 'sticky-task', 'sticky task must win over an older equal-rank head');
+});
+
+test('mtime tie-break: among equal-rank non-sticky tasks, the older file is claimed first', () => {
+  const { pipe, pending, env } = setup();
+  const now = Date.now();
+  writeTask(pending, 'newer-task', {}, 100);
+  writeTask(pending, 'older-task', {}, 500);
+  const r = claimNext({ claimant: 'node-b', pipelineDirs: [pipe], env, now, readRemote: () => '' });
+  assert.ok(r);
+  assert.strictEqual(r.task.id, 'older-task');
+});
+
 test('premiumPriority: a premium adhoc task beats a normal pending task', () => {
   const { pipe, pending, adhoc, env } = setup();
   const now = Date.now();
