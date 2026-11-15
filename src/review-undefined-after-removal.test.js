@@ -172,6 +172,31 @@ test('changesFromEdits groups ops per file in order and keeps create/delete apar
   assert.deepEqual(c.map((x) => [x.file, x.edits.length, x.isNew, x.isDeleted]), [['a.js', 2, false, false], ['b.js', 0, true, false], ['c.js', 0, false, true]]);
 });
 
+const METHOD_BASE = 'function renderProviderToggle() {\n  return 1;\n}\nclass Pane {\n  init() {\n    this.renderProviderToggle();\n  }\n}\n';
+const METHOD_EDIT = (extra) => [{ mode: 'edit', file: 'static/chat.js', find: 'function renderProviderToggle() {\n  return 1;\n}\nclass Pane {\n', replace: `class Pane {\n  renderProviderToggle() {\n    return 1;\n  }\n${extra || ''}` }];
+
+test('a top-level function turned into a class method with only this.name() calls is not flagged, and the skipped definition is recorded', () => {
+  const r = find({ edits: METHOD_EDIT() }, { 'static/chat.js': METHOD_BASE });
+  assert.deepEqual(r.uses, []);
+  assert.deepEqual(r.ignoredMethodDefs, [{ file: 'static/chat.js', name: 'renderProviderToggle', line: 2 }]);
+});
+
+test('a surviving bare call or callback-style call is still flagged next to a same-named method', () => {
+  for (const call of ['renderProviderToggle();', 'renderProviderToggle(function () {', 'renderProviderToggle(() => {']) {
+    const base = METHOD_BASE + `${call}\n`;
+    const r = find({ edits: METHOD_EDIT() }, { 'static/chat.js': base });
+    assert.deepEqual(names(r), ['renderProviderToggle'], call);
+    assert.match(r.uses[0].lines[0].text, /^renderProviderToggle\(/);
+  }
+});
+
+test('async/static methods, optional chaining and comments are not uses', () => {
+  const base = 'function chatRender() {}\n// chatRender() is gone\nclass A {\n  async chatRender() {}\n  static chatRender() {}\n  go(o) { o?.chatRender(); this.chatRender(); }\n}\n';
+  const r = find({ edits: [{ mode: 'edit', file: 'a.js', find: 'function chatRender() {}\n', replace: '' }] }, { 'a.js': base });
+  assert.deepEqual(r.uses, []);
+  assert.equal(r.ignoredMethodDefs.length, 2);
+});
+
 test('usesOf reports each line once and only real uses', () => {
   const post = 'const x = f(name, name);\nobj.name = 1;\nreturn { name: 1 };\nreturn { name };\n';
   assert.deepEqual(usesOf(post, 'name').map((u) => u.line), [1, 4]);
