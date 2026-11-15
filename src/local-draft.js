@@ -718,9 +718,17 @@ const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) 
 // observability_review finding that the review already dismissed counts as an expected
 // dismissal; a bare silent-catch-block rule never does, so a genuine finding's plan is never
 // truncated. Logs 'plan-done-capped' only when the text actually shrinks.
-function capPlanForTask(task, text, appendHistoryEvent) {
+function derivePlanCapContext(task) {
   const ruleId = (task.promptContext && (task.promptContext.originalRule || task.promptContext.rule)) || '';
-  const expected = (task.source === 'observability_review' && task.reviewDisposition === 'dismissed') ? 'dismiss' : null;
+  const expectedDisposition = (task.source === 'observability_review' && task.reviewDisposition === 'dismissed') ? 'dismiss' : null;
+  return { ruleId, expectedDisposition };
+}
+
+// ruleId / expectedDisposition may be passed in (runPlanPass derives them once); when omitted they are derived from the task.
+function capPlanForTask(task, text, appendHistoryEvent, ruleIdArg, expectedArg) {
+  const derived = derivePlanCapContext(task);
+  const ruleId = ruleIdArg !== undefined ? ruleIdArg : derived.ruleId;
+  const expected = expectedArg !== undefined ? expectedArg : derived.expectedDisposition;
   const capped = require('./silent-catch-plan-cap').capPlanStageOutput(text, ruleId, expected);
   if (capped.length < text.length) {
     appendHistoryEvent(task, 'plan-done-capped', `ruleId=${ruleId} expectedDisposition=${expected} originalLength=${text.length} cappedLength=${capped.length}`);
@@ -729,7 +737,7 @@ function capPlanForTask(task, text, appendHistoryEvent) {
 }
 
 async function attemptSeedReroll({
-  planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task,
+  planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task, ruleId, expectedDisposition,
 }) {
   let totalAttempts = planResult.attempts || 1;
   let reRolled = false;
@@ -752,14 +760,14 @@ async function attemptSeedReroll({
   if (stillThin && seedPlan) {
     // Thin rolls, but a real plan from a prior attempt exists -- reuse it verbatim rather
     // than hand the implement tiers a stub with no map.
-    task.planResponse = capPlanForTask(task, seedPlan, appendHistoryEvent);
+    task.planResponse = capPlanForTask(task, seedPlan, appendHistoryEvent, ruleId, expectedDisposition);
     task.lastGoodPlan = seedPlan;
     recordPlan(attempt, { text: seedPlan, attempts: totalAttempts, reRolled, seededFromPrior: true });
     appendHistoryEvent(task, 'plan-done', `${totalAttempts} attempt(s), reused a prior attempt's plan (${seedPlan.length} chars) after ${reRolled ? 'two thin rolls' : 'a thin roll'}`);
     return { planResult, totalAttempts, reRolled, stillThin, seededFromPrior: true };
   }
 
-  task.planResponse = capPlanForTask(task, planResult.response, appendHistoryEvent);
+  task.planResponse = capPlanForTask(task, planResult.response, appendHistoryEvent, ruleId, expectedDisposition);
   // Fix 2b: keep the last good plan outside draftAttempts (so record collapse can't drop
   // it -- it is the seed source for any later retry). Never store a thin one.
   if (!stillThin) task.lastGoodPlan = planResult.response;
@@ -857,7 +865,7 @@ async function executePlanRolls(callPlan, planLen, { substanceGated, recordModel
 // locals. Call order, arguments, and side effects are exactly what the inline code did;
 // returns { blocked: true, blockedReason, blockedStage: 'plan' } on a degenerate roll,
 // else undefined after handing the (possibly re-rolled) plan to attemptSeedReroll.
-async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding }) {
+async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding, ruleId, expectedDisposition }) {
   if (planResult.degenerate) {
     const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
     recordPlan(attempt, { degenerate: planResult.degenerate, attempts: planResult.attempts || 1 });
@@ -879,7 +887,7 @@ async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRo
   // value keeps the bookkeeping locals (totalAttempts, reRolled, stillThin,
   // seededFromPrior) available below.
   const seedReroll = await attemptSeedReroll({
-    planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task,
+    planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task, ruleId, expectedDisposition,
   });
   return { planResult: seedReroll.planResult, totalAttempts: seedReroll.totalAttempts, reRolled: seedReroll.reRolled, stillThin: seedReroll.stillThin, seededFromPrior: seedReroll.seededFromPrior };
 }
@@ -908,7 +916,7 @@ function reusePriorPlanForContinuation(task, attempt) {
   if (resolveSourceName(task) !== 'adhoc' || task.isAgenticContinuation !== true || task._planCritiqueRevised) return false;
   const plan = bestPriorPlan(task);
   if (!plan || parseCriteriaBlock(plan).length === 0) return false;
-  task.planResponse = plan;
+  task.planResponse = capPlanForTask(task, plan, appendHistoryEvent);
   task.lastGoodPlan = plan;
   if (process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE !== 'false') applyPlanAcceptanceCriteria(task);
   recordPlan(attempt, { text: plan, seededFromPrior: true });
@@ -921,6 +929,8 @@ async function runPlanPass(task, {
   runOrientPassFn = runOrientPass, recordModelCall,
 }) {
   if (reusePriorPlanForContinuation(task, attempt)) return { blocked: false };
+  // Plan-cap context derived once per pass and threaded to every plan write site below.
+  const { ruleId, expectedDisposition } = derivePlanCapContext(task);
   // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
   // trial lookup): researchPlanPrompt's own header used to call the research plan pass
   // "intentionally throwaway" and never gave it tool access -- so it could (and did)
@@ -1040,7 +1050,7 @@ async function runPlanPass(task, {
   // into handlePlanResult above -- same behavior, same recordPlan/appendHistoryEvent
   // order, now a single named unit. Returns { blocked: ... } on a degenerate roll.
   const handled = await handlePlanResult(task, attempt, {
-    planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding,
+    planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding, ruleId, expectedDisposition,
   });
   if (handled && handled.blocked) return handled;
   planResult = handled.planResult;
@@ -1068,7 +1078,7 @@ async function runPlanPass(task, {
     }
     // A degenerate re-roll carries no usable plan -- keep the previous one.
     if (!reRoll.degenerate) {
-      task.planResponse = capPlanForTask(task, reRoll.response, appendHistoryEvent);
+      task.planResponse = capPlanForTask(task, reRoll.response, appendHistoryEvent, ruleId, expectedDisposition);
       // Keep the seed source (lastGoodPlan) consistent with the plan we now accept.
       if (!planIsThin(reRoll.response)) task.lastGoodPlan = reRoll.response;
     }
