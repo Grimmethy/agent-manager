@@ -332,6 +332,24 @@ def api_git_merge_held_hub_branch_early(branch):
         _release_apply_lock(lock_fd)
 
 
+def _registered_projects_payload():
+    """Read-only list of projects.json entries for the browser: {label, repoRoot, realRoot?}.
+    Re-reads the registry on every call (no cache). pipelineDir/domainsPath are not exposed."""
+    from app import read_project_registry
+    out = []
+    for e in read_project_registry() or []:
+        root = e.get("repoRoot") if isinstance(e, dict) else None
+        if not isinstance(root, str) or not root.strip():
+            continue
+        item = {"label": e.get("label") or os.path.basename(root.rstrip("/\\")) or root, "repoRoot": root}
+        try:
+            item["realRoot"] = os.path.realpath(root)
+        except (OSError, ValueError):
+            pass
+        out.append(item)
+    return out
+
+
 @pipeline_1_more_bp.route("/api/pipeline/status")
 def api_pipeline_status():
     from app import ENV_FILE_PATH, _pipeline_running, _pipeline_stoppable, get_active_repo_root, read_env_file
@@ -339,7 +357,7 @@ def api_pipeline_status():
     running = _pipeline_running()
     return jsonify({
         "activeRepoRoot": get_active_repo_root(),
-        "running": running, "drains": drain_registry.running_drains(),
+        "running": running, "drains": drain_registry.running_drains(), "registeredProjects": _registered_projects_payload(),
         # "stoppable" is looser than "running": true whenever a real daemon process
         # exists, even if every heartbeat says otherwise. The frontend gates its Stop
         # control on (running || stoppable) so a wrong "running" can never hide the only
