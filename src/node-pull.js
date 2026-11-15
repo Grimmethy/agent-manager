@@ -103,6 +103,7 @@ async function pullOnce({ env = process.env, deps = {}, state = makeState() } = 
 
     const sec = Number(body.retryAfterSec);
     state.nextAllowedAt = d.now() + (Number.isFinite(sec) && sec >= 0 ? sec * 1000 : BACKOFF_FIRST_MS);
+    d.log(`node-pull: idle; wok asked to retry in ${Number.isFinite(sec) ? sec : 'unknown'} s`);
     return { task: null, retryAfterSec: body.retryAfterSec };
   } catch (e) {
     return failure(d, state, errorMessage(e));
