@@ -26,7 +26,7 @@ const { readPipelineHistory } = require('./pipeline-history.js');
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_DAYS = 30;
-const UNKNOWN_FIELDS = [];
+const UNKNOWN_FIELDS = ['metric.before', 'metric.after', 'cost.gpu_minutes', 'cost.peak_ram_mb'];
 
 function assertDay(label, value) {
   if (!DAY_RE.test(value) || Number.isNaN(Date.parse(`${value}T00:00:00Z`))) {
@@ -129,7 +129,7 @@ function buildRow(day, calls, historyEvents, nowIso) {
     items: { released: [], held: [], filed: [] },
     metric: { name: 'backfill', before: null, after: null },
     cost: { gpu_minutes: null, peak_ram_mb: null, model_calls: c.calls },
-    note: `Backfilled for ${day} from model-stats.db and pipeline-history. ${nullNote}. metric.before, metric.after, cost.gpu_minutes and cost.peak_ram_mb are null: not measured.`,
+    note: `Backfilled for ${day} from model-stats.db and pipeline-history. ${nullNote}. metric.before, metric.after, cost.gpu_minutes and cost.peak_ram_mb are null: not measured. null is the intended representation for them, not 0.`,
   };
 }
 
