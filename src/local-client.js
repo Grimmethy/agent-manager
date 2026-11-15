@@ -26,6 +26,8 @@ const { injectAmplificationInstruction, extractAmplificationRequests } = require
 const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { EventEmitter } = require('events');
+const emitter = new EventEmitter();
 
 // Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
 // unset, which would turn every caller of this module (including test files that require
@@ -312,7 +314,7 @@ async function postGenerate({ url, body, timeoutMs, headers, post = postJson, un
   }
 }
 
-async function callOnce({ prompt, images, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
+async function callOnce({ prompt, images, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, allowAmplification = false, conceptId = null, post } = {}) {
   // Forge exclusion (2026-10-14): never START a model call while PromptForge's comfyui-lease is held -- it would reload the model
   // PromptForge just evicted. Checked here, before any prompt building, in-flight lock or network I/O. See gpu-guard.js ForgePauseError.
   // A lease may be scoped to certain endpoints (gpu-guard.js leaseHeldFor): only a call to a leased card is refused, the other cards' lanes carry on.
@@ -403,8 +405,9 @@ async function callOnce({ prompt, images, think = true, temperature = 0.4, numCt
   // default/global scope when omitted, same as it always did before this existed.
   if (source) tokenFoldHeaders['X-TokenFold-Scope'] = source;
   try {
-    const result = await postGenerate({ url: OLLAMA_URL, body, timeoutMs: resolvedTimeoutMs, headers: tokenFoldHeaders });
+    const result = await postGenerate({ url: OLLAMA_URL, body, timeoutMs: resolvedTimeoutMs, headers: tokenFoldHeaders, post });
     localThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration, endpoint: OLLAMA_URL, model: lockModel });
+    emitter.emit('local-model-ready');
     // 2026-08-23, Grimmethy: "we need a way to differentiate 'working' from 'loading'...
     // this isn't the first time a lack of verbosity has caused us confusion" -- Ollama's
     // own response already carries this exact breakdown (load_duration -- time spent
@@ -425,6 +428,17 @@ async function callOnce({ prompt, images, think = true, temperature = 0.4, numCt
   } finally {
     inflightLock.release(lockPath);
   }
+}
+
+// 2026-11-10 (HUB0408): register a listener for the 'local-model-ready' event, emitted
+// once per successful top-level call or callOnce (never on a thrown error). Returns an
+// unsubscribe function that removes the listener, so callers can clean up without keeping
+// a reference to the emitter.
+function onLocalModelReady(fn) {
+  emitter.on('local-model-ready', fn);
+  return () => {
+    emitter.off('local-model-ready', fn);
+  };
 }
 
 // 2026-09-18 (pipeline throughput investigation, following the qwen2.5:3b GPU-thrashing
@@ -809,7 +823,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, CALLER_RECORDED_STAGES, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, NEVER_EXPIRE, maxNumPredictThatFits, capNumPredictToFit, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
+module.exports = { call, callOnce, CALLER_RECORDED_STAGES, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, NEVER_EXPIRE, maxNumPredictThatFits, capNumPredictToFit, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD, onLocalModelReady };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,
