@@ -66,3 +66,60 @@ WantedBy=timers.target
 ```
 
 Enable with `systemctl --user enable --now am-notify-summary.timer`. It is not enabled by the code.
+
+## Stuck-task notifier (premium tasks in blocked / needs-clarification)
+
+`src/stuck-task-notifier.js` watches the `blocked/` and `needs-clarification/` directories under the home queue (and every pooled project queue, when `--pool-queues` is passed) and pings the owner the moment a **premium** task lands in one of them. Non-premium entries are ignored; the existing pile is recorded silently on first run so it does not flood the phone.
+
+Triggered by `src/wait-for-change.js` (fs.watch / inotify), not by a timer. The 600-second `--timeout` is the only safety net and is documented on its own line in the source; on timeout the loop only re-checks in-memory pending keys, never rescanning the directory.
+
+### Running it
+
+One-shot (useful for testing):
+
+```sh
+node src/stuck-task-notifier.js /media/model-cache/github/agent-manager/queue
+```
+
+Drain mode (long-running, the production path):
+
+```sh
+node src/stuck-task-notifier.js --drain \
+  --home-queue /media/model-cache/github/agent-manager/queue \
+  --seen /media/model-cache/github/agent-manager/.stuck-task-seen.json \
+  --pool-queues
+```
+
+`--seen` defaults to `<cwd>/.stuck-task-seen.json`. `--timeout` defaults to 600 seconds.
+
+### systemd user service (example, not installed)
+
+```ini
+# ~/.config/systemd/user/am-stuck-notifier.service
+[Unit]
+Description=Agent Manager stuck-task notifier
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=AGENT_MANAGER_PIPELINE_DIR=/media/model-cache/github/agent-manager
+Environment=AGENT_MANAGER_NOTIFY_URL=http://<wok tailnet address>:<port>/agentmanager
+ExecStart=/usr/bin/node /media/model-cache/github/agent-manager/src/stuck-task-notifier.js --drain \
+  --home-queue /media/model-cache/github/agent-manager/queue \
+  --seen /media/model-cache/github/agent-manager/.stuck-task-seen.json \
+  --pool-queues
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+Enable with `systemctl --user enable --now am-stuck-notifier.service`. It is not enabled by the code.
+
+### Noise control
+
+`notify()` dedupes the same `stuck:<state>:<taskId>` key for 60 minutes (the `urgent` window in `src/notify.js`). A task that re-enters `blocked` within 60 minutes of its last notification will be reported as `duplicate` and never reach the phone. The seen file still treats it as new (its mtime changed), so the next trigger will try again. Force a resend by deleting and recreating the task file, or by waiting out the window.
+
+Idle wake rate on an idle queue: 1 wake per 600 seconds (one per timeout interval), measured by running `--drain` against an empty `blocked/` and `needs-clarification/` for one hour and counting timeout events. That is ~144 idle wakes per day per home queue; pooled queues add one wake per timeout per extra project.
+
