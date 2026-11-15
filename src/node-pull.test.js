@@ -349,6 +349,82 @@ test('the default request really claims a task through claimNext, while an empty
   assert.equal(claimNext({ nodeId: body.id, claimant: body.id, classes: [], pipelineDirs: [pipe], env, now: Date.now(), readRemote: () => '' }), null);
 });
 
+test('a worker folder under queue/drafting is watched from startup, and a change in it claims once the worker is free', async (t) => {
+  const { env, pipelineDir } = setup(t);
+  const c = clock();
+  const timers = fakeTimers();
+  const server = await claimServer(t, [{ body: { ok: true, task: null, retryAfterSec: 0 } }]);
+  const watched = [];
+  let free = false;
+  const daemon = startDaemon({
+    env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url },
+    deps: {
+      now: c.now, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, log: noLog,
+      isWorkerFree: () => free,
+      listDirs: () => ['worker-a'],
+      watch: (dir, cb) => { watched.push({ dir, cb }); return { close() {}, on() {} }; },
+    },
+  });
+  t.after(() => daemon.stop());
+  await settle();
+  const workerDir = path.join(pipelineDir, 'queue', 'drafting', 'worker-a');
+  const worker = watched.find((w) => w.dir === workerDir);
+  assert.ok(worker, 'a watcher is registered on the existing worker folder');
+  worker.cb();
+  c.advance(DEBOUNCE_MS);
+  timers.fireLast();
+  await settle();
+  assert.equal(server.requests.length, 0, 'the same event while the worker is busy claims nothing');
+  free = true;
+  worker.cb();
+  c.advance(DEBOUNCE_MS);
+  timers.fireLast();
+  await waitForRequests(server, 1);
+  assert.equal(server.requests.length, 1, 'one claim once the worker is free');
+});
+
+test('stop() closes the watcher registered for a worker folder under queue/drafting', (t) => {
+  const { env, pipelineDir } = setup(t);
+  const c = clock();
+  const timers = fakeTimers();
+  const closedBy = {};
+  const daemon = startDaemon({
+    env,
+    deps: {
+      now: c.now, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, log: noLog,
+      isWorkerFree: () => false,
+      listDirs: () => ['worker-a'],
+      watch: (dir) => ({ close() { closedBy[dir] = true; }, on() {} }),
+    },
+  });
+  daemon.stop();
+  assert.equal(closedBy[path.join(pipelineDir, 'queue', 'drafting', 'worker-a')], true);
+});
+
+test('a successful claim arms a 10 minute safety re-check that runs one more trigger', async (t) => {
+  const { env } = setup(t);
+  const c = clock();
+  const timers = fakeTimers();
+  const server = await claimServer(t, [
+    { body: { ok: true, task: { id: 't-safety' }, repo: { remoteUrl: 'https://example.invalid/r.git' } } },
+    { body: { ok: true, task: null, retryAfterSec: 0 } },
+  ]);
+  const daemon = startDaemon({
+    env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url },
+    deps: { now: c.now, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, watch: () => ({ close() {}, on() {} }), log: noLog, ensureRepo: async () => {} },
+  });
+  t.after(() => daemon.stop());
+  await waitForRequests(server, 1);
+  await settle();
+  const safety = timers.live().filter((x) => x.ms === 600_000);
+  assert.equal(safety.length, 1, 'one safety timer after the successful claim');
+  c.advance(600_000);
+  safety[0].fired = true;
+  safety[0].fn();
+  await waitForRequests(server, 2);
+  assert.equal(server.requests.length, 2, 'the safety re-check ran one more trigger');
+});
+
 // --- idle and took-task logging (wok idle answers were silent before) ---
 
 test('an idle answer with retryAfterSec 60 logs exactly one idle line', async (t) => {

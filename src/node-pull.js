@@ -14,6 +14,19 @@ const path = require('path');
 const DEBOUNCE_MS = 2000;
 const BACKOFF_FIRST_MS = 30000;
 const BACKOFF_CAP_MS = 600000;
+// Safety net: one trigger() this long after a successful claim, so a missed fs event cannot park the daemon.
+const SAFETY_RECHECK_MS = 600000;
+// Queue folders whose changes may mean this node's worker has become free (queue/adhoc is watched too; queue/drafting has its own handling).
+const WATCHED_QUEUES = ['pending', 'blocked', 'review', 'node-outbox'];
+
+// Names of the directories directly inside dir; a missing or unreadable dir has none.
+function listSubdirs(dir) {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch (e) {
+    return [];
+  }
+}
 
 function defaultLog(message) {
   process.stderr.write(String(message) + '\n');
@@ -33,6 +46,7 @@ function resolveDeps(deps = {}) {
     setTimeout: deps.setTimeout || setTimeout,
     clearTimeout: deps.clearTimeout || clearTimeout,
     watch: deps.watch || fs.watch,
+    listDirs: deps.listDirs || listSubdirs,
     classes: deps.classes,
     isPaused: deps.isPaused || (() => false),
     isWorkerFree: deps.isWorkerFree || (() => true),
@@ -122,6 +136,9 @@ function startDaemon({ env = process.env, deps = {} } = {}) {
   let pending = false;
   let stopped = false;
   let watcher = null;
+  let safetyTimer = null;
+  const extraWatchers = [];
+  const draftingWatchers = new Map();
 
   const clear = (t) => {
     if (t) d.clearTimeout(t);
@@ -140,9 +157,10 @@ function startDaemon({ env = process.env, deps = {} } = {}) {
       return;
     }
     inFlight = true;
-    pullOnce({ env, deps: d, state }).then(() => {
+    pullOnce({ env, deps: d, state }).then((out) => {
       inFlight = false;
       if (stopped) return;
+      if (out && out.task) armSafety();
       if (state.nextAllowedAt > d.now()) armRetry();
       if (pending) {
         pending = false;
@@ -182,6 +200,54 @@ function startDaemon({ env = process.env, deps = {} } = {}) {
     d.log('node-pull: AGENT_MANAGER_PIPELINE_DIR is not set; watching disabled');
   }
 
+  // Every other queue folder whose change may mean this node's worker has become free fires the same debounced onWatch.
+  // queue/drafting also rescans its worker folders: a file moving out of queue/drafting/<worker> fires no event on queue/drafting itself.
+  const watchDir = (dir, cb = onWatch) => {
+    try {
+      const w = d.watch(dir, cb);
+      if (w && typeof w.on === 'function') {
+        w.on('error', (e) => d.log(`node-pull: watch error: ${errorMessage(e)}`));
+      }
+      return w || null;
+    } catch (e) {
+      if (!e || e.code !== 'ENOENT') d.log(`node-pull: cannot watch ${dir}: ${errorMessage(e)}`);
+      return null;
+    }
+  };
+  const closeWatcher = (w) => {
+    if (w && typeof w.close === 'function') w.close();
+  };
+  if (pipelineDir) {
+    const queueDir = path.join(pipelineDir, 'queue');
+    for (const name of WATCHED_QUEUES) {
+      const w = watchDir(path.join(queueDir, name));
+      if (w) extraWatchers.push(w);
+    }
+    const draftingDir = path.join(queueDir, 'drafting');
+    const rescanDrafting = () => {
+      for (const name of d.listDirs(draftingDir)) {
+        if (draftingWatchers.has(name)) continue;
+        const w = watchDir(path.join(draftingDir, name));
+        if (w) draftingWatchers.set(name, w);
+      }
+    };
+    const dw = watchDir(draftingDir, () => {
+      rescanDrafting();
+      onWatch();
+    });
+    if (dw) extraWatchers.push(dw);
+    rescanDrafting();
+  }
+
+  // A successful claim arms one re-check 10 minutes later, so a missed fs event cannot park the daemon.
+  const armSafety = () => {
+    safetyTimer = clear(safetyTimer);
+    safetyTimer = d.setTimeout(() => {
+      safetyTimer = null;
+      trigger();
+    }, SAFETY_RECHECK_MS);
+  };
+
   trigger();
 
   return {
@@ -191,7 +257,10 @@ function startDaemon({ env = process.env, deps = {} } = {}) {
       stopped = true;
       debounceTimer = clear(debounceTimer);
       retryTimer = clear(retryTimer);
-      if (watcher && typeof watcher.close === 'function') watcher.close();
+      safetyTimer = clear(safetyTimer);
+      closeWatcher(watcher);
+      for (const w of extraWatchers) closeWatcher(w);
+      for (const w of draftingWatchers.values()) closeWatcher(w);
     },
   };
 }
