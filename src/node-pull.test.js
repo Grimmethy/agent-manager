@@ -35,7 +35,9 @@ async function claimServer(t, answers) {
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise((done) => server.close(done)));
-  return { url: `http://127.0.0.1:${server.address().port}/claim`, requests };
+  // Built by concatenation: a '/' right after a template substitution confuses the repo's size-ratchet tokenizer (it reads it as a regex start).
+  const port = server.address().port;
+  return { url: 'http://127.0.0.1:' + port + '/claim', requests };
 }
 
 function setup(t, extraEnv = {}) {
