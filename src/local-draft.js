@@ -2001,7 +2001,19 @@ async function runDraftPasses(task, attempt, {
         // A stacked task builds on its chain branch tip, not the shared checkout's working tree (null for every non-stacked task).
         const guardRef = resolveGroundingRef(task, repoRoot);
         const existsAtRef = guardRef ? (p) => !!resolveAtRef(repoRoot, guardRef, p, grepAllowedDirs) : null;
-        const preImplementGuard = planTargetGuard(task, task.planResponse, repoRoot, grepAllowedDirs, existsAtRef);
+        const revisionCount = typeof task.revisionCount === 'number' ? task.revisionCount : 0;
+        const preImplementGuard = planTargetGuard({ ...task, revisionCount }, task.planResponse, repoRoot, grepAllowedDirs, existsAtRef);
+        if (preImplementGuard.revise) {
+          task.revisionCount = preImplementGuard.revise.revisionCount;
+          appendHistoryEvent(task, 'revise', preImplementGuard.revise.feedback);
+          return {
+            succeeded: true,
+            blocked: false,
+            revise: true,
+            reviseFeedback: preImplementGuard.revise.feedback,
+            blockedStage: 'pre-implement',
+          };
+        }
         if (preImplementGuard.blocked) {
           appendHistoryEvent(task, 'blocked', preImplementGuard.reason);
           return {
