@@ -39,18 +39,21 @@
 //               pipeline's default pin (49152, sized for the 24 GB cards). Becomes AGENT_MANAGER_LANE_NUM_CTX in the lane's env
 //               (gpu-capacity.js reads it). Measured on an 8 GB RX 580 with qwen3-vl:8b: 49152 -> 10.6 tok/s at 80% GPU, 16384 -> 26.2 tok/s at 100%.
 //   provider    optional 'ollama' (default, today's behaviour) | 'cloud'. A 'cloud' lane's ollamaUrl is the cloud-providers gateway (an
-//               Ollama-compatible endpoint that forwards to a cloud model), not a GPU. It is EXPLICIT and BOUNDED: it REQUIRES a non-empty
-//               taskClasses allowlist (an entry without one is dropped, so a cloud lane can never claim "anything"), preempt must be 'never',
+//               Ollama-compatible endpoint that forwards to a cloud model), not a GPU. It is EXPLICIT and BOUNDED: it takes an OPTIONAL
+//               taskClasses allowlist (absent or null = any task source; a non-empty array = an allowlist; an empty array or non-array drops the entry), preempt must be 'never',
 //               and it cannot run a reviewer daemon. numCtx/numBatch are ignored (they describe a GPU). A cloud lane carries provider:'cloud'
 //               and cloud:true on its lane object; ollama lanes keep their exact shape (those keys are absent, read them as false).
 //               'script' (2026-11-02): a lane whose work is a SCRIPT HANDLER (src/script-handler-registry.js), not a model draft -- ollamaUrl is the service the script
-//               talks to (the GPU broker for the llm-tuner), `model` is optional (default 'script'). Bounded exactly like a cloud lane (non-empty taskClasses, preempt
+//               talks to (the GPU broker for the llm-tuner), `model` is optional (default 'script'). Bounded like a cloud lane (a non-empty taskClasses allowlist is REQUIRED, preempt
 //               'never', no reviewer, numCtx/numBatch ignored) and carries provider:'script' and script:true; it is never probed, leased or offered to chat.
 //   taskClasses optional allowlist of task SOURCE names (brain_dump_sort, change_review, ...). Absent = the lane claims any
 //               task (today's behaviour for the host and P40 lanes). Present = the claim loop (next-claimable-task.js) only
 //               offers this lane tasks of those sources, so a small GPU can be given only the work that fits it. A task
 //               explicitly pinned to the lane (operator action) still wins. An EMPTY list is invalid (a lane that can claim
 //               nothing is a misconfiguration, not a feature) and drops the entry.
+//
+//   reviews    optional boolean on a cloud lane (default true; absent on ollama and script lanes). It is carried on the lane object;
+//               nothing reads it yet. A non-boolean value drops the entry.
 //
 // FAIL CLOSED: a malformed file, or an entry missing a required field / with a bad id, URL, preempt or taskClasses, never
 // creates a lane (and never widens one); the problem goes to stderr once per process and every other lane carries on.
@@ -143,8 +146,8 @@ function laneFromEntry(raw, index) {
   const model = typeof raw.model === 'string' ? raw.model.trim() : (script && raw.model === undefined ? 'script' : '');
   if (!model) { warnOnce(`${where} (${id}) needs a "model"; skipped`); return null; }
   const cloud = provider === 'cloud';
-  const bounded = cloud || script; // not a GPU: no ctx/batch, no reviewer, never preempted, and it must name what it may claim
-  if (bounded && (raw.taskClasses === undefined || raw.taskClasses === null)) { warnOnce(`${where} (${id}) is a ${provider} lane and needs a taskClasses allowlist; skipped`); return null; }
+  const bounded = cloud || script; // not a GPU: no ctx/batch, no reviewer, never preempted, and a script lane must name what it may claim
+  if (script && (raw.taskClasses === undefined || raw.taskClasses === null)) { warnOnce(`${where} (${id}) is a ${provider} lane and needs a taskClasses allowlist; skipped`); return null; }
   if (raw.slow !== undefined && typeof raw.slow !== 'boolean') { warnOnce(`${where} (${id}) slow must be true or false; skipped`); return null; }
   let numCtx = null;
   if (!bounded && raw.numCtx !== undefined && raw.numCtx !== null) {
@@ -174,6 +177,8 @@ function laneFromEntry(raw, index) {
     if (!list.length) { warnOnce(`${where} (${id}) taskClasses must be a non-empty array of task source names; skipped`); return null; }
     taskClasses = [...new Set(list)];
   }
+  if (raw.reviews !== undefined && typeof raw.reviews !== 'boolean') { warnOnce(`${where} (${id}) reviews must be true or false; skipped`); return null; }
+  const reviews = cloud ? (raw.reviews === undefined ? true : raw.reviews) : undefined;
   return {
     id,
     gpu,
@@ -194,7 +199,7 @@ function laneFromEntry(raw, index) {
     model,
     tier,
     reserve,
-    ...(cloud ? { provider: 'cloud', cloud: true } : {}),
+    ...(cloud ? { provider: 'cloud', cloud: true, reviews } : {}),
     ...(script ? { provider: 'script', script: true } : {}),
   };
 }
