@@ -632,24 +632,6 @@ function renderProviderToggle(idAttr) {
   return `<button type="button" class="secondary provider-toggle${claudeClass}" id="${idAttr}" data-provider="${provider}" title="Local model vs. your Claude subscription -- click to switch">${label}</button>`;
 }
 
-function wireProviderToggle(idAttr) {
-  const btn = document.getElementById(idAttr);
-  if (!btn) return;
-  btn.onclick = (e) => {
-    e.stopPropagation();
-    const next = btn.dataset.provider === 'local' ? 'claude' : 'local';
-    providerChoices[idAttr] = next;
-    btn.dataset.provider = next;
-    btn.textContent = next === 'local' ? 'Local' : 'Claude';
-    btn.classList.toggle('provider-toggle-claude', next === 'claude');
-  };
-}
-
-function providerPayload(idAttr) {
-  const btn = document.getElementById(idAttr);
-  return { provider: (btn && btn.dataset.provider) || 'local' };
-}
-
 function allSourceNames() {
   if (!allSourceNamesPromise) {
     allSourceNamesPromise = fetchJson('/api/job-types').then((jobTypes) => jobTypes.map((j) => j.name).sort());
