@@ -22,12 +22,16 @@
 // Settings: AGENT_MANAGER_NODES_BIND (default 127.0.0.1; set it to the LAN address to accept other machines), AGENT_MANAGER_NODES_PORT (default 7471).
 // Run: node src/node-registry-server.js
 
+const fs = require('fs');
 const http = require('http');
+const path = require('path');
 const { verifyToken, recordHeartbeat, loadNodes, sweepStale } = require('./node-registry.js');
 const { readPause } = require('./worker-switch.js');
 const { claimNext } = require('./node-claim.js');
 const { leaseFor, returnLease, settleExpired } = require('./lease-ledger.js');
 const { makeAskNode } = require('./node-status-client.js');
+const { findRecordFile } = require('./lend-task.js');
+const { writeJsonAtomicSync } = require('./atomic-write.js');
 
 const MAX_BODY_BYTES = 8 * 1024;
 const RETRY_AFTER_SEC = 60;
@@ -67,6 +71,23 @@ function readBody(req) {
 // AGENT_MANAGER_NODE_PIPELINE_DIRS is a comma-separated list of pipeline directories; blanks and empty entries are dropped.
 function parsePipelineDirs(value) {
   return String(value || '').split(',').map((d) => d.trim()).filter((d) => d.length > 0);
+}
+
+// After a release, drops the leasedTo stamp that claimNext wrote on the task record, so the pool sees the task as unleased again.
+// Only the first record found is touched, and only when leasedTo names the releasing node. Best effort: the ledger row is the truth,
+// so a missing record or a failed write is swallowed and never fails the release. No other field is changed.
+function clearLeasedTo(taskId, nodeId, pipelineDirs) {
+  for (const pipelineDir of pipelineDirs) {
+    const file = findRecordFile(pipelineDir, taskId);
+    if (!file) continue;
+    try {
+      const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (!record || typeof record !== 'object' || record.leasedTo !== nodeId) return;
+      const { leasedTo, ...rest } = record;
+      writeJsonAtomicSync(file, rest);
+    } catch (e) { /* best effort: the ledger row is the truth */ }
+    return;
+  }
 }
 
 function createServer({
@@ -119,6 +140,7 @@ function createServer({
     if (!lease || lease.nodeId !== payload.id) return send(res, 409, { ok: false, error: 'lease is not held by this node' });
     const returned = release(payload.taskId, { env });
     if (!returned) return send(res, 409, { ok: false, error: 'no lent lease for this task' });
+    clearLeasedTo(payload.taskId, lease.nodeId, pipelineDirs);
     return send(res, 200, { ok: true });
   };
 
