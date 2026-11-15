@@ -298,3 +298,51 @@ test('consecutive errors double the backoff up to a 10 minute cap and stay there
   }
   assert.deepEqual(waits, [30000, 60000, 120000, 240000, 480000, 600000, 600000, 600000]);
 });
+
+// --- the request body never carries an empty classes list (HUB0416 corrective) ---
+// An absent classes key means "no class filter" on the claim side; claimNext filters with Array.isArray(classes) && !classes.includes(...),
+// so an empty array would filter out every task and a node started with the daemon would never claim anything.
+
+async function bodyFor(t, depsExtra) {
+  const { env } = setup(t);
+  const server = await claimServer(t, [{ body: { ok: true, task: null, retryAfterSec: 0 } }]);
+  await pullOnce({ env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url }, deps: { log: noLog, ensureRepo: async () => {}, ...depsExtra } });
+  assert.equal(server.requests.length, 1);
+  return server.requests[0].body;
+}
+
+test('without deps.classes the request body has exactly the key id', async (t) => {
+  const body = await bodyFor(t, {});
+  assert.deepEqual(Object.keys(body), ['id']);
+  assert.deepEqual(body, { id: NODE_ID });
+});
+
+test('with deps.classes the request body carries them, in order', async (t) => {
+  assert.deepEqual(await bodyFor(t, { classes: ['adhoc', 'pending'] }), { id: NODE_ID, classes: ['adhoc', 'pending'] });
+});
+
+test('an empty deps.classes array sends no classes key', async (t) => {
+  const body = await bodyFor(t, { classes: [] });
+  assert.equal('classes' in body, false);
+  assert.deepEqual(body, { id: NODE_ID });
+});
+
+test('the default request really claims a task through claimNext, while an empty classes array would claim nothing', async (t) => {
+  const { claimNext } = require('./node-claim.js');
+  const body = await bodyFor(t, {});
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'node-pull-claim-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const pipe = path.join(root, 'pipe');
+  fs.mkdirSync(path.join(pipe, 'queue', 'pending'), { recursive: true });
+  fs.writeFileSync(path.join(pipe, 'queue', 'pending', 't-claimable.json'), JSON.stringify({ id: 't-claimable', title: 't-claimable' }));
+  const nodesDir = path.join(root, 'nodes');
+  fs.mkdirSync(nodesDir, { recursive: true });
+  const env = { AGENT_MANAGER_NODES_DIR: nodesDir };
+  // What the registry does with the default body: no classes key -> no filter -> the task is claimed.
+  const got = claimNext({ nodeId: body.id, claimant: body.id, classes: body.classes, pipelineDirs: [pipe], env, now: Date.now(), readRemote: () => '' });
+  assert.ok(got, 'the default request claims the pending task');
+  assert.equal(got.task.id, 't-claimable');
+  // The old body ({id, classes: []}) is the defect this corrective removes: it claims nothing.
+  fs.rmSync(path.join(nodesDir, 'leases.json'), { force: true });
+  assert.equal(claimNext({ nodeId: body.id, claimant: body.id, classes: [], pipelineDirs: [pipe], env, now: Date.now(), readRemote: () => '' }), null);
+});
