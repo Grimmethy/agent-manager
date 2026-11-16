@@ -159,6 +159,28 @@ worker_switched_off() {
   node "$switch_js" is-disabled "$id" 2>/dev/null
 }
 
+# cloud_take_review <instance_id> -> exit 0 when this cloud worker just reviewed one waiting item (the caller then ends the tick), 1 when it did not and should go on to
+# draft. Owner rule (cloud-agent-pool): cloud agents review before they draft, and when every waiting review is already claimed the agent takes a draft. Only a worker-cloud /
+# worker-cloudN instance reviews, and not when its lane says reviews:false (LANE_RULES_CLOUD_REVIEWS, kept fresh by reload_lane_rules; unset counts as true). No spawn at all
+# when queue/review/ holds no .json file; otherwise `node src/review-unclaimed.js` asks whether some item has no live claim. If one does, run ONE review as
+# `review-runner.sh reviewer-<gpu> --once` under this worker's own env (OLLAMA_URL = the lane's gateway, LOCAL_MODEL = its model): --once reviews one item and exits 10 when it
+# did, 0 when it found nothing; the runner's per-item claim already keeps two workers off one item. AGENT_MANAGER_CLOUD_REVIEW_RUNNER overrides the runner path (tests).
+# No timer or loop here: the caller's tick is the trigger.
+cloud_take_review() {
+  local id="${1:-}"
+  [[ "$id" =~ ^worker-cloud[0-9]*$ ]] || return 1
+  [[ "${LANE_RULES_CLOUD_REVIEWS:-true}" != "false" ]] || return 1
+  compgen -G "${QUEUE_DIR:-${PIPELINE_DIR:-}/queue}/review/*.json" >/dev/null || return 1
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  node "${here}/../src/review-unclaimed.js" "${PIPELINE_DIR:-}" "${INSTANCES_DIR:-}" >/dev/null 2>&1 || return 1
+  local runner="${AGENT_MANAGER_CLOUD_REVIEW_RUNNER:-${here}/review-runner.sh}"
+  write_heartbeat_file "$id" "working" "${HEARTBEAT_MODEL:-}" "" "review" "${STARTED_AT:-}"
+  local rc=0
+  bash "$runner" "reviewer-${id#worker-}" --once || rc=$?
+  [[ $rc -eq 10 ]]
+}
+
 # cloud_dial_off <instance_id> -> exit 0 when the cloud-agent dial (src/cloud-dial.js, cloud-dial.json) turns this cloud lane off, 1 otherwise. Only a worker-cloud /
 # worker-cloudN instance is ever asked; every other worker returns 1 at once. With no dial file (today's state) it returns 1 without spawning node. With a file it asks
 # `node src/cloud-dial.js is-off <id>` only when the dial file or lanes.json is newer than a per-instance stamp, and otherwise reuses the last answer (CLOUD_DIAL_LAST), so
@@ -765,7 +787,7 @@ check_instance_liveness() {
 
 # reload_lane_rules [instance_id] -> re-reads this lane's taskClasses and reviewer daemon from src/lanes.js --env (one node spawn), so a lanes.json
 # edit reaches a running worker without a restart. Gated on a bash -nt test: node runs only when lanes.json is newer than LANE_RULES_STAMP, so an
-# unchanged registry costs no spawn. Sets LANE_RULES_TASK_CLASSES and LANE_RULES_REVIEWS. A failed call or missing keys keeps the last good values.
+# unchanged registry costs no spawn. Sets LANE_RULES_TASK_CLASSES, LANE_RULES_REVIEWS and (cloud lanes only) LANE_RULES_CLOUD_REVIEWS. A failed call or missing keys keeps the last good values.
 # The stamp is touched on every path inside the gate, so a failing call is not retried until lanes.json changes again. Logs one line only when a value
 # changes. No timer or loop here: the caller's tick is the trigger.
 reload_lane_rules() {
@@ -786,14 +808,16 @@ reload_lane_rules() {
 
   printf '%s\n' "$out" | grep -q '^LANE_TASK_CLASSES=' || return 0
   printf '%s\n' "$out" | grep -q '^LANE_REVIEWS=' || return 0
-  local classes reviews
+  local classes reviews cloud_reviews
   classes="$(printf '%s\n' "$out" | sed -n 's/^LANE_TASK_CLASSES=//p' | head -n 1)"
   reviews="$(printf '%s\n' "$out" | sed -n 's/^LANE_REVIEWS=//p' | head -n 1)"
+  cloud_reviews="$(printf '%s\n' "$out" | sed -n 's/^LANE_CLOUD_REVIEWS=//p' | head -n 1)"   # cloud lanes only (true|false); empty for every other lane
 
-  if [[ "${LANE_RULES_TASK_CLASSES-__unset__}" != "$classes" || "${LANE_RULES_REVIEWS-__unset__}" != "$reviews" ]]; then
-    printf '[%s] lane rules: taskClasses=%s reviews=%s\n' "$id" "${classes:-any}" "${reviews:-none}" >&2
+  if [[ "${LANE_RULES_TASK_CLASSES-__unset__}" != "$classes" || "${LANE_RULES_REVIEWS-__unset__}" != "$reviews" || "${LANE_RULES_CLOUD_REVIEWS-__unset__}" != "$cloud_reviews" ]]; then
+    printf '[%s] lane rules: taskClasses=%s reviews=%s%s\n' "$id" "${classes:-any}" "${reviews:-none}" "${cloud_reviews:+ cloudReviews=$cloud_reviews}" >&2
   fi
   LANE_RULES_TASK_CLASSES="$classes"
   LANE_RULES_REVIEWS="$reviews"
+  LANE_RULES_CLOUD_REVIEWS="$cloud_reviews"
   return 0
 }
