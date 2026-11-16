@@ -30,6 +30,14 @@
 // time, so the round-trip closes instead of just getting detected after the fact.
 
 const { extractRequestObjectTokens } = require('./request-object-tokens.js');
+const { findOverride, buildOverrideEvent } = require('./gate-override.js');
+
+// Records an applied owner override on the task's history via the existing task-history sink (appendHistoryEvent). Called for EVERY matched override, even when it
+// suppressed nothing (`suppressed` may be []), so a misapplied override can always be found later. task-history.js is required lazily at call time.
+function recordGateOverride(task, gate, entry, suppressed) {
+  const { type, ...payload } = buildOverrideEvent({ gate, reason: entry.reason, by: entry.by, at: entry.at, suppressed });
+  require('./task-history.js').appendHistoryEvent(task, type, JSON.stringify(payload));
+}
 
 // --- diff parsing -----------------------------------------------------------
 
@@ -583,9 +591,13 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   const targets = extractDeclaredTargets(task, planText);
   const forbidden = extractForbiddenPaths(combined)
     .filter((f) => !targets.some((t) => pathsRefEqual(f, t)));
+  const forbiddenOverride = findOverride(task, 'forbidden-path');
+  const forbiddenSuppressed = [];
   if (forbidden.length) {
     const violations = files.map((f) => ({ f, hit: pathHitsForbidden(f.path, forbidden) })).filter((v) => v.hit);
-    if (violations.length) {
+    if (violations.length && forbiddenOverride) {
+      for (const v of violations) forbiddenSuppressed.push(v.f.path);
+    } else if (violations.length) {
       const list = violations.map((v) => `${v.f.path} (matches forbidden "${v.hit}")`).join(', ');
       return {
         code: 'forbidden-path',
@@ -594,6 +606,8 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
       };
     }
   }
+
+  if (forbiddenOverride) recordGateOverride(task, 'forbidden-path', forbiddenOverride, forbiddenSuppressed);
 
   // 2. Deletes a file the task never asked to delete.
   const deletes = files.filter((f) => f.kind === 'delete');
@@ -610,6 +624,8 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   // (when present) is authoritative -- see extractDeclaredFiles's own header for why a
   // free-text keyword scan can't distinguish an edit target from a cited-as-evidence
   // path. Only falls back to CODE_SIGNAL_RE's blind scan when no Files: line exists.
+  const docsOverride = findOverride(task, 'docs-only');
+  const docsSuppressed = [];
   const nonDoc = files.filter((f) => !isDocPath(f.path));
   // A task whose own declared edit targets are ALL documentation (its Files: line, a path in its title, or a file it says to create) is a documentation task no matter how many code paths
   // its text cites as evidence (HUB0117 3/4: "Edit `docs/local-delegation.md` ... point to `agent-manager.env.example`").
@@ -644,6 +660,7 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
       // Fall through to the legacy check below
     } else if (mentionsDocs && allFilesAreDocs) {
       // Pure docs task: no code signals, diff matches declared docs -> pass
+      if (docsOverride) recordGateOverride(task, 'docs-only', docsOverride, []);
       return null;
     }
     // Mixed task (code + docs) that only produced docs: provide specific feedback about missing code
@@ -663,13 +680,17 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
       const specificFeedback = missingCode.length > 0
         ? ` The task mentions these code paths that your diff should include: ${missingCode.join(', ')}.`
         : '';
-      return {
+      if (docsOverride) {
+        for (const f of files) docsSuppressed.push(f.path);
+      } else return {
         code: 'docs-only',
         reason: `diff only touches documentation (${files.map((f) => f.path).join(', ')}) -- the task asks for a code change`,
         retryFeedback: `${feedbackBase}${specificFeedback}`,
       };
     }
   }
+
+  if (docsOverride) recordGateOverride(task, 'docs-only', docsOverride, docsSuppressed);
 
   // 4. A checkable "all N tests pass/added" claim contradicted by the diff's own test defs.
   const claimed = extractClaimedTestCount(summary);
