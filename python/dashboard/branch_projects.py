@@ -83,7 +83,9 @@ def _refresh_stale(projects):
             import event_stream
             with _lock:
                 previous = _state["cache"].get(p["repoRoot"]) or {}
-                _state["cache"][p["repoRoot"]] = {"at": time.time(), "branches": branches, "error": err}
+                # okAt is the last SUCCESSFUL refresh: a failed one keeps the previous okAt, so the age counts from the last good list.
+                ok_at = previous.get("okAt", 0.0) if err else time.time()
+                _state["cache"][p["repoRoot"]] = {"at": time.time(), "okAt": ok_at, "branches": branches, "error": err}
             if event_stream.digest(branches) != event_stream.digest(previous.get("branches")):
                 event_stream.announce("branch-list-changed", project=p["repoRoot"])
     finally:
@@ -112,6 +114,13 @@ def other_project_branches(active_root):
     return result, pending
 
 
+def _age_seconds(entry, now):
+    """Whole seconds since the last successful refresh of a cached project list, or None when there is no list, its `at` was expired (0.0), or it has no okAt."""
+    if not entry or not entry.get("at") or not entry.get("okAt"):
+        return None
+    return max(0, int(now - entry["okAt"]))
+
+
 def combined_branches(active_branches, active_root):
     """Active project's branches first (their existing order), then each other project's, projects A-Z and oldest push first within one. Every row is a copy carrying a
     `project` tag, so the cached lists are never mutated. Returns (rows, pending project labels)."""
@@ -122,9 +131,13 @@ def combined_branches(active_branches, active_root):
         tag = project_tag(active) if active else {"label": "active project", "repoRoot": active_root or "", "active": True}
         rows.extend({**b, "project": tag} for b in active_branches)
     others, pending = other_project_branches(active_root)
+    with _lock:
+        cache = dict(_state["cache"])
+    now = time.time()
     for p, branches in sorted(others, key=lambda pb: pb[0]["label"].lower()):
         tag = project_tag(p)
-        rows.extend({**b, "project": tag} for b in sorted(branches, key=lambda b: b.get("pushedAt") or ""))
+        age = _age_seconds(cache.get(p["repoRoot"]), now)
+        rows.extend({**b, "project": tag, "repoRoot": p["repoRoot"], "ageSeconds": age} for b in sorted(branches, key=lambda b: b.get("pushedAt") or ""))
     return rows, pending
 
 
@@ -164,8 +177,30 @@ def refresh_branches(scope):
     rows = app._list_unmerged_branches_uncached(force_fetch=True, repo_root=scope["repoRoot"], pipeline_dir=scope["pipelineDir"],
                                                 fetch_timeout=app._ACTION_FETCH_TIMEOUT_SECONDS)
     with _lock:
-        _state["cache"][scope["repoRoot"]] = {"at": time.time(), "branches": rows, "error": None}
+        now = time.time()
+        _state["cache"][scope["repoRoot"]] = {"at": now, "okAt": now, "branches": rows, "error": None}
     return rows
+
+
+def refresh_other_projects(active_root, only_root=None):
+    """Recompute the cached list of every NON-active registered project NOW (or only `only_root`), one after another. Returns {repoRoot: {"ok": bool, "error": str|None}}.
+    A failing project is recorded and the others still run. Raises ValueError when `only_root` names no non-active registered project (the route answers 400)."""
+    others = [p for p in registered_projects(active_root) if not p["active"]]
+    if only_root:
+        real = os.path.realpath(only_root)
+        others = [p for p in others if p["repoRoot"] == real]
+        if not others:
+            raise ValueError(f"'{only_root}' is not a registered project")
+    results = {}
+    for p in others:
+        try:
+            refresh_branches(p)
+            results[p["repoRoot"]] = {"ok": True, "error": None}
+        except Exception as e:  # noqa: BLE001 -- one broken repo must not stop the others
+            err = f"{type(e).__name__}: {e}"
+            print(f"[branches] refresh of {p['label']} failed (non-fatal): {err}", file=sys.stderr)
+            results[p["repoRoot"]] = {"ok": False, "error": err}
+    return results
 
 
 def after_action(scope):
