@@ -71,6 +71,19 @@ test('returned with lastEvent null is not delivered', () => {
   assert.deepEqual(r.outcomes, [{ taskId: 'a', node: 'grimm', result: 'abandoned' }]);
 });
 
+test('returned or expired with lastEvent merged is merged and never delivered', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['a', 'b'], leases: [row('a', { state: 'returned', lastEvent: 'merged' }), row('b', { state: 'expired', lastEvent: 'merged' })] });
+  assert.deepEqual(r.outcomes.map((o) => o.result), ['merged', 'merged']);
+  assert.deepEqual(r.delivered, []);
+  assert.deepEqual(r.pending, []);
+});
+
+test('returned with lastEvent failed or blocked is failed and never delivered', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['a', 'b'], leases: [row('a', { state: 'returned', lastEvent: 'failed' }), row('b', { state: 'returned', lastEvent: 'blocked' })] });
+  assert.deepEqual(r.outcomes.map((o) => o.result), ['failed', 'failed']);
+  assert.deepEqual(r.delivered, []);
+});
+
 test('returned + failed is not delivered and is a failed outcome', () => {
   const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['a'], leases: [row('a', { state: 'returned', lastEvent: 'failed' })] });
   assert.deepEqual(r.delivered, []);
