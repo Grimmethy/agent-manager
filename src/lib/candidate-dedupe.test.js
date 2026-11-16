@@ -89,3 +89,25 @@ test('entriesIn reads a Symbol: line, so an entry whose title has no identifier 
   assert.deepEqual(entriesIn(text), [{ id: 'AC-7', key: 'src/a.js::realfn' }]);
   assert.deepEqual(findDuplicateCandidate({ title: 'Something unrelated', files: 'src/a.js', symbol: 'realFn' }, [{ ref: 'master', text }]), { duplicateOf: 'AC-7', ref: 'master', matchedBy: 'identifier' });
 });
+
+// --- whole-file candidates ("Remove unused file <path>") are keyed by their path ---
+
+test('whole-file title yields a non-null key containing the lowercased path', () => {
+  const k = candidateKey(cand('Remove unused file X/a.tsx', 'X/a.tsx'));
+  assert.notEqual(k, null);
+  assert.match(k, /x\/a\.tsx/);
+});
+
+test('whole-file keys for different paths differ', () => {
+  assert.notEqual(
+    candidateKey(cand('Remove unused file X/a.tsx', 'X/a.tsx')),
+    candidateKey(cand('Remove unused file X/b.tsx', 'X/b.tsx')),
+  );
+});
+
+test('backticked titles keep their previous keys', () => {
+  assert.equal(
+    candidateKey(cand('Decompose `api_task_requeue` into four single-purpose helpers', 'python/dashboard/routes/task.py')),
+    'python/dashboard/routes/task.py::api_task_requeue',
+  );
+});
