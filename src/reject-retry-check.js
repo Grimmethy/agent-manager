@@ -1118,6 +1118,19 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
   return summary;
 }
 
+// True when any prior draft attempt on this task was blocked by a degenerate critique call.
+// Primary signal: task.draftAttempts[i].critique.outcome === 'critique-degenerate' (written by recordCritique in
+// src/draft-attempt-record.js). Fallback: the attempt's blockedReason, which finalize copies from the draft result and
+// which implement-critique.js sets to 'Critique call degenerate (...)' when the critique call came back degenerate.
+function hasPriorCritiqueDegenerate(task) {
+  if (!task || typeof task !== 'object' || !Array.isArray(task.draftAttempts)) return false;
+  return task.draftAttempts.some((attempt) => {
+    if (!attempt || typeof attempt !== 'object') return false;
+    if (attempt.critique && attempt.critique.outcome === 'critique-degenerate') return true;
+    return typeof attempt.blockedReason === 'string' && attempt.blockedReason.startsWith('Critique call degenerate');
+  });
+}
+
 function main() {
   const { pipelineDir, deepDiveCoveragePath, brainDumpPath } = getConfig();
   const queueDir = path.join(pipelineDir, 'queue');
@@ -1131,7 +1144,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { selectFeedbackBranch, buildFeedbackString, isCritiqueDegenerateBlock, rejectRetryCheck, stampBrainDumpSortExhausted, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
+module.exports = { hasPriorCritiqueDegenerate, selectFeedbackBranch, buildFeedbackString, isCritiqueDegenerateBlock, rejectRetryCheck, stampBrainDumpSortExhausted, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
 
 if (require.main === module) {
   main();
