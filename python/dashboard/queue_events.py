@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-TYPES = ("verdict_recorded", "branch_merged")
+TYPES = ("verdict_recorded", "branch_merged", "branch_pushed")
 MAX_LINE_BYTES = 3500
 DEFAULT_ROTATE_BYTES = 5 * 1024 * 1024
 
