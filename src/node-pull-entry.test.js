@@ -9,6 +9,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { buildDaemonDeps, repoNameFromUrl, parseClasses, PAUSE_MARKER } = require('./node-pull-entry.js');
+const { maxTasks, countHeldTasks } = require('./node-pull-entry.js');
 
 const NODE = 'grimm';
 
@@ -198,6 +199,73 @@ test('a started daemon makes exactly one claim with body {id} and the bearer tok
   assert.equal(seen.length, 1);
   assert.deepEqual(seen[0].body, { id: NODE });
   assert.equal(seen[0].auth, 'Bearer tok');
+});
+
+test('maxTasks reads AGENT_MANAGER_NODE_MAX_TASKS: whole numbers 1 to 8 count, anything else is 1', () => {
+  for (const [raw, want] of [['2', 2], ['8', 8], ['1', 1], [' 3 ', 3], ['08', 8], ['0', 1], ['-1', 1], ['1.5', 1], ['2.0', 1], ['abc', 1], ['9', 1], [' ', 1], ['', 1]]) {
+    assert.equal(maxTasks({ AGENT_MANAGER_NODE_MAX_TASKS: raw }), want, JSON.stringify(raw));
+  }
+  assert.equal(maxTasks({}), 1, 'unset');
+  assert.equal(maxTasks(undefined), 1, 'no env');
+});
+
+test('with the variable unset one held record makes the worker not free and zero held keeps it free', (t) => {
+  const { env, pipelineDir } = setup(t);
+  assert.equal(buildDaemonDeps(env).isWorkerFree(), true, 'zero held');
+  put(pipelineDir, 'adhoc', 't1', { leasedTo: NODE });
+  assert.equal(buildDaemonDeps(env).isWorkerFree(), false, 'one held');
+});
+
+test('with AGENT_MANAGER_NODE_MAX_TASKS=2: zero held is free, one held is free, two held is not', (t) => {
+  const { env, pipelineDir } = setup(t, { AGENT_MANAGER_NODE_MAX_TASKS: '2' });
+  assert.equal(buildDaemonDeps(env).isWorkerFree(), true, 'zero');
+  put(pipelineDir, 'adhoc', 't1', { leasedTo: NODE });
+  assert.equal(buildDaemonDeps(env).isWorkerFree(), true, 'one');
+  put(pipelineDir, 'pending', 't2', { leasedTo: NODE });
+  assert.equal(buildDaemonDeps(env).isWorkerFree(), false, 'two');
+});
+
+test('held records add up across adhoc, pending and a drafting worker folder', (t) => {
+  const { env, pipelineDir } = setup(t);
+  put(pipelineDir, 'adhoc', 'a1', { leasedTo: NODE });
+  put(pipelineDir, path.join('drafting', 'worker-a'), 'd1', { leasedTo: NODE });
+  assert.equal(countHeldTasks(pipelineDir, NODE), 2);
+  assert.equal(buildDaemonDeps({ ...env, AGENT_MANAGER_NODE_MAX_TASKS: '2' }).isWorkerFree(), false, 'two held with limit 2');
+  assert.equal(buildDaemonDeps({ ...env, AGENT_MANAGER_NODE_MAX_TASKS: '8' }).isWorkerFree(), true, 'two held with limit 8');
+});
+
+test('records leased to another node and records with no leasedTo are not counted', (t) => {
+  const { pipelineDir } = setup(t);
+  put(pipelineDir, 'adhoc', 'o1', { leasedTo: 'someone-else' });
+  put(pipelineDir, 'pending', 'p1', {});
+  put(pipelineDir, path.join('drafting', 'worker-a'), 'o2', { leasedTo: 'wok' });
+  assert.equal(countHeldTasks(pipelineDir, NODE), 0);
+});
+
+test('countHeldTasks skips an invalid json file and a non-json file', (t) => {
+  const { pipelineDir } = setup(t);
+  put(pipelineDir, 'adhoc', 'ok', { leasedTo: NODE });
+  fs.writeFileSync(path.join(pipelineDir, 'queue', 'adhoc', 'bad.json'), '{ not json');
+  fs.writeFileSync(path.join(pipelineDir, 'queue', 'adhoc', 'note.txt'), JSON.stringify({ leasedTo: NODE }));
+  assert.equal(countHeldTasks(pipelineDir, NODE), 1);
+});
+
+test('countHeldTasks returns the exact number of held records: 0, 1 and 3', (t) => {
+  const { pipelineDir } = setup(t);
+  assert.equal(countHeldTasks(pipelineDir, NODE), 0);
+  put(pipelineDir, 'pending', 'one', { leasedTo: NODE });
+  assert.equal(countHeldTasks(pipelineDir, NODE), 1);
+  put(pipelineDir, 'pending', 'two', { leasedTo: NODE });
+  put(pipelineDir, path.join('drafting', 'worker-b'), 'three', { leasedTo: NODE });
+  assert.equal(countHeldTasks(pipelineDir, NODE), 3);
+});
+
+test('an unset node id or pipeline dir is still not free with a high limit', (t) => {
+  const { env } = setup(t, { AGENT_MANAGER_NODE_MAX_TASKS: '8' });
+  const noId = { ...env }; delete noId.AGENT_MANAGER_NODE_ID;
+  assert.equal(buildDaemonDeps(noId).isWorkerFree(), false);
+  const noDir = { ...env }; delete noDir.AGENT_MANAGER_PIPELINE_DIR;
+  assert.equal(buildDaemonDeps(noDir).isWorkerFree(), false);
 });
 
 test('the pause marker keeps the started daemon from claiming at all', async (t) => {
