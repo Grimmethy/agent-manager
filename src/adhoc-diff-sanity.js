@@ -106,6 +106,18 @@ const DOC_DELIVERABLE_RE = /\b(?:append|prepend|create|write|add|merge|insert|do
 // changed)" was itself read as a code request because of "NEW file" and "write"). Only meaningful together with a stated documentation deliverable, see wantsCodeChange.
 const READ_ONLY_RE = /\bread-only\b|\bnothing else (?:is |was |gets )?(?:touched|changed|modified|edited)\b|\bchange nothing else\b|\bwrite ONLY the one\b/i;
 
+// Markdown emphasis or backticks around a plain word ("Do **not** open", "__never__ edit", "`delete`") hide a negator or code word from the regexes below.
+// Strip the markup from plain words only. A path token (it contains "/" or ".") keeps its backticks or emphasis.
+function normaliseEmphasis(text) {
+  return String(text || '')
+    .replace(/(?<![\w*])\*\*([A-Za-z][A-Za-z' -]*?)\*\*(?![\w*/.])/g, '$1')
+    .replace(/(?<![\w_])__([A-Za-z][A-Za-z' -]*?)__(?![\w_/.])/g, '$1')
+    .replace(/`([A-Za-z][\w-]*)`/g, '$1');
+}
+
+// Prohibition triggers. A code signal AFTER one of these in the same sentence is a negated request, not a request for code.
+const PROHIBITION_TRIGGER_RE = /\b(do\s+not|don['’]t|never|no|without)\b/i;
+
 function stripNonRequests(sen) {
   return sen.replace(NEGATED_VERB_RE, ' ').replace(PIPELINE_BOILERPLATE_RE, ' ');
 }
@@ -117,11 +129,20 @@ function scanForCodeSignals(text) {
   // still part of the SAME citation ("The code anchor is real: src/foo.js defines ..."),
   // and splitting on it would separate the citation marker from the very code-signal
   // token it's meant to cover.
-  const sentences = String(text || '').split(/(?<=[.!?])\s+|\n+/);
+  const sentences = normaliseEmphasis(text).split(/(?<=[.!?])\s+|\n+/);
+  const excluded = [];
   let docDeliverable = false;
   const tripping = [];
-  for (const sen of sentences) {
+  for (let si = 0; si < sentences.length; si++) {
+    const sen = sentences[si];
     if (CITATION_CONTEXT_RE.test(sen)) continue;
+    // A prohibition ("Do not open src/x.js") negates the code signals that come AFTER its trigger in the same sentence. A signal BEFORE the trigger is a real request
+    // ("Change the timeout in src/foo.js but do not touch the tests"), so such a sentence is left to the normal scan.
+    const prohib = PROHIBITION_TRIGGER_RE.exec(sen);
+    if (prohib && CODE_SIGNAL_RE.test(sen.slice(prohib.index + prohib[0].length)) && !CODE_SIGNAL_RE.test(sen.slice(0, prohib.index))) {
+      excluded.push({ event: 'prohibition-excluded-from-signal', sentenceIndex: si, trigger: prohib[1].toLowerCase() });
+      continue;
+    }
     let cleaned = stripNonRequests(sen);
     const doc = DOC_DELIVERABLE_RE.exec(cleaned);
     if (doc) {
@@ -132,7 +153,7 @@ function scanForCodeSignals(text) {
     }
     if (CODE_SIGNAL_RE.test(cleaned)) tripping.push(cleaned);
   }
-  return { docDeliverable, tripping };
+  return { docDeliverable, tripping, excluded };
 }
 
 // A code PATH merely named, cited or described does not make a sentence a request -- but a sentence that OPENS WITH AN IMPERATIVE does, whatever the verb: "Lazy-load the job

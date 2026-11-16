@@ -830,6 +830,11 @@ test('identifier verbs: "lease-delete+yield" in a code-citing sentence is a name
   assert.equal(taskWantsCodeChange(adhocTask('Create docs/notes.md listing the evidence. Also delete the lease in src/a.js.')), true);
 });
 
+test('prohibition: a code path negated by "Do **not**" in the same sentence is not a request; a following imperative sentence still is', () => {
+  assert.equal(taskWantsCodeChange(adhocTask('Do **not** open or modify src/gpu-vram.js')), false);
+  assert.equal(taskWantsCodeChange(adhocTask('Do not open src/gpu-vram.js. Also delete the lease in src/a.js.')), true);
+});
+
 test('read-only doc tasks: tasks that name a doc deliverable WITHOUT a read-only statement, or that give a real imperative at a code path, still want code', () => {
   assert.equal(taskWantsCodeChange(adhocTask('Create docs/x.md and change the timeout in src/a.js.')), true);
   assert.equal(taskWantsCodeChange(adhocTask('Add a retry to fetchThing in src/a.js and create docs/x.md describing it.')), true);

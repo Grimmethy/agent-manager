@@ -2,7 +2,7 @@
 
 // Node pull (multi-node plan): asks the claim endpoint for work when this node has a free worker. A task that comes back is
 // written into this machine's queue/adhoc/ (writeAdhoc from src/node-intake-server.js) stamped leasedTo: <node id>.
-// pullOnce never throws. Daemon entry: node src/node-pull.js --daemon. All timers come from deps; there is no periodic timer.
+// pullOnce never throws. Daemon entry: node src/node-pull.js --daemon. All timers come from deps. Besides the debounce and retry timers, there is one 10-minute safety re-check timer, armed only after a successful pullOnce and never while a retry timer is pending.
 //
 // Settings: AGENT_MANAGER_CLAIM_URL (POST target), AGENT_MANAGER_NODE_TOKEN_FILE (token file, read and trimmed),
 // AGENT_MANAGER_NODE_ID (sent as id), AGENT_MANAGER_PIPELINE_DIR (where adhoc records are written).
@@ -14,6 +14,9 @@ const path = require('path');
 const DEBOUNCE_MS = 2000;
 const BACKOFF_FIRST_MS = 30000;
 const BACKOFF_CAP_MS = 600000;
+const SAFETY_RECHECK_MS = 10 * 60 * 1000;
+const WATCHED_QUEUES = ['adhoc', 'pending', 'blocked', 'review', 'node-outbox'];
+const DRAFTING_DIR = 'drafting';
 
 function defaultLog(message) {
   process.stderr.write(String(message) + '\n');
@@ -21,6 +24,15 @@ function defaultLog(message) {
 
 function errorMessage(e) {
   return e && e.message ? e.message : String(e);
+}
+
+// Names of the subdirectories directly inside dir; [] if dir cannot be read.
+function defaultListDirs(dir) {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch (e) {
+    return [];
+  }
 }
 
 function resolveDeps(deps = {}) {
@@ -33,6 +45,7 @@ function resolveDeps(deps = {}) {
     setTimeout: deps.setTimeout || setTimeout,
     clearTimeout: deps.clearTimeout || clearTimeout,
     watch: deps.watch || fs.watch,
+    listDirs: deps.listDirs || defaultListDirs,
     classes: deps.classes,
     isPaused: deps.isPaused || (() => false),
     isWorkerFree: deps.isWorkerFree || (() => true),
@@ -121,7 +134,9 @@ function startDaemon({ env = process.env, deps = {} } = {}) {
   let inFlight = false;
   let pending = false;
   let stopped = false;
-  let watcher = null;
+  const queueWatchers = [];
+  const draftWatchers = new Map();
+  let safetyTimer = null;
 
   const clear = (t) => {
     if (t) d.clearTimeout(t);
@@ -143,7 +158,13 @@ function startDaemon({ env = process.env, deps = {} } = {}) {
     pullOnce({ env, deps: d, state }).then(() => {
       inFlight = false;
       if (stopped) return;
-      if (state.nextAllowedAt > d.now()) armRetry();
+      if (state.nextAllowedAt > d.now()) {
+        // Error or retryAfterSec: retry only. Never a safety timer alongside it.
+        safetyTimer = clear(safetyTimer);
+        armRetry();
+      } else {
+        armSafety();
+      }
       if (pending) {
         pending = false;
         trigger();
@@ -161,6 +182,15 @@ function startDaemon({ env = process.env, deps = {} } = {}) {
     }, wait);
   };
 
+  const armSafety = () => {
+    safetyTimer = clear(safetyTimer);
+    // poll-ok: safety net for dropped fs.watch events; fires at most once per 10 min, re-arms only after a successful pullOnce, stops when paused or on error. Idle cost: one wake per 10 min (unmeasured in this pass).
+    safetyTimer = d.setTimeout(() => {
+      safetyTimer = null;
+      trigger();
+    }, SAFETY_RECHECK_MS);
+  };
+
   const onWatch = () => {
     debounceTimer = clear(debounceTimer);
     debounceTimer = d.setTimeout(() => {
@@ -169,15 +199,49 @@ function startDaemon({ env = process.env, deps = {} } = {}) {
     }, DEBOUNCE_MS);
   };
 
-  if (pipelineDir) {
+  const watchDir = (dir, label, handler) => {
     try {
-      watcher = d.watch(path.join(pipelineDir, 'queue', 'adhoc'), onWatch);
-      if (watcher && typeof watcher.on === 'function') {
-        watcher.on('error', (e) => d.log(`node-pull: watch error: ${errorMessage(e)}`));
+      const w = d.watch(dir, handler);
+      if (w && typeof w.on === 'function') {
+        w.on('error', (e) => d.log(`node-pull: watch error on ${label}: ${errorMessage(e)}`));
       }
+      return w;
     } catch (e) {
-      d.log(`node-pull: cannot watch adhoc queue: ${errorMessage(e)}`);
+      d.log(`node-pull: cannot watch ${label}: ${errorMessage(e)}`);
+      return null;
     }
+  };
+
+  // Opens watchers for new worker subdirectories of queue/drafting and closes those whose directory is gone.
+  const syncDraftWatchers = () => {
+    const draftingDir = path.join(pipelineDir, 'queue', DRAFTING_DIR);
+    const names = new Set(d.listDirs(draftingDir));
+    for (const [name, handle] of draftWatchers) {
+      if (!names.has(name)) {
+        if (handle && typeof handle.close === 'function') handle.close();
+        draftWatchers.delete(name);
+      }
+    }
+    for (const name of names) {
+      if (!draftWatchers.has(name)) {
+        const handle = watchDir(path.join(draftingDir, name), `queue/${DRAFTING_DIR}/${name}`, onWatch);
+        if (handle) draftWatchers.set(name, handle);
+      }
+    }
+  };
+
+  if (pipelineDir) {
+    for (const name of WATCHED_QUEUES) {
+      const handle = watchDir(path.join(pipelineDir, 'queue', name), `queue/${name}`, onWatch);
+      if (handle) queueWatchers.push(handle);
+    }
+    // Known gap: if queue/drafting does not exist at startup its watch fails and is not retried; it is picked up only after a restart.
+    const draftHandle = watchDir(path.join(pipelineDir, 'queue', DRAFTING_DIR), `queue/${DRAFTING_DIR}`, () => {
+      syncDraftWatchers();
+      onWatch();
+    });
+    if (draftHandle) queueWatchers.push(draftHandle);
+    syncDraftWatchers();
   } else {
     d.log('node-pull: AGENT_MANAGER_PIPELINE_DIR is not set; watching disabled');
   }
@@ -191,12 +255,20 @@ function startDaemon({ env = process.env, deps = {} } = {}) {
       stopped = true;
       debounceTimer = clear(debounceTimer);
       retryTimer = clear(retryTimer);
-      if (watcher && typeof watcher.close === 'function') watcher.close();
+      safetyTimer = clear(safetyTimer);
+      for (const w of queueWatchers) {
+        if (w && typeof w.close === 'function') w.close();
+      }
+      queueWatchers.length = 0;
+      for (const w of draftWatchers.values()) {
+        if (w && typeof w.close === 'function') w.close();
+      }
+      draftWatchers.clear();
     },
   };
 }
 
-module.exports = { pullOnce, makeState, startDaemon, DEBOUNCE_MS, BACKOFF_FIRST_MS, BACKOFF_CAP_MS };
+module.exports = { pullOnce, makeState, startDaemon, DEBOUNCE_MS, BACKOFF_FIRST_MS, BACKOFF_CAP_MS, SAFETY_RECHECK_MS, WATCHED_QUEUES };
 
 if (require.main === module && process.argv.includes('--daemon')) {
   // The real dependencies (repo on demand, one claimed task at a time, pause marker, class filter) live in src/node-pull-entry.js.
