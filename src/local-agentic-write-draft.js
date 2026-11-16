@@ -30,6 +30,32 @@ const { getConfig } = require('./config.js');
 const { runPlanWithTools, ORIENT_TURN_LIMIT, REQUEST_TIMEOUT_MS } = require('./local-tool-client.js');
 const { isForgePause } = require('./gpu-guard.js');
 const { resolveReadOnlySiblingRoots } = require('./accessible-roots.js');
+const { taskReadOnlyRoots } = require('./task-repo-roots.js');
+const chatProjects = require('./chat-projects.js');
+const pluginsManifest = require('./plugins-manifest.js');
+
+// Registered repo paths (projects.json repoRoots + plugins.json register-path dirs) that the task's own text names. Read-only:
+// the result is appended to readOnlyRoots only, leaving the primary and extra root arguments untouched. Excludes the writable worktree, the live checkout
+// and the apply clone so a task naming them never exposes them as sibling roots. Never throws.
+function taskReadOnlyRootsFor(task, worktreeDir) {
+  const nodePath = require('path');
+  const registered = [];
+  try {
+    for (const p of chatProjects.listProjects()) if (p && p.repoRoot) registered.push(p.repoRoot);
+  } catch { /* unreadable projects.json -> no project roots */ }
+  try {
+    for (const rp of pluginsManifest.enabledRegisterPaths(pluginsManifest.readPluginsManifest())) registered.push(nodePath.dirname(rp));
+  } catch { /* unreadable plugins.json -> no plugin roots */ }
+  const taskText = [task && task.title, task && task.rawText].filter((s) => typeof s === 'string').join('\n');
+  const cfg = getConfig();
+  const exclude = new Set([worktreeDir, cfg.repoRoot, cfg.applyRepoRoot, process.env.AGENT_MANAGER_CORE_REPO_ROOT]
+    .filter(Boolean).map((p) => nodePath.resolve(p)));
+  try {
+    return taskReadOnlyRoots(taskText, registered).filter((p) => !exclude.has(p));
+  } catch {
+    return [];
+  }
+}
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock, formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
 const { priorVerdictBlock } = require('./lib/prompt-blocks.js');
@@ -829,7 +855,7 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       allowWrite: true,
       primaryRoot: worktreeDir,
       // Registered plugin/project repos, READ-ONLY (2026-10-16): cross-repo verification tasks need real path:line evidence from them; writes stay in worktreeDir.
-      readOnlyRoots: resolveReadOnlySiblingRoots({ repoRoot: getConfig().repoRoot, worktreeDir, applyRepoRoot: getConfig().applyRepoRoot }),
+      readOnlyRoots: [...new Set([...resolveReadOnlySiblingRoots({ repoRoot: getConfig().repoRoot, worktreeDir, applyRepoRoot: getConfig().applyRepoRoot }), ...taskReadOnlyRootsFor(task, worktreeDir)])],
       // On a cap-exhausted run, spend one more no-tools turn forcing a RESOLUTION line
       // so resolveAgenticDraft has something to route on instead of a hard block.
       forceSummaryOnCap: true,
