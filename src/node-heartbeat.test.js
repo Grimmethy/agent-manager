@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
-const { config, readToken, freeRamGb, buildPayload, applyReply, runOnce, main, GLOBAL_PAUSE_TTL_MIN } = require('./node-heartbeat.js');
+const { config, readToken, freeRamGb, readCodeSha, buildPayload, applyReply, runOnce, main, GLOBAL_PAUSE_TTL_MIN } = require('./node-heartbeat.js');
 const { readPause, setPause } = require('./worker-switch.js');
 const { createServer } = require('./node-registry-server.js');
 const { registerNode, loadNodes } = require('./node-registry.js');
@@ -22,7 +22,7 @@ function setup(extra = {}) {
   const sent = [];
   const reply = { status: 200, body: { ok: true, globalPause: false, serverTime: '2026-11-11T12:00:00.000Z' } };
   const post = async (url, token, body) => { sent.push({ url, token, body: JSON.parse(body) }); return { status: reply.status, text: typeof reply.body === 'string' ? reply.body : JSON.stringify(reply.body) }; };
-  const deps = { loadavg: () => [1.234, 0, 0], readMeminfo: () => 'MemTotal: 16000000 kB\nMemAvailable: 8388608 kB\n', freemem: () => 123 };
+  const deps = { execGit: () => 'b'.repeat(40) + '\n', loadavg: () => [1.234, 0, 0], readMeminfo: () => 'MemTotal: 16000000 kB\nMemAvailable: 8388608 kB\n', freemem: () => 123 };
   return { dir, env, sent, reply, post, deps, run: () => runOnce({ env, now: () => T0, post, deps }) };
 }
 
@@ -44,11 +44,53 @@ test('freeRamGb uses MemAvailable, falls back to os.freemem, and rounds to two p
 test('the payload has the id, state up, load, free RAM, the paused flag and the time; address only when configured', () => {
   const t = setup();
   const p = buildPayload(config(t.env), t.env, T0, t.deps);
-  assert.deepEqual(p, { id: 'grimm', state: 'up', load: 1.23, freeRamGb: 8, paused: false, at: '2026-11-11T12:00:00.000Z' });
+  assert.deepEqual(p, { id: 'grimm', state: 'up', load: 1.23, freeRamGb: 8, paused: false, at: '2026-11-11T12:00:00.000Z', codeSha: 'b'.repeat(40) });
   setPause('node', { ttlMin: 5 }, t.env, T0);
   assert.equal(buildPayload(config(t.env), t.env, T0 + 1000, t.deps).paused, true);
   assert.equal(buildPayload(config(t.env), t.env, T0 + 10 * 60 * 1000, t.deps).paused, false, 'an expired node pause is not reported');
   assert.equal(buildPayload(config({ ...t.env, AGENT_MANAGER_NODE_ADDRESS: '192.168.40.83' }), t.env, T0, t.deps).address, '192.168.40.83');
+});
+
+test('readCodeSha returns the sha for a 40-hex answer and passes git -C <dir> rev-parse HEAD', () => {
+  const sha = 'a'.repeat(40);
+  let seen;
+  assert.equal(readCodeSha('/x', { execGit: (args) => { seen = args; return `${sha}\n`; } }), sha);
+  assert.deepEqual(seen, ['-C', '/x', 'rev-parse', 'HEAD']);
+  assert.equal(readCodeSha(undefined, { codeDir: '/y', execGit: (args) => { seen = args; return sha; } }), sha);
+  assert.deepEqual(seen, ['-C', '/y', 'rev-parse', 'HEAD']);
+});
+
+test('readCodeSha defaults to the agent-manager checkout, not the cwd, and honours deps.codeDir', () => {
+  const sha = 'a'.repeat(40);
+  let seen;
+  // Run from a different cwd, so process.cwd() cannot coincide with the checkout root.
+  const origCwd = process.cwd();
+  process.chdir(os.tmpdir());
+  try {
+    assert.notEqual(process.cwd(), path.resolve(__dirname, '..'));
+    assert.equal(readCodeSha(undefined, { execGit: (args) => { seen = args; return sha; } }), sha);
+  } finally {
+    process.chdir(origCwd);
+  }
+  assert.deepEqual(seen, ['-C', path.resolve(__dirname, '..'), 'rev-parse', 'HEAD']);
+  assert.equal(readCodeSha(undefined, { codeDir: '/x/y', execGit: (args) => { seen = args; return sha; } }), sha);
+  assert.deepEqual(seen, ['-C', '/x/y', 'rev-parse', 'HEAD']);
+});
+
+test('readCodeSha returns null on a throw, on text that is not a sha, on 39 or 41 hex and on uppercase', () => {
+  assert.equal(readCodeSha('/x', { execGit: () => { throw new Error('no git'); } }), null);
+  for (const out of ['not a sha', 'a'.repeat(39), 'a'.repeat(41), 'A'.repeat(40), '']) {
+    assert.equal(readCodeSha('/x', { execGit: () => out }), null, out);
+  }
+});
+
+test('buildPayload carries codeSha, and null when it cannot be read', () => {
+  const t = setup();
+  const sha = 'c'.repeat(40);
+  assert.equal(buildPayload(config(t.env), t.env, T0, { ...t.deps, execGit: () => sha }).codeSha, sha);
+  const p = buildPayload(config(t.env), t.env, T0, { ...t.deps, execGit: () => { throw new Error('boom'); } });
+  assert.equal(p.codeSha, null);
+  assert.ok('codeSha' in p);
 });
 
 test('readToken trims the file and refuses an empty one', () => {

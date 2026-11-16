@@ -121,6 +121,11 @@ function numberOrNull(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
+// A node's code version: the HEAD sha of its checkout, exactly 40 lowercase hex characters, otherwise null (never throws).
+function codeShaOrNull(v) {
+  return typeof v === 'string' && /^[0-9a-f]{40}$/.test(v) ? v : null;
+}
+
 // Records a heartbeat for a registered node and returns its record. Throws on an unknown node, an unusable state or a non-boolean paused.
 function recordHeartbeat(payload = {}, env = process.env, now = Date.now()) {
   const nodes = loadNodes(env);
@@ -137,6 +142,7 @@ function recordHeartbeat(payload = {}, env = process.env, now = Date.now()) {
     load: numberOrNull(payload.load),
     freeRamGb: numberOrNull(payload.freeRamGb),
     paused: payload.paused === true,
+    codeSha: codeShaOrNull(payload.codeSha),
   };
   nodes[payload.id] = updated;
   saveNodes(nodes, env);
