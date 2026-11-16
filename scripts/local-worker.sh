@@ -212,9 +212,17 @@ process_drafting_file() {
     mv -n "$wpath" "${QUEUE_DIR}/blocked/${name}"
     printf '[worker-%s] blocked %s: %s\n' "$INSTANCE_ID" "$task_id" "$draft_result" >&2
   elif [[ "$draft_succeeded" == "true" && "$draft_needs_clarification" == "true" ]]; then
-    mkdir -p "${QUEUE_DIR}/needs-clarification" >/dev/null 2>&1
-    mv -n "$wpath" "${QUEUE_DIR}/needs-clarification/${name}"
-    printf '[worker-%s] %s needs a human decision -- moved to needs-clarification/\n' "$INSTANCE_ID" "$task_id" >&2
+    # A stop record (a question for a human, no diff) from a NODE worker goes to queue/node-outbox/ so src/node-package-send.js ships it to wok, which files it in its own
+    # queue/needs-clarification/ and ends the lease. A wok worker files it here, as before. The is-node check runs once, in this branch.
+    if node "${PACKAGE_SRC_DIR}/node-outbox.js" is-node; then
+      mkdir -p "${QUEUE_DIR}/node-outbox" >/dev/null 2>&1
+      mv -n "$wpath" "${QUEUE_DIR}/node-outbox/${name}"
+      printf '[worker-%s] %s stopped on a node with a question, ready to send to wok: %s\n' "$INSTANCE_ID" "$task_id" "$task_id" >&2
+    else
+      mkdir -p "${QUEUE_DIR}/needs-clarification" >/dev/null 2>&1
+      mv -n "$wpath" "${QUEUE_DIR}/needs-clarification/${name}"
+      printf '[worker-%s] %s needs a human decision -- moved to needs-clarification/\n' "$INSTANCE_ID" "$task_id" >&2
+    fi
   elif [[ "$draft_succeeded" == "true" && "$draft_recorded" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/done" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/done/${name}"
