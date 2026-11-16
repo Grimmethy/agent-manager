@@ -30,6 +30,7 @@ const path = require('node:path');
 const { checkDrift } = require('./live-checkout-drift');
 const { notify } = require('./notify');
 const { writeJsonAtomicSync } = require('./atomic-write');
+const { publishCode } = require('./node-code-publish');
 
 const AUDIT_FILE = 'live-checkout-sync.audit.jsonl';
 const STATE_FILE = 'live-checkout-sync-state.json';
@@ -62,9 +63,23 @@ function readLastState(statePath) {
   }
 }
 
-function writeLastState(statePath, lastState) {
+function readStateObject(statePath) {
+  try {
+    const data = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    return (data && typeof data === 'object') ? data : {};
+  } catch {
+    return {};
+  }
+}
+
+// Merges fields into the state file so the last-state and publish-failure flags do not overwrite each other.
+function writeStateFields(statePath, fields) {
   fs.mkdirSync(path.dirname(statePath), { recursive: true });
-  writeJsonAtomicSync(statePath, { lastState, updated: new Date().toISOString() });
+  writeJsonAtomicSync(statePath, { ...readStateObject(statePath), ...fields, updated: new Date().toISOString() });
+}
+
+function writeLastState(statePath, lastState) {
+  writeStateFields(statePath, { lastState });
 }
 
 function appendAudit(auditPath, entry) {
@@ -189,6 +204,72 @@ async function syncLiveCheckout(repoDir, options = {}) {
   return { action: 'refused', reason: drift.state, shas: shaList };
 }
 
+// Publish gate for the code bundle step. Its default is 'dry-run', which intentionally differs from the
+// sync gate above (AGENT_MANAGER_LIVE_SYNC, default 'off'): unless set to 'on' this step only records what it would do.
+function publishMode(env) {
+  const v = String(env && env.AGENT_MANAGER_LIVE_CHECKOUT_SYNC || 'dry-run').toLowerCase();
+  return v === 'on' ? 'on' : 'dry-run';
+}
+
+const PUBLISH_FAILED_KEY = 'code-publish:failed';
+
+// Runs after the branch_merged sync. Fetches origin, then either records a dry-run line or publishes the code bundle.
+// Never throws; a failure is audited, notified once until the next success, and the drain continues.
+async function publishAfterFetch(repoDir, pipelineDir, options) {
+  const env = options.env || process.env;
+  const git = options.git || defaultGit;
+  const notifyFn = options.notify || notify;
+  const auditPath = path.join(pipelineDir, AUDIT_FILE);
+  const statePath = path.join(pipelineDir, STATE_FILE);
+
+  const fetched = git(repoDir, ['fetch', '--quiet', 'origin']);
+  if (fetched.code !== 0) {
+    appendAudit(auditPath, { action: 'fetch-error', error: fetched.err || 'git fetch origin failed' });
+    return { action: 'fetch-error' };
+  }
+
+  if (publishMode(env) === 'dry-run') {
+    const head = git(repoDir, ['rev-parse', 'origin/master']);
+    const sha8 = head.code === 0 ? head.out.trim().slice(0, 8) : 'unknown';
+    appendAudit(auditPath, { action: 'publish', mode: 'dry-run', message: `would publish ${sha8} of origin/master` });
+    return { action: 'publish', mode: 'dry-run', sha8 };
+  }
+
+  let res = null;
+  let failure = null;
+  try {
+    res = publishCode({ repoDir, pipelineDir });
+  } catch (err) {
+    failure = (err && err.message) || String(err);
+  }
+
+  const state = readStateObject(statePath);
+
+  if (failure === null) {
+    const sha8 = String(res.sha || '').slice(0, 8);
+    const published = res.reason === 'published';
+    appendAudit(auditPath, { action: 'publish', mode: 'on', message: `published ${sha8} ${published}`, reason: res.reason });
+    if (state.codePublishFailed) writeStateFields(statePath, { codePublishFailed: false });
+    return { action: 'publish', mode: 'on', sha8, published };
+  }
+
+  appendAudit(auditPath, { action: 'publish-error', mode: 'on', error: failure });
+  if (!state.codePublishFailed) {
+    try {
+      await notifyFn({
+        level: 'summary',
+        key: PUBLISH_FAILED_KEY,
+        title: 'code publish failed',
+        text: `Code bundle publish failed: ${failure}`,
+      });
+    } catch (_) {
+      // a notify failure must not stop the drain
+    }
+    writeStateFields(statePath, { codePublishFailed: true });
+  }
+  return { action: 'publish-error', error: failure };
+}
+
 const queueEvents = require('./queue-events');
 const CONSUMER = 'live-checkout-sync';
 
@@ -207,8 +288,9 @@ async function onBranchMerged(repoDir, options = {}) {
     return { action: 'idle' };
   }
   const result = await syncLiveCheckout(repoDir, options);
+  const publish = await publishAfterFetch(repoDir, pipelineDir, options);
   drained.commit();
-  return result;
+  return { ...result, publish };
 }
 
 module.exports = { syncLiveCheckout, onBranchMerged, mode, defaultGit, readLastState, writeLastState, appendAudit, sendNotice };
