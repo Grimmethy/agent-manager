@@ -135,6 +135,118 @@ def rewires_code(run_git, repo_root, main_branch, branch):
     return False
 
 
+# Python declarations, ported from the Python branch of declRe in extractChangedSymbols (src/review-verify.js):
+# `def name` / `class name`, optionally async. The JS also matches const/let arrow functions; those are not Python.
+_PY_DECL_RE = re.compile(r"^(?:async\s+)?(?:def\s+|class\s+)([A-Za-z_]\w*)")
+# Lines that open a module-level export list. JS `module.exports` / `exports.x`, and Python `__all__ = ` or `__all__ += `.
+_EXPORT_OPEN_RE = re.compile(r"^\s*(?:module\.exports\b|exports\.|__all__\s*\+?=)")
+_HUNK_NEW_RE = re.compile(r"^@@ -\S+ \+(\d+)")
+
+
+def _export_block_lines(text):
+    """1-based line numbers that belong to an export statement, including multi-line ones.
+
+    A statement starts at an export opener line and runs until its bracket depth returns to zero, so a multi-line
+    `__all__ = [` ... `]` list is covered line by line. An opener with no brackets is a one-line block.
+    Hits inside these lines are re-listings of a name, not uses, so they do not count as references.
+    """
+    lines = (text or "").splitlines()
+    inside = set()
+    i = 0
+    while i < len(lines):
+        if not _EXPORT_OPEN_RE.match(lines[i]):
+            i += 1
+            continue
+        depth, j = 0, i
+        while j < len(lines):
+            inside.add(j + 1)
+            depth += sum(lines[j].count(c) for c in "([{") - sum(lines[j].count(c) for c in ")]}")
+            if depth <= 0:
+                break
+            j += 1
+        i = j + 1
+    return inside
+
+
+def check_inert_additions(run_git, repo_root, main_branch, branch):
+    """('needs-work', [message]) when the branch adds Python functions/classes and NONE of them is referenced; else None.
+
+    Never returns 'red'. It only fires when every added name is unreferenced; if any added name is used, the branch
+    is not inert and this returns None. A failed git call returns None, because a guess would flag a branch on
+    missing evidence.
+
+    Reference rule: `git grep -w` at origin/<branch> finds the name in a non-test .py file, outside its own definition
+    line, and outside an export block (see _export_block_lines). Export blocks are handled as follows: a name that is
+    only listed in `module.exports` or `__all__` is an inert re-export, so it does not count. Multi-line blocks are
+    covered by the bracket-depth scan. If a file cannot be read for that scan, its hits count as references, so we
+    lean toward not flagging.
+    """
+    ok, diff = _git(run_git, ["diff", "-U0", f"origin/{main_branch}...origin/{branch}", "--", "*.py"], repo_root)
+    if not ok:
+        return None
+    added = {}  # (name, defining path) -> line number on the branch
+    path, lineno, active = "", 0, False
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            path = line[6:]
+            active = path.endswith(".py") and not _TEST_PATH_RE.search(path)
+            continue
+        if line.startswith("+++"):
+            active, path = False, ""
+            continue
+        m = _HUNK_NEW_RE.match(line)
+        if m:
+            lineno = int(m.group(1))
+            continue
+        if not active or not line.startswith("+"):
+            continue
+        decl = _PY_DECL_RE.match(line[1:].lstrip())
+        if decl:
+            added.setdefault((decl.group(1), path), lineno)
+        lineno += 1
+    if not added:
+        return None
+    hits_by_name = {}
+    for name in sorted({n for n, _ in added}):
+        ok, out = _git(run_git, ["grep", "-n", "-w", "-e", name, f"origin/{branch}", "--", "*.py"], repo_root)
+        if not ok:
+            return None
+        hits_by_name[name] = out.splitlines()
+    export_cache = {}
+
+    def export_lines(p):
+        if p not in export_cache:
+            ok_show, text = _git(run_git, ["show", f"origin/{branch}:{p}"], repo_root)
+            export_cache[p] = _export_block_lines(text) if ok_show else set()
+        return export_cache[p]
+
+    prefix = f"origin/{branch}:"
+    unreferenced = []
+    for (name, defpath), defline in sorted(added.items()):
+        referenced = False
+        for h in hits_by_name[name]:
+            if not h.startswith(prefix):
+                continue
+            parts = h[len(prefix):].split(":", 2)
+            if len(parts) < 3 or not parts[1].isdigit():
+                continue
+            hpath, hline = parts[0], int(parts[1])
+            if not hpath.endswith(".py") or _TEST_PATH_RE.search(hpath):
+                continue
+            if hpath == defpath and hline == defline:
+                continue
+            if hline in export_lines(hpath):
+                continue
+            referenced = True
+            break
+        if not referenced:
+            unreferenced.append((name, defpath))
+    if not unreferenced or len(unreferenced) != len(added):
+        return None
+    listed = ", ".join(f"{n} ({p})" for n, p in unreferenced)
+    return ("needs-work", [f"adds {len(unreferenced)} Python function/class name(s) that nothing references: {listed}"])
+
+
 def _conflicts(run_git, repo_root, a, b):
     """True only when git reports a real content CONFLICT between the two branch heads (never on a git failure)."""
     ok, out = _git(run_git, ["merge-tree", "--write-tree", "--name-only", f"origin/{a}", f"origin/{b}"], repo_root)
