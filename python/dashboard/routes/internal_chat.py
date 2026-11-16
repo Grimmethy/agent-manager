@@ -94,6 +94,41 @@ def api_internal_chat_roots():
     return jsonify({"roots": _chat_roots()})
 
 
+@internal_chat_bp.route("/api/internal/chat/register-repo", methods=["POST"])
+def api_internal_chat_register_repo():
+    # Operator route: registers an EXISTING local checkout as a project. Body: {path, cloneUrl?}.
+    # cloneUrl is accepted but informational only -- this route NEVER runs git clone; a missing
+    # directory is refused so the operator clones it manually and retries.
+    # pipelineDir is a sibling <repoRoot>-pipeline directory, never inside the tracked repo.
+    _require_internal_token()
+    from app import _chat_roots, get_registry_warnings, record_project_registry_entry, validate_project_entry
+
+    body = request.get_json(silent=True) or {}
+    raw_path = (body.get("path") or "").strip()
+    if not raw_path:
+        abort(400, description="path is required")
+    repo_root = os.path.normpath(os.path.abspath(raw_path))
+    if not os.path.isdir(repo_root):
+        abort(400, description=f"repo directory does not exist: {repo_root} -- clone it manually, then retry (this route never runs git clone)")
+
+    pipeline_dir = repo_root + "-pipeline"
+    domains_path = os.path.join(pipeline_dir, "task-domains.json")
+    roots_before = _chat_roots()
+    os.makedirs(pipeline_dir, exist_ok=True)
+    if not os.path.exists(domains_path):
+        with open(domains_path, "w", encoding="utf-8"):
+            pass
+
+    entry = {"repoRoot": repo_root, "pipelineDir": pipeline_dir, "domainsPath": domains_path}
+    problems = validate_project_entry(entry)
+    registered = False
+    if not problems:
+        registered = record_project_registry_entry(repo_root, pipeline_dir, domains_path) is not False
+    roots_after = _chat_roots()
+    warnings = get_registry_warnings() + [{"entry": entry, "reason": p} for p in problems]
+    return jsonify({"rootsBefore": roots_before, "rootsAfter": roots_after, "registered": registered, "warnings": warnings})
+
+
 @internal_chat_bp.route("/api/internal/chat/run-command", methods=["POST"])
 def api_internal_chat_run_command():
     """Runs ONE owner-confirmed, allowlisted command for the chat plugin (owner decision A, 2026-10-25: the restricted host-side runner; design in the
