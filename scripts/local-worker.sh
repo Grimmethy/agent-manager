@@ -726,6 +726,15 @@ while :; do                                                                     
     continue
   fi
 
+  # Cloud agents review before they draft (cloud_take_review, scripts/agent-manager-common.sh): when queue/review/ holds an item no live reviewer has claimed, this cloud lane
+  # reviews ONE item and ends the tick; when every waiting review is already claimed (or there is none) it goes on to draft. A premium-only borrowed tick never reviews.
+  if ! "$PREMIUM_ONLY" && cloud_take_review "$INSTANCE_ID"; then
+    did_work=true
+    if "$ONCE"; then exit 10; fi
+    end_of_tick_pause
+    continue
+  fi
+
   # GPU headroom check -- before spending any real model call this tick, see whether the
   # GPU actually has room for it and, if not, ask TheAgent to stop a known idle app
   # (ComfyUI/n8n) sitting on VRAM this pipeline doesn't need but isn't using either. Best
