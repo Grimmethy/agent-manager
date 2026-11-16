@@ -3,7 +3,9 @@
 When a user votes on a branch that exists on origin but hasn't been fetched into the
 unmerged list yet (listing lags by a minute or two), we store the verdict in a pending
 file. When the listing refreshes and the branch appears with a matching head SHA, the
-verdict is applied. If the head SHA moved, the pending verdict is dropped.
+verdict is applied and the pending file removed. If the listed head SHA differs from the
+parked head SHA, the pending file is kept (never applied to a different head) and a
+`sha_mismatch_kept` event is logged.
 
 This module is standalone (same pattern as branch_verdicts.py): it must not import
 from app at top level to avoid circular imports. Everything it needs is passed in.
@@ -102,52 +104,69 @@ def apply_pending_verdicts(qdir, repo_root, list_unmerged_branches, _run_git, bv
     """Apply pending verdicts for branches that are now in the listing.
 
     For each pending verdict:
-    - Check if the branch is in the current listing
-    - If yes, verify the head SHA matches
-    - If SHA matches, apply the verdict and remove the pending file
-    - If SHA doesn't match, drop the pending verdict (branch moved)
+    - Check if the branch is in the current listing; if it is missing, do one forced
+      refresh of the listing (at most once per call) and check again
+    - If the branch is still not listed, keep the pending file
+    - If the listed headSha is missing, keep the pending file (outcome kept_no_listed_sha)
+    - If the listed headSha differs from the parked headSha, keep the pending file and
+      log sha_mismatch_kept; the verdict is not applied
+    - If the SHAs match, apply the verdict; the pending file is removed only after
+      record_verdict succeeds. If it raises, the file is kept (record_failed_kept)
     """
     pending_list = list_pending_verdicts(qdir)
     if not pending_list:
         return
 
-    # Get current listing
-    branches = list_unmerged_branches(force=False)
-    if not branches:
-        return
+    branches = list_unmerged_branches(force=False) or []
+    refreshed = False
 
     for pending in pending_list:
         branch = pending.get("branch")
-        pending_sha = pending.get("headSha")
-        if not branch or not pending_sha:
-            remove_pending_verdict(qdir, branch)
+        parked_sha = pending.get("headSha")
+        if not branch or not parked_sha:
+            # Malformed pending file: nothing can be applied from it
+            if branch:
+                remove_pending_verdict(qdir, branch)
             continue
 
-        # Find the branch in the current listing
-        match = next((b for b in branches if b["branch"] == branch), None)
-        if not match:
+        match = next((b for b in branches if b.get("branch") == branch), None)
+        if match is None and not refreshed:
+            refreshed = True
+            branches = list_unmerged_branches(force=True) or []
+            match = next((b for b in branches if b.get("branch") == branch), None)
+        if match is None:
             # Branch still not listed, keep pending
             continue
 
-        current_sha = match.get("headSha")
-        if not current_sha:
-            # No SHA in listing, drop pending
-            remove_pending_verdict(qdir, branch)
+        listed_sha = match.get("headSha")
+        if not listed_sha:
+            logger.info(
+                f"Pending verdict for {branch} kept: parked_sha={parked_sha} "
+                f"listed_sha=None outcome=kept_no_listed_sha"
+            )
             continue
 
-        if current_sha == pending_sha:
-            # SHA matches, apply the verdict
-            try:
-                bv.record_verdict(
-                    qdir, branch, current_sha,
-                    pending["verdict"], pending["reasons"], pending["source"]
-                )
-                logger.info(f"Applied pending verdict for {branch}")
-            except Exception as exc:
-                logger.warning(f"Failed to apply pending verdict for {branch}: {exc}")
-            finally:
-                remove_pending_verdict(qdir, branch)
-        else:
-            # SHA doesn't match, branch moved, drop pending
-            remove_pending_verdict(qdir, branch)
-            logger.info(f"Dropped pending verdict for {branch} (head moved to {current_sha})")
+        if listed_sha != parked_sha:
+            logger.info(
+                f"Pending verdict for {branch} kept: parked_sha={parked_sha} "
+                f"listed_sha={listed_sha} outcome=sha_mismatch_kept"
+            )
+            continue
+
+        try:
+            bv.record_verdict(
+                qdir, branch, listed_sha,
+                pending["verdict"], pending["reasons"], pending["source"]
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Pending verdict for {branch} kept: parked_sha={parked_sha} "
+                f"listed_sha={listed_sha} outcome=record_failed_kept: {exc}"
+            )
+            continue
+
+        remove_pending_verdict(qdir, branch)
+        logger.info(
+            f"Applied pending verdict for {branch}: parked_sha={parked_sha} "
+            f"listed_sha={listed_sha} outcome=applied"
+        )
