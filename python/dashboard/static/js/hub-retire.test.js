@@ -1,45 +1,61 @@
 'use strict';
+
+// Tests for hub-retire.js (the hub retire flow helpers). Pure functions, no DOM.
 // Run: node --test python/dashboard/static/js/hub-retire.test.js
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { hubRetireRequest, hubRetirePreview, hubRetireOutcome } = require('./hub-retire.js');
 
-test('hubRetireRequest encodes the hub id into the URL', () => {
-  const result = hubRetireRequest('a b', 'stale');
-  assert.equal(result.url, '/api/hub/a%20b/retire');
-});
-
-test('hubRetireRequest trims the reason in the body', () => {
-  const result = hubRetireRequest('hub1', '  stale  ');
-  assert.deepEqual(result.body, { reason: 'stale' });
-});
-
-test('hubRetireRequest returns an error for a whitespace-only reason', () => {
-  const result = hubRetireRequest('hub1', '   ');
-  assert.ok('error' in result);
-  assert.equal(typeof result.error, 'string');
-  assert.ok(result.error.length > 0);
-  assert.equal(result.url, undefined);
-});
-
-test('hubRetirePreview keeps every child and preserves review state', () => {
+test('hubRetirePreview keeps a review child alongside drafting and approved ones', () => {
   const subTasks = [
-    { id: 't1', state: 'done', title: 'First' },
-    { id: 't2', state: 'review', title: 'Second' },
-    { id: 't3', state: 'pending', title: 'Third' },
+    { id: 'T-1', state: 'drafting', title: 'Same title' },
+    { id: 'T-2', state: 'approved', title: 'Same title' },
+    { id: 'T-3', state: 'review', title: 'Review piece' },
   ];
-  const preview = hubRetirePreview(subTasks);
-  assert.equal(preview.length, subTasks.length);
-  const review = preview.find((t) => t.id === 't2');
+  const out = hubRetirePreview(subTasks);
+  assert.equal(out.length, 3);
+  const review = out.find((c) => c.state === 'review');
   assert.ok(review, 'review child must be present');
-  assert.equal(review.state, 'review');
+  assert.equal(review.id, 'T-3');
+  assert.deepEqual(out.map((c) => c.id), ['T-1', 'T-2', 'T-3']);
 });
 
-test('hubRetireOutcome closes the dialog on 204', () => {
-  assert.deepEqual(hubRetireOutcome(204, {}), { close: true });
+test('hubRetireRequest rejects an empty reason with an error and no body', () => {
+  const empty = hubRetireRequest('H1', '');
+  assert.ok(empty.error, 'empty reason must return an error');
+  assert.equal(empty.body, undefined);
+  assert.equal(empty.url, undefined);
 });
 
-test('hubRetireOutcome keeps the dialog open with the server message on 409', () => {
-  assert.deepEqual(hubRetireOutcome(409, { description: 'busy' }), { close: false, message: 'busy' });
+test('hubRetireRequest rejects a whitespace-only reason with an error and no body', () => {
+  const ws = hubRetireRequest('H1', '   ');
+  assert.ok(ws.error, 'whitespace reason must return an error');
+  assert.equal(ws.body, undefined);
+  assert.equal(ws.url, undefined);
+});
+
+test('hubRetireRequest URL-encodes the hub id and sends the trimmed reason', () => {
+  const req = hubRetireRequest('a/b c', '  reason  ');
+  assert.equal(req.url, '/api/hub/' + encodeURIComponent('a/b c') + '/retire');
+  assert.deepEqual(req.body, { reason: 'reason' });
+});
+
+test('hubRetireOutcome 409 keeps the dialog open with the server message', () => {
+  // The server's abort(409, description=...) puts the text in `description`.
+  const out = hubRetireOutcome(409, { description: 'conflict text' });
+  assert.equal(out.close, false);
+  assert.match(out.message, /conflict text/);
+});
+
+test('hubRetireOutcome 500 keeps the dialog open', () => {
+  const out = hubRetireOutcome(500, {});
+  assert.equal(out.close, false);
+  assert.equal(typeof out.message, 'string');
+  assert.ok(out.message.length > 0);
+});
+
+test('hubRetireOutcome 2xx closes the dialog', () => {
+  assert.equal(hubRetireOutcome(200, {}).close, true);
+  assert.equal(hubRetireOutcome(204, {}).close, true);
 });

@@ -114,6 +114,21 @@ test('recordHeartbeat stores null for an uppercase, 39-character, numeric or obj
   }
 });
 
+test('recordHeartbeat stores null for a 41-character hex codeSha', () => {
+  const { env } = setup();
+  registerNode(spec(), env);
+  assert.equal(recordHeartbeat({ id: 'grimm', codeSha: 'a'.repeat(41) }, env, T0).codeSha, null);
+});
+
+test('recordHeartbeat stores null for an array or String object wrapping a valid sha', () => {
+  const { env } = setup();
+  registerNode(spec(), env);
+  const sha = 'a'.repeat(40);
+  assert.equal(recordHeartbeat({ id: 'grimm', codeSha: [sha] }, env, T0).codeSha, null);
+  // eslint-disable-next-line no-new-wrappers
+  assert.equal(recordHeartbeat({ id: 'grimm', codeSha: new String(sha) }, env, T0).codeSha, null);
+});
+
 test('a heartbeat without a codeSha key clears a previously stored one', () => {
   const { env } = setup();
   registerNode(spec(), env);

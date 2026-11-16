@@ -175,6 +175,9 @@ Persist:
 }
 ```
 
+Build the Acceptance block with `node scripts/record-acceptance.js` (`run`, `mutate`, then `render`) instead of writing it by hand; hand-written blocks have repeatedly carried wrong counts.
+Each `run` or `mutate` writes an entry to `--out` (default `./acceptance-log.json`); `node scripts/record-acceptance.js render` prints the block to paste into the task record.
+
 `<summary>` must include a literal `Acceptance:` block, one line per criterion:
 `N. <criterion> -- <what check you ran> -- <PASS/FAIL + brief result>`.
 
