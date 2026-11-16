@@ -482,4 +482,27 @@ async function draftResearchBranch(task, { recordModelCall, draftResearchImpleme
   return { succeeded: true, blocked: false };
 }
 
-module.exports = { resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResearchBranch, runUiVisibilityFastpath };
+// HUB0446 3/5: PREMISE NOTE helper. Appends a PREMISE NOTE block listing the files that
+// already implement the requested premise to a draft-context text block.
+function appendPremiseNote(contextText, files) {
+  const list = (Array.isArray(files) ? files : []).map((f) => `- ${f}`).join('\n');
+  const block = `PREMISE NOTE: the files below already exist and appear to implement the requested change.\n${list}`;
+  const base = typeof contextText === 'string' ? contextText : '';
+  return base.trim() ? `${base.replace(/\s+$/, '')}\n\n${block}` : block;
+}
+
+// HUB0446 3/5: builds the needs-clarification result for a premise that is already built.
+// Same field shape as the design-decision result in draftAdhocBranch (reason + openQuestions),
+// with no options key. The file list is rendered into openQuestions.
+function buildPremiseAlreadyBuiltResult(files) {
+  const list = (Array.isArray(files) ? files : []).map((f) => `- ${f}`).join('\n');
+  return {
+    reason: 'premise-already-built',
+    openQuestions: `The premise of this task is already built. Existing files:\n${list}`,
+  };
+}
+
+module.exports = {
+  resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResearchBranch, runUiVisibilityFastpath,
+  appendPremiseNote, buildPremiseAlreadyBuiltResult,
+};
