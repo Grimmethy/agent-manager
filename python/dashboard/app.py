@@ -2548,14 +2548,17 @@ def _sync_live_checkout(main_branch):
     at load 25) must be reported as "not synced", never raised: raising turned a merge that had landed
     into an uncaught 500 and skipped stamping the task record."""
     try:
-        return _sync_live_checkout_unguarded(main_branch)
+        result = _sync_live_checkout_unguarded(main_branch)
     except subprocess.TimeoutExpired as exc:
         cmd = " ".join(str(a) for a in (exc.cmd if isinstance(exc.cmd, (list, tuple)) else [exc.cmd]))
-        return {
+        result = {
             "synced": False,
+            "reason_code": "git-failed",
             "reason": f"git did not answer in time while syncing the dashboard checkout (`{cmd}` took longer than {exc.timeout:g} s; the machine is busy). "
                       "The merge itself is on origin: run `git pull --ff-only` in the dashboard checkout, or merge any other branch to retry.",
         }
+    logger.info("live checkout sync: reason_code=%s project_root=%s synced=%s reason=%s", result.get("reason_code"), PACKAGE_ROOT, result.get("synced"), result.get("reason"))
+    return result
 
 
 def _sync_live_checkout_unguarded(main_branch):
@@ -2580,15 +2583,18 @@ def _sync_live_checkout_unguarded(main_branch):
         ["git", "status", "--porcelain", "--untracked-files=no"], cwd=str(PACKAGE_ROOT), capture_output=True, text=True, timeout=15,
     )
     if status.returncode != 0:
-        return {"synced": False, "reason": "PACKAGE_ROOT is not a git repo or git status failed"}
+        return {"synced": False, "reason_code": "not-repo", "reason": "PACKAGE_ROOT is not a git repo or git status failed"}
     if status.stdout.strip():
-        return {"synced": False, "reason": "PACKAGE_ROOT has uncommitted local changes -- left untouched, sync it by hand"}
+        return {"synced": False, "reason_code": "tracked-dirty", "reason": "PACKAGE_ROOT has uncommitted local changes -- left untouched, sync it by hand"}
 
     # Pre-check: if the incoming commits add any file that already exists as an
     # untracked file in the working tree, git pull --ff-only will refuse to
     # overwrite it. Report those paths so the user can resolve them.
-    head = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
-    _run_git(["fetch", "origin"], PACKAGE_ROOT, timeout=_ACTION_FETCH_TIMEOUT_SECONDS)
+    try:
+        head = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
+        _run_git(["fetch", "origin"], PACKAGE_ROOT, timeout=_ACTION_FETCH_TIMEOUT_SECONDS)
+    except RuntimeError as e:
+        return {"synced": False, "reason_code": "git-failed", "reason": str(e)}
     remote_ref = f"origin/{main_branch}"
     try:
         # name-status: lists paths with status codes (A=added, M=modified, D=deleted).
@@ -2599,20 +2605,20 @@ def _sync_live_checkout_unguarded(main_branch):
 
     if added_paths:
         untracked_out = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard"],
+            ["git", "ls-files", "--others"],
             cwd=str(PACKAGE_ROOT), capture_output=True, text=True, timeout=15,
         )
         untracked = {p for p in untracked_out.stdout.strip().splitlines() if p.strip()} if untracked_out.stdout.strip() else set()
         collisions = sorted(added_paths & untracked)
         if collisions:
-            return {"synced": False, "reason": f"untracked files block fast-forward: {', '.join(collisions)}"}
+            return {"synced": False, "reason_code": "untracked-collision", "reason": f"untracked files block fast-forward: {', '.join(collisions)}"}
 
     try:
         before = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
         _run_git(["merge", "--ff-only", remote_ref], PACKAGE_ROOT, timeout=_ACTION_FETCH_TIMEOUT_SECONDS)
         after = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
     except RuntimeError as e:
-        return {"synced": False, "reason": str(e)}
+        return {"synced": False, "reason_code": "ff-failed", "reason": str(e)}
 
     if before == after:
         return {"synced": True, "changed": False, "restartTriggered": False}
