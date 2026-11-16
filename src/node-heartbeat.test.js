@@ -60,6 +60,23 @@ test('readCodeSha returns the sha for a 40-hex answer and passes git -C <dir> re
   assert.deepEqual(seen, ['-C', '/y', 'rev-parse', 'HEAD']);
 });
 
+test('readCodeSha defaults to the agent-manager checkout, not the cwd, and honours deps.codeDir', () => {
+  const sha = 'a'.repeat(40);
+  let seen;
+  // Run from a different cwd, so process.cwd() cannot coincide with the checkout root.
+  const origCwd = process.cwd();
+  process.chdir(os.tmpdir());
+  try {
+    assert.notEqual(process.cwd(), path.resolve(__dirname, '..'));
+    assert.equal(readCodeSha(undefined, { execGit: (args) => { seen = args; return sha; } }), sha);
+  } finally {
+    process.chdir(origCwd);
+  }
+  assert.deepEqual(seen, ['-C', path.resolve(__dirname, '..'), 'rev-parse', 'HEAD']);
+  assert.equal(readCodeSha(undefined, { codeDir: '/x/y', execGit: (args) => { seen = args; return sha; } }), sha);
+  assert.deepEqual(seen, ['-C', '/x/y', 'rev-parse', 'HEAD']);
+});
+
 test('readCodeSha returns null on a throw, on text that is not a sha, on 39 or 41 hex and on uppercase', () => {
   assert.equal(readCodeSha('/x', { execGit: () => { throw new Error('no git'); } }), null);
   for (const out of ['not a sha', 'a'.repeat(39), 'a'.repeat(41), 'A'.repeat(40), '']) {
