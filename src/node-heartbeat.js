@@ -23,6 +23,8 @@
 
 const fs = require('fs');
 const os = require('os');
+const path = require('path');
+const childProcess = require('child_process');
 const http = require('http');
 const https = require('https');
 const { setPause, clearPause, readPause } = require('./worker-switch.js');
@@ -56,7 +58,21 @@ function freeRamGb(readMeminfo = () => fs.readFileSync('/proc/meminfo', 'utf8'),
   return Math.round((bytes / (1024 * 1024 * 1024)) * 100) / 100;
 }
 
+// HEAD sha of the agent-manager checkout at dir: 40 lowercase hex, or null for ANY failure (no git, not a repo, unexpected output).
+function readCodeSha(dir, deps = {}) {
+  try {
+    const d = dir || (deps && deps.codeDir) || path.resolve(__dirname, '..');
+    const execGit = (deps && deps.execGit) || ((args) => childProcess.execFileSync('git', args, { timeout: 3000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
+    const out = String(execGit(['-C', d, 'rev-parse', 'HEAD'])).replace(/\r?\n$/, '');
+    return /^[0-9a-f]{40}$/.test(out) ? out : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 function buildPayload(cfg, env = process.env, now = Date.now(), deps = {}) {
+  let codeSha = null;
+  try { codeSha = readCodeSha(deps.codeDir, deps); } catch (e) { codeSha = null; }
   const payload = {
     id: cfg.id,
     state: 'up',
@@ -64,6 +80,7 @@ function buildPayload(cfg, env = process.env, now = Date.now(), deps = {}) {
     freeRamGb: freeRamGb(deps.readMeminfo, deps.freemem),
     paused: readPause('node', env, now) !== null,
     at: new Date(now).toISOString(),
+    codeSha,
   };
   if (cfg.address) payload.address = cfg.address;
   return payload;
@@ -143,4 +160,4 @@ if (require.main === module) {
   main().then((code) => { process.exitCode = code; });
 }
 
-module.exports = { config, readToken, freeRamGb, buildPayload, applyReply, runOnce, main, GLOBAL_PAUSE_TTL_MIN };
+module.exports = { config, readToken, freeRamGb, readCodeSha, buildPayload, applyReply, runOnce, main, GLOBAL_PAUSE_TTL_MIN };
