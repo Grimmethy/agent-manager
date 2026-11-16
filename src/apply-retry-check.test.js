@@ -168,6 +168,24 @@ test('applyRetryCheck falls back to the ordinary bounded retry when no needsClar
   assert.ok(fs.existsSync(path.join(pendingDir, 'task-1.json')));
 });
 
+// Guard: an approved-shaped task (implementResponse + localVerdict set) whose apply fails with a plain git 'patch does not apply' must still redraft to pendingDir and never touch the hold counter.
+test('applyRetryCheck still redrafts a plain patch-does-not-apply failure to pendingDir when implementResponse and localVerdict are set', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    blockedReason: 'git apply failed: patch does not apply',
+    applyRetryCount: 0,
+    implementResponse: '{"mode":"edit","file":"src/local-draft.js","find":"old","replace":"new"}',
+    localVerdict: 'Auto-approved: fixture verdict string for the patch-does-not-apply guard',
+  });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.equal(summary.held, 0, 'a patch-does-not-apply failure is a draft failure, never an infra hold');
+  assert.ok(fs.existsSync(path.join(pendingDir, 'task-1.json')));
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'task-1.json')));
+});
+
 // --- apply-stage "find string not found" on a candidate whose own site is already fixed -----
 // 2026-09-18 (observability-fix-ac-169): a scanner-derived candidate whose edit's `find`
 // string no longer matches because the flagged code was since fixed by unrelated work. Every
