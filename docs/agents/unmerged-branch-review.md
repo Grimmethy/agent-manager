@@ -16,6 +16,7 @@ hub.** A hub's sub-tasks are frequently designed as a matched set, not independe
   substance — e.g. the sub-tasks cover only one of several deliverables the original ask
   named. That context changes what "done" or "mergeable" even means for the pieces you're
   looking at, and is easy to miss if you only look at the individual branch's own commit.
+  Each vote in `localVotes` carries `verdict` and `response` plus, since 2026-11-16, `provider` (`cloud` when the vote ran on a cloud-lane gateway, otherwise `ollama`) and `model` (the model that cast it), so a verdict can be read as a cloud agent's or a local model's. Older records without the two keys still read.
 
 **Verdicts (2026-10-31):** merge (green), needs-work (yellow: a defect to fix), hold (blue: the piece is sound but cannot merge yet, because its hub is
 unfinished or a sibling must merge first; it is never redrafted and never counted as a defect), discard (red). `discard_stats.py` reports hold in its own column.

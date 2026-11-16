@@ -139,6 +139,19 @@ test('a 400 moves the record to node-refused with a reason sidecar, counts refus
   assert.equal(posts, 0);
 });
 
+test('a 400 whose refile into node-refused fails leaves the record in the outbox and counts it failed, not refused, exit 3', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  const refusedDir = path.join(s.dir, 'queue', 'node-refused');
+  fs.writeFileSync(refusedDir, 'a plain file where the directory should be');
+  const now = () => Date.UTC(2026, 10, 16, 1, 2, 3);
+  const r = await run(s, { post: async () => ({ status: 400 }), now });
+  assert.equal(r.code, 3);
+  assert.deepEqual(r.result, { sent: 0, failed: 1, refused: 0, remaining: 1 });
+  assert.deepEqual(fs.readdirSync(s.outbox), ['a.json']);
+  assert.equal(fs.statSync(refusedDir).isFile(), true);
+});
+
 test('401, 403, 409, 503 and a thrown send are transient: the record stays in the outbox, nothing is refused, failed 1, exit 3', async () => {
   const posts = [401, 403, 409, 503].map((status) => async () => ({ status }));
   posts.push(async () => { throw new Error('down'); });

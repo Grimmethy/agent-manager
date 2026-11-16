@@ -44,7 +44,80 @@ test('rows for another node are ignored, so their tasks are reported missing for
 
 test('a taskId with no row at all is reported in missing', () => {
   const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['nope'], leases: [] });
-  assert.deepEqual(r, { outcomes: [], pending: [], missing: ['nope'] });
+  assert.deepEqual(r, { outcomes: [], pending: [], missing: ['nope'], delivered: [] });
+});
+
+test('returned + applied is delivered and still an abandoned outcome', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['a'], leases: [row('a', { state: 'returned', lastEvent: 'applied' })] });
+  assert.deepEqual(r.delivered, ['a']);
+  assert.deepEqual(r.outcomes, [{ taskId: 'a', node: 'grimm', result: 'abandoned' }]);
+});
+
+test('expired + reviewed is delivered and still an abandoned outcome', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['a'], leases: [row('a', { state: 'expired', lastEvent: 'reviewed' })] });
+  assert.deepEqual(r.delivered, ['a']);
+  assert.deepEqual(r.outcomes, [{ taskId: 'a', node: 'grimm', result: 'abandoned' }]);
+});
+
+test('returned + drafted is delivered and still an abandoned outcome', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['a'], leases: [row('a', { state: 'returned', lastEvent: 'drafted' })] });
+  assert.deepEqual(r.delivered, ['a']);
+  assert.deepEqual(r.outcomes, [{ taskId: 'a', node: 'grimm', result: 'abandoned' }]);
+});
+
+test('returned with lastEvent null is not delivered', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['a'], leases: [row('a', { state: 'returned', lastEvent: null })] });
+  assert.deepEqual(r.delivered, []);
+  assert.deepEqual(r.outcomes, [{ taskId: 'a', node: 'grimm', result: 'abandoned' }]);
+});
+
+test('returned or expired with lastEvent merged is merged and never delivered', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['a', 'b'], leases: [row('a', { state: 'returned', lastEvent: 'merged' }), row('b', { state: 'expired', lastEvent: 'merged' })] });
+  assert.deepEqual(r.outcomes.map((o) => o.result), ['merged', 'merged']);
+  assert.deepEqual(r.delivered, []);
+  assert.deepEqual(r.pending, []);
+});
+
+test('returned with lastEvent failed or blocked is failed and never delivered', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['a', 'b'], leases: [row('a', { state: 'returned', lastEvent: 'failed' }), row('b', { state: 'returned', lastEvent: 'blocked' })] });
+  assert.deepEqual(r.outcomes.map((o) => o.result), ['failed', 'failed']);
+  assert.deepEqual(r.delivered, []);
+});
+
+test('returned + failed is not delivered and is a failed outcome', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['a'], leases: [row('a', { state: 'returned', lastEvent: 'failed' })] });
+  assert.deepEqual(r.delivered, []);
+  assert.deepEqual(r.outcomes, [{ taskId: 'a', node: 'grimm', result: 'failed' }]);
+});
+
+test('a merged row is not delivered', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['a'], leases: [row('a', { state: 'merged', lastEvent: 'applied' })] });
+  assert.deepEqual(r.delivered, []);
+});
+
+test('a lent row with lastEvent applied is not delivered and stays pending', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['a'], leases: [row('a', { state: 'lent', lastEvent: 'applied' })] });
+  assert.deepEqual(r.delivered, []);
+  assert.deepEqual(r.pending, ['a']);
+});
+
+test('a task with no row is not delivered', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['nope'], leases: [] });
+  assert.deepEqual(r.delivered, []);
+  assert.deepEqual(r.missing, ['nope']);
+});
+
+test('delivered keeps the order of taskIds', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['c', 'a', 'b'], leases: [row('a', { state: 'returned', lastEvent: 'drafted' }), row('b', { state: 'returned', lastEvent: 'drafted' }), row('c', { state: 'returned', lastEvent: 'drafted' })] });
+  assert.deepEqual(r.delivered, ['c', 'a', 'b']);
+});
+
+test('a mixed input keeps outcomes, pending and missing exactly as before', () => {
+  const r = outcomesFromLedger({ nodeId: 'grimm', taskIds: ['a', 'b', 'c', 'd', 'e'], leases: [row('a', { state: 'merged' }), row('b', { state: 'returned', lastEvent: 'applied' }), row('c'), row('e', { state: 'returned', lastEvent: 'failed' })] });
+  assert.deepEqual(r.outcomes, [{ taskId: 'a', node: 'grimm', result: 'merged' }, { taskId: 'b', node: 'grimm', result: 'abandoned' }, { taskId: 'e', node: 'grimm', result: 'failed' }]);
+  assert.deepEqual(r.pending, ['c']);
+  assert.deepEqual(r.missing, ['d']);
+  assert.deepEqual(r.delivered, ['b']);
 });
 
 test('the outcomes pass scoreTrial without throwing', () => {
