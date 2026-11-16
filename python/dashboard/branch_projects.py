@@ -66,6 +66,17 @@ def expire_all():
             entry["at"] = 0.0
 
 
+def expire(project_root):
+    """Mark one project's cached list stale (its `at` back to 0, the last good list kept) so the next request starts a background refresh for that project only.
+
+    Leaves every other project's entry and the TTL untouched. The project_root is the real repo root the cache is keyed by; if the project has no entry yet
+    the call is a no-op (nothing to refresh)."""
+    with _lock:
+        entry = _state["cache"].get(project_root)
+        if entry is not None:
+            entry["at"] = 0.0
+
+
 def _refresh_stale(projects):
     """Background thread body: recompute each stale project in turn. A failure stamps the entry anyway (keeping any previous list) so a broken repo is retried at the
     next TTL, not on every request."""

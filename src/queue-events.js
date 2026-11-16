@@ -24,7 +24,7 @@ const realFs = require('fs');
 const crypto = require('crypto');
 const path = require('path');
 
-const TYPES = ['verdict_recorded', 'branch_merged'];
+const TYPES = ['verdict_recorded', 'branch_merged', 'branch_pushed'];
 const MAX_LINE_BYTES = 3500;
 const DEFAULT_ROTATE_BYTES = 5 * 1024 * 1024;
 
@@ -52,6 +52,7 @@ function readJson(fs, file) {
 
 function append(pipelineDir, event, { fs = realFs, now = () => new Date(), maxBytes = DEFAULT_ROTATE_BYTES } = {}) {
   if (!event || !TYPES.includes(event.type)) throw new RangeError(`unknown event type: ${event && event.type}`);
+  if (process.env.AGENT_MANAGER_QUEUE_EVENTS && process.env.AGENT_MANAGER_QUEUE_EVENTS.trim().toLowerCase() === 'off') return false;
   let project = path.resolve(pipelineDir);
   try { project = fs.realpathSync(pipelineDir); } catch { /* not on disk yet: the given path */ }
   const rec = {
@@ -167,7 +168,7 @@ if (require.main === module) {
   const opt = {};
   for (let i = 0; i < rest.length; i += 2) opt[rest[i].replace(/^--/, '')] = rest[i + 1];
   if (cmd !== 'emit' || !opt.dir || !opt.type) {
-    console.error('usage: queue-events.js emit --dir <pipelineDir> --type <verdict_recorded|branch_merged> [--branch B] [--task-id I] [--sha S] [--verdict V] [--source S]');
+    console.error('usage: queue-events.js emit --dir <pipelineDir> --type <verdict_recorded|branch_merged|branch_pushed> [--branch B] [--task-id I] [--sha S] [--verdict V] [--source S]');
     process.exit(2);
   }
   try {
