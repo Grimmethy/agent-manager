@@ -8,9 +8,8 @@
 // check (rejected for this doc: it maps prose concepts to paths, not a clean enumerable
 // registry the way src/task-sources.js's own drift-scan.js PAIRS mechanism expects).
 //
-// Deliberately proves ONLY that the file exists, never that a cited line range or
-// function name inside it is still accurate -- the doc's own header states that
-// limitation explicitly. A test that tried to verify line numbers too would need
+// Proves that each cited file exists, and that each #symbol anchor's symbol is still defined in its file (a definition-shaped
+// match, not a full parse). Line ranges are never verified -- the doc's own header states that limitation explicitly. A test that tried to verify line numbers too would need
 // updating every time an unrelated edit shifted a few lines, which is exactly the kind
 // of maintenance burden this mechanism exists to avoid.
 
@@ -73,6 +72,44 @@ function extractCitedPaths(markdown) {
   return [...paths];
 }
 
+// Same backtick scan as extractCitedPaths, but keeps the #symbol anchor. Only spans that carry an anchor are returned.
+function extractCitedAnchors(markdown) {
+  const backtickSpans = markdown.match(/`[^`]+`/g) || [];
+  const anchors = new Map();
+  for (const span of backtickSpans) {
+    const content = span.slice(1, -1);
+    const m = content.match(/^([A-Za-z0-9_./-]+\.(?:js|py|md|json))(?::[\d,\s-]+)?#([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)$/);
+    if (m) anchors.set(`${m[1]}#${m[2]}`, { path: m[1], symbol: m[2] });
+  }
+  return [...anchors.values()];
+}
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Definition-shaped match, not a full parse: `function NAME`, `class NAME`, `def NAME`, `const|let|var NAME`, or `NAME(`/`NAME =`/`NAME:`
+// (method or property definitions).
+function definesSymbol(source, name) {
+  const n = escapeRegex(name);
+  return new RegExp(`(?:function|class|def|const|let|var)\\s+${n}\\b|\\b${n}\\s*[(=:]`).test(source);
+}
+
+// Returns drifted anchor rows. A dotted Class.method needs both segments. Ignored (host-local) paths and unreadable files are skipped
+// here; the existence test already reports a missing file.
+function findDriftedSymbols(anchors, { read, ignored }) {
+  const drifted = [];
+  for (const { path: citedPath, symbol } of anchors) {
+    const resolved = resolveShorthand(citedPath);
+    if (ignored(resolved)) continue;
+    const source = read(resolved);
+    if (source == null) continue;
+    const ok = symbol.split('.').every((seg) => definesSymbol(source, seg));
+    if (!ok) drifted.push(`${citedPath}#${symbol} -> ${resolved}`);
+  }
+  return drifted;
+}
+
 test('every file path cited in docs/agents/codebase-map.md still exists', () => {
   const markdown = fs.readFileSync(DOC_PATH, 'utf8');
   const cited = extractCitedPaths(markdown);
@@ -130,6 +167,26 @@ test('findMissingCitations skips a missing path only when it is git-ignored (hos
     ['src/gone.js -> src/gone.js', 'other.json -> other.json']);
   assert.deepEqual(findMissingCitations(['review-task.js'], { exists, ignored }), ['review-task.js -> python/dashboard/static/js/review-task.js'],
     'a bare name still resolves through the documented shorthand, so a wrong bare citation is reported');
+});
+
+test('every #symbol anchor cited in docs/agents/codebase-map.md still appears in its file', () => {
+  const markdown = fs.readFileSync(DOC_PATH, 'utf8');
+  const anchors = extractCitedAnchors(markdown);
+  const read = (rel) => { try { return fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8'); } catch { return null; } };
+  const drifted = findDriftedSymbols(anchors, { read, ignored: isGitIgnored });
+  assert.deepEqual(drifted, [], `codebase-map.md has #symbol anchor(s) whose symbol is no longer defined in the cited file -- fix the symbol name or move the range:\n${drifted.join('\n')}`);
+});
+
+test('findDriftedSymbols reports only symbols that are not defined in the cited file', () => {
+  const sources = { 'src/a.js': 'function foo(x) { return x; }\nclass Cls {\n  meth() {}\n}\n' };
+  const read = (rel) => sources[rel] ?? null;
+  const ignored = () => false;
+  assert.deepEqual(findDriftedSymbols([{ path: 'src/a.js', symbol: 'foo' }], { read, ignored }), []);
+  assert.deepEqual(findDriftedSymbols([{ path: 'src/a.js', symbol: 'gone' }], { read, ignored }), ['src/a.js#gone -> src/a.js']);
+  assert.deepEqual(findDriftedSymbols([{ path: 'src/a.js', symbol: 'Cls.meth' }], { read, ignored }), []);
+  assert.deepEqual(findDriftedSymbols([{ path: 'src/a.js', symbol: 'Cls.missing' }], { read, ignored }), ['src/a.js#Cls.missing -> src/a.js']);
+  assert.deepEqual(findDriftedSymbols([{ path: 'src/a.js', symbol: 'gone' }], { read, ignored: () => true }), []);
+  assert.deepEqual(findDriftedSymbols([{ path: 'src/unreadable.js', symbol: 'foo' }], { read, ignored }), []);
 });
 
 test('isGitIgnored is true for the real host-local plugins.json and false for a tracked file', () => {
