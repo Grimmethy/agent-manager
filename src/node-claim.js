@@ -11,6 +11,11 @@
 // those lists are merged globally by rankPriorityResolved (src/rank-priority.js), ties broken by file mtime then by
 // list order. A candidate that isHubBlocked (src/hub-stickiness.js) or that cannot be lent is skipped and
 // recorded in the skipped array; the scan continues with the next candidate.
+//
+// Filtered pipeline dirs (AGENT_MANAGER_NODE_FILTERED_DIRS, comma separated): a task in such a dir is claimed only when
+// eligibleForNode holds (source 'manual', not stacked, domain in AGENT_MANAGER_NODE_FILTER_DOMAINS (default ['adhoc']),
+// and filed for this repo or unscoped). Other tasks there are recorded in skipped as 'not-eligible-for-node'.
+// Pipeline dirs not listed in AGENT_MANAGER_NODE_FILTERED_DIRS are unfiltered, exactly as before.
 
 const fs = require('fs');
 const path = require('path');
@@ -23,6 +28,32 @@ const { isHubBlocked } = require('./hub-stickiness.js');
 const { readRemoteUrl } = require('./remote-url.js');
 const { workerNode } = require('./node-affinity.js');
 const { rankPriorityResolved } = require('./rank-priority.js');
+
+// Node eligibility (filtered pipeline dirs only): plain manual work this node may take. Not stacked hub pieces, not
+// non-manual sources, not tasks filed for another repo. Premium priority is not a restriction.
+function eligibleForNode(task, { pipelineDir, domains = ['adhoc'] } = {}) {
+  if (!task || typeof task !== 'object') return false;
+  if (task.source !== 'manual') return false;
+  if (task.stacked) return false;
+  if (!domains.includes(task.domain)) return false;
+  if (task.generatedForRepoRoot && path.resolve(task.generatedForRepoRoot) !== path.resolve(pipelineDir)) return false;
+  return true;
+}
+
+function splitList(value) {
+  return String(value || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+// Absolute, resolved pipeline dirs listed in AGENT_MANAGER_NODE_FILTERED_DIRS. Unset gives [].
+function filteredDirs(env = process.env) {
+  return splitList(env.AGENT_MANAGER_NODE_FILTERED_DIRS).map((d) => path.resolve(d));
+}
+
+// Domains a node may take from filtered dirs (AGENT_MANAGER_NODE_FILTER_DOMAINS). Unset or empty gives ['adhoc'].
+function filterDomains(env = process.env) {
+  const list = splitList(env.AGENT_MANAGER_NODE_FILTER_DOMAINS);
+  return list.length ? list : ['adhoc'];
+}
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
@@ -89,6 +120,10 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
     if (held && held.stacked && held.stacked.branch) stickyBranches.add(held.stacked.branch);
   }
 
+  // Computed once per call: which pipeline dirs are filtered, and the domains allowed there.
+  const filtered = new Set(filteredDirs(env));
+  const allowedDomains = filterDomains(env);
+
   // One ordered list per pipeline dir and sub-directory. pickClaimableTasks keeps its own order within each list.
   const lists = [];
   const seen = new Set();
@@ -104,6 +139,12 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
         if (!task || typeof task !== 'object') continue;
         const taskId = name.replace(/\.json$/, '');
         if (seen.has(taskId)) continue;
+        // Deliberately before seen.add (not after the classes check): an ineligible copy in a filtered dir must not
+        // shadow an eligible same-id record in a later, unfiltered dir.
+        if (filtered.has(path.resolve(pipelineDir)) && !eligibleForNode(task, { pipelineDir, domains: allowedDomains })) {
+          skipped.push({ taskId, reason: 'not-eligible-for-node' });
+          continue;
+        }
         seen.add(taskId);
         if (leasedIds.has(taskId)) continue; // leased (unexpired)
         if (task.pinnedWorker && task.pinnedWorker !== claimant) continue; // pinned to another worker
@@ -152,4 +193,4 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
   return null;
 }
 
-module.exports = { claimNext };
+module.exports = { claimNext, eligibleForNode, filteredDirs, filterDomains };

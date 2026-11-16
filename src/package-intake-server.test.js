@@ -294,3 +294,78 @@ test('a hand-built version 2 package that still carries a lease stamp and a hist
     assert.deepEqual(draft.history.map((h) => h.stage), ['draft-done', 'node-draft-received']);
   } finally { await srv.close(); }
 });
+
+const needsClarificationFile = (s) => path.join(s.env.AGENT_MANAGER_PIPELINE_DIR, 'queue', 'needs-clarification', 'HUB1-05-x.json');
+
+const STOP_RECORD = { id: 'HUB1-05-x', title: 'T', status: 'drafting', leasedTo: 'grimm', needsClarification: { reason: 'which branch to use?', openQuestions: ['main', 'develop'] }, localVotes: [1], history: [{ stage: 'draft-done' }] };
+
+test('a stop record for a leased task returns 200 and routes to needs-clarification with node-stop-received, the original is gone, the lease is returned and marked blocked', async () => {
+  const s = setup();
+  lendLease('HUB1-05-x', 'grimm', { env: s.env });
+  seedOriginal(s, 'pending');
+  const pkg = buildRecordPackage({ record: STOP_RECORD, nodeId: 'grimm', now: Date.UTC(2026, 10, 11) });
+  const srv = await start(s);
+  try {
+    const r = await call(srv.port, { token: s.token, body: pkg });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json, { ok: true, taskId: 'HUB1-05-x' });
+    assert.equal(fs.existsSync(path.join(s.env.AGENT_MANAGER_PIPELINE_DIR, 'queue', 'pending', 'HUB1-05-x.json')), false);
+    assert.equal(fs.existsSync(reviewFile(s)), false);
+    const landed = JSON.parse(fs.readFileSync(needsClarificationFile(s), 'utf8'));
+    assert.equal(landed.needsClarification.reason, 'which branch to use?');
+    assert.deepEqual(landed.needsClarification.openQuestions, ['main', 'develop']);
+    assert.equal('leasedTo' in landed, false);
+    assert.equal(landed.fromNode, 'grimm');
+    assert.equal(landed.status, 'drafting');
+    assert.equal(landed.history.length, 1);
+    assert.equal(landed.history[0].stage, 'node-stop-received');
+    assert.equal(landed.history[0].detail, 'stopped on grimm: which branch to use?');
+    assert.match(landed.history[0].at, /^\d{4}-\d\d-\d\dT/);
+    assert.deepEqual(JSON.parse(fs.readFileSync(stored(s), 'utf8')), pkg);
+    assert.equal(leaseFor('HUB1-05-x', s.env).state, 'returned');
+    assert.equal(leaseFor('HUB1-05-x', s.env).lastEvent, 'blocked');
+    assert.match(leaseFor('HUB1-05-x', s.env).lastEventAt, /^\d{4}-\d\d-\d\dT/);
+    assert.equal(s.notices.length, 1);
+    assert.equal(s.notices[0].level, 'summary');
+    assert.equal(s.notices[0].key, 'node-package:HUB1-05-x');
+    assert.match(s.notices[0].title, /stopped/);
+  } finally { await srv.close(); }
+});
+
+test('a normal record still lands in queue/review unchanged: no regression for the draft path', async () => {
+  const s = setup();
+  lendLease('HUB1-05-x', 'grimm', { env: s.env });
+  seedOriginal(s, 'adhoc');
+  const pkg = buildRecordPackage({ record: DRAFT, nodeId: 'grimm', now: Date.UTC(2026, 10, 11) });
+  const srv = await start(s);
+  try {
+    const r = await call(srv.port, { token: s.token, body: pkg });
+    assert.equal(r.status, 200);
+    assert.equal(fs.existsSync(path.join(s.env.AGENT_MANAGER_PIPELINE_DIR, 'queue', 'adhoc', 'HUB1-05-x.json')), false);
+    const landed = JSON.parse(fs.readFileSync(reviewFile(s), 'utf8'));
+    assert.equal(landed.status, 'needs-review');
+    assert.equal(landed.fromNode, 'grimm');
+    assert.equal(landed.rawDiff, 'diff --git a b');
+    assert.equal(landed.history[0].stage, 'node-draft-received');
+    assert.equal(landed.history[0].detail, 'drafted on grimm');
+    assert.equal(leaseFor('HUB1-05-x', s.env).state, 'returned');
+    assert.equal(leaseFor('HUB1-05-x', s.env).lastEvent, undefined);
+    assert.equal(fs.existsSync(needsClarificationFile(s)), false);
+  } finally { await srv.close(); }
+});
+
+test('a stop-shaped record for an unleased task returns 409: nothing is stored or filed', async () => {
+  const s = setup();
+  seedOriginal(s, 'pending');
+  const pkg = buildRecordPackage({ record: STOP_RECORD, nodeId: 'grimm', now: Date.UTC(2026, 10, 11) });
+  const srv = await start(s);
+  try {
+    const r = await call(srv.port, { token: s.token, body: pkg });
+    assert.equal(r.status, 409);
+    assert.match(r.json.error, /no lease/);
+    assert.equal(fs.existsSync(stored(s)), false);
+    assert.equal(fs.existsSync(reviewFile(s)), false);
+    assert.equal(fs.existsSync(needsClarificationFile(s)), false);
+    assert.equal(s.notices.length, 0);
+  } finally { await srv.close(); }
+});

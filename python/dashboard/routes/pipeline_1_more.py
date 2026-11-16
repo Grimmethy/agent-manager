@@ -898,7 +898,7 @@ def _git_busy_response(step, exc, changed):
 
 @pipeline_1_more_bp.route("/api/git/branches/<path:branch>/merge", methods=["POST"])
 def api_git_merge_branch(branch):
-    from app import get_active_repo_root
+    from app import get_active_repo_root, logger
     repo_root = get_active_repo_root()
     if not repo_root:
         abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
@@ -914,8 +914,11 @@ def api_git_merge_branch(branch):
     if scope:
         repo_root = scope["repoPath"]
 
+    _t_start = time.monotonic()
     try:
+        _t_validate = time.monotonic()
         context = _validate_and_authorize_merge(repo_root, branch, force, scope)
+        validateS = round(time.monotonic() - _t_validate, 1)
     except LookupError as e:
         abort(404, description=str(e))
     except PermissionError as e:
@@ -924,7 +927,9 @@ def api_git_merge_branch(branch):
         return _git_busy_response("checking the branch", e, changed=False)
 
     try:
+        _t_merge = time.monotonic()
         _execute_git_merge(context)
+        mergeS = round(time.monotonic() - _t_merge, 1)
     except MergeLockBusy:
         abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
     except subprocess.TimeoutExpired as e:
@@ -936,29 +941,61 @@ def api_git_merge_branch(branch):
     # failure becomes a warning, and the later steps still run (the task record must be stamped even when the live-checkout sync was too slow).
     warnings = []
     qdir = scope["qdir"] if scope else None
-    live_sync = _guarded_post_merge_step("syncing the dashboard checkout", warnings, lambda: _apply_post_merge_side_effects(context))
+    try:
+        _t_livesync = time.monotonic()
+        live_sync = _guarded_post_merge_step("syncing the dashboard checkout", warnings, lambda: _apply_post_merge_side_effects(context))
+        liveSyncS = round(time.monotonic() - _t_livesync, 1)
+    except Exception:
+        liveSyncS = 0.0
     if live_sync is None:
         live_sync = {"synced": False, "reason": warnings[-1]}
-    _guarded_post_merge_step("stamping the task record", warnings, lambda: _record_merge_in_task_file(branch, context["main_branch"], qdir))
-    _guarded_post_merge_step("closing the task log", warnings, lambda: _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir))
+    try:
+        _t_stamp = time.monotonic()
+        _guarded_post_merge_step("stamping the task record", warnings, lambda: _record_merge_in_task_file(branch, context["main_branch"], qdir))
+        stampS = round(time.monotonic() - _t_stamp, 1)
+    except Exception:
+        stampS = 0.0
+    try:
+        _t_tasklog = time.monotonic()
+        _guarded_post_merge_step("closing the task log", warnings, lambda: _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir))
+        taskLogS = round(time.monotonic() - _t_tasklog, 1)
+    except Exception:
+        taskLogS = 0.0
 
     # Check which plugins are behind after merge (if the merged repo is a plugin's repo).
     # Mirrors the pattern in routes/plugins.py: iterate manifest, call behind_checkout,
     # set restartNeeded field on each plugin entry.
     restart_needed = []
+    pluginsBehindS = 0.0
+    pluginsChecked = 0
     try:
+        _t_plugins = time.monotonic()
         from app import _read_plugins_manifest
         import plugin_process_manager
         manifest = _read_plugins_manifest()
         pm = plugin_process_manager.PluginProcessManager()
         for p in manifest:
             if p.get("slot") or p.get("processName"):
+                pluginsChecked += 1
                 behind_info = pm.behind_checkout(p)
                 p["restartNeeded"] = bool(behind_info.get("behind"))
                 if behind_info.get("behind"):
                     restart_needed.append(p.get("name") or p.get("slot") or str(p))
+        pluginsBehindS = round(time.monotonic() - _t_plugins, 1)
     except Exception:
         logger.warning("Non-fatal: could not check plugin behind-status after merge", exc_info=True)
+
+    totalS = round(time.monotonic() - _t_start, 1)
+
+    try:
+        logger.info(
+            f"merge timings branch={branch} total={totalS} "
+            f"validate={validateS} merge={mergeS} "
+            f"liveSync={liveSyncS} stamp={stampS} "
+            f"taskLog={taskLogS} plugins={pluginsBehindS}({pluginsChecked})"
+        )
+    except Exception:
+        pass
 
     return jsonify({
         "succeeded": True,
@@ -967,6 +1004,16 @@ def api_git_merge_branch(branch):
         "liveSync": live_sync,
         "warnings": warnings,
         "restartNeeded": restart_needed,
+        "timings": {
+            "validateS": validateS,
+            "mergeS": mergeS,
+            "liveSyncS": liveSyncS,
+            "stampS": stampS,
+            "taskLogS": taskLogS,
+            "pluginsBehindS": pluginsBehindS,
+            "pluginsChecked": pluginsChecked,
+            "totalS": totalS,
+        },
     })
 
 
