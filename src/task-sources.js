@@ -130,10 +130,27 @@ const NO_CODE_COMING_DISPOSITIONS = new Set(['noop', 'dismissed', 'filed', 'aban
 // DEPENDENCY's own registered source (its record shape decides what "released" means, e.g.
 // a stacked hub kernel's own semantics), via `dependencyRelease.releaseSignals(record)` on
 // that registration; falls back to this bundle when the source hasn't declared one.
+// A done record that claims to be a noop for an implemented adhoc draft, but carries no branch,
+// no mergedAt and no diff. Nothing ever landed, so it must not release dependents. Without this
+// guard the 'noop' disposition in NO_CODE_COMING_DISPOSITIONS released them anyway.
+function isEmptyImplementedNoop(record) {
+  if (!record || typeof record !== 'object') return false;
+  if (record.terminalDisposition !== 'noop') return false;
+  if (record.adhocResolution !== 'implemented') return false;
+  if (record.branch || record.mergedAt) return false;
+  return typeof record.rawDiff !== 'string' || record.rawDiff.trim() === '';
+}
+
+// Default dependency-release predicate (S1 of the hub-tasks extraction, 2026-09-23) -- the
+// exact checks this function inlined before the hook existed. Resolved through the
+// DEPENDENCY's own registered source (its record shape decides what "released" means, e.g.
+// a stacked hub kernel's own semantics), via `dependencyRelease.releaseSignals(record)` on
+// that registration; falls back to this bundle when the source hasn't declared one.
 function defaultReleaseSignals(record) {
   // 'applied-direct' commits straight to main (directToMain sources) -- the code is
   // already there just as surely as a 'merged' mergedAt stamp says it is.
   if (record && (record.mergedAt || record.terminalDisposition === 'applied-direct')) return true;
+  if (isEmptyImplementedNoop(record)) return false;
   if (record && NO_CODE_COMING_DISPOSITIONS.has(record.terminalDisposition)) return true;
   // Stacked file-decompose child (file-decompose-to-hub.js `mode: 'stacked'`): the whole
   // stack commits onto ONE shared branch and merges to main as a single unit later, so a
@@ -3001,7 +3018,7 @@ module.exports = {
   nextDeepDiveTask, nextBrainDumpSortTask,
   nextPathPrefetchResolveTask, nextResearchTask,
   parseStrongLeadsFromIndex,
-  isTaskReady, pendingReadinessMap, isDependencySatisfied, isSoftDependencySatisfied,
+  isTaskReady, pendingReadinessMap, isDependencySatisfied, isSoftDependencySatisfied, isEmptyImplementedNoop,
   listSecondBrainTopLevel,
   nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
   nextPipelineForensicsTask, markPipelineForensicsReported,
