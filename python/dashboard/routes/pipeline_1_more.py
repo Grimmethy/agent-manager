@@ -442,6 +442,40 @@ def api_git_unmerged_branches():
     return resp.make_conditional(request)
 
 
+@pipeline_1_more_bp.route("/api/git/stale-branch-candidates")
+def api_git_stale_branch_candidates():
+    """Read-only: unmerged branches far behind main that no live owner covers (see branch_staleness.py).
+    Rows come from the same cached list the unmerged-branches route serves (already verdict-enriched) plus
+    the other registered projects. This view performs no writes."""
+    import json
+    import branch_projects
+    import branch_staleness
+    from app import _find_task_record_anywhere, get_active_repo_root, get_pipeline_dir, list_unmerged_branches
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+    qdir = Path(get_pipeline_dir()) / "queue"
+    branches = list_unmerged_branches(force=False, stale_ok=True)
+    branches, _pending = branch_projects.combined_branches(branches, repo_root)
+
+    def find_by_id(task_id):
+        data, _state = _find_task_record_anywhere(qdir, task_id)
+        return data
+
+    def find_by_sha(head_sha):
+        for f in sorted((qdir / "done").glob("*.json")):
+            try:
+                data = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("headSha") == head_sha:
+                return data
+        return None
+
+    threshold = branch_staleness.stale_threshold(os.environ)
+    return jsonify(branch_staleness.stale_candidates(branches, threshold, find_by_id, find_by_sha))
+
+
 @pipeline_1_more_bp.route("/api/git/held-hub-branches")
 def api_git_held_hub_branches():
     """Hubs with built-but-unlisted children, so the tab can say what each is waiting on."""
