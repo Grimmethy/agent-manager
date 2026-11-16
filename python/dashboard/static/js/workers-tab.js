@@ -239,7 +239,7 @@ async function renderWorkers(isPoll) {
   // call-level data (review-task.js's majorityVote never calls recordCall, see that
   // route's own docstring) so it keeps the existing terminal-state recent-tasks view.
   const expandedIsWorker = !!(expandedWorkerId && expandedWorkerId.startsWith('worker'));
-  const [instances, workerModels, costSummary, recentTasks, cloudMeter, stalledWorker, verifierWorker, needsworkWorker, contextMapWorker, contextMemoryWorker, contextImpactWorker, pipelineOpsWorkers] = await Promise.all([
+  const [instances, workerModels, costSummary, recentTasks, cloudMeter, stalledWorker, verifierWorker, needsworkWorker, contextMapWorker, contextMemoryWorker, contextImpactWorker, pipelineOpsWorkers, forgeMode] = await Promise.all([
     fetchJson('/api/instances'),
     fetchJson('/api/worker-models'),
     fetchJson('/api/models/cost-summary'),
@@ -262,7 +262,10 @@ async function renderWorkers(isPoll) {
     fetchJson('/api/context-worker/impact').catch(() => null),
     // Pipeline-ops worker cards (pipeline-ops-workers-panel.js): fail soft the same way.
     fetchJson('/api/pipeline-ops-workers').catch(() => null),
+    // GPU session state (forge mode) so a stale card can say why it is yielding: fail soft, any failure counts as no session.
+    fetchJson('/api/pipeline/forge-mode').catch(() => null),
   ]);
+  const gpuSessionActive = !!(forgeMode && forgeMode.gpuSession && forgeMode.gpuSession.active);
   // Candidate list for each worker's own "assign task" override dropdown (2026-09-07
   // follow-up, Grimmethy after live-testing the override: "the only tasks I have
   // access to... are pipeline debrief tasks. The task I want, autodecomp, is in
@@ -309,7 +312,7 @@ async function renderWorkers(isPoll) {
   });
   // Nothing shown has changed since the last draw (only ages): a poll/event-driven redraw would rebuild the same page, so leave it alone (workers-render-signature.js).
   const renderSignature = !assignableFetchFailed && typeof workersRenderSignature === 'function' ? workersRenderSignature(
-    { instances, workerModels, costSummary, recentTasks, cloudMeter, stalledWorker, verifierWorker, needsworkWorker, contextMapWorker, contextMemoryWorker, contextImpactWorker, pipelineOpsWorkers, assignableByInstance },
+    { instances, workerModels, costSummary, recentTasks, cloudMeter, stalledWorker, verifierWorker, needsworkWorker, contextMapWorker, contextMemoryWorker, contextImpactWorker, pipelineOpsWorkers, assignableByInstance, ...(gpuSessionActive !== undefined ? { gpuSessionActive } : {}) },
     { expanded: expandedWorkerId, pinned: pendingWorkerAssign, chosen: selectedWorkerTaskType, completed: completedTasksLog.length, newest: completedTasksLog[0] ? (completedTasksLog[0].taskId || completedTasksLog[0].id || completedTasksLog[0].endedAt || null) : null }) : '';
   if (typeof workersCanSkipRender === 'function' && workersCanSkipRender(renderSignature, isPoll, main)) return;
   const filterBar = buildWorkersFilterBarHtml(workerModels);
@@ -331,7 +334,7 @@ async function renderWorkers(isPoll) {
         ${buildWorkerModelSelectHtml(inst, workerModels, overrides)}
         ${canAssignTask(inst) ? buildTaskPickerHtml(inst, assignableByInstance[inst.instanceId] || [], selectedWorkerTaskType[inst.instanceId] || '') : ''}
         <div class="badge-col">
-          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : statusLabel(inst.status)}</span>
+          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? workerStaleLabel({ stale: inst.stale, gpuSessionActive }) : statusLabel(inst.status)}</span>
           ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
           <span class="state-timer" id="state-timer-${inst.instanceId}">${inst.stateAgeSeconds != null ? 'in this state ' + fmtDuration(inst.stateAgeSeconds) : ''}</span>
           ${typeof buildWorkerSwitchHtml === 'function' ? buildWorkerSwitchHtml(inst) : ''}
@@ -342,6 +345,7 @@ async function renderWorkers(isPoll) {
         ${inst.currentTaskId && inst.projectLabel ? ' · <span class="badge ' + (inst.borrowed ? 'warn' : 'idle') + '" title="' + (inst.borrowed ? 'Borrowed: this lane is idle in the active project and is working a task of ' + escapeAttr(inst.projectLabel) + ' (idle-pool borrowing)' : 'This task belongs to the active project') + '">📁 ' + escapeHtml(inst.projectLabel) + (inst.borrowed ? ' (borrowed)' : '') + '</span>' : ''}
         ${inst.currentTaskId && inst.hub ? ' · <span class="badge ok" title="This task belongs to hub ' + escapeAttr(inst.hub.label) + '" style="font-weight:700">🗂 ' + escapeHtml(hubTag(inst.hub)) + '</span>' : ''}
         ${inst.currentTaskId ? ' · working on <strong><a href="#" data-open-task-anywhere="' + escapeAttr(inst.currentTaskId) + '">' + escapeHtml(inst.currentTaskId) + '</a></strong>' + (inst.currentPass ? ' (' + escapeHtml(inst.currentPass) + ')' : '') + ' · ' + trajectoryLinkHtml(inst.currentTaskId) : ''}
+        ${strandedClaimLabel({ stale: inst.stale, currentTaskId: inst.currentTaskId }) ? ' · <span class="badge warn">' + escapeHtml(strandedClaimLabel({ stale: inst.stale, currentTaskId: inst.currentTaskId })) + '</span>' : ''}
         ${pendingWorkerAssign[inst.instanceId] ? ' · <strong>📌 pinned, waiting for ' + escapeAttr(inst.instanceId) + ' to pick it up…</strong>' : ''}
         ${costByInstance[inst.instanceId] ? ' · ' + fmtUsd(costByInstance[inst.instanceId]) + ' est. API cost' : ''}
       </div>
