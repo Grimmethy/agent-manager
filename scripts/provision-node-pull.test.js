@@ -40,7 +40,7 @@ test('am-node-pull.service runs node src/node-pull.js --daemon', () => {
   assert.ok(fs.existsSync(unit('am-node-pull.service')));
   const exec = lines(unit('am-node-pull.service')).filter((l) => l.startsWith('ExecStart='));
   assert.equal(exec.length, 1);
-  assert.ok(exec[0].endsWith('node src/node-pull.js --daemon'), exec[0]);
+  assert.ok(exec[0].endsWith(`${repo}/src/node-pull.js --daemon`), exec[0]);
 });
 
 test('am-node-send.path triggers on PathChanged of queue/node-outbox and names the send service', () => {
@@ -54,7 +54,103 @@ test('am-node-send.service runs src/node-package-send.js', () => {
   assert.ok(fs.existsSync(unit('am-node-send.service')));
   const exec = lines(unit('am-node-send.service')).filter((l) => l.startsWith('ExecStart='));
   assert.equal(exec.length, 1);
-  assert.ok(exec[0].includes('src/node-package-send.js'), exec[0]);
+  assert.ok(exec[0].includes(`${repo}/src/node-package-send.js`), exec[0]);
+});
+
+// The unit files must be runnable as written: an absolute node binary, the node repo as the working directory, node.env as the EnvironmentFile,
+// and the four flags node-package-send.js needs (--url and --token-file come from node.env through systemd's ${VAR} expansion).
+for (const name of ['am-node-pull.service', 'am-node-send.service']) {
+  test(`${name} starts with an absolute node path, runs in the node repo and reads node.env`, () => {
+    const l = lines(unit(name));
+    const exec = l.find((x) => x.startsWith('ExecStart='));
+    assert.match(exec, /^ExecStart=\/[^ ]*\/node /, exec);
+    assert.ok(l.includes(`WorkingDirectory=${repo}`), `${name} WorkingDirectory`);
+    assert.ok(l.includes(`EnvironmentFile=${pipe}/node.env`), `${name} EnvironmentFile`);
+  });
+}
+
+test('am-node-send.service passes --url, --token-file, --node-id and --outbox', () => {
+  const exec = lines(unit('am-node-send.service')).find((l) => l.startsWith('ExecStart='));
+  assert.ok(exec.includes(' --url ${AGENT_MANAGER_PACKAGE_URL}'), exec);
+  assert.ok(exec.includes(' --token-file ${AGENT_MANAGER_NODE_TOKEN_FILE}'), exec);
+  assert.ok(exec.includes(' --node-id grimm '), exec);
+  assert.ok(exec.endsWith(` --outbox ${pipe}/queue/node-outbox`), exec);
+});
+
+test('node.env carries the commented AGENT_MANAGER_PACKAGE_URL example the send service reads', () => {
+  const env = read(path.join(pipe, 'node.env'));
+  assert.match(env, /^#\s*AGENT_MANAGER_PACKAGE_URL=/m);
+  assert.doesNotMatch(env, /^AGENT_MANAGER_PACKAGE_URL=/m);
+});
+
+test('a second run keeps an edited unit byte for byte and says kept', () => {
+  const t = fs.mkdtempSync(path.join(root, 'rerun-'));
+  const args = ['grimm', path.join(t, 'pipe'), path.join(t, 'repo'), path.join(t, 'units')];
+  const opts = { encoding: 'utf8', timeout: 60000, env: { ...process.env, HOME: home } };
+  assert.equal(spawnSync('bash', [SCRIPT, ...args], opts).status, 0);
+  const edited = path.join(t, 'units', 'am-node-send.service');
+  fs.writeFileSync(edited, '[Service]\nExecStart=/usr/bin/node hand-written\n');
+  const again = spawnSync('bash', [SCRIPT, ...args], opts);
+  assert.equal(again.status, 0, again.stderr);
+  assert.equal(read(edited), '[Service]\nExecStart=/usr/bin/node hand-written\n');
+  assert.match(again.stdout, new RegExp(`^kept    ${edited}$`, 'm'));
+  assert.doesNotMatch(again.stdout, /^wrote   .*am-node-send\.service$/m);
+});
+
+test('am-node-retry.service is a oneshot that runs src/reject-retry-check.js from the node repo with node.env', () => {
+  const l = lines(unit('am-node-retry.service'));
+  assert.ok(l.includes('Type=oneshot'));
+  const exec = l.find((x) => x.startsWith('ExecStart='));
+  assert.match(exec, /^ExecStart=\/[^ ]*\/node /, exec);
+  assert.ok(exec.endsWith(` ${repo}/src/reject-retry-check.js`), exec);
+  assert.ok(l.includes(`WorkingDirectory=${repo}`));
+  assert.ok(l.includes(`EnvironmentFile=${pipe}/node.env`));
+  for (const want of SCHED) assert.ok(l.includes(want), `lacks ${want}`);
+});
+
+test('am-node-retry.path watches queue/blocked and names the retry service', () => {
+  const l = lines(unit('am-node-retry.path'));
+  assert.ok(l.includes(`PathChanged=${pipe}/queue/blocked`), l.join('\n'));
+  assert.ok(l.includes('Unit=am-node-retry.service'));
+});
+
+test('a second run keeps an edited am-node-retry.service byte for byte', () => {
+  const t = fs.mkdtempSync(path.join(root, 'retry-rerun-'));
+  const args = ['grimm', path.join(t, 'pipe'), path.join(t, 'repo'), path.join(t, 'units')];
+  const opts = { encoding: 'utf8', timeout: 60000, env: { ...process.env, HOME: home } };
+  assert.equal(spawnSync('bash', [SCRIPT, ...args], opts).status, 0);
+  const edited = path.join(t, 'units', 'am-node-retry.service');
+  fs.writeFileSync(edited, '[Service]\nExecStart=/usr/bin/node mine\n');
+  const again = spawnSync('bash', [SCRIPT, ...args], opts);
+  assert.equal(again.status, 0, again.stderr);
+  assert.equal(read(edited), '[Service]\nExecStart=/usr/bin/node mine\n');
+  assert.match(again.stdout, new RegExp(`^kept    ${edited}$`, 'm'));
+});
+
+test('a directory at a unit path is kept: exit 0, kept printed, nothing written into it', () => {
+  const t = fs.mkdtempSync(path.join(root, 'dir-at-unit-'));
+  const unitDir = path.join(t, 'units');
+  fs.mkdirSync(path.join(unitDir, 'am-node-send.service'), { recursive: true });
+  const r = spawnSync('bash', [SCRIPT, 'grimm', path.join(t, 'pipe'), path.join(t, 'repo'), unitDir], { encoding: 'utf8', timeout: 60000, env: { ...process.env, HOME: home } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`^kept    ${path.join(unitDir, 'am-node-send.service')}$`, 'm'));
+  assert.deepEqual(fs.readdirSync(path.join(unitDir, 'am-node-send.service')), []);
+});
+
+test('a node found by name only (not an absolute path) stops with exit 1 and says so', () => {
+  const t = fs.mkdtempSync(path.join(root, 'bare-node-'));
+  const r = spawnSync('/bin/bash', [SCRIPT, 'grimm', path.join(t, 'pipe'), path.join(t, 'repo'), path.join(t, 'units')], { encoding: 'utf8', timeout: 60000, env: { HOME: home, PATH: '/nonexistent', 'BASH_FUNC_node%%': '() { :; }' } });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /not absolute/);
+  assert.equal(fs.existsSync(path.join(t, 'units')), false);
+});
+
+test('a PATH without node stops with exit 1 before any unit is written', () => {
+  const t = fs.mkdtempSync(path.join(root, 'nonode-'));
+  const noNode = spawnSync('/bin/bash', [SCRIPT, 'grimm', path.join(t, 'pipe'), path.join(t, 'repo'), path.join(t, 'units')], { encoding: 'utf8', timeout: 60000, env: { HOME: home, PATH: '/nonexistent' } });
+  assert.equal(noNode.status, 1, noNode.stderr);
+  assert.match(noNode.stderr, /node is not on PATH/);
+  assert.equal(fs.existsSync(path.join(t, 'units')), false);
 });
 
 // systemd does not accept Nice/IOSchedulingClass/CPUSchedulingPolicy in a .path unit, so only the two service units carry them.
@@ -74,7 +170,7 @@ test('node.env carries commented examples and no uncommented setting for the pul
 });
 
 test('the units are written only: plain files, nothing enabled, nothing under the temp HOME', () => {
-  assert.deepEqual(fs.readdirSync(units).sort(), ['am-node-pull.service', 'am-node-send.path', 'am-node-send.service']);
+  assert.deepEqual(fs.readdirSync(units).sort(), ['am-node-pull.service', 'am-node-retry.path', 'am-node-retry.service', 'am-node-send.path', 'am-node-send.service']);
   for (const f of fs.readdirSync(units)) assert.equal(fs.lstatSync(unit(f)).isFile(), true, f);
   assert.deepEqual(fs.readdirSync(home), []);
   assert.match(run.stdout, /Nothing was started/);

@@ -44,7 +44,7 @@ test('a first run creates the nine queue directories, the domains, one disabled 
   assert.deepEqual(env.split('\n').filter((l) => l !== '' && !l.startsWith('#')), [
     'AGENT_MANAGER_NODE_ID=grimm', `AGENT_MANAGER_PIPELINE_DIR=${t.pipe}`, `AGENT_MANAGER_REPO_ROOT=${t.repo}`, `AGENT_MANAGER_DOMAINS_PATH=${t.pipe}/task-domains.json`, `AGENT_MANAGER_LANES_PATH=${t.pipe}/lanes.json`,
   ]);
-  assert.deepEqual(env.split('\n').filter((l) => l.startsWith('#')), ['# AGENT_MANAGER_CLAIM_URL=', '# AGENT_MANAGER_NODE_TOKEN_FILE=', '# AGENT_MANAGER_NODE_REPOS_DIR=']);
+  assert.deepEqual(env.split('\n').filter((l) => l.startsWith('#')), ['# AGENT_MANAGER_CLAIM_URL=', '# AGENT_MANAGER_NODE_TOKEN_FILE=', '# AGENT_MANAGER_NODE_REPOS_DIR=', '# AGENT_MANAGER_PACKAGE_URL=']);
   assert.ok(env.endsWith('\n'));
   assert.deepEqual(fs.readdirSync(t.pipe).sort(), ['lanes.json', 'node.env', 'queue', 'task-domains.json']);
   assert.match(r.stdout, /Nothing was started/);
@@ -77,7 +77,8 @@ test('a second run keeps everything: files unchanged, an edited lanes.json untou
   assert.equal(read(path.join(t.pipe, 'node.env')), before.env);
   assert.equal(fs.readFileSync(path.join(t.pipe, 'queue', 'adhoc', 'keep-me.json'), 'utf8'), '{}');
   assert.deepEqual(fs.readdirSync(t.pipe).sort(), ['lanes.json', 'node.env', 'queue', 'task-domains.json']);
-  assert.equal((r.stdout.match(/^kept /gm) || []).length, QUEUES.length + 1);
+  // the queue folders, lanes.json and (since units are never overwritten) the five unit files
+  assert.equal((r.stdout.match(/^kept /gm) || []).length, QUEUES.length + 1 + 5);
   assert.doesNotMatch(r.stdout, /^created /m);
 });
 
