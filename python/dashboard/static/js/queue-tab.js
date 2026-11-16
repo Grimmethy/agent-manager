@@ -183,6 +183,8 @@ async function renderQueueTab(state) {
   // first time a new family appears in the (already hierarchy-ordered) list -- works even
   // when a page starts mid-family, since every row carries its family's label, not just roots.
   let lastHubFamily = null;
+  // hub-labels.js resolveHubLabels, guarded so the tab still renders if the script is not loaded. Used only for the family header's parent line.
+  const hubLabels = (typeof resolveHubLabels === 'function') ? (resolveHubLabels(tasks) || {}) : {};
   const rows = tasks.map(t => {
     const isPrompt = showApply && approvalModeBySource[t.source] === 'prompt';
     // Orange left-border + ⚠ prefix on every row here -- the actual ask (Discuss session
@@ -268,7 +270,11 @@ async function renderQueueTab(state) {
       : `<td>${t.id}</td>`;
     let familyHeaderRow = '';
     if (state === 'coordinating' && t.hubFamily && t.hubFamily !== lastHubFamily) {
-      familyHeaderRow = `<tr><td colspan="4" style="background:rgba(91,157,255,0.14);color:var(--link);font-weight:600;padding:6px 8px;border-top:1px solid var(--border)">🗂 ${escapeHtml(t.hubFamily)}</td></tr>`;
+      const famRootId = t.hubDepth ? ((tasks.find(x => x && !x.hubDepth && x.hubFamily === t.hubFamily) || {}).id || null) : t.id;
+      const famInfo = famRootId && hubLabels[famRootId];
+      const famParentLine = famInfo && famInfo.parentLabel ? `<div class="meta" style="font-size:12px;font-weight:400">part of ${escapeHtml(famInfo.parentLabel)} / ${escapeHtml(famInfo.parentRecordId)}</div>` : '';
+      const famOpenAttrs = famRootId ? ` class="clickable" data-state="coordinating" data-id="${escapeAttr(famRootId)}" title="${escapeAttr(famRootId)}" tabindex="0" role="button" style="cursor:pointer" onkeydown="if(event.key==='Enter'){openDetail(this.dataset.state,this.dataset.id)}"` : '';
+      familyHeaderRow = `<tr${famOpenAttrs}><td colspan="4" style="background:rgba(91,157,255,0.14);color:var(--link);font-weight:600;padding:6px 8px;border-top:1px solid var(--border)">🗂 ${escapeHtml(t.hubFamily)}${famParentLine}</td></tr>`;
       lastHubFamily = t.hubFamily;
     }
     return `${familyHeaderRow}

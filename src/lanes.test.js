@@ -460,3 +460,17 @@ test('isScriptEndpoint: true only for an enabled script lane endpoint (trailing 
   assert.equal(isScriptEndpoint('http://127.0.0.1:7449', withRegistry('{ not json')), false);
   assert.equal(isCloudEndpoint('http://127.0.0.1:7449', env), false, 'and a script endpoint is not a cloud endpoint');
 });
+
+test('CLI --env: a cloud lane prints LANE_CLOUD_REVIEWS (true by default, false when reviews is false); other lanes print nothing extra', () => {
+  const { execFileSync } = require('node:child_process');
+  const env = { ...process.env, ...withRegistry([
+    CLOUD,
+    { ...CLOUD, gpu: 'cloud2', ollamaUrl: 'http://127.0.0.1:7480', reviews: false },
+    RX580,
+  ]) };
+  const envLines = (id) => execFileSync('node', [path.join(__dirname, 'lanes.js'), '--env', id], { env, encoding: 'utf8' }).trim().split('\n');
+  assert.ok(envLines('worker-cloud').includes('LANE_CLOUD_REVIEWS=true'), 'default is true');
+  assert.ok(envLines('worker-cloud2').includes('LANE_CLOUD_REVIEWS=false'));
+  assert.equal(envLines('worker-cloud').filter((l) => l.startsWith('LANE_CLOUD_REVIEWS=')).length, 1);
+  assert.equal(envLines('worker-rx580').some((l) => l.startsWith('LANE_CLOUD_REVIEWS=')), false, 'a non-cloud lane keeps its exact output');
+});

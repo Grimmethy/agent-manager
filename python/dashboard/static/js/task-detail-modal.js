@@ -234,6 +234,18 @@ function renderTaskDetailModal(task) {
     + `<button type="button" class="${premiumOn ? 'action' : 'secondary'}" id="task-premium-priority" title="${premiumOn ? 'Currently claimed ahead of everything else in the queue, every pass, until turned off or the task completes. Click to turn off.' : 'Always claim this task first, every pass, regardless of source or age -- stays on until you turn it off or the task completes.'}">${premiumOn ? '★ Premium Priority (on)' : '☆ Set Premium Priority'}</button>`
     + (premiumProvenanceText(task, Date.now()) ? ` <span class="muted" id="task-premium-provenance">${escapeHtml(premiumProvenanceText(task, Date.now()))}</span>` : '')
     + `</div>`;
+  // Retire hub (HUB0441 3/3): only a coordinating hub gets the button. The panel stays hidden until clicked; the client sends the whole
+  // sub-task list unfiltered and the server (routes/task.py api_hub_retire) decides which children are safe to archive.
+  if (task._foundState === 'coordinating') {
+    html += `<div style="margin:6px 0"><button type="button" class="secondary" id="task-hub-retire-btn">Retire hub...</button></div>`
+      + `<div id="task-hub-retire-panel" style="display:none;margin:6px 0">`
+      + `<input type="text" id="task-hub-retire-reason" placeholder="Why retire this hub? (required)" style="width:100%">`
+      + `<div id="task-hub-retire-preview" style="margin:6px 0"></div>`
+      + `<div class="meta" style="margin:4px 0">Retiring archives every unfinished sub-task. If any is in flight (review, approved or drafting) the server refuses and nothing changes.</div>`
+      + `<button type="button" class="action" id="task-hub-retire-confirm">Confirm retire</button> `
+      + `<div id="task-hub-retire-error" class="meta da-outcome-error" style="margin:4px 0"></div>`
+      + `</div>`;
+  }
   if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
   html += `<div><strong>${escapeHtmlBright(task.title || '')}</strong></div>`;
   // Hub back-link (2026-09-06, Grimmethy: "when a task is a sub-task of a hub I should be
@@ -398,6 +410,44 @@ function renderTaskDetailModal(task) {
   // implement -- and hard-caps the payload at <=200 chars before sendTextToChat
   // (core-ui.js:783), which POSTs the { text } verbatim to /api/chat/inject with no
   // further expansion. That is the full, complete scope of what gets injected.
+  // Retire hub wiring (HUB0441 3/3): the request is validated by hubRetireRequest before any fetch; the response is judged by hubRetireOutcome.
+  const hubRetireBtn = document.getElementById('task-hub-retire-btn');
+  if (hubRetireBtn) {
+    const hubRetirePanel = document.getElementById('task-hub-retire-panel');
+    const hubRetireReason = document.getElementById('task-hub-retire-reason');
+    const hubRetirePreviewEl = document.getElementById('task-hub-retire-preview');
+    const hubRetireConfirm = document.getElementById('task-hub-retire-confirm');
+    const hubRetireError = document.getElementById('task-hub-retire-error');
+    hubRetireBtn.onclick = () => {
+      const rows = hubRetirePreview(task.subTasks);
+      hubRetirePreviewEl.innerHTML = rows.length
+        ? rows.map((c) => `<div class="task-history-row"><code>${escapeHtml(c.id)}</code> <span class="meta">${escapeHtml(c.state || '?')}</span> ${escapeHtmlBright(c.title || '')}</div>`).join('')
+        : '<span class="meta">This hub has no sub-tasks.</span>';
+      hubRetireError.textContent = '';
+      hubRetirePanel.style.display = '';
+    };
+    hubRetireConfirm.onclick = async () => {
+      hubRetireError.textContent = '';
+      const req = hubRetireRequest(task.id, hubRetireReason.value);
+      if (req.error) { hubRetireError.textContent = req.error; return; }
+      hubRetireConfirm.disabled = true;
+      try {
+        const res = await fetch(req.url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req.body) });
+        const payload = await res.json().catch(() => ({}));
+        const outcome = hubRetireOutcome(res.status, payload);
+        if (outcome.close) {
+          closeDetail();
+          renderQueueTab('coordinating');
+        } else {
+          hubRetireError.textContent = outcome.message;
+        }
+      } catch (e) {
+        hubRetireError.textContent = 'Retire failed: ' + e.message;
+      } finally {
+        hubRetireConfirm.disabled = false;
+      }
+    };
+  }
   const taskSendToChatBtn = document.getElementById('task-send-to-chat');
   if (taskSendToChatBtn) {
     taskSendToChatBtn.onclick = async () => {

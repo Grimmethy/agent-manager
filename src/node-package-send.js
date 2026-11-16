@@ -7,8 +7,10 @@
 //
 // Each record in the outbox (*.json, sorted by name) is sent with the node's token read from the file (never from the environment, never printed or logged). A 2xx
 // answer moves the record to node-sent/, a sibling of the outbox; any other answer, a send that cannot be made, a file that is not a JSON record with a string id,
-// or a move that fails leaves the file where it is and counts as failed. Prints one JSON line {sent, failed, remaining}. Exit 0 when nothing failed, 3 when any
-// failed, 2 for a missing argument, an unreadable or empty token file, or an outbox that is not a directory (usage on stderr).
+// or a move that fails leaves the file where it is and counts as failed. HTTP 400 is the exception: the package can never be accepted as it stands, so the file
+// is moved to node-refused/ (a sibling of node-sent/) with a <name>.reason.txt beside it reading `HTTP 400 at <ISO time>`, and counts as refused, not failed.
+// Prints one JSON line {sent, failed, refused, remaining}. Exit 0 when nothing failed (refused alone is 0), 3 when any failed, 2 for a missing argument, an
+// unreadable or empty token file, or an outbox that is not a directory (usage on stderr).
 
 const fs = require('fs');
 const path = require('path');
@@ -41,6 +43,17 @@ function moveToSent(file, sentDir) {
   }
 }
 
+function moveToRefused(file, refusedDir, line) {
+  try {
+    fs.mkdirSync(refusedDir, { recursive: true });
+    fs.renameSync(file, path.join(refusedDir, path.basename(file)));
+  } catch (e) {
+    return false;
+  }
+  try { fs.writeFileSync(path.join(refusedDir, `${path.basename(file)}.reason.txt`), `${line}\n`); } catch (e) { /* the file is already out of the outbox */ }
+  return true;
+}
+
 async function main(argv, env = process.env, deps = {}, out = (s) => process.stdout.write(`${s}\n`), err = (s) => process.stderr.write(s)) {
   const url = flag(argv, '--url');
   const tokenFile = flag(argv, '--token-file');
@@ -52,18 +65,22 @@ async function main(argv, env = process.env, deps = {}, out = (s) => process.std
   if (!token) { err('the token file is missing or empty\n'); return 2; }
   if (!fs.existsSync(outbox) || !fs.statSync(outbox).isDirectory()) { err('the outbox is not a directory\n'); return 2; }
   const sentDir = path.join(path.dirname(outbox), 'node-sent');
+  const refusedDir = path.join(path.dirname(outbox), 'node-refused');
   const now = deps.now || Date.now;
   let sent = 0;
   let failed = 0;
+  let refused = 0;
   for (const name of outboxFiles(outbox)) {
     const file = path.join(outbox, name);
     const record = readJson(file);
     if (!record || typeof record.id !== 'string' || !record.id) { failed += 1; continue; }
     const pkg = buildRecordPackage({ record, nodeId, now: now() });
     const r = await sendPackage(pkg, { url, tokenFile, post: deps.post });
-    if (r.ok && moveToSent(file, sentDir)) sent += 1; else failed += 1;
+    if (r.ok) { if (moveToSent(file, sentDir)) sent += 1; else failed += 1; }
+    else if (r.status === 400) { if (moveToRefused(file, refusedDir, `HTTP 400 at ${new Date(now()).toISOString()}`)) refused += 1; else failed += 1; }
+    else failed += 1;
   }
-  out(JSON.stringify({ sent, failed, remaining: outboxFiles(outbox).length }));
+  out(JSON.stringify({ sent, failed, refused, remaining: outboxFiles(outbox).length }));
   return failed ? 3 : 0;
 }
 
