@@ -188,7 +188,12 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
       continue;
     }
     const remoteUrl = readRemote(c.pipelineDir);
-    return { task: { ...record, leasedTo: claimant }, lease, repo: { root: c.pipelineDir, remoteUrl }, skipped };
+    // Handed-out copy only (the wok file above keeps dependsOn). The deps were verified satisfied on wok by the filter
+    // above, so their ids are passed as dependsOnResolved, stamped with the same 'now' claimNext already uses.
+    const { dependsOn, ...rest } = record;
+    const verifiedIds = Array.isArray(dependsOn) ? dependsOn.slice() : [];
+    const lent = { ...rest, leasedTo: claimant, dependsOnResolved: { ids: verifiedIds, checkedAt: now } };
+    return { task: lent, lease, repo: { root: c.pipelineDir, remoteUrl }, skipped };
   }
   return null;
 }
