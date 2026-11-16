@@ -45,6 +45,20 @@ function priorRejectionBlock(task) {
   ].join('\n');
 }
 
+// Renders the grounded-only retry block: lists the repo-relative files an implement pass
+// must ground its edits in. Absolute entries are dropped, since only repo-relative paths
+// are meaningful inside the isolated worktree. Returns '' when no usable entries remain.
+function groundedOnlyBlock(paths) {
+  const entries = (Array.isArray(paths) ? paths : [])
+    .filter((p) => typeof p === 'string' && p && !path.isAbsolute(p));
+  if (entries.length === 0) return '';
+  return [
+    'GROUNDED-ONLY -- edit only these repo-relative files; do not use absolute paths:',
+    ...entries.map((p) => `  - ${p}`),
+    '',
+  ].join('\n');
+}
+
 // The RESOLUTION verbs an agentic implement pass may end with. `implemented` +
 // `no-changes-needed` produce a reviewable outcome; `decompose` yields a sub-task list;
 // `needs-human-decision` routes straight to queue/needs-clarification/.
@@ -1162,7 +1176,7 @@ function summariseInvestigation(responseText, toolCallLog) {
 }
 
 module.exports = {
-  GIT_ENV, GIT_TIMEOUT_MS, runGit, priorRejectionBlock,
+  GIT_ENV, GIT_TIMEOUT_MS, runGit, priorRejectionBlock, groundedOnlyBlock,
   RESOLUTION_RE, parseSubTaskProposals, formatSubTaskProposalsForReview, parseClarificationOptions, extractFirstJsonArray,
   agenticWorktreePaths, prepareAdhocWorktree, cleanupAdhocWorktree, applyPartialDiff,
   runAgenticDraftInWorktree, resolveAgenticDraft,
