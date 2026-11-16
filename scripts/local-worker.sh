@@ -528,6 +528,7 @@ fi
 # NOT an infra failure (a real success, a non-infra block, or a genuinely idle tick).
 CONSECUTIVE_INFRA_FAILURES=0
 SWITCHED_OFF_TICKS=0                                                     # consecutive ticks this worker has been switched off by the operator (worker_switched_off); only used to print one line on each transition
+DIAL_OFF_TICKS=0                                                         # consecutive ticks this cloud lane has been turned off by the cloud-agent dial (cloud_dial_off); only used to print one line on each transition
 LANE_RULES_STAMP="${TEMP_DIR:-${TMPDIR:-/tmp}}/lane-rules-${INSTANCE_ID}.stamp"   # reload_lane_rules (agent-manager-common.sh) re-reads this lane's taskClasses and reviews only when lanes.json is newer than this per-instance stamp; the tick is the trigger, no timer
 ENDPOINT_DOWN_TICKS=0                                                    # consecutive ticks the lane's Ollama endpoint did not answer (see the circuit breaker in the main loop)
 LAST_WAKE=""                                                            # how the last idle wait ended: event | timeout | sleep (see wait_for_queue_change)
@@ -662,6 +663,22 @@ while :; do                                                                     
   if (( SWITCHED_OFF_TICKS > 0 )); then
     printf '[worker-%s] switched back on after %s tick(s) off; resuming.\n' "$INSTANCE_ID" "$SWITCHED_OFF_TICKS" >&2
     SWITCHED_OFF_TICKS=0
+  fi
+  # Cloud-agent dial (src/cloud-dial.js): a cloud lane ranked past the dial count claims nothing this tick, like a switched-off worker; a task already in drafting/ finishes first. Heartbeat
+  # status disabled with pass "dial" (so the Workers tab can tell it from the operator switch). No dial file (today) = this block never fires and spawns nothing.
+  if cloud_dial_off "$INSTANCE_ID"; then
+    if (( DIAL_OFF_TICKS == 0 )); then
+      printf '[worker-%s] turned off by the cloud-agent dial -- claiming nothing until the dial is raised.\n' "$INSTANCE_ID" >&2
+    fi
+    DIAL_OFF_TICKS=$((DIAL_OFF_TICKS + 1))
+    write_heartbeat_file "$INSTANCE_ID" "disabled" "$HEARTBEAT_MODEL" "" "dial" "$STARTED_AT"
+    if "$ONCE"; then exit 0; fi
+    sleep "${AGENT_MANAGER_SWITCHED_OFF_PAUSE_S:-${ORC_TICK_SECS:-30}}"
+    continue
+  fi
+  if (( DIAL_OFF_TICKS > 0 )); then
+    printf '[worker-%s] the cloud-agent dial now includes this lane after %s tick(s) off; resuming.\n' "$INSTANCE_ID" "$DIAL_OFF_TICKS" >&2
+    DIAL_OFF_TICKS=0
   fi
   reload_lane_rules "$INSTANCE_ID" || true                                      # a lanes.json edit (taskClasses, reviews) reaches this running worker without a restart; no node spawn while lanes.json is unchanged, and a failure never stops the tick. Sets LANE_RULES_TASK_CLASSES / LANE_RULES_REVIEWS for later pieces; nothing reads them yet.
   refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work -- see the function's own comment above the loop.

@@ -159,6 +159,27 @@ worker_switched_off() {
   node "$switch_js" is-disabled "$id" 2>/dev/null
 }
 
+# cloud_dial_off <instance_id> -> exit 0 when the cloud-agent dial (src/cloud-dial.js, cloud-dial.json) turns this cloud lane off, 1 otherwise. Only a worker-cloud /
+# worker-cloudN instance is ever asked; every other worker returns 1 at once. With no dial file (today's state) it returns 1 without spawning node. With a file it asks
+# `node src/cloud-dial.js is-off <id>` only when the dial file or lanes.json is newer than a per-instance stamp, and otherwise reuses the last answer (CLOUD_DIAL_LAST), so
+# a steady dial costs no spawn per tick. Any node failure counts as NOT off (a broken dial must never stall the swarm). No timer or loop: the caller's tick is the trigger.
+cloud_dial_off() {
+  local id="${1:-}"
+  [[ "$id" =~ ^worker-cloud[0-9]*$ ]] || return 1
+  local here dial lanes stamp
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  dial="${AGENT_MANAGER_CLOUD_DIAL_PATH:-${HOME}/.local/state/agent-manager/cloud-dial.json}"
+  lanes="${AGENT_MANAGER_LANES_PATH:-${here}/../lanes.json}"
+  stamp="${CLOUD_DIAL_STAMP:-${TEMP_DIR:-/tmp}/cloud-dial-${id}.stamp}"
+  if [[ ! -f "$dial" ]]; then CLOUD_DIAL_LAST=""; return 1; fi
+  if [[ -n "${CLOUD_DIAL_LAST:-}" && ! "$dial" -nt "$stamp" && ! "$lanes" -nt "$stamp" ]]; then
+    [[ "$CLOUD_DIAL_LAST" == "off" ]]; return
+  fi
+  touch "$stamp" 2>/dev/null || true
+  if node "${here}/../src/cloud-dial.js" is-off "$id" >/dev/null 2>&1; then CLOUD_DIAL_LAST="off"; return 0; fi
+  CLOUD_DIAL_LAST="on"; return 1
+}
+
 comfyui_lease_held() {
   local endpoint="${1:-}"
   local lease_path="${AGENT_MANAGER_COMFY_LEASE_PATH:-${HOME}/.local/state/agent-manager/comfyui-lease.json}"
