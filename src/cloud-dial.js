@@ -22,6 +22,8 @@
 //   node src/cloud-dial.js mode <manual|auto>
 //   node src/cloud-dial.js is-off <laneId>     exit 0 when the lane is off, 1 otherwise; prints nothing. Lane ids come from src/lanes.js getLanes()
 //                                              filtered to enabled cloud lanes.
+//   node src/cloud-dial.js status              JSON {count, mode, setAt, setBy, lanes: [{id, rank, off}]}: the state plus every enabled cloud lane in lane order, so the dashboard
+//                                              never re-implements the order or the off rule (feature cloud-agent-pool, FF-3c).
 
 const fs = require('fs');
 const os = require('os');
@@ -122,17 +124,27 @@ function isLaneOff(laneId, env = process.env, cloudLaneIds = undefined) {
   }
 }
 
-module.exports = { dialPath, read, setCount, unset, setMode, laneRank, isLaneOff, defaultCloudLaneIds };
+// The dial state plus every cloud lane in lane order with its 0-based rank and whether the dial turns it off. One call for the dashboard, so the order and the off rule stay defined
+// here only. `cloudLaneIds` defaults to the enabled cloud lanes of the registry; ids that are not cloud lane ids are left out.
+function status(env = process.env, cloudLaneIds = undefined) {
+  const state = read(env);
+  const ids = cloudLaneIds === undefined ? defaultCloudLaneIds(env) : cloudLaneIds;
+  const ordered = [...new Set((Array.isArray(ids) ? ids : []).filter((id) => laneNumber(id) !== null))].sort((a, b) => laneNumber(a) - laneNumber(b));
+  return { ...state, lanes: ordered.map((id, rank) => ({ id, rank, off: state.count !== null && rank >= state.count })) };
+}
+
+module.exports = { dialPath, read, setCount, unset, setMode, laneRank, isLaneOff, defaultCloudLaneIds, status };
 
 if (require.main === module) {
   const [cmd, arg] = process.argv.slice(2);
   try {
     if (cmd === 'get') console.log(JSON.stringify(read()));
+    else if (cmd === 'status') console.log(JSON.stringify(status()));
     else if (cmd === 'set') console.log(JSON.stringify(setCount(arg, 'cli')));
     else if (cmd === 'unset') console.log(JSON.stringify(unset('cli')));
     else if (cmd === 'mode') console.log(JSON.stringify(setMode(arg, 'cli')));
     else if (cmd === 'is-off') process.exit(isLaneOff(arg) ? 0 : 1);
-    else { console.error('usage: cloud-dial.js get | set <n> | unset | mode <manual|auto> | is-off <laneId>'); process.exit(2); }
+    else { console.error('usage: cloud-dial.js get | status | set <n> | unset | mode <manual|auto> | is-off <laneId>'); process.exit(2); }
   } catch (e) {
     console.error(e.message);
     process.exit(1);
