@@ -77,6 +77,22 @@ test('readCodeSha defaults to the agent-manager checkout, not the cwd, and honou
   assert.deepEqual(seen, ['-C', '/x/y', 'rev-parse', 'HEAD']);
 });
 
+test('readCodeSha with no dir and no deps.codeDir uses the agent-manager root, and an explicit codeDir wins', () => {
+  const sha = 'a'.repeat(40);
+  let seen;
+  const execGit = (args) => { seen = args; return sha; };
+  const origCwd = process.cwd();
+  process.chdir(os.tmpdir());
+  try {
+    assert.equal(readCodeSha(undefined, { execGit }), sha);
+  } finally {
+    process.chdir(origCwd);
+  }
+  assert.deepEqual(seen, ['-C', path.resolve(__dirname, '..'), 'rev-parse', 'HEAD']);
+  assert.equal(readCodeSha(undefined, { codeDir: '/x/y', execGit }), sha);
+  assert.deepEqual(seen, ['-C', '/x/y', 'rev-parse', 'HEAD']);
+});
+
 test('readCodeSha returns null on a throw, on text that is not a sha, on 39 or 41 hex and on uppercase', () => {
   assert.equal(readCodeSha('/x', { execGit: () => { throw new Error('no git'); } }), null);
   for (const out of ['not a sha', 'a'.repeat(39), 'a'.repeat(41), 'A'.repeat(40), '']) {
