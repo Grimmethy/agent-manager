@@ -520,6 +520,7 @@ fi
 # NOT an infra failure (a real success, a non-infra block, or a genuinely idle tick).
 CONSECUTIVE_INFRA_FAILURES=0
 SWITCHED_OFF_TICKS=0                                                     # consecutive ticks this worker has been switched off by the operator (worker_switched_off); only used to print one line on each transition
+LANE_RULES_STAMP="${TEMP_DIR:-${TMPDIR:-/tmp}}/lane-rules-${INSTANCE_ID}.stamp"   # reload_lane_rules (agent-manager-common.sh) re-reads this lane's taskClasses and reviews only when lanes.json is newer than this per-instance stamp; the tick is the trigger, no timer
 ENDPOINT_DOWN_TICKS=0                                                    # consecutive ticks the lane's Ollama endpoint did not answer (see the circuit breaker in the main loop)
 LAST_WAKE=""                                                            # how the last idle wait ended: event | timeout | sleep (see wait_for_queue_change)
 WAKE_RECONCILE_HITS=0                                                    # timeout wakes that then found work: a producer changed state without announcing it in a queue directory (ADR-0024 rule 6)
@@ -654,6 +655,7 @@ while :; do                                                                     
     printf '[worker-%s] switched back on after %s tick(s) off; resuming.\n' "$INSTANCE_ID" "$SWITCHED_OFF_TICKS" >&2
     SWITCHED_OFF_TICKS=0
   fi
+  reload_lane_rules "$INSTANCE_ID" || true                                      # a lanes.json edit (taskClasses, reviews) reaches this running worker without a restart; no node spawn while lanes.json is unchanged, and a failure never stops the tick. Sets LANE_RULES_TASK_CLASSES / LANE_RULES_REVIEWS for later pieces; nothing reads them yet.
   refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work -- see the function's own comment above the loop.
   printf '[worker-%s] tick at %s — searching for new drafts...\n' "$INSTANCE_ID" "$(date -u '+%FT%T.%NZ' 2>/dev/null)"    # status message at top of each iteration — same information PowerShell's Write-Verbose emits but using printf for format-safety (avoids issues if variable contents include '%' characters which would be interpreted as string-formatting directives by `echo -e` on some systems, breaking log output).
   write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"   # so the dashboard's Workers tab sees this instance exists even on a tick that claims nothing -- previously never called anywhere in this script, which is why no workers ever showed up regardless of whether the process was alive.
