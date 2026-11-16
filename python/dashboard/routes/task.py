@@ -199,11 +199,34 @@ def api_hub_retire(hub_id):
     qdir, _scope = _qdir_for_request(body)
     if not qdir:
         abort(404)
+    cascade = body.get("cascade", False)
+    if not isinstance(cascade, bool):
+        abort(400, description="cascade must be a JSON boolean (true or false)")
+    from hub_label_lookup import HubRefAmbiguous, HubRefNotFound, resolve_hub_ref
+    try:
+        root_id = resolve_hub_ref(hub_id, base_dir=qdir)
+    except HubRefNotFound:
+        abort(404, description=f"no coordinating hub '{hub_id}'")
+    except HubRefAmbiguous as exc:
+        return jsonify({"error": "ambiguous hub reference", "ref": hub_id, "candidates": exc.candidates}), 409
+    hub_id = root_id
     hub_file = qdir / "coordinating" / f"{hub_id}.json"
     hub = read_json_safe(hub_file)
     if not isinstance(hub, dict):
         abort(404, description=f"no coordinating hub '{hub_id}'")
     reason = (body.get("reason") or "").strip() or None
+    if cascade:
+        from hub_retire_cascade import CascadeRefused, apply_cascade, plan_cascade, refuse_cascade
+        who = "dashboard"
+        blockers, order = plan_cascade(hub_id, qdir)
+        if blockers:
+            refuse_cascade(hub_id, blockers, who, reason or "", qdir)
+            abort(409, description="not retired, nothing changed: " + "; ".join(blockers))
+        try:
+            archived_nodes = apply_cascade(order, who, reason or "", qdir)
+        except CascadeRefused as exc:
+            abort(409, description="not retired, nothing changed: " + "; ".join(exc.blockers))
+        return jsonify({"cascadeRoot": hub_id, "archived": archived_nodes})
     archive_dir = qdir / "done" / "_archived_no_action"
 
     to_retire, left, blockers = [], {}, []
