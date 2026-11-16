@@ -84,3 +84,23 @@ test('formatSummary prints a null field as -', () => {
 test('formatSummary of an empty array is the header line only', () => {
   assert.equal(formatSummary([]), HEADER);
 });
+
+test("two state 'expired' rows plus a lent row already past expiresAt gives expired 3", () => {
+  const leases = [lease('a', 'expired'), lease('a', 'expired'), lease('a', 'lent', at(-MIN))];
+  const [row] = summarizeNodes([node('a')], leases, NOW);
+  assert.equal(row.expired, 3);
+  assert.equal(row.lentNow, 0);
+  assert.equal(row.nextExpiryMin, null);
+});
+
+test("a state 'expired' row with a FUTURE expiresAt counts as expired, not lentNow, and leaves nextExpiryMin null", () => {
+  const [row] = summarizeNodes([node('a')], [lease('a', 'expired', at(10 * MIN))], NOW);
+  assert.equal(row.expired, 1);
+  assert.equal(row.lentNow, 0);
+  assert.equal(row.nextExpiryMin, null);
+});
+
+test("a state 'expired' row for an unknown nodeId is ignored", () => {
+  const rows = summarizeNodes([node('a')], [lease('ghost', 'expired')], NOW);
+  assert.deepEqual(rows, [{ id: 'a', status: 'up', load: 0.5, freeRamGb: 8, lentNow: 0, returned: 0, expired: 0, merged: 0, nextExpiryMin: null }]);
+});
