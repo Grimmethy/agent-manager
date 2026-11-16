@@ -171,6 +171,13 @@ async function sweepBranchConflicts({
     fullScan = !scan || !Number.isFinite(scan.at) || now - scan.at >= reconcileMs(env);
     reconcile = fullScan && !!scan;
     mergeEvent = drained.events.some((e) => e.type === 'branch_merged');
+    if (mergeEvent) {                                      // main moved: bring the live checkout forward when it is safe (FF-2). Mode off by default; no timer.
+      try {
+        await require('./live-checkout-sync').syncLiveCheckout(repoRoot, { env, pipelineDir });
+      } catch (e) {
+        console.error(`live-checkout-sync: ${e && e.message ? e.message : e}`);
+      }
+    }
     summary.journal.fullScan = fullScan;
     if (fullScan || mergeEvent) {
       names = listDone();                                  // main moved (or the safety net is due): any pending-merge task may conflict now

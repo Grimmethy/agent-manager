@@ -118,6 +118,7 @@ test('recordHeartbeat stores null for a 41-character hex codeSha', () => {
   const { env } = setup();
   registerNode(spec(), env);
   assert.equal(recordHeartbeat({ id: 'grimm', codeSha: 'a'.repeat(41) }, env, T0).codeSha, null);
+  assert.equal(loadNodes(env).grimm.codeSha, null);
 });
 
 test('recordHeartbeat stores null for an array or String object wrapping a valid sha', () => {
