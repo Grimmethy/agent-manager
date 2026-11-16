@@ -479,4 +479,14 @@ function requireSecondBrainDir() {
   return d;
 }
 
-module.exports = { getConfig, ensureRegistered, resolveGraphPath, resolveCommunityCoveragePath, getSecondBrainDir, requireSecondBrainDir };
+// JournalForge keep-and-resurface handoff URL (journal loop). Env JOURNALFORGE_URL: unset ->
+// the loopback default; '' or 'off' -> null (handoff disabled). Read at call time so tests can set it per run.
+function getJournalForgeUrl() {
+  const raw = process.env.JOURNALFORGE_URL;
+  if (raw === undefined) return 'http://127.0.0.1:7448';
+  const v = String(raw).trim();
+  if (v === '' || v.toLowerCase() === 'off') return null;
+  return v;
+}
+
+module.exports = { getConfig, ensureRegistered, resolveGraphPath, resolveCommunityCoveragePath, getSecondBrainDir, requireSecondBrainDir, getJournalForgeUrl };
