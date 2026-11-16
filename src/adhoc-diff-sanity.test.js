@@ -1090,3 +1090,50 @@ test('docs-only gate AC5: code+docs in same sentence with docs-only diff is reje
   assert.equal(p.code, 'docs-only', 'a task mentioning both code and docs in the same sentence with only a docs diff must be rejected');
   assert.match(p.retryFeedback, /only created\/edited documentation/);
 });
+
+// --- gate-override wiring (HUB0453 1/2) ---
+const overrideEntry = (gate) => ({ gate, reason: 'owner approved', by: 'owner', at: '2026-11-15T00:00:00.000Z' });
+const overrideEvents = (t) => (t.history || []).filter((h) => h.stage === 'gate-override').map((h) => JSON.parse(h.detail));
+const FORBIDDEN_TEXT = 'Do not touch src/protected.js. Update the handler in src/other.js.';
+const forbiddenAndDeleteDiff = () => editDiff('src/protected.js') + deleteDiff('src/core.js');
+
+test('gate-override: forbidden-path override does not suppress a substance finding', () => {
+  const t = { ...adhoc(FORBIDDEN_TEXT), gateOverrides: [overrideEntry('forbidden-path')] };
+  const p = adhocDiffSubstanceProblem(t, forbiddenAndDeleteDiff());
+  assert.ok(p, 'substance problem must still be reported');
+  assert.equal(p.code, 'unrequested-delete');
+});
+
+test('gate-override: control -- no override keeps the forbidden-path result', () => {
+  const t = adhoc(FORBIDDEN_TEXT);
+  const p = adhocDiffSubstanceProblem(t, forbiddenAndDeleteDiff());
+  assert.equal(p.code, 'forbidden-path');
+  assert.equal(overrideEvents(t).length, 0);
+});
+
+test('gate-override: audit event carries entry fields and suppressed paths', () => {
+  const t = { ...adhoc(FORBIDDEN_TEXT), gateOverrides: [overrideEntry('forbidden-path')] };
+  adhocDiffSubstanceProblem(t, forbiddenAndDeleteDiff());
+  const ev = overrideEvents(t);
+  assert.equal(ev.length, 1);
+  assert.equal(ev[0].gate, 'forbidden-path');
+  assert.equal(ev[0].reason, 'owner approved');
+  assert.equal(ev[0].by, 'owner');
+  assert.equal(ev[0].at, '2026-11-15T00:00:00.000Z');
+  assert.deepEqual(ev[0].suppressed, ['src/protected.js']);
+});
+
+test('gate-override: a matching override that suppresses nothing is still audited', () => {
+  const t = { ...adhoc(FORBIDDEN_TEXT), gateOverrides: [overrideEntry('docs-only')] };
+  assert.equal(adhocDiffSubstanceProblem(t, editDiff('src/other.js')), null);
+  const ev = overrideEvents(t);
+  assert.equal(ev.length, 1);
+  assert.equal(ev[0].gate, 'docs-only');
+  assert.deepEqual(ev[0].suppressed, []);
+});
+
+test('gate-override: a docs-only override does not suppress a forbidden-path finding', () => {
+  const t = { ...adhoc(FORBIDDEN_TEXT), gateOverrides: [overrideEntry('docs-only')] };
+  const p = adhocDiffSubstanceProblem(t, editDiff('src/protected.js'));
+  assert.equal(p.code, 'forbidden-path');
+});
