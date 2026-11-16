@@ -114,6 +114,14 @@ test('CRLF line endings are stripped from row text', () => {
   assert.ok(!r.includes('\r'));
 });
 
+test('a long CRLF line is cut to 160 characters with no carriage return', () => {
+  const root = mkTree({ 'src/l.js': 'readyToMerge' + 'a'.repeat(300) + '\r\n' });
+  const row = buildReport(root).split('\n').find((l) => l.startsWith('- src/l.js:1 -- '));
+  const text = row.slice('- src/l.js:1 -- '.length);
+  assert.equal(text.length, 160);
+  assert.ok(!text.includes('\r'));
+});
+
 test('--out creates the directory and equals the stdout form', () => {
   const root = mkTree({ 'src/a.js': 'readyToMerge\n' });
   const out = path.join(root, 'new', 'deep', 'report.md');
