@@ -40,6 +40,29 @@ class Identifiers(unittest.TestCase):
                          [("AC-10", "applyBrainDumpSort"), ("AC-52", "renderHardwareTab"), ("AC-60", "run_queue_sweep"), ("AC-61", None)])
 
 
+class WholeFileIdentifiers(unittest.TestCase):
+    """'Remove unused file <path>' titles are identified by the path, so two different files never collide."""
+
+    def test_different_taxharvest_files_get_different_identifiers(self):
+        a = br.candidate_identifier("Remove unused file TaxHarvest/src/components/Alpha.tsx")
+        b = br.candidate_identifier("Remove unused file TaxHarvest/src/lib/beta-helpers.ts")
+        self.assertEqual(a, "TaxHarvest/src/components/Alpha.tsx")
+        self.assertEqual(b, "TaxHarvest/src/lib/beta-helpers.ts")
+        self.assertNotEqual(a, b)
+
+    def test_the_same_path_gives_equal_identifiers(self):
+        a = br.candidate_identifier("Remove unused file TaxHarvest/src/lib/beta-helpers.ts")
+        b = br.candidate_identifier("Remove unused file TaxHarvest/src/lib/beta-helpers.ts (no importers)")
+        self.assertEqual(a, b)
+
+    def test_a_per_symbol_title_still_returns_the_symbol(self):
+        self.assertEqual(br.candidate_identifier("Decompose `applyBrainDumpSort` into named helpers"), "applyBrainDumpSort")
+
+    def test_an_aspect_ratio_whole_file_title_returns_its_own_path(self):
+        self.assertEqual(br.candidate_identifier("Remove unused file TaxHarvest/src/components/ui/aspect-ratio.tsx"),
+                         "TaxHarvest/src/components/ui/aspect-ratio.tsx")
+
+
 class DuplicateCandidates(unittest.TestCase):
     def setUp(self):
         self.fx = Fixture()
