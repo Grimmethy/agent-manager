@@ -374,3 +374,82 @@ test('a task answer logs only the took-task line, never the idle line', async (t
   await pullOnce({ env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url }, deps: { log: (m) => lines.push(m), ensureRepo: async () => {} } });
   assert.deepEqual(lines, ['node-pull: took task t-log']);
 });
+
+// --- watched queues, the drafting-lease gate and the safety re-check timer (HUB0434 2/2) ---
+const { SAFETY_RECHECK_MS } = require('./node-pull.js');
+
+// Records every directory the daemon asks to watch, with the callback it registered.
+function recordingWatch() {
+  const watched = [];
+  const watch = (dir, cb) => { const handle = { dir, cb, close() {}, on() {} }; watched.push(handle); return handle; };
+  return { watched, watch };
+}
+
+// True while a worker's drafting directory holds a leased record.
+function hasLeaseIn(dir) {
+  try { return fs.readdirSync(dir).some((f) => f.endsWith('.json')); } catch (e) { return false; }
+}
+
+test('the daemon watches exactly the six queue dirs under the pipeline dir', async (t) => {
+  const { env, pipelineDir } = setup(t);
+  const server = await claimServer(t, [{ body: { ok: true, task: null, retryAfterSec: 0 } }]);
+  const timers = fakeTimers();
+  const w = recordingWatch();
+  const daemon = startDaemon({
+    env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url },
+    deps: { now: clock().now, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, watch: w.watch, log: noLog },
+  });
+  t.after(() => daemon.stop());
+  await waitForRequests(server, 1);
+  const got = w.watched.map((x) => x.dir).sort();
+  const want = ['adhoc', 'pending', 'blocked', 'review', 'node-outbox', 'drafting'].map((name) => path.join(pipelineDir, 'queue', name)).sort();
+  assert.deepEqual(got, want);
+});
+
+test('a change under queue/pending claims once while the worker is free and nothing while a leased record sits in drafting/<worker>', async (t) => {
+  const { env, pipelineDir } = setup(t);
+  fs.mkdirSync(path.join(pipelineDir, 'queue', 'pending'), { recursive: true });
+  const workerDraft = path.join(pipelineDir, 'queue', 'drafting', NODE_ID);
+  const server = await claimServer(t, [{ body: { ok: true, task: null, retryAfterSec: 0 } }]);
+  const timers = fakeTimers();
+  const w = recordingWatch();
+  const daemon = startDaemon({
+    env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url },
+    deps: { now: clock().now, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, watch: w.watch, log: noLog, isWorkerFree: () => !hasLeaseIn(workerDraft) },
+  });
+  t.after(() => daemon.stop());
+  await waitForRequests(server, 1);
+  assert.equal(server.requests.length, 1, 'one pull at start');
+  const pendingWatch = w.watched.find((x) => x.dir === path.join(pipelineDir, 'queue', 'pending'));
+  assert.ok(pendingWatch, 'queue/pending is watched');
+  pendingWatch.cb();
+  timers.fireLast();
+  await waitForRequests(server, 2);
+  assert.equal(server.requests.length, 2, 'a pending change with the worker free claims once');
+  fs.mkdirSync(workerDraft, { recursive: true });
+  fs.writeFileSync(path.join(workerDraft, 't-held.json'), JSON.stringify({ id: 't-held', leasedTo: NODE_ID }));
+  pendingWatch.cb();
+  timers.fireLast();
+  await settle();
+  assert.equal(server.requests.length, 2, 'a leased record in drafting blocks the claim');
+});
+
+test('the safety re-check timer is armed after a successful claim and fires exactly one more pull', async (t) => {
+  const { env } = setup(t);
+  const timers = fakeTimers();
+  const w = recordingWatch();
+  const server = await claimServer(t, [{ body: { ok: true, task: { id: 't-safe' }, repo: { remoteUrl: 'https://example.invalid/r.git' } } }]);
+  const daemon = startDaemon({
+    env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url },
+    deps: { now: clock().now, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, watch: w.watch, log: noLog, ensureRepo: async () => {}, writeAdhoc: () => true },
+  });
+  t.after(() => daemon.stop());
+  await waitForRequests(server, 1);
+  const armed = timers.live();
+  assert.equal(armed.length, 1, 'exactly one timer armed after the successful claim');
+  assert.equal(armed[0].ms, SAFETY_RECHECK_MS);
+  timers.fireLast();
+  await waitForRequests(server, 2);
+  await settle();
+  assert.equal(server.requests.length, 2, 'the safety timer fires exactly one more pull');
+});
