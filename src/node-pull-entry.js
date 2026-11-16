@@ -1,11 +1,11 @@
 'use strict';
 
-// Daemon dependencies for `node src/node-pull.js --daemon` (FF-3 wiring): the real ensureRepo adapter, a one-task-at-a-time worker-free check,
+// Daemon dependencies for `node src/node-pull.js --daemon` (FF-3 wiring): the real ensureRepo adapter, a worker-free check (up to AGENT_MANAGER_NODE_MAX_TASKS claimed tasks per node, default 1),
 // a pause marker and the optional class filter. buildDaemonDeps(env, overrides) returns { ensureRepo, isWorkerFree, isPaused, classes }.
 //   ensureRepo({remoteUrl, baseBranch}): the repo name is the last path segment of remoteUrl without .git; calls src/node-repo-ensure.js
 //     ensureRepo({name, remoteUrl, baseBranch}, {env}); a result with ok:false (or no result) throws so pullOnce reports the failure.
-//   isWorkerFree(): true only while no record in <AGENT_MANAGER_PIPELINE_DIR>/queue/adhoc, queue/pending or queue/drafting/<worker>/ has
-//     leasedTo equal to AGENT_MANAGER_NODE_ID, i.e. one claimed task at a time per node. A missing directory is empty; an unreadable directory,
+//   isWorkerFree(): true only while fewer than AGENT_MANAGER_NODE_MAX_TASKS records in <AGENT_MANAGER_PIPELINE_DIR>/queue/adhoc, queue/pending or queue/drafting/<worker>/ have
+//     leasedTo equal to AGENT_MANAGER_NODE_ID (a whole number 1 to 8; unset or invalid means 1, i.e. one claimed task at a time per node). A missing directory is empty; an unreadable directory,
 //     an unset node id or an unset pipeline dir count as NOT free (safe). A record that vanishes or is not valid JSON while being read is skipped.
 //   isPaused(): true while <AGENT_MANAGER_STATE_DIR or ~/.local/state/agent-manager>/node-pull-paused exists (a marker the owner can touch).
 //   classes: AGENT_MANAGER_NODE_CLASSES (comma separated, trimmed, empty entries dropped) when it has an entry, else undefined.
@@ -48,14 +48,15 @@ function claimDirs(pipelineDir) {
   return dirs;
 }
 
-function holdsLeasedTask(dir, nodeId) {
+function countLeasedIn(dir, nodeId) {
   let names;
   try {
     names = fs.readdirSync(dir);
   } catch (e) {
-    if (e.code === 'ENOENT') return false;
+    if (e.code === 'ENOENT') return 0;
     throw e;
   }
+  let count = 0;
   for (const name of names) {
     if (!name.endsWith('.json')) continue;
     let record;
@@ -64,9 +65,28 @@ function holdsLeasedTask(dir, nodeId) {
     } catch (e) {
       continue; // moved away between the listing and the read, or not valid JSON: not a record we can attribute to this node
     }
-    if (record && record.leasedTo === nodeId) return true;
+    if (record && record.leasedTo === nodeId) count += 1;
   }
-  return false;
+  return count;
+}
+
+// How many claimed tasks this node holds: records leased to nodeId summed over claimDirs(pipelineDir). Unreadable directories throw as before.
+function countHeldTasks(pipelineDir, nodeId) {
+  let total = 0;
+  for (const dir of claimDirs(pipelineDir)) total += countLeasedIn(dir, nodeId);
+  return total;
+}
+
+// AGENT_MANAGER_NODE_MAX_TASKS: a whole number from 1 to 8 (surrounding spaces allowed); unset, empty or anything else means 1. Never throws.
+function maxTasks(env) {
+  try {
+    const raw = env && typeof env.AGENT_MANAGER_NODE_MAX_TASKS === 'string' ? env.AGENT_MANAGER_NODE_MAX_TASKS.trim() : '';
+    if (!/^[0-9]+$/.test(raw)) return 1;
+    const n = parseInt(raw, 10);
+    return n >= 1 && n <= 8 ? n : 1;
+  } catch (e) {
+    return 1;
+  }
 }
 
 function buildDaemonDeps(env = process.env, overrides = {}) {
@@ -85,7 +105,7 @@ function buildDaemonDeps(env = process.env, overrides = {}) {
       const nodeId = String(env.AGENT_MANAGER_NODE_ID || '').trim();
       if (!pipelineDir || !nodeId) return false;
       try {
-        return !claimDirs(pipelineDir).some((dir) => holdsLeasedTask(dir, nodeId));
+        return countHeldTasks(pipelineDir, nodeId) < maxTasks(env);
       } catch (e) {
         return false;
       }
@@ -95,4 +115,4 @@ function buildDaemonDeps(env = process.env, overrides = {}) {
   };
 }
 
-module.exports = { buildDaemonDeps, repoNameFromUrl, parseClasses, PAUSE_MARKER };
+module.exports = { buildDaemonDeps, repoNameFromUrl, parseClasses, PAUSE_MARKER, maxTasks, countHeldTasks };
