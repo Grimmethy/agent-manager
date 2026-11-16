@@ -27,6 +27,13 @@ function isDecomposeParent(record) {
     subs.every((p) => !!p && typeof p === 'object' && typeof p.title === 'string' && !!p.title && typeof p.rawText === 'string' && !!p.rawText);
 }
 
+// A stop record (the node stopped on an open question): needsClarification is a plain object with a non-empty string reason. It carries no diff.
+function isStopRecord(record) {
+  if (!record || typeof record !== 'object') return false;
+  const nc = record.needsClarification;
+  return !!nc && typeof nc === 'object' && !Array.isArray(nc) && typeof nc.reason === 'string' && nc.reason !== '';
+}
+
 // Deep copy of value without the secret-looking keys (at every depth, inside arrays too).
 function scrub(value) {
   if (Array.isArray(value)) return value.map(scrub);
@@ -61,7 +68,9 @@ function validatePackage(pkg) {
   if (typeof pkg.nodeId !== 'string' || !pkg.nodeId) return { ok: false, reason: 'nodeId is missing' };
   if (pkg.version === RECORD_PACKAGE_VERSION) {
     if (pkg.kind !== 'record') return { ok: false, reason: "kind must be 'record'" };
-    if (typeof pkg.record.rawDiff !== 'string' || (pkg.record.rawDiff === '' && !isDecomposeParent(pkg.record))) return { ok: false, reason: 'record.rawDiff must be a non-empty string' };
+    const rawDiff = pkg.record.rawDiff;
+    const stopOk = isStopRecord(pkg.record) && (rawDiff === undefined || rawDiff === '');
+    if (!stopOk && (typeof rawDiff !== 'string' || (rawDiff === '' && !isDecomposeParent(pkg.record)))) return { ok: false, reason: 'record.rawDiff must be a non-empty string' };
     return { ok: true, reason: '' };
   }
   if (typeof pkg.sha !== 'string' || !SHA_RE.test(pkg.sha)) return { ok: false, reason: 'sha must be 40 hex characters' };
@@ -98,4 +107,4 @@ async function sendPackage(pkg, { url, tokenFile, post = httpPost } = {}) {
   }
 }
 
-module.exports = { PACKAGE_VERSION, RECORD_PACKAGE_VERSION, PACKAGE_STRIP, RECORD_PACKAGE_STRIP, SECRET_KEY_RE, SEND_TIMEOUT_MS, scrub, buildPackage, buildRecordPackage, validatePackage, sendPackage, httpPost };
+module.exports = { PACKAGE_VERSION, RECORD_PACKAGE_VERSION, PACKAGE_STRIP, RECORD_PACKAGE_STRIP, SECRET_KEY_RE, SEND_TIMEOUT_MS, scrub, buildPackage, buildRecordPackage, isStopRecord, validatePackage, sendPackage, httpPost };
