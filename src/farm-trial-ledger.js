@@ -10,8 +10,11 @@
 //   state 'returned' or 'expired'          -> 'abandoned'
 //   anything else (lent, no final event)   -> pending (left out of outcomes)
 // A taskId with no row for this node (none at all, or claimed only by another node) -> missing (left out of outcomes).
+// delivered: the taskIds (in taskIds order) whose row for this node has state 'returned' or 'expired' and lastEvent 'drafted', 'reviewed' or 'applied':
+//   the node got the work out but nothing merged it. Such a task also appears in outcomes as 'abandoned'; delivered is an extra list for the operator.
+//   A merged, failed or blocked row, a lent row and a missing task are never delivered.
 //
-//   outcomesFromLedger({ nodeId, taskIds, leases }) -> { outcomes, pending, missing }
+//   outcomesFromLedger({ nodeId, taskIds, leases }) -> { outcomes, pending, missing, delivered }
 //   node src/farm-trial-ledger.js --node <id> --tasks <a,b> [--out file.json]
 //     prints the result JSON, writes the outcomes array to --out when given; exit 0 all resolved, 3 pending or missing, 2 usage
 // Reads only the lease ledger (listLeases); nothing polls, nothing starts a trial. See docs/agents/multi-node-runbook.md.
@@ -20,6 +23,7 @@ const fs = require('fs');
 const { listLeases } = require('./lease-ledger.js');
 
 const FLAGS = ['--node', '--tasks', '--out'];
+const DELIVERED_EVENTS = ['drafted', 'reviewed', 'applied'];
 
 function resultFor(row) {
   if (row.state === 'merged' || row.lastEvent === 'merged') return 'merged';
@@ -46,7 +50,12 @@ function outcomesFromLedger({ nodeId, taskIds, leases } = {}) {
     if (result) outcomes.push({ taskId, node: nodeId, result });
     else pending.push(taskId);
   }
-  return { outcomes, pending, missing };
+  const delivered = [];
+  for (const taskId of taskIds) {
+    const row = mine.get(taskId);
+    if (row && (row.state === 'returned' || row.state === 'expired') && DELIVERED_EVENTS.includes(row.lastEvent)) delivered.push(taskId);
+  }
+  return { outcomes, pending, missing, delivered };
 }
 
 // Parses --flag value pairs; null when a flag is unknown, repeated or has no value.
