@@ -1132,6 +1132,47 @@ test('gate-override: a matching override that suppresses nothing is still audite
   assert.deepEqual(ev[0].suppressed, []);
 });
 
+test('gate-override: forbidden-path override with a substance failure suppresses the path and still reports substance', () => {
+  const t = { ...adhoc(FORBIDDEN_TEXT), gateOverrides: [overrideEntry('forbidden-path')] };
+  const p = adhocDiffSubstanceProblem(t, forbiddenAndDeleteDiff());
+  assert.ok(p, 'substance problem must still be reported');
+  assert.notEqual(p.code, 'forbidden-path');
+  const ev = overrideEvents(t);
+  assert.equal(ev.length, 1);
+  assert.deepEqual(ev[0].suppressed, ['src/protected.js']);
+});
+
+test('gate-override: docs-only override on a real-code diff does not hide the real substance failure', () => {
+  const t = { ...adhoc(FORBIDDEN_TEXT), gateOverrides: [overrideEntry('docs-only')] };
+  const p = adhocDiffSubstanceProblem(t, editDiff('src/other.js') + deleteDiff('src/core.js'));
+  assert.ok(p, 'real substance failure must still block');
+  assert.equal(p.code, 'unrequested-delete');
+  assert.equal(overrideEvents(t).filter((e) => e.gate === 'docs-only').length, 0);
+});
+
+test('gate-override: docs-only override suppresses the docs-only finding and records the doc path', () => {
+  const raw = 'Implement the new task source in src/task-sources.js to support the GitHub integration.';
+  const t = { ...adhoc(raw), gateOverrides: [overrideEntry('docs-only')] };
+  const p = adhocDiffSubstanceProblem(t, createDiff('docs/adr/0042-task-source.md'));
+  assert.equal(p, null);
+  const ev = overrideEvents(t);
+  assert.equal(ev.length, 1);
+  assert.equal(ev[0].gate, 'docs-only');
+  assert.deepEqual(ev[0].suppressed, ['docs/adr/0042-task-source.md']);
+});
+
+test('gate-override: with no gateOverrides the docs-only result matches the pre-change result', () => {
+  const raw = 'Implement the new task source in src/task-sources.js to support the GitHub integration.';
+  const diff = createDiff('docs/adr/0042-task-source.md');
+  const plain = adhoc(raw);
+  const empty = { ...adhoc(raw), gateOverrides: [] };
+  const p1 = adhocDiffSubstanceProblem(plain, diff);
+  const p2 = adhocDiffSubstanceProblem(empty, diff);
+  assert.equal(p1.code, 'docs-only');
+  assert.deepEqual(p2, p1);
+  assert.equal(overrideEvents(empty).length, 0);
+});
+
 test('gate-override: a docs-only override does not suppress a forbidden-path finding', () => {
   const t = { ...adhoc(FORBIDDEN_TEXT), gateOverrides: [overrideEntry('docs-only')] };
   const p = adhocDiffSubstanceProblem(t, editDiff('src/protected.js'));
