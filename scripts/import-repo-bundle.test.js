@@ -158,3 +158,27 @@ test('refusals exit 2 and change nothing', () => {
   assert.equal(fs.existsSync(fresh), false, 'a refused call creates no destination');
   assert.deepEqual(fs.readdirSync(busy), ['file.txt']);
 });
+
+test('a relative bundle path fast-forwards an existing clone', () => {
+  const root = tmp();
+  const source = makeSource(root);
+  const dest = path.join(root, 'copy');
+  assert.equal(run([bundle(source, root, 'one.bundle'), dest]).status, 0);
+  commit(source, 'b.txt', 'two\n');
+  bundle(source, root, 'two.bundle');
+  const r = spawnSync('bash', [SCRIPT, 'two.bundle', dest], { cwd: root, encoding: 'utf8', env: GIT_ENV });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(git(dest, 'rev-parse', 'HEAD'), git(source, 'rev-parse', 'master'));
+});
+
+test('a missing bundle into an existing clone exits 2 and changes nothing', () => {
+  const root = tmp();
+  const source = makeSource(root);
+  const dest = path.join(root, 'copy');
+  assert.equal(run([bundle(source, root, 'one.bundle'), dest]).status, 0);
+  const before = git(dest, 'rev-parse', 'HEAD');
+  const r = run([path.join(root, 'missing.bundle'), dest]);
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  assert.match(r.stderr, /cannot read the bundle/);
+  assert.equal(git(dest, 'rev-parse', 'HEAD'), before);
+});
