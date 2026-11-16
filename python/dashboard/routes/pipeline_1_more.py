@@ -413,6 +413,18 @@ def api_pipeline_stop():
 def api_git_unmerged_branches():
     # Served from the cache (stale-while-revalidate, see app.list_unmerged_branches): the forced full recompute took ~37 s under load, past the tab's 30 s timeout.
     from app import _branch_cache, _branch_cache_lock, _invalidate_branch_cache, branch_list_refreshing, list_unmerged_branches
+    want_refresh = request.args.get("refresh") == "1"
+    only_root = None
+    project_arg = (request.args.get("project") or "").strip()
+    if project_arg:
+        # Match by realpath against the registered projects; an unknown one is a 400 before any git work or refresh.
+        import branch_projects
+        from app import get_active_repo_root
+        wanted = os.path.realpath(project_arg)
+        match = next((p for p in branch_projects.registered_projects(get_active_repo_root()) if os.path.realpath(p["repoRoot"]) == wanted), None)
+        if match is None:
+            return jsonify({"error": "unknown project", "project": project_arg}), 400
+        only_root = match["repoRoot"]
     if request.args.get("kick") == "1":
         # The page was told that something that feeds the list happened (a task finished, a verdict, a merge): start the background refresh NOW instead of waiting for the
         # TTL, and still answer from the last good list. The refresh announces branch-list-changed when it finds a difference, and the page reads the list again.
@@ -425,13 +437,33 @@ def api_git_unmerged_branches():
     with _branch_cache_lock:
         filled = _branch_cache["at"]
     pending = []
+    project_errors = {}
     if request.args.get("projects") == "all":
         # Every registered project, active first, each row tagged with its `project`. The default (no param) stays the active project's bare list: the verdict/merge
         # tooling and the verify-unmerged-branches skill read it and act on the active repo only.
         import branch_projects
         from app import get_active_repo_root
-        branches, pending = branch_projects.combined_branches(branches, get_active_repo_root())
+        active_root = get_active_repo_root()
+        if want_refresh:
+            active_real = os.path.realpath(active_root) if active_root else None
+            # Never refresh the active project (it has its own cache); a targeted request for it is a no-op.
+            if not (only_root and os.path.realpath(only_root) == active_real):
+                try:
+                    results = branch_projects.refresh_other_projects(active_root, only_root=only_root) or {}
+                except Exception as e:  # noqa: BLE001 -- a failed refresh must not turn the list into a 500
+                    results = {only_root: {"ok": False, "error": f"{type(e).__name__}: {e}"}} if only_root else {}
+                for root, res in results.items():
+                    if active_real and os.path.realpath(root) == active_real:
+                        continue
+                    if isinstance(res, dict) and not res.get("ok", True):
+                        project_errors[root] = res.get("error") or "refresh failed"
+        branches, pending = branch_projects.combined_branches(branches, active_root)
+        for row in branches:
+            proj = row.get("project") or {}
+            row["error"] = None if proj.get("active") else project_errors.get(proj.get("repoRoot"))
     resp = jsonify(branches)
+    if project_errors:
+        resp.headers["X-Branch-Project-Errors"] = json.dumps(project_errors)
     resp.headers["X-Branch-Cache-Age"] = str(max(0, int(time.time() - filled))) if filled else "0"
     resp.headers["X-Branch-Projects-Pending"] = ",".join(pending)
     resp.headers["X-Branch-Refreshing"] = "1" if branch_list_refreshing() else "0"
