@@ -64,21 +64,34 @@ const JS_DEF_RES = [
   /^class\s+([A-Za-z_$][\w$]*)\b/,
 ];
 const PY_DEF_RES = [/^(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(/, /^class\s+([A-Za-z_]\w*)\b/];
+// A decorator that registers the function it sits on with a framework (Flask route table, app hooks). Such a function is called by the framework, not by name.
+// Click-style decorators (@click.command, @click.option) are deliberately not matched.
+const PY_REGISTER_DECORATOR_RE = /^@[A-Za-z_]\w*\.(?:route|get|post|put|delete|patch|errorhandler|before_request|after_request|teardown_request|teardown_appcontext|context_processor)\b/;
 
 // New top-level definitions the diff adds to a file: column 0 only, so methods and nested helpers are not candidates.
 function topLevelDefinitions(entry) {
-  const res = entry.file.endsWith('.py') ? PY_DEF_RES : JS_DEF_RES;
+  const isPy = entry.file.endsWith('.py');
+  const res = isPy ? PY_DEF_RES : JS_DEF_RES;
   const out = [];
+  let decorated = false;                      // a PY_REGISTER_DECORATOR_RE line sits directly above the next def (blank and comment lines keep it)
   for (const { line, text } of entry.added) {
     if (!text) continue;                      // the patterns are anchored at column 0, so methods and nested helpers never match
+    if (isPy && PY_REGISTER_DECORATOR_RE.test(text)) { decorated = true; continue; }
+    if (isPy && (text.startsWith('@') || text.startsWith('#'))) continue;
+    let m = null;
     for (const re of res) {
-      const m = text.match(re);
-      if (m) {
-        const name = m[1];
-        if (name.length >= 4 && !NAME_STOPLIST.has(name)) out.push({ kind: /^class\b/.test(text) ? 'class' : 'function', name, file: entry.file, line });
-        break;
+      m = text.match(re);
+      if (m) break;
+    }
+    if (m) {
+      const name = m[1];
+      if (name.length >= 4 && !NAME_STOPLIST.has(name)) {
+        const def = { kind: /^class\b/.test(text) ? 'class' : 'function', name, file: entry.file, line };
+        if (isPy && decorated) def.registered = true;
+        out.push(def);
       }
     }
+    decorated = false;
   }
   return out;
 }
@@ -145,7 +158,8 @@ function findInertAdditions({ rawDiff, repoRoot, baseRef, grep = defaultGrep } =
         candidates.push(...topLevelDefinitions(entry));
       }
     }
-    for (const c of candidates.slice(0, MAX_CANDIDATES)) {
+    // a framework-registered function (decorated route or hook) is referenced by its decorator, so it is never a candidate
+    for (const c of candidates.filter((x) => !x.registered).slice(0, MAX_CANDIDATES)) {
       result.considered += 1;
       let referenced = false;
       if (c.kind === 'file') {

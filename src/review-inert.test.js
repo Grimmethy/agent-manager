@@ -19,6 +19,17 @@ const noGrep = () => [];                                   // nothing on the bas
 const find = (parts, grep = noGrep) => findInertAdditions({ rawDiff: parts.join(''), repoRoot: '/repo', baseRef: 'origin/master', grep });
 const names = (r) => r.inert.map((i) => i.name);
 
+test('a Python function under a route or hook decorator is registered, so not inert even with no JS caller; click-style and undecorated defs are still judged', () => {
+  const routed = fileDiff('python/dashboard/routes/x.py', ['@bp.route("/api/x", methods=["GET"])', 'def api_x():', '    return {}'], { start: 50 });
+  assert.deepEqual(names(find([routed])), []);
+  const hook = fileDiff('python/dashboard/app.py', ['@app.before_request', 'def check_auth():', '    pass']);
+  assert.deepEqual(names(find([hook])), []);
+  const click = fileDiff('python/x.py', ['@click.command()', 'def tool():', '    pass']);
+  assert.deepEqual(names(find([click])), ['tool']);
+  const plain = fileDiff('python/x.py', ['def orphan_helper():', '    pass']);
+  assert.deepEqual(names(find([plain])), ['orphan_helper']);
+});
+
 test('parseDiffFiles reads status flags and the new-file line number of every added line', () => {
   const diff = fileDiff('src/a.js', ['one', 'two'], { start: 10 }) + fileDiff('src/new.js', ['x'], { isNew: true }) + fileDiff('src/old.js', ['y'], { deleted: true })
     + 'diff --git a/src/r1.js b/src/r2.js\nsimilarity index 90%\nrename from src/r1.js\nrename to src/r2.js\n';
