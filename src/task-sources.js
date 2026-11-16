@@ -2898,11 +2898,13 @@ registerTaskSource('backlog_decomposition', {
 // generator" convention arch_review (70, outranking arch_discovery's 80) already
 // establishes -- draining an already-ordered backlog is more valuable than generating a
 // new one when both have eligible work on the same tick. No `apply` key -- falls through
-// to the generic Group-B git-branch-diff path, exactly like arch_review.
+// to the generic Group-B git-branch-diff path, exactly like arch_review. NOT emptyApproval
+// (same reasoning as pipeline_forensics_fix below): an empty draft means the fix could not
+// be produced -> reject -> retry -> block for a human, never a silent approval.
 registerTaskSource('backlog_fulfillment', {
   priority: taskPriority('backlog_fulfillment', 16),
   next: () => nextCandidateFulfillmentTask(getConfig().backlogCandidatesPath, 'backlog_fulfillment'),
-  emptyApproval: true, candidateFulfillment: true,
+  candidateFulfillment: true,
   candidatesPath: () => getConfig().backlogCandidatesPath,
   candidateDocTitle: '# Backlog Candidates',
 });

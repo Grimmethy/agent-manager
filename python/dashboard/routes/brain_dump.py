@@ -98,6 +98,17 @@ def api_brain_dump():
     return jsonify(_filtered_brain_dump_view(machine=False))
 
 
+def _parse_paging_int(name):
+    """Optional non-negative integer query param for /api/filed-findings paging. Absent -> None.
+    Anything that is not a plain run of ASCII digits (empty string, sign, decimal, space, ...) is a 400."""
+    raw = request.args.get(name)
+    if raw is None:
+        return None
+    if not (raw.isascii() and raw.isdigit()):
+        abort(400, description=f"{name} must be a non-negative integer")
+    return int(raw)
+
+
 @brain_dump_bp.route("/api/filed-findings")
 def api_filed_findings():
     """Filed Findings tab's left pane -- every entry a pipeline sweep raised on its own
@@ -106,7 +117,15 @@ def api_filed_findings():
     a human's own notes never get crowded out by machine-filed volume (764 of 999 live
     entries were machine-raised at time of writing). Same filter semantics as
     /api/brain-dump -- see _filtered_brain_dump_view's own header."""
-    return jsonify(_filtered_brain_dump_view(machine=True))
+    limit = _parse_paging_int("limit")
+    offset = _parse_paging_int("offset")
+    findings = _filtered_brain_dump_view(machine=True)
+    if limit is None:
+        # No paging requested: the bare array, exactly as before.
+        return jsonify(findings)
+    offset = offset or 0
+    total = len(findings)
+    return jsonify({"findings": findings[offset:offset + limit], "total": total})
 
 
 @brain_dump_bp.route("/api/brain-dump/capture", methods=["POST"])

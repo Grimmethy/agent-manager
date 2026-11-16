@@ -405,3 +405,28 @@ test('record_branch_verdict: refusal path is unchanged (no read-back attempted)'
   assert.equal(b.ok, false);
   assert.equal(html404.calls.filter((c) => c.method === 'GET').length, 1); // only initial, no re-fetch
 });
+
+test('record_branch_verdict refuses verdict HOLD with an error naming merge, needs-work and discard, and posts nothing', async () => {
+  const d = fakeDashboard();
+  const out = await recordBranchVerdictTool({ branch: 'agent/one', sha: SHA, verdict: 'HOLD', reasons: ['x'] }, { request: d.request });
+  assert.equal(out.ok, false);
+  assert.match(out.error, /merge/);
+  assert.match(out.error, /needs-work/);
+  assert.match(out.error, /discard/);
+  assert.equal(posts(d).length, 0);
+});
+
+test('a no conflicts reason with no named command gains the NOT RUN marker when posted', async () => {
+  const d = fakeDashboard();
+  const reason = 'no conflicts reported by the reviewer';
+  await recordBranchVerdictTool({ branch: 'agent/one', sha: SHA, verdict: 'needs-work', reasons: [reason] }, { request: d.request });
+  const sent = posts(d)[0].body.reasons;
+  assert.deepEqual(sent, [`${reason} NOT RUN: claim "no conflicts" was not backed by a named command in this verdict`]);
+});
+
+test('a no conflicts reason backed by a backtick-quoted command is posted unchanged', async () => {
+  const d = fakeDashboard();
+  const reason = 'no conflicts per `git merge-tree` run on this head';
+  await recordBranchVerdictTool({ branch: 'agent/one', sha: SHA, verdict: 'needs-work', reasons: [reason] }, { request: d.request });
+  assert.deepEqual(posts(d)[0].body.reasons, [reason]);
+});

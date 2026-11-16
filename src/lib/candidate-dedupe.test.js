@@ -16,7 +16,7 @@ const cand = (title, files) => ({ title, files });
 test('same function twice -> duplicate of the existing AC id', () => {
   const text = doc([['AC-51', 'Decompose `api_task_requeue` into helpers', 'python/dashboard/routes/task.py']]);
   const hit = findDuplicateCandidate(cand('Decompose `api_task_requeue` into four single-purpose helpers', 'python/dashboard/routes/task.py'), [{ ref: 'master', text }]);
-  assert.deepEqual(hit, { duplicateOf: 'AC-51', ref: 'master' });
+  assert.deepEqual(hit, { duplicateOf: 'AC-51', ref: 'master', matchedBy: 'identifier' });
 });
 
 test('a moved function (different line in the snippet/title suffix) still matches: line numbers never enter the key', () => {
@@ -30,7 +30,7 @@ test('match found only on an unmerged branch ref', () => {
   const master = doc([['AC-1', 'Other `foo`', 'src/a.js']]);
   const branch = doc([['AC-9', 'Decompose `bar`', 'src/b.js']]);
   const hit = findDuplicateCandidate(cand('Decompose `bar` again', 'src/b.js'), [{ ref: 'master', text: master }, { ref: 'agent/triage-queue', text: branch }]);
-  assert.deepEqual(hit, { duplicateOf: 'AC-9', ref: 'agent/triage-queue' });
+  assert.deepEqual(hit, { duplicateOf: 'AC-9', ref: 'agent/triage-queue', matchedBy: 'identifier' });
 });
 
 test('different function in the same file, or same function name in a different file, is not a duplicate', () => {
@@ -61,7 +61,7 @@ test('unbackticked verb-led titles dedupe on file + symbol (AC-199 vs AC-52 shap
   const file = 'python/dashboard/static/js/branches-joblist-hardware-tabs.js';
   const text = doc([['AC-52', 'Decompose renderHardwareTab into per-section renderers', file]]);
   const hit = findDuplicateCandidate(cand('Decompose renderHardwareTab into per-section builders', file), [{ ref: 'master', text }]);
-  assert.deepEqual(hit, { duplicateOf: 'AC-52', ref: 'master' });
+  assert.deepEqual(hit, { duplicateOf: 'AC-52', ref: 'master', matchedBy: 'identifier' });
 });
 
 test('same symbol in a different file is not a duplicate: a moved or same-named function is never matched on the symbol alone (AC-198 shape)', () => {
@@ -87,5 +87,5 @@ test('an explicit symbol wins over the title, whatever the title says', () => {
 test('entriesIn reads a Symbol: line, so an entry whose title has no identifier is still keyed', () => {
   const text = '# C\n\n### AC-7 \u00b7 Tidy the retry logic\nStrength: Strong\nFiles: src/a.js\nSymbol: realFn\n\nProblem:\np\n';
   assert.deepEqual(entriesIn(text), [{ id: 'AC-7', key: 'src/a.js::realfn' }]);
-  assert.deepEqual(findDuplicateCandidate({ title: 'Something unrelated', files: 'src/a.js', symbol: 'realFn' }, [{ ref: 'master', text }]), { duplicateOf: 'AC-7', ref: 'master' });
+  assert.deepEqual(findDuplicateCandidate({ title: 'Something unrelated', files: 'src/a.js', symbol: 'realFn' }, [{ ref: 'master', text }]), { duplicateOf: 'AC-7', ref: 'master', matchedBy: 'identifier' });
 });

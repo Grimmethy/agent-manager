@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import re
 import logging
 
-from flask import Blueprint, abort, jsonify
+from flask import Blueprint, abort, jsonify, request
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +50,31 @@ def api_reports():
     report has been generated yet, same shape every other SECOND_BRAIN_DIR-gated endpoint
     here uses."""
     from app import _REPORT_PERIODS
+    # Paged mode only when limit or offset is supplied; otherwise return the bare array unchanged.
+    paged = "limit" in request.args or "offset" in request.args
+    period_filter = ""
+    limit = 200
+    offset = 0
+    if paged:
+        try:
+            limit = int(request.args.get("limit", "200"))
+        except ValueError:
+            abort(400, description="limit must be an integer")
+        if limit < 1:
+            abort(400, description="limit must be at least 1")
+        limit = min(limit, 200)
+        try:
+            offset = int(request.args.get("offset", "0"))
+        except ValueError:
+            abort(400, description="offset must be an integer")
+        if offset < 0:
+            abort(400, description="offset must be >= 0")
+        period_filter = request.args.get("period", "")
+        if period_filter:
+            _safe_report_period(period_filter)
     root = _reports_root()
     if not root or not root.is_dir():
-        return jsonify([])
+        return jsonify({"reports": [], "total": 0}) if paged else jsonify([])
     reports = []
     for period in _REPORT_PERIODS:
         period_dir = root / period
@@ -71,7 +93,12 @@ def api_reports():
                 "generatedAt": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
             })
     reports.sort(key=lambda r: r["generatedAt"], reverse=True)
-    return jsonify(reports)
+    if not paged:
+        return jsonify(reports)
+    if period_filter:
+        reports = [r for r in reports if r["period"] == period_filter]
+    total = len(reports)
+    return jsonify({"reports": reports[offset:offset + limit], "total": total})
 
 
 @reports_bp.route("/api/reports/<period>/<filename>")
