@@ -437,21 +437,36 @@ async function openReportDetail(period, filename) {
   backdrop.classList.add('open');
 }
 
+// Reports tab paging state: reportsListTotal is the server's count of the filtered set
+// (before slicing); reportsListOffset is the offset of the last page loaded.
+let reportsListTotal = 0;
+let reportsListOffset = 0;
+
 async function renderReportsTab() {
-  const main = document.getElementById('main');
+  const periodParam = reportsPeriodFilter === 'all' ? '' : reportsPeriodFilter;
   try {
-    reportsListCache = await fetchJson('/api/reports');
+    const page = await fetchJson(buildListUrl(24, 0, periodParam));
+    reportsListCache = appendPage([], page.reports);
+    reportsListTotal = page.total;
+    reportsListOffset = 0;
   } catch (e) {
-    main.innerHTML = `<div class="empty">Error loading reports: ${escapeHtml(e.message)}</div>`;
+    document.getElementById('main').innerHTML = `<div class="empty">Error loading reports: ${escapeHtml(e.message)}</div>`;
     return;
   }
+  renderReportsView();
+}
+
+// Renders the Reports tab from reportsListCache without refetching.
+function renderReportsView() {
+  const main = document.getElementById('main');
 
   const filterBar = `
     <div class="row" style="margin-bottom:12px">
       ${['all', 'hourly', 'daily', 'weekly'].map(p => `<button class="${reportsPeriodFilter === p ? 'active' : ''}" data-report-filter="${p}">${p[0].toUpperCase()}${p.slice(1)}</button>`).join('')}
     </div>`;
 
-  const visible = reportsPeriodFilter === 'all' ? reportsListCache : reportsListCache.filter(r => r.period === reportsPeriodFilter);
+  // The period filter is applied server-side (buildListUrl's period param), so the cache is already filtered.
+  const visible = reportsListCache;
 
   if (visible.length === 0) {
     main.innerHTML = filterBar + '<div class="empty">No reports generated yet -- the pipeline files an hourly report as soon as the first hour elapses since it started tracking.</div>';
@@ -462,7 +477,10 @@ async function renderReportsTab() {
         <td>${escapeHtml(r.filename)}</td>
         <td>${fmtAge((Date.now() - new Date(r.generatedAt).getTime()) / 1000)} ago</td>
       </tr>`).join('');
-    main.innerHTML = filterBar + `<table><thead><tr><th>Period</th><th>Report</th><th>Generated</th></tr></thead><tbody>${rows}</tbody></table>`;
+    const more = hasMore(reportsListCache.length, reportsListTotal)
+      ? '<div style="margin:12px 0"><button class="secondary" id="reports-load-more">Load more</button></div>'
+      : '';
+    main.innerHTML = filterBar + `<table><thead><tr><th>Period</th><th>Report</th><th>Generated</th></tr></thead><tbody>${rows}</tbody></table>` + more;
   }
 
   main.querySelectorAll('[data-report-filter]').forEach((btn) => {
@@ -471,6 +489,21 @@ async function renderReportsTab() {
   main.querySelectorAll('[data-open-report-period]').forEach((row) => {
     row.onclick = () => openReportDetail(row.dataset.openReportPeriod, row.dataset.openReportFilename);
   });
+  const loadMoreBtn = document.getElementById('reports-load-more');
+  if (loadMoreBtn) loadMoreBtn.onclick = async () => {
+    loadMoreBtn.disabled = true;
+    try {
+      const next = nextOffset(reportsListOffset, 24);
+      const page = await fetchJson(buildListUrl(24, next, reportsPeriodFilter === 'all' ? '' : reportsPeriodFilter));
+      reportsListCache = appendPage(reportsListCache, page.reports);
+      reportsListTotal = page.total;
+      reportsListOffset = next;
+      renderReportsView();
+    } catch (e) {
+      loadMoreBtn.disabled = false;
+      showToast('Could not load more reports: ' + e.message);
+    }
+  };
 }
 
 async function renderTokenfoldTab() {

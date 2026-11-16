@@ -123,6 +123,17 @@ def other_project_branches(active_root):
     return result, pending
 
 
+def failed_project_labels() -> list[str]:
+    """Labels of the registered projects whose last branch-list refresh failed (their cache entry carries a truthy `error`), sorted. A failed root with no
+    registered label is named by its repo root, so a real failure is never silently dropped. Returns [] when nothing failed."""
+    with _lock:
+        failed = [root for root, entry in _state["cache"].items() if (entry or {}).get("error")]
+    if not failed:
+        return []
+    labels = {p["repoRoot"]: p["label"] for p in registered_projects(None)}
+    return sorted(labels.get(root, root) for root in failed)
+
+
 def combined_branches(active_branches, active_root):
     """Active project's branches first (their existing order), then each other project's, projects A-Z and oldest push first within one. Every row is a copy carrying a
     `project` tag, so the cached lists are never mutated. Returns (rows, pending project labels)."""
