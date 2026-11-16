@@ -7,6 +7,8 @@
 //                   -> 200 {ok: true, taskId}
 //                   A version 2 package (the drafted record, no branch) also REPLACES the leased original in queue/pending or queue/adhoc: the node's record
 //                   (leasedTo removed, fromNode set, status needs-review) is written to queue/review/ under the original file name and the original is deleted.
+//                   A version 2 STOP record (isStopRecord in src/review-package.js: the node stopped on an open question, no diff) goes to queue/needs-clarification/
+//                   instead, without a needs-review status, with a node-stop-received history entry; the lease is returned and then marked with the event 'blocked'.
 //   400 bad or oversized (over 4 MB) body, a package that validatePackage refuses, or a task id that is not /^[A-Za-z0-9._-]{1,200}$/;
 //   401 missing or wrong token (the node id comes from the package; unknown and wrong give the same answer);
 //   403 the request does not come from the address the node was registered with; 404 any other path; 405 any other method on /package;
@@ -21,9 +23,9 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const { verifyToken, loadNodes } = require('./node-registry.js');
-const { validatePackage, RECORD_PACKAGE_VERSION } = require('./review-package.js');
+const { validatePackage, RECORD_PACKAGE_VERSION, isStopRecord } = require('./review-package.js');
 const { findRecordFile } = require('./lend-task.js');
-const { leaseFor, returnLease } = require('./lease-ledger.js');
+const { leaseFor, returnLease, recordEvent } = require('./lease-ledger.js');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
 const { notify } = require('./notify.js');
 const { normalizeIp, bearer, TASK_ID_RE } = require('./node-intake-server.js');
@@ -85,11 +87,18 @@ function nodePipelineDirs(env) {
 }
 
 // Files the node's drafted record in wok's queue/review/ under the original's file name, then removes the original (write first, so a crash never loses the task).
+// A STOP record (isStopRecord: the node stopped on an open question, no diff) is filed in queue/needs-clarification/ instead, keeps its needsClarification and
+// adhocResolution, gets no needs-review status and a node-stop-received history entry naming the node and the reason.
 function replaceWithDraft(pipelineDir, originalFile, pkg, atMs) {
-  const draft = { ...pkg.record, fromNode: pkg.nodeId, status: 'needs-review' };
+  const stop = isStopRecord(pkg.record);
+  const draft = stop ? { ...pkg.record, fromNode: pkg.nodeId } : { ...pkg.record, fromNode: pkg.nodeId, status: 'needs-review' };
   delete draft.leasedTo;
-  draft.history = [...(Array.isArray(draft.history) ? draft.history : []), { stage: 'node-draft-received', at: new Date(atMs).toISOString(), detail: `drafted on ${pkg.nodeId}` }];
-  const dir = path.join(pipelineDir, 'queue', 'review');
+  const at = new Date(atMs).toISOString();
+  const entry = stop
+    ? { stage: 'node-stop-received', at, detail: `stopped on ${pkg.nodeId}: ${pkg.record.needsClarification.reason}` }
+    : { stage: 'node-draft-received', at, detail: `drafted on ${pkg.nodeId}` };
+  draft.history = [...(Array.isArray(draft.history) ? draft.history : []), entry];
+  const dir = path.join(pipelineDir, 'queue', stop ? 'needs-clarification' : 'review');
   fs.mkdirSync(dir, { recursive: true });
   writeJsonAtomicSync(path.join(dir, path.basename(originalFile)), draft);
   fs.unlinkSync(originalFile);
@@ -126,8 +135,13 @@ function createServer({ env = process.env, now = () => Date.now(), send: sendNot
       storePackage(pipelineDir, pkg);
       if (original) replaceWithDraft(pipelineDir, original, pkg, now());
       returnLease(pkg.taskId, { now: now(), env });
+      const stopped = pkg.version === RECORD_PACKAGE_VERSION && isStopRecord(pkg.record);
+      if (stopped) recordEvent(pkg.taskId, 'blocked', { now: now(), env });
       try {
-        await sendNotice({ level: 'summary', key: `node-package:${pkg.taskId}`, title: `Node ${nodeId}: review package arrived`, text: pkg.branch ? `Task ${pkg.taskId} came back from ${nodeId} on ${pkg.branch}.` : `Task ${pkg.taskId} was drafted on ${nodeId} and is waiting in review.` }, { env, now });
+        const notice = stopped
+          ? { level: 'summary', key: `node-package:${pkg.taskId}`, title: `Node ${nodeId}: task stopped with a question`, text: `Task ${pkg.taskId} stopped on ${nodeId} and needs a decision.` }
+          : { level: 'summary', key: `node-package:${pkg.taskId}`, title: `Node ${nodeId}: review package arrived`, text: pkg.branch ? `Task ${pkg.taskId} came back from ${nodeId} on ${pkg.branch}.` : `Task ${pkg.taskId} was drafted on ${nodeId} and is waiting in review.` };
+        await sendNotice(notice, { env, now });
       } catch (e) { /* the notice is best effort */ }
       return send(res, 200, { ok: true, taskId: pkg.taskId });
     } catch (e) {
