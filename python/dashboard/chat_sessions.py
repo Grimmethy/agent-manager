@@ -29,6 +29,7 @@ _acquire_apply_lock()/_release_apply_lock() pair already used by the merge-branc
 endpoint, so this module never needs its own git-mutex logic.
 """
 import json
+import os
 import time
 import uuid
 from pathlib import Path
@@ -101,6 +102,10 @@ def _new_session(roots: list, instances_dir, provider: str, model: str, effort: 
         # plugin/project repos, all read/write. See app.py:_chat_roots().
         "roots": roots,
         "repoRoot": roots[0],
+        # mtimes (st_mtime_ns, one per registry file) of projects.json / plugins.json at the
+        # moment `roots` was last computed -- get_active_session() compares against these
+        # to decide whether to refresh session["roots"]. None = never stamped.
+        "rootsMtime": None,
         "instancesDir": str(instances_dir) if instances_dir else None,
         # Only meaningful for the Claude provider (claude_client.generate()'s own
         # `resume` param) -- the CLI's real session id, captured from the first reply and
@@ -123,20 +128,64 @@ def _new_session(roots: list, instances_dir, provider: str, model: str, effort: 
     }
 
 
+def _roots_mtime(paths) -> list:
+    """One st_mtime_ns per path, None for a missing file -- never raises. A plain stat per
+    file, no directory scan."""
+    mtimes = []
+    for p in paths:
+        try:
+            mtimes.append(os.stat(p).st_mtime_ns)
+        except OSError:
+            mtimes.append(None)
+    return mtimes
+
+
+def _refresh_roots(session: dict, roots: list, registry_paths) -> bool:
+    """Overwrite session['roots'] with the caller's freshly computed `roots` (app.py's
+    _chat_roots()) when the registry files changed since the last stamp. repoRoot is never
+    touched -- it stays stable for the session. With registry_paths=None there is no mtime
+    to compare, so the roots list itself is compared instead. Returns True if changed."""
+    fresh = [r for r in (roots or []) if r]
+    if not fresh:
+        return False
+    if registry_paths is None:
+        if session.get("roots") == fresh:
+            return False
+        session["roots"] = fresh
+        return True
+    mtime = _roots_mtime(registry_paths)
+    if session.get("rootsMtime") is not None and session.get("rootsMtime") == mtime:
+        return False
+    session["roots"] = fresh
+    session["rootsMtime"] = mtime
+    return True
+
+
 def get_active_session(storage_dir: Path, roots: list, instances_dir=None,
-                        provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None) -> dict:
+                        provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None,
+                        registry_paths=None) -> dict:
     """The single ongoing conversation for this project (Brain Dump #153: "hideable panel
     on the right side of the app" -- global, not per-subject like Discuss). Creates one if
     none is currently active. Does NOT re-resolve provider/model/effort for an existing
     active session -- same "fixed for the session's lifetime" reasoning discuss_sessions.py
     already documents (a mid-conversation provider switch would hand the new
-    provider/model a transcript or --resume history it didn't generate)."""
+    provider/model a transcript or --resume history it didn't generate).
+
+    Roots are refreshed on EVERY call, not on a timer: when `registry_paths` (the caller's
+    projects.json / plugins.json paths) is given, their mtimes are stat'd and session['roots']
+    is overwritten from the caller's fresh `roots` only if one of them changed (tracked in
+    session['rootsMtime']). session['repoRoot'] stays stable across refreshes."""
     sessions = _read_sessions(storage_dir)
     active = [s for s in sessions.values() if s.get("status") == "active"]
     if active:
         active.sort(key=lambda s: s.get("startedAt") or "", reverse=True)
-        return active[0]
+        session = active[0]
+        if _refresh_roots(session, roots, registry_paths):
+            _write_sessions(storage_dir, sessions)
+        return session
     session = _new_session(roots, instances_dir, provider, model, effort)
+    if registry_paths is not None:
+        session["rootsMtime"] = _roots_mtime(registry_paths)
     sessions[session["id"]] = session
     _write_sessions(storage_dir, sessions)
     return session
