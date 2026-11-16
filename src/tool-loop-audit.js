@@ -101,12 +101,12 @@ function strLen(v) {
 
 // ctx: { source, taskId, stage, lane, model, turn, phase }. message is the assistant
 // message as postChatTurn returned it; only its sizes are recorded.
-function buildTurnEndEntry(ctx, { message, usage, doneReason }) {
+function buildTurnEndEntry(ctx, { message, usage, doneReason }, timing) {
   const msg = message || {};
   const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
   const content = typeof msg.content === 'string' ? msg.content : '';
   const { endClass, heuristic } = classifyTurnEnd({ doneReason, toolCallCount: toolCalls.length, content });
-  return {
+  const entry = {
     ...ctx,
     doneReason: doneReason == null ? null : doneReason,
     endClass,
@@ -118,6 +118,12 @@ function buildTurnEndEntry(ctx, { message, usage, doneReason }) {
     promptEvalCount: usage && usage.prompt_eval_count != null ? usage.prompt_eval_count : null,
     evalCount: usage && usage.eval_count != null ? usage.eval_count : null,
   };
+  // Optional per-turn timings (HUB0464): only added when supplied as finite numbers.
+  if (timing && typeof timing === 'object') {
+    if (Number.isFinite(timing.modelCallMs)) entry.modelCallMs = timing.modelCallMs;
+    if (Number.isFinite(timing.toolExecMs)) entry.toolExecMs = timing.toolExecMs;
+  }
+  return entry;
 }
 
 // One entry per BLANK sample (brain-dump 1891): a turn that came back with no tool calls and no content is treated as a
