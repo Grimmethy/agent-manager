@@ -345,6 +345,8 @@ if (require.main === module) {
     // The lane's claim allowlist and reviewer daemon, so the worker can re-read them each tick. Empty = claims any source / no reviewer.
     console.log(`LANE_TASK_CLASSES=${lane.taskClasses ? lane.taskClasses.join(',') : ''}`);
     console.log(`LANE_REVIEWS=${lane.reviewer ? lane.reviewerId : ''}`);
+    // A cloud lane's `reviews` flag (default true): may this lane take review work before it drafts (feature cloud-agent-pool). Printed for cloud lanes only, so every other lane's output is unchanged.
+    if (lane.cloud) console.log(`LANE_CLOUD_REVIEWS=${lane.reviews === false ? 'false' : 'true'}`);
   } else {
     console.log(JSON.stringify(lanes));
   }

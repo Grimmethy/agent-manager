@@ -765,7 +765,7 @@ check_instance_liveness() {
 
 # reload_lane_rules [instance_id] -> re-reads this lane's taskClasses and reviewer daemon from src/lanes.js --env (one node spawn), so a lanes.json
 # edit reaches a running worker without a restart. Gated on a bash -nt test: node runs only when lanes.json is newer than LANE_RULES_STAMP, so an
-# unchanged registry costs no spawn. Sets LANE_RULES_TASK_CLASSES and LANE_RULES_REVIEWS. A failed call or missing keys keeps the last good values.
+# unchanged registry costs no spawn. Sets LANE_RULES_TASK_CLASSES, LANE_RULES_REVIEWS and (cloud lanes only) LANE_RULES_CLOUD_REVIEWS. A failed call or missing keys keeps the last good values.
 # The stamp is touched on every path inside the gate, so a failing call is not retried until lanes.json changes again. Logs one line only when a value
 # changes. No timer or loop here: the caller's tick is the trigger.
 reload_lane_rules() {
@@ -786,14 +786,16 @@ reload_lane_rules() {
 
   printf '%s\n' "$out" | grep -q '^LANE_TASK_CLASSES=' || return 0
   printf '%s\n' "$out" | grep -q '^LANE_REVIEWS=' || return 0
-  local classes reviews
+  local classes reviews cloud_reviews
   classes="$(printf '%s\n' "$out" | sed -n 's/^LANE_TASK_CLASSES=//p' | head -n 1)"
   reviews="$(printf '%s\n' "$out" | sed -n 's/^LANE_REVIEWS=//p' | head -n 1)"
+  cloud_reviews="$(printf '%s\n' "$out" | sed -n 's/^LANE_CLOUD_REVIEWS=//p' | head -n 1)"   # cloud lanes only (true|false); empty for every other lane
 
-  if [[ "${LANE_RULES_TASK_CLASSES-__unset__}" != "$classes" || "${LANE_RULES_REVIEWS-__unset__}" != "$reviews" ]]; then
-    printf '[%s] lane rules: taskClasses=%s reviews=%s\n' "$id" "${classes:-any}" "${reviews:-none}" >&2
+  if [[ "${LANE_RULES_TASK_CLASSES-__unset__}" != "$classes" || "${LANE_RULES_REVIEWS-__unset__}" != "$reviews" || "${LANE_RULES_CLOUD_REVIEWS-__unset__}" != "$cloud_reviews" ]]; then
+    printf '[%s] lane rules: taskClasses=%s reviews=%s%s\n' "$id" "${classes:-any}" "${reviews:-none}" "${cloud_reviews:+ cloudReviews=$cloud_reviews}" >&2
   fi
   LANE_RULES_TASK_CLASSES="$classes"
   LANE_RULES_REVIEWS="$reviews"
+  LANE_RULES_CLOUD_REVIEWS="$cloud_reviews"
   return 0
 }
