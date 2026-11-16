@@ -136,3 +136,50 @@ test('CLI: get, set, unset, mode and is-off exit codes', () => {
   assert.equal(JSON.parse(run('unset').stdout).count, null);
   assert.equal(run('bogus').status, 2);
 });
+
+test('status: the state plus every cloud lane in lane order with rank and off, agreeing with isLaneOff', () => {
+  const { env } = sandbox();
+  const shuffled = ['worker-cloud10', 'worker-cloud3', 'worker-cloud', 'worker-cloud2', 'worker-3090'];
+  let s = dial.status(env, shuffled);
+  assert.deepEqual(s.lanes.map((l) => l.id), ['worker-cloud', 'worker-cloud2', 'worker-cloud3', 'worker-cloud10'], 'natural order, non-cloud ids left out');
+  assert.deepEqual(s.lanes.map((l) => l.rank), [0, 1, 2, 3]);
+  assert.deepEqual(s.lanes.map((l) => l.off), [false, false, false, false], 'unset: nothing off');
+  assert.equal(s.count, null);
+  dial.setCount(2, 'tester', env);
+  s = dial.status(env, shuffled);
+  assert.equal(s.count, 2);
+  assert.equal(s.setBy, 'tester');
+  assert.deepEqual(s.lanes.map((l) => l.off), [false, false, true, true]);
+  for (const l of s.lanes) assert.equal(l.off, dial.isLaneOff(l.id, env, shuffled), `${l.id}: status and isLaneOff must agree`);
+  dial.setCount(0, 't', env);
+  assert.deepEqual(dial.status(env, shuffled).lanes.map((l) => l.off), [true, true, true, true]);
+  dial.setCount(99, 't', env);
+  assert.deepEqual(dial.status(env, shuffled).lanes.map((l) => l.off), [false, false, false, false]);
+  assert.deepEqual(dial.status(env, []).lanes, []);
+  assert.deepEqual(dial.status(env, ['worker-cloud', 'worker-cloud']).lanes.map((l) => l.id), ['worker-cloud'], 'duplicates collapse');
+});
+
+test('status on a broken state file reads as unset with no lane off', () => {
+  const { env, file } = sandbox();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, '{not json');
+  const s = dial.status(env, ['worker-cloud', 'worker-cloud2']);
+  assert.equal(s.count, null);
+  assert.deepEqual(s.lanes.map((l) => l.off), [false, false]);
+});
+
+test('CLI status prints the JSON for the enabled cloud lanes of the registry', () => {
+  const { env, dir } = sandbox();
+  const lanes = path.join(dir, 'lanes.json');
+  fs.writeFileSync(lanes, JSON.stringify([
+    { gpu: 'cloud2', ollamaUrl: 'http://127.0.0.1:8', model: 'haiku', provider: 'cloud', preempt: 'never' },
+    { gpu: 'cloud', ollamaUrl: 'http://127.0.0.1:9', model: 'haiku', provider: 'cloud', preempt: 'never' },
+    { gpu: 'cloud3', ollamaUrl: 'http://127.0.0.1:7', model: 'haiku', provider: 'cloud', preempt: 'never', enabled: false },
+  ]));
+  const e = { ...env, AGENT_MANAGER_LANES_PATH: lanes, AGENT_MANAGER_LOCAL_GPU: 'testgpu' };
+  const run = (...args) => spawnSync('node', [path.join(__dirname, 'cloud-dial.js'), ...args], { encoding: 'utf8', env: e });
+  run('set', '1');
+  const out = JSON.parse(run('status').stdout);
+  assert.equal(out.count, 1);
+  assert.deepEqual(out.lanes, [{ id: 'worker-cloud', rank: 0, off: false }, { id: 'worker-cloud2', rank: 1, off: true }]);
+});

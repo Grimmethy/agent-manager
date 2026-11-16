@@ -78,3 +78,18 @@ test('the input array and its rows are not modified', () => {
   run(leases);
   assert.deepEqual(leases, before);
 });
+
+test('a numeric mergedAt is not a finish time: a returned row is judged by its parsable returnedAt', () => {
+  const fresh = iso(NOW - 1 * DAY);
+  // mergedAt is the number 5, so it must be skipped and returnedAt (fresh) decides: kept
+  assert.deepEqual(run([row('n1', 'returned', { mergedAt: 5, returnedAt: fresh })]), { prunable: [], kept: 1 });
+});
+
+test('a returned row with a numeric mergedAt and an old returnedAt is prunable by returnedAt', () => {
+  const old = iso(NOW - 30 * DAY);
+  assert.deepEqual(run([row('n2', 'returned', { mergedAt: 5, returnedAt: old })]).prunable, ['n2']);
+});
+
+test('a returned row whose only finish field is a number has no parsable finish time and is kept', () => {
+  assert.deepEqual(run([row('n3', 'returned', { mergedAt: 5, returnedAt: null, expiresAt: null })]), { prunable: [], kept: 1 });
+});
