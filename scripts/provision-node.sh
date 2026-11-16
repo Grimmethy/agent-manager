@@ -10,7 +10,7 @@
 #   <pipeline-dir>/task-domains.json  every standard domain (scripts/ensure-task-domains.sh: written when missing, missing domains added when present)
 #   <pipeline-dir>/lanes.json         ONE lane, the cloud lane of lanes.example.json, DISABLED; an existing lanes.json is never overwritten
 #   <pipeline-dir>/node.env           AGENT_MANAGER_NODE_ID, AGENT_MANAGER_PIPELINE_DIR, AGENT_MANAGER_REPO_ROOT, AGENT_MANAGER_DOMAINS_PATH, AGENT_MANAGER_LANES_PATH (rewritten identically; the commented AGENT_MANAGER_CLAIM_URL, AGENT_MANAGER_NODE_TOKEN_FILE and AGENT_MANAGER_NODE_REPOS_DIR lines are appended)
-#   [unit-dir]/am-node-pull.service, am-node-send.path, am-node-send.service (written only, never enabled or started; an existing unit file is kept, never overwritten)
+#   [unit-dir]/am-node-pull.service, am-node-send.path, am-node-send.service, am-node-retry.service, am-node-retry.path (written only, never enabled or started; an existing unit file is kept, never overwritten)
 #     Both services run <node-repo-dir>/src/... with the absolute node binary found by `command -v node` and read <pipeline-dir>/node.env as an EnvironmentFile. The send service passes
 #     --url ${AGENT_MANAGER_PACKAGE_URL} and --token-file ${AGENT_MANAGER_NODE_TOKEN_FILE} (systemd fills them from node.env once the operator uncomments them), --node-id <node-id> and --outbox <pipeline-dir>/queue/node-outbox.
 # Exit 1 (nothing created) when node is not on PATH as an absolute path. Exit 2 (nothing created) for a missing argument, an extra one, the id 'wok', an id that is not lowercase letters, digits and dashes (1 to 31 characters, not
@@ -109,6 +109,33 @@ ExecStart=$NODE_BIN $REPO_DIR/src/node-package-send.js --url \${AGENT_MANAGER_PA
 Nice=19
 IOSchedulingClass=idle
 CPUSchedulingPolicy=idle
+EOF
+
+# The retry pair (src/reject-retry-check.js: moves review-rejected blocked records back to queue/pending, capped) is written like the others and never enabled or started.
+write_unit_if_absent "$UNIT_DIR/am-node-retry.service" <<EOF
+[Unit]
+Description=Agent Manager node reject-retry sweep (requeues review-rejected blocked records)
+
+[Service]
+Type=oneshot
+WorkingDirectory=$REPO_DIR
+EnvironmentFile=$PIPELINE_DIR/node.env
+ExecStart=$NODE_BIN $REPO_DIR/src/reject-retry-check.js
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+EOF
+
+write_unit_if_absent "$UNIT_DIR/am-node-retry.path" <<EOF
+[Unit]
+Description=Agent Manager node reject-retry trigger (watches queue/blocked)
+
+[Path]
+PathChanged=$PIPELINE_DIR/queue/blocked
+Unit=am-node-retry.service
+
+[Install]
+WantedBy=default.target
 EOF
 
 printf 'AGENT_MANAGER_NODE_ID=%s\nAGENT_MANAGER_PIPELINE_DIR=%s\nAGENT_MANAGER_REPO_ROOT=%s\nAGENT_MANAGER_DOMAINS_PATH=%s\nAGENT_MANAGER_LANES_PATH=%s\n' \
