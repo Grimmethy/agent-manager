@@ -96,6 +96,42 @@ test('recordHeartbeat refreshes lastSeen, state, load, free RAM, paused and the 
   assert.equal(rec.cores, 4, 'registration details are kept');
 });
 
+test('recordHeartbeat stores a valid 40-hex codeSha and listNodes shows it', () => {
+  const { env } = setup();
+  registerNode(spec(), env);
+  const sha = 'a'.repeat(40);
+  recordHeartbeat({ id: 'grimm', codeSha: sha }, env, T0);
+  const listed = listNodes(env, T0).find((n) => n.id === 'grimm');
+  assert.equal(listed.codeSha, sha);
+  assert.equal(loadNodes(env).grimm.codeSha, sha);
+});
+
+test('recordHeartbeat stores null for an uppercase, 39-character, numeric or object codeSha', () => {
+  const { env } = setup();
+  registerNode(spec(), env);
+  for (const bad of ['A'.repeat(40), 'a'.repeat(39), 123, {}]) {
+    assert.equal(recordHeartbeat({ id: 'grimm', codeSha: bad }, env, T0).codeSha, null, String(bad));
+  }
+});
+
+test('a heartbeat without a codeSha key clears a previously stored one', () => {
+  const { env } = setup();
+  registerNode(spec(), env);
+  recordHeartbeat({ id: 'grimm', codeSha: 'b'.repeat(40) }, env, T0);
+  assert.equal(recordHeartbeat({ id: 'grimm' }, env, T0 + MIN).codeSha, null);
+});
+
+test('codeSha does not change the other heartbeat fields', () => {
+  const { env: envA } = setup();
+  const { env: envB } = setup();
+  registerNode(spec(), envA);
+  registerNode(spec(), envB);
+  const payload = { id: 'grimm', state: 'up', load: 1.25, freeRamGb: 7.5, paused: true };
+  const without = recordHeartbeat(payload, envA, T0);
+  const withSha = recordHeartbeat({ ...payload, codeSha: 'c'.repeat(40) }, envB, T0);
+  for (const k of ['state', 'load', 'freeRamGb', 'paused', 'lastSeen']) assert.deepEqual(withSha[k], without[k], k);
+});
+
 test('recordHeartbeat defaults state to up, makes junk numbers null, and rejects an unknown node, a bad state and a non-boolean paused', () => {
   const { env } = setup();
   registerNode(spec(), env);
