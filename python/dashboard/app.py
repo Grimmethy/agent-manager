@@ -441,18 +441,80 @@ def is_claude_token_configured() -> bool:
 PROJECT_REGISTRY_PATH = PACKAGE_ROOT / "projects.json"
 
 
+# Problems found by the most recent registry read(s): list of {entry, reason}. Replaced
+# (not appended) on every read so repeated reads never accumulate duplicates.
+_REGISTRY_WARNINGS: list = []
+# True when the last read found the file corrupt / not a list. record_project_registry_entry()
+# refuses to rewrite the file in that state, so a corrupt registry is never clobbered.
+_REGISTRY_CORRUPT = False
+
+
+def get_registry_warnings() -> list:
+    """Copy of the registry warnings store: list of {entry, reason}."""
+    return [dict(w) for w in _REGISTRY_WARNINGS]
+
+
+def _set_registry_warnings(items: list) -> None:
+    global _REGISTRY_WARNINGS
+    _REGISTRY_WARNINGS = list(items)
+
+
+def validate_project_entry(entry) -> list:
+    """Problem strings for one projects.json entry. An empty list means usable."""
+    if not isinstance(entry, dict):
+        return ["entry is not an object"]
+    problems = []
+    for key in ("repoRoot", "pipelineDir", "domainsPath"):
+        value = entry.get(key)
+        if not value or not isinstance(value, str):
+            problems.append(f"missing required key: {key}")
+    if problems:
+        return problems
+    if os.path.realpath(entry["pipelineDir"]) == os.path.realpath(entry["repoRoot"]):
+        problems.append("pipelineDir must differ from repoRoot")
+    if not os.path.isdir(entry["repoRoot"]):
+        problems.append(f"repoRoot is not an existing directory: {entry['repoRoot']}")
+    if not os.path.exists(entry["domainsPath"]):
+        problems.append(f"domainsPath does not exist: {entry['domainsPath']}")
+    return problems
+
+
 def read_project_registry() -> list:
     """List of {repoRoot, pipelineDir, domainsPath, label} for every project ever started
     via the Project tab -- project-history.json only stores a bare repo path, which isn't
-    enough to locate a non-active project's queue/task-domains.json later. Corrupt/missing
-    file -> empty list, never a 500."""
+    enough to locate a non-active project's queue/task-domains.json later. Missing file ->
+    empty list with no warning. Corrupt file, unreadable file, or non-list data -> empty
+    list plus an explicit warning (never a 500, never silent). Every dict entry is validated
+    with validate_project_entry; problems go to get_registry_warnings(), and the entry is
+    still returned so callers decide what to do with it."""
+    global _REGISTRY_CORRUPT
+    _REGISTRY_CORRUPT = False
+    warnings: list = []
+    path_str = str(PROJECT_REGISTRY_PATH)
     if not PROJECT_REGISTRY_PATH.is_file():
+        _set_registry_warnings(warnings)
         return []
     try:
         data = json.loads(PROJECT_REGISTRY_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError as exc:
+        _REGISTRY_CORRUPT = True
+        warnings.append({"entry": path_str, "reason": f"corrupt JSON: {exc}"})
+        _set_registry_warnings(warnings)
         return []
+    except OSError as exc:
+        warnings.append({"entry": path_str, "reason": f"unreadable: {exc}"})
+        _set_registry_warnings(warnings)
+        return []
+    if not isinstance(data, list):
+        _REGISTRY_CORRUPT = True
+        warnings.append({"entry": path_str, "reason": "registry is not a JSON list"})
+        _set_registry_warnings(warnings)
+        return []
+    for e in data:
+        for problem in validate_project_entry(e):
+            warnings.append({"entry": e, "reason": problem})
+    _set_registry_warnings(warnings)
+    return data
 
 
 def record_project_registry_entry(repo_root: str, pipeline_dir: str, domains_path: str):
@@ -463,6 +525,11 @@ def record_project_registry_entry(repo_root: str, pipeline_dir: str, domains_pat
     try:
         normalized_root = os.path.normpath(repo_root)
         entries = read_project_registry()
+        if _REGISTRY_CORRUPT:
+            # Refuse to overwrite a corrupt/unreadable registry: the reader already recorded
+            # the reason in get_registry_warnings(); rewriting would discard the user's data.
+            logger.warning("Not rewriting corrupt project registry at %s", PROJECT_REGISTRY_PATH)
+            return False
         prior = next((e for e in entries if os.path.normpath(e.get("repoRoot", "")) == normalized_root), {})
         entries = [e for e in entries if os.path.normpath(e.get("repoRoot", "")) != normalized_root]
         entry = {
@@ -1790,22 +1857,34 @@ def _chat_roots() -> list:
     plugin's repo (dirname of its register.js) and each projects.json repoRoot. A fresh
     clone with no plugins.json / projects.json just yields [agent-manager]."""
     raw = [str(PACKAGE_ROOT)]
+    extra_warnings: list = []
     for e in _read_plugins_manifest():
         rp = e.get("registerPath")
         if rp and e.get("enabled") is not False:
             raw.append(os.path.dirname(rp))
+    # read_project_registry() resets the warnings store and records validation problems;
+    # the skips below are appended to it so get_registry_warnings() reports both.
     for e in read_project_registry():
-        if e.get("repoRoot"):
-            raw.append(e["repoRoot"])
+        # read_project_registry() already recorded every problem for this entry; an entry
+        # that fails validation (or is not an object) is skipped as a chat root, not added.
+        if not isinstance(e, dict) or not e.get("repoRoot"):
+            continue
+        raw.append(e["repoRoot"])
     seen, out = set(), []
     for p in raw:
         try:
             real = os.path.realpath(p)
         except OSError:
+            extra_warnings.append({"entry": p, "reason": "path could not be resolved; skipped as a chat root"})
             continue
-        if real not in seen and os.path.isdir(real):
-            seen.add(real)
-            out.append(real)
+        if real in seen:
+            continue
+        if not os.path.isdir(real):
+            extra_warnings.append({"entry": p, "reason": "not an existing directory; skipped as a chat root"})
+            continue
+        seen.add(real)
+        out.append(real)
+    _set_registry_warnings(get_registry_warnings() + extra_warnings)
     return out or [os.path.realpath(str(PACKAGE_ROOT))]
 
 
