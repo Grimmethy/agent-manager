@@ -108,6 +108,27 @@ test('an empty symbolic-ref answer falls back to master', () => {
   assert.equal(r.branch, 'master');
 });
 
+// Distinct from the sibling test above: also asserts the branch field on the
+// returned object as a second kill surface for the '|| master' fallback.
+test('empty symbolic-ref result pins branch field to master (injected execGit)', () => {
+  const calls = [];
+  const execGit = (args) => {
+    calls.push(args);
+    if (args[0] === 'symbolic-ref') return '\n';
+    if (args[0] === 'rev-list') {
+      assert.ok(
+        args.includes('refs/remotes/origin/master...HEAD'),
+        'rev-list should target origin/master...HEAD when symbolic-ref is empty'
+      );
+      return '0 0\n';
+    }
+    throw new Error('unexpected git call: ' + args.join(' '));
+  };
+  const r = checkDrift('/unused', { execGit });
+  assert.equal(r.branch, 'master', 'branch should be master when symbolic-ref yields empty');
+  assert.deepEqual(r, { state: 'current', ahead: 0, behind: 0, branch: 'master' });
+});
+
 test('git failure returns an error result and does not throw', () => {
   const execGit = (args) => {
     if (args[0] === 'symbolic-ref') return 'feature/x\n';
