@@ -38,7 +38,11 @@ function changedFiles(root, base) {
   if (mb.error) return mb;
   const d = git(root, ['diff', '--name-only', '--diff-filter=ACMR', mb.out.trim()]);
   if (d.error) return d;
-  return { files: d.out.split('\n').filter(Boolean) };
+  // Untracked files are new files the branch has not staged yet; `git diff` against the merge-base does not list them.
+  const u = git(root, ['ls-files', '--others', '--exclude-standard']);
+  if (u.error) return u;
+  const files = [...new Set([...d.out.split('\n'), ...u.out.split('\n')].filter(Boolean))];
+  return { files };
 }
 
 function main(argv) {
