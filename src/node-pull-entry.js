@@ -48,7 +48,55 @@ function claimDirs(pipelineDir) {
   return dirs;
 }
 
-function countLeasedIn(dir, nodeId) {
+// Sibling queues whose presence of the same file name marks an adhoc/pending record as a dead duplicate (the work already left or stopped).
+const DEAD_DUPLICATE_DIRS = ['needs-clarification', 'blocked', 'node-sent', 'node-refused', 'node-outbox'];
+
+// True when queueName (adhoc or pending, relative to <pipelineDir>/queue) holds a record fileName whose exact name also exists in one of DEAD_DUPLICATE_DIRS.
+// drafting/<worker> records are never dead. A missing sibling directory counts as empty; other read errors throw.
+function isDeadDuplicate(pipelineDir, queueName, fileName) {
+  if (queueName !== 'adhoc' && queueName !== 'pending') return false;
+  const queue = path.join(pipelineDir, 'queue');
+  for (const sibling of DEAD_DUPLICATE_DIRS) {
+    let names;
+    try {
+      names = fs.readdirSync(path.join(queue, sibling));
+    } catch (e) {
+      if (e.code === 'ENOENT') continue;
+      throw e;
+    }
+    if (names.includes(fileName)) return true;
+  }
+  return false;
+}
+
+// True when the record named fileName in queue queueName (relative to <pipelineDir>/queue) is leased to nodeId and is not a dead duplicate.
+// A missing file, invalid JSON, or ENOENT on the sibling directory are treated as "not held".
+// Dead-duplicate check only applies to adhoc/pending; drafting records are never dead.
+function holdsLeasedTask(pipelineDir, queueName, fileName, nodeId) {
+  if (queueName !== 'adhoc' && queueName !== 'pending') {
+    // drafting: no dead-duplicate check, just check if leased
+    const filePath = path.join(pipelineDir, 'queue', queueName, fileName);
+    let record;
+    try {
+      record = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    } catch (e) {
+      return false;
+    }
+    return !!(record && record.leasedTo === nodeId);
+  }
+  if (isDeadDuplicate(pipelineDir, queueName, fileName)) return false;
+  const filePath = path.join(pipelineDir, 'queue', queueName, fileName);
+  let record;
+  try {
+    record = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) {
+    return false;
+  }
+  return !!(record && record.leasedTo === nodeId);
+}
+
+function countLeasedIn(dir, nodeId, pipelineDir) {
+  const queueName = path.relative(path.join(pipelineDir, 'queue'), dir);
   let names;
   try {
     names = fs.readdirSync(dir);
@@ -59,13 +107,7 @@ function countLeasedIn(dir, nodeId) {
   let count = 0;
   for (const name of names) {
     if (!name.endsWith('.json')) continue;
-    let record;
-    try {
-      record = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
-    } catch (e) {
-      continue; // moved away between the listing and the read, or not valid JSON: not a record we can attribute to this node
-    }
-    if (record && record.leasedTo === nodeId) count += 1;
+    if (holdsLeasedTask(pipelineDir, queueName, name, nodeId)) count += 1;
   }
   return count;
 }
@@ -73,7 +115,7 @@ function countLeasedIn(dir, nodeId) {
 // How many claimed tasks this node holds: records leased to nodeId summed over claimDirs(pipelineDir). Unreadable directories throw as before.
 function countHeldTasks(pipelineDir, nodeId) {
   let total = 0;
-  for (const dir of claimDirs(pipelineDir)) total += countLeasedIn(dir, nodeId);
+  for (const dir of claimDirs(pipelineDir)) total += countLeasedIn(dir, nodeId, pipelineDir);
   return total;
 }
 
@@ -115,4 +157,4 @@ function buildDaemonDeps(env = process.env, overrides = {}) {
   };
 }
 
-module.exports = { buildDaemonDeps, repoNameFromUrl, parseClasses, PAUSE_MARKER, maxTasks, countHeldTasks };
+module.exports = { buildDaemonDeps, repoNameFromUrl, parseClasses, PAUSE_MARKER, maxTasks, countHeldTasks, isDeadDuplicate };
