@@ -847,6 +847,6 @@ function planImportBindingProblem(task, summary) {
 
 module.exports = {
   adhocDiffSubstanceProblem, adhocNoChangesClaimProblem, parseChangedFiles, extractForbiddenPaths,
-  extractDeclaredTargets, pathsRefEqual, taskWantsCodeChange,
+  extractDeclaredTargets, extractDeclaredFiles, pathsRefEqual, taskWantsCodeChange,
   planImportBindingProblem, planImportBindingStats,
 };
