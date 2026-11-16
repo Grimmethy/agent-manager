@@ -74,8 +74,92 @@ test('node.env carries commented examples and no uncommented setting for the pul
 });
 
 test('the units are written only: plain files, nothing enabled, nothing under the temp HOME', () => {
-  assert.deepEqual(fs.readdirSync(units).sort(), ['am-node-pull.service', 'am-node-send.path', 'am-node-send.service']);
+  assert.deepEqual(fs.readdirSync(units).sort(), ['am-node-pull.service', 'am-node-retry.path', 'am-node-retry.service', 'am-node-send.path', 'am-node-send.service']);
   for (const f of fs.readdirSync(units)) assert.equal(fs.lstatSync(unit(f)).isFile(), true, f);
   assert.deepEqual(fs.readdirSync(home), []);
   assert.match(run.stdout, /Nothing was started/);
+});
+
+// The retry pair is written only. Each test passes its own temp unit dir as the 4th argument.
+const NODE_ON_PATH = spawnSync('bash', ['-c', 'command -v node'], { encoding: 'utf8' }).stdout.trim();
+
+const provisionInto = (dir) => {
+  const pipeDir = path.join(dir, 'pipe');
+  const repoDir = path.join(dir, 'repo');
+  const unitDir = path.join(dir, 'units');
+  const homeDir = path.join(dir, 'home');
+  fs.mkdirSync(homeDir, { recursive: true });
+  const res = spawnSync('bash', [SCRIPT, 'grimm', pipeDir, repoDir, unitDir], {
+    encoding: 'utf8',
+    timeout: 60000,
+    env: { ...process.env, HOME: homeDir },
+  });
+  return { res, pipeDir, unitDir };
+};
+
+test('am-node-retry.service ExecStart starts with the absolute node binary', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provision-node-retry-'));
+  try {
+    const { res, unitDir } = provisionInto(dir);
+    assert.equal(res.status, 0, res.stderr);
+    assert.ok(path.isAbsolute(NODE_ON_PATH), NODE_ON_PATH);
+    const exec = read(path.join(unitDir, 'am-node-retry.service')).split('\n').filter((l) => l.startsWith('ExecStart='));
+    assert.equal(exec.length, 1);
+    assert.ok(exec[0].startsWith(`ExecStart=${NODE_ON_PATH}`), exec[0]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('am-node-retry.service reads EnvironmentFile from the pipeline dir node.env', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provision-node-retry-'));
+  try {
+    const { res, pipeDir, unitDir } = provisionInto(dir);
+    assert.equal(res.status, 0, res.stderr);
+    const l = read(path.join(unitDir, 'am-node-retry.service')).split('\n');
+    assert.ok(l.includes(`EnvironmentFile=${pipeDir}/node.env`), l.join('\n'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('am-node-retry.path watches the pipeline dir queue/blocked', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provision-node-retry-'));
+  try {
+    const { res, pipeDir, unitDir } = provisionInto(dir);
+    assert.equal(res.status, 0, res.stderr);
+    const l = read(path.join(unitDir, 'am-node-retry.path')).split('\n');
+    assert.ok(l.includes(`PathChanged=${pipeDir}/queue/blocked`), l.join('\n'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a second provisioning run keeps an edited am-node-retry.service', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provision-node-retry-'));
+  try {
+    const first = provisionInto(dir);
+    assert.equal(first.res.status, 0, first.res.stderr);
+    const file = path.join(first.unitDir, 'am-node-retry.service');
+    const edited = '# hand edited\n' + read(file);
+    fs.writeFileSync(file, edited);
+    const second = provisionInto(dir);
+    assert.equal(second.res.status, 0, second.res.stderr);
+    assert.equal(read(file), edited);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('neither retry unit has an [Install] section', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provision-node-retry-'));
+  try {
+    const { res, unitDir } = provisionInto(dir);
+    assert.equal(res.status, 0, res.stderr);
+    for (const name of ['am-node-retry.service', 'am-node-retry.path']) {
+      assert.doesNotMatch(read(path.join(unitDir, name)), /^\[Install\]/m, name);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
