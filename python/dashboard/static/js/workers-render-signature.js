@@ -38,10 +38,14 @@ function workersStats() {
 // Returns '' when parts or ui is null/undefined, or when any top-level payload in parts is null/undefined (no skip is possible then).
 function workersRenderSignature(parts, ui) {
   if (parts == null || ui == null) return '';
-  for (const key of Object.keys(parts)) {
-    if (parts[key] == null) return '';
+  // gpuSessionActive is optional: pull it out before the null guard so an absent field cannot blank the signature.
+  const { gpuSessionActive, ...rest } = parts;
+  for (const key of Object.keys(rest)) {
+    if (rest[key] == null) return '';
   }
-  return JSON.stringify([workersStripVolatile(parts), ui]);
+  if (gpuSessionActive === null) return '';
+  const shown = gpuSessionActive === undefined ? rest : { ...rest, gpuSessionActive };
+  return JSON.stringify([workersStripVolatile(shown), ui]);
 }
 
 // mainEl must still hold the cards drawn last time (another tab may have replaced #main since).
