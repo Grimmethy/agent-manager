@@ -109,6 +109,24 @@ test('a bundle name with .. is refused before anything runs', () => {
   });
 });
 
+test('a bundle name that is empty is refused before anything runs', () => {
+  withInbox(JSON.stringify({ ...LATEST, bundle: '' }), (dir) => {
+    const deps = fakeDeps([OTHER]);
+    assert.throws(() => applyCode(dir, '/node', deps), /bundle must be a plain file name/);
+    assert.equal(deps.calls.runStatus.length, 0);
+  });
+});
+
+test('a latest.json whose JSON is a number or a string (not an object) is refused', () => {
+  for (const content of ['42', '"text"']) {
+    withInbox(content, (dir) => {
+      const deps = fakeDeps([OTHER]);
+      assert.throws(() => applyCode(dir, '/node', deps), /latest\.json is not an object/);
+      assert.equal(deps.calls.runStatus.length, 0);
+    });
+  }
+});
+
 test('a missing latest.json is refused', () => {
   withInbox(undefined, (dir) => {
     assert.throws(() => applyCode(dir, '/node', fakeDeps([OTHER])), /missing or unparsable/);
