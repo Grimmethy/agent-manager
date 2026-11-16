@@ -2459,6 +2459,7 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
             "matchedTaskState": label["matchedTaskState"],
             "description": label["description"],
             "subject": subject.strip(),
+            "headSha": head_sha,
             **({"candidateCount": candidate_count} if candidate_count else {}),
             "pushedAt": pushed_at,
             "ahead": ahead,
@@ -2501,7 +2502,42 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
     return branches
 
 
+_parked_apply_active = False
+
+
+def _apply_parked_verdicts_to(branches):
+    """Apply parked verdicts to THIS list before it is cached, then mark the rows that still have a parked verdict (verdictPending). The list_fn handed to the apply returns `branches` and never recomputes, so the apply cannot re-enter the listing; the flag drops any nested call."""
+    global _parked_apply_active
+    with _branch_cache_lock:
+        if _parked_apply_active:
+            return
+        _parked_apply_active = True
+    try:
+        import branch_verdicts_pending as bvp
+        import branch_verdicts as bv
+        qdir = queue_dir()
+        repo_root = get_active_repo_root() if qdir else None
+        if qdir and repo_root:
+            parked = len(bvp.list_pending_verdicts(qdir))
+            # A miss refreshes once through the normal path; the _parked_apply_active flag makes the nested store skip this apply (re-entry guard).
+            bvp.apply_pending_verdicts(qdir, repo_root, lambda force=False: list_unmerged_branches(force=True) if force else branches, _run_git, bv)
+            if len(bvp.list_pending_verdicts(qdir)) != parked:
+                bv.enrich_branches_with_verdicts(qdir, repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
+            still_parked = {p.get("branch") for p in bvp.list_pending_verdicts(qdir)}
+            for b in branches:
+                if b.get("branch") in still_parked:
+                    b["verdictPending"] = True
+                else:
+                    b.pop("verdictPending", None)
+    except Exception as exc:  # noqa: BLE001 -- a parked verdict must never fail the listing
+        print(f"[branches] pending verdict apply failed (non-fatal): {exc}", file=sys.stderr)
+    finally:
+        with _branch_cache_lock:
+            _parked_apply_active = False
+
+
 def _store_branch_list(branches):
+    _apply_parked_verdicts_to(branches)      # verdicts apply BEFORE the write, so the stored and returned list reflects them
     with _branch_cache_lock:
         _branch_cache["at"] = time.time()
         _branch_cache["branches"] = branches
@@ -2511,17 +2547,7 @@ def _store_branch_list(branches):
         _branch_cache["digest"] = fingerprint
     if changed:
         event_stream.announce("branch-list-changed", project="active")      # the Branches tab re-reads the cached list (a recompute that found nothing new says nothing)
-    # Apply any pending verdicts for branches that are now in the listing
-    try:
-        import branch_verdicts_pending as bvp
-        import branch_verdicts as bv
-        qdir = queue_dir()
-        if qdir:
-            repo_root = get_active_repo_root()
-            if repo_root:
-                bvp.apply_pending_verdicts(qdir, repo_root, list_unmerged_branches, _run_git, bv)
-    except Exception as exc:
-        print(f"[branches] pending verdict apply failed (non-fatal): {exc}", file=sys.stderr)
+    # Parked verdicts were already applied before the cache write (_apply_parked_verdicts_to).
 
 
 def _refresh_branch_list_in_background():
