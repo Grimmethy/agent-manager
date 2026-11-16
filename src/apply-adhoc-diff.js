@@ -26,6 +26,7 @@ const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
 const { ownerGateFor } = require('./owner-gates.js');
 const { validProposalFiles } = require('./proposal-files.js');
 const { targetHintForFailure } = require('./apply-target-hint.js');
+const { inferTestDependsOn, validateTestDependencies } = require('./lib/test-dependencies.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const { gitTimeoutMs } = require('./lib/git-timeout.js');
@@ -219,6 +220,21 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
     if (k > 0) prevOf.set(i, survivingIndices[k - 1]);
   });
 
+  // Test-dependency edges (src/lib/test-dependencies.js): a "tests" child is linked to the
+  // sibling whose behavior it exercises. Runs on id-bearing proposals before any record is written.
+  const withIds = subTasks.map((sub, i) => ({ ...sub, id: ids[i] }));
+  const inferred = inferTestDependsOn(withIds);
+  const validation = validateTestDependencies(inferred.proposals);
+  if (!validation.ok) throw new Error(`test-dependency validation failed: ${validation.errors.join('; ')}`);
+  const testDependsOn = new Map(); // surviving child index -> sibling id it must wait on
+  inferred.proposals.forEach((p, i) => {
+    if (!p.dependsOn || foldTargets.has(i)) return;
+    const targetIndex = ids.indexOf(p.dependsOn);
+    if (targetIndex < 0 || foldTargets.has(targetIndex)) return;
+    testDependsOn.set(i, p.dependsOn);
+  });
+  const testDependencyUnresolved = inferred.unresolved.slice(); // ambiguous tests children left with no edge
+
   const carriedDiff = parentTask && typeof parentTask.carriedPartialDiff === 'string' && parentTask.carriedPartialDiff.trim() ? parentTask.carriedPartialDiff : null;
   const queued = [];
   const ownerGates = []; // pieces that wait on the owner (owner-gates.js)
@@ -257,6 +273,11 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
     }
     // Work an earlier pass of the parent already landed (agentic-draft-common.js carriedPartialDiff): the pieces describe what REMAINS on top
     // of it, so the FIRST piece's worktree starts from it (applied as uncommitted changes) and every later piece stacks on the result.
+    const testDep = testDependsOn.get(i);
+    if (testDep) {
+      const existingDeps = Array.isArray(record.dependsOn) ? record.dependsOn : [];
+      if (!existingDeps.includes(testDep)) record.dependsOn = [...existingDeps, testDep];
+    }
     if (carriedDiff && i === survivingIndices[0]) {
       record.priorPartialDiff = carriedDiff;
       record.promptContext.rawText = `PRIOR WORK ALREADY APPLIED: an earlier pass of the parent task made some of this change. Those edits are applied to your worktree as uncommitted changes -- run git diff to see them, and do NOT redo them. Your job is the part below, on top of them.\n\n${sub.rawText}`;
@@ -277,6 +298,7 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
   queued.ownerGates = ownerGates;
   queued.hubSerial = hubSerial;
   queued.hubLabel = hubLabel;
+  queued.testDependencyUnresolved = testDependencyUnresolved;
   return queued;
 }
 
@@ -307,6 +329,7 @@ function buildDecomposedPlan(task, pipelineDir) {
     hubSerial: queued.hubSerial,
     hubLabel: queued.hubLabel,
     ownerGates: queued.ownerGates,
+    testDependencyUnresolved: queued.testDependencyUnresolved || [],
   };
 }
 
