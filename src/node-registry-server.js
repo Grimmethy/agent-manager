@@ -7,7 +7,7 @@
 // server accepts nothing but these node routes.
 //
 //   POST /heartbeat    Authorization: Bearer <that node's token>, JSON {id, address?, state, load, freeRamGb, paused, at}
-//                      -> 200 {ok: true, globalPause: bool, serverTime: ISO}
+//                      -> 200 {ok: true, globalPause: bool, serverTime: ISO, code: [{repo, sha}]}
 //   POST /claim        JSON {id, classes?} -> 200 {ok: true, task, lease, repo} | 200 {ok: true, task: null, retryAfterSec: 60}
 //                      (a paused node always gets the retryAfterSec answer)
 //   POST /event        JSON {id, taskId, event} -> 200 {ok: true}; 400 on an event outside drafted/reviewed/applied/merged/blocked/failed;
@@ -18,6 +18,7 @@
 //
 // globalPause is true while a global pause marker (src/worker-switch.js _pause-global) is active on this machine and was not itself set from wok's heartbeat
 // reply, so a node that applied the pause cannot echo it back. Every heartbeat is followed by sweepStale(), so one node's heartbeat checks all the others.
+// The heartbeat reply's code field is the published code list ([{repo, sha}], [] when nothing is published), read from src/node-code-publish.js on each heartbeat.
 //
 // Settings: AGENT_MANAGER_NODES_BIND (default 127.0.0.1; set it to the LAN address to accept other machines), AGENT_MANAGER_NODES_PORT (default 7471).
 // Run: node src/node-registry-server.js
@@ -32,6 +33,7 @@ const { leaseFor, returnLease, settleExpired } = require('./lease-ledger.js');
 const { makeAskNode } = require('./node-status-client.js');
 const { findRecordFile } = require('./lend-task.js');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
+const { readPublished } = require('./node-code-publish.js');
 
 const MAX_BODY_BYTES = 8 * 1024;
 const RETRY_AFTER_SEC = 60;
@@ -112,7 +114,7 @@ function createServer({
       await sweep(env, now());
     } catch (e) { /* the alert is best effort: a failed sweep must not fail the heartbeat */ }
     const pause = readPause('global', env, now());
-    return send(res, 200, { ok: true, globalPause: pause !== null && pause.source !== 'wok', serverTime: new Date(now()).toISOString() });
+    return send(res, 200, { ok: true, globalPause: pause !== null && pause.source !== 'wok', serverTime: new Date(now()).toISOString(), code: readPublished().map(({repo, sha}) => ({repo, sha})) });
   };
 
   const handleClaim = async (res, payload, registered) => {
