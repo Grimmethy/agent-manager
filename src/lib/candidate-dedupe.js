@@ -63,6 +63,12 @@ function fallbackTitleIdentifier(title) {
   return tok && looksLikeIdentifier(tok) ? tok.toLowerCase() : '';
 }
 
+// "Remove unused file <path>" -> the lowercased path, else null. Whole-file entries are identified by their path.
+function wholeFileTitlePath(title) {
+  const m = String(title || '').match(/^Remove unused file\s+(\S+)/);
+  return m ? m[1].toLowerCase() : null;
+}
+
 function normalizeSymbol(symbol) {
   return String(symbol || '').trim().replace(/^`+|`+$/g, '').replace(/\(\)$/, '').trim().toLowerCase();
 }
@@ -71,7 +77,7 @@ function normalizeSymbol(symbol) {
 function candidateKey(candidate) {
   if (!candidate) return null;
   const files = normalizeFiles(candidate.files);
-  const ident = normalizeSymbol(candidate.symbol) || titleIdentifier(candidate.title) || fallbackTitleIdentifier(candidate.title);
+  const ident = wholeFileTitlePath(candidate.title) || normalizeSymbol(candidate.symbol) || titleIdentifier(candidate.title) || fallbackTitleIdentifier(candidate.title);
   if (files.length === 0 || !ident) return null;
   return `${files.join('|')}::${ident}`;
 }
@@ -135,4 +141,4 @@ function findDuplicateCandidate(candidate, docTexts) {
   return null;
 }
 
-module.exports = { candidateKey, snippetKey, dedupeKey, snippetFirstLine, entriesIn, findDuplicateCandidate, normalizeFiles, titleIdentifier, fallbackTitleIdentifier };
+module.exports = { candidateKey, snippetKey, dedupeKey, snippetFirstLine, entriesIn, findDuplicateCandidate, normalizeFiles, titleIdentifier, fallbackTitleIdentifier, wholeFileTitlePath };
