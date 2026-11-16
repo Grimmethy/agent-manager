@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
-const { scrub, buildPackage, buildRecordPackage, validatePackage, sendPackage, httpPost, PACKAGE_STRIP, RECORD_PACKAGE_STRIP, SEND_TIMEOUT_MS } = require('./review-package.js');
+const { scrub, buildPackage, buildRecordPackage, validatePackage, sendPackage, httpPost, isStopRecord, PACKAGE_STRIP, RECORD_PACKAGE_STRIP, SEND_TIMEOUT_MS } = require('./review-package.js');
 
 const SHA = 'a'.repeat(40);
 const T0 = Date.UTC(2026, 10, 11, 12, 0, 0);
@@ -183,4 +183,28 @@ test('a decompose parent with two proposals and an empty rawDiff is ok; the same
 test('a normal record with a non-empty rawDiff still passes validation', () => {
   const pkg = buildRecordPackage({ record: { ...DRAFT, adhocResolution: 'decompose', subTaskProposals: [{ title: 'a', rawText: 'x' }] }, nodeId: 'grimm', now: T0 });
   assert.deepEqual(validatePackage(pkg), { ok: true, reason: '' });
+});
+
+const STOP = { needsClarification: { reason: 'design-decision', openQuestions: 'which?' } };
+
+test('isStopRecord is true only for a plain object with a non-empty string reason', () => {
+  assert.equal(isStopRecord({ ...DRAFT, rawDiff: '', ...STOP }), true);
+  for (const r of [null, undefined, { needsClarification: null }, { needsClarification: [] }, { needsClarification: 'x' },
+    { needsClarification: {} }, { needsClarification: { reason: '' } }, { needsClarification: { reason: 5 } },
+    { needsClarification: { openQuestions: 'x' } }, { title: 'no stop' }]) {
+    assert.equal(isStopRecord(r), false, JSON.stringify(r));
+  }
+});
+
+test('validatePackage accepts a stop record with rawDiff empty or absent, and refuses the same empty rawDiff otherwise', () => {
+  const msg = 'record.rawDiff must be a non-empty string';
+  const absent = { ...DRAFT, ...STOP }; delete absent.rawDiff;
+  assert.deepEqual(validatePackage(buildRecordPackage({ record: { ...DRAFT, ...STOP, rawDiff: '' }, nodeId: 'grimm', now: T0 })), { ok: true, reason: '' });
+  assert.deepEqual(validatePackage(buildRecordPackage({ record: absent, nodeId: 'grimm', now: T0 })), { ok: true, reason: '' });
+  const noReason = validatePackage(buildRecordPackage({ record: { ...DRAFT, rawDiff: '', needsClarification: {} }, nodeId: 'grimm', now: T0 }));
+  assert.equal(noReason.ok, false);
+  assert.equal(noReason.reason, msg);
+  const noStop = validatePackage(buildRecordPackage({ record: { ...DRAFT, rawDiff: '' }, nodeId: 'grimm', now: T0 }));
+  assert.equal(noStop.ok, false);
+  assert.equal(noStop.reason, msg);
 });
