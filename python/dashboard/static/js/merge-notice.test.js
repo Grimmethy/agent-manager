@@ -45,7 +45,10 @@ test('a synced:false without a reason shows nothing (no empty bullet)', () => {
 
 test('the merge button handler uses it and still treats a succeeded response as a success', () => {
   const h = src.slice(src.indexOf('const notice = mergeNoticeText(result);'));
-  assert.ok(h.startsWith('const notice = mergeNoticeText(result);\n        if (notice) alert(notice);'));
+  assert.ok(h.startsWith('const notice = mergeNoticeText(result);'));
+  assert.ok(src.includes("typeof mergeOutcomeText === 'function' ? mergeOutcomeText(result) : ''"));
+  assert.ok(src.includes('if (shown) alert(shown);'));
+  assert.ok(src.indexOf('mergeOutcomeText(result)') < src.indexOf('result.liveSync && result.liveSync.restartTriggered'));
   assert.match(src, /if \(!resp\.ok \|\| !result\.succeeded\) throw new Error\(result\.reason/);
 });
 

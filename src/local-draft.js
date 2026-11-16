@@ -2418,7 +2418,7 @@ function tryGroundingRefreshFallback(task) {
   }
 }
 
-module.exports = { reusePriorPlanForContinuation, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, SPLIT_TRUNCATION_MAX_RETRIES, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
+module.exports = { reusePriorPlanForContinuation, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, SPLIT_TRUNCATION_MAX_RETRIES, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback, attemptSeedReroll };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on
