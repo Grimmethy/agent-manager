@@ -238,3 +238,109 @@ test('a queue/drafting/w1 change debounced 2 s into a single pull produces exact
   await waitForRequests(server, 2);
   assert.equal(server.requests.length, 2, 'one pull for the w1 change');
 });
+
+// (d) stop() closes every watcher handle (queue and per-worker) exactly once
+test('stop() closes every watcher handle (queue and per-worker) exactly once', async (t) => {
+  const { env, pipelineDir } = setup(t);
+  // Pre-create both worker drafting directories so syncDraftWatchers at startup opens them.
+  fs.mkdirSync(path.join(pipelineDir, 'queue', 'drafting', 'w1'), { recursive: true });
+  fs.mkdirSync(path.join(pipelineDir, 'queue', 'drafting', 'w2'), { recursive: true });
+  const server = await claimServer(t, [{ body: { ok: true, task: null, retryAfterSec: 0 } }]);
+  const timers = fakeTimers();
+  const w = recordingWatch();
+  const daemon = startDaemon({
+    env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url },
+    deps: { now: clock().now, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, watch: w.watch, log: noLog },
+  });
+  t.after(() => daemon.stop());
+  await waitForRequests(server, 1);
+
+  // Before stop: every handle is open, none closed.
+  for (const handle of w.watched) {
+    assert.equal(handle.closeCount, 0, `pre-stop: ${handle.dir} is not closed`);
+  }
+  const beforeStopCount = w.watched.length;
+
+  // Stop the daemon.
+  daemon.stop();
+
+  // Every handle, including per-worker ones, must have close() called exactly once.
+  assert.equal(w.watched.length, beforeStopCount, 'stop() does not drop handles from the recording');
+  for (const handle of w.watched) {
+    assert.equal(handle.closeCount, 1, `post-stop: ${handle.dir} close() called exactly once`);
+  }
+});
+
+// (e) the safety timer's delay is 600_000 ms (literal, not the constant)
+test('the safety timer armed after a successful pull fires at 600_000 ms', async (t) => {
+  const { env, pipelineDir } = setup(t);
+  // Pre-seed drafting with w1 so the initial syncDraftWatchers opens just w1.
+  fs.mkdirSync(path.join(pipelineDir, 'queue', 'drafting', 'w1'), { recursive: true });
+  const server = await claimServer(t, [{ body: { ok: true, task: null, retryAfterSec: 0 } }]);
+  const timers = fakeTimers();
+  const w = recordingWatch();
+  const daemon = startDaemon({
+    env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url },
+    deps: { now: clock().now, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, watch: w.watch, log: noLog },
+  });
+  t.after(() => daemon.stop());
+  await waitForRequests(server, 1);
+
+  // After the first successful pull, exactly one safety timer should be armed at the documented 600_000 ms delay.
+  const safety = timers.live().filter((x) => x.ms === 600_000);
+  assert.equal(safety.length, 1, 'one safety timer armed after a successful pull');
+  assert.equal(safety[0].ms, 600_000, 'safety timer delay is the literal 600_000 ms');
+});
+
+// (f) shrinking listDirs closes removed workers; growing it re-opens them
+test('shrinking listDirs closes removed workers and growing it re-opens them', async (t) => {
+  const { env, pipelineDir } = setup(t);
+  // Pre-create both worker drafting directories so they exist on disk.
+  fs.mkdirSync(path.join(pipelineDir, 'queue', 'drafting', 'w1'), { recursive: true });
+  fs.mkdirSync(path.join(pipelineDir, 'queue', 'drafting', 'w2'), { recursive: true });
+  const server = await claimServer(t, [{ body: { ok: true, task: null, retryAfterSec: 0 } }]);
+  const timers = fakeTimers();
+  const w = recordingWatch();
+
+  // listDirs starts returning both workers, then we shrink it to ['w2'], then grow it back.
+  let dirs = ['w1', 'w2'];
+  const customListDirs = () => dirs.slice();
+  const daemon = startDaemon({
+    env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url },
+    deps: { now: clock().now, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, watch: w.watch, listDirs: customListDirs, log: noLog },
+  });
+  t.after(() => daemon.stop());
+  await waitForRequests(server, 1);
+
+  // Initial sync opens both w1 and w2 watchers.
+  const w1Initial = w.watched.filter((h) => h.dir === path.join(pipelineDir, 'queue', 'drafting', 'w1'));
+  const w2Initial = w.watched.filter((h) => h.dir === path.join(pipelineDir, 'queue', 'drafting', 'w2'));
+  assert.equal(w1Initial.length, 1, 'w1 watcher is open at startup');
+  assert.equal(w2Initial.length, 1, 'w2 watcher is open at startup');
+  assert.equal(w1Initial[0].closeCount, 0, 'w1 is not closed at startup');
+  assert.equal(w2Initial[0].closeCount, 0, 'w2 is not closed at startup');
+
+  // Shrink listDirs to ['w2'] and fire the queue/drafting callback so syncDraftWatchers re-runs.
+  dirs = ['w2'];
+  const draftWatch = w.watched.find((h) => h.dir === path.join(pipelineDir, 'queue', 'drafting'));
+  assert.ok(draftWatch, 'queue/drafting is watched');
+  draftWatch.cb();
+  await settle();
+
+  // w1's original handle must have been closed exactly once; w2's must not have been closed.
+  const w1AfterShrink = w.watched.filter((h) => h.dir === path.join(pipelineDir, 'queue', 'drafting', 'w1'));
+  const w2AfterShrink = w.watched.filter((h) => h.dir === path.join(pipelineDir, 'queue', 'drafting', 'w2'));
+  assert.equal(w1AfterShrink.length, 1, 'w1 handle is still recorded after shrink (closed)');
+  assert.equal(w1AfterShrink[0].closeCount, 1, 'w1 close() called exactly once on shrink');
+  assert.equal(w2AfterShrink.length, 1, 'w2 handle is still recorded after shrink (kept)');
+  assert.equal(w2AfterShrink[0].closeCount, 0, 'w2 close() not called on shrink');
+
+  // Grow listDirs back to ['w1','w2'] and fire the callback again: w1 should be re-registered.
+  dirs = ['w1', 'w2'];
+  draftWatch.cb();
+  await settle();
+
+  const w1AfterGrow = w.watched.filter((h) => h.dir === path.join(pipelineDir, 'queue', 'drafting', 'w1'));
+  assert.equal(w1AfterGrow.length, 2, 'two w1 handles after grow (original closed + new registered)');
+  assert.ok(w1AfterGrow.some((h) => h.closeCount === 0), 'the new w1 handle is not closed');
+});
