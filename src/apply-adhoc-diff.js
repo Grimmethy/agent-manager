@@ -51,6 +51,8 @@ function slugify(str) {
 // substring -- the same "it edits a file the earlier one creates" case the prompt already
 // names, just enforced mechanically when the model forgets it. Never overrides an
 // `after` the model DID set.
+// Capture group 1 (m[1]) is the created file's repo-relative path; every other group is
+// non-capturing (?:...). inferMissingAfterLinks reads m[1]. Verified against this regex's source.
 const CREATED_FILE_RE = /\b(?:create|add|write|scaffold)\b(?:[^.\n]{0,60}?)\b([\w./-]+\.(?:js|ts|py|ps1|sh))\b/i;
 
 function inferMissingAfterLinks(subTasks) {
@@ -479,4 +481,4 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
   }
 }
 
-module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask, slugify, BRAIN_DUMP_DISPOSITION_RE, renameSources, unquoteGitPath };
+module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask, slugify, BRAIN_DUMP_DISPOSITION_RE, CREATED_FILE_RE, renameSources, unquoteGitPath };
