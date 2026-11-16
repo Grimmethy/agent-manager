@@ -96,6 +96,18 @@ test('detached HEAD falls back to master (injected execGit)', () => {
   assert.deepEqual(checkDrift('/unused', { execGit }), { state: 'current', ahead: 0, behind: 0, branch: 'master' });
 });
 
+test('an empty symbolic-ref answer falls back to master', () => {
+  const calls = [];
+  const execGit = (args) => {
+    calls.push(args);
+    if (args[0] === 'symbolic-ref') return '\n';
+    return '0 0\n';
+  };
+  const r = checkDrift('/unused', { execGit });
+  assert.deepEqual(calls[1], ['rev-list', '--left-right', '--count', 'refs/remotes/origin/master...HEAD']);
+  assert.equal(r.branch, 'master');
+});
+
 test('git failure returns an error result and does not throw', () => {
   const execGit = (args) => {
     if (args[0] === 'symbolic-ref') return 'feature/x\n';
