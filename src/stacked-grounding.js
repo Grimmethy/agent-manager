@@ -103,4 +103,87 @@ function resolveAtRef(repoRoot, ref, candidatePath, extraRoots = []) {
   return null;
 }
 
-module.exports = { resolveGroundingRef, readFileAtRef, grepAtRef, resolveAtRef };
+// ---- Stacked-tree existence helpers: does a file/symbol exist in the world a stacked piece builds on (hub tip + applied lower-seq siblings)?
+
+const fs = require('fs');
+
+// The hub branch name for a stacked task, or null (non-stacked, or the branch doesn't resolve).
+function resolveStackedBase(task, repoRoot) {
+  if (!task || !task.stacked) return null;
+  return resolveGroundingRef(task, repoRoot) || null;
+}
+
+let stackedRefResolver = resolveStackedBase;
+
+// Test seam: overrides resolveStackedBase for the helpers below. A non-function argument restores the real one.
+function setStackedRefResolverForTest(fn) {
+  stackedRefResolver = typeof fn === 'function' ? fn : resolveStackedBase;
+}
+
+// A live hub: a stacked piece with seq > 1 whose hub branch ref resolves.
+function isLiveHub(task, repoRoot) {
+  const seq = Number(task && task.stacked && task.stacked.seq);
+  if (!(seq > 1)) return false;
+  return !!stackedRefResolver(task, repoRoot || process.cwd());
+}
+
+function normPath(p) {
+  return String(p || '').replace(/\\/g, '/').replace(/^\.?\//, '');
+}
+
+// Paths on the Files lines of applied siblings with a lower seq on the same hub branch.
+function appliedSiblingFiles(task, repoRoot) {
+  const out = new Set();
+  try {
+    const seq = Number(task && task.stacked && task.stacked.seq);
+    const branch = task && task.stacked && task.stacked.branch;
+    if (!(seq > 1) || !branch) return out;
+    const { liveSiblingsOnBranch } = require('./lib/shared-branch.js');
+    const { extractDeclaredFiles } = require('./adhoc-diff-sanity.js');
+    if (typeof extractDeclaredFiles !== 'function') return out;
+    const pipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR || repoRoot;
+    const { siblings } = liveSiblingsOnBranch({ pipelineDir, branch, selfId: task.id });
+    for (const s of siblings || []) {
+      let rec;
+      try { rec = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', s.state, `${s.id}.json`), 'utf8')); } catch { continue; }
+      const sseq = Number(rec && rec.stacked && rec.stacked.seq);
+      if (!(sseq < seq)) continue;
+      const text = [rec.rawText, rec.description, rec.text, rec.title].filter((x) => typeof x === 'string').join('\n');
+      for (const f of extractDeclaredFiles(text) || []) out.add(normPath(f));
+    }
+  } catch { /* best effort: no sibling evidence */ }
+  return out;
+}
+
+// Hub ref first (resolveAtRef), then the base checkout, then Files lines of applied lower-seq siblings.
+function fileExistsForTask(task, repoRoot, filePath) {
+  const p = normPath(filePath);
+  if (!p) return false;
+  const ref = stackedRefResolver(task, repoRoot);
+  if (ref) {
+    try { if (resolveAtRef(repoRoot, ref, p)) return true; } catch { /* fall through */ }
+  }
+  try { if (fs.existsSync(path.join(repoRoot, p))) return true; } catch { /* fall through */ }
+  if (ref && appliedSiblingFiles(task, repoRoot).has(p)) return true;
+  return false;
+}
+
+// Hub ref first (grepAtRef), then the base checkout.
+function symbolExistsForTask(task, repoRoot, symbol) {
+  const sym = String(symbol || '');
+  if (!sym) return false;
+  const ref = stackedRefResolver(task, repoRoot);
+  if (ref) {
+    try { if (String(grepAtRef(repoRoot, ref, sym)).trim()) return true; } catch { /* fall through */ }
+  }
+  try {
+    return !!String(runGit(['grep', '-I', '-F', '-e', sym], repoRoot)).trim();
+  } catch {
+    return false;
+  }
+}
+
+module.exports = {
+  resolveGroundingRef, readFileAtRef, grepAtRef, resolveAtRef,
+  resolveStackedBase, isLiveHub, fileExistsForTask, symbolExistsForTask, setStackedRefResolverForTest,
+};
