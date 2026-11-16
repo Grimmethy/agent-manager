@@ -115,3 +115,21 @@ describe('deliveryStalled streaks', () => {
     }
   });
 });
+
+describe('pass-runs write failure', () => {
+  it('returns {ok:false} without throwing when the store parent is a regular file', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pass-runs-'));
+    try {
+      const blocker = path.join(dir, 'not-a-dir');
+      fs.writeFileSync(blocker, 'x');
+      const storePath = path.join(blocker, 'pass-runs.jsonl');
+      let result;
+      assert.doesNotThrow(() => {
+        result = recordPassRun(valid(), { file: storePath });
+      });
+      assert.equal(result.ok, false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
