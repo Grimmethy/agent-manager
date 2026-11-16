@@ -31,4 +31,16 @@ function statusLabel(status) {
   return status;
 }
 
-if (typeof module !== 'undefined') module.exports = { fmtAge, statusBadgeClass, statusLabel };
+// What a worker card says when its heartbeat is stale: yielding when a GPU session is what stopped it, otherwise plain STALE.
+function workerStaleLabel({ stale, gpuSessionActive }) {
+  if (stale && gpuSessionActive) return 'yielding: GPU session';
+  return 'STALE';
+}
+
+// The claim of a worker that is gone and still holds a task: null when there is nothing to flag.
+function strandedClaimLabel({ stale, currentTaskId }) {
+  if (stale && currentTaskId) return 'worker gone: claim not released';
+  return null;
+}
+
+if (typeof module !== 'undefined') module.exports = { fmtAge, statusBadgeClass, statusLabel, workerStaleLabel, strandedClaimLabel };
