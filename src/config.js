@@ -449,6 +449,14 @@ function getConfig() {
   };
 }
 
+// Paths already warned about as missing, so a plugin whose register.js is absent logs one
+// warning per path per process rather than one per load.
+const warnedMissingRegisterPaths = new Set();
+
+// Health snapshot written by ensureRegistered(): plugins skipped because their registerPath
+// does not exist on disk. Read via getPluginLoadHealth().
+const pluginLoadHealth = { skipped: [] };
+
 let registered = false;
 function ensureRegistered() {
   if (registered) return;
@@ -467,9 +475,23 @@ function ensureRegistered() {
     const { registerPath } = getConfig();
     paths = registerPath ? registerPath.split(',').map((s) => s.trim()).filter(Boolean) : [];
   }
+  pluginLoadHealth.skipped = [];
+  const fs = require('fs');
   for (const p of paths) {
+    if (!fs.existsSync(p)) {
+      pluginLoadHealth.skipped.push(p);
+      if (!warnedMissingRegisterPaths.has(p)) {
+        warnedMissingRegisterPaths.add(p);
+        console.warn(`[config] skipping plugin: registerPath does not exist: ${p}`);
+      }
+      continue;
+    }
     require(p);
   }
+}
+
+function getPluginLoadHealth() {
+  return { skipped: [...pluginLoadHealth.skipped] };
 }
 
 function getSecondBrainDir() { return process.env.SECOND_BRAIN_DIR || null; }
@@ -489,4 +511,4 @@ function getJournalForgeUrl() {
   return v;
 }
 
-module.exports = { getConfig, ensureRegistered, resolveGraphPath, resolveCommunityCoveragePath, getSecondBrainDir, requireSecondBrainDir, getJournalForgeUrl };
+module.exports = { getConfig, ensureRegistered, getPluginLoadHealth, resolveGraphPath, resolveCommunityCoveragePath, getSecondBrainDir, requireSecondBrainDir, getJournalForgeUrl };
