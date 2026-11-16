@@ -68,7 +68,11 @@ function branchProjectHeaderHtml(group) {
   return `<div data-project-header="${_bpEscape(p.label)}" style="margin:16px 0 8px;padding:8px 12px;border-radius:6px;background:${branchProjectColorCss(p.label)};color:#fff;display:flex;gap:10px;align-items:baseline">`
     + `<strong>${_bpEscape(p.label)}</strong>${p.active ? '<span>● active project</span>' : ''}`
     + `<span style="opacity:.8">${n} branch${n === 1 ? '' : 'es'}</span>`
-    + `<span style="opacity:.6;font-family:monospace;font-size:12px;margin-left:auto">${_bpEscape(p.repoRoot)}</span></div>`;
+    + (!p.active && p.repoRoot ? `<span data-project-age style="opacity:.9">${_bpEscape(branchAgeText(p.ageSeconds))}</span>` : '')
+    + (p.error ? `<span data-project-error role="alert" style="background:#7f1d1d;color:#fff;padding:2px 6px;border-radius:4px">${_bpEscape(p.error)}</span>` : '')
+    + `<span style="opacity:.6;font-family:monospace;font-size:12px;margin-left:auto">${_bpEscape(p.repoRoot)}</span>`
+    + (!p.active && p.repoRoot ? `<button type="button" data-branch-refresh="${_bpEscape(p.repoRoot)}">Refresh</button>` : '')
+    + `</div>`;
 }
 
 // Headers only earn their space when more than one project is on screen.
@@ -110,6 +114,41 @@ function branchConfirmWithProject(message, btn) {
   return `PROJECT: ${label}\n(not the active project -- this runs in ${root})\n\n${message}`;
 }
 
+// Age of the project's last successful scan (ageSeconds from the server; null until the project has been scanned once).
+function branchAgeText(ageSeconds) {
+  if (ageSeconds == null) return 'not loaded yet';
+  return `as of ${Math.floor(Number(ageSeconds) / 60)}m ago`;
+}
+
+// One refresh per project at a time: the Refresh button is disabled while its request is in flight.
+const branchProjectRefreshing = new Set();
+let branchRefreshBound = false;
+
+async function refreshBranchProject(repoRoot, btn) {
+  if (!repoRoot || branchProjectRefreshing.has(repoRoot)) return;
+  branchProjectRefreshing.add(repoRoot);
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch(`/api/git/unmerged-branches?projects=all&refresh=1&project=${encodeURIComponent(repoRoot)}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    // The server has now recomputed this project; re-render the tab from its fresh cache (same as after a merge or discard).
+    if (typeof renderBranchesTab === 'function') await renderBranchesTab();
+  } catch (e) {
+    alert(`Refresh failed for ${repoRoot}: ${e.message}`);
+  } finally {
+    branchProjectRefreshing.delete(repoRoot);
+    if (btn) btn.disabled = false;
+  }
+}
+
+if (typeof document !== 'undefined' && !branchRefreshBound) {
+  branchRefreshBound = true;
+  document.addEventListener('click', (e) => {
+    const btn = e.target && e.target.closest && e.target.closest('[data-branch-refresh]');
+    if (btn) refreshBranchProject(btn.dataset.branchRefresh, btn);
+  });
+}
+
 // Same as fetchJson (core-ui.js) but also reads which projects the server is still scanning.
 async function fetchBranchList({ kick = false } = {}) {
   const controller = new AbortController();
@@ -129,4 +168,4 @@ async function fetchBranchList({ kick = false } = {}) {
   return r.json();
 }
 
-if (typeof module !== 'undefined') module.exports = { branchListRefreshingHtml, branchIsActiveProject, branchRowKey, BRANCH_PROJECT_PINS, branchProjectHue, branchProjectColorCss, branchProjectChipHtml, groupBranchesByProject, branchProjectHeaderHtml, branchListWithProjectHeadersHtml, branchProjectsPendingHtml, branchProjectRequestRoot, branchActionUrl, branchConfirmWithProject };
+if (typeof module !== 'undefined') module.exports = { branchAgeText, branchListRefreshingHtml, branchIsActiveProject, branchRowKey, BRANCH_PROJECT_PINS, branchProjectHue, branchProjectColorCss, branchProjectChipHtml, groupBranchesByProject, branchProjectHeaderHtml, branchListWithProjectHeadersHtml, branchProjectsPendingHtml, branchProjectRequestRoot, branchActionUrl, branchConfirmWithProject };
