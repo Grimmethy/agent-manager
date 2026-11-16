@@ -39,6 +39,8 @@ function summarizeNodes(nodes, leases, now) {
       row.returned += 1;
     } else if (lease.state === 'merged') {
       row.merged += 1;
+    } else if (lease.state === 'expired') {
+      row.expired += 1;
     } else if (lease.state === 'lent') {
       const at = Date.parse(lease.expiresAt);
       if (!Number.isFinite(at) || at <= now) {
