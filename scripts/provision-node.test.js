@@ -77,8 +77,8 @@ test('a second run keeps everything: files unchanged, an edited lanes.json untou
   assert.equal(read(path.join(t.pipe, 'node.env')), before.env);
   assert.equal(fs.readFileSync(path.join(t.pipe, 'queue', 'adhoc', 'keep-me.json'), 'utf8'), '{}');
   assert.deepEqual(fs.readdirSync(t.pipe).sort(), ['lanes.json', 'node.env', 'queue', 'task-domains.json']);
-  // the queue folders, lanes.json and (since units are never overwritten) the three unit files
-  assert.equal((r.stdout.match(/^kept /gm) || []).length, QUEUES.length + 1 + 3);
+  // the queue folders, lanes.json and (since units are never overwritten) the five unit files
+  assert.equal((r.stdout.match(/^kept /gm) || []).length, QUEUES.length + 1 + 5);
   assert.doesNotMatch(r.stdout, /^created /m);
 });
 
