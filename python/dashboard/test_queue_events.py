@@ -100,6 +100,30 @@ class CrossLanguage(Base):
         expected = [dict({k: None for k in KEYS}, **e, project=os.path.realpath(self.dir)) for e in events]
         self.assertEqual(got, expected)
 
+    def test_branch_pushed_line_has_identical_keys_and_order_from_node_and_python(self):
+        node_dir = tempfile.mkdtemp(prefix="qev-node-")
+        self.addCleanup(shutil.rmtree, node_dir, True)
+        event = {"type": "branch_pushed", "branch": "agent/t9", "taskId": "t9", "sha": "abc123", "verdict": "approved", "source": "apply"}
+        script = "const q=require('./src/queue-events.js');q.append(process.argv[1],JSON.parse(process.argv[2]))"
+        out = subprocess.run(["node", "-e", script, node_dir, json.dumps(event)], cwd=str(REPO), capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(queue_events.append_event(self.dir, event))
+        node_journal = os.path.join(node_dir, "queue-events", "journal.jsonl")
+        with open(node_journal, encoding="utf-8") as f:
+            node_lines = f.read().split("\n")[:-1]
+        py_lines = self.lines()
+        self.assertEqual(len(node_lines), 1)
+        self.assertEqual(len(py_lines), 1)
+        node_rec, py_rec = json.loads(node_lines[0]), json.loads(py_lines[0])
+        self.assertEqual(list(node_rec.keys()), KEYS)
+        self.assertEqual(list(py_rec.keys()), list(node_rec.keys()))
+        self.assertEqual(node_rec["type"], "branch_pushed")
+        self.assertEqual(py_rec["type"], "branch_pushed")
+        for key in ("type", "branch", "taskId", "sha", "verdict", "source"):
+            self.assertEqual(node_rec[key], py_rec[key])
+        for line in (node_lines[0], py_lines[0]):
+            self.assertLess(len((line + "\n").encode("utf-8")), queue_events.MAX_LINE_BYTES)
+
 
 if __name__ == "__main__":
     unittest.main()
