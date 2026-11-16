@@ -159,6 +159,28 @@ worker_switched_off() {
   node "$switch_js" is-disabled "$id" 2>/dev/null
 }
 
+# cloud_take_review <instance_id> -> exit 0 when this cloud worker just reviewed one waiting item (the caller then ends the tick), 1 when it did not and should go on to
+# draft. Owner rule (cloud-agent-pool): cloud agents review before they draft, and when every waiting review is already claimed the agent takes a draft. Only a worker-cloud /
+# worker-cloudN instance reviews, and not when its lane says reviews:false (LANE_RULES_CLOUD_REVIEWS, kept fresh by reload_lane_rules; unset counts as true). No spawn at all
+# when queue/review/ holds no .json file; otherwise `node src/review-unclaimed.js` asks whether some item has no live claim. If one does, run ONE review as
+# `review-runner.sh reviewer-<gpu> --once` under this worker's own env (OLLAMA_URL = the lane's gateway, LOCAL_MODEL = its model): --once reviews one item and exits 10 when it
+# did, 0 when it found nothing; the runner's per-item claim already keeps two workers off one item. AGENT_MANAGER_CLOUD_REVIEW_RUNNER overrides the runner path (tests).
+# No timer or loop here: the caller's tick is the trigger.
+cloud_take_review() {
+  local id="${1:-}"
+  [[ "$id" =~ ^worker-cloud[0-9]*$ ]] || return 1
+  [[ "${LANE_RULES_CLOUD_REVIEWS:-true}" != "false" ]] || return 1
+  compgen -G "${QUEUE_DIR:-${PIPELINE_DIR:-}/queue}/review/*.json" >/dev/null || return 1
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  node "${here}/../src/review-unclaimed.js" "${PIPELINE_DIR:-}" "${INSTANCES_DIR:-}" >/dev/null 2>&1 || return 1
+  local runner="${AGENT_MANAGER_CLOUD_REVIEW_RUNNER:-${here}/review-runner.sh}"
+  write_heartbeat_file "$id" "working" "${HEARTBEAT_MODEL:-}" "" "review" "${STARTED_AT:-}"
+  local rc=0
+  bash "$runner" "reviewer-${id#worker-}" --once || rc=$?
+  [[ $rc -eq 10 ]]
+}
+
 # cloud_dial_off <instance_id> -> exit 0 when the cloud-agent dial (src/cloud-dial.js, cloud-dial.json) turns this cloud lane off, 1 otherwise. Only a worker-cloud /
 # worker-cloudN instance is ever asked; every other worker returns 1 at once. With no dial file (today's state) it returns 1 without spawning node. With a file it asks
 # `node src/cloud-dial.js is-off <id>` only when the dial file or lanes.json is newer than a per-instance stamp, and otherwise reuses the last answer (CLOUD_DIAL_LAST), so
