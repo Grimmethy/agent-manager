@@ -91,7 +91,7 @@ test('a 2xx answer moves each record to node-sent next to the outbox, in name or
   const post = async (url, headers, body) => { seen.push({ url, headers, pkg: JSON.parse(body) }); return { status: 200 }; };
   const r = await run(s, { post, now: () => Date.UTC(2026, 10, 11) });
   assert.equal(r.code, 0);
-  assert.deepEqual(r.result, { sent: 8, failed: 0, remaining: 0 });
+  assert.deepEqual(r.result, { sent: 8, failed: 0, refused: 0, remaining: 0 });
   assert.deepEqual(fs.readdirSync(s.outbox), []);
   assert.deepEqual(fs.readdirSync(s.sent).sort(), ids.map((id) => `${id}.json`));
   assert.deepEqual(seen.map((x) => x.pkg.taskId), ids);
@@ -112,10 +112,60 @@ test('a refusal, a network failure and a thrown send leave the record in the out
     put(s, 'a.json', REC('a'));
     const r = await run(s, { post });
     assert.equal(r.code, 3);
-    assert.deepEqual(r.result, { sent: 0, failed: 1, remaining: 1 });
+    assert.deepEqual(r.result, { sent: 0, failed: 1, refused: 0, remaining: 1 });
     assert.deepEqual(fs.readdirSync(s.outbox), ['a.json']);
     assert.equal(fs.existsSync(s.sent), false);
   }
+});
+
+test('a 400 moves the record to node-refused with a reason sidecar, counts refused and exits 0; a second run does not resend it', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  const refusedDir = path.join(s.dir, 'queue', 'node-refused');
+  const now = () => Date.UTC(2026, 10, 16, 1, 2, 3);
+  const r = await run(s, { post: async () => ({ status: 400 }), now });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.result, { sent: 0, failed: 0, refused: 1, remaining: 0 });
+  assert.deepEqual(Object.keys(r.result), ['sent', 'failed', 'refused', 'remaining']);
+  assert.deepEqual(fs.readdirSync(s.outbox), []);
+  assert.deepEqual(fs.readdirSync(refusedDir).sort(), ['a.json', 'a.json.reason.txt']);
+  const reason = fs.readFileSync(path.join(refusedDir, 'a.json.reason.txt'), 'utf8');
+  assert.equal(reason, 'HTTP 400 at 2026-11-16T01:02:03.000Z\n');
+  assert.match(reason, /400/);
+  let posts = 0;
+  const again = await run(s, { post: async () => { posts += 1; return { status: 200 }; }, now });
+  assert.equal(again.code, 0);
+  assert.deepEqual(again.result, { sent: 0, failed: 0, refused: 0, remaining: 0 });
+  assert.equal(posts, 0);
+});
+
+test('401, 403, 409, 503 and a thrown send are transient: the record stays in the outbox, nothing is refused, failed 1, exit 3', async () => {
+  const posts = [401, 403, 409, 503].map((status) => async () => ({ status }));
+  posts.push(async () => { throw new Error('down'); });
+  for (const post of posts) {
+    const s = setup();
+    put(s, 'a.json', REC('a'));
+    const r = await run(s, { post });
+    assert.equal(r.code, 3);
+    assert.deepEqual(r.result, { sent: 0, failed: 1, refused: 0, remaining: 1 });
+    assert.deepEqual(fs.readdirSync(s.outbox), ['a.json']);
+    assert.equal(fs.existsSync(path.join(s.dir, 'queue', 'node-refused')), false);
+  }
+});
+
+test('a mixed outbox of a 200, a 400 and a 503 gives sent 1, failed 1, refused 1, remaining 1', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  put(s, 'b.json', REC('b'));
+  put(s, 'c.json', REC('c'));
+  const statuses = { a: 200, b: 400, c: 503 };
+  const post = async (url, headers, body) => ({ status: statuses[JSON.parse(body).taskId] });
+  const r = await run(s, { post });
+  assert.equal(r.code, 3);
+  assert.deepEqual(r.result, { sent: 1, failed: 1, refused: 1, remaining: 1 });
+  assert.deepEqual(fs.readdirSync(s.outbox), ['c.json']);
+  assert.deepEqual(fs.readdirSync(s.sent), ['a.json']);
+  assert.deepEqual(fs.readdirSync(path.join(s.dir, 'queue', 'node-refused')).sort(), ['b.json', 'b.json.reason.txt']);
 });
 
 test('records that are not JSON, have no string id or an empty id are failed and left; good records around them are still sent', async () => {
@@ -129,7 +179,7 @@ test('records that are not JSON, have no string id or an empty id are failed and
   fs.writeFileSync(path.join(s.outbox, 'notes.txt'), 'not a record');
   const r = await run(s, { post: ok });
   assert.equal(r.code, 3);
-  assert.deepEqual(r.result, { sent: 2, failed: 4, remaining: 4 });
+  assert.deepEqual(r.result, { sent: 2, failed: 4, refused: 0, remaining: 4 });
   assert.deepEqual(fs.readdirSync(s.outbox).sort(), ['b-junk.json', 'c-noid.json', 'd-numid.json', 'e-emptyid.json', 'notes.txt']);
 });
 
@@ -139,7 +189,7 @@ test('a move into node-sent that fails leaves the record in the outbox and count
   fs.writeFileSync(s.sent, 'a plain file where the directory should be');
   const r = await run(s, { post: ok });
   assert.equal(r.code, 3);
-  assert.deepEqual(r.result, { sent: 0, failed: 1, remaining: 1 });
+  assert.deepEqual(r.result, { sent: 0, failed: 1, refused: 0, remaining: 1 });
 });
 
 test('a record filed while the send is running is not sent this time and is counted as remaining', async () => {
@@ -148,7 +198,7 @@ test('a record filed while the send is running is not sent this time and is coun
   const post = async () => { put(s, 'z-new.json', REC('z')); return { status: 200 }; };
   const r = await run(s, { post });
   assert.equal(r.code, 0);
-  assert.deepEqual(r.result, { sent: 1, failed: 0, remaining: 1 });
+  assert.deepEqual(r.result, { sent: 1, failed: 0, refused: 0, remaining: 1 });
   assert.deepEqual(fs.readdirSync(s.outbox), ['z-new.json']);
 });
 
@@ -157,7 +207,7 @@ test('an empty outbox prints zero counts and exits 0 without posting', async () 
   let posts = 0;
   const r = await run(s, { post: async () => { posts += 1; return { status: 200 }; } });
   assert.equal(r.code, 0);
-  assert.deepEqual(r.result, { sent: 0, failed: 0, remaining: 0 });
+  assert.deepEqual(r.result, { sent: 0, failed: 0, refused: 0, remaining: 0 });
   assert.equal(posts, 0);
 });
 
@@ -187,7 +237,7 @@ test('a real round trip: the package intake on wok replaces the leased original 
     const url = `http://127.0.0.1:${server.address().port}/package`;
     const r = await run(s, { extra: { '--url': url } });
     assert.equal(r.code, 0, r.errs.join(''));
-    assert.deepEqual(r.result, { sent: 1, failed: 0, remaining: 0 });
+    assert.deepEqual(r.result, { sent: 1, failed: 0, refused: 0, remaining: 0 });
     const filed = JSON.parse(fs.readFileSync(path.join(env.AGENT_MANAGER_PIPELINE_DIR, 'queue', 'review', 'HUB7-01-x.json'), 'utf8'));
     assert.equal(filed.fromNode, 'grimm');
     assert.equal(filed.status, 'needs-review');
