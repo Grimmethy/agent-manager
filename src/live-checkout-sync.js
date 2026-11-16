@@ -310,7 +310,34 @@ if (require.main === module) {
     if (args[i] === '--mode' && args[i + 1]) { envOverride.AGENT_MANAGER_LIVE_SYNC = args[++i]; }
   }
   const env = { ...process.env, ...envOverride };
-  syncLiveCheckout(repoDir, { env, pipelineDir }).then((result) => {
+  const publishReconcileStep = async (repo, pipeDir, envVars) => {
+    // Once per reconcile cycle. Gate AGENT_MANAGER_LIVE_CHECKOUT_SYNC, default 'dry-run'.
+    const gate = String(envVars.AGENT_MANAGER_LIVE_CHECKOUT_SYNC || 'dry-run').toLowerCase();
+    const audit = path.join(pipeDir, AUDIT_FILE);
+    if (gate !== 'on') {
+      const head = defaultGit(repo, ['rev-parse', 'origin/master']);
+      const sha8 = head.code === 0 ? head.out.trim().slice(0, 8) : 'unknown';
+      appendAudit(audit, { action: 'publish', mode: 'dry-run', message: `would publish ${sha8} of origin/master` });
+      return;
+    }
+    const { publishCode } = require('./node-code-publish');
+    const { recordCorrection } = require('./queue-events');
+    try {
+      const res = publishCode({ repoDir: repo, pipelineDir: pipeDir });
+      const sha8 = String(res.sha || '').slice(0, 8);
+      const published = res.reason === 'published';
+      appendAudit(audit, { action: 'publish', mode: 'on', message: `published ${sha8} ${published}`, reason: res.reason });
+      if (published) recordCorrection(pipeDir, 'live-checkout-sync', 1);
+    } catch (err) {
+      const failure = (err && err.message) || String(err);
+      appendAudit(audit, { action: 'publish-error', mode: 'on', error: failure });
+      try {
+        await require('./notify').notify({ level: 'summary', key: 'code-publish:failed', title: 'code publish failed', text: `Code bundle publish failed: ${failure}` });
+      } catch (_) { /* a notify failure must not stop the cycle */ }
+    }
+  };
+  syncLiveCheckout(repoDir, { env, pipelineDir }).then(async (result) => {
+    await publishReconcileStep(repoDir, pipelineDir, env);
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
   }).catch((err) => {
     process.stderr.write(`error: ${err.message}\n`);
