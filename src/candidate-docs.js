@@ -221,23 +221,25 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   let duplicatesSkipped = [];
   if (dedupe && process.env.AGENT_MANAGER_CANDIDATE_DEDUPE !== 'false') {
     try {
-      const { findDuplicateCandidate, candidateKey } = require('./lib/candidate-dedupe.js');
+      const { findDuplicateCandidate, dedupeKey } = require('./lib/candidate-dedupe.js');
       const views = dedupeDocViews(candidatesPath, text);
       const seenKeys = new Set();
       candidates = candidates.filter((c) => {
-        const key = candidateKey(c);
-        const dup = findDuplicateCandidate(c, views) || (key && seenKeys.has(key) ? { duplicateOf: 'an earlier candidate in this batch', ref: 'this batch' } : null);
+        const dk = dedupeKey(c);
+        const seenId = dk ? `${dk.kind}:${dk.key}` : null;
+        const dup = findDuplicateCandidate(c, views) || (seenId && seenKeys.has(seenId) ? { duplicateOf: 'an earlier candidate in this batch', ref: 'this batch', matchedBy: dk.kind } : null);
         if (dup) { duplicatesSkipped.push(dup); return false; }
-        if (key) seenKeys.add(key);
+        if (seenId) seenKeys.add(seenId);
         return true;
       });
     } catch { duplicatesSkipped = []; /* fail-open: append as before */ }
     if (candidates.length === 0 && duplicatesSkipped.length > 0) {
       const first = duplicatesSkipped[0];
+      const via = first.matchedBy === 'snippet' ? 'file+snippet line' : 'identifier';
       return {
         skipped: true,
         duplicateOf: first.duplicateOf,
-        reason: `skipped: candidate already exists as ${first.duplicateOf} (${first.ref}) -- not appended again`,
+        reason: `skipped: candidate already exists as ${first.duplicateOf} (${first.ref}) (matched by ${via}) -- not appended again`,
       };
     }
   }
