@@ -1393,6 +1393,9 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   }
   const toolCallLog = [];
   let turnsUsed = 0;
+  // Per-turn timings (HUB0464 1/3): one entry per model turn that actually starts.
+  const timings = [];
+  let activeTimingEntry = null;
   // Trajectory record (trajectory.js, brain-dump 1892): run start + every turn's end entry, written once from withUsage.
   const trajectoryStartedMs = Date.now();
   const trajectoryTurns = [];
@@ -1421,10 +1424,10 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   const auditCtx = (turn, phase) => ({
     source, taskId, stage, lane: process.env.AGENT_MANAGER_INSTANCE_ID || null, model: MODEL || null, turn, phase,
   });
-  const logTurnEnd = (turn, phase, turnRes) => {
+  const logTurnEnd = (turn, phase, turnRes, timing) => {
     try {
       if (!turnRes || turnRes.flakeErr || !turnRes.message) return;
-      const entry = buildTurnEndEntry(auditCtx(turn, phase), turnRes);
+      const entry = buildTurnEndEntry(auditCtx(turn, phase), turnRes, timing);
       trajectoryTurns.push(entry);
       logToolLoopEvent(pipelineDir, 'turn-end', entry);
     } catch { /* best-effort -- see logToolLoopEvent */ }
@@ -1449,6 +1452,8 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   // single spot, same convention the done_reason:"length" marker uses in this file.
   const withUsage = (r) => {
     const merged = { ...r, ...usageAcc };
+    // Per-turn timings (HUB0464 1/3): attached only when at least one turn started.
+    if (timings.length > 0) merged.timings = timings;
     // Commands the chat proposed this turn (propose_command) ride on the result so the plugin can show them for the owner's confirmation.
     const proposals = proposalsFromToolLog(toolCallLog);
     if (proposals.length) merged.commandProposals = proposals;
@@ -1511,6 +1516,15 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   // still calling tools; stopped early with no RESOLUTION line). See the header on the
   // forceSummaryOnCap param and the call sites for why each path needs it.
   const runForcedSummaryTurn = async (reason = 'turns') => {
+    const forcedT0 = Date.now();
+    try {
+      return await runForcedSummaryTurnBody(reason);
+    } finally {
+      // Elapsed time (including any retry call) goes to the triggering turn's entry. A context-triggered summary fires before that turn's entry exists, so it is not attributed.
+      if (activeTimingEntry) activeTimingEntry.forcedSummaryMs = (activeTimingEntry.forcedSummaryMs || 0) + (Date.now() - forcedT0);
+    }
+  };
+  const runForcedSummaryTurnBody = async (reason = 'turns') => {
     turnStartLengths.push(messages.length);
     turnStartLogLengths.push(toolCallLog.length);
     // Three genuinely distinct causes land here, each needing its own model-facing
@@ -1685,6 +1699,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     // summary turn itself adds exactly one). Unconditional (not gated behind
     // forceSummaryOnCap) since this is a structural safety net every caller needs, not an
     // opt-in behavioral nudge.
+    activeTimingEntry = null;
     const contextEstimate = estimateContextTokens(messages, lastRealPromptTokens, lastRealPromptAtLength);
     const contextWillTrigger = contextEstimate + RESERVED_RESPONSE_TOKENS >= PINNED_NUM_CTX;
     logContextAudit({
@@ -1700,6 +1715,9 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
 
     turnStartLengths.push(messages.length);
     turnStartLogLengths.push(toolCallLog.length);
+    // HUB0464 1/3: one timing entry per turn that actually starts (after the context check).
+    activeTimingEntry = { turn: turn + 1, modelCallMs: 0, toolExecMs: 0 };
+    timings.push(activeTimingEntry);
 
     // If this run is meant to produce a diff and has spent its orientation budget without
     // a single edit, one firm push before the next turn: stop exploring, act now. The
@@ -1742,11 +1760,13 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     }
 
     const sentAtLength = messages.length;
+    const modelT0 = Date.now();
     const { message, usage, doneReason, flakeErr } = await chatTurnWithFlakeRecovery({
       messages, tools, tokenFoldHeaders, onChunk, instancesDir, forgePause: forgePauseFor(isChatCaller),
       toolCallLog, turnStartLengths, turnStartLogLengths,
       onEmptyAttempt: (info) => logEmptyAttempt(turn, 'loop', info),
     });
+    if (activeTimingEntry) activeTimingEntry.modelCallMs += Date.now() - modelT0;
     addUsage(usage);
     // Real anchor for estimateContextTokens (see its own header) -- prompt_eval_count is
     // Ollama's own tokenized size of exactly the `messages` array as it existed at
@@ -1767,7 +1787,8 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
         ceiling: PINNED_NUM_CTX,
       });
     }
-    logTurnEnd(turn, 'loop', { message, usage, doneReason, flakeErr });
+    // Tool execution has not run yet at this point, so only modelCallMs is known here.
+    logTurnEnd(turn, 'loop', { message, usage, doneReason, flakeErr }, { modelCallMs: activeTimingEntry ? activeTimingEntry.modelCallMs : 0 });
     if (flakeErr) {
       // Rollback exhausted too (or there was no prior turn to roll back -- a first-turn
       // failure is a genuinely different, unexplained case). Graceful-degrade if the
@@ -1838,7 +1859,9 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       return withUsage({ response: content, toolCallLog, turnsUsed, toolsDisabled: false });
     }
     const toolLogStart = toolCallLog.length;
+    const execT0 = Date.now();
     await executeToolCalls(message, toolCalls, toolHandlers, messages, toolCallLog);
+    if (activeTimingEntry) activeTimingEntry.toolExecMs += Date.now() - execT0;
     logToolOutcomes(turn, toolCallLog.slice(toolLogStart));
   }
 
