@@ -30,6 +30,8 @@ _HUB_LABEL_RE = re.compile(r"\b(HUB\d+)\b")
 _TEST_PATH_RE = re.compile(r"(^|/)(test_[^/]+\.py|[^/]+\.test\.[jt]sx?|tests?/)")
 _CANDIDATE_DOC_GLOB = "Docs/*_CANDIDATES.md"
 _CONFLICT_RE = re.compile(r"^CONFLICT \(", re.MULTILINE)
+_WHOLE_FILE_RE = re.compile(r"^Remove unused file\s+(\S+)")
+_PATH_TRAIL_PUNCT = ".,;:)]}'\"`"
 
 
 def _git(run_git, args, cwd):
@@ -47,6 +49,9 @@ def candidate_identifier(title):
     (applyBrainDumpSort, renderHardwareTab) of length >= 6. Plain words never count, so a title with no code name
     yields None and is treated as 'new' rather than guessed at.
     """
+    wf = _WHOLE_FILE_RE.match(title or "")
+    if wf:
+        return wf.group(1).rstrip(_PATH_TRAIL_PUNCT) or None
     m = _BACKTICK_RE.search(title or "")
     if m:
         return m.group(1).split(".")[-1]
