@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawnSync, execSync } = require('node:child_process');
 
 const SCRIPT = path.join(__dirname, 'provision-node.sh');
 
@@ -41,6 +41,23 @@ test('am-node-pull.service runs node src/node-pull.js --daemon', () => {
   const exec = lines(unit('am-node-pull.service')).filter((l) => l.startsWith('ExecStart='));
   assert.equal(exec.length, 1);
   assert.ok(exec[0].endsWith(`${repo}/src/node-pull.js --daemon`), exec[0]);
+});
+
+test('am-node-pull.service has an ExecStartPre=- loaded-sha line before ExecStart=', () => {
+  const t = fs.mkdtempSync(path.join(root, 'execpre-'));
+  const cmd = ['grimm', path.join(t, 'pipe'), path.join(t, 'repo'), path.join(t, 'units')]
+    .map((a) => `'${a}'`).join(' ');
+  const out = execSync(`bash '${SCRIPT}' ${cmd}`, { encoding: 'utf8', timeout: 60000, env: { ...process.env, HOME: home } });
+  assert.match(out, /^wrote   .*am-node-pull\.service$/m);
+  const l = lines(path.join(t, 'units', 'am-node-pull.service'));
+  const pre = l.filter((x) => x.startsWith('ExecStartPre=-'));
+  assert.equal(pre.length, 1, l.join('\n'));
+  assert.match(pre[0], /^ExecStartPre=-/);
+  assert.match(pre[0], /node-loaded-sha\.js write am-node-pull/, pre[0]);
+  assert.match(pre[0], /\|\| true/, pre[0]);
+  const execIdx = l.findIndex((x) => x.startsWith('ExecStart='));
+  assert.ok(execIdx >= 0, 'no ExecStart= line');
+  assert.ok(l.indexOf(pre[0]) < execIdx, `ExecStartPre=- at ${l.indexOf(pre[0])} not before ExecStart= at ${execIdx}`);
 });
 
 test('am-node-send.path triggers on PathChanged of queue/node-outbox and names the send service', () => {
