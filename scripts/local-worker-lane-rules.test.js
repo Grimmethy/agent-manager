@@ -16,11 +16,11 @@ const SCRIPT = path.join(__dirname, 'local-worker.sh');
 const ID = 'worker-cloud';
 const LINE = /lane rules: taskClasses=([^ ]*) reviews=/g;
 
-function lanesJson(taskClasses) {
-  return JSON.stringify([{ gpu: 'cloud', ollamaUrl: 'http://127.0.0.1:9', model: 'haiku', provider: 'cloud', preempt: 'never', taskClasses }]);
+function lanesJson(taskClasses, extra = {}) {
+  return JSON.stringify([{ gpu: 'cloud', ollamaUrl: 'http://127.0.0.1:9', model: 'haiku', provider: 'cloud', preempt: 'never', taskClasses, ...extra }]);
 }
 
-function sandbox(taskClasses = ['adhoc']) {
+function sandbox(taskClasses = ['adhoc'], extra = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-rules-'));
   const mk = (...p) => { const d = path.join(root, ...p); fs.mkdirSync(d, { recursive: true }); return d; };
   const A = mk('A'); mk('repoA'); mk('home'); mk('tmp'); mk('switch');
@@ -29,7 +29,7 @@ function sandbox(taskClasses = ['adhoc']) {
   const projectsPath = path.join(root, 'projects.json');
   fs.writeFileSync(projectsPath, JSON.stringify([{ repoRoot: path.join(root, 'repoA'), pipelineDir: A, domainsPath: path.join(A, 'task-domains.json'), label: 'A' }]));
   const lanesPath = path.join(root, 'lanes.json');
-  fs.writeFileSync(lanesPath, lanesJson(taskClasses));
+  fs.writeFileSync(lanesPath, lanesJson(taskClasses, extra));
   const env = {
     ...process.env,
     HOME: path.join(root, 'home'), TMPDIR: path.join(root, 'tmp'), TEMP_DIR: path.join(root, 'tmp'),
@@ -41,19 +41,21 @@ function sandbox(taskClasses = ['adhoc']) {
   };
   delete env.AGENT_MANAGER_INSTANCE_ID;
   // One tick; returns the taskClasses values of the "lane rules:" lines it printed.
+  const lastText = { v: '' };
   const tick = () => {
     const r = spawnSync('bash', [SCRIPT, ID, '--once'], { encoding: 'utf8', env, timeout: 120000 });
     assert.equal(r.status, 0, r.stderr);
+    lastText.v = `${r.stderr}\n${r.stdout}`;
     return [...(`${r.stderr}\n${r.stdout}`).matchAll(LINE)].map((m) => m[1]);
   };
   // Rewrites lanes.json after ageing the stamp 10 s into the past, so the edit is newer than the stamp without relying on timestamp granularity or a future mtime.
-  const rewrite = (classes) => {
+  const rewrite = (classes, extraRules = {}) => {
     const stamp = path.join(root, 'tmp', `lane-rules-${ID}.stamp`);
     const past = new Date(Date.now() - 10000);
     fs.utimesSync(stamp, past, past);
-    fs.writeFileSync(lanesPath, lanesJson(classes));
+    fs.writeFileSync(lanesPath, lanesJson(classes, extraRules));
   };
-  return { root, env, tick, rewrite, lanesPath };
+  return { root, env, tick, rewrite, lanesPath, lastText };
 }
 
 test('first tick reads the lane rules once and logs them', () => {
@@ -85,4 +87,40 @@ test('a worker switched off reads no lane rules', () => {
   assert.doesNotMatch(`${r.stderr}${r.stdout}`, /lane rules:/);
   fs.rmSync(path.join(s.root, 'switch', ID));
   assert.deepEqual(s.tick(), ['adhoc'], 'switched back on, the first tick that runs reads the rules');
+});
+
+test('the cloud lane reviews flag reaches the worker: true by default, false when the lane says so, and a change is re-read', () => {
+  const s = sandbox(['adhoc']);
+  assert.deepEqual(s.tick(), ['adhoc']);
+  assert.match(s.lastText.v, /lane rules: taskClasses=adhoc reviews=none cloudReviews=true/);
+  s.rewrite(['adhoc'], { reviews: false });
+  assert.deepEqual(s.tick(), ['adhoc'], 'only the reviews flag changed, and the worker still re-read lanes.json');
+  assert.match(s.lastText.v, /cloudReviews=false/);
+  assert.deepEqual(s.tick(), []);
+  const f = sandbox(['adhoc'], { reviews: false });
+  f.tick();
+  assert.match(f.lastText.v, /cloudReviews=false/);
+});
+
+test('reload_lane_rules in one shell: LANE_RULES_CLOUD_REVIEWS follows lanes.json, and each change logs exactly once', () => {
+  const s = sandbox(['adhoc']);
+  const common = path.join(__dirname, 'agent-manager-common.sh');
+  const stamp = path.join(s.root, 'tmp', 'harness.stamp');
+  const script = `source "${common}"
+    export LANE_RULES_STAMP="${stamp}"
+    reload_lane_rules ${ID}; echo "1:$LANE_RULES_CLOUD_REVIEWS"
+    reload_lane_rules ${ID}; echo "2:$LANE_RULES_CLOUD_REVIEWS"
+    sleep 1.1
+    echo '${lanesJson(['adhoc'], { reviews: false })}' > "${s.lanesPath}"
+    reload_lane_rules ${ID}; echo "3:$LANE_RULES_CLOUD_REVIEWS"
+    sleep 1.1
+    echo '${lanesJson(['adhoc'], { reviews: false })}' > "${s.lanesPath}"
+    reload_lane_rules ${ID}; echo "4:$LANE_RULES_CLOUD_REVIEWS"`;
+  const r = spawnSync('bash', ['-c', script], { encoding: 'utf8', env: s.env });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(r.stdout.trim().split('\n'), ['1:true', '2:true', '3:false', '4:false']);
+  const logged = r.stderr.split('\n').filter((l) => /lane rules:/.test(l));
+  assert.equal(logged.length, 2, 'one line for the first read and one for the flag change, none for the unchanged re-read: ' + r.stderr);
+  assert.match(logged[0], /cloudReviews=true/);
+  assert.match(logged[1], /cloudReviews=false/);
 });

@@ -17,7 +17,7 @@ const { postJson } = require('./ollama-http.js');
 const inflightLock = require('./model-inflight-lock.js');
 const gpuCapacity = require('./gpu-capacity.js');
 const gpuGuard = require('./gpu-guard.js');
-const { isSlowEndpoint } = require('./lanes.js');
+const { isSlowEndpoint, isCloudEndpoint } = require('./lanes.js');
 const localThroughput = require('./local-throughput.js');
 const { currentDateLine } = require('./current-date-line.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
@@ -755,6 +755,10 @@ async function callUnrecorded(opts, maxRetries = 2) {
 // (logHardFailureAudit keys off opts.taskId).
 async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
   const votes = [];
+  // Every vote records who cast it (feature cloud-agent-pool, FF-2b): provider 'cloud' when this process's OLLAMA_URL is a cloud-providers gateway (src/lanes.js isCloudEndpoint),
+  // else 'ollama', and the model the pass used (call()'s own `model || LOCAL_MODEL` rule). Two keys added; nothing existing is renamed or reordered, and readers that ignore them are unaffected.
+  const voteProvider = isCloudEndpoint(OLLAMA_URL) ? 'cloud' : 'ollama';
+  const voteModel = model || MODEL || null;
   const voteErrors = [];
   for (let i = 0; i < n; i++) {
     let result;
@@ -774,7 +778,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
     }
     if (result.degenerate) continue;
     const verdict = classify(result.response);
-    if (verdict) votes.push({ verdict, response: result.response });
+    if (verdict) votes.push({ verdict, response: result.response, provider: voteProvider, model: voteModel });
 
     // Early-exit once any verdict has mathematically already secured minAgreeing votes
     // -- no remaining vote can change the outcome (adding to a losing verdict's tally, or

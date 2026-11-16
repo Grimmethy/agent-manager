@@ -208,3 +208,18 @@ test('validatePackage accepts a stop record with rawDiff empty or absent, and re
   assert.equal(noStop.ok, false);
   assert.equal(noStop.reason, msg);
 });
+
+test('a stop record with a non-string rawDiff (a number or an object) is refused, not accepted as a stop record', () => {
+  const msg = 'record.rawDiff must be a non-empty string';
+  for (const rawDiff of [5, {}]) {
+    const r = validatePackage(buildRecordPackage({ record: { ...DRAFT, ...STOP, rawDiff }, nodeId: 'grimm', now: T0 }));
+    assert.equal(r.ok, false, JSON.stringify(rawDiff));
+    assert.equal(r.reason, msg);
+  }
+});
+
+test('isStopRecord is false for an array needsClarification even when the array has a string reason property', () => {
+  const arr = ['x'];
+  arr.reason = 'design-decision';
+  assert.equal(isStopRecord({ ...DRAFT, needsClarification: arr }), false);
+});
