@@ -108,3 +108,13 @@ function readLoadedSha(deps) {
 }
 
 module.exports = { writeLoadedSha, readLoadedSha };
+
+if (require.main === module) {
+  const [command, unitName] = process.argv.slice(2);
+  if (command === 'write' && unitName) {
+    try {
+      writeLoadedSha(unitName);
+    } catch (_) {}
+  }
+  process.exit(0);
+}
