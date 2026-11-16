@@ -10,6 +10,20 @@ function slugify(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
 }
 
+// Cap on the slug embedded in an adhoc task id (2026-11-14): an uncapped 230-character title made the
+// id, and so the queue file name <id>.json and branch agent/<id>, exceed the filesystem's 255-byte limit (ENAMETOOLONG).
+const MAX_SLUG = 100;
+
+// Shortens a slug to at most MAX_SLUG characters, cutting at the last '-' boundary when there is one.
+// A slug of MAX_SLUG characters or fewer is returned unchanged, so existing ids are byte-for-byte identical.
+function capSlug(slug) {
+  if (slug.length <= MAX_SLUG) return slug;
+  const head = slug.slice(0, MAX_SLUG + 1); // +1 lets a dash at index MAX_SLUG count as a boundary
+  const cut = head.lastIndexOf('-');
+  const out = cut > 0 ? head.slice(0, cut) : slug.slice(0, MAX_SLUG);
+  return out.replace(/-+$/, '');
+}
+
 // Port of app.py's default_task_domain() (2026-09-06): picking the first key in
 // task-domains.json with no regard for whether it's a sane generic default is what once
 // queued two real tasks with domain='adhoc' into a project whose task-domains.json
@@ -62,7 +76,7 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriori
     throw new Error(`Invalid domain '${resolvedDomain}'. Valid domains: ${validDomains.join(', ')}`);
   }
 
-  const id = `adhoc-${slugify(title)}-${Date.now()}`;
+  const id = `adhoc-${capSlug(slugify(title))}-${Date.now()}`;
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
   fs.mkdirSync(adhocDir, { recursive: true });
 
