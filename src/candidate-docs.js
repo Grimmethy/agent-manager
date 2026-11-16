@@ -79,6 +79,7 @@ function parseArchDiscoveryCandidates(implementResponse) {
       const anchorIdx = block.indexOf(bodyAnchor);
       const body = block.slice(anchorIdx + bodyAnchor.length).trim();
       return {
+        headingId: ((headingLine.match(/AC-(\d+)/) || [])[1]) || null,
         title: titleMatch[1].trim(),
         strength: strengthMatch ? strengthMatch[1].trim() : 'Strong',
         source: sourceMatch ? sourceMatch[1].trim() : '',
@@ -89,6 +90,22 @@ function parseArchDiscoveryCandidates(implementResponse) {
       };
     })
     .filter((c) => c && c.title && c.body);
+}
+
+// Retraction-note gate (2026-11-16, AC-60..62 incident): a block that merely RETRACTS an earlier
+// candidate (title struck through or marked RETRACTED/Withdrawn, or a body whose first non-metadata
+// line is a 'Status:' saying it is not a defect) is a model's own critique text leaking into the
+// implement response, never a real finding. Returns the rule name that fires, or null. Prose that
+// merely mentions 'retracted' later in the body is NOT a rule.
+const RETRACTION_STATUS_RE = /^Status:\s*(withdrawn|retracted|no defect|not a defect|no action required)\b/i;
+const CANDIDATE_METADATA_LINE_RE = /^(Strength|Depends-On-Index|Files|Source|Split-Depth|Symbol|Snippet):/i;
+function retractionGateReason(c) {
+  const title = String((c && c.title) || '').trim();
+  if (title.startsWith('~~') || /\b(RETRACTED|Withdrawn)\b/.test(title)) return 'R1';
+  const lines = String((c && c.body) || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const first = lines.find((l) => !CANDIDATE_METADATA_LINE_RE.test(l));
+  if (first && RETRACTION_STATUS_RE.test(first)) return 'R2';
+  return null;
 }
 
 function nextAvailableCandidateId(existingText) {
@@ -199,6 +216,17 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   if (candidates.length === 0) {
     return { skipped: true, reason: 'no candidates in implement response -- nothing to apply' };
   }
+  // Retraction-note gate (see retractionGateReason): drop blocks that retract an earlier candidate before anything else sees them.
+  const skippedByGate = [];
+  candidates = candidates.filter((c) => {
+    const rule = retractionGateReason(c);
+    if (!rule) return true;
+    skippedByGate.push({ id: c.headingId ? `AC-${c.headingId}` : null, title: String(c.title).slice(0, 80), rule, reason: `retraction-gate:${rule}` });
+    return false;
+  });
+  if (candidates.length === 0) {
+    return { skipped: true, reason: `skipped: ${skippedByGate.length} retraction note(s) rejected by retraction-gate -- nothing appended`, skippedByGate };
+  }
   let droppedNonStrong = 0;
   if (typeof requireStrength === 'string' && requireStrength.trim()) {
     const required = requireStrength.trim();
@@ -262,7 +290,7 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   fs.mkdirSync(path.dirname(candidatesPath), { recursive: true });
   writeAtomicSync(candidatesPath, text);
 
-  return { file: candidatesPath, candidateCount: candidates.length, candidateIds, ...(duplicatesSkipped.length ? { duplicatesSkipped: duplicatesSkipped.length } : {}), ...(droppedNonStrong ? { droppedNonStrong } : {}) };
+  return { file: candidatesPath, candidateCount: candidates.length, candidateIds, ...(duplicatesSkipped.length ? { duplicatesSkipped: duplicatesSkipped.length } : {}), ...(droppedNonStrong ? { droppedNonStrong } : {}), ...(skippedByGate.length ? { skippedByGate } : {}) };
 }
 
 module.exports = {
