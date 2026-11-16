@@ -30,6 +30,23 @@ test('a bad nodeId prints node=-', () => {
   assert.equal(line({ nodeId: 7 }), `${AT} /claim node=- status=200 ms=12`);
 });
 
+test('a 31-character nodeId is valid and printed as-is', () => {
+  const id = 'a'.repeat(31);
+  assert.equal(line({ nodeId: id }), `${AT} /claim node=${id} status=200 ms=12`);
+});
+
+test('an uppercase nodeId prints node=-', () => {
+  assert.equal(line({ nodeId: 'Grimm' }), `${AT} /claim node=- status=200 ms=12`);
+});
+
+test('a nodeId starting with a hyphen prints node=-', () => {
+  assert.equal(line({ nodeId: '-grimm' }), `${AT} /claim node=- status=200 ms=12`);
+});
+
+test('a nodeId with a mid-string underscore prints node=-', () => {
+  assert.equal(line({ nodeId: 'gr_imm' }), `${AT} /claim node=- status=200 ms=12`);
+});
+
 test('a missing nodeId prints node=-', () => {
   const { nodeId, ...rest } = base;
   assert.equal(formatRequestLine(rest), `${AT} /claim node=- status=200 ms=12`);
