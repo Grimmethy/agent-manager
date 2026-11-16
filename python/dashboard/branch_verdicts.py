@@ -257,6 +257,9 @@ def run_deterministic_checks(repo_root, main_branch, branch, run_git, extra_reas
     if dupes and dupes[0] == "discard":
         return dupes  # every candidate is a recurring duplicate: nothing here is worth keeping
     reasons = list(dupes[1]) if dupes else []
+    inert = branch_redundancy.check_inert_additions(run_git, repo_root, main_branch, branch)
+    if inert:
+        reasons.extend(inert[1])
     conflict = _check_conflicts(run_git, repo_root, main_branch, branch)
     if conflict:
         reasons.extend(conflict[1])
