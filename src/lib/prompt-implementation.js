@@ -22,8 +22,23 @@ function pathPrefetchResolveImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// Consumer-project label (mirrors consumerLabel() in src/prompts.js; duplicated here because
+// prompts.js requires this module, so importing back would be a cycle).
+const DEFAULT_CONSUMER = 'agent-manager';
+function consumerLabelFor(task) {
+  const pc = (task && task.promptContext) || {};
+  if (typeof pc.consumerProject === 'string' && pc.consumerProject.trim()) return pc.consumerProject.trim();
+  try {
+    const root = require('../config.js').getConfig().repoRoot;
+    const base = root ? require('path').basename(String(root)) : '';
+    if (base) return base;
+  } catch { /* no config here: the default */ }
+  return DEFAULT_CONSUMER;
+}
+
 function deepDiveImplementPrompt(task, planText) {
   const ctx = task.promptContext;
+  const P = consumerLabelFor(task);
   const fileCount = (ctx.files && ctx.files.length) || 0;
   return [
     'Earlier you wrote this PLAN for one community of an external project:',
@@ -38,9 +53,9 @@ function deepDiveImplementPrompt(task, planText) {
     `Community: ${ctx.communityName}`,
     'Files: the specific file path(s) this references -- copy each path EXACTLY as shown in the "Files in this community" list from your plan input (full path, e.g. "python/packages/autogen-ext/src/foo/_bar.py"), never shortened or paraphrased',
     'Rating: Use / Adapt / Ignore',
-    'Rationale: what this is, and specifically how it applies (or does not) to agent-manager',
+    'Rationale: what this is, and specifically how it applies (or does not) to ' + P + '',
     '',
-    'Rating means: Use = take it close to as-is; Adapt = the idea is good but agent-manager\'s own context differs enough that it needs real rework; Ignore = considered and does not apply -- state the concrete reason, do not just omit it. An Ignore item with a real reason is exactly as valid an outcome as a Use/Adapt item -- never skip writing one just because the verdict is negative.',
+    'Rating means: Use = take it close to as-is; Adapt = the idea is good but ' + P + '\'s own context differs enough that it needs real rework; Ignore = considered and does not apply -- state the concrete reason, do not just omit it. An Ignore item with a real reason is exactly as valid an outcome as a Use/Adapt item -- never skip writing one just because the verdict is negative.',
   ].join('\n');
 }
 
