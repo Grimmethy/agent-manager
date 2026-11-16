@@ -411,8 +411,8 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       // reschedule, or merge it away. Return a { succeeded:false, status:'needs-clarification' }
       // outcome so the downstream pipeline routes it to queue/awaiting-confirm/ with
       // a clear reason, same as any other human-gated hold. Plain (non-stacked)
-      // empty-diff tasks keep the old "succeeded:true" behavior: they are standalone
-      // no-ops, not hub pieces that freeze the chain.
+      // empty-diff tasks that are not hub pieces are no-ops and keep the succeeded:true
+      // behavior, EXCEPT an implemented or absent-resolution adhoc draft (see below).
       if (artifact.emptyDiff === true && task && task.stacked) {
         // HUB0308 1/2: stacked hub child with empty diff must NOT be silently
         // abandoned or closed — return a needs-clarification outcome so the
@@ -421,6 +421,18 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
         return {
           succeeded: false,
           reason: 'empty diff on a stacked hub piece: nothing landed',
+          status: 'needs-clarification',
+        };
+      }
+      // An adhoc draft whose diff came back empty while claiming 'implemented' (or with no
+      // resolution recorded) did not land anything. Hold it for a human instead of closing
+      // its originating brain dump entry as done. 'no-changes-needed' is a genuine no-op and
+      // falls through to the succeeded:true path below. Do NOT call abandonBranch() or
+      // closeOriginatingBrainDumpEntry() here.
+      if (artifact.emptyDiff === true && task && task.domain === 'adhoc' && (task.adhocResolution === 'implemented' || task.adhocResolution == null)) {
+        return {
+          succeeded: false,
+          reason: 'empty diff on an implemented adhoc draft: nothing landed',
           status: 'needs-clarification',
         };
       }

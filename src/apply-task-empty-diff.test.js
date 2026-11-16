@@ -83,6 +83,7 @@ test('non-stacked adhoc task with empty diff is still succeeded (standalone no-o
     domain: 'adhoc',
     source: 'manual',
     rawDiff: '',
+    adhocResolution: 'no-changes-needed',
     stacked: false,
   });
   const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
