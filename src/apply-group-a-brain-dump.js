@@ -11,6 +11,7 @@ const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-d
 const { checkEntryTargets, isEnabled: targetCheckEnabled } = require('./brain-dump-target-check.js');
 const { checkBrainDumpDuplicate, isEnabled: duplicateCheckEnabled } = require('./lib/brain-dump-duplicate-check.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { handOffJournalEntry } = require('./journalforge-handoff.js');
 const { normalizeTokens, jaccardSimilarity } = require('./text-similarity.js');
 const {
   CANONICAL_TOP_LEVEL,
@@ -724,7 +725,17 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
     return queueProjectTask(ctx, matchedProject);
   }
 
-  return filePassiveNote(ctx);
+  const filed = filePassiveNote(ctx);
+  // JournalForge keep-and-resurface handoff (journal loop). Runs only AFTER the vault note is
+  // filed, and can never change the filing or the sort result: any failure is caught here.
+  try {
+    const handoff = handOffJournalEntry({ entry, result, capturedAt: entry.capturedAt, pipelineDir });
+    if (handoff.handed) {
+      fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+      writeJsonAtomicSync(brainDumpPath, data);
+    }
+  } catch { /* handoff is best-effort; the note is already filed */ }
+  return filed;
 }
 
 function closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId, note }) {
