@@ -142,7 +142,7 @@ function archivedTaskFiles(pipelineDir) {
   return out;
 }
 
-function searchTasksTool(pipelineDir, { query, state, includeArchived } = {}) {
+function searchTasksTool(pipelineDir, { query, state, includeArchived, similar = false } = {}) {
   if (typeof query !== 'string' || !query.trim()) {
     return { error: 'search_tasks requires a non-empty "query" argument' };
   }
@@ -165,6 +165,27 @@ function searchTasksTool(pipelineDir, { query, state, includeArchived } = {}) {
     ];
   }
   if (includeArchived) candidates = [...candidates, ...archivedTaskFiles(pipelineDir)];
+
+  // similar mode: rank ALL candidates first, then cap, so a late/archived/body-only match is not dropped by file order.
+  if (similar === true) {
+    const { rankTasks, DUPLICATE_SCORE } = require('./task-similarity.js');
+    const docs = [];
+    const byKey = new Map();
+    for (const { fullPath, foundState } of candidates) {
+      let data;
+      try { data = JSON.parse(fs.readFileSync(fullPath, 'utf8')); } catch { continue; }
+      const fallbackId = path.basename(fullPath, '.json');
+      const id = data.id || fallbackId;
+      if (byKey.has(id)) continue;
+      const summary = { ...taskSummary(data, fallbackId), foundState };
+      byKey.set(id, summary);
+      docs.push({ id, title: data.title || '', promptContext: data.promptContext, state: foundState });
+    }
+    const ranked = rankTasks(query, docs, { limit: MAX_SEARCH_TASK_RESULTS });
+    const results = ranked.map((r) => ({ ...byKey.get(r.id), score: r.score, matchedOn: r.matchedOn }));
+    if (results.length > 0 && results[0].score < DUPLICATE_SCORE) results[0].note = 'no close match';
+    return { results };
+  }
 
   const results = [];
   for (const { fullPath, foundState } of candidates) {
@@ -207,6 +228,70 @@ function searchTasksAllProjects(args, opts = {}) {
   return { results };
 }
 
+// Records a duplicate-gate history event on the candidate task's own file (a dismissed task has no record of its own).
+// Best-effort: a failing write never changes the dismiss-or-queue decision.
+function recordGateEvent(entry, stage, detail, opts) {
+  try {
+    const { appendHistoryEvent } = require('./task-history.js');
+    const writer = opts.appendHistoryEvent || appendHistoryEvent;
+    const data = JSON.parse(fs.readFileSync(entry.fullPath, 'utf8'));
+    writer(data, stage, JSON.stringify(detail));
+    fs.writeFileSync(entry.fullPath, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.warn(`[queue_reviewed_task] could not record ${stage} for ${detail.candidateId}:`, e && e.message ? e.message : String(e));
+  }
+}
+
+// Returns a dismissal result when a same-source duplicate exists, else null. Throws only on unexpected errors (caller falls through).
+function duplicateGate(pipelineDir, title, description, opts = {}) {
+  // What queueAdhocTask stamps on every record it writes; opts.source overrides (tests / other callers).
+  const newSource = opts.source !== undefined ? opts.source : 'manual';
+  if (!newSource) return null;
+  const sim = require('./task-similarity.js');
+  const rank = opts.rankTasks || sim.rankTasks;
+  const threshold = opts.duplicateScore !== undefined ? opts.duplicateScore : sim.DUPLICATE_SCORE;
+  const { sharesDistinctivePhrase: phraseFn } = require('./text-similarity.js');
+  const query = `${title} ${description.slice(0, 600)}`;
+
+  const docs = [];
+  const byId = new Map();
+  const files = [
+    ...candidateTaskFiles(pipelineDir, 'drafting'),
+    ...QUEUE_STATES.flatMap((s) => candidateTaskFiles(pipelineDir, s)),
+    ...candidateTaskFiles(pipelineDir, 'adhoc'),
+  ];
+  for (const { fullPath, foundState } of files) {
+    let data;
+    try { data = JSON.parse(fs.readFileSync(fullPath, 'utf8')); } catch { continue; }
+    const id = data.id || path.basename(fullPath, '.json');
+    if (byId.has(id)) continue;
+    byId.set(id, { fullPath, source: data.source, title: data.title || '' });
+    docs.push({ id, title: data.title || '', promptContext: data.promptContext, state: foundState });
+  }
+  if (docs.length === 0) return null;
+
+  const ranked = rank(query, docs, { limit: 5 }) || [];
+  let dismissal = null;
+  for (const r of ranked) {
+    if (!(r.score >= threshold)) continue;
+    const entry = byId.get(r.id);
+    if (!entry) continue;
+    const candidateSource = r.source !== undefined ? r.source : entry.source;
+    const phrase = r.sharesDistinctivePhrase !== undefined ? r.sharesDistinctivePhrase : Boolean(phraseFn(query, entry.title));
+    const detail = { newTitle: title, candidateId: r.id, score: r.score, matchedOn: r.matchedOn, sharesDistinctivePhrase: phrase, source: candidateSource };
+    const dismiss = !dismissal && candidateSource === newSource && phrase === true && r.matchedOn !== 'id';
+    if (dismiss) dismissal = detail;
+    recordGateEvent(entry, dismiss ? 'duplicate-dismissed' : 'near-miss', detail, opts);
+  }
+  if (!dismissal) return null;
+  return {
+    dismissedAsDuplicateOf: dismissal.candidateId,
+    score: dismissal.score,
+    matchedOn: dismissal.matchedOn,
+    message: `Not queued: this looks like a duplicate of ${dismissal.candidateId} (score ${dismissal.score}). If it is genuinely different, reword the title/description and call again.`,
+  };
+}
+
 function queueReviewedTaskTool(pipelineDir, { title, description, project, dependsOn }, opts = {}) {
   if (typeof title !== 'string' || !title.trim()) return { error: 'queue_reviewed_task requires a non-empty "title" argument' };
   if (typeof description !== 'string' || !description.trim()) return { error: 'queue_reviewed_task requires a non-empty "description" argument' };
@@ -239,6 +324,14 @@ function queueReviewedTaskTool(pipelineDir, { title, description, project, depen
     if (unresolved.length > 0) {
       return { error: `queue_reviewed_task: dependsOn references unknown task id(s): ${unresolved.join(', ')} -- none of these exist in the target project's queue or done/` };
     }
+  }
+  // Duplicate gate: dismiss only a near-certain duplicate from the SAME source; everything else queues as before.
+  // Best-effort -- any failure inside it falls through to queueing so a broken gate never drops a task.
+  try {
+    const dismissed = duplicateGate(target.pipelineDir, title, description, opts);
+    if (dismissed) return dismissed;
+  } catch (e) {
+    console.warn('[queue_reviewed_task] duplicate gate failed, queueing anyway:', e && e.message ? e.message : String(e));
   }
   try {
     // premiumPriority: true (2026-09-16, Grimmethy: "any tasks that chat is working on

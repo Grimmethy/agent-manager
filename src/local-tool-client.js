@@ -615,7 +615,7 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'search_tasks',
-      description: 'Find tasks by a keyword/phrase match against their title and id (NOT a regex) when you do not already have an exact task id -- pass the result\'s "id" to read_task for details. Searches live queue states by default (not old archived tasks); pass includeArchived to also search those (slower).',
+      description: 'Find tasks by a keyword/phrase match against their title and id (NOT a regex) when you do not already have an exact task id -- pass the result\'s "id" to read_task for details. Searches live queue states by default (not old archived tasks); pass includeArchived to also search those (slower). Pass similar:true to rank results by title and body similarity instead of substring match (needs src/task-similarity.js, which is not available yet).',
       parameters: {
         type: 'object',
         properties: {
