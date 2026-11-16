@@ -721,6 +721,7 @@ while :; do                                                                     
   # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
   if mem_pressure_high; then
     printf '[worker-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
+    write_heartbeat_file "$INSTANCE_ID" "paused" "$HEARTBEAT_MODEL" "" "ram" "$STARTED_AT"   # status paused, pass ram: the Workers tab and the cloud-dial counts can tell a RAM hold from a GPU-session pause (pass gpu-session) and from idle
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
     continue
