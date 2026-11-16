@@ -20,6 +20,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { linkAgentManager } = require('../agent-manager-link.js');
 
 const DEFAULT_MAX_MB = 800;
 const DU_TIMEOUT_MS = 30_000;
@@ -78,6 +79,20 @@ function copyNodeModules(repoRoot, worktreeDir, { run = execFileSync, env = proc
     catch { return { copied: false, reason: 'node_modules is not gitignored in this repo' }; }
     // realpath: if the repo's node_modules is itself a symlink, `cp -a` would copy the LINK and the sandbox would share the real tree.
     run('cp', ['-a', '--reflink=auto', fs.realpathSync(path.join(repoRoot, 'node_modules')), path.join(worktreeDir, 'node_modules')], { timeout: COPY_TIMEOUT_MS, stdio: 'ignore' });
+    // The source's node_modules/agent-manager is a relative link (file:../agent-manager); cp -a copies it verbatim and it dangles in the worktree.
+    // Replace the copied entry with an absolute link to the real core checkout. Advisory: a failure here never fails the copy.
+    try {
+      const copiedLink = path.join(worktreeDir, 'node_modules', 'agent-manager');
+      if (fs.lstatSync(copiedLink).isSymbolicLink()) {
+        let coreAbs = null;
+        try { coreAbs = path.resolve(fs.realpathSync(path.join(repoRoot, 'node_modules', 'agent-manager'))); } catch { coreAbs = null; }
+        if (coreAbs) {
+          fs.unlinkSync(copiedLink);
+          const r = linkAgentManager(path.join(worktreeDir, 'node_modules'), coreAbs);
+          if (r.status === 'skipped') console.error(r.message);
+        }
+      }
+    } catch { /* advisory */ }
     return { copied: true, ms: Date.now() - started, sizeMb: plan.sizeMb };
   } catch (e) {
     // A partial copy is worse than none: the model would see a half-installed tree and blame its own change.
