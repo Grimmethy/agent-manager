@@ -28,6 +28,8 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { isForgePause } = require('./gpu-guard.js');
 const { findStalenessCandidates } = require('./staleness-audit.js');
 const { classifyVote } = require('./auto-confirm-review.js');
+const { normalizeTaskTokens, dupSimilarityThreshold } = require('./staleness-audit-dedup.js');
+const { jaccardSimilarity } = require('./text-similarity.js');
 
 const SCAN_DIRS = ['blocked', 'needs-clarification', 'coordinating'];
 const CORPUS_DIRS = ['pending', 'drafting', 'blocked', 'needs-clarification', 'coordinating', 'adhoc', 'approved', 'review'];
@@ -63,7 +65,7 @@ function classifyStaleTask(candidate) {
   // High-confidence deterministic -- nothing left to build.
   if (r.has('already-implemented-strong')) return mk('already-implemented', 'retire', 'high', [], 'deterministic-rule');
   if (r.has('invalid-premise')) return mk('invalid-premise', 'retire', 'high', [], 'deterministic-rule');
-  if (dup && DONE_STATES.has(String(dup.state))) {
+  if (dup && !dup.hubCapped && DONE_STATES.has(String(dup.state))) {
     return mk('duplicate-of', 'retire', 'high', [`the matched task ${dup.id} is already ${dup.state}`], 'deterministic-rule');
   }
 
@@ -216,8 +218,124 @@ function recentDoneTasks(pipelineDir, limit) {
 
 function safeMtime(p) { try { return fs.statSync(p).mtimeMs; } catch { return 0; } }
 
+// --- same-hub sibling guard -----------------------------------------------------------
+// Pieces of one decomposed hub repeat the same contract text, so they overlap heavily without
+// being duplicates. This runs BEFORE the duplicate-of overlap result is acted on: a same-hub pair
+// never takes the high-confidence retire path. Missing/empty fields never match.
+
+function nonEmptyStr(v) { return typeof v === 'string' && v.trim() !== ''; }
+
+function hubIdPrefix(id) {
+  const m = /^(HUB\d+)-\d+$/.exec(String(id || ''));
+  return m ? m[1] : null;
+}
+
+// Returns a hub key string when a and b are pieces of the same hub, else null.
+function sameHubKey(a, b) {
+  if (!a || !b) return null;
+  const fa = a.promptContext && a.promptContext.decomposedFrom;
+  const fb = b.promptContext && b.promptContext.decomposedFrom;
+  if (nonEmptyStr(fa) && nonEmptyStr(fb) && fa === fb) return `decomposedFrom:${fa}`;
+  const ba = a.stacked && typeof a.stacked === 'object' ? a.stacked.branch : null;
+  const bb = b.stacked && typeof b.stacked === 'object' ? b.stacked.branch : null;
+  if (nonEmptyStr(ba) && nonEmptyStr(bb) && ba === bb) return `branch:${ba}`;
+  const ha = hubIdPrefix(a.id);
+  const hb = hubIdPrefix(b.id);
+  if (ha && ha === hb) return ha;
+  return null;
+}
+
+function paragraphsOf(t) {
+  const raw = String((t && t.promptContext && t.promptContext.rawText) || '');
+  return raw.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+}
+
+// Derived copy (never mutates the task) without paragraphs that also appear verbatim in another
+// piece of the same hub group.
+function withoutRepeatedParagraphs(task, group) {
+  const elsewhere = new Set();
+  for (const o of group) {
+    if (o.id === task.id) continue;
+    for (const p of paragraphsOf(o)) elsewhere.add(p);
+  }
+  const kept = paragraphsOf(task).filter((p) => !elsewhere.has(p));
+  return { id: task.id, title: task.title, promptContext: { rawText: kept.join('\n\n') } };
+}
+
+function lastAdvisoryDetail(task) {
+  const h = Array.isArray(task.history) ? task.history : [];
+  for (let i = h.length - 1; i >= 0; i--) {
+    if (h[i] && h[i].stage === 'advisory') return h[i].detail;
+  }
+  return null;
+}
+
+// Mutates `candidates` entries / returns the filtered list. Counts suppressed pairs in
+// summary.sameHubSuppressed and appends one advisory event per affected task (aggregated).
+function applySameHubGuard({ scanned, corpus, candidates, dryRun, summary }) {
+  const threshold = dupSimilarityThreshold();
+  const out = candidates.slice();
+  const candById = new Map(out.map((c) => [c.task.id, c]));
+  const counted = new Set();
+  const notes = new Map();
+  for (const entry of scanned) {
+    const { task } = entry;
+    const mine = normalizeTaskTokens(task);
+    if (mine.size < 4) continue;
+    const family = corpus.filter((o) => o && o.id && o.id !== task.id && sameHubKey(task, o));
+    const group = [task, ...family];
+    for (const other of family) {
+      const raw = jaccardSimilarity(mine, normalizeTaskTokens(other));
+      if (raw < threshold) continue;
+      const key = sameHubKey(task, other);
+      const pairKey = [task.id, other.id].sort().join('|');
+      if (!counted.has(pairKey)) { counted.add(pairKey); summary.sameHubSuppressed += 1; }
+      const sa = normalizeTaskTokens(withoutRepeatedParagraphs(task, group));
+      const sb = normalizeTaskTokens(withoutRepeatedParagraphs(other, group));
+      const rem = (sa.size >= 4 && sb.size >= 4) ? jaccardSimilarity(sa, sb) : 0;
+      const capped = rem >= threshold;
+      const parts = notes.get(task.id) || [];
+      parts.push(`duplicate-of suppressed: same hub ${key} as ${other.id} (raw overlap ${Math.round(raw * 100)}%, ${capped ? 'capped at medium' : 'cleared after removing repeated paragraphs'})`);
+      notes.set(task.id, parts);
+
+      let cand = candById.get(task.id);
+      if (capped) {
+        const dup = { id: other.id, state: other.state || other.status || null, sim: Number(rem.toFixed(2)), hubCapped: true };
+        const evidence = `~${Math.round(rem * 100)}% token overlap with ${other.id} after removing paragraphs repeated across hub ${key} (same-hub sibling, capped at medium)`;
+        if (!cand) {
+          cand = { task, reasons: ['duplicate-of'], evidence: [evidence], duplicateOf: dup, lastActivityTs: 0, touchedFiles: [] };
+          out.push(cand); candById.set(task.id, cand);
+        } else if (cand.duplicateOf && !cand.duplicateOf.hubCapped && cand.duplicateOf.id !== other.id && cand.duplicateOf.sim >= rem) {
+          // a cross-parent match is at least as strong: keep its existing high-confidence path
+        } else {
+          cand.duplicateOf = dup;
+          if (!cand.reasons.includes('duplicate-of')) cand.reasons = [...cand.reasons, 'duplicate-of'];
+          cand.evidence = [...(cand.evidence || []).filter((e) => !String(e).includes(`token overlap with ${other.id}`)), evidence];
+        }
+      } else if (cand && cand.duplicateOf && cand.duplicateOf.id === other.id) {
+        cand.duplicateOf = null;
+        cand.reasons = (cand.reasons || []).filter((r) => r !== 'duplicate-of');
+        cand.evidence = (cand.evidence || []).filter((e) => !String(e).includes(`token overlap with ${other.id}`));
+      }
+    }
+  }
+  for (const entry of scanned) {
+    const parts = notes.get(entry.task.id);
+    if (!parts) continue;
+    const text = [...new Set(parts)].sort().join('; ').slice(0, 400);
+    if (dryRun || lastAdvisoryDetail(entry.task) === text) continue;
+    try {
+      appendHistoryEvent(entry.task, 'advisory', text);
+      fs.writeFileSync(entry.filePath, JSON.stringify(entry.task, null, 2));
+    } catch (e) {
+      console.error(`[adhoc-staleness-flag] ${entry.task.id}: ${e && e.message}`);
+    }
+  }
+  return out.filter((c) => c.duplicateOf || (c.reasons || []).some((r) => r !== 'duplicate-of'));
+}
+
 async function sweep({ pipelineDir, repoRoot, majorityVote, dryRun = false, now = Date.now() }) {
-  const summary = { scanned: 0, flagged: 0, highConfidence: 0, voted: 0, confirmed: 0, dropped: 0, skipped: 0, errors: 0, wouldFlag: [] };
+  const summary = { scanned: 0, flagged: 0, highConfidence: 0, voted: 0, confirmed: 0, dropped: 0, skipped: 0, errors: 0, sameHubSuppressed: 0, wouldFlag: [] };
   if (process.env.AGENT_MANAGER_ADHOC_STALENESS_FLAG === 'false') return summary;
 
   // Scoped to adhoc / brain-dump / manual tasks -- the "dead adhoc task" question. Other
@@ -233,9 +351,10 @@ async function sweep({ pipelineDir, repoRoot, majorityVote, dryRun = false, now 
     ...recentDoneTasks(pipelineDir, RECENT_DONE_LIMIT),
   ];
 
-  const candidates = findStalenessCandidates(
+  const rawCandidates = findStalenessCandidates(
     scanned.map((s) => s.task), {}, now, { repoRoot, corpusTasks: corpus },
   );
+  const candidates = applySameHubGuard({ scanned, corpus, candidates: rawCandidates, dryRun, summary });
   const byId = new Map(scanned.map((s) => [s.task.id, s]));
 
   for (const candidate of candidates) {
@@ -295,7 +414,7 @@ async function sweep({ pipelineDir, repoRoot, majorityVote, dryRun = false, now 
   return summary;
 }
 
-module.exports = { classifyStaleTask, sweep, buildStalenessVotePrompt, FLAG_TTL_MS, KEEP_COOLDOWN_MS };
+module.exports = { classifyStaleTask, sweep, sameHubKey, applySameHubGuard, buildStalenessVotePrompt, FLAG_TTL_MS, KEEP_COOLDOWN_MS };
 
 // --- CLI --------------------------------------------------------------------------
 if (require.main === module) {
@@ -316,7 +435,7 @@ if (require.main === module) {
         }
         console.log(`\nwould flag ${s.flagged} / scanned ${s.scanned}`);
       } else {
-        console.log(`adhoc-staleness-flag: scanned=${s.scanned} flagged=${s.flagged} (high=${s.highConfidence} voted=${s.voted} confirmed=${s.confirmed} dropped=${s.dropped}) skipped=${s.skipped} errors=${s.errors}`);
+        console.log(`adhoc-staleness-flag: scanned=${s.scanned} flagged=${s.flagged} (high=${s.highConfidence} voted=${s.voted} confirmed=${s.confirmed} dropped=${s.dropped}) skipped=${s.skipped} sameHubSuppressed=${s.sameHubSuppressed} errors=${s.errors}`);
       }
       process.exit(0);
     })
