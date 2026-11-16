@@ -243,6 +243,7 @@ elif [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]];
   while IFS= read -r lane_id; do
     [[ -n "$lane_id" ]] || continue
     mapfile -t lane_env < <(node "${SCRIPT_DIR}/../src/lanes.js" --env "$lane_id")
+    node "$REPO_DIR/src/node-loaded-sha.js" write "$lane_id" || true
     start_bg "$lane_id" "${PID_DIR}/${lane_id}.pid" "${LOG_DIR}/${lane_id}.log" \
       env ${lane_env[@]+"${lane_env[@]}"} \
       bash "${SCRIPT_DIR}/local-worker.sh" "$lane_id"
