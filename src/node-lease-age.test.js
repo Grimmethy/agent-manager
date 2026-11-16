@@ -96,6 +96,17 @@ test('TypeError: nodeId must be a non-empty string', () => {
   }
 });
 
+test('a lent row with an unparsable expiresAt is not live', () => {
+  const bad = { taskId: 'bad', nodeId: 'n1', state: 'lent', leasedAt: iso(NOW - 10 * MIN), expiresAt: 'not a date' };
+  assert.equal(oldestLiveLease([bad], 'n1', NOW), null);
+});
+
+test('a valid live lease is returned over an unparsable-expiresAt lease', () => {
+  const bad = { taskId: 'bad', nodeId: 'n1', state: 'lent', leasedAt: iso(NOW - 40 * MIN), expiresAt: 'not a date' };
+  const good = lease('good', 'n1', NOW - 10 * MIN, NOW + 50 * MIN);
+  assert.equal(oldestLiveLease([bad, good], 'n1', NOW).taskId, 'good');
+});
+
 test('TypeError: now must be a finite number', () => {
   for (const bad of [NaN, Infinity, '123', undefined]) {
     assert.throws(() => oldestLiveLease([], 'n1', bad), { name: 'TypeError', message: 'now must be a finite number' });
