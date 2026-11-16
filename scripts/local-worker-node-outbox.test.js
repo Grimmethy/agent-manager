@@ -45,7 +45,7 @@ function run(draftResult, nodeId) {
   if (nodeId !== undefined) env.AGENT_MANAGER_NODE_ID = nodeId;
   const r = spawnSync('bash', [path.join(pkg, 'scripts', 'local-worker.sh'), 'worker-x', '--once'], { encoding: 'utf8', timeout: 120000, env });
   const where = {};
-  for (const d of ['review', 'blocked', 'done', 'node-outbox']) {
+  for (const d of ['review', 'blocked', 'done', 'node-outbox', 'needs-clarification']) {
     const dir = path.join(P, 'queue', d);
     where[d] = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.json')) : [];
   }
@@ -80,4 +80,26 @@ test('on a node a blocked result still ends in blocked/, a recorded one in done/
   const failed = run({ succeeded: false }, 'grimm');
   assert.deepEqual(failed.where['node-outbox'], []);
   assert.deepEqual(failed.where.review, []);
+});
+
+// A stop record (a question for a human, no diff) is filed by a node in node-outbox/ so it ships to wok; a wok worker keeps filing it in needs-clarification/.
+const STOP = { succeeded: true, needsClarification: { reason: 'design-decision', openQuestions: 'which approach?' } };
+
+test('a stop record from a node ends in node-outbox/, not in needs-clarification/ or review/', () => {
+  const { r, where, P } = run(STOP, 'grimm');
+  assert.deepEqual(where['node-outbox'], ['t-1.json'], r.stderr);
+  assert.deepEqual(where['needs-clarification'], []);
+  assert.deepEqual(where.review, []);
+  assert.deepEqual(where.drafting, []);
+  assert.match(r.stderr, /t-1 stopped on a node with a question, ready to send to wok: t-1/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(P, 'queue', 'node-outbox', 't-1.json'), 'utf8')).id, 't-1');
+});
+
+test('a stop record on wok (no node id, or wok) still goes to needs-clarification/', () => {
+  for (const nodeId of [undefined, 'wok']) {
+    const { where } = run(STOP, nodeId);
+    assert.deepEqual(where['needs-clarification'], ['t-1.json'], JSON.stringify(nodeId));
+    assert.deepEqual(where['node-outbox'], [], JSON.stringify(nodeId));
+    assert.deepEqual(where.review, [], JSON.stringify(nodeId));
+  }
 });
