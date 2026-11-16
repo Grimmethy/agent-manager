@@ -74,6 +74,7 @@ Description=Agent Manager node pull (asks wok for work when a worker is free)
 [Service]
 WorkingDirectory=$REPO_DIR
 EnvironmentFile=$PIPELINE_DIR/node.env
+ExecStartPre=-/bin/sh -c 'node $REPO_DIR/src/node-loaded-sha.js write am-node-pull || true'
 ExecStart=$NODE_BIN $REPO_DIR/src/node-pull.js --daemon
 Nice=19
 IOSchedulingClass=idle
