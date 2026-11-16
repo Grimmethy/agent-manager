@@ -55,7 +55,7 @@ Raise the number of workers on a node one at a time and measure after each step.
 
 1. Baseline, with no farm running: `node src/farm-ramp.js baseline --site-url <the site's address>` (the median of three timed requests, plus the load average and free RAM). Keep the `siteMs` value.
 2. After each change in workers: `node src/farm-ramp.js step --workers <n> [--cap <n>] --baseline-ms <siteMs> --site-url <address> [--rate-limited]`.
-3. The decision: `raise` (no limit hit, go one worker higher), `hold` (at the cap), or `stop`. The limits are the site more than 20 percent slower than baseline, load average above 3.0, free RAM below 3 GB, or a rate limit from the cloud gateway (pass `--rate-limited`). On `stop` the cap is one below the worker count that broke a limit; keep it as the node's concurrency cap (`--cap` in `node src/node-registry.js register`).
+3. The decision: `raise` (no limit hit, go one worker higher), `hold` (at the cap), or `stop`. The limits are the site more than 20 percent slower than baseline, load average above 3.0, free RAM below 3 GB, or a rate limit from the cloud gateway (pass `--rate-limited`). On `stop` the cap is one below the worker count that broke a limit; record it as the node's concurrency cap (`--cap` in `node src/node-registry.js register`). The registry stores the cap but does not enforce it; the limit on claimed tasks is `AGENT_MANAGER_NODE_MAX_TASKS` (see the operating notes at the end).
 4. A value that cannot be measured (the site not answering, no `/proc/meminfo`) counts as a limit.
 
 ## 5. LAN addresses
@@ -96,3 +96,12 @@ Machine-to-machine traffic uses the wired LAN address, with the tailnet address 
 - Anything that moves a repo or the gateway for you: the export, copy, import and unit-writing steps of section 2a are run by hand, and the gateway's confirmation, its login and its start are yours.
 - Automatic scale-up after a passing trial; the trial score is read by the owner.
 - The cloud lane's Sonnet escalation, concurrency back-off and the unexplained liveness-probe 401s (see `cloud-lane.md`).
+
+## Operating notes from the first live runs (2026-11-14 to 2026-11-16)
+
+1. **One checkout for the units.** `am-node-send`, `am-node-heartbeat` and `am-node-pull` must all run from the same agent-manager checkout, the one the code-sync scripts update (on grimm, the checkout those scripts keep current). An older hand-copied directory that is not a checkout kept running old send and heartbeat code, and no codeSha was reported until the units were repointed.
+2. **Workers and slots.** Each extra cloud worker is one lane in the node's `lanes.json` (for example `gpu cloud2`, `cloud3`), one cloud-providers gateway on its own port (7451, 7452, and so on) and one transient unit started with `systemd-run`. `AGENT_MANAGER_NODE_MAX_TASKS` in `node-pull.env` (a whole number from 1 to 8, default 1) is how many claimed tasks the node may hold at once; set it equal to the number of workers. The registry's `concurrencyCap` is only recorded, not enforced.
+3. **Stop reporting.** A node worker that stops on an open question moves its record to `queue/node-outbox`. wok's package intake files it in `queue/needs-clarification` and ends the lease with the event `blocked`. A package wok can never accept (HTTP 400, for example a draft with no diff) moves to `queue/node-refused` with a `.reason` file.
+4. **Duplicate copies hold a slot.** A duplicate copy of an already stopped or sent task in the node's `queue/adhoc` holds a slot and can stall all claims. Look for the same file name in `queue/adhoc`, `queue/needs-clarification`, `queue/blocked` and `queue/node-sent`.
+5. **Site pauses are expected.** The site-traffic monitor pauses the node for 10 minutes when a visitor is on the Property Forager site ("site in use"); the registry then shows `paused` true. That is expected (section 1, rule 3).
+6. **Measured 2026-11-16, three workers.** grimm load was about 0.2 to 0.7 and 94 percent idle. A task takes about 2 minutes from claim to arrival on wok, and about 17 minutes from the first branch verdict to merged (wok's merge step is the slow leg).
