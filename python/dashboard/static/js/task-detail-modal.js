@@ -248,6 +248,11 @@ function renderTaskDetailModal(task) {
   }
   if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
   html += `<div><strong>${escapeHtmlBright(task.title || '')}</strong></div>`;
+  // Hub record id (HUB0439 4/4): a coordinating hub shows its own record id, plus the parent
+  // hub id when it has one, as a muted copy-friendly line under the title.
+  if (task._foundState === 'coordinating') {
+    html += `<div class="meta" style="user-select:all">${escapeHtml(task.id)}${task.parentHub ? ' · ' + escapeHtml(task.parentHub) : ''}</div>`;
+  }
   // Hub back-link (2026-09-06, Grimmethy: "when a task is a sub-task of a hub I should be
   // able to click into the hub task from the top of the sub task's task log") -- the
   // inverse of renderSubTaskChecklist just below (which shows a hub's children): a
