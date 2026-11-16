@@ -344,3 +344,54 @@ test('shrinking listDirs closes removed workers and growing it re-opens them', a
   assert.equal(w1AfterGrow.length, 2, 'two w1 handles after grow (original closed + new registered)');
   assert.ok(w1AfterGrow.some((h) => h.closeCount === 0), 'the new w1 handle is not closed');
 });
+
+// (h) every watcher gets an 'error' listener that logs 'watch error'; a throwing deps.watch logs 'cannot watch' and the daemon still starts
+test('(h) watcher error listeners log watch error, and a throwing deps.watch logs cannot watch while the daemon still starts', async (t) => {
+  const { env, pipelineDir } = setup(t);
+  fs.mkdirSync(path.join(pipelineDir, 'queue', 'drafting', 'w1'), { recursive: true });
+  fs.mkdirSync(path.join(pipelineDir, 'queue', 'drafting', 'w2'), { recursive: true });
+  const server = await claimServer(t, [{ body: { ok: true, task: null, retryAfterSec: 0 } }]);
+
+  // Part one: every fake handle has an 'error' listener, and invoking it logs 'watch error' with the message.
+  {
+    const timers = fakeTimers();
+    const w = recordingWatch();
+    const logs = [];
+    const daemon = startDaemon({
+      env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url },
+      deps: { now: clock().now, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, watch: w.watch, log: (line) => logs.push(String(line)) },
+    });
+    t.after(() => daemon.stop());
+    await settle();
+    assert.ok(w.watched.length > 0, 'at least one watcher is open');
+    for (const handle of w.watched) {
+      const errorRegs = handle.onCalls.filter((c) => c.event === 'error');
+      assert.equal(errorRegs.length, 1, `${handle.dir} has exactly one error listener`);
+      errorRegs[0].handler(new Error('boom'));
+    }
+    assert.ok(logs.some((l) => l.includes('watch error') && l.includes('boom')), 'error listener logs a watch error line containing boom');
+    daemon.stop();
+  }
+
+  // Part two: deps.watch throws for w1; the log names it as cannot watch and the daemon still starts with w2 watched.
+  {
+    const timers = fakeTimers();
+    const w = recordingWatch();
+    const logs = [];
+    const throwDir = path.join(pipelineDir, 'queue', 'drafting', 'w1');
+    const watch = (dir, cb) => {
+      if (dir === throwDir) throw new Error('EACCES');
+      return w.watch(dir, cb);
+    };
+    const daemon = startDaemon({
+      env: { ...env, AGENT_MANAGER_CLAIM_URL: server.url },
+      deps: { now: clock().now, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, watch, log: (line) => logs.push(String(line)) },
+    });
+    t.after(() => daemon.stop());
+    await settle();
+    assert.ok(logs.some((l) => l.includes('cannot watch') && l.includes('queue/drafting/w1')), 'log names the directory that could not be watched');
+    assert.ok(w.watched.some((h) => h.dir === path.join(pipelineDir, 'queue', 'drafting', 'w2')), 'w2 is still watched after w1 failed');
+    assert.equal(typeof daemon.stop, 'function', 'daemon started and returned a handle');
+    daemon.stop();
+  }
+});
