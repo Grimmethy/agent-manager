@@ -405,3 +405,61 @@ test('applyRetryCheck: the find feedback is not appended twice for the same fail
   const second = JSON.parse(fs.readFileSync(path.join(pendingDir, 'dup.json'), 'utf8'));
   assert.equal(second.priorRejectionFeedback.length, 1);
 });
+
+// --- stale-base / rebase-conflict from git-runner.js prepareStackedBranch: a git-STATE problem, held bounded by REBASE_MAX_HOLDS (=3)
+const STALE_REASON = 'prepareStackedBranch: origin/agent/rolling is based on a stale point of master (main has moved on since this rolling branch was last built) and neither merging the current master into it nor rebasing its still-unmerged commits onto it worked -- needs a human to reconcile, not an automatic sync: CONFLICT';
+
+test('applyRetryCheck: a stale-base/rebase failure is HELD with no applyRetryCount increment while the apply clone is dirty', () => {
+  const { root, blockedDir, pendingDir } = setupDirs();
+  const approvedDir = path.join(root, 'queue', 'approved');
+  const needsClarificationDir = path.join(root, 'queue', 'needs-clarification');
+  writeBlockedTask(blockedDir, 'rebase-1', { blockedReason: STALE_REASON, applyRetryCount: 1 });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, approvedDir, needsClarificationDir, recordModelOutcome: () => {}, isApplyCloneClean: () => false });
+
+  assert.equal(summary.held, 1);
+  assert.equal(summary.requeued, 0);
+  assert.equal(fs.existsSync(path.join(pendingDir, 'rebase-1.json')), false, 'no redraft');
+  const held = JSON.parse(fs.readFileSync(path.join(blockedDir, 'rebase-1.json'), 'utf8'));
+  assert.equal(held.applyRetryCount, 1, 'retry count untouched');
+  assert.equal(held.rebaseHolds, 1);
+});
+
+test('applyRetryCheck: a stale-base/rebase failure is released to approved/ when the apply clone is clean', () => {
+  const { root, blockedDir, pendingDir } = setupDirs();
+  const approvedDir = path.join(root, 'queue', 'approved');
+  const needsClarificationDir = path.join(root, 'queue', 'needs-clarification');
+  writeBlockedTask(blockedDir, 'rebase-2', { blockedReason: STALE_REASON, applyRetryCount: 0 });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, approvedDir, needsClarificationDir, recordModelOutcome: () => {}, isApplyCloneClean: () => true });
+
+  assert.equal(summary.released, 1);
+  assert.equal(summary.requeued, 0);
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'rebase-2.json')));
+  assert.equal(fs.existsSync(path.join(pendingDir, 'rebase-2.json')), false, 'no redraft');
+  const t = JSON.parse(fs.readFileSync(path.join(approvedDir, 'rebase-2.json'), 'utf8'));
+  assert.equal(t.status, 'approved');
+  assert.equal(t.blockedReason, undefined);
+  assert.equal(t.applyRetryCount, 0);
+});
+
+test('applyRetryCheck: a stale-base/rebase failure escalates to needs-clarification (git-state-rebase-stuck) after REBASE_MAX_HOLDS holds', () => {
+  const { root, blockedDir, pendingDir } = setupDirs();
+  const approvedDir = path.join(root, 'queue', 'approved');
+  const needsClarificationDir = path.join(root, 'queue', 'needs-clarification');
+  writeBlockedTask(blockedDir, 'rebase-3', { blockedReason: STALE_REASON, applyRetryCount: 0 });
+
+  // REBASE_MAX_HOLDS is 3: the first two ticks hold, the third escalates.
+  let last = null;
+  for (let i = 0; i < 3; i++) {
+    last = applyRetryCheck({ blockedDir, pendingDir, approvedDir, needsClarificationDir, recordModelOutcome: () => {}, isApplyCloneClean: () => false });
+  }
+
+  assert.equal(last.exhausted, 1);
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'rebase-3.json')), 'no longer parked in blocked/');
+  assert.equal(fs.existsSync(path.join(pendingDir, 'rebase-3.json')), false, 'no redraft');
+  const esc = JSON.parse(fs.readFileSync(path.join(needsClarificationDir, 'rebase-3.json'), 'utf8'));
+  assert.equal(esc.needsClarification.reason, 'git-state-rebase-stuck');
+  assert.equal(esc.applyRetryCount, 0, 'never spent a retry');
+  assert.ok(esc.history.some((h) => h.stage === 'needs-clarification'));
+});

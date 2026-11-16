@@ -93,7 +93,7 @@ function isFindStringMiss(task) {
 // path-config mismatch that had nothing to do with the draft's content -- the exact same
 // "treating infrastructure like a draft failure" mistake this whole check exists to
 // prevent for the three shapes above. Same fix shape, one more real shape covered.
-const INFRA_APPLY_RE = /apply clone is dirty|local changes to the following files would be overwritten|cannot rebase: you have unstaged changes|is outside repository at/i;
+const INFRA_APPLY_RE = /apply clone is dirty|local changes to the following files would be overwritten|cannot rebase: you have unstaged changes|is outside repository at|is based on a stale point of|neither merging the current \S+ into it nor rebasing/i;
 // 2026-09-26: a git subprocess hitting git-runner.js's 60s cap ("spawnSync git ETIMEDOUT", or its annotated form "git <cmd> timed out
 // after <n>ms") is also infrastructure -- the apply clone sits on the same rotational disk as the model files (IO pressure avg300 ~13%),
 // and 23 such timeouts across 3 days hit already-approved drafts (arch_discovery community-12 burned all 2 apply retries on it and was
@@ -103,6 +103,9 @@ const INFRA_APPLY_RE = /apply clone is dirty|local changes to the following file
 // counter is never touched for this failure class -- redrafting cannot fix a network timeout, and burning retries on it masks the real cause.
 const GIT_TIMEOUT_RE = /spawnSync git ETIMEDOUT|\bgit [\w-]+[^\n]{0,80} timed out after \d+ms/i;
 const APPLY_TIMEOUT_MAX_RELEASES = 4;
+// Stale-base / rebase-conflict failures from git-runner.js prepareStackedBranch are git-STATE problems, not draft quality. Each tick they are held
+// (no applyRetryCount burned). After REBASE_MAX_HOLDS holds with the clone still unable to recover, the task escalates to needs-clarification.
+const REBASE_MAX_HOLDS = 3;
 function isGitTimeoutApplyFailure(task) {
   return isApplyFailure(task) && GIT_TIMEOUT_RE.test(String(task.blockedReason || ''))
     && (Number(task.applyTimeoutReleases) || 0) < APPLY_TIMEOUT_MAX_RELEASES;
@@ -113,6 +116,11 @@ function isGitTimeoutApplyFailure(task) {
 // times we've tried to re-apply; the underlying cause (network/git) is unchanged.
 function isGitTimeoutFailure(task) {
   return isApplyFailure(task) && GIT_TIMEOUT_RE.test(String(task.blockedReason || ''));
+}
+// Stale-base / rebase-conflict wording thrown by git-runner.js prepareStackedBranch (a git-STATE problem, held bounded by REBASE_MAX_HOLDS).
+const REBASE_STALE_RE = /is based on a stale point of|neither merging the current \S+ into it nor rebasing/i;
+function isRebaseStaleFailure(task) {
+  return isApplyFailure(task) && REBASE_STALE_RE.test(String(task.blockedReason || ''));
 }
 function isInfraApplyFailure(task) {
   return isApplyFailure(task) && (INFRA_APPLY_RE.test(String(task.blockedReason || '')) || isGitTimeoutApplyFailure(task));
@@ -203,6 +211,27 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approv
 
       // Infra short-circuit -- see isInfraApplyFailure's own header. Before the retry-count logic and regardless of
       // applyRetryCount: the failure says nothing about this task, so it neither burns a retry nor gets redrafted.
+      // Stale-base / rebase-conflict short-circuit (git-runner.js prepareStackedBranch): a git-STATE problem, held like a dirty
+      // clone but bounded by REBASE_MAX_HOLDS. Every encounter counts as one hold, whether the task is then held or released.
+      if (isRebaseStaleFailure(task) && needsClarificationDir) {
+        task.rebaseHolds = (Number(task.rebaseHolds) || 0) + 1;
+        if (task.rebaseHolds >= REBASE_MAX_HOLDS) {
+          task.needsClarification = {
+            reason: 'git-state-rebase-stuck',
+            openQuestions: [
+              `Apply failed on a stale base or rebase conflict ${task.rebaseHolds} times (cap ${REBASE_MAX_HOLDS}): ${String(task.blockedReason || '')}`,
+              'Reconcile the rolling branch with main by hand (merge or rebase it), then requeue this task.',
+            ],
+          };
+          appendHistoryEvent(task, 'needs-clarification', `escalated after ${REBASE_MAX_HOLDS} stale-base/rebase holds -- git state stuck`);
+          fs.mkdirSync(needsClarificationDir, { recursive: true });
+          fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
+          fs.unlinkSync(filePath);
+          summary.exhausted++;
+          continue;
+        }
+        fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
+      }
       if (isInfraApplyFailure(task)) {
         if (approvedDirResolved && isApplyCloneClean()) {
           step = 'record';
