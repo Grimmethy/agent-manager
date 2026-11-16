@@ -272,3 +272,67 @@ test('the pause marker keeps the started daemon from claiming at all', async (t)
   const seen = await runDaemon(t, { paused: true });
   assert.equal(seen.length, 0);
 });
+
+// ---- dead duplicates: a leased adhoc/pending record whose name also sits in a sibling queue does not hold a slot ----
+const { isDeadDuplicate } = require('./node-pull-entry.js');
+
+for (const sib of ['needs-clarification', 'blocked', 'node-sent', 'node-refused', 'node-outbox']) {
+  test(`a leased adhoc record also present in ${sib} is a dead duplicate and is not counted`, (t) => {
+    const { env, pipelineDir } = setup(t);
+    put(pipelineDir, 'adhoc', 'dup', { leasedTo: NODE });
+    put(pipelineDir, sib, 'dup', {});
+    assert.equal(countHeldTasks(pipelineDir, NODE), 0);
+    assert.equal(buildDaemonDeps(env).isWorkerFree(), true);
+  });
+}
+
+test('a leased pending record also present in node-sent is not counted', (t) => {
+  const { pipelineDir } = setup(t);
+  put(pipelineDir, 'pending', 'dup', { leasedTo: NODE });
+  put(pipelineDir, 'node-sent', 'dup', {});
+  assert.equal(countHeldTasks(pipelineDir, NODE), 0);
+});
+
+test('the same name in done (not a dead-duplicate directory) still counts', (t) => {
+  const { pipelineDir } = setup(t);
+  put(pipelineDir, 'adhoc', 'dup', { leasedTo: NODE });
+  put(pipelineDir, 'done', 'dup', {});
+  assert.equal(countHeldTasks(pipelineDir, NODE), 1);
+});
+
+test('a leased drafting record with a same-named needs-clarification file still counts', (t) => {
+  const { env, pipelineDir } = setup(t);
+  put(pipelineDir, path.join('drafting', 'worker-x'), 'dup', { leasedTo: NODE });
+  put(pipelineDir, 'needs-clarification', 'dup', {});
+  assert.equal(countHeldTasks(pipelineDir, NODE), 1);
+  assert.equal(buildDaemonDeps(env).isWorkerFree(), false);
+});
+
+test('a different name in needs-clarification does not make a leased adhoc record dead', (t) => {
+  const { pipelineDir } = setup(t);
+  put(pipelineDir, 'adhoc', 'a1', { leasedTo: NODE });
+  put(pipelineDir, 'needs-clarification', 'b1', {});
+  assert.equal(countHeldTasks(pipelineDir, NODE), 1);
+});
+
+test('three dead duplicates do not hold slots: with limit 3 the worker is free', (t) => {
+  const { env, pipelineDir } = setup(t, { AGENT_MANAGER_NODE_MAX_TASKS: '3' });
+  const siblings = ['needs-clarification', 'blocked', 'node-sent'];
+  for (let i = 0; i < 3; i += 1) {
+    put(pipelineDir, 'adhoc', 'dup' + i, { leasedTo: NODE });
+    put(pipelineDir, siblings[i], 'dup' + i, {});
+  }
+  assert.equal(countHeldTasks(pipelineDir, NODE), 0);
+  assert.equal(buildDaemonDeps(env).isWorkerFree(), true);
+});
+
+test('isDeadDuplicate: exact names in a sibling are dead; drafting, prefixes, other queues and missing directories are not', (t) => {
+  const { pipelineDir } = setup(t);
+  assert.equal(isDeadDuplicate(pipelineDir, 'adhoc', 'x.json'), false, 'no sibling files yet');
+  put(pipelineDir, 'blocked', 'x', {});
+  assert.equal(isDeadDuplicate(pipelineDir, 'adhoc', 'x.json'), true, 'exact name in blocked');
+  assert.equal(isDeadDuplicate(pipelineDir, 'adhoc', 'x'), false, 'prefix or shorter name is not the same file');
+  assert.equal(isDeadDuplicate(pipelineDir, path.join('drafting', 'worker-x'), 'x.json'), false, 'drafting is never dead');
+  put(pipelineDir, 'done', 'y', {});
+  assert.equal(isDeadDuplicate(pipelineDir, 'adhoc', 'y.json'), false, 'done is not a dead-duplicate directory');
+});
