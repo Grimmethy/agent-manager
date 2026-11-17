@@ -431,6 +431,21 @@ def api_git_unmerged_branches():
         import branch_projects
         from app import get_active_repo_root
         branches, pending = branch_projects.combined_branches(branches, get_active_repo_root())
+    # Merge-loop status per branch, read on every render from the checker and merger ledgers (python/dashboard/merge_loop_status.py).
+    # Each branch is copied first so the shared cached list is never mutated.
+    from merge_loop_status import read_merge_loop_status
+    enriched = []
+    for b in branches:
+        b = dict(b)
+        b["merge_loop"] = read_merge_loop_status(b["branch"])
+        enriched.append(b)
+    branches = enriched
+    if request.args.get("left_for_you") == "1":
+        # Left for the owner: the latest checker row says LEAVE-FOR-OWNER and the merger ledger has no row for the branch.
+        def _left_for_you(ml):
+            row = ml["checker"]["row"]
+            return bool(row) and row.get("outcome") == "LEAVE-FOR-OWNER" and ml["merger"]["row"] is None
+        branches = [b for b in branches if _left_for_you(b["merge_loop"])]
     resp = jsonify(branches)
     resp.headers["X-Branch-Cache-Age"] = str(max(0, int(time.time() - filled))) if filled else "0"
     resp.headers["X-Branch-Projects-Pending"] = ",".join(pending)
