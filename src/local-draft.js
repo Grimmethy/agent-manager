@@ -2269,8 +2269,13 @@ async function main() {
   // up in the dashboard while the draft is still running -- and survives the worker being
   // killed mid-draft (chat preempt, stop.sh) instead of vanishing with the process. The
   // authoritative writeTaskJson below still runs on completion; these are additive.
+  // A file carrying draftInProgress: true is an UNFINISHED draft: the checkpoint writes
+  // below were flushed mid-run, so any blockedReason in such a file is provisional and may
+  // be superseded by the authoritative writeTaskJson on completion. The marker is added only
+  // to this in-flight copy; the live task object and the terminal write are never marked.
+  // task.status is already used by the pipeline, so the marker uses draftInProgress instead.
   setHistoryPersistHook(() => {
-    try { writeTaskJson(taskPath, task); } catch (_) { /* best-effort */ }
+    try { writeTaskJson(taskPath, { ...task, draftInProgress: true }); } catch (_) { /* best-effort */ }
   });
 
   // 2026-09-07 (Grimmethy, live-testing the Workers-tab assign-task override: "kicking
