@@ -10,7 +10,8 @@ const fs = require('fs');
 const path = require('path');
 const workerSwitch = require('./worker-switch.js');
 const notifyModule = require('./notify.js');
-const { PENDING_FILE } = require('./node-code-restart.js');
+const childProcess = require('child_process');
+const { PENDING_FILE, AUDIT_FILE } = require('./node-code-restart.js');
 
 const defaultNotify = notifyModule.notify || notifyModule;
 
@@ -104,7 +105,8 @@ function drainStep({ pipelineDir, env = process.env, now = Date.now, pauses = wo
   if (!pipelineDir) return 'none';
   const file = path.join(pipelineDir, 'instances', PENDING_FILE);
   const record = readRecord(file);
-  if (!record) return 'none';
+  // A record whose restart was already attempted (finishDrain) is no longer a drain: it must not re-set the pause.
+  if (!record || record.restartAttempted === true) return 'none';
 
   const nowMs = toMs(now);
   const sha8 = record.newSha.slice(0, 8);
@@ -140,4 +142,97 @@ function drainStep({ pipelineDir, env = process.env, now = Date.now, pauses = wo
   return allIdle && !draftBusy ? 'ready' : 'waiting';
 }
 
-module.exports = { drainStep, readLaneStatuses, draftingHasTask, DRAIN_PAUSE_TTL_MIN, DEFAULT_MAX_MIN };
+const DEFAULT_RESTART_UNITS = ['am-node-pull.service'];
+const RESTART_MODES = ['on', 'dry-run'];
+
+function defaultRun(cmd, args, opts) {
+  return childProcess.execFileSync(cmd, args, { encoding: 'utf8', timeout: 30000, ...opts });
+}
+
+// Units from AGENT_MANAGER_CODE_RESTART_UNITS (comma separated). Unset means the default unit; an empty value means none.
+function restartUnits(env) {
+  if (env.AGENT_MANAGER_CODE_RESTART_UNITS == null) return DEFAULT_RESTART_UNITS.slice();
+  return String(env.AGENT_MANAGER_CODE_RESTART_UNITS).split(',').map((u) => u.trim()).filter(Boolean);
+}
+
+// Appends one JSON line to instances/code-restart.log. Best effort: an audit failure never changes the outcome.
+function auditLine(pipelineDir, line) {
+  try {
+    fs.appendFileSync(path.join(pipelineDir, 'instances', AUDIT_FILE), `${JSON.stringify(line)}\n`);
+  } catch (e) { /* best effort */ }
+}
+
+// Runs the restart for a record that drainStep reported ready. Units run first (systemctl --user restart), then launch.sh.
+// Returns 'off' (AGENT_MANAGER_CODE_PULL is not on or dry-run), 'none' (no record, or already attempted), 'dry-run',
+// 'restarted' or 'failed'. The record is marked restartAttempted before any command, so a later heartbeat never repeats it.
+// On failure the record stays, the pause is still cleared (the node is not left paused) and ONE notice is sent.
+function finishDrain({ pipelineDir, env = process.env, run = defaultRun, notify = defaultNotify, now = Date.now, pauses = workerSwitch } = {}) {
+  if (!pipelineDir) return 'none';
+  const mode = String(env.AGENT_MANAGER_CODE_PULL == null ? 'off' : env.AGENT_MANAGER_CODE_PULL).trim();
+  if (!RESTART_MODES.includes(mode)) return 'off';
+  const file = path.join(pipelineDir, 'instances', PENDING_FILE);
+  const record = readRecord(file);
+  if (!record || record.restartAttempted === true) return 'none';
+
+  const nowMs = toMs(now);
+  const at = new Date(nowMs).toISOString();
+  const sha8 = record.newSha.slice(0, 8);
+
+  const steps = [];
+  if (record.units === true) {
+    for (const unit of restartUnits(env)) {
+      steps.push({ name: `restart ${unit}`, cmd: 'systemctl', args: ['--user', 'restart', unit] });
+    }
+  }
+  if (record.pipeline === true) {
+    const root = env.AGENT_MANAGER_REPO_ROOT;
+    if (root) steps.push({ name: 'launch.sh', cmd: path.join(root, 'scripts', 'launch.sh'), args: [], cwd: root });
+    else steps.push({ name: 'launch.sh', cmd: null, args: [], error: 'AGENT_MANAGER_REPO_ROOT is not set' });
+  }
+
+  if (mode === 'dry-run') {
+    for (const step of steps) {
+      auditLine(pipelineDir, { at, newSha: record.newSha, step: step.name, result: 'dry-run', command: step.cmd ? [step.cmd, ...step.args].join(' ') : null, error: step.error || null });
+    }
+    return 'dry-run';
+  }
+
+  writeRecord(file, { ...record, restartAttempted: true, restartAt: at });
+  let failed = 0;
+  for (const step of steps) {
+    let ok = true;
+    let error = step.error || null;
+    if (!step.error) {
+      try {
+        run(step.cmd, step.args, { cwd: step.cwd });
+      } catch (e) {
+        ok = false;
+        error = e.message;
+      }
+    } else {
+      ok = false;
+    }
+    if (!ok) failed += 1;
+    auditLine(pipelineDir, { at, newSha: record.newSha, step: step.name, ok, error });
+  }
+
+  const current = pauses.readPause('node', env, nowMs);
+  if (current && current.source === OWN_SOURCE) pauses.clearPause('node', env);
+
+  if (failed > 0) {
+    const result = notify({
+      level: 'urgent',
+      key: `code-restart-failed:${sha8}`,
+      title: 'Node code restart failed',
+      text: `${failed} of ${steps.length} restart step(s) for ${sha8} failed; see instances/code-restart.log. The code-sync pause was cleared so the node is not left paused.`,
+    }, { env, now: () => nowMs });
+    if (result && typeof result.then === 'function') result.then(null, () => {});
+    return 'failed';
+  }
+  try {
+    fs.unlinkSync(file);
+  } catch (e) { /* already gone */ }
+  return 'restarted';
+}
+
+module.exports = { drainStep, finishDrain, readLaneStatuses, draftingHasTask, DRAIN_PAUSE_TTL_MIN, DEFAULT_MAX_MIN };
