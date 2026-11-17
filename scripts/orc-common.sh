@@ -75,7 +75,7 @@ if [[ -z "$SNAPSHOT_FILE" ]]; then
   done
 fi
 if [[ -z "$SNAPSHOT_FILE" ]]; then
-  INSTANCE_ID="${AGENT_MANAGER_INSTANCE_ID:-unknown}"
+  [[ -n "${INSTANCE_ID:-}" ]] || INSTANCE_ID="${AGENT_MANAGER_INSTANCE_ID:-unknown}"
   SNAPSHOT_FILE="/dev/shm/agent-manager-queue-tick-${INSTANCE_ID}.json"
 fi
 
