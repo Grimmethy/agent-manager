@@ -49,20 +49,51 @@ function renderHistoryPanel() {
   });
 }
 
-async function fetchJson(url, { timeoutMs = 8000 } = {}) {
+// Failure memory (HUB0531 1/4): a timeout, AbortError, or non-OK response for a URL is
+// remembered with Date.now() and identical requests get that stored error back for
+// FETCH_FAILURE_MEMORY_MS. Expiry is checked only when a new call arrives -- no timer.
+const FETCH_FAILURE_MEMORY_MS = 15000;
+// In-flight GET dedupe: concurrent calls for the same URL share one promise, cleared on
+// settle. Note: the key is the URL alone, so sharers get the first caller's timeoutMs and
+// the same parsed JSON object reference -- a caller that mutates the result affects the others.
+const fetchInFlight = new Map();
+const fetchFailures = new Map();
+
+async function fetchJsonUncached(url, timeoutMs) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   let r;
   try {
     r = await fetch(url, { signal: controller.signal });
   } catch (e) {
-    if (e.name === 'AbortError') throw new Error(url + ' -> timed out after ' + (timeoutMs / 1000) + 's');
+    if (e.name === 'AbortError') {
+      const message = url + ' -> timed out after ' + (timeoutMs / 1000) + 's';
+      fetchFailures.set(url, { message, at: Date.now() });
+      throw new Error(message);
+    }
     throw e;
   } finally {
     clearTimeout(timeoutId);
   }
-  if (!r.ok) throw new Error(url + ' -> ' + r.status);
+  if (!r.ok) {
+    const message = url + ' -> ' + r.status;
+    fetchFailures.set(url, { message, at: Date.now() });
+    throw new Error(message);
+  }
   return r.json();
+}
+
+async function fetchJson(url, { timeoutMs = 8000 } = {}) {
+  const failure = fetchFailures.get(url);
+  if (failure) {
+    if (Date.now() - failure.at < FETCH_FAILURE_MEMORY_MS) throw new Error(failure.message);
+    fetchFailures.delete(url);
+  }
+  const pending = fetchInFlight.get(url);
+  if (pending) return pending;
+  const promise = fetchJsonUncached(url, timeoutMs).finally(() => fetchInFlight.delete(url));
+  fetchInFlight.set(url, promise);
+  return promise;
 }
 
 // Stale-render guard (2026-09-29, "display stutters and switches to the wrong tab"): every

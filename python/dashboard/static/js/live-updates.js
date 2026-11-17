@@ -166,14 +166,30 @@ function startLiveUpdates(deps) {
   let pending = null;
   let stream = null;
 
+  // Single-flight policy: RERUN ON COMPLETION, not drop. A trigger that arrives while a refresh is running is merged into `pending` (mergePlans) and the loop below
+  // re-checks `pending` after each await, so it is applied right after the current refresh settles; the latest state is never lost. That loop check is the
+  // rerun flag, checked by the completion path itself, so no timer is used. `inFlightTabs` holds the keys of tabs whose refresh is running: a refresh for a tab
+  // starts only if its key is absent, and the key is removed in a finally. `running` is kept as the page-wide serializer because applyLivePlan / runRefreshGuarded
+  // refresh shared state (summary, plugins, nav, main) in a fixed order and are not written to run concurrently; the Set is the per-tab guard layered on top.
+  const inFlightTabs = new Set();
+
   async function drain() {
     if (running) return;
     running = true;
     try {
       while (pending && !closed) {
+        const t = deps.getTab();
+        const tabKey = (t === null || t === undefined) ? '__none__' : String(t);
+        if (inFlightTabs.has(tabKey)) break;      // this tab is already refreshing: leave `pending` in place; the running refresh's completion drains it
         const plan = pending;
         pending = null;
-        try { await deps.apply(plan); } catch (e) { /* one failed refresh must not stop the next */ }
+        inFlightTabs.add(tabKey);
+        try {
+          await deps.apply(plan);
+        } catch (e) { /* one failed refresh must not stop the next */
+        } finally {
+          inFlightTabs.delete(tabKey);
+        }
       }
     } finally {
       running = false;

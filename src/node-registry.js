@@ -7,6 +7,10 @@
 //                      freeRamGb, paused}; written atomically.
 //   nodes-tokens.json  a map id -> token string, mode 600. A token is created when a node is registered and printed ONCE; it is never part of a node record.
 //
+// behindSince (node code sync, piece 5a): the heartbeat time at which a node's codeSha first differed from the sha wok published for agent-manager
+// (latest.json in AGENT_MANAGER_CODE_PUBLISH_DIR, default <AGENT_MANAGER_PIPELINE_DIR>/code-publish). Set on the first mismatch, kept while it lasts,
+// deleted when the shas match, left alone when either sha is unknown. Stored with the record, so a registry restart keeps the clock.
+//
 // A heartbeat (recordHeartbeat) refreshes lastSeen and the reported state. The status of a node is computed, never stored:
 //   stale   no heartbeat for AGENT_MANAGER_NODE_STALE_MIN minutes (default 5), or never one
 //   off     the node reported state "off" (an operator turned it off on purpose)
@@ -26,6 +30,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
 const { notify } = require('./notify.js');
+const { readPublished } = require('./node-code-publish.js');
 
 const NODE_ID_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 const HEARTBEAT_STATES = ['up', 'off'];
@@ -126,7 +131,16 @@ function codeShaOrNull(v) {
   return typeof v === 'string' && /^[0-9a-f]{40}$/.test(v) ? v : null;
 }
 
-// Records a heartbeat for a registered node and returns its record. Throws on an unknown node, an unusable state or a non-boolean paused.
+// The sha wok published for agent-manager, or null when nothing usable is published (never throws).
+function publishedSha(env) {
+  const dir = String(env.AGENT_MANAGER_CODE_PUBLISH_DIR || '').trim()
+    || (String(env.AGENT_MANAGER_PIPELINE_DIR || '').trim() ? path.join(String(env.AGENT_MANAGER_PIPELINE_DIR).trim(), 'code-publish') : '');
+  if (!dir) return null;
+  const entry = readPublished(dir, 'agent-manager');
+  return entry && typeof entry.sha === 'string' ? codeShaOrNull(entry.sha) : null;
+}
+
+// Records a heartbeat for a registered node and returns its record plus previousBehindSince (the stamp before this heartbeat, or null; not stored). Throws on an unknown node, an unusable state or a non-boolean paused.
 function recordHeartbeat(payload = {}, env = process.env, now = Date.now()) {
   const nodes = loadNodes(env);
   const record = nodes[payload.id];
@@ -144,9 +158,14 @@ function recordHeartbeat(payload = {}, env = process.env, now = Date.now()) {
     paused: payload.paused === true,
     codeSha: codeShaOrNull(payload.codeSha),
   };
+  const wokSha = publishedSha(env);
+  if (wokSha && updated.codeSha) {
+    if (updated.codeSha === wokSha) delete updated.behindSince;
+    else if (!updated.behindSince) updated.behindSince = updated.lastSeen;
+  }
   nodes[payload.id] = updated;
   saveNodes(nodes, env);
-  return updated;
+  return { ...updated, previousBehindSince: record.behindSince || null };
 }
 
 function statusOf(record, env = process.env, now = Date.now()) {
