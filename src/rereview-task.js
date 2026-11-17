@@ -114,7 +114,7 @@ async function main() {
   if (!result.ok) process.exit(2);
 }
 
-module.exports = { rereviewTask, isRereviewable, REREVIEWABLE_STATES, STALE_REVIEW_FIELDS };
+module.exports = { rereviewTask, isRereviewable, hasDraft, REREVIEWABLE_STATES, STALE_REVIEW_FIELDS };
 
 if (require.main === module) {
   main();
