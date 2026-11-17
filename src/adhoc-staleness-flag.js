@@ -30,6 +30,7 @@ const { findStalenessCandidates } = require('./staleness-audit.js');
 const { classifyVote } = require('./auto-confirm-review.js');
 const { normalizeTaskTokens, dupSimilarityThreshold } = require('./staleness-audit-dedup.js');
 const { jaccardSimilarity } = require('./text-similarity.js');
+const { isLiveHub } = require('./stacked-grounding.js');
 
 const SCAN_DIRS = ['blocked', 'needs-clarification', 'coordinating'];
 const CORPUS_DIRS = ['pending', 'drafting', 'blocked', 'needs-clarification', 'coordinating', 'adhoc', 'approved', 'review'];
@@ -368,6 +369,21 @@ async function sweep({ pipelineDir, repoRoot, majorityVote, dryRun = false, now 
     if (!flag) { summary.skipped += 1; continue; }
     if (existingFlagIsFresh(task, flag.reason, now)) { summary.skipped += 1; continue; }
 
+    // Live-hub pieces (a stacked child whose hub branch resolves) must never be retired
+    // while their predecessors are unapplied -- the hub's worktree isn't in place yet, so
+    // the evidence (files/symbols) the flag is based on may not actually exist in the world
+    // the piece will build against. Convert retire -> wait so the human sees "apply the hub
+    // first, then re-check" rather than a premature retirement. Non-stacked tasks (no
+    // stacked.branch, or seq <= 1, or the branch doesn't resolve) pass through unchanged.
+    if (flag.disposition === 'retire' && isLiveHub(task, repoRoot)) {
+      flag = {
+        ...flag,
+        disposition: 'wait',
+        reason: `${flag.reason}-wait-for-hub`,
+        evidence: [`live-hub piece: predecessors not yet applied, retire suppressed (re-check after hub lands)`],
+      };
+    }
+
     if (dryRun) {
       summary.wouldFlag.push({ id: task.id, state: entry.state, ...flag });
       summary.flagged += 1;
@@ -375,7 +391,7 @@ async function sweep({ pipelineDir, repoRoot, majorityVote, dryRun = false, now 
     }
 
     try {
-      if (flag.confidence === 'high') {
+      if (flag.confidence === 'high' && flag.disposition !== 'wait') {
         writeFlag(filePath, task, flag, now);
         summary.flagged += 1; summary.highConfidence += 1;
         continue;
