@@ -199,6 +199,8 @@ from app_branch_helpers import (  # noqa: F401
     partition_held_hub_branches,
 )
 
+from branch_projects import failed_project_labels  # noqa: E402
+
 # Moved verbatim into app_source_plugin_helpers.py (2026-10-01 breakdown); re-exported so every importer of app.X is unchanged.
 from app_source_plugin_helpers import (  # noqa: F401
     ALWAYS_ACTIVE_SOURCES,
@@ -281,6 +283,21 @@ def lan_mutation_gate():
             "set on the dashboard and supplied as a Bearer token."
         ))
     abort(401, description="Bad or missing Bearer token.")
+
+
+@app.after_request
+def add_branch_projects_failed_header(resp):
+    """Name the projects whose last unmerged-branches refresh failed, beside the route's X-Branch-Projects-Pending header. Omitted when none failed."""
+    if request.path != "/api/git/unmerged-branches":
+        return resp
+    try:
+        labels = [str(label).replace("\r", "").replace("\n", "") for label in failed_project_labels()]
+    except Exception as exc:  # noqa: BLE001 -- a header must never break the response
+        print(f"[branches] failed-project labels unavailable (non-fatal): {exc}", file=sys.stderr)
+        return resp
+    if labels:
+        resp.headers["X-Branch-Projects-Failed"] = ",".join(labels)
+    return resp
 
 
 import logging
@@ -2443,13 +2460,19 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
 
         conflict = memo(repo_root, base_sha, head_sha, "conflict", lambda: _check_merge_conflict(repo_root, main_branch, branch), final=lambda v: v.get("checked") is True)
 
-        label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
-        candidate_count = _triage_candidate_count(repo_root, main_branch, full_ref, subject, label)
         try:
-            trailers = memo(repo_root, base_sha, head_sha, "trailers", lambda: branch_trailer_ids(_run_git, repo_root, main_branch, full_ref))
-        except (RuntimeError, subprocess.SubprocessError, OSError):
-            trailers = []
-        hub = get_hub_data_provider().hub_for_branch(qdir, branch, list(dict.fromkeys([task_id, *trailers])))
+            label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
+            candidate_count = _triage_candidate_count(repo_root, main_branch, full_ref, subject, label)
+            try:
+                trailers = memo(repo_root, base_sha, head_sha, "trailers", lambda: branch_trailer_ids(_run_git, repo_root, main_branch, full_ref))
+            except (RuntimeError, subprocess.SubprocessError, OSError):
+                trailers = []
+            hub = get_hub_data_provider().hub_for_branch(qdir, branch, list(dict.fromkeys([task_id, *trailers])))
+        except Exception as exc:  # noqa: BLE001 -- one malformed task record must not blank the whole project's list
+            print(f"[branches] label/hub for {branch} failed (non-fatal): {type(exc).__name__}: {exc}", file=sys.stderr)
+            label = {"title": subject.strip(), "domain": None, "source": None, "matchedTaskState": None, "description": None}
+            candidate_count = 0
+            hub = None
         branches.append({
             "branch": branch,
             "taskId": task_id,
@@ -2459,6 +2482,7 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
             "matchedTaskState": label["matchedTaskState"],
             "description": label["description"],
             "subject": subject.strip(),
+            "headSha": head_sha,
             **({"candidateCount": candidate_count} if candidate_count else {}),
             "pushedAt": pushed_at,
             "ahead": ahead,
@@ -2501,7 +2525,42 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
     return branches
 
 
+_parked_apply_active = False
+
+
+def _apply_parked_verdicts_to(branches):
+    """Apply parked verdicts to THIS list before it is cached, then mark the rows that still have a parked verdict (verdictPending). The list_fn handed to the apply returns `branches` and never recomputes, so the apply cannot re-enter the listing; the flag drops any nested call."""
+    global _parked_apply_active
+    with _branch_cache_lock:
+        if _parked_apply_active:
+            return
+        _parked_apply_active = True
+    try:
+        import branch_verdicts_pending as bvp
+        import branch_verdicts as bv
+        qdir = queue_dir()
+        repo_root = get_active_repo_root() if qdir else None
+        if qdir and repo_root:
+            parked = len(bvp.list_pending_verdicts(qdir))
+            # A miss refreshes once through the normal path; the _parked_apply_active flag makes the nested store skip this apply (re-entry guard).
+            bvp.apply_pending_verdicts(qdir, repo_root, lambda force=False: list_unmerged_branches(force=True) if force else branches, _run_git, bv)
+            if len(bvp.list_pending_verdicts(qdir)) != parked:
+                bv.enrich_branches_with_verdicts(qdir, repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
+            still_parked = {p.get("branch") for p in bvp.list_pending_verdicts(qdir)}
+            for b in branches:
+                if b.get("branch") in still_parked:
+                    b["verdictPending"] = True
+                else:
+                    b.pop("verdictPending", None)
+    except Exception as exc:  # noqa: BLE001 -- a parked verdict must never fail the listing
+        print(f"[branches] pending verdict apply failed (non-fatal): {exc}", file=sys.stderr)
+    finally:
+        with _branch_cache_lock:
+            _parked_apply_active = False
+
+
 def _store_branch_list(branches):
+    _apply_parked_verdicts_to(branches)      # verdicts apply BEFORE the write, so the stored and returned list reflects them
     with _branch_cache_lock:
         _branch_cache["at"] = time.time()
         _branch_cache["branches"] = branches
@@ -2511,17 +2570,7 @@ def _store_branch_list(branches):
         _branch_cache["digest"] = fingerprint
     if changed:
         event_stream.announce("branch-list-changed", project="active")      # the Branches tab re-reads the cached list (a recompute that found nothing new says nothing)
-    # Apply any pending verdicts for branches that are now in the listing
-    try:
-        import branch_verdicts_pending as bvp
-        import branch_verdicts as bv
-        qdir = queue_dir()
-        if qdir:
-            repo_root = get_active_repo_root()
-            if repo_root:
-                bvp.apply_pending_verdicts(qdir, repo_root, list_unmerged_branches, _run_git, bv)
-    except Exception as exc:
-        print(f"[branches] pending verdict apply failed (non-fatal): {exc}", file=sys.stderr)
+    # Parked verdicts were already applied before the cache write (_apply_parked_verdicts_to).
 
 
 def _refresh_branch_list_in_background():
