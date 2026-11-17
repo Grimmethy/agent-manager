@@ -71,7 +71,10 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriori
   const cleanStacked = stacked === undefined || stacked === null ? undefined : normalizeStacked(stacked);
 
   const validDomains = Object.keys(JSON.parse(fs.readFileSync(domainsPath, 'utf8')));
-  const resolvedDomain = domain || defaultTaskDomain(validDomains);
+  // A repair (stacked) task defaults to domain 'adhoc' when the caller names none and the project lists 'adhoc'
+  // (otherwise it would be refused as an unknown domain); ordinary tasks keep defaultTaskDomain() unchanged.
+  const stackedDefaultDomain = cleanStacked && validDomains.includes('adhoc') ? 'adhoc' : undefined;
+  const resolvedDomain = domain || stackedDefaultDomain || defaultTaskDomain(validDomains);
   if (!validDomains.includes(resolvedDomain)) {
     throw new Error(`Invalid domain '${resolvedDomain}'. Valid domains: ${validDomains.join(', ')}`);
   }
