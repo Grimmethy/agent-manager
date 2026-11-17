@@ -1,6 +1,8 @@
 from flask import Blueprint, abort, jsonify, request, send_file
 
 import plugin_process_manager
+import os
+import urllib.request
 from pathlib import Path
 import subprocess
 
@@ -381,6 +383,40 @@ def api_plugin_ensure_started(name):
         "alreadyRunning": already_running,
         "started": started,
         "healthy": healthy,
+    })
+
+
+_PLUGIN_PROBE_TIMEOUT_SECONDS = 1.0
+
+
+def _probe_plugin_once(entry):
+    """One health request to the plugin's url + healthPath (default /healthz). True only
+    for a 2xx response, False on any exception. Single shot: no loop, no sleep."""
+    try:
+        url = str(entry["url"]).rstrip("/") + (entry.get("healthPath") or "/healthz")
+        with urllib.request.urlopen(url, timeout=_PLUGIN_PROBE_TIMEOUT_SECONDS) as r:
+            return 200 <= r.status < 300
+    except Exception:
+        return False
+
+
+@plugins_bp.route("/api/plugins/<name>/status", methods=["GET"])
+def api_plugin_status(name):
+    """Read-only status for a plugin tab: is it answering, its url, and whether tabs
+    should autostart it (AGENT_MANAGER_PLUGIN_TAB_AUTOSTART, default true). Never starts
+    anything."""
+    from app import ENV_FILE_PATH, _read_plugins_manifest, read_env_file
+    manifest = _read_plugins_manifest()
+    entry = next((p for p in manifest if p.get("name") == name), None)
+    if entry is None:
+        abort(404, description=f"no plugin named '{name}'")
+    env = {**os.environ, **read_env_file(ENV_FILE_PATH)}
+    raw = (env.get("AGENT_MANAGER_PLUGIN_TAB_AUTOSTART") or "").strip().lower()
+    autostart = raw not in ("0", "false", "no", "off")
+    return jsonify({
+        "running": _probe_plugin_once(entry),
+        "url": entry.get("url"),
+        "autostart": autostart,
     })
 
 

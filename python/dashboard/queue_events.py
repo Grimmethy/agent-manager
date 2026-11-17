@@ -16,7 +16,11 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-TYPES = ("verdict_recorded", "branch_merged", "branch_pushed")
+TYPES = ("verdict_recorded", "branch_merged", "branch_pushed", "task_stalled")
+# Mirrors STALL_STAGES in src/queue-events.js, copied verbatim.
+STALL_STAGES = ("blocked", "needs-clarification", "awaiting-confirm", "review-rejected", "apply-blocked", "unclaimed", "checker-left-for-owner", "checker-not-ready", "no-checker-row", "no-merger-row")
+# Mirrors activeStalls in src/queue-events.js: keys are project|taskId|stage.
+_active_stalls = set()
 MAX_LINE_BYTES = 3500
 DEFAULT_ROTATE_BYTES = 5 * 1024 * 1024
 
@@ -33,6 +37,8 @@ def _line(pipeline_dir, event):
         project = os.path.realpath(pipeline_dir)
     except (OSError, ValueError, TypeError):
         project = str(pipeline_dir)
+    if event["type"] == "task_stalled":
+        return _stall_line(event, project)
     rec = {
         "at": event.get("at") or _iso_now(),
         "type": event["type"],
@@ -45,6 +51,35 @@ def _line(pipeline_dir, event):
     }
     # Same bytes as JSON.stringify: compact separators, non-ASCII left as UTF-8.
     line = json.dumps(rec, separators=(",", ":"), ensure_ascii=False) + "\n"
+    if len(line.encode("utf-8")) >= MAX_LINE_BYTES:
+        raise ValueError("event line is %d bytes; the limit is %d" % (len(line.encode("utf-8")), MAX_LINE_BYTES - 1))
+    return line
+
+
+def _stall_line(event, project):
+    """One task_stalled line: keys at, type, taskId, project, stage, reason, since. A long reason is cut on a character boundary so the line stays under the limit."""
+    def build(reason):
+        rec = {
+            "at": event.get("at") or _iso_now(),
+            "type": "task_stalled",
+            "taskId": event.get("taskId") or None,
+            "project": project,
+            "stage": event.get("stage") or None,
+            "reason": reason or None,
+            "since": event.get("since") or None,
+        }
+        return json.dumps(rec, separators=(",", ":"), ensure_ascii=False) + "\n"
+    reason = event.get("reason")
+    line = build(reason)
+    if len(line.encode("utf-8")) >= MAX_LINE_BYTES and isinstance(reason, str):
+        lo, hi = 0, len(reason)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if len(build(reason[:mid]).encode("utf-8")) < MAX_LINE_BYTES:
+                lo = mid
+            else:
+                hi = mid - 1
+        line = build(reason[:lo])
     if len(line.encode("utf-8")) >= MAX_LINE_BYTES:
         raise ValueError("event line is %d bytes; the limit is %d" % (len(line.encode("utf-8")), MAX_LINE_BYTES - 1))
     return line
@@ -73,3 +108,42 @@ def append_event(pipeline_dir, event, rotate_bytes=DEFAULT_ROTATE_BYTES):
     except OSError as exc:
         logger.warning("queue-events: could not append to %s: %s", pipeline_dir, exc)
         return False
+
+
+def _project_of(pipeline_dir):
+    try:
+        return os.path.realpath(pipeline_dir)
+    except (OSError, ValueError, TypeError):
+        return str(pipeline_dir)
+
+
+def enter_stall(pipeline_dir, taskId, stage, reason, since):
+    """Announce a task_stalled event once per project|taskId|stage. Never raises: -> True when written, False otherwise."""
+    try:
+        if os.environ.get("AGENT_MANAGER_QUEUE_EVENTS", "on").strip().lower() == "off":
+            return False
+        if not isinstance(stage, str) or stage not in STALL_STAGES:
+            return False
+        if not taskId:
+            return False
+        project = _project_of(pipeline_dir)
+        key = "%s|%s|%s" % (project, taskId, stage)
+        if key in _active_stalls:
+            return False
+        written = append_event(pipeline_dir, {"type": "task_stalled", "taskId": taskId, "project": project, "stage": stage, "reason": reason, "since": since})
+        if written:
+            _active_stalls.add(key)
+        return bool(written)
+    except Exception as exc:
+        logger.warning("queue-events: enter_stall failed for %s: %s", pipeline_dir, exc)
+        return False
+
+
+def clear_stall(pipeline_dir, taskId, stage):
+    """Forget an active stall so the next enter_stall for it writes again. Writes no record, like clearStall in the Node writer. Never raises."""
+    try:
+        if not taskId or not stage:
+            return
+        _active_stalls.discard("%s|%s|%s" % (_project_of(pipeline_dir), taskId, stage))
+    except Exception as exc:
+        logger.warning("queue-events: clear_stall failed for %s: %s", pipeline_dir, exc)

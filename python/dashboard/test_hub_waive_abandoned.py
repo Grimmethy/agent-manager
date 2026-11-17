@@ -71,6 +71,31 @@ class TestHubWaiveAbandoned(unittest.TestCase):
         self.assertNotIn("abandonedPiecesWaived", self.record(other))
         self.assertEqual(self.client.post("/api/hub/ghost/waive-abandoned", json={"reason": "x"}).status_code, 404)
 
+    def test_the_400_409_and_404_refusals_leave_the_hub_file_byte_identical(self):
+        clean = self.hub(["pending-merge"], hub_id="clean")
+        other = self.hub(["abandoned"], hub_id="other")
+        cases = [
+            (f"/api/hub/{clean}/waive-abandoned", {"reason": "x"}, 409, clean),
+            (f"/api/hub/{other}/waive-abandoned", {"reason": "  "}, 400, other),
+            (f"/api/hub/{other}/waive-abandoned", {}, 400, other),
+            ("/api/hub/ghost/waive-abandoned", {"reason": "x"}, 404, other),
+        ]
+        for url, body, status, hub in cases:
+            path = self.q / "coordinating" / f"{hub}.json"
+            before = path.read_bytes()
+            r = self.client.post(url, json=body)
+            self.assertEqual(r.status_code, status, url)
+            self.assertEqual(path.read_bytes(), before, url)
+
+    def test_a_write_error_is_a_500_and_the_hub_file_is_unchanged(self):
+        hub = self.hub(["abandoned"], hub_id="broken")
+        path = self.q / "coordinating" / f"{hub}.json"
+        before = path.read_bytes()
+        with mock.patch.object(Path, "write_text", side_effect=OSError("disk full")):
+            r = self.client.post(f"/api/hub/{hub}/waive-abandoned", json={"reason": "x"})
+        self.assertEqual(r.status_code, 500)
+        self.assertEqual(path.read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

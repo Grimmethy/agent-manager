@@ -87,3 +87,11 @@ test('no timer; index.html, the nav, the icon, the live-updates list and the dis
   assert.match(read('live-updates.js'), /NON_QUEUE_TABS = \[[^\]]*'triggers'/);
   assert.match(read('branches-joblist-hardware-tabs.js'), /activeTab === 'triggers'\) await renderTriggersTab\(\)/);
 });
+
+test('the summary cards sit in a wrapping flex row; the offender table and episode list are untouched', () => {
+  const html = build(body());
+  assert.match(html, /<div style="display:flex;flex-wrap:wrap;gap:10px"><div style="min-width:120px"><div class="meta">Episodes<\/div>/);
+  assert.match(html, /What was biggest when pressure hit/);
+  assert.match(html, /<h3>Recent episodes<\/h3>/);
+  assert.ok((html.match(/<table>/g) || []).length >= 2, 'the offender and day tables are both rendered');
+});

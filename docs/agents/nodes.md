@@ -96,3 +96,57 @@ Wok lends a task by posting its record to the node's own intake, `node src/node-
 - Settings: `AGENT_MANAGER_LENDER_TOKEN_FILE` (a file, mode 600, holding the lender token; never read from the environment; a missing or empty file makes the server exit 2), `AGENT_MANAGER_LENDER_ADDRESS` (the one address allowed to lend; unset means any address that holds the token), `AGENT_MANAGER_PIPELINE_DIR`, `AGENT_MANAGER_INTAKE_BIND` (default `127.0.0.1`) and `AGENT_MANAGER_INTAKE_PORT` (default 7472).
 
 Nothing starts this server by itself: the owner creates the token file on the node, sets the bind address to the node's LAN address and starts it. A worker on that node claims the lent task only because of `leasedTo` (see `src/node-affinity.js`).
+
+## Bringing up the pull daemon on a node that has no GitHub access
+
+A node without GitHub access gets its clone from wok as a git bundle, and then pulls claimed tasks from wok's claim endpoint with `node src/node-pull.js --daemon` (`src/node-pull.js`, entry wiring in `src/node-pull-entry.js`).
+
+### 1. Sync the clone by bundle
+
+On wok, bundle one branch (`refs/heads/<branch>`, default `master`):
+
+    scripts/export-repo-bundle.sh <repo-dir> <out-dir> [branch]
+
+If the live checkout carries local-only commits, export from a scratch clone whose `master` is `origin/master`.
+
+Copy the bundle to the node, then on the node import it with an absolute bundle path (the convention; `scripts/import-repo-bundle.sh` resolves the path itself):
+
+    scripts/import-repo-bundle.sh <ABSOLUTE bundle path> <clone-dir> [branch]
+
+A fresh clone import removes its `origin`. If the node's clone has a local bare `origin` (grimm: `/workspace/GitHub/agent-manager-origin.git`), the drafting worktrees are built from that bare origin, so after every import run a plain fast-forward push (never force):
+
+    git -C <clone-dir> push origin master
+
+Without that push the drafting sandbox sees the old `master` and a draft fails with `Could not find .../src/<file>` (seen 2026-11-15).
+
+### 2. Environment files
+
+An operator-written file such as `~/.config/agent-manager/node-pull.env` (mode 600; no code reads this name, it is only a convention) holds:
+
+- `AGENT_MANAGER_CLAIM_URL`: `http://<wok LAN address>:7471/claim`
+- `AGENT_MANAGER_NODE_TOKEN_FILE`: the registry token file, the same token the heartbeat uses
+- `AGENT_MANAGER_NODE_REPOS_DIR`: where `src/node-repo-ensure.js` places the node's repos
+
+The pipeline's `node.env` supplies `AGENT_MANAGER_NODE_ID` and `AGENT_MANAGER_PIPELINE_DIR`. Both files are loaded with `EnvironmentFile=` in the unit.
+
+### 3. systemd user unit
+
+    # ~/.config/systemd/user/am-node-pull.service
+    [Service]
+    WorkingDirectory=<clone-dir>
+    EnvironmentFile=%h/.config/agent-manager/node-pull.env
+    EnvironmentFile=<pipeline node.env>
+    ExecStart=<absolute path to node> src/node-pull.js --daemon
+
+Do not enable it before wok's registry service has `AGENT_MANAGER_NODE_PIPELINE_DIRS` (the pipelines a node may claim from) and `AGENT_MANAGER_LENDER_TOKEN_FILE` (so expiry settles by asking the node; read in `src/node-status-client.js`).
+
+### 4. Foreground smoke test
+
+    set -a; . ~/.config/agent-manager/node-pull.env; . <pipeline node.env>; set +a
+    timeout 10 node src/node-pull.js --daemon
+
+A claim with nothing to hand out is answered idle (`handleClaim` in `src/node-registry-server.js` returns `task: null, retryAfterSec`).
+
+### 5. Pausing claims
+
+Creating the file `node-pull-paused` in `AGENT_MANAGER_STATE_DIR` (default `~/.local/state/agent-manager`) stops claiming (`isPaused` in `src/node-pull-entry.js`).

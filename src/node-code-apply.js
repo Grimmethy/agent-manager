@@ -55,6 +55,29 @@ function headOf(run, nodeRepoDir) {
   return run('git', ['-C', nodeRepoDir, 'rev-parse', 'HEAD']).trim();
 }
 
+// True when `git -C <repoDir> rev-parse --is-inside-work-tree`, run through the injected run, prints true. Synchronous like applyCode (the shared contract sketched a Promise; this returns a plain object instead of a Promise).
+// A throw (not a repo, git missing) or any output other than true is a refusal: { ok: false, reason: 'not-a-git-work-tree' }. Otherwise { ok: true }.
+function checkRepoIsWorkTree(repoDir, run) {
+  let out;
+  try {
+    out = run('git', ['-C', repoDir, 'rev-parse', '--is-inside-work-tree']);
+  } catch (e) {
+    return { ok: false, reason: 'not-a-git-work-tree' };
+  }
+  return String(out).trim() === 'true' ? { ok: true } : { ok: false, reason: 'not-a-git-work-tree' };
+}
+
+// One audit line per refusal, and one NOTICE per process pointing at the one-time conversion (runbook, section 2a).
+let noticeShown = false;
+function defaultAudit(line) { process.stderr.write(`${line}\n`); }
+function refuseNotWorkTree(repoDir, audit) {
+  audit(`applyCode: refused ${repoDir}: not-a-git-work-tree; nothing changed`);
+  if (!noticeShown) {
+    noticeShown = true;
+    audit(`applyCode: NOTICE ${repoDir} is a plain copy, not a git clone; convert it once (multi-node runbook, section 2a, One-time conversion)`);
+  }
+}
+
 // Applies the bundle named by <inDir>/latest.json to the checkout at nodeRepoDir. deps.repo (default 'agent-manager') picks the latest.json entry.
 // Returns { applied: false, reason: 'current', sha } when HEAD already has the sha (nothing else runs);
 // { applied: true, sha } after a clean import; { applied: false, reason: 'dirty-or-diverged' } when the import exits 3.
@@ -63,6 +86,13 @@ function applyCode(inDir, nodeRepoDir, deps = {}) {
   const run = deps.run || defaultRun;
   const runStatus = deps.runStatus || defaultRunStatus;
   const repo = typeof deps.repo === 'string' && deps.repo ? deps.repo : DEFAULT_REPO;
+  const audit = deps.audit || defaultAudit;
+  const check = deps.checkWorkTree || ((dir) => checkRepoIsWorkTree(dir, run));
+  const verdict = check(nodeRepoDir);
+  if (!verdict.ok) {
+    refuseNotWorkTree(nodeRepoDir, audit);
+    return { applied: false, reason: verdict.reason };
+  }
   const { sha, bundle, branch } = readLatest(inDir, repo);
   if (headOf(run, nodeRepoDir) === sha) return { applied: false, reason: 'current', sha };
   const result = runStatus(IMPORT_SCRIPT, [path.join(inDir, bundle), nodeRepoDir, branch]);
@@ -75,4 +105,4 @@ function applyCode(inDir, nodeRepoDir, deps = {}) {
   return { applied: true, sha };
 }
 
-module.exports = { applyCode };
+module.exports = { applyCode, checkRepoIsWorkTree };

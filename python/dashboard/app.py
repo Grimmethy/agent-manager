@@ -243,6 +243,18 @@ app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.after_request(compress_response)
 
 
+@app.route("/api/queue")
+def api_queue_project_filter():
+    # GET /api/queue?project=active|<slug>|all. Filter and dependency logic lives in
+    # routes/queue_project_filter.py. An unknown project becomes HTTP 400.
+    from routes.queue_project_filter import parse_project_param, queue_response
+    try:
+        project_param = parse_project_param(request.args.get("project"))
+    except ValueError as exc:
+        abort(400, description=str(exc))
+    return jsonify(queue_response(project_param))
+
+
 @app.errorhandler(HTTPException)
 def handle_http_exception(e):
     # Every route here is called by the dashboard's fetch()-based JS, which always does
@@ -2946,18 +2958,47 @@ def _seed_plugins_manifest() -> list:
     return entries
 
 
+# Last successfully parsed plugins.json contents. Served back when the file is later
+# unreadable or corrupt, so one bad write can't blank the Plugins tab or the plugin
+# resolver. None means no good copy exists yet in this process.
+_plugins_manifest_last_good = None
+_plugins_manifest_fallback_logged = False
+
+
 def _read_plugins_manifest() -> list:
+    global _plugins_manifest_last_good, _plugins_manifest_fallback_logged
     if not PLUGINS_MANIFEST_PATH.is_file():
         return _seed_plugins_manifest()
     try:
         parsed = json.loads(PLUGINS_MANIFEST_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as exc:
+        if not _plugins_manifest_fallback_logged:
+            _plugins_manifest_fallback_logged = True
+            logger.warning("Plugins manifest %s unreadable, using last-known-good copy: %s", PLUGINS_MANIFEST_PATH, exc)
+        if _plugins_manifest_last_good is not None:
+            return list(_plugins_manifest_last_good)
         return []
-    return parsed if isinstance(parsed, list) else []
+    if not isinstance(parsed, list):
+        return []
+    _plugins_manifest_last_good = parsed
+    _plugins_manifest_fallback_logged = False
+    return parsed
 
 
 def _write_plugins_manifest(entries: list) -> None:
-    PLUGINS_MANIFEST_PATH.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+    # Atomic write: temp file in the same directory, fsync, then os.replace onto the target.
+    target = PLUGINS_MANIFEST_PATH
+    tmp = target.with_name(f".plugins.json.tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(entries, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp)
+        raise
 
 
 def _resolve_plugin_root(name: str):
