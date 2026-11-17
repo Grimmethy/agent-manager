@@ -243,6 +243,18 @@ app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.after_request(compress_response)
 
 
+@app.route("/api/queue")
+def api_queue_project_filter():
+    # GET /api/queue?project=active|<slug>|all. Filter and dependency logic lives in
+    # routes/queue_project_filter.py. An unknown project becomes HTTP 400.
+    from routes.queue_project_filter import parse_project_param, queue_response
+    try:
+        project_param = parse_project_param(request.args.get("project"))
+    except ValueError as exc:
+        abort(400, description=str(exc))
+    return jsonify(queue_response(project_param))
+
+
 @app.errorhandler(HTTPException)
 def handle_http_exception(e):
     # Every route here is called by the dashboard's fetch()-based JS, which always does

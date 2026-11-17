@@ -1,6 +1,12 @@
 // Queue tab: task actions, hub sort and priority, the source filter wiring and renderQueueTab. Moved verbatim out of core-ui.js (2026-10-01); allSourceNames and safeSourceNames stayed behind because core-ui.test.js requires safeSourceNames from core-ui.js. A plain global <script>, loaded by index.html right after core-ui.js.
 // No require()/module.exports: the browser loads this with a plain <script src> tag, so every name below is a shared global.
 
+// Project filter state, keyed by queue state (active, pending, done, all). Mirrors
+// queueSourceFilter's shape -- per-state so each tab can keep its own project filter
+// independent of the others. Default 'active' matches the contract's precedence:
+// URL ?project=, then selected, then 'active'.
+var queueProjectFilter = { active: 'active', pending: 'active', done: 'active', all: 'all' };
+
 async function postTaskAction(state, id, action, confirmMessage, body) {
   if (confirmMessage && !confirm(confirmMessage)) return;
   try {
@@ -39,6 +45,21 @@ function wireQueueSourceFilter(state) {
     queueLoadedCount[state] = QUEUE_PAGE_SIZE;
     renderQueueTab(state);
   };
+}
+
+function wireQueueProjectFilter(state) {
+  const container = document.getElementById('queue-project-filter');
+  if (!container) return;
+  if (typeof renderQueueProjectFilter !== 'function') return;
+  renderQueueProjectFilter(container, {
+    projects: [], // populated by sibling task; empty for now
+    selected: queueProjectFilter[state] || 'active',
+    onChange: (value) => {
+      queueProjectFilter[state] = value;
+      queueLoadedCount[state] = QUEUE_PAGE_SIZE;
+      renderQueueTab(state);
+    },
+  });
 }
 
 // Hub Tasks tab sort control. Choice persists in localStorage so it survives a reload and
@@ -112,7 +133,9 @@ async function renderQueueTab(state) {
   if (!queueLoadedCount[state]) queueLoadedCount[state] = QUEUE_PAGE_SIZE;
   queueLoadInFlight = true;
   const sourceFilter = queueSourceFilter[state] || '';
-  const filterQS = sourceFilter ? `&source=${encodeURIComponent(sourceFilter)}` : '';
+  const projectValue = queueProjectFilter[state] || 'active';
+  const filterQS = sourceFilter ? `&source=${encodeURIComponent(sourceFilter)}` : '' +
+    (projectValue && projectValue !== 'all' ? `&project=${encodeURIComponent(projectValue)}` : '');
   // Hub Tasks tab sort (2026-09-09, Grimmethy: "I'd like the hubs to be sortable either
   // alphabetically by name or by priority"). Only the coordinating state honours it;
   // 'priority' (the default) = explicit hubPriority asc, then unranked hubs oldest-first.
@@ -141,12 +164,13 @@ async function renderQueueTab(state) {
          <option value="name" ${hubSort === 'name' ? 'selected' : ''}>Name (A–Z)</option>
        </select></label>`
     : '';
-  const filterHtml = `<div class="row" style="margin-bottom:8px"><label class="meta">Task type: <select id="queue-source-filter">${filterOptionsHtml}</select></label>${hubSortHtml}</div>`;
+  const filterHtml = `<div class="row" style="margin-bottom:8px"><label class="meta">Task type: <select id="queue-source-filter">${filterOptionsHtml}</select></label>${hubSortHtml}<div id="queue-project-filter"></div></div>`;
 
   if (isStale()) return;
   if (tasks.length === 0) {
     main.innerHTML = filterHtml + `<div class="empty">${sourceFilter ? `No "${escapeHtml(sourceFilter)}" tasks here.` : 'Nothing here.'}</div>`;
     wireQueueSourceFilter(state);
+    wireQueueProjectFilter(state);
     wireHubSort(state);
     return;
   }
@@ -312,6 +336,7 @@ async function renderQueueTab(state) {
   if (isStale()) return;
   main.innerHTML = filterHtml + `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th>${actionHeader}</tr></thead><tbody>${rows}</tbody></table>${footer}`;
   wireQueueSourceFilter(state);
+  wireQueueProjectFilter(state);
   wireHubSort(state);
   main.querySelectorAll('tr.clickable').forEach(row => {
     row.onclick = () => openDetail(row.dataset.state, row.dataset.id);
