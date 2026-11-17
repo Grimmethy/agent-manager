@@ -14,6 +14,12 @@
 //   403 the request does not come from the address the node was registered with; 404 any other path; 405 any other method on /package;
 //   409 the task has no lease, or its lease belongs to another node, or (version 2) there is no original record to replace (nothing is stored then).
 //
+//   GET /code/latest  Authorization: Bearer <that node's token>, X-Node-Id: <the node id> (a GET has no body to carry it)
+//                   -> 200 the JSON array in latest.json of the code publish directory (AGENT_MANAGER_CODE_PUBLISH_DIR, default <pipeline dir>/code-publish);
+//                   503 {error: 'nothing published'} when the file is missing, unparsable or not an array. Read-only, no timer: a node asks, wok never pushes.
+//                   401 missing or wrong token or node id (unknown and wrong give the same answer); 403 wrong address (as for POST /package);
+//                   405 any other method on /code/latest. Every other path is 404.
+//
 // The package is written atomically to <AGENT_MANAGER_PIPELINE_DIR>/queue/node-packages/<taskId>.json (a resend replaces it), the lease is ended with
 // returnLease() (src/lease-ledger.js) and one summary-level notification (src/notify.js, key node-package:<taskId>) is sent; the notice is best effort.
 // Settings: AGENT_MANAGER_PIPELINE_DIR, AGENT_MANAGER_PACKAGE_BIND (default 127.0.0.1), AGENT_MANAGER_PACKAGE_PORT (default 7473),
@@ -31,6 +37,17 @@ const { notify } = require('./notify.js');
 const { normalizeIp, bearer, TASK_ID_RE } = require('./node-intake-server.js');
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
+
+// The list published for the nodes: latest.json in the code publish directory, or null when there is none to serve.
+function readPublished(env, pipelineDir) {
+  const dir = String(env.AGENT_MANAGER_CODE_PUBLISH_DIR || '').trim() || path.join(pipelineDir, 'code-publish');
+  try {
+    const list = JSON.parse(fs.readFileSync(path.join(dir, 'latest.json'), 'utf8'));
+    return Array.isArray(list) ? list : null;
+  } catch (e) {
+    return null;
+  }
+}
 
 function send(res, status, body, extraHeaders = {}) {
   const text = JSON.stringify(body);
@@ -110,6 +127,18 @@ function createServer({ env = process.env, now = () => Date.now(), send: sendNot
   return http.createServer(async (req, res) => {
     try {
       const url = String(req.url || '').split('?')[0];
+      if (url === '/code/latest') {
+        if (req.method !== 'GET') return send(res, 405, { ok: false, error: 'GET only' });
+        const askId = String(req.headers['x-node-id'] || '').trim();
+        if (!verifyToken(askId, bearer(req.headers.authorization), env)) return send(res, 401, { ok: false, error: 'bad or missing token' });
+        const known = loadNodes(env)[askId];
+        if (known && known.address && normalizeIp(req.socket.remoteAddress) !== known.address) {
+          return send(res, 403, { ok: false, error: 'request does not come from the registered address' });
+        }
+        const published = readPublished(env, pipelineDir);
+        if (!published) return send(res, 503, { ok: false, error: 'nothing published' });
+        return send(res, 200, published);
+      }
       if (url !== '/package') return send(res, 404, { ok: false, error: 'not found' });
       if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'POST only' });
       let pkg;

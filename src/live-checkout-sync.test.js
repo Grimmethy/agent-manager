@@ -6,7 +6,17 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
-const { syncLiveCheckout, mode, sendNotice } = require('./live-checkout-sync');
+const PUBLISH_PATH = path.join(__dirname, 'node-code-publish.js');
+// Injected publisher: live-checkout-sync binds publishCode at load time, so the fake is placed in require.cache first.
+const fakePub = { calls: [], fail: null };
+function publishCodeFake(opts) {
+  fakePub.calls.push(opts);
+  if (fakePub.fail) throw new Error(fakePub.fail);
+  return { reason: 'published', sha: 'a'.repeat(40), bundle: 'fake.bundle', branch: 'master' };
+}
+require.cache[PUBLISH_PATH] = { id: PUBLISH_PATH, filename: PUBLISH_PATH, loaded: true, exports: { publishCode: publishCodeFake, readPublished: () => null } };
+const { syncLiveCheckout, onBranchMerged, mode, sendNotice } = require('./live-checkout-sync');
+const queueEvents = require('./queue-events');
 
 const CLI = path.join(__dirname, 'live-checkout-sync.js');
 
@@ -367,6 +377,99 @@ test('sendNotice sends recovered when state returns to current', async () => {
 function runCli(args) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
 }
+
+function resetPublisher() {
+  fakePub.calls.length = 0;
+  fakePub.fail = null;
+}
+
+function enqueueBranchMerged(pipelineDir, n) {
+  for (let i = 0; i < n; i += 1) {
+    queueEvents.append(pipelineDir, { type: 'branch_merged', branch: 'master', taskId: 'task-' + i });
+  }
+}
+
+test('three branch_merged events in one drain publish once', async (t) => {
+  resetPublisher();
+  const r = makeRepos(t);
+  const pipelineDir = path.join(r.root, 'pipeline');
+  fs.mkdirSync(pipelineDir, { recursive: true });
+  const notify = makeFakeNotify();
+  enqueueBranchMerged(pipelineDir, 3);
+
+  const env = { ...process.env, AGENT_MANAGER_LIVE_SYNC: 'on', AGENT_MANAGER_LIVE_CHECKOUT_SYNC: 'on' };
+  await onBranchMerged(r.checkout, { env, pipelineDir, notify });
+
+  assert.equal(fakePub.calls.length, 1);
+});
+
+test('dry-run never calls the publisher and audits would publish', async (t) => {
+  resetPublisher();
+  const r = makeRepos(t);
+  const pipelineDir = path.join(r.root, 'pipeline');
+  fs.mkdirSync(pipelineDir, { recursive: true });
+  const notify = makeFakeNotify();
+  enqueueBranchMerged(pipelineDir, 1);
+
+  const env = { ...process.env, AGENT_MANAGER_LIVE_SYNC: 'dry-run', AGENT_MANAGER_LIVE_CHECKOUT_SYNC: 'dry-run' };
+  await onBranchMerged(r.checkout, { env, pipelineDir, notify });
+
+  assert.equal(fakePub.calls.length, 0);
+  const sha8 = git(r.checkout, ['rev-parse', 'origin/master']).slice(0, 8);
+  const audit = readAudit(pipelineDir);
+  const line = audit.find((e) => e.action === 'publish' && e.mode === 'dry-run');
+  assert.ok(line, 'expected a dry-run publish audit line');
+  assert.equal(line.message, `would publish ${sha8} of origin/master`);
+});
+
+test('diverged checkout still publishes in mode on', async (t) => {
+  resetPublisher();
+  const r = makeRepos(t);
+  commit(r.checkout, 'local-1');
+  commit(r.work, 'remote-1');
+  pushMaster(r.work);
+  git(r.checkout, ['fetch', '-q', 'origin']);
+  const pipelineDir = path.join(r.root, 'pipeline');
+  fs.mkdirSync(pipelineDir, { recursive: true });
+  const notify = makeFakeNotify();
+  enqueueBranchMerged(pipelineDir, 1);
+
+  const env = { ...process.env, AGENT_MANAGER_LIVE_SYNC: 'on', AGENT_MANAGER_LIVE_CHECKOUT_SYNC: 'on' };
+  const result = await onBranchMerged(r.checkout, { env, pipelineDir, notify });
+
+  assert.equal(result.action, 'refused');
+  assert.equal(fakePub.calls.length, 1);
+  assert.equal(fakePub.calls[0].repoDir, r.checkout);
+});
+
+test('throwing publisher is audited and notified once without crashing', async (t) => {
+  resetPublisher();
+  fakePub.fail = 'boom';
+  const r = makeRepos(t);
+  commit(r.work, 'remote-1');
+  pushMaster(r.work);
+  git(r.checkout, ['fetch', '-q', 'origin']);
+  const pipelineDir = path.join(r.root, 'pipeline');
+  fs.mkdirSync(pipelineDir, { recursive: true });
+  const notify = makeFakeNotify();
+  const env = { ...process.env, AGENT_MANAGER_LIVE_SYNC: 'on', AGENT_MANAGER_LIVE_CHECKOUT_SYNC: 'on' };
+
+  enqueueBranchMerged(pipelineDir, 1);
+  const result = await onBranchMerged(r.checkout, { env, pipelineDir, notify });
+  assert.equal(result.publish.action, 'publish-error');
+
+  const audit = readAudit(pipelineDir);
+  const last = audit[audit.length - 1];
+  assert.equal(last.action, 'publish-error');
+  assert.equal(last.error, 'boom');
+  assert.equal(notify.calls.filter((c) => c.key === 'code-publish:failed').length, 1);
+
+  // Still failing on the next drain: no second notice.
+  enqueueBranchMerged(pipelineDir, 1);
+  await onBranchMerged(r.checkout, { env, pipelineDir, notify });
+  assert.equal(notify.calls.filter((c) => c.key === 'code-publish:failed').length, 1);
+  assert.equal(fakePub.calls.length, 2);
+});
 
 test('CLI usage exits 2', () => {
   const res = runCli([]);

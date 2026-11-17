@@ -12,6 +12,7 @@
 const { taskAnchorFiles, taskIdentifiers } = require('./task-anchor-files.js');
 const { grepCodebase } = require('./grep-codebase-tool.js');
 const { resolveAccessibleRoots } = require('./accessible-roots.js');
+const fs = require('fs');
 const path = require('path');
 
 const PLAN_GROUNDING_MAX_CHARS = 12000;
@@ -19,6 +20,13 @@ const GREP_HITS_MAX_CHARS = 8000;
 const MAX_IDENTIFIER_QUERIES = 6;
 const ANCHOR_MAX_FILES = 3;
 const ANCHOR_MAX_CHARS_PER_FILE = 4000;
+
+// Kill switch for codebase-map grounding. Read at call time, never at module load.
+// Only the exact values '0' and 'false' disable it; anything else, including unset, enables it.
+function mapGroundingEnabled() {
+  const v = process.env.AGENT_MANAGER_MAP_GROUNDING;
+  return !(v === '0' || v === 'false');
+}
 
 function repoRootOrNull(opts) {
   if (opts && opts.repoRoot) return opts.repoRoot;
@@ -54,6 +62,36 @@ function buildPlanGrounding(task, opts = {}) {
   } catch { anchorFiles = []; }
   const anchorPaths = anchorFiles.map((f) => f.path);
 
+  // HUB0528 2/3: codebase-map grounding, behind AGENT_MANAGER_MAP_GROUNDING. Map paths are kept
+  // out of anchorPaths so the grep filter below behaves exactly as before.
+  const mapStats = { enabled: mapGroundingEnabled(), matched: 0, included: 0, skippedDuplicate: 0, skippedUnreadable: 0, error: null, truncated: false, droppedByBudget: 0 };
+  const mapEntries = [];
+  if (mapStats.enabled) {
+    let matched = [];
+    try {
+      const { matchCodebaseMap } = require('./codebase-map-grounding.js');
+      matched = matchCodebaseMap({ repoRoot, taskText: rawText, maxFiles: ANCHOR_MAX_FILES }) || [];
+    } catch (err) {
+      mapStats.error = String((err && err.message) || err);
+      matched = [];
+    }
+    mapStats.matched = matched.length;
+    const seen = new Set(anchorPaths.map((p) => path.normalize(p)));
+    for (const rel of matched) {
+      const key = path.normalize(String(rel));
+      if (seen.has(key)) { mapStats.skippedDuplicate += 1; continue; }
+      let content;
+      try {
+        content = fs.readFileSync(path.join(repoRoot, key), 'utf8');
+      } catch { mapStats.skippedUnreadable += 1; continue; }
+      if (content.length > ANCHOR_MAX_CHARS_PER_FILE) mapStats.truncated = true;
+      seen.add(key);
+      mapEntries.push({ path: key.split(path.sep).join('/'), content: content.slice(0, ANCHOR_MAX_CHARS_PER_FILE) });
+      mapStats.included += 1;
+    }
+  }
+  const mapPaths = mapEntries.map((e) => e.path);
+
   // Multi-repo (2026-09-04): also grep each loaded plugin's own repo (accessible-roots.js)
   // -- a task about "the pipeline" is just as likely to be about agent-manager-hygiene's
   // code as agent-manager's own, and this grep is the only thing standing between a real
@@ -87,11 +125,14 @@ function buildPlanGrounding(task, opts = {}) {
   const shown = new Set(anchorPaths);
   grepHits = grepHits.filter((h) => h && h.file && !shown.has(h.file));
 
-  if (anchorFiles.length === 0 && grepHits.length === 0) return null;
+  if (anchorFiles.length === 0 && mapEntries.length === 0 && grepHits.length === 0) return null;
 
   const parts = [];
   if (anchorFiles.length) {
     parts.push('FILES THIS TASK NAMES (read from the repo just now):', '', renderAnchor(anchorFiles));
+  }
+  if (mapEntries.length) {
+    parts.push('', 'CODEBASE MAP MATCHES (from docs/agents/codebase-map.md):', '', renderAnchor(mapEntries));
   }
   if (grepHits.length) {
     let hitText = grepHits.map((h) => {
@@ -102,9 +143,15 @@ function buildPlanGrounding(task, opts = {}) {
     parts.push('', 'GREP HITS (repo grep on the identifiers this task names):', '', hitText);
   }
   let text = parts.join('\n').trim();
-  if (text.length > PLAN_GROUNDING_MAX_CHARS) text = `${text.slice(0, PLAN_GROUNDING_MAX_CHARS)}\n...[grounding truncated]`;
+  // The marker is counted inside the bound, so the final text never exceeds PLAN_GROUNDING_MAX_CHARS.
+  const GROUNDING_MARKER = '\n...[grounding truncated]';
+  if (text.length > PLAN_GROUNDING_MAX_CHARS) {
+    text = text.slice(0, PLAN_GROUNDING_MAX_CHARS - GROUNDING_MARKER.length) + GROUNDING_MARKER;
+  }
+  mapStats.droppedByBudget = mapEntries.filter((e) => !text.includes('--- ' + e.path + ' ---')).length;
+  if (mapStats.droppedByBudget > 0) mapStats.truncated = true;
 
-  return { text, anchorPaths, grepHits };
+  return { text, anchorPaths, grepHits, mapPaths, mapStats };
 }
 
 // Does the deterministic grounding already cover everything the task names? If so the
