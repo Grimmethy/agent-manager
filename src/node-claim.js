@@ -75,6 +75,22 @@ function skipPremiumFrom(env = process.env) {
   return ['true', '1', 'on'].includes(String(env.AGENT_MANAGER_NODE_SKIP_PREMIUM || '').trim().toLowerCase());
 }
 
+// Path used to compare repo roots: resolved, with symlinks followed when the path exists.
+function normalizeRepoRoot(p) {
+  const resolved = path.resolve(String(p));
+  try { return fs.realpathSync(resolved); } catch (e) { return resolved; }
+}
+
+// Why a pending/adhoc record must not be lent from pipelineDir, or null. Each condition is an independent signal; the first match wins.
+function lendSkipReason(task, pipelineDir) {
+  if (task.status === 'blocked' || task.status === 'needs-clarification') return 'previously-failed';
+  const hasAttempts = Array.isArray(task.draftAttempts) && task.draftAttempts.length > 0;
+  if (hasAttempts || Number(task.localRejectCount || 0) >= 1) return 'previously-failed';
+  if (task.status === 'done') return 'done';
+  if (task.generatedForRepoRoot && normalizeRepoRoot(task.generatedForRepoRoot) !== normalizeRepoRoot(pipelineDir)) return 'repo-root-mismatch';
+  return null;
+}
+
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
 }
@@ -150,6 +166,8 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
   // One ordered list per pipeline dir and sub-directory. pickClaimableTasks keeps its own order within each list.
   const lists = [];
   const seen = new Set();
+  // Records skipped as previously-failed during this call (reported on the claim result).
+  let previouslyFailedSkipped = 0;
   for (const pipelineDir of pipelineDirs) {
     for (const sub of ['pending', 'adhoc']) {
       const dir = path.join(pipelineDir, 'queue', sub);
@@ -171,6 +189,12 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
         }
         if (filtered.has(path.resolve(pipelineDir)) && !eligibleForNode(task, { pipelineDir, domains: allowedDomains, sources: allowedSources, allowStacked: stackedAllowed, skipPremium })) {
           skipped.push({ taskId, reason: 'not-eligible-for-node' });
+          continue;
+        }
+        const lendSkip = lendSkipReason(task, pipelineDir);
+        if (lendSkip) {
+          if (lendSkip === 'previously-failed') previouslyFailedSkipped++;
+          skipped.push({ taskId, reason: lendSkip });
           continue;
         }
         seen.add(taskId);
@@ -221,7 +245,7 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
     const { dependsOn, ...rest } = record;
     const verifiedIds = Array.isArray(dependsOn) ? dependsOn.slice() : [];
     const lent = { ...rest, leasedTo: claimant, dependsOnResolved: { ids: verifiedIds, checkedAt: now } };
-    return { task: lent, lease, repo: { root: c.pipelineDir, remoteUrl }, skipped };
+    return { task: lent, lease, repo: { root: c.pipelineDir, remoteUrl }, skipped, previouslyFailedSkipped };
   }
   return null;
 }

@@ -288,3 +288,37 @@ test('filtered dir: an ineligible copy does not shadow an eligible same-id copy 
   assert.strictEqual(r.repo.root, pipe2);
   assert.deepStrictEqual(skipped, [{ taskId: 'dup-task', reason: 'not-eligible-for-node' }]);
 });
+
+test('previously-failed, done and repo-mismatch records are skipped with their reasons; a fresh record is still lent', () => {
+  const { root, pipe, pending, env } = setup();
+  const now = Date.now();
+  writeTask(pending, 'blocked-task', { status: 'blocked' }, 500);
+  writeTask(pending, 'draft-task', { draftAttempts: [{ outcome: 'rejected' }] }, 450);
+  writeTask(pending, 'reject-task', { localRejectCount: 1 }, 400);
+  writeTask(pending, 'done-task', { status: 'done' }, 350);
+  writeTask(pending, 'mismatch-task', { generatedForRepoRoot: path.join(root, 'other-repo') }, 300);
+  writeTask(pending, 'fresh-task', { draftAttempts: [], localRejectCount: 0, generatedForRepoRoot: pipe }, 10);
+  const skipped = [];
+  const r = claimNext({ claimant: 'node-a', pipelineDirs: [pipe], env, now, skipped, readRemote: () => '' });
+  assert.ok(r);
+  assert.strictEqual(r.task.id, 'fresh-task');
+  assert.strictEqual(r.previouslyFailedSkipped, 3);
+  const reasons = skipped.map((s) => `${s.taskId}:${s.reason}`).sort();
+  assert.deepStrictEqual(reasons, [
+    'blocked-task:previously-failed',
+    'done-task:done',
+    'draft-task:previously-failed',
+    'mismatch-task:repo-root-mismatch',
+    'reject-task:previously-failed',
+  ]);
+});
+
+test('a repo root with a trailing slash is not treated as a mismatch', () => {
+  const { pipe, pending, env } = setup();
+  writeTask(pending, 'slash-task', { generatedForRepoRoot: pipe + '/' }, 100);
+  const skipped = [];
+  const r = claimNext({ claimant: 'node-a', pipelineDirs: [pipe], env, now: Date.now(), skipped, readRemote: () => '' });
+  assert.ok(r);
+  assert.strictEqual(r.task.id, 'slash-task');
+  assert.strictEqual(skipped.filter((s) => s.reason === 'repo-root-mismatch').length, 0);
+});
