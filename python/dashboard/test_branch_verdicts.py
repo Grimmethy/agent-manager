@@ -12,6 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import branch_redundancy as br  # noqa: E402
 import branch_verdicts as bv  # noqa: E402
 
 
@@ -141,6 +142,81 @@ class DeterministicChecks(unittest.TestCase):
         verdict, reasons = bv.run_deterministic_checks(self.fx.work, "master", "agent/unique2", run_git, ["stale vs master: 60 commits behind"])
         self.assertEqual(verdict, "needs-work")
         self.assertEqual(reasons, ["stale vs master: 60 commits behind"])
+
+
+class InertAdditions(unittest.TestCase):
+    """check_inert_additions (branch_redundancy.py) against real fixture branches. Python `def`/`class` only: the
+    contract filters the diff to *.py, so a JS function is never judged."""
+
+    def setUp(self):
+        self.fx = Fixture()
+        self.addCleanup(self.fx.cleanup)
+
+    def branch_with(self, name, files):
+        self.fx.branch_from_master(name)
+        for fname, text in files.items():
+            self.fx.write(fname, text)
+        self.fx.commit("add")
+        self.fx.push(name)
+
+    def inert(self, branch):
+        git(["fetch", "origin", "--prune"], self.fx.work)
+        return br.check_inert_additions(run_git, self.fx.work, "master", branch)
+
+    def test_inert_only_branch_is_needs_work_naming_the_functions(self):
+        self.branch_with("agent/inert", {"helpers.py": "def helper_a():\n    return 1\n\n\ndef helper_b():\n    return 2\n"})
+        result = self.inert("agent/inert")
+        self.assertIsNotNone(result)
+        verdict, reasons = result
+        self.assertEqual(verdict, "needs-work")
+        self.assertIn("helper_a", " ".join(reasons))
+        self.assertIn("helper_b", " ".join(reasons))
+
+    def test_helper_added_and_called_from_existing_code_is_not_flagged(self):
+        self.branch_with("agent/used", {"lib.py": "def used_one():\n    return 1\n", "caller.py": "from lib import used_one\n\nprint(used_one())\n"})
+        self.assertIsNone(self.inert("agent/used"))
+
+    def test_helper_referenced_only_from_a_test_file_is_still_inert(self):
+        self.branch_with("agent/testonly", {"lib.py": "def only_tested():\n    return 1\n", "test_lib.py": "from lib import only_tested\n\n\ndef test_it():\n    only_tested()\n"})
+        result = self.inert("agent/testonly")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "needs-work")
+        self.assertIn("only_tested", " ".join(result[1]))
+
+    def test_helper_referenced_only_in_all_is_still_inert(self):
+        self.branch_with("agent/exported", {"lib.py": "def helper_c():\n    return 1\n\n\n__all__ = [\"helper_c\"]\n"})
+        result = self.inert("agent/exported")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "needs-work")
+        self.assertIn("helper_c", " ".join(result[1]))
+
+    def test_helper_listed_in_a_multiline_all_is_still_inert(self):
+        self.branch_with("agent/multiexport", {"lib.py": "def helper_d():\n    return 1\n\n\n__all__ = [\n    \"helper_d\",\n    \"other\",\n]\n"})
+        result = self.inert("agent/multiexport")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "needs-work")
+        self.assertIn("helper_d", " ".join(result[1]))
+
+    def test_mixed_branch_is_not_flagged(self):
+        self.branch_with("agent/mixed", {"lib.py": "def used_one():\n    return 1\n\n\ndef unused_two():\n    return 2\n", "caller.py": "from lib import used_one\n\nused_one()\n"})
+        self.assertIsNone(self.inert("agent/mixed"))
+
+    def test_branch_adding_no_functions_is_not_flagged(self):
+        self.branch_with("agent/consts", {"config.py": "LIMIT = 5\nNAME = \"x\"\n", "notes.txt": "just text\n"})
+        self.assertIsNone(self.inert("agent/consts"))
+
+    def test_python_def_alongside_js_function_judges_only_the_python_def(self):
+        # Open decision: the contract is .py-only, so the JS function is never detected. See report.
+        self.branch_with("agent/pyjs", {"helpers.py": "def py_helper():\n    return 1\n", "widget.js": "function js_helper() {\n  return 1;\n}\n"})
+        result = self.inert("agent/pyjs")
+        self.assertIsNotNone(result)
+        text = " ".join(result[1])
+        self.assertIn("py_helper", text)
+        self.assertNotIn("js_helper", text)
+
+    def test_js_only_addition_is_not_judged(self):
+        self.branch_with("agent/jsonly", {"widget.js": "function js_helper() {\n  return 1;\n}\n"})
+        self.assertIsNone(self.inert("agent/jsonly"))
 
 
 class StoreAndStaleness(unittest.TestCase):
