@@ -172,7 +172,49 @@ function ownFilesLine(task) {
     .slice(0, 20);
 }
 
+function classifyFileStatus(filePath, promptContext, hubBranch, stackIndex, existsAtRef = null) {
+  const raw = promptContext && promptContext.newFile;
+  const created = raw == null ? [] : (typeof raw === 'string' ? [raw] : [...raw]);
+  if (created.includes(filePath)) return 'created';
+  if (hubBranch && typeof existsAtRef === 'function') {
+    try { if (existsAtRef(filePath) === true) return 'exists-on-hub'; } catch (e) { /* not visible on the hub */ }
+  }
+  return 'absent-evidence';
+}
+
+// Shared-contract form. 'exists-on-hub' also covers a file already present in the working tree.
+function invalidPremiseSignalContract({ repoRoot, promptContext, filesLine, hubBranch, stackIndex, existsAtRef = null }) {
+  const ctx = promptContext || {};
+  const entries = new Map();
+  for (const raw of String(filesLine || '').split(',')) {
+    const text = raw.trim();
+    const m = /\s*\(new\)$/i.exec(text);
+    const p = (m ? text.slice(0, m.index) : text).trim();
+    if (!p || /\s/.test(p) || p.startsWith('/') || p.includes('..')) continue;
+    entries.set(p, Boolean(m));
+  }
+  const newList = ctx.newFile == null ? [] : (typeof ctx.newFile === 'string' ? [ctx.newFile] : [...ctx.newFile]);
+  for (const p of newList) entries.set(p, true);
+  if (entries.size === 0) return null;
+  const createdFiles = [];
+  const absentEvidenceFiles = [];
+  for (const [p, isNew] of entries) {
+    let status = isNew ? 'created' : classifyFileStatus(p, ctx, hubBranch, stackIndex, existsAtRef);
+    if (status === 'absent-evidence' && repoRoot && resolveAgainstRepo(repoRoot, p)) status = 'exists-on-hub';
+    if (status === 'exists-on-hub') return null;
+    if (status === 'created') createdFiles.push(p); else absentEvidenceFiles.push(p);
+  }
+  if (absentEvidenceFiles.length === 0) return null;
+  const advisory = `treated as created (not evidence of staleness): ${createdFiles.join(', ') || 'none'}; treated as absent evidence: ${absentEvidenceFiles.join(', ')}`;
+  return { hit: true, evidence: [advisory], advisory, details: { absentEvidenceFiles, createdFiles } };
+}
+
 function invalidPremiseSignal(repoRoot, task, existsAtRef = null) {
+  if (repoRoot && typeof repoRoot === 'object' && 'promptContext' in repoRoot) return invalidPremiseSignalContract(repoRoot);
+  return invalidPremiseSignalLegacy(repoRoot, task, existsAtRef);
+}
+
+function invalidPremiseSignalLegacy(repoRoot, task, existsAtRef = null) {
   if (!repoRoot) return { hit: false, evidence: [] };
   const ownCreateTarget = task.promptContext && task.promptContext.newFile;
   const own = ownFilesLine(task).filter((p) => p !== ownCreateTarget);
@@ -198,4 +240,4 @@ function isDecomposeLoop(task) {
   return allDecompose && hasExhaustedRetries(task);
 }
 
-module.exports = { ownFilesLine, isStaleByAge, isFabricationRepeat, hasExhaustedRetries, alreadyImplementedSignal, invalidPremiseSignal, isDecomposeLoop, candidateFilePaths, distinctivePhrases, extractCreatedSymbols, lastActivityTs, stalenessThresholdMs, symbolDefinedInRepo, envDays, FABRICATION_KEYWORDS, GIT_LOG_TIMEOUT_MS, CREATE_VERB_RE, DEFAULT_STALENESS_THRESHOLD_DAYS, GENERATED_DOC_RE, MS_PER_DAY, NON_PROGRESS_STAGES, TITLE_PREFIX_RE };
+module.exports = { classifyFileStatus, ownFilesLine, isStaleByAge, isFabricationRepeat, hasExhaustedRetries, alreadyImplementedSignal, invalidPremiseSignal, isDecomposeLoop, candidateFilePaths, distinctivePhrases, extractCreatedSymbols, lastActivityTs, stalenessThresholdMs, symbolDefinedInRepo, envDays, FABRICATION_KEYWORDS, GIT_LOG_TIMEOUT_MS, CREATE_VERB_RE, DEFAULT_STALENESS_THRESHOLD_DAYS, GENERATED_DOC_RE, MS_PER_DAY, NON_PROGRESS_STAGES, TITLE_PREFIX_RE };
