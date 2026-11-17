@@ -8,7 +8,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { syncLiveCheckout, defaultGit } = require('./live-checkout-sync');
+const { syncLiveCheckout: realSync, defaultGit } = require('./live-checkout-sync');
+// The pipeline drain is injected in every test here: the real one would set a real _pause-node marker and run the real restart scripts (3c).
+const noDrain = { requestPipelineRestart: () => null, drainStep: () => 'waiting' };
+const syncLiveCheckout = (dir, opts = {}) => realSync(dir, { drain: noDrain, ...opts });
 const CLI = path.join(__dirname, 'live-checkout-sync.js');
 
 function git(cwd, args) {
@@ -179,6 +182,7 @@ test('dry-run runs nothing and audits would restart <unit> because <paths>', asy
   assert.deepEqual(run.calls, []);
   assert.equal(git(r.checkout, ['rev-parse', 'HEAD']), head);
   assert.deepEqual(readAudit(pipelineDir).pop().would, [
+    'would drain and restart the pipeline because src/node-registry.js',
     'would restart am-node-registry.service because src/node-registry.js',
     'would restart am-package-intake.service because src/node-registry.js',
   ]);
