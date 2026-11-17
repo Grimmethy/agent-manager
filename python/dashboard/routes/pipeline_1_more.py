@@ -442,6 +442,18 @@ def api_git_unmerged_branches():
     return resp.make_conditional(request)
 
 
+@pipeline_1_more_bp.route("/api/git/unmerged-branches", methods=["POST"])
+def api_git_unmerged_branches_refresh():
+    """Rebuild the Unmerged Branches cache on this request only: no model call, no timer.
+    Invalidates the cache, then recomputes it synchronously through the existing store path
+    (list_unmerged_branches -> _store_branch_list), and reports when the rebuild finished."""
+    from datetime import datetime, timezone
+    from app import _invalidate_branch_cache, list_unmerged_branches
+    _invalidate_branch_cache(refetch=True)
+    list_unmerged_branches(force=True)
+    return jsonify({"last_built_at": datetime.now(timezone.utc).isoformat()}), 200
+
+
 @pipeline_1_more_bp.route("/api/git/stale-branch-candidates")
 def api_git_stale_branch_candidates():
     """Read-only: unmerged branches far behind main that no live owner covers (see branch_staleness.py).
