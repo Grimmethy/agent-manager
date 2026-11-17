@@ -372,7 +372,7 @@ function computeBudgetHealthy() {
   };
 }
 
-module.exports = { isBudgetHealthy, computeBudgetHealthy, parseResetTime, usageTokenCount, estimateBudgetCeiling, estimateTimeToCap, currentWindowStartMs };
+module.exports = { isBudgetHealthy, computeBudgetHealthy, parseResetTime, usageTokenCount, estimateBudgetCeiling, estimateTimeToCap, currentWindowStartMs, listJsonlFiles };
 
 if (require.main === module) {
   console.log(JSON.stringify(isBudgetHealthy(), null, 2));
