@@ -41,6 +41,24 @@ function branchCardHtml(b) {
       ? `<span class="badge bad" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Hub ${escapeAttr(b.hub.id)}: ${b.hub.progress.done}/${b.hub.progress.total} done${b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : ''} -- click to open the hub">⚠ hub mid-flight</span>`
       : `<span class="badge ok" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Coordinator hub complete -- click to open the hub">✓ hub complete</span>`)
     : '';
+  // Merge-loop line (HUB0500 3/4). b.merge_loop follows merge_loop_status.py's shape:
+  // {checker: {status, row}, merger: {status, row}}. Three exclusive states: checker row
+  // found -> full line; checker file present but no row -> 'no row yet'; anything else
+  // (file missing or no merge_loop data) -> nothing.
+  const ml = b.merge_loop || null;
+  let mergeLoopLine = '';
+  if (ml && ml.checker) {
+    if (ml.checker.status === 'found' && ml.checker.row) {
+      const cr = ml.checker.row;
+      const mr = ml.merger && ml.merger.status === 'found' && ml.merger.row ? ml.merger.row : null;
+      const mergerOut = mr && mr.outcome ? String(mr.outcome) : 'none';
+      mergeLoopLine = `<div class="meta">Merge loop: checker ${escapeHtml(String(cr.outcome ?? ''))} - ${escapeHtml(String(cr.reason ?? ''))}; merger ${escapeHtml(mergerOut)}</div>`;
+    } else if (ml.checker.status === 'no_row_for_branch') {
+      mergeLoopLine = `<div class="meta">checker: no row yet</div>`;
+    }
+  }
+  // Chip links to the left-for-you filter; stopPropagation keeps the card's own open-detail click from firing.
+  const leftForYouChip = `<a class="badge warn" href="?left_for_you=1" onclick="event.stopPropagation()" title="Branches the pipeline left for you to decide on">left for you</a>`;
   const foreign = !branchIsActiveProject(b);
   return `
     <div class="worker-card" data-branch-row="${escapeAttr(branchRowKey(b))}" data-open-branch="${escapeAttr(branchRowKey(b))}" data-verdict-key="${branchVerdictKey(b)}" style="cursor:pointer;${branchVerdictBorderStyle(b)}">
@@ -55,6 +73,8 @@ function branchCardHtml(b) {
         </div>
       </div>
       ${branchVerdictBadgeHtml(b)}
+      ${mergeLoopLine}
+      <div style="margin-top:4px">${leftForYouChip}</div>
       <div class="meta">
         ${b.domain ? `domain <strong>${escapeHtml(b.domain)}</strong>${b.source ? ' · source <strong>' + escapeHtml(b.source) + '</strong>' : ''} · ` : ''}
         pushed ${fmtAge((Date.now() - new Date(b.pushedAt).getTime()) / 1000)} ago
