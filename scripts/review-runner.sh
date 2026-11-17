@@ -68,24 +68,55 @@ release_current_claim() {
   CURRENT_CLAIM=""
 }
 claim_review_item() {
-  local name="$1" d="${CLAIM_DIR}/${1}.d" owner_pid age
+  local name="$1" d="${CLAIM_DIR}/${1}.d" tmp="${CLAIM_DIR}/.tmp.$$.${1}" owner_pid age stale
   mkdir -p "$CLAIM_DIR" 2>/dev/null
-  if mkdir "$d" 2>/dev/null; then
-    printf '%s %s\n' "$$" "$INSTANCE_ID" > "${d}/owner"
+  # Build the complete claim (owner file included) in a private temp dir, then publish it with one rename.
+  # A claim directory therefore never exists without its owner file, so a fresh claim cannot look stale.
+  rm -rf "$tmp"
+  mkdir "$tmp" 2>/dev/null || return 1
+  printf '%s %s\n' "$$" "$INSTANCE_ID" > "${tmp}/owner"
+  if mv -T "$tmp" "$d" 2>/dev/null; then
     CURRENT_CLAIM="$name"
     return 0
   fi
-  owner_pid="$(awk '{print $1}' "${d}/owner" 2>/dev/null)"
+  owner_pid=""
+  if [[ -f "${d}/owner" ]]; then read -r owner_pid _ < "${d}/owner" || owner_pid=""; fi
   age=$(( $(date +%s) - $(stat -c %Y "$d" 2>/dev/null || echo 0) ))
   if [[ -n "$owner_pid" ]] && kill -0 "$owner_pid" 2>/dev/null && (( age < 10800 )); then
+    rm -rf "$tmp"
     return 1   # another live daemon is reviewing it
   fi
-  rm -rf "$d"
-  if mkdir "$d" 2>/dev/null; then
-    printf '%s %s\n' "$$" "$INSTANCE_ID" > "${d}/owner"
+  # Stale takeover runs under an atomic takeover lock, and staleness is re-checked while holding it. Renaming d without
+  # the lock can move a fresh claim that another taker just published into the stale path. A lock older than 60 s is
+  # left by a crashed taker and is cleared.
+  lock="${CLAIM_DIR}/${1}.takeover"
+  if [[ -d "$lock" ]] && (( $(date +%s) - $(stat -c %Y "$lock" 2>/dev/null || echo 0) > 60 )); then rmdir "$lock" 2>/dev/null; fi
+  if ! mkdir "$lock" 2>/dev/null; then
+    rm -rf "$tmp"
+    return 1   # another daemon is taking over this item right now
+  fi
+  owner_pid=""
+  if [[ -f "${d}/owner" ]]; then read -r owner_pid _ < "${d}/owner" || owner_pid=""; fi
+  age=$(( $(date +%s) - $(stat -c %Y "$d" 2>/dev/null || echo 0) ))
+  if [[ -n "$owner_pid" ]] && kill -0 "$owner_pid" 2>/dev/null && (( age < 10800 )); then
+    rmdir "$lock" 2>/dev/null
+    rm -rf "$tmp"
+    return 1   # re-checked under the lock: now owned by a live daemon
+  fi
+  stale="${d}.stale.$$"
+  if ! mv -T "$d" "$stale" 2>/dev/null; then
+    rmdir "$lock" 2>/dev/null
+    rm -rf "$tmp"
+    return 1   # rename failed: someone else moved or replaced the claim
+  fi
+  rm -rf "$stale"
+  if mv -T "$tmp" "$d" 2>/dev/null; then
+    rmdir "$lock" 2>/dev/null
     CURRENT_CLAIM="$name"
     return 0
   fi
+  rmdir "$lock" 2>/dev/null
+  rm -rf "$tmp"
   return 1
 }
 trap release_current_claim EXIT
