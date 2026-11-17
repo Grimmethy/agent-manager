@@ -3061,3 +3061,16 @@ Extract a small `moveToArchive(srcPath, destDir, destDirEnsuredRef, result)` hel
 
 Benefits:
 A change to the archiving mechanics (destination layout, cross-filesystem handling, error-message format) is made in one helper rather than in two parallel code paths. The public functions become shorter and more readable, each focusing on its distinct responsibility (enumerating which files to archive) while delegating the shared mechanics.
+
+### AC-245 · Extract GPU headroom decision logic from `ensureGpuHeadroomCore` into a composable policy layer
+Strength: Strong
+Files: src/gpu-guard.js
+
+Problem:
+`ensureGpuHeadroomCore` is a monolithic function (~120 lines) that bundles three distinct concerns into a single sequential pipeline: (1) lease-state gating (Forge family holds the GPU), (2) VRAM measurement and threshold comparison, and (3) remediation actions (ComfyUI `/free`, TheAgent `/stop`). These concerns have different failure modes, different testability requirements, and different evolution timelines. The lease check is a pure predicate on local state; the VRAM read is a system-call wrapper; the remediation is a networked control surface. Tying them together means: (1) every test of the remediation path must stub `readFreeVramMb`, `fetchJson`, and the lease file, (2) adding a new remediation requires threading it through the existing sequence with potential ordering dependencies, and (3) the decision logic is opaque — the function returns a flat result object where the caller must parse `note` to understand what happened, and the Ollama-resident-model exemption is a special case inside the starved branch that is easy to accidentally bypass.
+
+Solution:
+Refactor into three focused layers: (1) `evaluateGpuState(opts) → { leaseHeld, freeMb, ollamaResidentMb, cloudEndpoint }` — pure measurement that reads the lease, queries `nvidia-smi`, checks Ollama `/api/ps`, and determines if the endpoint is cloud, with no side effects; (2) `shouldRemediate(state) → { reason: 'lease-held' | 'ollama-resident' | 'proceed' }` — pure decision logic that takes the measured state and returns a reason for skipping remediation or a green light; (3) `executeRemediation(state, opts) → { freed, yielded, note }` — action execution that runs ComfyUI `/free` and TheAgent `/stop` in the current order and returns what was done; (4) `ensureGpuHeadroom(opts)` — thin orchestrator that calls the three layers in sequence and composes the Forge yield check at the top level. The public API and CLI entry point remain unchanged.
+
+Benefits:
+Each layer can be tested in isolation — lease-gating logic doesn't need network stubs, remediation doesn't need `nvidia-smi` stubs. Adding a new remediation path means adding a case to `executeRemediation`, not threading a new concern through `evaluateGpuState`. The decision reason (`lease-held`, `ollama-resident`, `proceed`) becomes a first-class value, not buried in a note string, enabling structured logging. The Ollama-resident-model exemption is extracted to `shouldRemediate`, making the exemption rule explicit and harder to accidentally bypass.
