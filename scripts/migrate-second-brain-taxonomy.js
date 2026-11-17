@@ -61,6 +61,13 @@ function listNotes(root) {
   return out;
 }
 
+// Folder name used as the collision-rename suffix. A bare vault-root file has dirname '.',
+// which must map to 'root' explicitly (the old `|| 'root'` never ran because '.' is truthy).
+function collisionSuffix(rel) {
+  const dir = path.posix.dirname(rel);
+  return dir === '.' ? 'root' : dir.split('/').pop();
+}
+
 function targetFor(relPath) {
   for (const [re, repl] of RULES) {
     if (re.test(relPath)) return relPath.replace(re, repl);
@@ -95,7 +102,7 @@ function main() {
     let destRel = tgt;
     const destAbs = () => path.join(secondBrainDir, destRel);
     if (fs.existsSync(destAbs())) {
-      const srcFolder = path.dirname(rel).split('/').pop() || 'root';
+      const srcFolder = collisionSuffix(rel);
       const stem = path.basename(destRel, '.md');
       destRel = path.join(path.dirname(destRel), `${stem}-${srcFolder}.md`).replace(/\\/g, '/');
       collisions += 1;
@@ -143,4 +150,6 @@ function main() {
   if (!APPLY) console.log('re-run with --apply to execute');
 }
 
-main();
+module.exports = { collisionSuffix, targetFor };
+
+if (require.main === module) main();
