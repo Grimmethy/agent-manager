@@ -21,7 +21,7 @@ which records it as a discard verdict.
 
 Standalone like branch_removals.py / branch_verdicts.py: no `import app`; the git runner is injected (app.py's _run_git).
 """
-import re
+import re; from candidate_file_key import candidate_key, whole_file_path
 
 _HEADING_RE = re.compile(r"^###\s+([A-Za-z]+-\d+)\s*[·\-–—:]\s*(.+?)\s*$")
 _BACKTICK_RE = re.compile(r"`([A-Za-z_][\w.]*)`")
@@ -47,22 +47,22 @@ def candidate_identifier(title):
     (applyBrainDumpSort, renderHardwareTab) of length >= 6. Plain words never count, so a title with no code name
     yields None and is treated as 'new' rather than guessed at.
     """
-    m = _BACKTICK_RE.search(title or "")
+    m = None if whole_file_path(title) else _BACKTICK_RE.search(title or "")
     if m:
         return m.group(1).split(".")[-1]
-    for tok in _TOKEN_RE.findall(title or ""):
+    for tok in ([] if whole_file_path(title) else _TOKEN_RE.findall(title or "")):
         if len(tok) >= 6 and ("_" in tok.strip("_") or (re.search(r"[a-z][A-Z]", tok) is not None)):
             return tok
     return None
 
 
 def parse_candidate_headings(doc_text):
-    """[{id, title, ident}] for every '### AC-N · title' heading in a candidates doc."""
+    """[{id, title, ident, path, key}] for every '### AC-N · title' heading in a candidates doc."""
     out = []
     for line in (doc_text or "").splitlines():
         m = _HEADING_RE.match(line)
         if m:
-            out.append({"id": m.group(1), "title": m.group(2), "ident": candidate_identifier(m.group(2))})
+            out.append({"id": m.group(1), "title": m.group(2), "ident": candidate_identifier(m.group(2)), "path": whole_file_path(m.group(2)), "key": candidate_key(m.group(2), candidate_identifier(m.group(2)))})
     return out
 
 
@@ -85,17 +85,17 @@ def check_duplicate_candidates(run_git, repo_root, main_branch, branch):
                 added.extend(parse_candidate_headings(line[1:]))
         ok, master_text = _git(run_git, ["show", f"origin/{main_branch}:{doc}"], repo_root)
         for c in parse_candidate_headings(master_text if ok else ""):
-            if c["ident"]:
-                existing.setdefault(c["ident"], c["id"])
+            if c["key"]:
+                existing.setdefault(c["key"], c["id"])
     if not added:
         return None
-    dups = [(c, existing[c["ident"]]) for c in added if c["ident"] and c["ident"] in existing]
-    new = [c for c in added if not (c["ident"] and c["ident"] in existing)]
-    dup_txt = "; ".join(f"{c['id']} {c['ident']} = {orig} already on {main_branch}" for c, orig in dups)
+    dups = [(c, existing[c["key"]]) for c in added if c["key"] and c["key"] in existing]
+    new = [c for c in added if not (c["key"] and c["key"] in existing)]
+    dup_txt = "; ".join(f"{c['id']} {c['key'][1]} = {orig} already on {main_branch}" for c, orig in dups)
     if dups and not new:
         return ("discard", [f"recurring: all {len(dups)} candidate(s) this branch adds are duplicates of ones on {main_branch} ({dup_txt})"])
     if dups:
-        new_txt = ", ".join(f"{c['id']}" + (f" ({c['ident']})" if c["ident"] else "") for c in new)
+        new_txt = ", ".join(f"{c['id']}" + (f" ({c['key'][1]})" if c["key"] else "") for c in new)
         return ("needs-work", [f"adds {len(new)} new candidate(s): {new_txt}", f"and {len(dups)} recurring duplicate(s) to drop: {dup_txt}"])
     return None
 
