@@ -38,13 +38,14 @@ const MAX_CONTEXT_LINES = 5;
 // allowed dir that is itself under the requested dir, or "."/"" meaning "all of them".
 // Returns { roots: [absolute paths] } or { error }.
 function resolvePrimaryDirs(repoRoot, allowedDirs, dir) {
-  const norm = String(dir == null ? '' : dir).trim().replace(/^\.\//, '').replace(/\/+$/, '');
-  if (path.isAbsolute(norm) || norm.startsWith('/')) {
+  const raw = String(dir == null ? '' : dir).trim();
+  if (path.isAbsolute(raw) || /^[\\/]/.test(raw) || /^[A-Za-z]:/.test(raw)) {
     return { error: `dir '${dir}' must be a relative path inside the repo, not an absolute path.` };
   }
-  if (norm.split('/').includes('..')) {
+  if (raw.split(/[\\/]/).includes('..')) {
     return { error: `dir '${dir}' may not contain '..' segments -- use a path inside the repo.` };
   }
+  const norm = raw.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
   if (norm === '' || norm === '.') {
     return { roots: allowedDirs.map((d) => path.join(repoRoot, d)) };
   }
@@ -54,7 +55,8 @@ function resolvePrimaryDirs(repoRoot, allowedDirs, dir) {
   if (matchDir !== undefined) {
     const candidate = path.resolve(repoRoot, norm);
     const allowedRoot = path.resolve(repoRoot, matchDir);
-    if (candidate !== allowedRoot && !candidate.startsWith(allowedRoot + path.sep)) {
+    const rel = path.relative(allowedRoot, candidate);
+    if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) {
       return { error: `dir '${dir}' resolves outside the allowed dir '${matchDir}'.` };
     }
     return { roots: [candidate] };
