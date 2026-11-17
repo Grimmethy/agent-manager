@@ -25,6 +25,7 @@ const { logPipelineEvent } = require('./pipeline-history.js');
 const { logToolLoopEvent, buildTurnEndEntry, buildEmptyAttemptEntry, buildToolOutcomeEntries } = require('./tool-loop-audit.js');
 const { buildTrajectory, writeTrajectory } = require('./trajectory.js');
 const { withLock } = require('./single-flight-lock.js');
+const { checkLaneEditTools } = require('./lane-edit-tools-gate.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { localOllamaLockKey } = require('./lib/ollama-lock-key.js');
 const { PINNED_NUM_CTX, laneNumBatch } = require('./gpu-capacity.js');
@@ -1330,6 +1331,29 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   const tools = withGrepDirsHint(
     allowWrite ? [...TOOLS, ...(isChatCaller ? CHAT_TOOLS : WRITE_TOOLS)] : TOOLS,
   );
+
+  // Lane edit-tool gate (HUB0549): if the task requires file edits but the session's
+  // tool list has no write-capable tool, refuse before any /api/chat call. The gate is
+  // synchronous and I/O-free; it only inspects the tool names and the mustEdit flag.
+  const toolNames = tools.map((t) => t.function?.name).filter(Boolean);
+  const laneGate = checkLaneEditTools({ lane: source || 'unknown', toolNames, mustEdit: leafMustEdit });
+  if (laneGate) {
+    logPipelineEvent(pipelineDir, 'lane-misconfigured', {
+      reason: laneGate.reason,
+      lane: laneGate.lane,
+      toolNames: laneGate.toolNames,
+    });
+    return {
+      doneReason: 'lane-misconfigured',
+      reason: laneGate.reason,
+      lane: laneGate.lane,
+      toolCallLog: [],
+      turnsUsed: 0,
+      response: '',
+      toolsDisabled: true,
+    };
+  }
+
   const toolHandlers = allowWrite
     ? {
       ...buildToolHandlers(readableRoots, pipelineDir, readOnlyRoots),

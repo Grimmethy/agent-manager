@@ -697,6 +697,22 @@ test('runPlanWithTools with a non-chat source still sends the full WRITE_TOOLS s
   });
 });
 
+test('HUB0549: a no-edit-tools session with leafMustEdit=true refuses before any /api/chat call', async () => {
+  const { checkLaneEditTools } = require('./lane-edit-tools-gate.js');
+  const gateResult = checkLaneEditTools({ lane: 'test', toolNames: ['read_file'], mustEdit: true });
+  assert.ok(gateResult, 'gate should refuse');
+  assert.ok(gateResult.reason.includes('lane-misconfigured'));
+  withMockedChat([], async (mod, _dir, { sentBodies }) => {
+    // No edit tools in the session (only read_file), but leafMustEdit=true
+    const result = await mod.runPlanWithTools({ prompt: 'fix it', leafMustEdit: true, source: 'test' });
+    assert.equal(result.doneReason, 'lane-misconfigured');
+    assert.ok(result.reason.includes('lane-misconfigured'));
+    assert.equal(result.lane, 'test');
+    assert.deepEqual(result.toolCallLog, []);
+    assert.equal(sentBodies.length, 0, 'zero /api/chat calls when gate refuses');
+  });
+});
+
 // --- chat_status tool (2026-10-29, post-incident hardening) ----------------------------
 // The earlier defect: chat_status was added to TOOLS/buildToolHandlers (shared), so it
 // reported only the 7 shared tools (omitting CHAT_TOOLS) and gates.mergeVerdictNeedsCheck
@@ -1713,8 +1729,10 @@ test('leafMustEdit: a firmer "final warning" fires when a leaf still has not edi
     const explore = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
     const finish = { role: 'assistant', content: 'RESOLUTION: needs-human-decision\nI need X' };
     // soft nudge at turn 2, hard nudge at turn >= 5; run explores through then concludes
+    // allowWrite=true so the gate (HUB0549) does not refuse: the session must have an edit tool
+    // for a leafMustEdit run to proceed past the lane-misconfigured check.
     await withMockedChat([explore, explore, explore, explore, explore, explore, explore, finish], async (mod, _dir, { sentBodies }) => {
-      await mod.runPlanWithTools({ prompt: 'go', maxTurns: 12, nudgeToEditEarly: true, leafMustEdit: true });
+      await mod.runPlanWithTools({ prompt: 'go', maxTurns: 12, nudgeToEditEarly: true, leafMustEdit: true, allowWrite: true });
       const msgs = sentBodies[sentBodies.length - 1].messages;
       const hard = msgs.filter((m) => m.role === 'user' && /Final warning/.test(m.content || ''));
       assert.equal(hard.length, 1, 'exactly one hard nudge');
