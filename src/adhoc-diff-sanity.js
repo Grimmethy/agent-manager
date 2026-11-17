@@ -569,6 +569,29 @@ function isCreatedDocDeliverable(task, planText, rawText, files) {
   return !scanForCodeSignals(rawText).tripping.some(opensWithImperative);
 }
 
+// Exact path tokens the task text names in a non-restriction sentence that also carries a create or change verb ("Add a test in src/foo.test.js").
+// Used only to exempt a changed file from the forbidden-path check when its normalized path EXACTLY equals a named path. Never prefix matching.
+const NAMED_PATH_NEGATION_RE = /\b(?:not|no|never|without|avoid|unchanged|don['’]t|do\s+not|must\s+not)\b/i;
+const NAMED_PATH_VERB_RE = /\b(?:create|add|implement|change|update|modify|edit|write|rename|replace|wire|append|prepend|insert|remove|delete|fix|refactor|move)\b/i;
+const NAMED_PATH_TOKEN_RE = /(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]+/g;
+function normalizeDiffPath(p) {
+  return String(p || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^[`'"(\[]+|[`'"),;:\]]+$/g, '');
+}
+function collectNamedDiffPaths(task, planText = '') {
+  const rawText = (task && task.promptContext && task.promptContext.rawText) || (task && task.title) || '';
+  const named = new Set();
+  for (const text of [rawText, planText]) {
+    for (const sen of String(text || '').split(/(?<=[.!?:;])\s+|\n+/)) {
+      if (NAMED_PATH_NEGATION_RE.test(sen) || !NAMED_PATH_VERB_RE.test(sen)) continue;
+      for (const m of sen.match(NAMED_PATH_TOKEN_RE) || []) {
+        const p = normalizeDiffPath(m);
+        if (p) named.add(p);
+      }
+    }
+  }
+  return named;
+}
+
 function taskWantsCodeChange(task) {
   const rawText = (task && task.promptContext && task.promptContext.rawText) || (task && task.title) || '';
   const planText = (task && (task.planResponse || task.lastGoodPlan)) || '';
@@ -594,7 +617,9 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   const forbiddenOverride = findOverride(task, 'forbidden-path');
   const forbiddenSuppressed = [];
   if (forbidden.length) {
-    const violations = files.map((f) => ({ f, hit: pathHitsForbidden(f.path, forbidden) })).filter((v) => v.hit);
+    // A file the task itself names exactly (in a create/change sentence, not a restriction) is exempt; directory and basename restrictions still apply to every other file.
+    const namedDiffPaths = collectNamedDiffPaths(task, planText);
+    const violations = files.map((f) => ({ f, hit: pathHitsForbidden(f.path, forbidden) })).filter((v) => v.hit && !namedDiffPaths.has(normalizeDiffPath(v.f.path)));
     if (violations.length && forbiddenOverride) {
       for (const v of violations) forbiddenSuppressed.push(v.f.path);
     } else if (violations.length) {

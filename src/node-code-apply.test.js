@@ -155,6 +155,73 @@ test('a latest.json whose sha is not 40 lowercase hex is refused', () => {
   }
 });
 
+// A list in latest.json: one entry per repo; applyCode takes the one named by deps.repo (default agent-manager).
+const LIST = [
+  { repo: 'cloud-providers', sha: OTHER, bundle: 'cp-bbbbbbbb.bundle', branch: 'main' },
+  { repo: 'agent-manager', sha: SHA, bundle: 'am-aaaaaaaa.bundle', branch: 'master' },
+];
+
+test('a list with two repos picks the entry of the repo option', () => {
+  withInbox(JSON.stringify(LIST), (dir) => {
+    const deps = { ...fakeDeps([SHA, OTHER], { status: 0, stdout: '' }), repo: 'cloud-providers' };
+    assert.deepEqual(applyCode(dir, '/node', deps), { applied: true, sha: OTHER });
+    const [, args] = deps.calls.runStatus[0];
+    assert.deepEqual(args, [path.join(dir, 'cp-bbbbbbbb.bundle'), '/node', 'main']);
+  });
+});
+
+test('a list without the repo option throws and runs nothing', () => {
+  withInbox(JSON.stringify(LIST), (dir) => {
+    const deps = { ...fakeDeps([SHA]), repo: 'no-such-repo' };
+    assert.throws(() => applyCode(dir, '/node', deps), /applyCode: latest\.json has no entry for no-such-repo/);
+    assert.equal(deps.calls.run.length, 0);
+    assert.equal(deps.calls.runStatus.length, 0);
+  });
+});
+
+test('a list is read for the default repo agent-manager when no repo option is given', () => {
+  withInbox(JSON.stringify(LIST), (dir) => {
+    const deps = fakeDeps([OTHER, SHA], { status: 0, stdout: '' });
+    assert.deepEqual(applyCode(dir, '/node', deps), { applied: true, sha: SHA });
+    assert.equal(deps.calls.runStatus[0][1][0], path.join(dir, 'am-aaaaaaaa.bundle'));
+  });
+});
+
+test('the old single object still applies as the default repo and is no entry for another repo', () => {
+  withInbox(JSON.stringify(LATEST), (dir) => {
+    const deps = fakeDeps([OTHER, SHA], { status: 0, stdout: '' });
+    assert.deepEqual(applyCode(dir, '/node', deps), { applied: true, sha: SHA });
+  });
+  withInbox(JSON.stringify(LATEST), (dir) => {
+    const deps = { ...fakeDeps([OTHER]), repo: 'cloud-providers' };
+    assert.throws(() => applyCode(dir, '/node', deps), /has no entry for cloud-providers/);
+    assert.equal(deps.calls.runStatus.length, 0);
+  });
+});
+
+test('a bad sha or a bundle name with a slash in a list entry throws before anything runs', () => {
+  const bad = [
+    [{ repo: 'agent-manager', sha: 'A'.repeat(40), bundle: 'x.bundle', branch: 'master' }, /sha must be 40 lowercase hex/],
+    [{ repo: 'agent-manager', sha: SHA, bundle: 'sub/x.bundle', branch: 'master' }, /plain file name/],
+    [{ repo: 'agent-manager', sha: SHA, bundle: 'x..bundle', branch: 'master' }, /plain file name/],
+  ];
+  for (const [entry, pattern] of bad) {
+    withInbox(JSON.stringify([entry]), (dir) => {
+      const deps = fakeDeps([OTHER]);
+      assert.throws(() => applyCode(dir, '/node', deps), pattern);
+      assert.equal(deps.calls.runStatus.length, 0);
+    });
+  }
+});
+
+test('an empty list and a list with non-object items have no entry', () => {
+  for (const content of ['[]', '[null, 7, "x"]']) {
+    withInbox(content, (dir) => {
+      assert.throws(() => applyCode(dir, '/node', fakeDeps([OTHER])), /has no entry for agent-manager/);
+    });
+  }
+});
+
 function git(args, cwd) {
   return childProcess.execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 }
