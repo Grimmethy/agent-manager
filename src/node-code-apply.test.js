@@ -8,7 +8,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const childProcess = require('child_process');
-const { applyCode } = require('./node-code-apply.js');
+const { applyCode, checkRepoIsWorkTree } = require('./node-code-apply.js');
 
 const SCRIPTS = path.join(__dirname, '..', 'scripts');
 const SHA = 'a'.repeat(40);
@@ -32,6 +32,7 @@ function fakeDeps(heads, status = { status: 0, stdout: '' }) {
   const queue = [...heads];
   return {
     calls,
+    checkWorkTree: () => ({ ok: true }),
     run(cmd, args) {
       calls.run.push([cmd, args]);
       const head = queue.length > 1 ? queue.shift() : queue[0];
@@ -43,6 +44,42 @@ function fakeDeps(heads, status = { status: 0, stdout: '' }) {
     },
   };
 }
+
+test('checkRepoIsWorkTree: a throw or any output other than true is a refusal, true is ok', () => {
+  assert.deepEqual(checkRepoIsWorkTree('/node', () => { throw new Error('fatal: not a git repository'); }), { ok: false, reason: 'not-a-git-work-tree' });
+  assert.deepEqual(checkRepoIsWorkTree('/node', () => 'false\n'), { ok: false, reason: 'not-a-git-work-tree' });
+  assert.deepEqual(checkRepoIsWorkTree('/node', () => 'true\n'), { ok: true });
+});
+
+test('a node directory that is not a git work tree is refused before anything else runs', () => {
+  withInbox(JSON.stringify(LATEST), (dir) => {
+    const calls = { run: [], runStatus: [] };
+    const lines = [];
+    const deps = {
+      audit: (line) => lines.push(line),
+      run(cmd, args) { calls.run.push([cmd, args]); throw new Error('fatal: not a git repository'); },
+      runStatus(cmd, args) { calls.runStatus.push([cmd, args]); return { status: 0, stdout: '' }; },
+    };
+    assert.deepEqual(applyCode(dir, '/node', deps), { applied: false, reason: 'not-a-git-work-tree' });
+    assert.equal(calls.runStatus.length, 0);
+    assert.equal(calls.run.length, 1);
+    assert.deepEqual(calls.run[0][1].slice(-2), ['rev-parse', '--is-inside-work-tree']);
+    const verbs = ['fetch', 'pull', 'checkout', 'clone', 'merge', 'reset', 'clean'];
+    assert.equal(calls.run.some(([, args]) => args.some((a) => verbs.includes(a))), false);
+    assert.ok(lines.some((l) => l.includes('not-a-git-work-tree')));
+  });
+});
+
+test('the NOTICE is printed at most once per process across refusals', () => {
+  withInbox(JSON.stringify(LATEST), (dir) => {
+    const lines = [];
+    const deps = { audit: (line) => lines.push(line), run() { throw new Error('not a repo'); }, runStatus() { throw new Error('must not run'); } };
+    applyCode(dir, '/node', deps);
+    applyCode(dir, '/node', deps);
+    assert.ok(lines.filter((l) => l.includes('NOTICE')).length <= 1);
+    assert.equal(lines.filter((l) => l.includes('not-a-git-work-tree')).length, 2);
+  });
+});
 
 test('current sha is a no-op: runStatus is never called', () => {
   withInbox(JSON.stringify(LATEST), (dir) => {

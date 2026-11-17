@@ -1,3 +1,43 @@
+const { ownerAllows } = require('./source-owner-guard.js');
+const { logPipelineEvent } = require('./pipeline-history.js');
+
+/** Per-source count of owner-mismatch suppressions, keyed by source name. */
+const ownerMismatchCounts = {};
+
+/** The running repo root for the owner guard, or null if it cannot be read (fails closed). */
+function runningRootForOwnerGuard() {
+  try {
+    return require('./config.js').getConfig().repoRoot || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Where the owner-mismatch history event is written (same directory the pipeline already logs to). */
+function pipelineDirForHistory() {
+  try {
+    const c = require('./config.js').getConfig();
+    return c.pipelineDir || process.env.AGENT_MANAGER_PIPELINE_DIR || c.repoRoot || null;
+  } catch {
+    return process.env.AGENT_MANAGER_PIPELINE_DIR || null;
+  }
+}
+
+/**
+ * Record one owner-mismatch suppression for a single source: a history event and a per-source counter.
+ * taskId is not known at the gate (the source has not produced a task yet), so it is logged as null.
+ */
+function recordOwnerMismatch(sourceName, runningRoot, owners) {
+  ownerMismatchCounts[sourceName] = (ownerMismatchCounts[sourceName] || 0) + 1;
+  logPipelineEvent(pipelineDirForHistory(), 'owner-mismatch', {
+    source: sourceName,
+    taskId: null,
+    runningRoot,
+    owners,
+    reason: 'owner-mismatch',
+  });
+}
+
 /**
  * Internal storage: plain object keyed by source name.
  */
@@ -29,6 +69,22 @@ function registerTaskSource(name, config) {
     const inner = config.next;
     const { sourceEligibleHere } = require('./lib/source-scope.js');
     config = { ...config, next: (...args) => (sourceEligibleHere({ scope: 'core' }) ? inner(...args) : null) };
+  }
+  // Owner guard (per source, no shared state): when this source declares owners, each generation call checks whether the
+  // running root is one of them via ownerAllows() from source-owner-guard.js. A mismatch returns null for this source only,
+  // records one owner-mismatch history event, and increments this source's own counter. Other sources are unaffected.
+  if (config && config.owners !== undefined && typeof config.next === 'function') {
+    const ownedNext = config.next;
+    const owners = config.owners;
+    config = {
+      ...config,
+      next: (...args) => {
+        const runningRoot = runningRootForOwnerGuard();
+        if (ownerAllows(runningRoot, owners)) return ownedNext(...args);
+        recordOwnerMismatch(name, runningRoot, owners);
+        return null;
+      },
+    };
   }
   // `variantOf` (task-atomization plugin, docs/design-notes/task-atomization-plugin.md): this source is a smaller-scoped VARIANT of another source -- the
   // same kind of work shaped for a smaller model. Metadata only: the scorecard / dashboards group a variant with its parent. Validated shape-wise here;
