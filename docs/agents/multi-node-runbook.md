@@ -27,6 +27,10 @@ The owner's steps, in order. Nothing here starts by itself.
 
 A node never merges, pushes or deploys: its output is a record that wok reviews.
 
+### Code routes (the node pulls wok's code)
+
+The package intake also answers two read-only routes for a node that pulls wok's published code instead of being sent it: `GET /code/latest` (the list in `latest.json` of the code publish directory, `AGENT_MANAGER_CODE_PUBLISH_DIR`, default `<pipeline dir>/code-publish`) and `GET /code/<name>.bundle` (a bundle file named by an entry of that list, and nothing else). Both need the node's bearer token in `Authorization` and the node id in `X-Node-Id`, and both only answer the address the node was registered with. They are LAN only, with no TLS, so they never write and never serve a path outside the list. The manual way stays: `scp` a bundle, or a shared directory, and `scripts/import-repo-bundle.sh`.
+
 ### Review of a node's draft under swap-only critical memory pressure
 The reviewer lanes normally yield their tick while the memory marker is critical. The marker can be critical through the swap backstop alone (swap free under 128 MB with under 4096 MB of RAM and any I/O stall). When that is the only cause, a draft that a node sent (a record in `queue/review` with `fromNode`) is reviewed anyway, one per tick: swap free under 128 MB, at least 1024 MB available, memory full stall under 5, I/O full stall under 10. Anything else critical still yields. Kill switch: `AGENT_MANAGER_NODE_DRAFT_REVIEW_UNDER_SWAP_CRITICAL=false`. Code: `nodeDraftMayRunUnderPressure` in `src/node-draft-pressure.js`, used by `scripts/review-runner.sh`.
 

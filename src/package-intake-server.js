@@ -18,7 +18,13 @@
 //                   -> 200 the JSON array in latest.json of the code publish directory (AGENT_MANAGER_CODE_PUBLISH_DIR, default <pipeline dir>/code-publish);
 //                   503 {error: 'nothing published'} when the file is missing, unparsable or not an array. Read-only, no timer: a node asks, wok never pushes.
 //                   401 missing or wrong token or node id (unknown and wrong give the same answer); 403 wrong address (as for POST /package);
-//                   405 any other method on /code/latest. Every other path is 404.
+//                   405 any other method on /code/latest.
+//
+//   GET /code/<name>.bundle  the same two headers and the same 401 and 403 checks. Streams the bundle file named <name>.bundle from the code publish directory
+//                   (Content-Type application/octet-stream, Content-Length from fs.stat) only when that exact name is the `bundle` of an entry in the current
+//                   latest.json; 404 for any other name, a name outside letters, digits, dot, underscore and dash (1 to 200 characters, ending in .bundle),
+//                   an unlisted or missing file, and any traversal; 405 for another method on such a name; 500 when the file cannot be read before the headers go out.
+//                   Every other path is 404.
 //
 // The package is written atomically to <AGENT_MANAGER_PIPELINE_DIR>/queue/node-packages/<taskId>.json (a resend replaces it), the lease is ended with
 // returnLease() (src/lease-ledger.js) and one summary-level notification (src/notify.js, key node-package:<taskId>) is sent; the notice is best effort.
@@ -38,15 +44,43 @@ const { normalizeIp, bearer, TASK_ID_RE } = require('./node-intake-server.js');
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
+const BUNDLE_NAME_RE = /^[A-Za-z0-9._-]{1,200}$/;
+
+function publishDir(env, pipelineDir) {
+  return String(env.AGENT_MANAGER_CODE_PUBLISH_DIR || '').trim() || path.join(pipelineDir, 'code-publish');
+}
+
 // The list published for the nodes: latest.json in the code publish directory, or null when there is none to serve.
 function readPublished(env, pipelineDir) {
-  const dir = String(env.AGENT_MANAGER_CODE_PUBLISH_DIR || '').trim() || path.join(pipelineDir, 'code-publish');
+  const dir = publishDir(env, pipelineDir);
   try {
     const list = JSON.parse(fs.readFileSync(path.join(dir, 'latest.json'), 'utf8'));
     return Array.isArray(list) ? list : null;
   } catch (e) {
     return null;
   }
+}
+
+// Streams one listed bundle: a missing or non-regular file is a 404, a read error before the headers go out is a 500, one after them ends the connection.
+function streamBundle(res, file) {
+  let size;
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile()) return send(res, 404, { ok: false, error: 'not found' });
+    size = stat.size;
+  } catch (e) {
+    return send(res, 404, { ok: false, error: 'not found' });
+  }
+  const stream = fs.createReadStream(file);
+  stream.once('open', () => {
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': size });
+    stream.pipe(res);
+  });
+  stream.once('error', () => {
+    if (res.headersSent) return res.destroy();
+    return send(res, 500, { ok: false, error: 'could not read the bundle' });
+  });
+  return undefined;
 }
 
 function send(res, status, body, extraHeaders = {}) {
@@ -127,7 +161,10 @@ function createServer({ env = process.env, now = () => Date.now(), send: sendNot
   return http.createServer(async (req, res) => {
     try {
       const url = String(req.url || '').split('?')[0];
-      if (url === '/code/latest') {
+      const codeMatch = /^\/code\/([^/]+)$/.exec(url);
+      const bundleName = codeMatch ? codeMatch[1] : null;
+      const isBundle = bundleName !== null && bundleName.endsWith('.bundle') && BUNDLE_NAME_RE.test(bundleName);
+      if (url === '/code/latest' || isBundle) {
         if (req.method !== 'GET') return send(res, 405, { ok: false, error: 'GET only' });
         const askId = String(req.headers['x-node-id'] || '').trim();
         if (!verifyToken(askId, bearer(req.headers.authorization), env)) return send(res, 401, { ok: false, error: 'bad or missing token' });
@@ -136,8 +173,13 @@ function createServer({ env = process.env, now = () => Date.now(), send: sendNot
           return send(res, 403, { ok: false, error: 'request does not come from the registered address' });
         }
         const published = readPublished(env, pipelineDir);
-        if (!published) return send(res, 503, { ok: false, error: 'nothing published' });
-        return send(res, 200, published);
+        if (url === '/code/latest') {
+          if (!published) return send(res, 503, { ok: false, error: 'nothing published' });
+          return send(res, 200, published);
+        }
+        const listed = (published || []).some((entry) => entry && typeof entry === 'object' && entry.bundle === bundleName);
+        if (!listed) return send(res, 404, { ok: false, error: 'not found' });
+        return streamBundle(res, path.join(publishDir(env, pipelineDir), bundleName));
       }
       if (url !== '/package') return send(res, 404, { ok: false, error: 'not found' });
       if (req.method !== 'POST') return send(res, 405, { ok: false, error: 'POST only' });
