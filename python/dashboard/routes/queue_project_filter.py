@@ -17,6 +17,9 @@ from pathlib import Path
 ACTIVE = "active"
 ALL = "all"
 
+# Dismissal counters for GET /api/queue. Defined ONLY in this module.
+queue_filter_stats = {}
+
 # Queue state directories scanned for task JSON files.
 _STATE_DIRS = (
     "pending",
@@ -134,3 +137,36 @@ def resolve_depends_on(piece, full_store):
             "project": d.get("project") if d else None,
         })
     return out
+
+
+def _bump_stat(key):
+    queue_filter_stats[key] = queue_filter_stats.get(key, 0) + 1
+
+
+# Rows for GET /api/queue: [{id, title, state, project, dependsOn}].
+# Dependencies resolve against the FULL store (all registered projects plus the active
+# queue), built BEFORE the project filter, so a cross-project dependency still resolves.
+def queue_response(project_param):
+    full = collect_pieces(ALL)
+    seen = {p.get('id') for p in full}
+    for p in collect_pieces(ACTIVE):
+        if p.get('id') not in seen:
+            seen.add(p.get('id'))
+            full.append(p)
+    rows = []
+    for piece in full:
+        if project_param != ALL and piece.get('project') != project_param:
+            _bump_stat('excluded_by_project:' + str(piece.get('project')))
+            continue
+        deps = resolve_depends_on(piece, full)
+        for dep in deps:
+            if dep['state'] is None:
+                _bump_stat('unresolved_dependency')
+        rows.append({
+            'id': piece.get('id'),
+            'title': piece.get('title'),
+            'state': piece.get('state'),
+            'project': piece.get('project'),
+            'dependsOn': deps,
+        })
+    return rows
