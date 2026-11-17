@@ -8,7 +8,7 @@
 //   GPU session POST <PromptForge>/api/gpu/acquire {owner:'forge-mode'}: PromptForge evicts the local models and starts ComfyUI, and while the lease is held the workers and reviewers idle
 //               by themselves (scripts/agent-manager-common.sh comfyui_lease_held) and resume when it is released. No second mechanism is invented here.
 //   P40 VM      --vm off shuts the libvirt domain down gracefully and waits for 'shut off'; `off` starts it again only if forge mode shut it down. Default: keep.
-// `on` refuses first, with the numbers and what holds the memory, when MemAvailable after the planned steps would be under 10 GB or the I/O pressure (some, 10 s) is 50 percent or more.
+// `on` refuses first, with the numbers and what holds the memory, when MemAvailable after the planned steps would be under the configured minimum (default 10 GB) or the I/O pressure (some, 10 s) is at or above the configured maximum (default 50 percent). The limits, their FORGE_MODE_* env overrides and the P40 VM share (default 4300 MB) come from src/forge-limits.js.
 // A failing step rolls the earlier ones back. Forge mode ends by itself after 6 hours or when the GPU session is gone (`expire`, called by the watchdog). One log line per step.
 // Standard library only; every side effect goes through an injectable `io` so the tests never touch the machine.
 
@@ -17,9 +17,11 @@ const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const { spawnSync } = require('node:child_process');
+const { limits } = require('./forge-limits.js');
 
-const MIN_AVAIL_MB = 10240;
-const MAX_IO_SOME10 = 50;
+// Configured defaults from the limits table. Passing {} means no env is read at load time.
+const DEFAULTS = limits({}).limits;
+
 const MAX_AGE_MIN = 360;
 const VM_WAIT_S = 180;
 
@@ -45,7 +47,7 @@ function topRss(exec, n = 5) {
 }
 
 // -> { ok, reasons[], top[] }. plannedFreeMB: what the planned steps will give back (the VM when it goes, the models PromptForge evicts).
-function preflight({ availMB, io, plannedFreeMB = 0, minAvailMB = MIN_AVAIL_MB, maxIo = MAX_IO_SOME10, top = [] }) {
+function preflight({ availMB, io, plannedFreeMB = 0, minAvailMB = DEFAULTS.minAvailMB, maxIo = DEFAULTS.maxIoSome10, top = [] }) {
   const reasons = [];
   if (availMB === null || availMB === undefined) reasons.push('MemAvailable is unreadable');
   else if (availMB + plannedFreeMB < minAvailMB) reasons.push(`MemAvailable ${Math.round(availMB)} MB + ${Math.round(plannedFreeMB)} MB freed by the plan = ${Math.round(availMB + plannedFreeMB)} MB, under the ${minAvailMB} MB needed`);
@@ -89,18 +91,31 @@ async function waitVm(io, want, seconds) {
   }
 }
 
+// ---- planned frees (MB the plan gives back) ----
+// off = the P40 VM share (only when the VM is running) + the models that would be evicted; keep = the models only.
+// `state` is accepted for the call shape; the VM state is read from libvirt.
+async function plannedFreeMB(state, env, io = realIo(env)) {
+  const { limits: L } = limits(env);
+  const keep = await io.modelsMB();
+  const vmShare = vmState(io) === 'running' ? L.vmMB : 0;
+  return { off: vmShare + keep, keep };
+}
+
 // ---- on ----
 async function on({ vm = 'keep' } = {}, io = realIo()) {
   const env = io.env;
   if (readMarker(env)) { io.log('already in forge mode (see status)'); return 0; }
   const vmRunning = vm === 'off' && vmState(io) === 'running';
   const rd = readings(env);
-  const planned = (vmRunning ? Number(env.FORGE_MODE_VM_MB || 4300) : 0) + (await io.modelsMB());
-  const pre = preflight({ ...rd, plannedFreeMB: planned, top: topRss(io.exec) });
+  const { limits: L, warnings } = limits(env);
+  for (const w of warnings) io.log(`warning: ${w}`);
+  const planned = await plannedFreeMB(null, env, io);
+  const chosen = vm === 'off' ? planned.off : planned.keep;
+  const pre = preflight({ ...rd, plannedFreeMB: chosen, minAvailMB: L.minAvailMB, maxIo: L.maxIoSome10, top: topRss(io.exec) });
   if (!pre.ok) {
     io.log(`refused: ${pre.reasons.join('; ')}`);
     if (pre.top.length) io.log(`holding memory: ${pre.top.join(', ')}`);
-    if (vm !== 'off') io.log('hint: --vm off shuts the P40 VM down and frees about 4 GB');
+    if (vm !== 'off') io.log(`hint: --vm off shuts the P40 VM down and frees about ${Math.round(L.vmMB / 1024)} GB`);
     return 1;
   }
   io.log(`preflight ok (MemAvailable ${Math.round(rd.availMB)} MB, I/O ${rd.io}%)`);
@@ -150,10 +165,11 @@ async function status(io = realIo()) {
   const env = io.env;
   const st = readMarker(env);
   const rd = readings(env);
+  const { limits: L, warnings: W } = limits(env);
   const g = await io.pf('GET', '/api/gpu/status');
   const age = st ? Math.max(0, Math.round((io.now() - Date.parse(st.since)) / 60000)) : null;
   return { paused: !!st, since: st ? st.since : null, ageMin: age, expiresInMin: st ? Math.max(0, MAX_AGE_MIN - age) : null, vm: { domain: domain(env), state: vmState(io), shutDownByForgeMode: !!(st && st.vmShutDown) },
-    gpuSession: { active: !!(g.json && g.json.active), reachable: g.status === 200 }, memAvailMB: rd.availMB === null ? null : Math.round(rd.availMB), ioSome10: rd.io, top: topRss(io.exec, 3) };
+    gpuSession: { active: !!(g.json && g.json.active), reachable: g.status === 200 }, memAvailMB: rd.availMB === null ? null : Math.round(rd.availMB), ioSome10: rd.io, top: topRss(io.exec, 3), limits: L, plannedFreeMB: await plannedFreeMB(st, env, io), warnings: W };
 }
 
 async function expire(io = realIo()) {
@@ -178,4 +194,4 @@ async function main(argv, io = realIo()) {
 
 if (require.main === module) main(process.argv.slice(2)).then((c) => process.exit(c)).catch((e) => { process.stderr.write(`[forge-mode] failed: ${e && e.message ? e.message : e}\n`); process.exit(1); });
 
-module.exports = { MIN_AVAIL_MB, MAX_IO_SOME10, MAX_AGE_MIN, VM_WAIT_S, markerPath, readMarker, readings, preflight, on, off, status, expire, main, realIo };
+module.exports = { DEFAULTS, MAX_AGE_MIN, VM_WAIT_S, plannedFreeMB, markerPath, readMarker, readings, preflight, on, off, status, expire, main, realIo };
