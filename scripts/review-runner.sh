@@ -436,6 +436,10 @@ while :; do
   done
   release_current_claim                                                         # the last item of this tick is done too
 
+  # Apply-infra mirror (src/apply-infra.js INFRA_APPLY_RE): the apply-side infra pattern mirrors
+  # INFRA_FAILURE_PATTERN above. Decision: the 60000 ms git-runner fetch ceiling stays UNCHANGED --
+  # under load (load average ~14) an ls-remote took 0.77 s and the same apply succeeded ~90 s later,
+  # so the timeout under load is the signal and retry with backoff (applyWithInfraRetry) is the fix.
   # Idle-only backoff: only pay the full poll interval when this tick genuinely found
   # nothing to review. Previously slept the full ORC_TICK_SECS (30s) unconditionally at the
   # end of EVERY tick regardless of whether more items were sitting right there waiting --
