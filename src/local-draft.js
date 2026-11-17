@@ -1223,12 +1223,13 @@ async function finalizeCandidateFulfillment(task, {
   // a dead end -- ask once, naming the rule, before blocking for a human. Any later failure blocks exactly as before. The flag is not a
   // clean-slate field, so a re-admitted task is not retried forever.
   if (split && split.invalid && split.tooFew && !task.splitTooFewRetried) {
-    task.splitTooFewRetried = true;
     const correction = `Your previous answer was mode "split" but only ${split.usable} of ${split.proposed} sub-candidate(s) were usable. A split needs AT LEAST 2 sub-candidates, each with a title, problem and solution, each touching exactly ONE file, listed in the order they must be applied (use dependsOn when a later piece needs an earlier one). For example: (1) create the new module, then (2) rewire the original file to use it. Do not put the whole job in a single sub-candidate.`;
-    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
-    task.priorRejectionFeedback.push(correction);
     const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: `${implPrompt}\n\n${correction}`, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
     if (!retryResult.degenerate) {
+      task.splitTooFewRetried = true;
+      const feedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+      feedback.push(correction);
+      task.priorRejectionFeedback = feedback;
       task.implementResponse = retryResult.response;
       split = parseCandidateSplit(task.implementResponse);
     }
