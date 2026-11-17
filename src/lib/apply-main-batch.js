@@ -4,7 +4,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { getConfig, ensureRegistered } = require('../config.js');
+const { ensureRegistered } = require('../config.js');
 const { getRegisteredSource, resolveSourceName } = require('../task-source-registry.js');
 const { createRealGitRunner } = require('../git-runner.js');
 const { writeTaskLogFile, taskLogRelPath, taskComputeForLog } = require('../task-log-store.js');
@@ -208,8 +208,6 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
 }
 
 function mainPartition() {
-  const { repoRoot } = getConfig();
-  void repoRoot;
   const direct = [];
   const other = [];
   for (const p of process.argv.slice(3)) {
