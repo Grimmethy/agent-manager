@@ -19,6 +19,10 @@ Act on a single item directly only when the user **explicitly asks** for that it
 even then prefer a dashboard `/api/task/...` endpoint or an existing sweep over
 hand-editing `queue/`. If no mechanism fits, the deliverable is a proposal for one.
 
+## Filing friction tasks: premium at filing
+
+Friction tasks that block work are filed premium at filing. The full rule is in AGENTS.md, section "Filing friction tasks: premium at filing".
+
 ## Agent skills
 
 ### Issue tracker
