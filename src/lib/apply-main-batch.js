@@ -208,8 +208,9 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
 }
 
 function mainPartition() {
-  const { repoRoot } = getConfig();
-  void repoRoot;
+  // Called for its side effect only: getConfig() throws if AGENT_MANAGER_REPO_ROOT is unset,
+  // so a misconfigured environment fails fast here. repoRoot itself is not needed.
+  getConfig();
   const direct = [];
   const other = [];
   for (const p of process.argv.slice(3)) {
