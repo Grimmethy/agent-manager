@@ -39,6 +39,15 @@ def _registry():
     return [e for e in read_project_registry() if isinstance(e, dict)]
 
 
+def list_registered_projects():
+    """Return [{label, repoRoot}] for every registered project, read via _registry()."""
+    return [
+        {"label": e["label"], "repoRoot": e["repoRoot"]}
+        for e in _registry()
+        if e.get("label") and e.get("repoRoot")
+    ]
+
+
 def parse_project_param(value):
     """Return 'active', 'all', or a known project slug (registry label).
 
