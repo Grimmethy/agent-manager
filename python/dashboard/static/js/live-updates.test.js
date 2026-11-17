@@ -204,6 +204,42 @@ test('snapshot and project-changed refresh everything the active tab allows', ()
   }
 });
 
+test('drain does not start a second refresh for a tab while one is still running', async () => {
+  // Tripwire, same pattern as core-ui.test.js: destructive endpoints throw and are recorded.
+  const DESTRUCTIVE_URL = /pipeline\/(stop|start)|\/workers?\/.*\/(enable|disable)|\/pause/;
+  const realFetch = globalThis.fetch;
+  const destructiveHits = [];
+  globalThis.fetch = async (url) => {
+    if (DESTRUCTIVE_URL.test(String(url))) {
+      destructiveHits.push(String(url));
+      throw new Error('tripwire: destructive URL ' + url);
+    }
+    throw new Error('tripwire: unexpected fetch ' + url);
+  };
+  try {
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    let refreshes = 0;
+    harness({
+      apply: async () => {
+        refreshes += 1;
+        if (refreshes === 1) await gate;      // the first refresh stays unresolved until the test releases it
+      },
+    });
+    const stream = FakeEventSource.last;
+    stream.emit('counts-changed', {});    // starts the first refresh for the 'pending' tab
+    stream.emit('counts-changed', {});    // arrives while it is running: must not start a second one
+    assert.equal(refreshes, 1, 'no second refresh while the first is pending');
+    release();
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    assert.equal(refreshes, 2, 'the merged trigger runs once the first refresh settles');
+    assert.deepEqual(destructiveHits, []);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('an unknown event asks for nothing', () => {
   assert.deepEqual(lu.planForEvent('nonsense-changed', 'pending'), lu.NO_PLAN);
 });
