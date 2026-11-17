@@ -131,6 +131,24 @@ def api_tasks_completed():
     return jsonify({"tasks": rows, "nextCursor": next_cursor})
 
 
+def _queue_scope(project_param):
+    """[(label, queue_dir)] the queue views read. An absent/empty ?project= is the active project
+    alone, exactly as before (its label is carried so every row can say where it came from).
+    'all' or a registered label/repo root reads each named project's own queue/. Raises
+    ValueError for an unknown name (the caller turns that into a 400). Resolved on every call."""
+    from app import queue_dir
+    from project_scope import resolve_project_scope
+    if not project_param:
+        qdir = queue_dir()
+        if not qdir:
+            return []
+        active = resolve_project_scope(None)
+        return [((active or {}).get("label"), qdir)]
+    picked = resolve_project_scope(project_param)
+    targets = picked if isinstance(picked, list) else [picked]
+    return [(p["label"], Path(p["pipelineDir"]) / "queue") for p in targets]
+
+
 @shared_misc_bp.route("/api/queue/<state>")
 def api_queue_state(state):
     """Returns {items: [...], total: N}. Incremental loading (2026-07-26, Grimmethy:
@@ -138,17 +156,22 @@ def api_queue_state(state):
     file METADATA is sorted first (cheap, no content read) and only the requested slice
     ever gets read_json_safe'd, so a 200+-item done/ folder no longer means reading and
     JSON-parsing every single file on every 5s poll, just the page actually being shown."""
-    from app import QUEUE_STATES, queue_dir, read_json_safe, task_summary
-    qdir = queue_dir()
-    if not qdir:
+    from app import QUEUE_STATES, read_json_safe, task_summary
+    try:
+        scope = _queue_scope((request.args.get("project") or "").strip())
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not scope:
         return jsonify({"items": [], "total": 0})
 
     if state == "drafting":
         # Never paginated -- an in-flight claim count is always small (bounded by worker
         # count), nothing like done/'s unbounded historical backlog.
         entries = []
-        drafting_root = qdir / "drafting"
-        if drafting_root.is_dir():
+        for label, sq in scope:
+            drafting_root = sq / "drafting"
+            if not drafting_root.is_dir():
+                continue
             for sub in drafting_root.iterdir():
                 if not sub.is_dir():
                     continue
@@ -157,11 +180,14 @@ def api_queue_state(state):
                     if data:
                         s = task_summary(data, f.stem)
                         s["claimedBy"] = sub.name
+                        s["project"] = label
                         entries.append(s)
             for f in drafting_root.glob("*.json"):  # legacy: no subfolder
                 data = read_json_safe(f)
                 if data:
-                    entries.append(task_summary(data, f.stem))
+                    s = task_summary(data, f.stem)
+                    s["project"] = label
+                    entries.append(s)
         return jsonify({"items": entries, "total": len(entries)})
 
     if state not in QUEUE_STATES:
@@ -178,13 +204,17 @@ def api_queue_state(state):
         # `parentHub` (see decompose-loop-autoroute.js / apply-task.js's recordApplyOutcome)
         # and walks it pre-order so a child always renders immediately beneath its parent,
         # tagging `hubDepth` for the frontend's indent -- then pages the flattened result.
-        state_dir = qdir / "coordinating"
         by_id = {}
-        if state_dir.is_dir():
+        for label, sq in scope:
+            state_dir = sq / "coordinating"
+            if not state_dir.is_dir():
+                continue
             for f in state_dir.glob("*.json"):
                 data = read_json_safe(f)
                 if data and (not source_filter or data.get("source") == source_filter):
-                    by_id[data.get("id", f.stem)] = task_summary(data, f.stem)
+                    entry = task_summary(data, f.stem)
+                    entry["project"] = label
+                    by_id[data.get("id", f.stem)] = entry
         explicit_parent = {}
         for tid, entry in by_id.items():
             parent = entry.get("parentHub")
@@ -261,38 +291,61 @@ def api_queue_state(state):
         page = ordered[offset:offset + limit] if limit is not None else ordered[offset:]
         return jsonify({"items": page, "total": total})
 
+    # Every scoped project's state dir is read into ONE candidate list, sorted newest-first
+    # BEFORE slicing, so ?limit/?offset page the merged result (not each project separately).
+    # Each row is tagged with the 'project' label it came from.
+    candidates = []
+    for label, sq in scope:
+        state_dir = sq / state
+        if state_dir.is_dir():
+            for f in state_dir.glob("*.json"):
+                candidates.append((f, label))
+    candidates.sort(key=lambda fl: fl[0].stat().st_mtime, reverse=True)
     entries = []
-    total = 0
-    state_dir = qdir / state
-    if state_dir.is_dir():
-        files = sorted(state_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if source_filter:
-            # Filtering by task type (Job Status > Done tab, 2026-08-17: "Done is getting
-            # huge, need to filter by task type") needs each file's own `source` field --
-            # unlike sorting, that's not derivable from the filename/mtime alone, so this
-            # reads every file in the state dir instead of just the requested page. Only
-            # pays that cost when a filter is actually selected; the default unfiltered
-            # request below keeps the cheap stat-only-sort-then-page-only-read behavior.
-            filtered = []
-            for f in files:
-                data = read_json_safe(f)
-                if data and data.get("source") == source_filter:
-                    filtered.append((f, data))
-            total = len(filtered)
-            page = filtered[offset:offset + limit] if limit is not None else filtered[offset:]
-            entries = [task_summary(data, f.stem) for f, data in page]
-        else:
-            total = len(files)
-            page = files[offset:offset + limit] if limit is not None else files[offset:]
-            for f in page:
-                data = read_json_safe(f)
-                if data:
-                    entries.append(task_summary(data, f.stem))
+    if source_filter:
+        # Filtering by task type needs each file's own `source` field, so every candidate is read
+        # only when a filter is selected; the unfiltered request reads only the requested page.
+        filtered = []
+        for f, label in candidates:
+            data = read_json_safe(f)
+            if data and data.get("source") == source_filter:
+                filtered.append((f, label, data))
+        total = len(filtered)
+        page = filtered[offset:offset + limit] if limit is not None else filtered[offset:]
+        for f, label, data in page:
+            s = task_summary(data, f.stem)
+            s["project"] = label
+            entries.append(s)
+    else:
+        total = len(candidates)
+        page = candidates[offset:offset + limit] if limit is not None else candidates[offset:]
+        for f, label in page:
+            data = read_json_safe(f)
+            if data:
+                s = task_summary(data, f.stem)
+                s["project"] = label
+                entries.append(s)
     return jsonify({"items": entries, "total": total})
 
 
 @shared_misc_bp.route("/api/adhoc-tasks")
 def api_adhoc_tasks():
+    # ?project= scopes this list the same way /api/queue/<state> does (see _queue_scope). Each
+    # scoped project's rows are merged, then sorted newest-first into one list; every row carries
+    # the 'project' label it came from.
+    try:
+        scope = _queue_scope((request.args.get("project") or "").strip())
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    include_done = request.args.get("includeDone") == "1"
+    tasks = []
+    for label, qdir in scope:
+        tasks.extend(_adhoc_tasks_for(qdir, label, include_done))
+    tasks.sort(key=lambda t: t.get("createdAt") or "", reverse=True)
+    return jsonify({"tasks": tasks})
+
+
+def _adhoc_tasks_for(qdir, project_label, include_done):
     """Every domain:'adhoc' task across the whole pipeline, in one flat list, with
     whichever queue state it's currently sitting in -- the cross-cutting view
     api_task_anywhere already has the right traversal shape for (drafting/ first,
@@ -317,11 +370,9 @@ def api_adhoc_tasks():
     how fast any one request actually was in isolation. done/ tasks aren't what this
     view exists to track anyway -- the whole point is active (in-progress) and stuck
     (blocked) work, both already excluded from that giant folder."""
-    from app import QUEUE_STATES, _adhoc_task_excerpt, queue_dir, read_json_safe
-    qdir = queue_dir()
+    from app import QUEUE_STATES, _adhoc_task_excerpt, read_json_safe
     if not qdir:
-        return jsonify({"tasks": []})
-    include_done = request.args.get("includeDone") == "1"
+        return []
 
     def is_adhoc(data, task_id):
         return data.get("domain") == "adhoc" or task_id.startswith("adhoc-")
@@ -354,6 +405,7 @@ def api_adhoc_tasks():
             "createdAt": data.get("createdAt"),
             "excerpt": _adhoc_task_excerpt(data),
             "dependsOn": dependency_status(data.get("dependsOn")),
+            "project": project_label,
         }
 
     tasks = []
@@ -392,7 +444,7 @@ def api_adhoc_tasks():
             tasks.append(task_row(data, task_id, state))
 
     tasks.sort(key=lambda t: t.get("createdAt") or "", reverse=True)
-    return jsonify({"tasks": tasks})
+    return tasks
 
 
 # /api/summary is polled every 5s per open browser tab and used to json-parse every record in
