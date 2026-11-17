@@ -17,8 +17,9 @@
 // mattering after the 12 seconds, so a dead probe cannot blind the monitor.
 //
 // Each pass (default every 10 seconds):
-//   traffic       setPause('node', {source: "site-traffic", reason: "site in use", ttlMin: 10}), refreshing the 10 minute expiry. A pause someone else set here (any
-//                 other source, for example the operator's) is left exactly as it is.
+//   traffic       at least AGENT_MANAGER_SITE_PAUSE_MIN_SOCKETS site sockets (default 1: any one; grimm runs with 3): setPause('node', {source: "site-traffic", reason: "site in use",
+//                 ttlMin: 10}), refreshing the 10 minute expiry. A pause someone else set here (any other source, for example the operator's) is left exactly as it is.
+//                 Fewer sockets than that count as no traffic.
 //   no traffic    after AGENT_MANAGER_SITE_IDLE_MIN minutes (default 5) without any, the node pause is cleared, but ONLY when its source is site-traffic.
 //   backstop      load average above AGENT_MANAGER_SITE_MAX_LOAD (default 3.0) or free RAM below AGENT_MANAGER_SITE_MIN_FREE_GB (default 3, MemAvailable) pauses with
 //                 source site-backstop and clears when both are back under the limits, so the live site is protected even before anyone has opened it.
@@ -57,6 +58,8 @@ function config(env = process.env) {
     stuckHours: numberFrom(env.AGENT_MANAGER_SITE_STUCK_HOURS, 6),
     probeMarker: env.AGENT_MANAGER_SITE_PROBE_MARKER || path.join(env.HOME || os.homedir(), '.local', 'state', 'agent-manager', 'site-probe-marker'),
     probeTtlS: numberFrom(env.AGENT_MANAGER_SITE_PROBE_TTL_S, 12),
+    // How many site sockets count as 'site in use' (default 1: any one). Fewer than this is treated as no traffic: it starts no pause, does not refresh one, and lets one lapse.
+    minSockets: Math.max(1, Math.floor(numberFrom(env.AGENT_MANAGER_SITE_PAUSE_MIN_SOCKETS, 1))),
   };
 }
 
@@ -131,7 +134,7 @@ function createMonitor({ env = process.env, markerMtime = markerMtimeDefault, no
     let action = 'none';
     const foreign = () => current && !OWN_SOURCES.includes(current.source);
 
-    if (sockets > 0) {
+    if (sockets >= cfg.minSockets) {
       state.lastTrafficAt = at;
       if (!foreign()) {
         setPause('node', pauseOpts('site-traffic', 'site in use'), env, at);
