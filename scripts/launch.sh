@@ -213,6 +213,9 @@ elif [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]];
   # or hard-fails the whole pipeline over a warm-up call.
   if [[ -n "${LOCAL_MODEL:-}" ]]; then
     printf '[launch] pre-warming local model %s (keeps it loaded first, before any task can evict it) -- this can take ~100s...\n' "$LOCAL_MODEL"
+    if ! command -v node >/dev/null 2>&1; then
+      printf '[launch] pre-warm skipped: node not found on PATH (needed to build the pre-warm request body) -- workers will load the model lazily on first real use\n'
+    else
     warm_started_at=$(date +%s)
     if curl -s -m 180 "${OLLAMA_URL:-http://localhost:11434}/api/generate" \
       -d "$(node -e 'const { PINNED_NUM_CTX } = require(process.argv[2]); console.log(JSON.stringify({model: process.argv[1], prompt: "hi", stream: false, keep_alive: -1, options: { num_ctx: PINNED_NUM_CTX }}))' "$LOCAL_MODEL" "${SCRIPT_DIR}/../src/gpu-capacity.js")" \
@@ -228,6 +231,7 @@ elif [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]];
       printf '[launch] local model pre-warm failed/timed out after 180s -- continuing anyway, workers will load it lazily on first real use\n'
     fi
     rm -f /tmp/agent-manager-prewarm-http-code
+    fi
   fi
 
   bash "${SCRIPT_DIR}/setup-merge-drivers.sh" "$AGENT_MANAGER_REPO_ROOT" >/dev/null 2>&1 || true
