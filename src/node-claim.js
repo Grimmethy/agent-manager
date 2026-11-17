@@ -12,7 +12,7 @@
 // list order. A candidate that isHubBlocked (src/hub-stickiness.js) or that cannot be lent is skipped and
 // recorded in the skipped array; the scan continues with the next candidate.
 //
-// Filtered pipeline dirs (AGENT_MANAGER_NODE_FILTERED_DIRS, comma separated): a task in such a dir is claimed only when
+// Filtered pipeline dirs (AGENT_MANAGER_NODE_FILTERED_DIRS, comma separated; AGENT_MANAGER_NODE_FILTER_SOURCES and AGENT_MANAGER_NODE_ALLOW_STACKED widen it, see eligibleForNode): a task in such a dir is claimed only when
 // eligibleForNode holds (source 'manual', not stacked, domain in AGENT_MANAGER_NODE_FILTER_DOMAINS (default ['adhoc']),
 // and filed for this repo or unscoped). Other tasks there are recorded in skipped as 'not-eligible-for-node'.
 // Pipeline dirs not listed in AGENT_MANAGER_NODE_FILTERED_DIRS are unfiltered, exactly as before.
@@ -29,12 +29,14 @@ const { readRemoteUrl } = require('./remote-url.js');
 const { workerNode } = require('./node-affinity.js');
 const { rankPriorityResolved } = require('./rank-priority.js');
 
-// Node eligibility (filtered pipeline dirs only): plain manual work this node may take. Not stacked hub pieces, not
-// non-manual sources, not tasks filed for another repo. Premium priority is not a restriction.
-function eligibleForNode(task, { pipelineDir, domains = ['adhoc'] } = {}) {
+// Node eligibility (filtered pipeline dirs only): work this node may take. By default plain manual work: not stacked hub pieces, not
+// non-manual sources, not tasks filed for another repo. Premium priority is not a restriction. Two settings widen it (owner decision 2026-11-16, to
+// give grimm enough work): `sources` (AGENT_MANAGER_NODE_FILTER_SOURCES, default ['manual']) and `allowStacked` (AGENT_MANAGER_NODE_ALLOW_STACKED, default false).
+// The domain list and the same-repo rule always apply. A stacked piece that is allowed still goes through the hub rules below (sticky branch, dependsOn).
+function eligibleForNode(task, { pipelineDir, domains = ['adhoc'], sources = ['manual'], allowStacked = false } = {}) {
   if (!task || typeof task !== 'object') return false;
-  if (task.source !== 'manual') return false;
-  if (task.stacked) return false;
+  if (!sources.includes(task.source)) return false;
+  if (task.stacked && !allowStacked) return false;
   if (!domains.includes(task.domain)) return false;
   if (task.generatedForRepoRoot && path.resolve(task.generatedForRepoRoot) !== path.resolve(pipelineDir)) return false;
   return true;
@@ -53,6 +55,17 @@ function filteredDirs(env = process.env) {
 function filterDomains(env = process.env) {
   const list = splitList(env.AGENT_MANAGER_NODE_FILTER_DOMAINS);
   return list.length ? list : ['adhoc'];
+}
+
+// Sources a node may take from filtered dirs (AGENT_MANAGER_NODE_FILTER_SOURCES). Unset or empty gives ['manual'].
+function filterSources(env = process.env) {
+  const list = splitList(env.AGENT_MANAGER_NODE_FILTER_SOURCES);
+  return list.length ? list : ['manual'];
+}
+
+// True when a node may take stacked hub pieces from filtered dirs (AGENT_MANAGER_NODE_ALLOW_STACKED = true, 1 or on). Anything else is false.
+function allowStackedFrom(env = process.env) {
+  return ['true', '1', 'on'].includes(String(env.AGENT_MANAGER_NODE_ALLOW_STACKED || '').trim().toLowerCase());
 }
 
 function readJson(file) {
@@ -123,6 +136,8 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
   // Computed once per call: which pipeline dirs are filtered, and the domains allowed there.
   const filtered = new Set(filteredDirs(env));
   const allowedDomains = filterDomains(env);
+  const allowedSources = filterSources(env);
+  const stackedAllowed = allowStackedFrom(env);
 
   // One ordered list per pipeline dir and sub-directory. pickClaimableTasks keeps its own order within each list.
   const lists = [];
@@ -141,7 +156,7 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
         if (seen.has(taskId)) continue;
         // Deliberately before seen.add (not after the classes check): an ineligible copy in a filtered dir must not
         // shadow an eligible same-id record in a later, unfiltered dir.
-        if (filtered.has(path.resolve(pipelineDir)) && !eligibleForNode(task, { pipelineDir, domains: allowedDomains })) {
+        if (filtered.has(path.resolve(pipelineDir)) && !eligibleForNode(task, { pipelineDir, domains: allowedDomains, sources: allowedSources, allowStacked: stackedAllowed })) {
           skipped.push({ taskId, reason: 'not-eligible-for-node' });
           continue;
         }
@@ -193,4 +208,4 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
   return null;
 }
 
-module.exports = { claimNext, eligibleForNode, filteredDirs, filterDomains };
+module.exports = { claimNext, eligibleForNode, filteredDirs, filterDomains, filterSources, allowStackedFrom };
