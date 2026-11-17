@@ -38,7 +38,9 @@ function httpsGetJson(urlString, headers) {
       res.on('data', (c) => { data += c; });
       res.on('end', () => {
         if (res.statusCode !== 200) {
-          reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 300)}`));
+          const err = new Error(`HTTP ${res.statusCode}: ${data.slice(0, 300)}`);
+          err.statusCode = res.statusCode;
+          reject(err);
           return;
         }
         try { resolve(JSON.parse(data)); } catch (e) { reject(new Error(`Unparseable JSON: ${e.message}`)); }
@@ -48,7 +50,11 @@ function httpsGetJson(urlString, headers) {
       // uncaught exception instead of a caught, reportable rejection.
       res.on('error', reject);
     });
-    req.on('timeout', () => req.destroy(new Error('request timed out')));
+    req.on('timeout', () => {
+      const err = new Error('request timed out');
+      err.code = 'ETIMEDOUT';
+      req.destroy(err);
+    });
     req.on('error', reject);
     req.end();
   });
@@ -72,7 +78,7 @@ async function searchGitHub(query) {
       stat: `${repo.stargazers_count} stars`,
     }));
   } catch (e) {
-    return [{ query, source: 'github', error: e.message }];
+    return [{ query, source: 'github', error: e.message, kind: classifyFetchError(e) }];
   }
 }
 
@@ -100,7 +106,7 @@ async function searchHuggingFace(query) {
     }));
     return models.concat(datasets);
   } catch (e) {
-    return [{ query, source: 'huggingface', error: e.message }];
+    return [{ query, source: 'huggingface', error: e.message, kind: classifyFetchError(e) }];
   }
 }
 
@@ -135,7 +141,24 @@ async function main() {
   process.stdout.write(JSON.stringify(results));
 }
 
-module.exports = { runSearches, searchGitHub, searchHuggingFace };
+const NETWORK_ERROR_CODES = new Set(['ENOTFOUND', 'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN']);
+
+// Classifies a fetch error as 'network' | 'rate-limit' | 'http' | 'parse'.
+// Unrecognized errors fall back to 'http' rather than 'network': the search breaker only
+// counts 'network', so an error we cannot identify must never cause a source to be skipped.
+// Parse errors are recognized by the 'Unparseable JSON' message prefix set in httpsGetJson.
+// GitHub signals some rate limits as 403 with a rate-limit message, so that case is included.
+function classifyFetchError(e) {
+  const message = String((e && e.message) || '');
+  if (e && e.statusCode === 429) return 'rate-limit';
+  if (e && e.statusCode === 403 && /rate limit/i.test(message)) return 'rate-limit';
+  if (e && e.statusCode !== undefined && e.statusCode !== null) return 'http';
+  if (e && NETWORK_ERROR_CODES.has(e.code)) return 'network';
+  if (message.startsWith('Unparseable JSON')) return 'parse';
+  return 'http';
+}
+
+module.exports = { runSearches, searchGitHub, searchHuggingFace, classifyFetchError };
 
 if (require.main === module) {
   main();
