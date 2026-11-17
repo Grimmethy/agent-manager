@@ -35,6 +35,7 @@
 const fs = require('fs');
 const path = require('path');
 const { isForgePause } = require('./gpu-guard.js');
+const { fileExistsForTask, symbolExistsForTask } = require('./stacked-grounding.js');
 
 const PREMISE_CHECK_MODEL = process.env.AGENT_MANAGER_CANDIDATE_PREMISE_MODEL;
 
@@ -84,11 +85,11 @@ function defaultRepoRoots() {
 }
 
 // -> full current text of relPath from the first root that has it, or null.
-function readCurrentFile(relPath, repoRoots) {
+function readCurrentFile(relPath, repoRoots, task) {
   for (const root of repoRoots) {
     try {
       const full = path.join(root, relPath);
-      if (fs.existsSync(full)) return fs.readFileSync(full, 'utf8');
+      if (fileExistsForTask(task, root, relPath)) return fs.readFileSync(full, 'utf8');
     } catch { /* unreadable in this root -- try the next */ }
   }
   return null;
@@ -97,11 +98,13 @@ function readCurrentFile(relPath, repoRoots) {
 // True when the symbol is present in the real file of any fetched path, OR when a snapshot
 // was truncated and no real file could be read to rule the symbol out (cannot verify --
 // never turn an unverifiable "not found" into a contradiction).
-function symbolVerifiedOnDisk(files, symbol, roots) {
+function symbolVerifiedOnDisk(files, symbol, roots, task) {
   let unverifiableTruncated = false;
+  // Stacked tasks only: also accept a symbol the hub ref / applied siblings define. Non-stacked tasks never reach this branch.
+  if (task && task.stacked && roots.some((r) => symbolExistsForTask(task, r, symbol))) return true;
   for (const f of files) {
     if (!f || !f.path) continue;
-    const onDisk = readCurrentFile(f.path, roots);
+    const onDisk = readCurrentFile(f.path, roots, task);
     if (onDisk !== null) {
       if (onDisk.includes(symbol)) return true;
     } else if (isTruncatedSnapshot(f.content)) {
@@ -137,7 +140,7 @@ function checkCitations(task, body, { repoRoots } = {}) {
       const symbol = sm[1].replace(/\($/, '');
       if (symbol === relPath || relPath.endsWith(`/${symbol}`)) continue; // the path token itself
       if (!content.includes(symbol)) {
-        const onDisk = readCurrentFile(relPath, roots);
+        const onDisk = readCurrentFile(relPath, roots, task);
         if (onDisk !== null ? onDisk.includes(symbol) : isTruncatedSnapshot(content)) continue;
         contradictions.push({
           kind: 'missing-citation',
@@ -218,7 +221,7 @@ function checkPrerequisiteClaim(task, body, { repoRoots } = {}) {
     if (introducedSymbols.includes(symbol)) continue;
     const nearbyClaim = problemBody.slice(Math.max(0, sm.index - CITATION_WINDOW_CHARS), sm.index).match(PREREQUISITE_CLAIM_RE);
     if (nearbyClaim && !allContent.includes(symbol)) {
-      if (symbolVerifiedOnDisk(files, symbol, roots)) continue;
+      if (symbolVerifiedOnDisk(files, symbol, roots, task)) continue;
       contradictions.push({
         kind: 'unverified-prerequisite',
         detail: `candidate claims \`${symbol}\` already exists, but that name does not appear anywhere in the real fetched content of any file this candidate cites`,
