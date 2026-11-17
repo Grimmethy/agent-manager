@@ -65,10 +65,14 @@ function normalizeStacked(stacked) {
   return { branch, seq, total };
 }
 
-function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority, premiumSetBy, project, generatedForRepoRoot, stacked }, { pipelineDir, domainsPath }) {
+function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority, premiumSetBy, project, generatedForRepoRoot, stacked, raisedFrom }, { pipelineDir, domainsPath }) {
   if (!title) throw new Error('queueAdhocTask: title is required');
   if (!promptContext) throw new Error('queueAdhocTask: promptContext is required');
   const cleanStacked = stacked === undefined || stacked === null ? undefined : normalizeStacked(stacked);
+  const cleanRaisedFrom = raisedFrom === undefined || raisedFrom === null ? undefined : raisedFrom;
+  if (cleanRaisedFrom !== undefined && (typeof cleanRaisedFrom !== 'string' || !cleanRaisedFrom.trim())) {
+    throw new Error('queueAdhocTask: raisedFrom must be a non-empty string');
+  }
 
   const validDomains = Object.keys(JSON.parse(fs.readFileSync(domainsPath, 'utf8')));
   // A repair (stacked) task defaults to domain 'adhoc' when the caller names none and the project lists 'adhoc'
@@ -118,6 +122,8 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriori
     ...(generatedForRepoRoot ? { generatedForRepoRoot } : {}),
     // The branch a repair task rides on (see normalizeStacked); absent for every ordinary task.
     ...(cleanStacked ? { stacked: cleanStacked } : {}),
+    // raisedFrom: optional provenance label (e.g. 'brain-dump-<serial>'), top-level so brain-dump-existing-work.js's taskMatchesEntry() reads it; absent when not given.
+    ...(cleanRaisedFrom !== undefined ? { raisedFrom: cleanRaisedFrom } : {}),
   };
   const filePath = path.join(adhocDir, `${id}.json`);
   fs.writeFileSync(filePath, JSON.stringify(record, null, 2) + '\n');
