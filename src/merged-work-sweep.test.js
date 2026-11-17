@@ -165,6 +165,42 @@ test('sweep: non-ancestor SHA whose content IS present elsewhere (refactor-moved
   assert.equal(fs.existsSync(inboxDir(pipelineDir)), false);
 });
 
+test('sweep: overflow beyond MAX_FINDINGS_PER_RUN is deferred, not marked checked', () => {
+  const root = makeRepo();
+  commitFile(root, 'unrelated.js', 'const u = 1;\n');
+  const branchName = currentBranch(root);
+  const pipelineDir = tmpPipeline();
+  const instancesDir = path.join(pipelineDir, 'instances');
+  for (let i = 1; i <= 6; i += 1) {
+    git(['checkout', '--orphan', `overflow-branch-${i}`], root);
+    git(['rm', '-rf', '--cached', '.'], root);
+    git(['clean', '-fdx'], root);
+    const marker = `distinctive-overflow-marker-${i}`;
+    const sha = commitFile(root, `overflow-${i}.js`, `const v${i} = "${marker}";\n`);
+    git(['checkout', branchName], root);
+    const rawDiff = [
+      `diff --git a/overflow-${i}.js b/overflow-${i}.js`,
+      'new file mode 100644',
+      '--- /dev/null',
+      `+++ b/overflow-${i}.js`,
+      `+const v${i} = "${marker}";`,
+    ].join('\n');
+    doneTask(pipelineDir, `task-overflow-${i}`, { sha, rawDiff });
+  }
+  const allIds = [1, 2, 3, 4, 5, 6].map((i) => `task-overflow-${i}`);
+
+  const first = sweep({ pipelineDir, repoRoot: root });
+  assert.equal(first.flagged, 5);
+  assert.equal(fs.readdirSync(inboxDir(pipelineDir)).length, 5);
+  const state = JSON.parse(fs.readFileSync(path.join(instancesDir, '.merged-work-sweep-state.json'), 'utf8'));
+  const deferred = allIds.filter((id) => !state.checkedIds.includes(id));
+  assert.equal(deferred.length, 1, 'exactly the overflow task must stay unchecked');
+
+  const second = sweep({ pipelineDir, repoRoot: root });
+  assert.equal(second.flagged, 1);
+  assert.equal(fs.readdirSync(inboxDir(pipelineDir)).length, 6);
+});
+
 test('sweep: a task already in checkedIds state is never re-scanned', () => {
   const root = makeRepo();
   const sha = commitFile(root, 'a.js', 'const a = 1;\n');
