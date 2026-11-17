@@ -23,4 +23,12 @@ function validProposalFiles(value) {
   return out.length ? out : undefined;
 }
 
-module.exports = { MAX_FILES, MAX_PATH_CHARS, validProposalFiles };
+// -> a new array where each declared entry exactly matching a newFiles member becomes 'path (new)'; other entries are unchanged. A non-array
+// newFiles is treated as empty and a non-array declared is returned unchanged. The input is not mutated.
+function markCreatedFiles(declared, newFiles) {
+  if (!Array.isArray(declared)) return declared;
+  const created = new Set(Array.isArray(newFiles) ? newFiles : []);
+  return declared.map((p) => (created.has(p) ? p + ' (new)' : p));
+}
+
+module.exports = { MAX_FILES, MAX_PATH_CHARS, validProposalFiles, markCreatedFiles };
