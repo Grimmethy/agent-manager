@@ -896,6 +896,33 @@ function onboardDeepDiveProject(lead, clonesDir) {
   };
 }
 
+// Retry cap for deep-dive onboarding. In-memory only: a process restart resets the counts.
+// Without a cap, a lead whose clone always fails is re-attempted (git clone + graph_build.py)
+// on every worker tick.
+const DEEP_DIVE_MAX_ATTEMPTS = 3;
+const deepDiveFailures = new Map(); // slug -> { count, lastError }
+
+function isDeepDiveExhausted(slug) {
+  const rec = deepDiveFailures.get(slug);
+  return !!rec && rec.count >= DEEP_DIVE_MAX_ATTEMPTS;
+}
+
+function clearDeepDiveFailure(slug) {
+  deepDiveFailures.delete(slug);
+}
+
+// Error type (404 / malformed URL vs. network) is not distinguished here: the error shapes
+// are not verified, so every failure counts the same toward the cap.
+function recordDeepDiveFailure(slug, lead, err) {
+  const msg = err && err.message ? err.message : String(err);
+  const rec = deepDiveFailures.get(slug) || { count: 0, lastError: '' };
+  rec.count += 1;
+  rec.lastError = msg;
+  deepDiveFailures.set(slug, rec);
+  console.error(`deep_dive: failed to onboard "${lead.name}" (attempt ${rec.count}/${DEEP_DIVE_MAX_ATTEMPTS}): ${msg}`);
+  if (rec.count === DEEP_DIVE_MAX_ATTEMPTS) console.error(`deep_dive: giving up on "${lead.name}" until restart`);
+}
+
 function nextDeepDiveTask() {
   const { repoRoot, projectSearchIndexPath, deepDiveCoveragePath, deepDiveClonesDir } = getConfig();
   // Same convention nextProjectSearchTask() already uses to write the "Relevant to" column
@@ -926,7 +953,7 @@ function nextDeepDiveTask() {
   for (const lead of strongLeads) {
     if (!onboardingOnline) break;
     const slug = slugifyForId(lead.name);
-    if (coverage.projects[slug]) continue; // already onboarded (or a prior onboarding attempt failed and will retry below)
+    if (coverage.projects[slug] || isDeepDiveExhausted(slug)) continue; // already onboarded, or failed DEEP_DIVE_MAX_ATTEMPTS times this process
     try {
       const onboarded = onboardDeepDiveProject(lead, deepDiveClonesDir);
       coverage.projects[slug] = {
@@ -939,12 +966,12 @@ function nextDeepDiveTask() {
         // without needing to re-parse INDEX.md itself.
         relevantToProject: projectTag,
       };
-      coverageChanged = true;
+      coverageChanged = true; clearDeepDiveFailure(slug);
     } catch (e) {
       // Clone/graph-build failures (bad URL, network, python not on PATH, etc.) must never
-      // crash the worker loop -- log and skip this lead for this tick; since it's still
-      // absent from coverage.projects, it's retried automatically next tick.
-      console.error(`deep_dive: failed to onboard "${lead.name}": ${e.message}`);
+      // crash the worker loop -- log and skip this lead for this tick. Retried on later ticks
+      // until DEEP_DIVE_MAX_ATTEMPTS (in-memory, resets on restart).
+      recordDeepDiveFailure(slug, lead, e);
     }
   }
   const saveCoverage = () => {
