@@ -11,6 +11,10 @@
 // (latest.json in AGENT_MANAGER_CODE_PUBLISH_DIR, default <AGENT_MANAGER_PIPELINE_DIR>/code-publish). Set on the first mismatch, kept while it lasts,
 // deleted when the shas match, left alone when either sha is unknown. Stored with the record, so a registry restart keeps the clock.
 //
+// behindTooLong / markBehindNotified (node code sync, piece 5b): a heartbeat whose behindSince is older than AGENT_MANAGER_NODE_BEHIND_MIN minutes (default 30)
+// earns ONE summary notice per episode (src/node-registry-server.js); behindNotified on the record holds the stamp already noticed, so the same episode is not
+// announced again, and it is what a later recovery notice checks. Neither runs on a timer: the heartbeat is the trigger.
+//
 // A heartbeat (recordHeartbeat) refreshes lastSeen and the reported state. The status of a node is computed, never stored:
 //   stale   no heartbeat for AGENT_MANAGER_NODE_STALE_MIN minutes (default 5), or never one
 //   off     the node reported state "off" (an operator turned it off on purpose)
@@ -168,6 +172,28 @@ function recordHeartbeat(payload = {}, env = process.env, now = Date.now()) {
   return { ...updated, previousBehindSince: record.behindSince || null };
 }
 
+const DEFAULT_BEHIND_MIN = 30;
+
+// Whole minutes a node has been behind when its stamp is parsable and strictly older than N minutes, else null. N comes from AGENT_MANAGER_NODE_BEHIND_MIN (a bad or
+// non-positive value gives 30). Pure.
+function behindTooLong(behindSince, now, env = process.env) {
+  const since = Date.parse(behindSince);
+  if (typeof behindSince !== 'string' || !Number.isFinite(since) || !Number.isFinite(now)) return null;
+  const limit = Number(env && env.AGENT_MANAGER_NODE_BEHIND_MIN);
+  const minutes = Number.isFinite(limit) && limit > 0 ? limit : DEFAULT_BEHIND_MIN;
+  return now - since > minutes * 60000 ? Math.floor((now - since) / 60000) : null;
+}
+
+// Records (or, with null, clears) the behindSince stamp already noticed for a node. Returns true when the record was written.
+function markBehindNotified(id, stamp, env = process.env) {
+  const nodes = loadNodes(env);
+  if (!nodes[id]) return false;
+  if (stamp === null) delete nodes[id].behindNotified;
+  else nodes[id].behindNotified = stamp;
+  saveNodes(nodes, env);
+  return true;
+}
+
 function statusOf(record, env = process.env, now = Date.now()) {
   const seen = Date.parse(record.lastSeen);
   if (!Number.isFinite(seen) || now - seen > staleMinutes(env) * 60 * 1000) return 'stale';
@@ -226,4 +252,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { nodesDir, staleMinutes, isValidNodeId, loadNodes, loadTokens, registerNode, verifyToken, recordHeartbeat, statusOf, listNodes, sweepStale, main };
+module.exports = { publishedSha, behindTooLong, markBehindNotified, nodesDir, staleMinutes, isValidNodeId, loadNodes, loadTokens, registerNode, verifyToken, recordHeartbeat, statusOf, listNodes, sweepStale, main };
