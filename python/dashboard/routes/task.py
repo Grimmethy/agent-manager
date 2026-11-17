@@ -862,6 +862,57 @@ def api_task_answer_clarification(task_id):
     return jsonify({"id": task_id, "answered": True})
 
 
+@task_bp.route("/api/task/blocked/<task_id>/answer", methods=["POST"])
+def api_task_answer_blocked(task_id):
+    """Answers a blocked task: appends the human's answer to the task's existing guidance
+    (promptContext.rawText, the same field the needs-clarification answer route appends to),
+    moves the record from queue/blocked/ to queue/pending/ keeping its id and rawText identity,
+    and appends an 'answered' history event. Body: {"answer": "<non-empty text>"}.
+    400 for a missing/whitespace-only answer and 404 for an unknown blocked id, both leaving
+    every store unchanged."""
+    from app import read_json_safe
+    body = request.get_json(silent=True) or {}
+    answer = body.get("answer")
+    answer = answer.strip() if isinstance(answer, str) else ""
+    if not answer:
+        abort(400, description="answer is required")
+    qdir, _scope = _qdir_for_request(body)
+    if not qdir:
+        abort(404)
+    src = qdir / "blocked" / f"{task_id}.json"
+    data = read_json_safe(src)
+    if not data:
+        abort(404)
+
+    pending_dir = qdir / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    dest = pending_dir / f"{task_id}.json"
+    if dest.exists():
+        abort(409, description=f"'{task_id}' already has a task in pending/")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # Append, never overwrite: any existing guidance text is kept verbatim ahead of the answer.
+    prompt_context = data.get("promptContext")
+    if not isinstance(prompt_context, dict):
+        prompt_context = {}
+    prior_text = prompt_context.get("rawText") or ""
+    prompt_context["rawText"] = prior_text + (
+        f"\n\nHUMAN ANSWER (answered from the Blocked picker, {now_iso}):\n{answer}\n"
+    )
+    data["promptContext"] = prompt_context
+    history = data.get("history")
+    history = list(history) if isinstance(history, list) else []
+    history.append({
+        "stage": "answered", "type": "answered", "at": now_iso,
+        "detail": "answered from the blocked picker -- moved to pending/ for a fresh attempt",
+    })
+    data["history"] = history
+    data["status"] = "pending"
+    dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    src.unlink()
+    return jsonify({"id": task_id, "answered": True})
+
+
 @task_bp.route("/api/task/needs-clarification/<task_id>/done", methods=["POST"])
 def api_task_mark_done_clarification(task_id):
     """Manual "mark as done" for a held needs-clarification task (Job Status > Needs
