@@ -353,7 +353,7 @@ function computeBudgetHealthy() {
     usedTokens: sinceLastLimitTokens,
     usedPercent: Math.min(100, Math.round((sinceLastLimitTokens / ceiling.ceilingTokens) * 100)),
     sampleCount: ceiling.sampleCount,
-    basis: 'empirical: max observed 5h-window token total across past real rate-limit hits -- not a real quota number, Claude Code under a subscription does not expose one',
+    basis: 'empirical: ceiling is the max token total observed in a 5-hour lookback ending at each past real rate-limit hit -- not a real quota number, Claude Code under a subscription does not expose one. usedTokens/usedPercent count tokens since the last real rate-limit boundary (sinceLastLimit.windowStart), which may span more or less than 5 hours',
     estimatedCapAt: estimateTimeToCap(allEntries, ceiling.ceilingTokens, sinceLastLimitTokens, now),
   } : null;
 
