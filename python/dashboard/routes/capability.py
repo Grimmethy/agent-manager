@@ -29,6 +29,6 @@ def api_capability():
             logger.warning("capability scorecard exited %d: %s", result.returncode, result.stderr[:300])
             return jsonify([])
         return jsonify(json.loads(result.stdout))
-    except (subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
         logger.warning("capability scorecard failed: %s", exc)
         return jsonify([])
