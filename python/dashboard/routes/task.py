@@ -88,7 +88,7 @@ def _clean_slate_for_fresh_adhoc_attempt(data):
 @task_bp.route("/api/task/<state>/<task_id>")
 def api_task_detail(state, task_id):
     from app import QUEUE_STATES, _files_touched_for, _incoming_task_links, _outgoing_task_links, _task_cost_summary, _task_input_summary, _work_log_for, queue_dir, read_json_safe
-    qdir = queue_dir()
+    qdir, _scope = _qdir_for_request()   # ?project=<repoRoot> reads that registered project's queue; absent = the active project (same as before)
     if not qdir:
         abort(404)
 

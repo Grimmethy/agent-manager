@@ -340,8 +340,19 @@ function findTabByKey(key) {
 // disable just took its replaced CORE_TABS row down with it. Either way the handling is the
 // same: switchToTab() runs the real leave/enter transition rather than just reassigning
 // activeTab, so the tab we're leaving still gets its own cleanup hook.
+// Two-strike rule: a single miss is not enough to redirect, because the tab list can be
+// briefly incomplete mid-update. goneActiveTabStrikes counts consecutive misses; a hit resets
+// it, and the redirect fires on the 2nd consecutive miss (then the counter resets). No timer
+// is involved -- the caller's own poll is what re-invokes this.
+let goneActiveTabStrikes = 0;
 function redirectFromGoneActiveTab(fallbackKey = 'project') {
-  if (findTabByKey(activeTab)) return false;
+  if (findTabByKey(activeTab)) {
+    goneActiveTabStrikes = 0;
+    return false;
+  }
+  goneActiveTabStrikes += 1;
+  if (goneActiveTabStrikes < 2) return false;
+  goneActiveTabStrikes = 0;
   switchToTab(fallbackKey);
   return true;
 }
