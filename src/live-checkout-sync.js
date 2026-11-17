@@ -22,19 +22,29 @@
 //
 // AGENT_MANAGER_LIVE_SYNC=on|dry-run|off (default off).
 //
+// Unit restarts (FF-3/3b): after a successful fast-forward (mode 'on') the changed paths (`git diff --name-only old..new`) go through restartActions()
+// (src/live-checkout-restart-rule.js); when units is true, each unit in AGENT_MANAGER_LIVE_SYNC_UNITS (comma separated, default
+// am-node-registry.service,am-package-intake.service, both user units) gets `systemctl --user restart <unit>` once. A failing restart is audited
+// (`restarts` on the ff line) and noticed (summary, key live-checkout:restart-failed) and does not stop the next unit. In dry-run the audit line only says
+// 'would restart <unit> because <paths>'. The event is the fast-forward itself: no timer. options.run(cmd, args) -> {code, out, err} replaces systemctl in tests.
+//
 // CLI: node src/live-checkout-sync.js <repo-dir> [--pipeline-dir DIR] [--mode on|dry-run]
 
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 const fs = require('fs');
 const path = require('node:path');
 const { checkDrift } = require('./live-checkout-drift');
 const { notify } = require('./notify');
 const { writeJsonAtomicSync } = require('./atomic-write');
 const { publishCode } = require('./node-code-publish');
+const { restartActions } = require('./live-checkout-restart-rule');
 
 const AUDIT_FILE = 'live-checkout-sync.audit.jsonl';
 const STATE_FILE = 'live-checkout-sync-state.json';
 const GIT_TIMEOUT_MS = 10_000;
+const DEFAULT_UNITS = ['am-node-registry.service', 'am-package-intake.service'];
+const RESTART_TIMEOUT_MS = 60_000;
+const SHOWN_PATHS = 5;
 
 function mode(env) {
   const v = String(env && env.AGENT_MANAGER_LIVE_SYNC || 'off').toLowerCase();
@@ -52,6 +62,58 @@ function defaultGit(repoDir, args) {
   } catch (e) {
     return { code: typeof e.status === 'number' ? e.status : 2, out: String(e.stdout || ''), err: String(e.stderr || '') };
   }
+}
+
+function liveSyncUnits(env) {
+  const names = String(env && env.AGENT_MANAGER_LIVE_SYNC_UNITS || '').split(',').map((n) => n.trim()).filter(Boolean);
+  return names.length > 0 ? names : DEFAULT_UNITS;
+}
+
+function defaultRun(cmd, args) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8', timeout: RESTART_TIMEOUT_MS });
+  return { code: typeof r.status === 'number' ? r.status : 1, out: r.stdout || '', err: r.stderr || (r.error ? String(r.error.message) : '') };
+}
+
+// Restarts (or, in dry-run, only describes) the units the changed paths need. Never throws.
+// Returns { units: boolean, restarts: [{unit, ok, error?}], would: [string] }; restarts is empty in dry-run, would is empty in mode on.
+async function restartUnitsFor(repoDir, range, options, dry) {
+  const env = options.env || process.env;
+  const git = options.git || defaultGit;
+  const run = options.run || defaultRun;
+  const notifyFn = options.notify || notify;
+  const result = { units: false, restarts: [], would: [] };
+  const diff = git(repoDir, ['diff', '--name-only', range]);
+  if (diff.code !== 0) {
+    result.error = `git diff ${range} failed: ${diff.err || diff.out || ''}`.trim();
+    return result;
+  }
+  const paths = diff.out.split('\n').map((l) => l.trim()).filter(Boolean);
+  const actions = restartActions(paths);
+  result.units = actions.units;
+  if (!actions.units) return result;
+  const because = actions.matched.units.slice(0, SHOWN_PATHS).join(', ') + (actions.matched.units.length > SHOWN_PATHS ? ', ...' : '');
+  for (const unit of liveSyncUnits(env)) {
+    if (dry) {
+      result.would.push(`would restart ${unit} because ${because}`);
+      continue;
+    }
+    let r;
+    try {
+      r = run('systemctl', ['--user', 'restart', unit]);
+    } catch (e) {
+      r = { code: 1, err: (e && e.message) || String(e) };
+    }
+    if (r.code === 0) {
+      result.restarts.push({ unit, ok: true });
+      continue;
+    }
+    const error = String(r.err || r.out || `exit ${r.code}`).trim().slice(0, 300);
+    result.restarts.push({ unit, ok: false, error });
+    try {
+      await notifyFn({ level: 'summary', key: 'live-checkout:restart-failed', title: `live checkout: restart of ${unit} failed`, text: `After a fast-forward, systemctl --user restart ${unit} failed: ${error}` });
+    } catch (e) { /* the notice is best effort */ }
+  }
+  return result;
 }
 
 function readLastState(statePath) {
@@ -157,7 +219,8 @@ async function syncLiveCheckout(repoDir, options = {}) {
       return { action: 'refused', reason: 'dirty', files };
     }
     if (mode(env) === 'dry-run') {
-      appendAudit(auditPath, { action: 'would-ff', branch: drift.branch, behind: drift.behind });
+      const planned = await restartUnitsFor(repoDir, `HEAD..origin/${drift.branch}`, options, true);
+      appendAudit(auditPath, { action: 'would-ff', branch: drift.branch, behind: drift.behind, ...(planned.would.length ? { would: planned.would } : {}), ...(planned.error ? { restartError: planned.error } : {}) });
       await sendNotice(notifyFn, statePath, fromState, 'behind');
       return { action: 'would-ff', branch: drift.branch, behind: drift.behind };
     }
@@ -173,12 +236,15 @@ async function syncLiveCheckout(repoDir, options = {}) {
       return { action: 'ff-error', error: merge.err || merge.out || 'merge --ff-only failed' };
     }
     const after = git(repoDir, ['rev-parse', 'HEAD']);
+    const restarted = await restartUnitsFor(repoDir, `${before.out.trim()}..${after.out.trim()}`, options, false);
     appendAudit(auditPath, {
       action: 'ff',
       branch: drift.branch,
       behind: drift.behind,
       oldHead: before.out.trim(),
       newHead: after.out.trim(),
+      ...(restarted.restarts.length ? { restarts: restarted.restarts } : {}),
+      ...(restarted.error ? { restartError: restarted.error } : {}),
     });
     await sendNotice(notifyFn, statePath, fromState, 'current');
     return {
@@ -187,6 +253,7 @@ async function syncLiveCheckout(repoDir, options = {}) {
       behind: drift.behind,
       oldHead: before.out.trim(),
       newHead: after.out.trim(),
+      restarts: restarted.restarts,
     };
   }
 
