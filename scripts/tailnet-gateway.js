@@ -195,7 +195,8 @@ async function main(env = process.env) {
       if (r.listening.length) log('now also listening on ' + r.listening.join(' '));
     }).catch(e => log('rescan error: ' + e.message));
   }, 60000);
-  const stop = () => { clearInterval(rescan); gateway.close().then(() => process.exit(0)); };
+  let stopping = false;
+  const stop = () => { if (stopping) return; stopping = true; clearInterval(rescan); gateway.close().then(() => process.exit(0)); };
   process.on('SIGTERM', stop);
   process.on('SIGINT', stop);
   return gateway;
