@@ -3074,3 +3074,42 @@ Refactor into three focused layers: (1) `evaluateGpuState(opts) → { leaseHeld,
 
 Benefits:
 Each layer can be tested in isolation — lease-gating logic doesn't need network stubs, remediation doesn't need `nvidia-smi` stubs. Adding a new remediation path means adding a case to `executeRemediation`, not threading a new concern through `evaluateGpuState`. The decision reason (`lease-held`, `ollama-resident`, `proceed`) becomes a first-class value, not buried in a note string, enabling structured logging. The Ollama-resident-model exemption is extracted to `shouldRemediate`, making the exemption rule explicit and harder to accidentally bypass.
+
+### AC-246 · Silent mutation of config object in `registerTaskSource`
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+The `registerTaskSource` function silently mutates the `config` parameter when `config.scope === 'core'` by replacing `config.next` with a wrapped version that adds a scope eligibility check. This side effect is not documented in the JSDoc and is not obvious from the function name, creating a hidden contract that callers are unlikely to anticipate.
+
+Solution:
+Either document the mutation behavior in the JSDoc and function name (e.g., `registerTaskSourceInPlace`), or make the function pure by returning a new config object instead of mutating the input. If mutation is necessary for performance, at minimum clone the config before wrapping `next` to avoid affecting the caller's original object.
+
+Benefits:
+Callers can reason about config objects without worrying about hidden side effects. Reusing config objects across multiple registrations becomes safe. The function's behavior is explicit and documented, reducing the risk of subtle bugs.
+
+### AC-247 · God module pattern in `candidate-fulfillment.js`
+Strength: Strong
+Files: src/sdk/candidate-fulfillment.js
+
+Problem:
+The `candidate-fulfillment.js` file acts as a god module by requiring 9+ internal modules, exporting everything from `candidateDocs` plus its own functions, containing complex grounding logic with multiple fallback strategies, and including a massive comment block explaining rationale. This creates tight coupling between candidate parsing, file grounding, premise checking, task lifecycle, and history tracking, making the file difficult to understand, test, and maintain.
+
+Solution:
+Extract the grounding logic into a dedicated module (e.g., `src/sdk/grounding.js`), separate the task lifecycle helpers into their own file, and reduce the exports to a focused API. Consider splitting the large comment block into a separate design document or inline comments in extracted modules.
+
+Benefits:
+Reduced coupling between concerns makes each module easier to test and modify independently. Smaller, focused files improve readability and onboarding. Changes to one concern (e.g., grounding strategy) no longer risk regressions in unrelated functionality (e.g., task history tracking).
+
+### AC-248 · Complex multi-strategy grounding logic with multiple fallbacks
+Strength: Worth exploring
+Files: src/sdk/candidate-fulfillment.js
+
+Problem:
+The grounding logic uses a complex multi-strategy approach with four fallbacks: snippet fuzzy match, backtick-quoted symbol matching, line citation fallback, and flat truncation as a last resort. While well-documented, this complexity increases the risk of bugs and makes it difficult to reason about correctness, especially in edge cases where citations may drift from current reality.
+
+Solution:
+Document the decision tree with a flowchart or decision matrix, add unit tests for each fallback strategy with known edge cases, and consider extracting each strategy into its own function with clear contracts. The acknowledged gap ("a citation drifted by more than half of MAX_FETCHED_FILE_CHARS from current reality is a real, accepted gap") should be explicitly tested and documented as a known limitation.
+
+Benefits:
+Improved testability ensures each fallback strategy works correctly in isolation. Clearer documentation helps future maintainers understand when and why each strategy is used. Explicitly testing edge cases reduces the risk of unexpected behavior in production.
