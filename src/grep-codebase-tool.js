@@ -39,13 +39,26 @@ const MAX_CONTEXT_LINES = 5;
 // Returns { roots: [absolute paths] } or { error }.
 function resolvePrimaryDirs(repoRoot, allowedDirs, dir) {
   const norm = String(dir == null ? '' : dir).trim().replace(/^\.\//, '').replace(/\/+$/, '');
+  if (path.isAbsolute(norm) || norm.startsWith('/')) {
+    return { error: `dir '${dir}' must be a relative path inside the repo, not an absolute path.` };
+  }
+  if (norm.split('/').includes('..')) {
+    return { error: `dir '${dir}' may not contain '..' segments -- use a path inside the repo.` };
+  }
   if (norm === '' || norm === '.') {
     return { roots: allowedDirs.map((d) => path.join(repoRoot, d)) };
   }
   if (allowedDirs.includes(norm)) return { roots: [path.join(repoRoot, norm)] };
   // requested dir is inside an allowed dir, e.g. "python/dashboard" under "python"
-  const underAllowed = allowedDirs.some((d) => norm === d || norm.startsWith(`${d}/`));
-  if (underAllowed) return { roots: [path.join(repoRoot, norm)] };
+  const matchDir = allowedDirs.find((d) => norm === d || norm.startsWith(`${d}/`));
+  if (matchDir !== undefined) {
+    const candidate = path.resolve(repoRoot, norm);
+    const allowedRoot = path.resolve(repoRoot, matchDir);
+    if (candidate !== allowedRoot && !candidate.startsWith(allowedRoot + path.sep)) {
+      return { error: `dir '${dir}' resolves outside the allowed dir '${matchDir}'.` };
+    }
+    return { roots: [candidate] };
+  }
   // an allowed dir is inside the requested dir, e.g. dir="." handled above, or a parent
   const containedAllowed = allowedDirs.filter((d) => d.startsWith(`${norm}/`));
   if (containedAllowed.length) return { roots: containedAllowed.map((d) => path.join(repoRoot, d)) };
@@ -168,4 +181,4 @@ function grepCodebase({ query, dir, root, contextLines }) {
   return hits;
 }
 
-module.exports = { grepCodebase };
+module.exports = { grepCodebase, resolvePrimaryDirs };
