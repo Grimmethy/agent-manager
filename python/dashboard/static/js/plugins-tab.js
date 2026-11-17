@@ -57,7 +57,7 @@ function buildSlotSections(slottedPlugins) {
 function buildAddPluginForm() {
   return `<h3 style="margin-top:24px;">Add a plugin</h3>
     <div style="display:flex; flex-direction:column; gap:8px; max-width:640px;">
-      <input type="text" id="plugin-add-path" placeholder="Absolute path to the plugin's register.js (e.g. /media/model-cache/github/agent-manager-imagegen/register.js)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+      <input type="text" id="plugin-add-path" placeholder="Absolute path to the plugin's register.js (e.g. path/to/register.js)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
       <input type="text" id="plugin-add-name" placeholder="Name (optional -- defaults to the plugin folder name)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
       <input type="text" id="plugin-add-desc" placeholder="Description (optional)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
       <button class="action" id="plugin-add-btn" style="align-self:flex-start;">Add plugin</button>
