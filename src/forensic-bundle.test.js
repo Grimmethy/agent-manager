@@ -288,7 +288,7 @@ test('buildForensicBundle: no winners -> no digest section', () => {
     for (let n = 1; n <= 10; n += 1) writeWinner(dir, n);
     const bundle = buildForensicBundle({ pipelineDir: dir, dbPath: undefined, subject: { kind: 'source', key: 'manual' } });
     assert.ok(bundle.winnerTasks.length >= 1);
-    assert.ok(bundle.winnerTasks.length <= 5, `winnerTasks.length ${bundle.winnerTasks.length} exceeds MAX_WINNERS=5`);
+    assert.equal(bundle.winnerTasks.length, 5, `expected exactly MAX_WINNERS=5 winners from 10 qualifying, got ${bundle.winnerTasks.length}`);
     assert.equal(bundle.winnerContrastAvailable, true);
   });
 })();

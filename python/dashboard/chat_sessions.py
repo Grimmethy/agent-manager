@@ -30,6 +30,7 @@ endpoint, so this module never needs its own git-mutex logic.
 """
 import json
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -37,6 +38,7 @@ from pathlib import Path
 import chat_card
 import claude_client
 import codebase_map_digest
+import context_log_retrieval
 import local_tool_client
 import model_stats_client
 import ollama_client
@@ -347,6 +349,35 @@ _LOCAL_SYSTEM_PROMPT = (
 )
 
 
+# TASK-REF as written by Chat (see src/context-log-marker.js TASK_REF_LINE_RE). The line
+# must start with TASK-REF: (optionally indented); the value is the rest of that line.
+_TASK_REF_RE = re.compile(r"(?:^|\n)[ \t]*TASK-REF:[ \t]*(.+)$", re.M)
+_PLACEHOLDER_TASK_REF = "<task id>"
+
+
+def _latest_task_ref(session: dict):
+    """The most recent TASK-REF stated in the session transcript, or None."""
+    for turn in reversed(session.get("transcript") or []):
+        for raw in reversed(_TASK_REF_RE.findall(turn.get("text") or "")):
+            ref = raw.strip()
+            if ref and ref != _PLACEHOLDER_TASK_REF:
+                return ref
+    return None
+
+
+def _context_log_block(session: dict) -> str:
+    """Context-log block for the session's latest task ref, or "" (no ref, no logs, or no
+    SECOND_BRAIN_DIR configured). The block already ends with its audit line."""
+    task_ref = _latest_task_ref(session)
+    if not task_ref:
+        return ""
+    second_brain = os.environ.get("SECOND_BRAIN_DIR", "")
+    project = Path(session["repoRoot"]).name
+    block_text, _injected = context_log_retrieval.retrieve_context_logs(
+        second_brain, project=project, task_ref=task_ref)
+    return block_text
+
+
 def _local_system_prompt(session: dict) -> str:
     prompt = _LOCAL_SYSTEM_PROMPT + "\n\nAccessible repos:\n" + _roots_blurb(session)
     agents_md = _read_agents_md(session)
@@ -355,6 +386,9 @@ def _local_system_prompt(session: dict) -> str:
     map_digest = _codebase_map_digest(session)
     if map_digest:
         prompt += "\n\n---\n\n" + map_digest
+    context_block = _context_log_block(session)
+    if context_block:
+        prompt += "\n\n---\n\n" + context_block
     return prompt
 
 

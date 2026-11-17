@@ -271,11 +271,11 @@ class CrossProjectActions(unittest.TestCase):
         self.assertEqual(next(b for b in cached if b["branch"] == "agent/oth-1").get("verdict"), "needs-work")
         self.assertFalse(pending.exists())
 
-    def test_a_parked_verdict_for_an_older_head_is_dropped_not_applied(self):
+    def test_a_parked_verdict_for_an_older_head_is_kept_not_applied(self):
         pending = self._park(self.other, "agent/oth-1", "0" * 40)
         rows = branch_projects.refresh_branches(self._scope())
         self.assertIsNone(next(b for b in rows if b["branch"] == "agent/oth-1").get("verdict"))
-        self.assertFalse(pending.exists())
+        self.assertTrue(pending.exists())
         self.assertFalse((self.other["pipe"] / "queue" / "branch-verdicts.json").exists())
 
     def test_a_parked_verdict_for_a_branch_that_is_not_listed_keeps_waiting(self):
