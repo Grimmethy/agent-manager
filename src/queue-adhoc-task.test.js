@@ -10,7 +10,7 @@ const { queueAdhocTask, defaultTaskDomain } = require('./queue-adhoc-task.js');
 
 function tmpPipeline() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-task-test-'));
-  fs.writeFileSync(path.join(dir, 'task-domains.json'), JSON.stringify({ default: {}, other_domain: {} }));
+  fs.writeFileSync(path.join(dir, 'task-domains.json'), JSON.stringify({ default: {}, adhoc: {}, other_domain: {} }));
   return dir;
 }
 
@@ -309,6 +309,15 @@ test('a valid stacked target is written on the record with exactly the three key
   const { record, filePath } = queueWith({ stacked: { branch: HUB_BRANCH, seq: 4, total: 6 } });
   assert.deepEqual(record.stacked, { branch: HUB_BRANCH, seq: 4, total: 6 });
   assert.deepEqual(JSON.parse(fs.readFileSync(filePath, 'utf8')).stacked, { branch: HUB_BRANCH, seq: 4, total: 6 });
+});
+
+test('a stacked record with no domain given is domain adhoc; an explicit domain wins; an ordinary record still defaults to default', () => {
+  assert.equal(queueWith({ stacked: { branch: HUB_BRANCH, seq: 2, total: 2 } }).record.domain, 'adhoc');
+  assert.equal(queueWith({ domain: 'other_domain', stacked: { branch: HUB_BRANCH, seq: 2, total: 2 } }).record.domain, 'other_domain');
+  assert.equal(queueWith({}).record.domain, 'default');
+  const cli = tmpPipeline();
+  assert.equal(runCli(['--stacked-branch', HUB_BRANCH], cli).status, 0);
+  assert.equal(cliRecord(cli).domain, 'adhoc');
 });
 
 test('no stacked argument (or null) writes no stacked key at all: an ordinary task is unchanged', () => {

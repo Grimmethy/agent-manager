@@ -45,6 +45,20 @@ A node has no GitHub access, so a repo reaches it as a bundle file, and the clou
 5. **Write the gateway unit:** `scripts/provision-node-gateway.sh <cloud-providers-dir> ~/.config/systemd/user` (an optional third argument is the port, default 7450). It refuses anything that is not an absolute path or a port from 1024 to 65535. It writes `am-cloud-gateway.service`, which runs the gateway on the logged-in Claude account **without** the confirmation, and `am-cloud-gateway.confirm-subscription.conf.example`, a template that systemd does not read. The gateway refuses to start without the confirmation.
 6. **Your decisions and commands** (the scripts do none of them): run `claude auth login` on the node; copy the template to `~/.config/systemd/user/am-cloud-gateway.service.d/confirm-subscription.conf` **only if you accept** that Anthropic's consumer terms may not permit automated use of a Pro login (`cloud-lane.md`, "Billing"); then `systemctl --user daemon-reload` and `systemctl --user enable --now am-cloud-gateway.service`; check `curl http://127.0.0.1:7450/health`; and last set `enabled` to `true` on the cloud lane in `<pipeline-dir>/lanes.json` and restart the node's workers.
 
+### One-time conversion of a plain-copy node checkout (owner step)
+
+Use this when a node's checkout is a plain directory of files, not a git clone: `git -C <node-repo-dir> rev-parse HEAD` says not a git repository, and `ls -a` shows no `.git` (grimm, 2026-11-17). Until it is done, `applyCode` in `src/node-code-apply.js` refuses with reason `not-a-git-work-tree`, writes one audit line per refusal and one NOTICE per process, and changes nothing. Every step is yours; the agent does not run them.
+
+1. **Inventory:** `cd <node-repo-dir> && ls -a`. List the node-local files that are not in the published repo, such as `agent-manager.env` and any queue or pipeline state. Those are the only files copied back in step 5.
+2. **Drain the node units:** stop the workers through the drain before touching the directory. Check the usage line of `src/node-code-drain.js` first.
+3. **Back up:** `mv <node-repo-dir> <node-repo-dir>.bak-$(date +%Y%m%d)`. Nothing is deleted.
+4. **Import the current master bundle into an empty directory:** `mkdir <node-repo-dir> && scripts/import-repo-bundle.sh <bundle-file> <node-repo-dir>`. The bundle comes from wok (`scripts/export-repo-bundle.sh`). It prints `head=<sha> dest=<path>`; the clone has no remote.
+5. **Copy back only the inventoried node-local files** from the backup with `cp -p`. Do not copy back the backup's `src/`, `scripts/` or `.git`.
+6. **Check the entry files:** `node --check` on each entry file the units run (the ExecStart targets of the node units).
+7. **Restart the units through the drain**, then check that `git -C <node-repo-dir> rev-parse HEAD` equals the `head=` value from step 4 and that the registry codeSha is the same.
+
+**Rollback:** stop the units through the drain, `mv <node-repo-dir> <node-repo-dir>.failed-$(date +%Y%m%d)`, `mv <node-repo-dir>.bak-YYYYMMDD <node-repo-dir>` (the dated name from step 3), then restart the units.
+
 ## 3. The trial (the 80 percent bar)
 
 Before the farm is scaled up, run a small batch of real tasks through one node and score it.

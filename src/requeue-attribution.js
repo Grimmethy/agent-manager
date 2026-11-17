@@ -293,8 +293,10 @@ module.exports = {
 // (python/dashboard/requeue_attribution_client.py) can record a MANUAL requeue, which
 // otherwise never reaches this classifier at all (api_task_requeue is pure Python).
 // payload: { task?, taskFile?, reasonHint, requeueWriter, actor, blockedStage? }.
-// Prints the { signature, category } result as JSON. Best-effort: any failure exits 0
-// with an empty object so a telemetry problem never breaks a requeue on the caller side.
+// Prints the { signature, category } result as JSON. Failures are NOT swallowed: any error
+// writes a message to stderr, leaves stdout empty, and exits 1. The Flask caller
+// (python/dashboard/requeue_attribution_client.py) already treats a nonzero exit as None, so
+// a telemetry failure still never breaks a requeue on the caller side.
 if (require.main === module) {
   (async () => {
     try {
@@ -305,7 +307,10 @@ if (require.main === module) {
       }
       const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf8'));
       let task = payload.task;
-      if (!task && payload.taskFile && fs.existsSync(payload.taskFile)) {
+      if (!task && payload.taskFile) {
+        if (!fs.existsSync(payload.taskFile)) {
+          throw new Error(`taskFile not found: ${payload.taskFile}`);
+        }
         task = JSON.parse(fs.readFileSync(payload.taskFile, 'utf8'));
       }
       const repoRoot = process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT;
@@ -319,7 +324,8 @@ if (require.main === module) {
       });
       process.stdout.write(JSON.stringify(result || {}));
     } catch (e) {
-      process.stdout.write('{}');
+      process.stderr.write(`requeue-attribution classify failed: ${e && e.message ? e.message : String(e)}\n`);
+      process.exitCode = 1;
     }
   })();
 }
