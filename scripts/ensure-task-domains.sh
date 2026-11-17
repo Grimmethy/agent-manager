@@ -4,12 +4,12 @@
 # Why (2026-10-26): provision-plugin-repo.sh and adopt-existing-project.sh wrote a file with only
 # "default", and register-project.sh wrote none, so a project's adhoc tasks failed review with
 # "Unknown task domain: adhoc (valid: default)" until someone noticed. The standard set is now
-# derived from src/task-domains-registry.js (one source of truth: every registered source name
-# plus 'default' and 'adhoc').
+# taken from config/task-domains.template.json (one source of truth: the ten standard domains,
+# including 'default' and 'adhoc').
 #
 # Usage: scripts/ensure-task-domains.sh <pipeline_dir>
 #
-# - file missing: written from the registry.
+# - file missing: written from config/task-domains.template.json.
 # - file present: every standard domain it lacks is ADDED. An existing domain is never changed or
 #   removed (the file belongs to the project; a custom workDirKind stays). The original is first
 #   copied to task-domains.json.bak-<date> (only when something is added).
@@ -31,8 +31,7 @@ const path = require("path");
 const target = process.argv[1];
 const packageRoot = process.argv[2];
 
-const { getStandardDomains } = require(path.join(packageRoot, "src", "task-domains-registry.js"));
-const standardDomains = getStandardDomains();
+const standardDomains = JSON.parse(fs.readFileSync(path.join(packageRoot, "config", "task-domains.template.json"), "utf8"));
 
 if (!fs.existsSync(target)) {
   fs.writeFileSync(target, JSON.stringify(standardDomains, null, 2) + "\n");
