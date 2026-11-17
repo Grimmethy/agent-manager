@@ -26,7 +26,11 @@
 // (src/live-checkout-restart-rule.js); when units is true, each unit in AGENT_MANAGER_LIVE_SYNC_UNITS (comma separated, default
 // am-node-registry.service,am-package-intake.service, both user units) gets `systemctl --user restart <unit>` once. A failing restart is audited
 // (`restarts` on the ff line) and noticed (summary, key live-checkout:restart-failed) and does not stop the next unit. In dry-run the audit line only says
-// 'would restart <unit> because <paths>'. The event is the fast-forward itself: no timer. options.run(cmd, args) -> {code, out, err} replaces systemctl in tests.
+// 'would restart <unit> because <paths>'. The event is the fast-forward itself: no timer.
+//
+// Pipeline restart (FF-3/3c): when restartActions().pipeline is true after the fast-forward (mode 'on'), src/live-checkout-drain.js records the pending restart and takes its first
+// drain step (the _pause-node marker with source wok, then stop.sh and launch.sh once every lane is idle); in dry-run the audit line only says 'would drain and restart the pipeline
+// because <paths>'. options.drain ({requestPipelineRestart, drainStep}) replaces the module in tests. options.run(cmd, args) -> {code, out, err} replaces systemctl in tests.
 //
 // CLI: node src/live-checkout-sync.js <repo-dir> [--pipeline-dir DIR] [--mode on|dry-run]
 
@@ -38,6 +42,7 @@ const { notify } = require('./notify');
 const { writeJsonAtomicSync } = require('./atomic-write');
 const { publishCode } = require('./node-code-publish');
 const { restartActions } = require('./live-checkout-restart-rule');
+const liveDrain = require('./live-checkout-drain');
 
 const AUDIT_FILE = 'live-checkout-sync.audit.jsonl';
 const STATE_FILE = 'live-checkout-sync-state.json';
@@ -81,7 +86,7 @@ async function restartUnitsFor(repoDir, range, options, dry) {
   const git = options.git || defaultGit;
   const run = options.run || defaultRun;
   const notifyFn = options.notify || notify;
-  const result = { units: false, restarts: [], would: [] };
+  const result = { units: false, pipeline: false, matchedPipeline: [], restarts: [], would: [] };
   const diff = git(repoDir, ['diff', '--name-only', range]);
   if (diff.code !== 0) {
     result.error = `git diff ${range} failed: ${diff.err || diff.out || ''}`.trim();
@@ -90,9 +95,13 @@ async function restartUnitsFor(repoDir, range, options, dry) {
   const paths = diff.out.split('\n').map((l) => l.trim()).filter(Boolean);
   const actions = restartActions(paths);
   result.units = actions.units;
-  if (!actions.units) return result;
-  const because = actions.matched.units.slice(0, SHOWN_PATHS).join(', ') + (actions.matched.units.length > SHOWN_PATHS ? ', ...' : '');
-  for (const unit of liveSyncUnits(env)) {
+  result.pipeline = actions.pipeline;
+  result.matchedPipeline = actions.matched.pipeline;
+  if (!actions.units && !actions.pipeline) return result;
+  const shown = (list) => list.slice(0, SHOWN_PATHS).join(', ') + (list.length > SHOWN_PATHS ? ', ...' : '');
+  const because = shown(actions.matched.units);
+  if (dry && actions.pipeline) result.would.push(`would drain and restart the pipeline because ${shown(actions.matched.pipeline)}`);
+  for (const unit of actions.units ? liveSyncUnits(env) : []) {
     if (dry) {
       result.would.push(`would restart ${unit} because ${because}`);
       continue;
@@ -237,6 +246,16 @@ async function syncLiveCheckout(repoDir, options = {}) {
     }
     const after = git(repoDir, ['rev-parse', 'HEAD']);
     const restarted = await restartUnitsFor(repoDir, `${before.out.trim()}..${after.out.trim()}`, options, false);
+    let pipelineDrain = null;
+    if (restarted.pipeline) {
+      const drain = options.drain || liveDrain;
+      try {
+        drain.requestPipelineRestart({ pipelineDir, newSha: after.out.trim(), paths: restarted.matchedPipeline, fs });
+        pipelineDrain = drain.drainStep({ pipelineDir, repoDir, env, notify: notifyFn, fs, ...(options.drainDeps || {}) });
+      } catch (e) {
+        pipelineDrain = 'error';
+      }
+    }
     appendAudit(auditPath, {
       action: 'ff',
       branch: drift.branch,
@@ -244,6 +263,7 @@ async function syncLiveCheckout(repoDir, options = {}) {
       oldHead: before.out.trim(),
       newHead: after.out.trim(),
       ...(restarted.restarts.length ? { restarts: restarted.restarts } : {}),
+      ...(pipelineDrain ? { pipelineDrain } : {}),
       ...(restarted.error ? { restartError: restarted.error } : {}),
     });
     await sendNotice(notifyFn, statePath, fromState, 'current');
@@ -254,6 +274,7 @@ async function syncLiveCheckout(repoDir, options = {}) {
       oldHead: before.out.trim(),
       newHead: after.out.trim(),
       restarts: restarted.restarts,
+      ...(pipelineDrain ? { pipelineDrain } : {}),
     };
   }
 
