@@ -271,3 +271,76 @@ test('re-registering a node that has been heard from keeps everything it reporte
   const long = recordHeartbeat({ id: 'grimm', address: 'x'.repeat(200) }, env, T0);
   assert.equal(long.lastAddress.length, 64);
 });
+
+// behindSince: the heartbeat clock of a node whose code differs from what wok published.
+const WOK = 'a'.repeat(40);
+const OLD = 'b'.repeat(40);
+function publishSha(s, sha) {
+  const dir = path.join(s.dir, 'pub');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'latest.json'), JSON.stringify(sha === undefined ? [] : [{ repo: 'agent-manager', sha, bundle: 'x.bundle', branch: 'master' }]));
+  s.env.AGENT_MANAGER_CODE_PUBLISH_DIR = dir;
+}
+const behind = (s) => loadNodes(s.env).grimm.behindSince;
+
+test('behindSince: the first mismatching heartbeat sets it to the heartbeat time and reports no previous stamp', () => {
+  const s = setup(); registerNode(spec(), s.env); publishSha(s, WOK);
+  const r = recordHeartbeat({ id: 'grimm', codeSha: OLD }, s.env, T0);
+  assert.equal(behind(s), new Date(T0).toISOString());
+  assert.equal(r.previousBehindSince, null);
+  assert.equal(loadNodes(s.env).grimm.previousBehindSince, undefined);
+});
+
+test('behindSince: a later mismatch keeps the first time and reports it as the previous stamp', () => {
+  const s = setup(); registerNode(spec(), s.env); publishSha(s, WOK);
+  recordHeartbeat({ id: 'grimm', codeSha: OLD }, s.env, T0);
+  const r = recordHeartbeat({ id: 'grimm', codeSha: OLD }, s.env, T0 + 40 * MIN);
+  assert.equal(behind(s), new Date(T0).toISOString());
+  assert.equal(r.previousBehindSince, new Date(T0).toISOString());
+});
+
+test('behindSince: a matching heartbeat clears it, still reports the stamp it cleared, and a new mismatch starts a new clock', () => {
+  const s = setup(); registerNode(spec(), s.env); publishSha(s, WOK);
+  recordHeartbeat({ id: 'grimm', codeSha: OLD }, s.env, T0);
+  const r = recordHeartbeat({ id: 'grimm', codeSha: WOK }, s.env, T0 + MIN);
+  assert.equal(behind(s), undefined);
+  assert.equal('behindSince' in loadNodes(s.env).grimm, false);
+  assert.equal(r.previousBehindSince, new Date(T0).toISOString());
+  recordHeartbeat({ id: 'grimm', codeSha: OLD }, s.env, T0 + 2 * MIN);
+  assert.equal(behind(s), new Date(T0 + 2 * MIN).toISOString());
+});
+
+test('behindSince: an unknown sha on either side changes nothing (no latest.json, no entry, bad sha, node sha missing)', () => {
+  const s = setup(); registerNode(spec(), s.env);
+  s.env.AGENT_MANAGER_CODE_PUBLISH_DIR = path.join(s.dir, 'nothing-here');
+  recordHeartbeat({ id: 'grimm', codeSha: OLD }, s.env, T0);
+  assert.equal(behind(s), undefined);
+  publishSha(s, undefined);
+  recordHeartbeat({ id: 'grimm', codeSha: OLD }, s.env, T0);
+  assert.equal(behind(s), undefined);
+  publishSha(s, 'not-a-sha');
+  recordHeartbeat({ id: 'grimm', codeSha: OLD }, s.env, T0);
+  assert.equal(behind(s), undefined);
+  publishSha(s, WOK);
+  recordHeartbeat({ id: 'grimm', codeSha: OLD }, s.env, T0);
+  assert.equal(behind(s), new Date(T0).toISOString());
+  recordHeartbeat({ id: 'grimm' }, s.env, T0 + MIN);
+  assert.equal(behind(s), new Date(T0).toISOString());
+});
+
+test('behindSince: the published list is found through AGENT_MANAGER_PIPELINE_DIR/code-publish and survives a reload', () => {
+  const s = setup({ AGENT_MANAGER_PIPELINE_DIR: path.join(os.tmpdir(), `pd-${process.pid}-${Date.now()}`) });
+  registerNode(spec(), s.env);
+  const dir = path.join(s.env.AGENT_MANAGER_PIPELINE_DIR, 'code-publish');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'latest.json'), JSON.stringify([{ repo: 'other', sha: 'c'.repeat(40) }, { repo: 'agent-manager', sha: WOK }]));
+  recordHeartbeat({ id: 'grimm', codeSha: OLD }, s.env, T0);
+  assert.equal(listNodes(s.env, T0).find((n) => n.id === 'grimm').behindSince, new Date(T0).toISOString());
+});
+
+test('behindSince: a node that reports no codeSha is never stamped, even when wok has published one', () => {
+  const s = setup(); registerNode(spec(), s.env); publishSha(s, WOK);
+  recordHeartbeat({ id: 'grimm' }, s.env, T0);
+  recordHeartbeat({ id: 'grimm', codeSha: 'not-hex' }, s.env, T0 + MIN);
+  assert.equal('behindSince' in loadNodes(s.env).grimm, false);
+});
