@@ -474,10 +474,10 @@ function renderBrainDumpCard(entry) {
   // regardless of which queue state it's currently in) whenever a taskId is actually
   // present; falls back to a plain, non-clickable badge for an older/Chat-raised finding
   // that predates this or genuinely has no task to link (taskId stays null for Chat).
-  const raisedByBadge = entry.raisedBy
+  const raisedByBadge = entry.raisedBy && entry.raisedBy.source
     ? (entry.raisedBy.taskId
-      ? `<span class="chip clickable" data-open-task="${escapeAttr(entry.raisedBy.taskId)}" title="Flagged automatically while working on ${escapeAttr(entry.raisedBy.taskId)} -- click to open that task">🤖 ${escapeHtml(entry.raisedBy.source || 'pipeline')}</span>`
-      : `<span class="chip" title="Flagged automatically while working on a ${escapeAttr(entry.raisedBy.source || 'pipeline')} task (no task link available)">🤖 ${escapeHtml(entry.raisedBy.source || 'pipeline')}</span>`)
+      ? `<span class="chip clickable" data-open-task="${escapeAttr(entry.raisedBy.taskId)}" title="Flagged automatically while working on ${escapeAttr(entry.raisedBy.taskId)} -- click to open that task">🤖 ${escapeHtml(entry.raisedBy.source)}</span>`
+      : `<span class="chip" title="Flagged automatically while working on a ${escapeAttr(entry.raisedBy.source)} task (no task link available)">🤖 ${escapeHtml(entry.raisedBy.source)}</span>`)
     : '';
   // Suppress only makes sense for a machine-raised entry (retire a stale/obsolete
   // finding a sweep keeps re-flagging) -- a human's own Brain Dump note is deleted, not
