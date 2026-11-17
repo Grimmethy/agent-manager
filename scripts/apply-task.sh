@@ -178,15 +178,31 @@ mkdir -p "$DONE_DIR" "$BLOCKED_DIR" "$AWAITING_CONFIRM_DIR" "$COORDINATING_DIR"
 # alike. Called right before every mv into $BLOCKED_DIR below; a task that already has a
 # real blockedReason (the normal case) is left untouched.
 ensure_blocked_reason() {
-  local task_path="$1" fallback_note="$2"
+  local task_path="$1" fallback_note="$2" real_text="" errfile="${APPLY_ERRFILE:-}"
+  # Failure path only (this function runs solely when apply did not succeed). Prefer the failing
+  # node process's own stderr (echoed so the operator still sees it); fall back to the last 20
+  # lines of the apply loop log only when stderr is empty. Each source is read once. The log is
+  # written by apply-loop.sh, so its tail may belong to another run -- best-effort context only.
+  if [[ -n "$errfile" && -s "$errfile" ]]; then
+    real_text="$(<"$errfile")"
+    cat "$errfile" >&2
+  fi
+  if [[ -z "${real_text//[[:space:]]/}" ]]; then
+    local applog="$HOME/.local/state/agent-manager/logs/apply-task-loop.log"
+    if [[ -r "$applog" ]]; then real_text="$(tail -n 20 "$applog" 2>/dev/null)"; fi
+  fi
+  if [[ -n "$errfile" ]]; then rm -f "$errfile"; fi
   node -e '
     const fs = require("fs");
-    const [p, fallback] = process.argv.slice(1);
+    const [p, fallback, realText] = process.argv.slice(1);
+    const realOut = String(realText || "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\r/g, "").trim();
     try {
       const task = JSON.parse(fs.readFileSync(p, "utf8"));
       if (task.blockedReason) process.exit(0); // already has a real reason -- nothing to backstop
-      const reason = (fallback && fallback.trim())
-        ? `apply-task.sh backstop: no blockedReason was ever recorded for this failure (likely a SIGKILL mid-apply, since even a caught exception writes one) -- last known output: ${fallback.trim().slice(0, 500)}`
+      const reason = realOut
+        ? `apply-task.sh backstop: apply exited without a blockedReason -- last output: ${realOut.slice(-600)}`
+        : (fallback && fallback.trim())
+        ? `apply-task.sh backstop: apply exited without a blockedReason -- last known output: ${fallback.trim().slice(0, 500)}`
         : "apply-task.sh backstop: no blockedReason was ever recorded for this failure (likely a SIGKILL mid-apply) and no output was captured either -- check apply-task.log around this task'\''s timestamp for the real cause.";
       task.blockedReason = reason;
       task.blockedStage = task.blockedStage || "apply";
@@ -194,7 +210,7 @@ ensure_blocked_reason() {
       task.history.push({ stage: "blocked", at: new Date().toISOString(), detail: reason });
       fs.writeFileSync(p, JSON.stringify(task, null, 2));
     } catch (e) { /* best-effort -- never block the real mv on this backstop */ }
-  ' "$task_path" "$fallback_note" 2>/dev/null || true
+  ' "$task_path" "$fallback_note" "$real_text" 2>/dev/null || true
 }
 
 # Split approved tasks into directToMain triage tasks (candidate-doc appends -- batchable
@@ -251,11 +267,15 @@ if [[ ${#direct_files[@]} -gt 0 ]]; then
 fi
 
 for file in "${other_files[@]}"; do
+  # Drop the previous iteration's stderr capture (success never reads it; failures already removed it).
+  if [[ -n "${APPLY_ERRFILE:-}" ]]; then rm -f "$APPLY_ERRFILE"; fi
   task_id="$(resolve_task_id "$file")"
   report_id_mismatch "$file" "$task_id"
   printf '[apply-task] applying %s...\n' "$task_id"
 
-  result="$(node "${REPO_DIR}/src/apply-task.js" "$file")"
+  APPLY_ERRFILE="$(mktemp "${TEMP_DIR}/apply-task-err.XXXXXX" 2>/dev/null || true)"
+  trap 'rm -f "${APPLY_ERRFILE:-}"' EXIT
+  result="$(node "${REPO_DIR}/src/apply-task.js" "$file" 2>"${APPLY_ERRFILE:-/dev/null}")"
   succeeded="$(printf '%s' "$result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
   # Checked BEFORE succeeded -- a delete-containing Group B batch reports succeeded:false
   # (nothing was touched, so it genuinely isn't a success) but this is a hold for a human,
