@@ -322,3 +322,29 @@ test('a repo root with a trailing slash is not treated as a mismatch', () => {
   assert.strictEqual(r.task.id, 'slash-task');
   assert.strictEqual(skipped.filter((s) => s.reason === 'repo-root-mismatch').length, 0);
 });
+
+test('blocked status with non-empty draftAttempts is skipped as previously-failed', () => {
+  const { pipe, pending, env } = setup();
+  const now = Date.now();
+  writeTask(pending, 'combined-fail-task', { status: 'blocked', draftAttempts: [{ outcome: 'rejected' }] }, 100);
+  writeTask(pending, 'fresh-task', {}, 50);
+  const skipped = [];
+  const r = claimNext({ claimant: 'node-a', pipelineDirs: [pipe], env, now, skipped, readRemote: () => '' });
+  assert.ok(r);
+  assert.strictEqual(r.task.id, 'fresh-task');
+  assert.strictEqual(r.previouslyFailedSkipped, 1);
+  assert.deepStrictEqual(skipped, [{ taskId: 'combined-fail-task', reason: 'previously-failed' }]);
+});
+
+test('needs-clarification status is skipped as previously-failed', () => {
+  const { pipe, pending, env } = setup();
+  const now = Date.now();
+  writeTask(pending, 'clarify-task', { status: 'needs-clarification' }, 100);
+  writeTask(pending, 'fresh-task', {}, 50);
+  const skipped = [];
+  const r = claimNext({ claimant: 'node-a', pipelineDirs: [pipe], env, now, skipped, readRemote: () => '' });
+  assert.ok(r);
+  assert.strictEqual(r.task.id, 'fresh-task');
+  assert.strictEqual(r.previouslyFailedSkipped, 1);
+  assert.deepStrictEqual(skipped, [{ taskId: 'clarify-task', reason: 'previously-failed' }]);
+});
