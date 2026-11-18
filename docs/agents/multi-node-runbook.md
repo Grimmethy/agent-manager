@@ -27,6 +27,18 @@ The owner's steps, in order. Nothing here starts by itself.
 
 A node never merges, pushes or deploys: its output is a record that wok reviews.
 
+### 2b. Node claim filter (the dirs, sources and domains a node may take)
+
+Three env vars shape which tasks a node may claim from a pipeline dir listed in `AGENT_MANAGER_NODE_FILTERED_DIRS` (comma-separated, absolute paths; unset gives `[]`). The three vars and their defaults:
+
+- `AGENT_MANAGER_NODE_FILTERED_DIRS` — comma-separated absolute paths of pipeline dirs this node **filters**. A dir not listed here is unfiltered and every task there is eligible (subject only to the global premium gate). Unset or empty gives `[]`.
+- `AGENT_MANAGER_NODE_FILTER_SOURCES` — which `source` values are eligible inside a filtered dir (default `['manual']`). Unset or empty gives `['manual']`.
+- `AGENT_MANAGER_NODE_FILTER_DOMAINS` — which `domain` values are eligible inside a filtered dir (default `['adhoc', 'default']`). Unset or empty gives `['adhoc', 'default']`.
+
+The same-repo rule always applies: a task in a filtered dir is claimed only when `generatedForRepoRoot` resolves to that dir or is unset. `AGENT_MANAGER_NODE_ALLOW_STACKED` (default off) and `AGENT_MANAGER_NODE_SKIP_PREMIUM` (default off) also apply.
+
+The live registry unit sets `AGENT_MANAGER_NODE_FILTER_DOMAINS=adhoc,default` (owner order 2026-11-16) so the swarm can take Feature Forge tasks (source `manual`, domain `default`) in addition to adhoc. To restrict a node further, set `AGENT_MANAGER_NODE_FILTER_DOMAINS` to a subset (for example `AGENT_MANAGER_NODE_FILTER_DOMAINS=adhoc` excludes `default`); the explicit value always wins over the default.
+
 ### Code routes (the node pulls wok's code)
 
 The package intake also answers two read-only routes for a node that pulls wok's published code instead of being sent it: `GET /code/latest` (the list in `latest.json` of the code publish directory, `AGENT_MANAGER_CODE_PUBLISH_DIR`, default `<pipeline dir>/code-publish`) and `GET /code/<name>.bundle` (a bundle file named by an entry of that list, and nothing else). Both need the node's bearer token in `Authorization` and the node id in `X-Node-Id`, and both only answer the address the node was registered with. They are LAN only, with no TLS, so they never write and never serve a path outside the list. The manual way stays: `scp` a bundle, or a shared directory, and `scripts/import-repo-bundle.sh`.
