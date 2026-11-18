@@ -18,7 +18,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { extractDiffCreateTargets, checkFilePaths, extractFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix, checkCompletionClaimsInNote, stripVendoredDiffSections } = require('./fact-checker.js');
+const { extractDiffCreateTargets, checkFilePaths, extractFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix, checkCompletionClaimsInNote, getCompletionClaimDismissals, stripVendoredDiffSections } = require('./fact-checker.js');
 
 // Real git repo fixture with exactly one real commit -- needed to test checkCommitClaims
 // against a hash that genuinely exists, not just one that doesn't.
@@ -257,6 +257,39 @@ test('checkDraft does not flag a create-mode draft\'s own target as a missing-fi
   // buildVerdictPrompt), so the explanation has to travel with the data itself, not just
   // live in the derived flags list the model never sees on its own.
   assert.equal(check.isCreateTarget, true);
+});
+
+test('checkCompletionClaimsInNote: a negation in an earlier sentence does not dismiss a genuine claim -> verdict true', () => {
+  const repoRoot = makeRepo();
+  fs.writeFileSync(path.join(repoRoot, 'src', 'real-file.js'), 'let retryCount = 0;');
+  const results = checkCompletionClaimsInNote('Nothing is yet to do here. Already added `retryCount` in src/real-file.js.', repoRoot);
+  assert.equal(results.length, 1);
+  assert.equal(results[0].verdict, 'true');
+  assert.equal(results[0].found, true);
+  assert.equal(results[0].symbol, 'retryCount');
+  assert.equal(results[0].line, 1);
+});
+
+test('checkCompletionClaimsInNote dismisses a same-clause negated claim and counts the dismissal', () => {
+  const repoRoot = makeRepo();
+  const before = getCompletionClaimDismissals().negated;
+  const results = checkCompletionClaimsInNote('This is not already added `x` in src/real-file.js', repoRoot);
+  assert.equal(results.length, 0);
+  assert.equal(getCompletionClaimDismissals().negated, before + 1);
+});
+
+test('checkCompletionClaimsInNote: a named file that does not exist -> verdict false', () => {
+  const repoRoot = makeRepo();
+  const [r] = checkCompletionClaimsInNote('Already fixed in src/missing.js', repoRoot);
+  assert.equal(r.verdict, 'false');
+  assert.equal(r.found, false);
+});
+
+test('checkCompletionClaimsInNote: a file-only claim with no symbol -> verdict unchecked', () => {
+  const repoRoot = makeRepo();
+  const [r] = checkCompletionClaimsInNote('Already added in src/real-file.js', repoRoot);
+  assert.equal(r.verdict, 'unchecked');
+  assert.equal(r.found, false);
 });
 
 test('checkDraft does NOT stamp isCreateTarget on a path that merely happens to share a name with an unrelated create target', () => {

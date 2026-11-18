@@ -1098,7 +1098,25 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref) {
 // environment errors (read failure => found:false with an error note, never a throw), and a
 // per-claim object so a caller can render found:false entries as "unverified, needs check"
 // instead of trusting the prose.
-const COMPLETION_CLAIM_RE = /\balready\s+(?:in\s+place|inserted)/gi;
+const COMPLETION_CLAIM_RE = /\balready\s+(?:in\s+place|inserted|implemented|fixed|added|exists|landed|present)\b/gi;
+const NEGATION_LOOKBACK = 24;
+const NEGATION_WORD_RE = /\b(?:not|never|no\s+longer|yet\s+to)\b|n't/i;
+const completionClaimDismissals = { negated: 0, lastSample: [] };
+
+// True when the ~24 characters before a claim contain a negation word. The window is clipped
+// at the nearest sentence boundary so a negation in an earlier sentence never suppresses a
+// genuine claim (e.g. "Nothing is yet to do here. Already added ...").
+function isNegatedCompletionClaim(text, matchIndex) {
+  const before = text.slice(Math.max(0, matchIndex - NEGATION_LOOKBACK), matchIndex);
+  let cut = -1;
+  for (const ch of ['.', ';', '!', '?', '\n']) cut = Math.max(cut, before.lastIndexOf(ch));
+  const clause = cut === -1 ? before : before.slice(cut + 1);
+  return NEGATION_WORD_RE.test(clause);
+}
+
+function getCompletionClaimDismissals() {
+  return { negated: completionClaimDismissals.negated, lastSample: completionClaimDismissals.lastSample.map((s) => ({ ...s })) };
+}
 const CLAIM_FN_RE = /\bfunction\s+([A-Za-z_$][A-Za-z0-9_$]*)/;
 const CLAIM_BACKTICK_RE = /`([^`\n]+)`/g;
 
@@ -1106,6 +1124,17 @@ function checkCompletionClaimsInNote(noteText, repoRoot) {
   const text = noteText || '';
   const results = [];
   for (const m of text.matchAll(COMPLETION_CLAIM_RE)) {
+    if (isNegatedCompletionClaim(text, m.index)) {
+      completionClaimDismissals.negated += 1;
+      completionClaimDismissals.lastSample.push({
+        at: new Date().toISOString(),
+        phrase: m[0],
+        reason: 'negated',
+        excerpt: text.slice(Math.max(0, m.index - 40), m.index + m[0].length + 40),
+      });
+      if (completionClaimDismissals.lastSample.length > 20) completionClaimDismissals.lastSample.shift();
+      continue;
+    }
     // Verify against the sentence(s) around the claim, not the whole note -- a stray path
     // or function name far away is not part of this claim (same locality rule as the
     // heavy-change/scope-adjacency heuristic).
@@ -1127,7 +1156,7 @@ function checkCompletionClaimsInNote(noteText, repoRoot) {
       if (!/\.[a-z]{2,4}$/i.test(cand)) claimedToken = cand;
     }
 
-    const candidate = { file, functionName, claimedToken, found: false, evidence: '' };
+    const candidate = { file, functionName, claimedToken, verdict: 'unchecked', symbol: null, line: null, found: false, evidence: '' };
     if (!file && !functionName && !claimedToken) {
       candidate.evidence = 'no file, function, or token extractable from the claim -- cannot verify';
       results.push(candidate);
@@ -1140,6 +1169,7 @@ function checkCompletionClaimsInNote(noteText, repoRoot) {
     }
     const { resolvedPath } = resolveAgainstRepoDetailed(repoRoot, file);
     if (!resolvedPath) {
+      candidate.verdict = 'false';
       candidate.evidence = `file not found: ${file}`;
       results.push(candidate);
       continue;
@@ -1156,8 +1186,9 @@ function checkCompletionClaimsInNote(noteText, repoRoot) {
     }
     const lineAt = (idx) => content.slice(0, idx).split('\n').length;
     if (!functionName && !claimedToken) {
-      // File-existence alone is the claim -- and it resolved, so the claim holds.
-      candidate.found = true;
+      // File-existence alone names no symbol, so per the verdict contract this is unchecked, not true.
+      candidate.verdict = 'unchecked';
+      candidate.found = false;
       candidate.evidence = `file ${file} exists (resolved: ${path.relative(repoRoot, resolvedPath) || path.basename(resolvedPath)})`;
       results.push(candidate);
       continue;
@@ -1171,6 +1202,8 @@ function checkCompletionClaimsInNote(noteText, repoRoot) {
         ok = false;
         parts.push(`function '${functionName}' not found in ${file}`);
       } else {
+        candidate.symbol = functionName;
+        candidate.line = lineAt(idx);
         parts.push(`function '${functionName}' confirmed at ${file}:${lineAt(idx)}`);
       }
     }
@@ -1180,10 +1213,15 @@ function checkCompletionClaimsInNote(noteText, repoRoot) {
         ok = false;
         parts.push(`token '${claimedToken}' not found in ${file}`);
       } else {
+        if (candidate.line == null) {
+          candidate.symbol = claimedToken;
+          candidate.line = lineAt(tidx);
+        }
         parts.push(`token '${claimedToken}' confirmed at ${file}:${lineAt(tidx)}`);
       }
     }
-    candidate.found = ok;
+    candidate.verdict = ok ? 'true' : 'false';
+    candidate.found = candidate.verdict === 'true';
     candidate.evidence = parts.join('; ');
     results.push(candidate);
   }
@@ -1206,6 +1244,7 @@ module.exports = {
   checkCommitClaims,
   checkRevertsAPriorFix,
   checkCompletionClaimsInNote,
+  getCompletionClaimDismissals,
   extractFilePaths,
   extractCreateModeTargets,
   extractDiffCreateTargets,
