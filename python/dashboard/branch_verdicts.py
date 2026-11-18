@@ -416,7 +416,19 @@ def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, hub_l
                         if written:
                             task_ids, hub_id = resolve_owner(repo_root, b.get("mainBranch") or "master", branch, run_git,
                                                              queue_dir, hub_lookup, b.get("taskId"))
-                            write_task_log(queue_dir, task_ids, hub_id or (b.get("hub") or {}).get("id"), branch, verdict, reasons, "deterministic", sha)
+                            hub_id_to_use = hub_id or (b.get("hub") or {}).get("id")
+                            # Compute expected writes matching write_task_log's actual behavior: dedup + skip missing files
+                            _expected_ids = []
+                            for _tid in [t for t in list(task_ids or []) + [hub_id_to_use] if t]:
+                                if _tid not in _expected_ids:
+                                    _expected_ids.append(_tid)
+                            corrected_expected_writes = sum(1 for _tid in _expected_ids if _task_file(queue_dir, _tid) is not None)
+                            actual_writes = write_task_log(queue_dir, task_ids, hub_id_to_use, branch, verdict, reasons, "deterministic", sha)
+                            if actual_writes < corrected_expected_writes:
+                                logger.warning(
+                                    "Partial write for %s: %d/%d task(s) written (expected %d based on file existence)",
+                                    branch, actual_writes, corrected_expected_writes, corrected_expected_writes,
+                                )
                         verdicts = load_verdicts(queue_dir)
                 elif existing is not None:
                     clear_verdict(queue_dir, branch, sha)
