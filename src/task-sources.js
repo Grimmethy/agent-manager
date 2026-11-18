@@ -48,6 +48,7 @@ const { runSoWhatCitationCheck: runPipelineDebriefSoWhatCheck } = require('./pip
 const { runPremiseCheckAsPostImplement } = require('./candidate-premise-check.js');
 const { listHeldTasksFifo, deriveResolveIdentity, selfHealResolveDeadlock, buildResolveTask } = require('./lib/task-resolve.js');
 const { taskPriority } = require('./lib/task-priority.js');
+const { reasonFor } = require('./unclaimed-reason.js');
 const { markPipelineHealthAuditChecked, markUiVisibilityAuditChecked, coverageEntryActiveLocal, markPipelineDebriefReported } = require('./lib/task-audit.js');
 const { nextProductSpecSectionTask, getNextTask, setPreemptLoaders } = require('./lib/task-selection.js'); setPreemptLoaders({ nextAdhocTask, nextDerivedTask }); // registered here (hoisted declarations) so lib/task-selection.js need not require this file
 
@@ -501,17 +502,32 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
     // behind one that genuinely can't proceed yet.
     if (Array.isArray(parsed.dependsOn) && parsed.dependsOn.length > 0) {
       const unmet = parsed.dependsOn.filter((depId) => !isDependencySatisfied(pipelineDir, depId));
-      if (unmet.length > 0) continue;
+      if (unmet.length > 0) {
+        const poolState = { claimed: false, dependencyUnmet: true };
+        const unclaimedReason = reasonFor(parsed, poolState);
+        if (unclaimedReason) setUnclaimedReason(id, unclaimedReason);
+        continue;
+      }
     }
     // prerequisiteHubs (hub-prerequisites.js): the piece needs files only another open hub's unmerged branch has, so it waits for that hub's MERGE.
-    if (unmetPrerequisiteHubs(pipelineDir, parsed).length > 0) continue;
+    if (unmetPrerequisiteHubs(pipelineDir, parsed).length > 0) {
+      const poolState = { claimed: false, dependencyUnmet: true };
+      const unclaimedReason = reasonFor(parsed, poolState);
+      if (unclaimedReason) setUnclaimedReason(id, unclaimedReason);
+      continue;
+    }
     // softDependsOn (see isSoftDependencySatisfied's own comment): same skip-past
     // behavior, but satisfied once the dependency reaches queue/done/ -- no merge
     // required. A separate array from dependsOn so a coordinator can mix hard
     // (file-content) and soft (sequencing-only) edges on the same task.
     if (Array.isArray(parsed.softDependsOn) && parsed.softDependsOn.length > 0) {
       const unmet = parsed.softDependsOn.filter((depId) => !isSoftDependencySatisfied(pipelineDir, depId));
-      if (unmet.length > 0) continue;
+      if (unmet.length > 0) {
+        const poolState = { claimed: false, dependencyUnmet: true };
+        const unclaimedReason = reasonFor(parsed, poolState);
+        if (unclaimedReason) setUnclaimedReason(id, unclaimedReason);
+        continue;
+      }
     }
     // Hub-aware draft sequencing (see hubHasUnmergedEarlierSibling's own header in
     // hub-priority.js for the full incident): a coarser safety net alongside dependsOn,
@@ -519,13 +535,21 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
     // declared for, or was satisfied by the stacked-branch exemption without the
     // sibling's code actually being visible where THIS candidate will draft/review.
     if (hubOrder.siblingHolds(pipelineDir, parsed)) {
+      const poolState = { claimed: false, laneNotAllowed: true };
+      const unclaimedReason = reasonFor(parsed, poolState);
+      if (unclaimedReason) setUnclaimedReason(id, unclaimedReason);
       continue;
     }
     // A derived finding is HELD (skipped this call, never dropped) while another open code-changing task names the same file: it was raised about a
     // moving target (usually that very task's unmerged work) and is re-judged, by derived-premise-sweep.js, once that task ends. See derived-gate.js.
     if (dir === 'derived') {
       if (!derivedHoldIndex) derivedHoldIndex = derivedGate.openTaskIndex(pipelineDir);
-      if (derivedGate.isHeld(parsed, derivedHoldIndex).held) continue;
+      if (derivedGate.isHeld(parsed, derivedHoldIndex).held) {
+        const poolState = { claimed: false, ioHeld: true };
+        const unclaimedReason = reasonFor(parsed, poolState);
+        if (unclaimedReason) setUnclaimedReason(id, unclaimedReason);
+        continue;
+      }
     }
 
     // Spread the WHOLE file through, then force only the fields this source's contract
@@ -548,6 +572,7 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
     // nothing in the file can win against this source's fixed contract, while everything
     // else (history, createdAt, preDrafted, implementResponse, planResponse, ...) now
     // passes through unconditionally instead of needing its own one-off carve-out.
+    setUnclaimedReason(id, null);
     return {
       ...parsed,
       id,
