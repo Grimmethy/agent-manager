@@ -26,7 +26,7 @@ async function postTaskAction(state, id, action, confirmMessage, body) {
         }
         return;
       }
-      throw new Error(respBody.description || `${res.status}`);
+      throw new Error(respBody.error || respBody.description || `${res.status}`);
     }
     await renderQueueTab(state);
   } catch (e) {
@@ -100,7 +100,10 @@ async function setHubPriority(id, current) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || `HTTP ${res.status}`);
+    }
     showToast(payload.priority === null ? 'Hub priority cleared.' : `Hub priority set to ${payload.priority}.`, 'info');
     renderQueueTab('coordinating');
   } catch (e) {
