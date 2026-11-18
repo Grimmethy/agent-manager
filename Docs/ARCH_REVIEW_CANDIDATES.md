@@ -3113,3 +3113,44 @@ Document the decision tree with a flowchart or decision matrix, add unit tests f
 
 Benefits:
 Improved testability ensures each fallback strategy works correctly in isolation. Clearer documentation helps future maintainers understand when and why each strategy is used. Explicitly testing edge cases reduces the risk of unexpected behavior in production.
+
+### AC-249 · Split `concepts.js` into focused modules
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+`concepts.js` bundles six distinct concerns — registry CRUD, lifecycle state machine, build-tally tracking, timeline computation, prompt instruction injection/extraction, and path/slug helpers — into a single file. The `getConceptTimeline` function takes `loadBrainDump` and `listTaskHistory` as injected dependencies, signaling that the module is coupled to data sources it shouldn't directly manage. Any change to the brain-dump schema or task-history layout requires editing this one file that also owns the concept registry and build-tally marker convention.
+
+Solution:
+Split `concepts.js` into focused modules: one for registry CRUD (`loadConcepts`, `writeConcepts`, `findConcept`, `createConcept`), one for lifecycle state machine (`shelveConcept`, `reopenConcept`, `shipConcept`, `recordConceptResearch`, `recordConceptBuildTally`), one for build-tally tracking, one for timeline computation (`getConceptTimeline`), one for prompt instruction injection/extraction, and one for path/slug helpers. Move `getConceptTimeline` to the timeline module and have it accept pre-fetched timeline data rather than requiring dependency injection of data-store loaders.
+
+Benefits:
+Each module has a single responsibility and a clear boundary. Changes to the brain-dump schema or task-history layout only touch the timeline module, not the registry or lifecycle code. Test surface becomes smaller and more focused. New contributors can reason about one concern at a time.
+
+### AC-250 · Extract shared marker injection/extraction utility
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+`concepts.js` and `incident-amplification-marker.js` both implement the same structural pattern: an instruction string, an injection function that checks idempotency via `text.includes(marker)` and appends if absent, and an extraction function that parses structured blocks from freeform text with a "drop malformed, never throw" leniency philosophy. The regex parsing, `cleanText` stripping, and `\n{3,}` normalization are duplicated. This pattern could be abstracted into a small marker-convention utility without losing the distinct semantics each marker carries.
+
+Solution:
+Create a small utility module (`marker-utils.js`) that exports: `injectMarker(text, marker, instruction)` — handles the idempotency check and append, and `extractMarker(text, marker, parser)` — handles regex parsing, `cleanText` stripping, and normalization with lenient error handling. Each marker module passes its own instruction string and parser function to these shared helpers.
+
+Benefits:
+Eliminates duplication of the marker pattern. Fixes become easier — a change to the normalization or parsing logic only needs to happen in one place. New marker types can be added by implementing just the instruction string and parser, without reimplementing the structural boilerplate.
+
+### AC-251 · Decouple `getConceptTimeline` from data-store schemas
+Strength: Worth exploring
+Files: src/concepts.js
+
+Problem:
+`getConceptTimeline` reaches into two conceptually separate data stores — brain-dump entries and task history records — and depends on their internal schemas: it assumes brain-dump entries have a `raisedBy.conceptId` field and that tasks have a `conceptId` field. The dependency injection of `loadBrainDump` and `listTaskHistory` is a workaround for this coupling rather than a clean separation. If either data store changes its schema, this function must be updated even though it's conceptually about "what happened for this concept," not about the structure of brain-dump or task-history.
+
+Solution:
+Introduce a thin adapter layer or a dedicated timeline query function in the brain-dump and task-history modules that returns concept-relevant data in a schema-agnostic shape. `getConceptTimeline` then operates on this normalized shape rather than reaching into raw data-store layouts. Alternatively, move timeline computation entirely out of the concept registry and into a separate timeline module that owns its own queries.
+
+Benefits:
+The concept registry no longer depends on the internal structure of brain-dump or task-history. Schema changes in those stores don't ripple into the concept registry. Timeline logic can evolve independently.
+
+NOTE: AC-002 flag was not applied — the pre-check's "missing-file" lead for `marker-utils.js` is a false positive because the draft is creating this file (not claiming it already exists), which is explicitly permitted by the review guidance.
