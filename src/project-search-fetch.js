@@ -13,10 +13,11 @@
 // below is deliberately conservative and a fixed delay separates each GitHub call.
 //
 // CLI: node project-search-fetch.js <queries.json>   where queries.json is {"queries": [...]}
-// Writes a JSON array of results to stdout: [{query, source, name, url, description, stat}]
-// Never throws on an individual query's failure -- a rate-limit or network error for one
-// query is swallowed and that query just contributes zero results, so one bad call can't
-// blank out results a caller already has from the others.
+// Writes a JSON array of results to stdout: [{query, source, name, url, description, stat}].
+// A GitHub or Hugging Face call that fails contributes an {query, source, error} entry in that
+// array instead of results, so one bad call can't blank out results from the others.
+// If every search call failed (no source succeeded for any query), stdout is instead a single
+// object: {all_queries_failed: true, errors: [...]}, so a consumer can skip the model call.
 
 const https = require('https');
 
@@ -104,16 +105,23 @@ async function searchHuggingFace(query) {
   }
 }
 
-async function runSearches(queries) {
+async function runSearchesDetailed(queries) {
   const capped = queries.slice(0, MAX_QUERIES);
   const results = [];
+  let anySucceeded = false;
   for (let i = 0; i < capped.length; i++) {
     const query = capped[i];
     if (i > 0) await sleep(GITHUB_CALL_DELAY_MS); // conservative pacing for GitHub's tighter search-endpoint limit
     const [ghResults, hfResults] = await Promise.all([searchGitHub(query), searchHuggingFace(query)]);
+    // A source succeeded if its array holds no error entry (an empty array is a successful zero-hit search).
+    if (ghResults.every((r) => !r.error) || hfResults.every((r) => !r.error)) anySucceeded = true;
     results.push(...ghResults, ...hfResults);
   }
-  return results;
+  return { results, anySucceeded };
+}
+
+async function runSearches(queries) {
+  return (await runSearchesDetailed(queries)).results;
 }
 
 async function main() {
@@ -131,7 +139,11 @@ async function main() {
     process.stdout.write(JSON.stringify([{ error: `Could not read/parse queries file: ${e.message}` }]));
     return;
   }
-  const results = await runSearches(queries);
+  const { results, anySucceeded } = await runSearchesDetailed(queries);
+  if (queries.length > 0 && !anySucceeded) {
+    process.stdout.write(JSON.stringify({ all_queries_failed: true, errors: results }));
+    return;
+  }
   process.stdout.write(JSON.stringify(results));
 }
 
