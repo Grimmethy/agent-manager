@@ -3212,3 +3212,35 @@ Benefits:
 - Makes it easier to find and modify specific functionality
 - Reduces cognitive load when reading the file
 - Clarifies the module's API surface
+
+### AC-256 · `apply-core.js` `usesGroupB` has counterintuitive naming and inverted logic
+Strength: Strong
+
+**Strength:** Strong
+**Files:** `src/apply-core.js`
+
+**Problem:**
+The function `usesGroupB(task)` returns `true` when a source does NOT have an `apply` function. This is because Group B sources don't register an `apply` function, while Group A sources do. The function name suggests it checks for Group B, but the implementation checks for the absence of `apply`. This is confusing and error-prone, especially for new contributors who might assume the function name is literal.
+
+**Solution:**
+Rename `usesGroupB` to something more descriptive like `hasNoApplyFunction` or `isGroupBSource`, and add a clarifying comment explaining the convention: Group B sources intentionally omit `apply`, while Group A sources register one. Alternatively, invert the logic by creating a `hasApplyFunction` function and using `!hasApplyFunction(task)` at call sites.
+
+**Benefits:**
+The code becomes more self-documenting and less prone to misinterpretation. New contributors can understand the Group A/B distinction without needing to trace through the implementation of `usesGroupB`. The naming aligns with the actual check being performed.
+
+### AC-257 · `task-history.js` `COLLAPSIBLE_REPEAT_STAGES` is hardcoded
+Strength: Strong
+
+**Strength:** Worth exploring
+**Files:** `src/task-history.js`
+
+**Problem:**
+The `COLLAPSIBLE_REPEAT_STAGES` Set only contains 'exhausted'. If other stages need collapsing in the future, the code needs to be modified. This is a minor friction point but not critical.
+
+**Solution:**
+Consider making `COLLAPSIBLE_REPEAT_STAGES` configurable or extensible, perhaps by allowing it to be passed as a parameter to the function that uses it, or by defining it in a constants file that can be extended. Alternatively, document the current limitation and add a TODO comment for future extensibility.
+
+**Benefits:**
+The code becomes more maintainable and adaptable to future requirements. If additional stages need collapsing, the change is localized and doesn't require modifying core logic.
+
+NOTE: The independent review (CRITIQUE section) found no issues with the original draft—AC-004's problem statement and solution are accurate against the source, and AC-005's observation is valid—so no changes were applied.
