@@ -131,6 +131,70 @@ def api_tasks_completed():
     return jsonify({"tasks": rows, "nextCursor": next_cursor})
 
 
+def _coordinating_family(state_dir, source_filter, sort_mode):
+    """Ordered parentHub/subTasks family list for ONE coordinating/ dir (HUB0636 1/6).
+
+    Same algorithm as the no-project coordinating branch of api_queue_state, but scoped
+    to a single queue dir so a hub id can only parent children inside its own project.
+    Returns rows with hubDepth and hubFamily set; the caller tags project fields and pages.
+    """
+    from app import read_json_safe, task_summary
+    by_id = {}
+    if state_dir is not None and state_dir.is_dir():
+        for f in state_dir.glob("*.json"):
+            data = read_json_safe(f)
+            if data and (not source_filter or data.get("source") == source_filter):
+                by_id[data.get("id", f.stem)] = task_summary(data, f.stem)
+    explicit_parent = {}
+    for tid, entry in by_id.items():
+        parent = entry.get("parentHub")
+        if parent and parent in by_id and parent != tid:
+            explicit_parent[tid] = parent
+    derived_parent = {}
+    for tid, entry in by_id.items():
+        for st in entry.get("subTasks") or []:
+            sid = st.get("id") if isinstance(st, dict) else None
+            if sid and sid in by_id and sid != tid:
+                derived_parent.setdefault(sid, tid)
+    children_of = {}
+    for tid in by_id:
+        parent = explicit_parent.get(tid) or derived_parent.get(tid)
+        children_of.setdefault(parent, []).append(tid)
+    for kids in children_of.values():
+        kids.sort(key=lambda tid: by_id[tid].get("createdAt") or "", reverse=True)
+    roots = children_of.get(None, [])
+    if sort_mode == "name":
+        roots.sort(key=lambda tid: (by_id[tid].get("title") or tid).casefold())
+    else:
+        def _root_key(tid):
+            hp = by_id[tid].get("hubPriority")
+            rank = hp if isinstance(hp, (int, float)) and not isinstance(hp, bool) else float("inf")
+            return (rank, by_id[tid].get("createdAt") or "\uffff")
+        roots.sort(key=_root_key)
+    children_of[None] = roots
+
+    ordered = []
+    visited = set()
+
+    def walk(tid, depth, family_label):
+        if tid in visited:
+            return
+        visited.add(tid)
+        entry = dict(by_id[tid])
+        entry["hubDepth"] = depth
+        entry["hubFamily"] = family_label if depth > 0 else entry.get("title") or tid
+        ordered.append(entry)
+        for child_id in children_of.get(tid, []):
+            walk(child_id, depth + 1, entry["hubFamily"])
+
+    for root_id in children_of.get(None, []):
+        walk(root_id, 0, None)
+    for tid in by_id:
+        if tid not in visited:
+            walk(tid, 0, None)
+    return ordered
+
+
 @shared_misc_bp.route("/api/queue/<state>")
 def api_queue_state(state):
     """Returns {items: [...], total: N}. Incremental loading (2026-07-26, Grimmethy:
@@ -150,6 +214,27 @@ def api_queue_state(state):
             project_param = parse_project_param(project_raw)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        if state == "coordinating":
+            # HUB0636 1/6: build the parentHub/subTasks family tree separately for each
+            # project's coordinating/ dir, so a hub can only parent children inside its own
+            # project. Every row is tagged with project, projectName and projectRoot.
+            from routes.queue_project_filter import ALL, _queue_dir_for, _registry
+            sort_mode = (request.args.get("sort") or "priority").strip().lower()
+            reg_by_label = {e.get("label"): e for e in _registry() if e.get("label")}
+            scope_labels = list(reg_by_label) if project_param == ALL else [project_param]
+            rows = []
+            for label in scope_labels:
+                pdir = _queue_dir_for(label)
+                root = (reg_by_label.get(label) or {}).get("repoRoot")
+                state_dir = pdir / "coordinating" if pdir is not None else None
+                for row in _coordinating_family(state_dir, source_filter, sort_mode):
+                    row["project"] = label
+                    row["projectName"] = label
+                    row["projectRoot"] = root
+                    rows.append(row)
+            total = len(rows)
+            page = rows[offset:offset + limit] if limit is not None else rows[offset:]
+            return jsonify({"items": page, "total": total})
         full_store = collect_pieces("all")
         proj_items = []
         for piece in collect_pieces(project_param):
