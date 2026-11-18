@@ -78,6 +78,10 @@ test('resolveTimeoutMs scales down for a cheap short call instead of always retu
   assert.ok(cheap >= MIN_TIMEOUT_MS);
 });
 
+test('MIN_TIMEOUT_MS is 180 s, 2x the 90 s worst contended cold-load measurement', () => {
+  assert.equal(MIN_TIMEOUT_MS, 180_000);
+});
+
 test('resolveTimeoutMs never exceeds the caller-supplied ceiling even for a huge workload', () => {
   const ms = resolveTimeoutMs({ promptTokens: 100000, numPredict: 100000, tokensPerSecond: 5, ceilingMs: 240_000 });
   assert.equal(ms, 240_000);

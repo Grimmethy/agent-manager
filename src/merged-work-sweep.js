@@ -148,6 +148,10 @@ function sweep({ pipelineDir, repoRoot, instancesDir = path.join(pipelineDir, 'i
         continue;
       }
 
+      // Cap check BEFORE the content check and BEFORE mark-checked: a task we cannot file
+      // this run must stay unchecked so the next tick picks it up. Stopping (break, not
+      // continue) also keeps the remaining candidates unchecked, not silently dropped.
+      if (summary.flagged >= MAX_FINDINGS_PER_RUN) break;
       summary.contentChecked += 1;
       const result = verifyMergedWorkPresent(task, repoRoot);
       checkedIds.add(task.id);
@@ -159,7 +163,6 @@ function sweep({ pipelineDir, repoRoot, instancesDir = path.join(pipelineDir, 'i
       // 'missing', or 'partial' below verify-merged-work.js's own 0.8 'present' floor --
       // both are worth a human/agent look, matching the brain-dump note's own "low-ratio
       // partial" wording.
-      if (summary.flagged >= MAX_FINDINGS_PER_RUN) continue;
       summary.flagged += 1;
       const missingFiles = result.files.filter((f) => f.checked && f.foundCount < f.meaningfulLineCount).map((f) => f.path);
       writeSideFindingInbox({
