@@ -230,8 +230,8 @@ function renderTaskDetailModal(task) {
   // cleared the moment it's claimed), this is meant to be "set once, forget it."
   const premiumOn = !!task.premiumPriority;
   html += `<div style="margin:8px 0 4px">`
-    + `<button type="button" class="secondary" id="task-send-to-chat">Send to Chat</button> `
-    + `<button type="button" class="${premiumOn ? 'action' : 'secondary'}" id="task-premium-priority" title="${premiumOn ? 'Currently claimed ahead of everything else in the queue, every pass, until turned off or the task completes. Click to turn off.' : 'Always claim this task first, every pass, regardless of source or age -- stays on until you turn it off or the task completes.'}">${premiumOn ? '★ Premium Priority (on)' : '☆ Set Premium Priority'}</button>`
+    + `<button type="button" class="secondary" id="task-send-to-chat" data-action="send-to-chat">Send to Chat</button> `
+    + `<button type="button" class="${premiumOn ? 'action' : 'secondary'}" id="task-premium-priority" data-action="premium-priority" title="${premiumOn ? 'Currently claimed ahead of everything else in the queue, every pass, until turned off or the task completes. Click to turn off.' : 'Always claim this task first, every pass, regardless of source or age -- stays on until you turn it off or the task completes.'}">${premiumOn ? '★ Premium Priority (on)' : '☆ Set Premium Priority'}</button>`
     + (premiumProvenanceText(task, Date.now()) ? ` <span class="muted" id="task-premium-provenance">${escapeHtml(premiumProvenanceText(task, Date.now()))}</span>` : '')
     + `</div>`;
   // Retire hub (HUB0441 3/3): only a coordinating hub gets the button. The panel stays hidden until clicked; the client sends the whole
@@ -386,6 +386,7 @@ function renderTaskDetailModal(task) {
   else if (emptyPlan) html += `<div class="field-label">Plan</div><pre class="meta">(the plan pass returned an empty response — nothing was drafted; see Blocked Reason above)</pre>`;
   if (task.implementResponse && !reportShown) html += `<div class="field-label">Implement</div><pre>${escapeHtmlBright(task.implementResponse)}</pre>`;
   else if (emptyImpl) html += `<div class="field-label">Implement</div><pre class="meta">(the implement pass returned an empty response — nothing was drafted; see Blocked Reason above)</pre>`;
+  currentModalTask = task;
   content.innerHTML = html;
   backdrop.classList.add('open');
   // Jump to another task from an in-modal link (the forensic study's failing/winner ids) --
@@ -448,49 +449,8 @@ function renderTaskDetailModal(task) {
       }
     };
   }
-  const taskSendToChatBtn = document.getElementById('task-send-to-chat');
-  if (taskSendToChatBtn) {
-    taskSendToChatBtn.onclick = async () => {
-      taskSendToChatBtn.disabled = true;
-      try {
-        const parts = [`# ${task.id}`];
-        if (task.title) parts.push('title: ' + task.title);
-        let text = parts.join('\n\n');
-        if (text.length > 200) text = text.slice(0, 199) + '…'; // hard cap: sendTextToChat must never receive >200 chars
-        await sendTextToChat(text); // POSTs, expands the sidebar, tells the plugin iframe to refresh; throws on !ok
-        showToast('Sent to chat', 'info');
-      } catch (e) {
-        showToast('Could not send to chat: ' + e.message);
-      } finally {
-        taskSendToChatBtn.disabled = false;
-      }
-    };
-  }
-  const taskPremiumPriorityBtn = document.getElementById('task-premium-priority');
-  if (taskPremiumPriorityBtn) {
-    taskPremiumPriorityBtn.onclick = async () => {
-      taskPremiumPriorityBtn.disabled = true;
-      try {
-        const nextEnabled = !premiumOn;
-        const res = await fetch(`/api/task-anywhere/${encodeURIComponent(task.id)}/premium-priority`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ enabled: nextEnabled }),
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        showToast(nextEnabled ? 'Premium priority set -- claimed first every pass until you turn it off' : 'Premium priority cleared', 'info');
-        task.premiumPriority = nextEnabled;
-        // mirror what the route just stamped so the in-place re-render shows who/when instead of "origin unknown"
-        const nowIso = new Date().toISOString();
-        if (nextEnabled) { task.premiumSetBy = 'operator-ui'; task.premiumSetAt = nowIso; delete task.premiumClearedAt; delete task.premiumClearedBy; }
-        else { task.premiumClearedBy = 'operator-ui'; task.premiumClearedAt = nowIso; }
-        renderTaskDetailModal(task); // re-render in place so the button flips state immediately, no full reopen
-      } catch (e) {
-        showToast('Could not update premium priority: ' + e.message);
-        taskPremiumPriorityBtn.disabled = false;
-      }
-    };
-  }
+  // Delegated click handler installed once at module top level (task-detail-modal.js:installTaskDetailModalDelegation).
+  // `currentModalTask` is set below just before content.innerHTML is written so the handler can look up the current task id / premium flag.
   armTaskDetailAutoRefresh(task);
 }
 
@@ -852,3 +812,63 @@ function closeDetail() {
   document.getElementById('modal-backdrop').classList.remove('open');
   deepDiveDetailCache = null; // force a fresh fetch next time any project's modal opens
 }
+
+let currentModalTask = null;
+
+async function handleSendToChat(btn) {
+  btn.disabled = true;
+  try {
+    const task = currentModalTask;
+    if (!task) return;
+    const parts = [`# ${task.id}`];
+    if (task.title) parts.push('title: ' + task.title);
+    let text = parts.join('\n\n');
+    if (text.length > 200) text = text.slice(0, 199) + '…'; // hard cap: sendTextToChat must never receive >200 chars
+    await sendTextToChat(text); // POSTs, expands the sidebar, tells the plugin iframe to refresh; throws on !ok
+    showToast('Sent to chat', 'info');
+  } catch (e) {
+    showToast('Could not send to chat: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function handlePremiumPriority(btn) {
+  const task = currentModalTask;
+  if (!task) return;
+  const premiumOn = !!task.premiumPriority;
+  btn.disabled = true;
+  try {
+    const nextEnabled = !premiumOn;
+    const res = await fetch(`/api/task-anywhere/${encodeURIComponent(task.id)}/premium-priority`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: nextEnabled }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    showToast(nextEnabled ? 'Premium priority set -- claimed first every pass until you turn it off' : 'Premium priority cleared', 'info');
+    task.premiumPriority = nextEnabled;
+    // mirror what the route just stamped so the in-place re-render shows who/when instead of "origin unknown"
+    const nowIso = new Date().toISOString();
+    if (nextEnabled) { task.premiumSetBy = 'operator-ui'; task.premiumSetAt = nowIso; delete task.premiumClearedAt; delete task.premiumClearedBy; }
+    else { task.premiumClearedBy = 'operator-ui'; task.premiumClearedAt = nowIso; }
+    renderTaskDetailModal(task); // re-render in place so the button flips state immediately, no full reopen
+  } catch (e) {
+    showToast('Could not update premium priority: ' + e.message);
+    btn.disabled = false;
+  }
+}
+
+function installTaskDetailModalDelegation() {
+  const content = document.getElementById('modal-content');
+  if (!content || content.dataset.delegated) return;
+  content.dataset.delegated = '1';
+  content.addEventListener('click', (event) => {
+    const el = event.target.closest('[data-action]');
+    const action = el?.dataset.action;
+    if (action === 'send-to-chat') handleSendToChat(el);
+    else if (action === 'premium-priority') handlePremiumPriority(el);
+  });
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', installTaskDetailModalDelegation);
+else installTaskDetailModalDelegation();
