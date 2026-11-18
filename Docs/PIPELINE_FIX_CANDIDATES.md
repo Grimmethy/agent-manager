@@ -430,3 +430,14 @@ Solution: Modify the grounding check in `src/review-task.js` to allow citations 
 Benefits: Design document tasks that reference environment-specific tokens will no longer be rejected by the review gate.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-adhoc-passive-tuning-loops-design-doc-for-the-shared-loop-shape-t-1792124226356
+
+### AC-148 · on-demand task "HUB0138-02-add-tests-for-brain-dump-sort-skip-behavior"
+Strength: Strong
+Files: src/local-tool-client.js, src/reject-retry-check.js
+
+Model confidence: Strong | Worth exploring
+Problem: The local-agentic-write tier's Ollama endpoint circuit breaker does not trip fast enough on infra outages, and the retry/requeue logic in reject-retry-check.js does not clear stale state or bound the retry budget effectively, leading to 22+ failed attempts and eventual exhaustion instead of failing fast and escalating.
+Solution: In src/local-tool-client.js, add a circuit breaker that trips after 3 consecutive Ollama endpoint failures (not 5), and in src/reject-retry-check.js, reduce the max retry count from 2/2 to 1/1 for infra-outage failures and immediately escalate to needs-clarification instead of retrying. Acceptance check: run the subject task in an environment where Ollama is down; it should fail fast (within 3 attempts) and escalate to a human rather than exhausting retries.
+Benefits: Tasks blocked by Ollama infra outages will fail fast and escalate to humans instead of wasting tokens on 20+ retry cycles, reducing cost and improving user experience.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-hub0138-02-add-tests-for-brain-dump-sort-skip-behavior-1793172143170
