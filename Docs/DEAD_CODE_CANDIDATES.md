@@ -51,3 +51,17 @@ Strength: Strong
 Symbol: CONTEXT_LOG_INSTRUCTION
 
 The symbol is genuinely used at line 64 of its own file inside `injectContextLogInstruction()` via template literal interpolation (`${CONTEXT_LOG_INSTRUCTION}`), which naive grep-based dead-code detectors commonly miss. The constant is a module-internal implementation detail of this actively-consumed module (5 consumers), and removing it would break the function's contract without providing meaningful cleanup. The zero-external-calls result is expected design, not evidence of death.
+
+### AC-5 · Remove dead `DATE_LINE` export from src/doc-accuracy-check.js
+Strength: Strong
+Files: src/doc-accuracy-check.js
+Symbol: DATE_LINE
+
+Problem:
+`DATE_LINE` is defined and exported from src/doc-accuracy-check.js but is never consumed by any code in this repository. The grep found zero call sites for the symbol, and the two files that name this module (src/adhoc-diff-sanity.js, src/adhoc-diff-sanity.test.js) only require the module itself — never the `DATE_LINE` export specifically. The defining comment at lines 27-28 explicitly marks it as a future placeholder ("Held for any future prompt-building code path"), and the current pipeline is fully deterministic with no model call, so the symbol is genuinely unused. The only "use" of the export is its own `module.exports` declaration at line 99, which is therefore a dead export.
+
+Solution:
+In src/doc-accuracy-check.js, remove three things: (1) line 25, the import `const { currentDateLine } = require('./current-date-line.js');` — `currentDateLine` is only used to produce `DATE_LINE` and is not referenced elsewhere in this file; (2) line 29, the declaration `const DATE_LINE = currentDateLine();` along with the two comment lines 27-28 that describe it as a future placeholder; and (3) the `DATE_LINE` entry from the `module.exports` object on line 99, leaving it as `module.exports = { checkDocAccuracy, extractPathRefs };`. No other file in the repo needs updating because no internal code references the symbol.
+
+Benefits:
+Removing this dead code eliminates a misleading unused export that invites future readers (or agents) to assume the symbol is wired into a prompt path that does not yet exist. It also drops an unnecessary dependency on `./current-date-line.js` from this module, shrinking its surface area and making the file's actual contract — a pure deterministic file-existence check — unambiguous.
