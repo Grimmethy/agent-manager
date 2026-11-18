@@ -102,11 +102,26 @@ function createConcept({ name, description, kind }, pipelineDir, { createdBy } =
 // takes priority" must not silently flip it back to 'researched' and erase that decision.
 const STABLE_CONCEPT_STATUSES = new Set(['shelved', 'shipped']);
 
-function recordConceptResearch(pipelineDir, conceptId) {
+// Single membership check for the stable set. Guards in this file go through here.
+function isStableConceptStatus(status) {
+  return STABLE_CONCEPT_STATUSES.has(status);
+}
+
+// Single guard for forward mutators: returns { data, concept } only when the concept exists
+// and is not in a stable state; otherwise null.
+function loadMutableConcept(pipelineDir, conceptId) {
   if (!conceptId) return null;
   const data = loadConcepts(pipelineDir);
   const concept = findConcept(data, conceptId);
-  if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
+  if (!concept || isStableConceptStatus(concept.status)) return null;
+  return { data, concept };
+}
+
+function recordConceptResearch(pipelineDir, conceptId) {
+  if (!conceptId) return null;
+  const guarded = loadMutableConcept(pipelineDir, conceptId);
+  if (!guarded) return null;
+  const { data, concept } = guarded;
   concept.researchForkCount = (concept.researchForkCount || 0) + 1;
   concept.lastResearchedAt = new Date().toISOString();
   if (concept.status === 'open') concept.status = 'researched';
@@ -119,9 +134,9 @@ function recordConceptResearch(pipelineDir, conceptId) {
 // tally as such rather than presenting it as fact.
 function recordConceptBuildTally(pipelineDir, conceptId, kind) {
   if (!conceptId || (kind !== 'scratch' && kind !== 'adapted')) return null;
-  const data = loadConcepts(pipelineDir);
-  const concept = findConcept(data, conceptId);
-  if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
+  const guarded = loadMutableConcept(pipelineDir, conceptId);
+  if (!guarded) return null;
+  const { data, concept } = guarded;
   if (kind === 'scratch') concept.builtFromScratchCount = (concept.builtFromScratchCount || 0) + 1;
   else concept.adaptedFromResourceCount = (concept.adaptedFromResourceCount || 0) + 1;
   if (concept.status === 'researched' || concept.status === 'open') concept.status = 'in-progress';
@@ -145,7 +160,7 @@ function shelveConcept(pipelineDir, conceptId, { reason, revisitCondition } = {}
   if (!conceptId || !reason) return null;
   const data = loadConcepts(pipelineDir);
   const concept = findConcept(data, conceptId);
-  if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
+  if (!concept || isStableConceptStatus(concept.status)) return null;
   concept.statusBeforeShelve = concept.status;
   concept.status = 'shelved';
   concept.shelvedAt = new Date().toISOString();
@@ -164,7 +179,7 @@ function reopenConcept(pipelineDir, conceptId) {
   if (!conceptId) return null;
   const data = loadConcepts(pipelineDir);
   const concept = findConcept(data, conceptId);
-  if (!concept || !STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
+  if (!concept || !isStableConceptStatus(concept.status)) return null;
   concept.status = concept.statusBeforeShelve || 'researched';
   delete concept.statusBeforeShelve;
   delete concept.shelvedAt;
@@ -181,7 +196,7 @@ function shipConcept(pipelineDir, conceptId) {
   if (!conceptId) return null;
   const data = loadConcepts(pipelineDir);
   const concept = findConcept(data, conceptId);
-  if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
+  if (!concept || isStableConceptStatus(concept.status)) return null;
   concept.status = 'shipped';
   concept.shippedAt = new Date().toISOString();
   writeConcepts(pipelineDir, data);
@@ -280,7 +295,7 @@ module.exports = {
   CONCEPT_BUILD_INSTRUCTION,
   injectConceptBuildInstruction,
   extractConceptBuildReport,
-  STABLE_CONCEPT_STATUSES,
+  isStableConceptStatus,
   shelveConcept,
   reopenConcept,
   shipConcept,
