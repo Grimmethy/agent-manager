@@ -1284,6 +1284,10 @@ async function finalizeCandidateFulfillment(task, {
     // codebase that the fetched content contradicts (arch-import-premise-check.js in the
     // hygiene plugin; see AC-8, which split into 3 children before anyone checked its
     // premise was false). Skipped once splitBlocked is already true -- cheapest check first.
+    if (!splitBlocked && !entry) {
+      // No registered source for this task: the premise check is skipped. Log it so the skip is visible, not silent.
+      console.warn(`[premiseCheck] task=${task.id || task.name || 'unknown'} source=${resolveSourceName(task) || 'unknown-source'} no registered source -- premise check skipped`);
+    }
     if (!splitBlocked && entry && typeof entry.premiseCheck === 'function') {
       let premise;
       try {
