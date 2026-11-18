@@ -35,7 +35,7 @@ function classifyStatus(porcelain) {
 
 // run(args) -> stdout (throws on failure). Returns { mode, restored, wouldRestore, other }. Never throws: a failed restore leaves the file in `other`.
 function healGeneratedDirt(run, { mode = healMode() } = {}) {
-  const result = { mode, restored: [], wouldRestore: [], other: [] };
+  const result = { mode, restored: [], wouldRestore: [], other: [], restoreError: null };
   if (mode === 'off') return result;
   let status;
   try { status = run(['status', '--porcelain', '--untracked-files=no']); } catch { return result; }
@@ -46,7 +46,9 @@ function healGeneratedDirt(run, { mode = healMode() } = {}) {
   try {
     run(['checkout', '--', ...generated]);
     result.restored = generated;
-  } catch {
+  } catch (err) {
+    result.restoreError = String((err && err.message) || err);
+    process.stderr.write(`apply-clone-dirt: restore of ${generated.length} generated file(s) failed: ${result.restoreError}\n`);
     result.other = other.concat(generated.map((f) => ` M ${f}`));
   }
   return result;
