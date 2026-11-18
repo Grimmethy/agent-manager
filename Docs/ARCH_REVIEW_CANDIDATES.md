@@ -3361,3 +3361,31 @@ Benefits:
 - **Maintainability:** Changes to the commit message format are isolated to a single helper, reducing the risk of missing a case or introducing inconsistencies.
 
 NOTE: The CRITIQUE section reported "NO ISSUES FOUND" with no specific flags to address, so no changes to the draft were necessary.
+
+### AC-810 · Overloaded `applyDirectToMainBatchOnBranch` function in `apply-main-batch.js`
+Strength: Strong
+Files: src/lib/apply-main-batch.js
+
+Problem:
+The `applyDirectToMainBatchOnBranch` function performs filtering, branch preparation, artifact writing, staging, committing, pushing, and error recovery all in one place. This violates single responsibility, making the function difficult to test, maintain, and reason about. Each of these concerns has different failure modes and testing requirements, but they are entangled in a single function.
+
+Solution:
+Extract smaller, focused functions for each major responsibility: task filtering, branch preparation, artifact processing, and push handling. Each extracted function should have a single, well-defined purpose with clear inputs and outputs. This decomposition enables independent testing and makes each concern independently maintainable.
+
+Benefits:
+Improved testability through smaller, focused functions. Reduced cognitive load when reading or modifying the code. Easier to add new functionality or change behavior for one concern without affecting others. Clearer error handling and recovery for each stage of the batch apply process.
+
+### AC-811 · Defensive `typeof` checks for gitRunner methods in `apply-main-batch.js`
+Strength: Strong
+Files: src/lib/apply-main-batch.js
+
+Problem:
+The code uses `typeof gitRunner.quarantineDirtyTree === 'function'` checks throughout the batch apply logic. This suggests the gitRunner interface is not well-defined or stable. If the interface changes, these checks silently skip functionality without error, leading to silent failures that are difficult to diagnose. For example, if a method is removed or renamed, the code continues without quarantining dirty trees, potentially causing downstream apply failures.
+
+Solution:
+Define a clear interface contract for gitRunner and validate it at initialization. Remove the defensive `typeof` checks and rely on the interface contract. Use TypeScript interfaces, JSDoc type annotations, or runtime validation at startup to ensure the gitRunner implementation provides all required methods. This makes failures visible immediately rather than silently swallowed.
+
+Benefits:
+Failures become visible at initialization rather than manifesting as silent downstream errors. Clearer documentation of the gitRunner contract through explicit interface definitions. Easier to identify when a gitRunner implementation is incompatible. Reduced risk of silent data loss or corruption from missing quarantine functionality.
+
+NOTE: AC-003 was removed entirely because it was based on a fundamental misunderstanding — it conflated signature production functions (`signatureForTask`, `signatureForClarificationTask`) with signature parsing logic, and misattributed the actual parsing duplication to `blocked-drain.js` when it resides in `pipeline-self-audit.js` (already covered by AC-243 in the existing candidates tail).
