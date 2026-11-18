@@ -663,7 +663,10 @@ write_heartbeat_file() {
     if (startedAt) hb.startedAt = startedAt;
     // Borrowed-project label (docs/design-notes/idle-pool-borrowing.md): set only while this lane runs a task of another suite project.
     if (process.env.AGENT_MANAGER_BORROWING_FROM) hb.project = process.env.AGENT_MANAGER_BORROWING_FROM;
-    fs.writeFileSync(hbPath, JSON.stringify(hb, null, 2));
+    // Atomic write (temp file in the same dir + rename): a reader never sees a truncated or half-written heartbeat.
+    const tmpPath = hbPath + "." + process.pid + ".tmp";
+    fs.writeFileSync(tmpPath, JSON.stringify(hb, null, 2));
+    fs.renameSync(tmpPath, hbPath);
   ' "$hb_path" "$instance_id" "$status" "$model" "$task_id" "$pass" "$started_at" "${AGENT_MANAGER_DAEMON_PID:-$$}"
 }
 
@@ -756,7 +759,17 @@ check_instance_liveness() {
     const fs = require("fs");
     const [hbPath, myPid] = process.argv.slice(1);
     let hb;
-    try { hb = JSON.parse(fs.readFileSync(hbPath, "utf8")); } catch { process.exit(0); }
+    try { hb = JSON.parse(fs.readFileSync(hbPath, "utf8")); } catch {
+      // Unparseable (empty or truncated): wait one second and re-read once. If it still does not parse, recover the owner pid from the raw text when possible.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
+      let raw = "";
+      try { raw = fs.readFileSync(hbPath, "utf8"); } catch { process.exit(0); }
+      try { hb = JSON.parse(raw); } catch {
+        const m = /"daemonPid"\s*:\s*(\d+)/.exec(raw) || /"pid"\s*:\s*(\d+)/.exec(raw);
+        if (!m) process.exit(0);
+        hb = { daemonPid: Number(m[1]) };
+      }
+    }
     // daemonPid (2026-09-07 -- see write_heartbeat_file/src/heartbeat.js for the full
     // incident): the STABLE identity of the daemon itself, not whichever process
     // (daemon or a spawned child) most recently wrote a heartbeat -- plain `pid` gets
