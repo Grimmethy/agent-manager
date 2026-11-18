@@ -375,17 +375,14 @@ def write_task_log(queue_dir, task_ids, hub_id, branch, verdict, reasons, source
 
 
 def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, hub_lookup=None):
-    """Mutates `branches` in place: adds verdict/reasons/source/verifiedAt/stale/headSha to each.
-
-    Runs the deterministic checks only when this head SHA has no verdict yet (a chat/manual one is never
-    replaced, and an existing deterministic one is reused, not recomputed on every list build). Best-effort:
-    a failure on one branch leaves it grey and never breaks the list.
-    """
+    """Mutates `branches` in place: adds verdict/reasons/source/verifiedAt/stale/headSha, then reverify/verdictAgeHours/duplicateOf (branch_reverify.py).
+    Deterministic checks run only when this head SHA has no verdict (a chat/manual one is never replaced; a conflicting 'merge' is demoted, branch_reverify.py).
+    Best-effort: a failure on one branch leaves it grey and never breaks the list."""
     if not queue_dir:
         return branches
     verdicts = load_verdicts(queue_dir)
     # Cross-branch pass (needs the whole list): open rivals from different hubs that cannot both merge.
-    import branch_redundancy
+    import branch_redundancy, branch_reverify
     try:
         alternatives = branch_redundancy.find_alternatives(branches, repo_root, (branches[0].get("mainBranch") if branches else None) or "master", run_git)
     except Exception as exc:  # noqa: BLE001 -- best-effort; a failure here must never break the branch list
@@ -398,9 +395,10 @@ def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, hub_l
         b["headSha"] = sha
         try:
             existing = (verdicts.get(branch) or {}).get(sha)
-            # A chat/manual verdict for this exact SHA is final. A deterministic one is recomputed each build
-            # (master may have moved: a conflict can clear, a branch can become already-on-master) but only
-            # rewritten/logged when it actually changed.
+            if sha and existing and branch_reverify.demote_or_restore(queue_dir, repo_root, branch, sha, existing, b, run_git, hub_lookup):
+                b.update(get_verdict(queue_dir, branch, sha, load_verdicts(queue_dir)))
+                continue
+            # A chat/manual verdict for this exact SHA is final. A deterministic one is recomputed each build (a conflict can clear, a branch can land) and only rewritten/logged when it changed.
             if sha and (existing is None or existing.get("source") == "deterministic"):
                 extra = []
                 if b.get("hubSiblingConflicts"):
@@ -424,4 +422,5 @@ def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, hub_l
         except (ValueError, OSError, RuntimeError) as exc:
             logger.warning("Deterministic verdict check failed for %s (non-fatal): %s", branch, exc)
         b.update(get_verdict(queue_dir, branch, sha, verdicts))
+    branch_reverify.annotate_reverify(branches)
     return branches
