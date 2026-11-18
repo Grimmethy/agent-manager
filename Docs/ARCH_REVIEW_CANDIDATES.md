@@ -3244,3 +3244,16 @@ Consider making `COLLAPSIBLE_REPEAT_STAGES` configurable or extensible, perhaps 
 The code becomes more maintainable and adaptable to future requirements. If additional stages need collapsing, the change is localized and doesn't require modifying core logic.
 
 NOTE: The independent review (CRITIQUE section) found no issues with the original draft—AC-004's problem statement and solution are accurate against the source, and AC-005's observation is valid—so no changes were applied.
+
+### AC-258 · Extract duplicated move-to-archive helper in `src/done-archive.js`
+Strength: Strong
+Files: src/done-archive.js
+
+Problem:
+`archiveDoneTasks` and `archiveSpecificDoneTasks` both implement an identical five-step move pattern: track a `destDirEnsured` flag, call `fs.mkdirSync(destDir, { recursive: true })` on first use, call `fs.renameSync(src, dest)`, catch the rename error, and push a formatted message into `result.errors`. The only difference between the two functions is how `src` is determined — one enumerates the task directory, the other receives an explicit task ID. This duplication means any change to the archive-move semantics (e.g. adding a checksum, switching to a copy-then-delete, or refining the error message format) must be mirrored in both functions, creating a real risk of drift and a maintenance burden for a trivially small shared behavior.
+
+Solution:
+Extract a small `moveToArchive(srcPath, destDir, destDirEnsuredRef, result)` helper that owns the five-step pattern. Both `archiveDoneTasks` and `archiveSpecificDoneTasks` then resolve their `src` value (via directory scan or explicit ID) and delegate to the helper. The `destDirEnsured` flag is passed by reference so the helper can mutate it in place, preserving the existing "ensure once" contract without changing the public API or call signatures of the two callers.
+
+Benefits:
+The shared mechanics are localized to a single function, eliminating the risk of the two callers diverging when the archive-move behavior is updated. Readability improves because each caller now expresses only its source-resolution difference. Test surface shrinks — the move semantics are exercised once through the helper rather than duplicated across two entry points — and any future change to the archive protocol (e.g. adding idempotency guards or checksums) requires editing one location.
