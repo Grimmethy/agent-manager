@@ -42,6 +42,8 @@ class ProjectsCase(unittest.TestCase):
         with branch_projects._lock:
             self._saved = dict(branch_projects._state)
             branch_projects._state.update({"cache": {}, "thread": None})
+            branch_projects._queue[:] = []
+            branch_projects._current["root"] = None
         self.addCleanup(self._restore)
         p = mock.patch.object(app, "read_project_registry", lambda: list(self.registry))
         p.start()
@@ -139,6 +141,74 @@ class ProjectsCase(unittest.TestCase):
         self.assertEqual((real, match["branch"]), (self.roots["beta"], "agent/b1"))
         self.assertEqual(branch_projects.find_other_project_branch(self.roots["beta"], "agent/nope"), (None, None))
         self.assertEqual(branch_projects.find_other_project_branch(str(self.tmp / "elsewhere"), "agent/b1"), (None, None))
+
+    def test_empty_cache_scans_preferred_project_first(self):
+        seen = []
+        with mock.patch.object(app, "_list_unmerged_branches_uncached", side_effect=lambda **kw: seen.append(kw["repo_root"]) or []):
+            branch_projects.other_project_branches(self.roots["alpha"], prefer_root=self.roots["gamma"])
+            self.join()
+        self.assertEqual(seen[0], self.roots["gamma"])
+        self.assertEqual(sorted(seen), sorted([self.roots["beta"], self.roots["gamma"]]))
+
+    def test_call_during_running_scan_queues_preferred_project_after_running_one(self):
+        delta = self.tmp / "delta"
+        (delta / ".git").mkdir(parents=True)
+        self.roots["delta"] = str(delta.resolve())
+        self.registry.append({"repoRoot": self.roots["delta"], "pipelineDir": str(self.tmp / "delta-pipe"), "label": "delta"})
+        gate, started, calls = threading.Event(), threading.Event(), []
+
+        def slow(**kw):
+            calls.append(kw["repo_root"])
+            started.set()
+            gate.wait(5)
+            return []
+        with mock.patch.object(app, "_list_unmerged_branches_uncached", side_effect=slow):
+            branch_projects.other_project_branches(self.roots["alpha"])
+            self.assertTrue(started.wait(5))
+            self.assertEqual(branch_projects._current["root"], self.roots["beta"])
+            branch_projects.other_project_branches(self.roots["alpha"], prefer_root=self.roots["delta"])
+            with branch_projects._lock:
+                queued = [q["repoRoot"] for q in branch_projects._queue]
+            self.assertEqual(queued, [self.roots["delta"], self.roots["gamma"]])
+            gate.set()
+            self.join()
+        self.assertEqual(calls, [self.roots["beta"], self.roots["delta"], self.roots["gamma"]])
+
+    def test_cached_project_is_not_listed_as_pending(self):
+        branch_projects._state["cache"][self.roots["beta"]] = {"at": time.time(), "branches": [row("agent/b1")], "error": None}
+        with mock.patch.object(app, "_list_unmerged_branches_uncached", return_value=[]):
+            _, pending = branch_projects.other_project_branches(self.roots["alpha"])
+            self.join()
+        self.assertNotIn("beta", pending)
+        self.assertEqual(pending, ["gamma"])
+
+    def test_request_refresh_rescans_a_cached_project(self):
+        branch_projects._state["cache"][self.roots["beta"]] = {"at": time.time(), "branches": [], "error": None}
+        calls = []
+        with mock.patch.object(app, "_list_unmerged_branches_uncached", side_effect=lambda **kw: calls.append(kw["repo_root"]) or []):
+            branch_projects.request_refresh(self.roots["beta"])
+            self.join()
+        self.assertEqual(calls, [self.roots["beta"]])
+
+    def test_scan_states_report_scanning_and_queued(self):
+        gate, started = threading.Event(), threading.Event()
+
+        def slow(**kw):
+            started.set()
+            gate.wait(5)
+            return []
+        with mock.patch.object(app, "_list_unmerged_branches_uncached", side_effect=slow):
+            branch_projects.other_project_branches(self.roots["alpha"])
+            self.assertTrue(started.wait(5))
+            states = {s["label"]: s["state"] for s in branch_projects.project_scan_states(self.roots["alpha"])}
+            gate.set()
+            self.join()
+        self.assertEqual(states, {"beta": "scanning", "gamma": "queued"})
+
+    def test_scan_states_report_ready_and_pending(self):
+        branch_projects._state["cache"][self.roots["gamma"]] = {"at": time.time(), "branches": [], "error": None}
+        states = {s["label"]: s["state"] for s in branch_projects.project_scan_states(self.roots["alpha"])}
+        self.assertEqual(states, {"beta": "pending", "gamma": "ready"})
 
     def test_held_hub_groups_tags_active_project_when_include_other_projects(self):
         """list_held_hub_groups(include_other_projects=True) must tag the active

@@ -17,6 +17,8 @@ import time
 
 _lock = threading.Lock()
 _state = {"cache": {}, "thread": None}  # cache: real repo root -> {"at": epoch, "branches": [...], "error": str|None}
+_queue = []  # project dicts waiting for a scan, front = next (guarded by _lock)
+_current = {"root": None}  # real repo root the scan thread is working on right now (guarded by _lock)
 
 
 def _ttl_seconds():
@@ -77,12 +79,51 @@ def expire(project_root):
             entry["at"] = 0.0
 
 
-def _refresh_stale(projects):
-    """Background thread body: recompute each stale project in turn. A failure stamps the entry anyway (keeping any previous list) so a broken repo is retried at the
-    next TTL, not on every request."""
+def _enqueue_locked(projects, front_root=None):
+    """Append each project not already queued or being scanned; move front_root to the front if it is queued. Caller holds _lock."""
+    for p in projects:
+        if p["repoRoot"] == _current["root"] or any(q["repoRoot"] == p["repoRoot"] for q in _queue):
+            continue
+        _queue.append(p)
+    if front_root:
+        for i, q in enumerate(_queue):
+            if q["repoRoot"] == front_root:
+                _queue.insert(0, _queue.pop(i))
+                break
+
+
+def _ensure_thread_locked():
+    """Start the one drain thread if none is running and there is work. Caller holds _lock."""
+    if _state["thread"] is None and _queue:
+        t = threading.Thread(target=_refresh_stale, name="branch-projects-refresh", daemon=True)
+        _state["thread"] = t
+        t.start()
+
+
+def _pop_next():
+    """Under one lock hold: the next queued project (now marked as the one being scanned), or None after clearing the thread slot when the queue is empty."""
+    with _lock:
+        if not _queue:
+            _state["thread"] = None
+            _current["root"] = None
+            return None
+        p = _queue.pop(0)
+        _current["root"] = p["repoRoot"]
+        return p
+
+
+def _refresh_stale(projects=None):
+    """Background thread body: drain the queue, recomputing one project at a time until it is empty. Optional `projects` are enqueued first. The thread slot is cleared in the
+    same lock hold that finds the queue empty, so a request that enqueues meanwhile either lands in this drain or starts a new thread. A failure stamps the entry anyway
+    (keeping any previous list) so a broken repo is retried at the next TTL, not on every request."""
     import app
+    import event_stream
+    me = threading.current_thread()
+    if projects:
+        with _lock:
+            _enqueue_locked(projects)
     try:
-        for p in projects:
+        for p in iter(_pop_next, None):
             err = None
             try:
                 branches = app._list_unmerged_branches_uncached(force_fetch=True, repo_root=p["repoRoot"], pipeline_dir=p["pipelineDir"])
@@ -91,28 +132,67 @@ def _refresh_stale(projects):
                 print(f"[branches] project {p['label']} failed (non-fatal): {err}", file=sys.stderr)
                 with _lock:
                     branches = list((_state["cache"].get(p["repoRoot"]) or {}).get("branches") or [])
-            import event_stream
             with _lock:
                 previous = _state["cache"].get(p["repoRoot"]) or {}
                 _state["cache"][p["repoRoot"]] = {"at": time.time(), "branches": branches, "error": err}
+                _current["root"] = None
             if event_stream.digest(branches) != event_stream.digest(previous.get("branches")):
                 event_stream.announce("branch-list-changed", project=p["repoRoot"])
     finally:
         with _lock:
-            _state["thread"] = None
+            if _state["thread"] is me:
+                _state["thread"] = None
+            _current["root"] = None
 
 
-def other_project_branches(active_root):
-    """({project tag -> branches}, pending labels). Never blocks on git: returns the cache and starts the refresh thread for anything stale."""
+def request_refresh(project_root):
+    """Queue one project at the FRONT of the scan, regardless of its TTL (an event-driven ask, not a schedule). A project already being scanned is left alone."""
+    real = os.path.realpath(project_root or "")
+    project = next((p for p in registered_projects(None) if p["repoRoot"] == real), None)
+    if project is None:
+        return
+    with _lock:
+        if real == _current["root"]:
+            return
+        _queue[:] = [q for q in _queue if q["repoRoot"] != real]
+        _queue.insert(0, project)
+        _ensure_thread_locked()
+
+
+def project_scan_states(active_root):
+    """[{label, repoRoot, state}] for every other registered project; state is one of scanning, queued, failed, ready, pending."""
+    others = [p for p in registered_projects(active_root) if not p["active"]]
+    with _lock:
+        current = _current["root"]
+        queued = {q["repoRoot"] for q in _queue}
+        cache = dict(_state["cache"])
+    out = []
+    for p in others:
+        root = p["repoRoot"]
+        entry = cache.get(root)
+        if root == current:
+            state = "scanning"
+        elif root in queued:
+            state = "queued"
+        elif entry is not None and entry.get("error"):
+            state = "failed"
+        elif entry is not None:
+            state = "ready"
+        else:
+            state = "pending"
+        out.append({"label": p["label"], "repoRoot": root, "state": state})
+    return out
+
+
+def other_project_branches(active_root, prefer_root=None):
+    """({project tag -> branches}, pending labels). Never blocks on git: returns the cache and queues anything stale for the refresh thread. prefer_root, if stale, goes to the front."""
     others = [p for p in registered_projects(active_root) if not p["active"]]
     ttl, now = _ttl_seconds(), time.time()
     with _lock:
         cache = dict(_state["cache"])
         stale = [p for p in others if now - (cache.get(p["repoRoot"]) or {}).get("at", 0.0) >= ttl]
-        if stale and _state["thread"] is None:
-            t = threading.Thread(target=_refresh_stale, args=(stale,), name="branch-projects-refresh", daemon=True)
-            _state["thread"] = t
-            t.start()
+        _enqueue_locked(stale, prefer_root)
+        _ensure_thread_locked()
     result, pending = [], []
     for p in others:
         entry = cache.get(p["repoRoot"])
@@ -144,6 +224,11 @@ def combined_branches(active_branches, active_root):
         tag = project_tag(active) if active else {"label": "active project", "repoRoot": active_root or "", "active": True}
         rows.extend({**b, "project": tag} for b in active_branches)
     others, pending = other_project_branches(active_root)
+    with _lock:
+        scanning = _current["root"]
+    if scanning:
+        scanning_labels = {p["repoRoot"]: p["label"] for p in projects}
+        pending = [label for label in pending if label != scanning_labels.get(scanning)]
     for p, branches in sorted(others, key=lambda pb: pb[0]["label"].lower()):
         tag = project_tag(p)
         rows.extend({**b, "project": tag} for b in sorted(branches, key=lambda b: b.get("pushedAt") or ""))
