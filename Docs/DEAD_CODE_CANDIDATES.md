@@ -65,3 +65,17 @@ In src/doc-accuracy-check.js, remove three things: (1) line 25, the import `cons
 
 Benefits:
 Removing this dead code eliminates a misleading unused export that invites future readers (or agents) to assume the symbol is wired into a prompt path that does not yet exist. It also drops an unnecessary dependency on `./current-date-line.js` from this module, shrinking its surface area and making the file's actual contract — a pure deterministic file-existence check — unambiguous.
+
+### AC-6 · Remove unused LABEL_RE constant from src/hub-serial.js
+Strength: Strong
+Files: src/hub-serial.js
+Symbol: LABEL_RE
+
+Problem:
+The constant `LABEL_RE` is defined at the top of src/hub-serial.js but is never referenced anywhere in the module itself, is not exported via `module.exports`, and a codebase-wide grep found zero call sites. It sits alongside the sibling `TITLE_PREFIX_RE`, which is actively used by `hasHubTitlePrefix` and `hubTitle` -- the asymmetry indicates `LABEL_RE` was drafted for a label-matching feature that was never wired in (or whose usage was removed without cleaning up the constant). No consumer of this module depends on it.
+
+Solution:
+Delete the `const LABEL_RE = /^HUB\d{4,}(?:-\d+)?/;` declaration from src/hub-serial.js. No call sites need updating because none exist. No other files import this symbol, so no cross-file changes are required.
+
+Benefits:
+Eliminates a misleading unused constant that invites future readers to wonder why it exists or to mistakenly reuse it. Reduces surface area in a module that already handles file locking and monotonic serial allocation -- one fewer regex to maintain, test, or misinterpret.
