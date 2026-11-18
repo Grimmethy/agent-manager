@@ -285,6 +285,81 @@ test('checkCompletionClaimsInNote: a named file that does not exist -> verdict f
   assert.equal(r.found, false);
 });
 
+test('checkCompletionClaimsInNote: already implemented with a real token -> verdict true', () => {
+  const repoRoot = makeRepo();
+  fs.writeFileSync(path.join(repoRoot, 'src', 'real-file.js'), 'let retryCount = 0;');
+  const [r] = checkCompletionClaimsInNote('Already implemented `retryCount` in src/real-file.js', repoRoot);
+  assert.equal(r.verdict, 'true');
+});
+
+test('checkCompletionClaimsInNote: already fixed with a real token -> verdict true', () => {
+  const repoRoot = makeRepo();
+  fs.writeFileSync(path.join(repoRoot, 'src', 'real-file.js'), 'let retryCount = 0;');
+  const [r] = checkCompletionClaimsInNote('Already fixed `retryCount` in src/real-file.js', repoRoot);
+  assert.equal(r.verdict, 'true');
+});
+
+test('checkCompletionClaimsInNote: already added with a real token -> verdict true', () => {
+  const repoRoot = makeRepo();
+  fs.writeFileSync(path.join(repoRoot, 'src', 'real-file.js'), 'let retryCount = 0;');
+  const [r] = checkCompletionClaimsInNote('Already added `retryCount` in src/real-file.js', repoRoot);
+  assert.equal(r.verdict, 'true');
+});
+
+test('checkCompletionClaimsInNote: already exists with a real token -> verdict true', () => {
+  const repoRoot = makeRepo();
+  fs.writeFileSync(path.join(repoRoot, 'src', 'real-file.js'), 'let retryCount = 0;');
+  const [r] = checkCompletionClaimsInNote('Already exists `retryCount` in src/real-file.js', repoRoot);
+  assert.equal(r.verdict, 'true');
+});
+
+test('checkCompletionClaimsInNote: already landed with a real token -> verdict true', () => {
+  const repoRoot = makeRepo();
+  fs.writeFileSync(path.join(repoRoot, 'src', 'real-file.js'), 'let retryCount = 0;');
+  const [r] = checkCompletionClaimsInNote('Already landed `retryCount` in src/real-file.js', repoRoot);
+  assert.equal(r.verdict, 'true');
+});
+
+test('checkCompletionClaimsInNote: already present with a real token -> verdict true', () => {
+  const repoRoot = makeRepo();
+  fs.writeFileSync(path.join(repoRoot, 'src', 'real-file.js'), 'let retryCount = 0;');
+  const [r] = checkCompletionClaimsInNote('Already present `retryCount` in src/real-file.js', repoRoot);
+  assert.equal(r.verdict, 'true');
+});
+
+test('checkCompletionClaimsInNote: negated and non-matching phrases yield zero results', () => {
+  const repoRoot = makeRepo();
+  fs.writeFileSync(path.join(repoRoot, 'src', 'real-file.js'), 'let retryCount = 0;');
+  const notes = [
+    'This is not already implemented `retryCount` in src/real-file.js',
+    "isn't already fixed `retryCount` in src/real-file.js",
+    'already implementing `retryCount` in src/real-file.js',
+    'already presented `retryCount` in src/real-file.js',
+    'already existing `retryCount` in src/real-file.js',
+  ];
+  for (const note of notes) {
+    assert.equal(checkCompletionClaimsInNote(note, repoRoot).length, 0, note);
+  }
+});
+
+test('checkCompletionClaimsInNote: exists phrase naming an absent file -> verdict false', () => {
+  const repoRoot = makeRepo();
+  const [r] = checkCompletionClaimsInNote('Already exists `retryCount` in src/missing.js', repoRoot);
+  assert.equal(r.verdict, 'false');
+});
+
+test('checkCompletionClaimsInNote: file-only exists claim with no symbol -> verdict unchecked', () => {
+  const repoRoot = makeRepo();
+  const [r] = checkCompletionClaimsInNote('src/real-file.js already exists', repoRoot);
+  assert.equal(r.verdict, 'unchecked');
+});
+
+test('checkCompletionClaimsInNote: no path and no symbol -> verdict unchecked', () => {
+  const repoRoot = makeRepo();
+  const [r] = checkCompletionClaimsInNote('Already added somewhere in the module.', repoRoot);
+  assert.equal(r.verdict, 'unchecked');
+});
+
 test('checkCompletionClaimsInNote: a file-only claim with no symbol -> verdict unchecked', () => {
   const repoRoot = makeRepo();
   const [r] = checkCompletionClaimsInNote('Already added in src/real-file.js', repoRoot);
