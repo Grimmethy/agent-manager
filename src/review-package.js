@@ -19,6 +19,7 @@ const RECORD_PACKAGE_STRIP = [...PACKAGE_STRIP, 'leasedTo'];
 const SECRET_KEY_RE = /token|secret|password/i;
 const SEND_TIMEOUT_MS = 15000;
 const SHA_RE = /^[0-9a-f]{40}$/;
+const REPLY_CAP = 300;
 
 // A decompose parent (the node split the task): no diff of its own, its work is the sub-task proposals, each with a title and a rawText.
 function isDecomposeParent(record) {
@@ -32,6 +33,13 @@ function isStopRecord(record) {
   if (!record || typeof record !== 'object') return false;
   const nc = record.needsClarification;
   return !!nc && typeof nc === 'object' && !Array.isArray(nc) && typeof nc.reason === 'string' && nc.reason !== '';
+}
+
+// True when the record carries a draft: an implementResponse, a non-empty rawDiff, an adhocResolution, or it is a stop record or decompose parent.
+function hasDraft(record) {
+  if (!record || typeof record !== 'object') return false;
+  return !!record.implementResponse || (typeof record.rawDiff === 'string' && record.rawDiff !== '') || !!record.adhocResolution ||
+    isStopRecord(record) || isDecomposeParent(record);
 }
 
 // Deep copy of value without the secret-looking keys (at every depth, inside arrays too).
@@ -68,9 +76,11 @@ function validatePackage(pkg) {
   if (typeof pkg.nodeId !== 'string' || !pkg.nodeId) return { ok: false, reason: 'nodeId is missing' };
   if (pkg.version === RECORD_PACKAGE_VERSION) {
     if (pkg.kind !== 'record') return { ok: false, reason: "kind must be 'record'" };
+    if (!hasDraft(pkg.record)) return { ok: false, reason: 'record has no draft' };
     const rawDiff = pkg.record.rawDiff;
     const stopOk = isStopRecord(pkg.record) && (rawDiff === undefined || rawDiff === '');
-    if (!stopOk && (typeof rawDiff !== 'string' || (rawDiff === '' && !isDecomposeParent(pkg.record)))) return { ok: false, reason: 'record.rawDiff must be a non-empty string' };
+    const noChanges = pkg.record.adhocResolution === 'no-changes-needed' && (rawDiff === undefined || rawDiff === '');
+    if (!stopOk && !noChanges && (typeof rawDiff !== 'string' || (rawDiff === '' && !isDecomposeParent(pkg.record)))) return { ok: false, reason: 'record.rawDiff must be a non-empty string' };
     return { ok: true, reason: '' };
   }
   if (typeof pkg.sha !== 'string' || !SHA_RE.test(pkg.sha)) return { ok: false, reason: 'sha must be 40 hex characters' };
@@ -84,8 +94,10 @@ function httpPost(url, headers, body, timeoutMs) {
     const target = new URL(url);
     const lib = target.protocol === 'https:' ? https : http;
     const req = lib.request(target, { method: 'POST', headers: { ...headers, 'Content-Length': Buffer.byteLength(body) }, timeout: timeoutMs }, (res) => {
-      res.resume();
-      res.on('end', () => resolve({ status: res.statusCode }));
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { if (text.length < REPLY_CAP) text = (text + chunk).slice(0, REPLY_CAP); });
+      res.on('end', () => resolve({ status: res.statusCode, body: text }));
     });
     req.on('timeout', () => req.destroy(new Error('timeout')));
     req.on('error', reject);
@@ -97,14 +109,15 @@ function httpPost(url, headers, body, timeoutMs) {
 async function sendPackage(pkg, { url, tokenFile, post = httpPost } = {}) {
   let token = '';
   try { token = fs.readFileSync(tokenFile, 'utf8').trim(); } catch (e) { token = ''; }
-  if (!token) return { ok: false, status: 0 };
+  if (!token) return { ok: false, status: 0, body: '' };
   try {
     const res = await post(url, { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, JSON.stringify(pkg), SEND_TIMEOUT_MS);
     const status = Number(res && res.status) || 0;
-    return { ok: status >= 200 && status < 300, status };
+    const body = res && typeof res.body === 'string' ? res.body.slice(0, REPLY_CAP) : '';
+    return { ok: status >= 200 && status < 300, status, body };
   } catch (e) {
-    return { ok: false, status: 0 };
+    return { ok: false, status: 0, body: '' };
   }
 }
 
-module.exports = { PACKAGE_VERSION, RECORD_PACKAGE_VERSION, PACKAGE_STRIP, RECORD_PACKAGE_STRIP, SECRET_KEY_RE, SEND_TIMEOUT_MS, scrub, buildPackage, buildRecordPackage, isStopRecord, validatePackage, sendPackage, httpPost };
+module.exports = { PACKAGE_VERSION, RECORD_PACKAGE_VERSION, PACKAGE_STRIP, RECORD_PACKAGE_STRIP, SECRET_KEY_RE, SEND_TIMEOUT_MS, scrub, buildPackage, buildRecordPackage, isStopRecord, hasDraft, validatePackage, sendPackage, httpPost };
