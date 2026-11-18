@@ -3432,3 +3432,42 @@ If `fetchJson` is used by other modules in `core-ui.js`, export it as a public h
 
 Benefits:
 The function's scope and usage become explicit instead of implicit. Tests no longer need to load the entire `core-ui.js` to test `fetchJson`. The function can be reasoned about independently of `core-ui.js`'s other concerns.
+
+### AC-815 · Global state coupling in branch-verdicts.js
+Strength: Strong
+Files: python/dashboard/static/js/branch-verdicts.js
+
+Problem:
+The module `branch-verdicts.js` depends on at least eight external globals (`currentBranches`, `currentHeldHubs`, `branchProjectsPending`, `branchProjectsPendingHtml`, `branchListRefreshing`, `branchListRefreshingHtml`, `branchListWithProjectHeadersHtml`, `branchCardHtml`, `wireBranchCard`) that are not declared or imported within the file. Functions like `renderBranchListInto` and `refreshBranchVerdictFilterBar` accept some parameters but silently read `currentHeldHubs` from the global scope, creating a hidden contract. This makes the module's true dependencies invisible to callers, prevents reliable unit testing from Node, and allows silent failures when globals are missing or renamed.
+
+Solution:
+Introduce an explicit `BranchVerdictContext` object that encapsulates all shared state and dependencies. Pass this context as the first parameter to every function that requires it, replacing global reads with explicit access. Remove the `typeof X === 'function'` guards for optional dependencies and instead require them to be provided via the context, failing loudly at initialization if any are missing.
+
+Benefits:
+Callers now see the full dependency graph in function signatures. The module becomes testable from Node without browser globals. Missing dependencies cause clear initialization errors instead of silent runtime failures. Refactoring or renaming a dependency requires updating only the context definition and its consumers.
+
+### AC-816 · Mixed concerns in a single module
+Strength: Strong
+Files: python/dashboard/static/js/branch-verdicts.js
+
+Problem:
+The file bundles pure data transformations, HTML generation, DOM manipulation, event wiring, and user interaction handlers (with browser-only APIs like `localStorage`, `fetch`, `prompt`, `confirm`, `alert`) into one module. The comment claims "Pure string/array functions, no DOM, so they are testable from Node," but the file also contains DOM-bound code. This mixing obscures what can be tested where, increases the cognitive load for contributors, and forces Node-based tests to mock browser APIs they don't need.
+
+Solution:
+Split the file into four modules by concern: `branch-verdict-data.js` (pure transformations, fully testable), `branch-verdict-html.js` (HTML generation), `branch-verdict-ui.js` (DOM rendering and event wiring), and `branch-verdict-interactions.js` (user flows like discard-all). Each module exports a focused API. The UI module imports from data and html modules; the interactions module imports from UI and data.
+
+Benefits:
+Pure data functions become trivially testable from Node without any browser mocking. Contributors can work on one concern without navigating unrelated code. Test suites can target each module's boundary, improving coverage signal. The file's public surface becomes smaller and more predictable.
+
+### AC-817 · Fragile conditional dependency checks
+Strength: Worth exploring
+Files: python/dashboard/static/js/branch-verdicts.js
+
+Problem:
+The code uses `typeof X === 'function'` checks to guard calls to `branchProjectsPendingHtml`, `branchListRefreshingHtml`, and `branchListWithProjectHeadersHtml`. These guards suggest the functions are optional, but their absence is not reported to the developer—it is silently skipped. If a dependent script fails to load or is renamed, the UI degrades silently without any error, making it difficult to diagnose missing features.
+
+Solution:
+Replace the conditional checks with explicit registration or injection. At module initialization, verify that all required dependency functions are present and throw a clear error if any are missing. Alternatively, accept these functions as parameters to a setup function and store them in the context object for later use.
+
+Benefits:
+Missing dependencies produce immediate, actionable errors instead of silent UI degradation. The contract between modules becomes explicit and auditable. Future refactors can rename or relocate dependencies without risking silent breakage.
