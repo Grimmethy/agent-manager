@@ -69,3 +69,25 @@ test('ok=true, sample=null when the inbox is genuinely empty (no .json files at 
   assert.equal(result.ok, true);
   assert.equal(result.sample, null);
 });
+
+// A subdirectory whose name ends in .json must not abort the pre-flight. readFileSync on a
+// directory throws EISDIR; that sits inside the same try as JSON.parse, so the entry is
+// skipped and the valid sibling record is still found.
+test('ok=true when a directory named foo.json sits next to a valid .json record (EISDIR skipped, not thrown)', () => {
+  const dir = inboxDir(pipelineDir);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(path.join(dir, 'foo.json'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'valid.json'),
+    JSON.stringify({ title: 'real finding', body: 'real body text' }),
+  );
+  let result;
+  try {
+    result = searchPreflight(pipelineDir);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  assert.equal(result.ok, true);
+  assert.equal(result.sample.title, 'real finding');
+  assert.ok(result.sample.tokenCount > 0);
+});

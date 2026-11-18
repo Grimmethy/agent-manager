@@ -235,8 +235,8 @@ test('filteredDirs and filterDomains parse, trim, drop blanks, and apply the def
     filteredDirs({ AGENT_MANAGER_NODE_FILTERED_DIRS: ' /tmp/a , ,/tmp/b/ ,' }),
     [path.resolve('/tmp/a'), path.resolve('/tmp/b')],
   );
-  assert.deepStrictEqual(filterDomains({}), ['adhoc']);
-  assert.deepStrictEqual(filterDomains({ AGENT_MANAGER_NODE_FILTER_DOMAINS: '  ' }), ['adhoc']);
+  assert.deepStrictEqual(filterDomains({}), ['adhoc', 'default']);
+  assert.deepStrictEqual(filterDomains({ AGENT_MANAGER_NODE_FILTER_DOMAINS: '  ' }), ['adhoc', 'default']);
   assert.deepStrictEqual(filterDomains({ AGENT_MANAGER_NODE_FILTER_DOMAINS: ' adhoc , review ,' }), ['adhoc', 'review']);
 });
 
@@ -271,6 +271,37 @@ test('unlisted dir: claimNext claims the first record exactly as before, with no
   assert.ok(r);
   assert.strictEqual(r.task.id, 'stacked-task');
   assert.strictEqual(skipped.filter((s) => s.reason === 'not-eligible-for-node').length, 0);
+});
+
+// ---- Four tests for the widened default domain list (owner decision 2026-11-16): default must include 'default' so the swarm can take Feature Forge tasks ----
+
+test('eligibleForNode: a manual, non-stacked, domain default record is claimable with the default domains', () => {
+  const opts = { pipelineDir: '/tmp/some-pipe', domains: ['adhoc', 'default'] };
+  const base = { source: 'manual', domain: 'default' };
+  assert.strictEqual(eligibleForNode(base, opts), true);
+  assert.strictEqual(eligibleForNode({ ...base, stacked: { branch: 'feat' } }, opts), false);
+  assert.strictEqual(eligibleForNode({ ...base, source: 'hub' }, opts), false);
+  assert.strictEqual(eligibleForNode({ ...base, generatedForRepoRoot: '/tmp/another-repo' }, opts), false);
+});
+
+test('eligibleForNode: a non-manual, domain default record is not claimable', () => {
+  const opts = { pipelineDir: '/tmp/some-pipe', domains: ['adhoc', 'default'] };
+  assert.strictEqual(eligibleForNode({ source: 'hub', domain: 'default' }, opts), false);
+  assert.strictEqual(eligibleForNode({ source: 'deep_dive', domain: 'default' }, opts), false);
+  assert.strictEqual(eligibleForNode({ source: 'derived_task', domain: 'default' }, opts), false);
+});
+
+test('eligibleForNode: a stacked, domain default record is not claimable', () => {
+  const opts = { pipelineDir: '/tmp/some-pipe', domains: ['adhoc', 'default'] };
+  assert.strictEqual(eligibleForNode({ source: 'manual', domain: 'default', stacked: { branch: 'feat' } }, opts), false);
+  assert.strictEqual(eligibleForNode({ source: 'manual', domain: 'default', stacked: true }, opts), false);
+});
+
+test('filterDomains: an explicit AGENT_MANAGER_NODE_FILTER_DOMAINS=adhoc still excludes default', () => {
+  const opts = { pipelineDir: '/tmp/some-pipe', domains: filterDomains({ AGENT_MANAGER_NODE_FILTER_DOMAINS: 'adhoc' }) };
+  assert.deepStrictEqual(opts.domains, ['adhoc']);
+  assert.strictEqual(eligibleForNode({ source: 'manual', domain: 'default' }, opts), false);
+  assert.strictEqual(eligibleForNode({ source: 'manual', domain: 'adhoc' }, opts), true);
 });
 
 test('filtered dir: an ineligible copy does not shadow an eligible same-id copy in an unlisted dir', () => {

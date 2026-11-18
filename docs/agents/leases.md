@@ -2,6 +2,8 @@
 
 Part of the multi-node plan (see `docs/agents/nodes.md`). Wok keeps the ledger of every task; a task is **lent** to a node, and the lease says until when. The store is `leases.json` in the nodes directory (`AGENT_MANAGER_NODES_DIR`, default `$HOME/.local/state/agent-manager/nodes`), written atomically.
 
+`AGENT_MANAGER_NODE_SKIP_PREMIUM` (default off) makes records with `premiumPriority` true non-lendable to nodes, so they stay in the wok claim pool. It accepts `true`, `1`, or `on` (trimmed and lowercased); any other value leaves it off. It does not change the registry drop-in or other eligibility rules.
+
 A lease is a record `{taskId, nodeId, leasedAt, expiresAt, state}` with `state` one of `lent`, `returned`, `expired`.
 
 ## Lifecycle

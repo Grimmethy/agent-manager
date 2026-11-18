@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const childProcess = require('child_process');
+const { refresh } = require('./node-code-refresh');
 
 const IMPORT_SCRIPT = path.join(__dirname, '..', 'scripts', 'import-repo-bundle.sh');
 const IMPORT_TIMEOUT_MS = 120000;
@@ -94,7 +95,25 @@ function applyCode(inDir, nodeRepoDir, deps = {}) {
     return { applied: false, reason: verdict.reason };
   }
   const { sha, bundle, branch } = readLatest(inDir, repo);
-  if (headOf(run, nodeRepoDir) === sha) return { applied: false, reason: 'current', sha };
+  const headSha = headOf(run, nodeRepoDir);
+  const audit = typeof deps.audit === 'function' ? deps.audit : () => {};
+  const notify = typeof deps.notify === 'function' ? deps.notify : () => {};
+  const refreshResult = refresh({
+    headSha,
+    publishedSha: sha,
+    seq: deps.seq || 1,
+    fileMtimes: deps.fileMtimes || [],
+    headTime: deps.headTime || 0,
+    clean: deps.clean === true,
+    onMaster: deps.onMaster === true,
+    runner: runStatus,
+    audit,
+    notify,
+  });
+  if (refreshResult === 'refused' || refreshResult === 'failed') {
+    audit(`refresh ${refreshResult}: proceeding with applyCode`);
+  }
+  if (headSha === sha) return { applied: false, reason: 'current', sha };
   const result = runStatus(IMPORT_SCRIPT, [path.join(inDir, bundle), nodeRepoDir, branch]);
   if (result.status === 3) return { applied: false, reason: 'dirty-or-diverged' };
   if (result.status !== 0) {
