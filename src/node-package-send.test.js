@@ -299,3 +299,77 @@ test('the command line exits 2 with the usage line when it is given nothing', ()
   assert.match(r.stderr, /^usage: node src\/node-package-send\.js /);
   assert.equal(r.stdout, '');
 });
+
+test('a failed send logs one stderr line per record with the HTTP status and the start of the answer, or the network reason', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  put(s, 'b.json', REC('b'));
+  const answers = [{ status: 503, body: 'upstream\nbusy' }, null];
+  const r = await run(s, { post: async () => { const a = answers.shift(); if (a === null) throw new Error('boom'); return a; } });
+  assert.equal(r.code, 3);
+  assert.ok(r.errs.some((e) => e.startsWith('failed a.json: HTTP 503 upstream busy')), r.errs.join('|'));
+  assert.ok(r.errs.some((e) => e.startsWith('failed b.json: no answer from wok')), r.errs.join('|'));
+});
+
+test('a record that failed three runs in a row is skipped for the backoff time, the run exits 0 and reports backedOff, and it is tried again afterwards', async () => {
+  const s = setup();
+  put(s, 'stuck.json', REC('stuck'));
+  const posts = [];
+  const post = async () => { posts.push(1); return { status: 503, body: '' }; };
+  let t = Date.UTC(2026, 10, 18, 12, 0, 0);
+  const now = () => t;
+  for (let i = 0; i < 3; i++) { const r = await run(s, { post, now }); assert.equal(r.code, 3, `failure ${i + 1} still exits 3`); t += 1000; }
+  assert.equal(posts.length, 3);
+  const quiet = await run(s, { post, now });
+  assert.equal(posts.length, 3, 'inside the backoff nothing is posted');
+  assert.equal(quiet.code, 0);
+  assert.deepEqual(quiet.result, { sent: 0, failed: 0, refused: 0, remaining: 1, backedOff: 1 });
+  t += 11 * 60 * 1000;
+  const again = await run(s, { post, now });
+  assert.equal(posts.length, 4, 'after the backoff it is tried again');
+  assert.equal(again.code, 3);
+});
+
+test('a backed-off record does not hold back a good record filed after it, and a success clears the record\'s failure count', async () => {
+  const s = setup();
+  put(s, 'a-stuck.json', REC('a-stuck'));
+  const bad = async () => ({ status: 503 });
+  let t = Date.UTC(2026, 10, 18, 12, 0, 0);
+  const now = () => t;
+  for (let i = 0; i < 3; i++) await run(s, { post: bad, now });
+  put(s, 'b-good.json', REC('b-good'));
+  const r = await run(s, { post: ok, now });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.result, { sent: 1, failed: 0, refused: 0, remaining: 1, backedOff: 1 });
+  t += 11 * 60 * 1000;
+  const healed = await run(s, { post: ok, now });
+  assert.equal(healed.code, 0);
+  assert.equal(healed.result.sent, 1);
+  const state = JSON.parse(fs.readFileSync(path.join(path.dirname(s.outbox), 'node-send-backoff.json'), 'utf8'));
+  assert.deepEqual(state, {});
+});
+
+test('AGENT_MANAGER_NODE_SEND_BACKOFF_AFTER and _MS change the threshold and the pause', async () => {
+  const s = setup();
+  put(s, 'x.json', REC('x'));
+  const t0 = Date.UTC(2026, 10, 18, 12, 0, 0);
+  const lines = [];
+  const code1 = await main(argvFor(s), { AGENT_MANAGER_NODE_SEND_BACKOFF_AFTER: '1', AGENT_MANAGER_NODE_SEND_BACKOFF_MS: '60000' }, { post: async () => ({ status: 503 }), now: () => t0 }, (l) => lines.push(l), () => {});
+  assert.equal(code1, 3);
+  const code2 = await main(argvFor(s), { AGENT_MANAGER_NODE_SEND_BACKOFF_AFTER: '1', AGENT_MANAGER_NODE_SEND_BACKOFF_MS: '60000' }, { post: async () => { throw new Error('must not post'); }, now: () => t0 + 30000 }, (l) => lines.push(l), () => {});
+  assert.equal(code2, 0);
+  const code3 = await main(argvFor(s), { AGENT_MANAGER_NODE_SEND_BACKOFF_AFTER: '1', AGENT_MANAGER_NODE_SEND_BACKOFF_MS: '60000' }, { post: ok, now: () => t0 + 61000 }, (l) => lines.push(l), () => {});
+  assert.equal(code3, 0);
+  assert.equal(JSON.parse(lines[2]).sent, 1);
+});
+
+test('a refused (400) or sent record leaves no failure entry behind, and the entry of a record that left the outbox is dropped', async () => {
+  const s = setup();
+  put(s, 'gone.json', REC('gone'));
+  await run(s, { post: async () => ({ status: 503 }) });
+  fs.unlinkSync(path.join(s.outbox, 'gone.json'));
+  put(s, 'r.json', REC('r'));
+  await run(s, { post: async () => ({ status: 400, body: 'bad' }) });
+  const state = JSON.parse(fs.readFileSync(path.join(path.dirname(s.outbox), 'node-send-backoff.json'), 'utf8'));
+  assert.deepEqual(state, {});
+});

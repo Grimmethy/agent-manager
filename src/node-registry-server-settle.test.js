@@ -122,3 +122,33 @@ test('a live lease is never asked, checked with a counting fake', async () => {
     assert.equal(calls, 0, 'a live lease is never asked');
   } finally { await s.close(); }
 });
+
+test('an overdue lease answered blocked leaves a node-blocked trace on the wok record and the same claim does not hand it back', async () => {
+  const s = await start({ server: { settleAskNode: async () => ({ answer: 'blocked', reason: 'plan limit' }) } });
+  try {
+    lendLease('T5', 'grimm', { now: T0 - 2 * HOUR, env: s.env });
+    const file = path.join(s.pipelineDir, 'queue', 'adhoc', 'T5.json');
+    fs.writeFileSync(file, JSON.stringify({ id: 'T5', leasedTo: 'grimm', history: [{ stage: 'node-blocked grimm' }, { stage: 'node-blocked grimm' }] }));
+    const r = await s.post({ id: 'grimm' }, s.auth, '/claim');
+    assert.equal(r.status, 200);
+    assert.equal(r.body.task, null, 'blocked twice on this node: not offered to it again');
+    const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(rec.leasedTo, undefined);
+    assert.equal(rec.history.at(-1).stage, 'node-blocked grimm');
+    assert.equal(leaseFor('T5', s.env).lastEvent, 'blocked');
+  } finally { await s.close(); }
+});
+
+test('every claim heals a record whose ledger row is no longer lent but still carries leasedTo', async () => {
+  const s = await start({ server: { settleAskNode: async () => 'in-progress' } });
+  try {
+    const { expireLeases } = require('./lease-ledger.js');
+    lendLease('T6', 'grimm', { now: T0 - 2 * HOUR, ttlMs: 1000, env: s.env });
+    expireLeases({ now: T0, env: s.env });
+    const file = path.join(s.pipelineDir, 'queue', 'adhoc', 'T6.json');
+    fs.writeFileSync(file, JSON.stringify({ id: 'T6', leasedTo: 'grimm' }));
+    const r = await s.post({ id: 'grimm', classes: ['no-such-class'] }, s.auth, '/claim');
+    assert.equal(r.body.task, null, 'the class filter keeps this claim from taking T6, so only the healing can have touched the record');
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).leasedTo, undefined);
+  } finally { await s.close(); }
+});
