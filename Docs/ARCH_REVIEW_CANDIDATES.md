@@ -3257,3 +3257,56 @@ Extract a small `moveToArchive(srcPath, destDir, destDirEnsuredRef, result)` hel
 
 Benefits:
 The shared mechanics are localized to a single function, eliminating the risk of the two callers diverging when the archive-move behavior is updated. Readability improves because each caller now expresses only its source-resolution difference. Test surface shrinks — the move semantics are exercised once through the helper rather than duplicated across two entry points — and any future change to the archive protocol (e.g. adding idempotency guards or checksums) requires editing one location.
+
+### AC-259 · `resolveBareFilename` does not swallow failures — it propagates them
+Strength: Strong
+
+**Strength:** Moderate  
+**Files:** `src/task-anchor-files.js`
+
+**Problem:**  
+`resolveBareFilename(repoRoot, name)` calls `resolveAgainstRepoDetailed(repoRoot, name)` without a try/catch. If `resolveAgainstRepoDetailed` throws (EACCES, ELOOP, ENOSPC, etc.), the error propagates up to `taskAnchorFiles`'s `add()` flow, which does not catch it. This means a filesystem error during anchor resolution becomes an unhandled exception that crashes the task, rather than being logged and degraded gracefully. The original draft incorrectly claimed the function "silently swallows" failures — it actually crashes.
+
+**Solution:**  
+Wrap the `resolveAgainstRepoDetailed` call in a try/catch that logs a warning with the bare filename and the error, then returns `null` (or a structured `{ path: null, error: <reason> }`) so the caller can handle it. This prevents a single filesystem error from crashing the entire task.
+
+**Benefits:**  
+Prevents crashes in CI or restricted environments where filesystem errors are common. Makes the contract of `resolveBareFilename` explicit: it can fail, and callers should handle that.
+
+---
+
+### AC-260 · `taskAnchorFiles` fallback to working tree is intentional but undocumented
+Strength: Strong
+
+**Strength:** Weak  
+**Files:** `src/task-anchor-files.js`
+
+**Problem:**  
+The code at lines 188-193 shows that when `resolveGroundingRef` returns `null` (non-stacked task) or when `readFileAtRef` returns `null` (file doesn't exist at that ref), the code falls back to `fs.readFileSync(full, 'utf8')` from the working tree. This is intentional fallback behavior, but it's not documented. The original draft incorrectly claimed this was a bug — it's actually the designed behavior.
+
+**Solution:**  
+Add a comment explaining the fallback logic: "If the file doesn't exist at the grounding ref (or the task isn't stacked), fall back to the working tree." This makes the behavior explicit for future maintainers.
+
+**Benefits:**  
+Prevents future developers from "fixing" the fallback by adding unnecessary complexity. Makes the contract of `taskAnchorFiles` explicit.
+
+---
+
+### AC-261 · `windowedContent`'s distinctive identifier heuristic is working as designed
+Strength: Strong
+
+**Strength:** None  
+**Files:** `src/task-anchor-files.js`
+
+**Problem:**  
+The original draft claimed the heuristic "can mis-window on common tokens," but the code shows it explicitly filters for low-frequency tokens (`n <= 4`). The heuristic is working as designed — it's looking for tokens that appear 1-4 times, which are more likely to be distinctive. The original draft's concern about `localStorage` appearing ≤4 times is theoretically possible but not a verified failure mode.
+
+**Solution:**  
+No changes needed. The heuristic is working as designed.
+
+**Benefits:**  
+None — the original concern was based on unverifiable claims.
+
+---
+
+NOTE: The original draft's AC-804 was corrected to accurately describe the behavior (propagates errors, doesn't swallow them). AC-805 was revised to acknowledge the fallback is intentional. AC-806 was removed as the concern was based on unverifiable claims about the heuristic's behavior.
