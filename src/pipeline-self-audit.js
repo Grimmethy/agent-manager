@@ -163,6 +163,7 @@ module.exports = {
   hasZeroHitHarnessSearch,
   categorizeBlockedReason,
   signatureForTask,
+  classifyBlockedTask,
   findAuditClusters,
   buildAuditRawText,
   buildAuditTask,
