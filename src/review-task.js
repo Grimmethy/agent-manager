@@ -166,6 +166,18 @@ function renderImplementResponseForReview(implementResponse) {
 // hallucination data points stays complete and chronologically ordered.
 // base-rate: 4 occurrences logged to date; evaluate a detection/prevention mechanism at the 5th.
 
+// Parses a task record's subTaskProposals field: accepts an already-parsed array or a JSON
+// string. Returns the array only when it has 2+ entries (a decompose is a batch), otherwise null.
+// A string that fails JSON.parse returns null. Never mutates the input. Local, not exported.
+// (A different free-text parser with the same name lives in agentic-draft-common.js.)
+function parseSubTaskProposals(value) {
+  let parsed = value;
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(value); } catch (e) { return null; }
+  }
+  return Array.isArray(parsed) && parsed.length >= 2 ? parsed : null;
+}
+
 // review-task.js reads each source's own review-gate guidance off the registry
 // (source.reviewGuidance / source.reviewCompletenessQuestion, set in src/task-sources.js
 // or by an AGENT_MANAGER_REGISTER_PATH plugin) instead of an if (task.source === ...) chain.
