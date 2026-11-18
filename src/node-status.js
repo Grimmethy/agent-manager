@@ -6,14 +6,32 @@
 
 const HEADER = 'id status load freeRamGb lent returned expired merged nextExpiryMin';
 const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
 
 // Prints null and undefined as '-', anything else as a plain string.
 function cell(value) {
   return value === null || value === undefined ? '-' : String(value);
 }
 
+// Leases granted and returned with no node event in the last hour: state 'returned', returnedAt within HOUR_MS before now, leasedAt set, lastEvent unset.
+// Reads stored lease rows only; no clock of its own.
+function countLentReturnedWithoutEvent(leases, now) {
+  let count = 0;
+  for (const lease of leases) {
+    if (!lease || lease.state !== 'returned') continue;
+    if (!Number.isFinite(Date.parse(lease.leasedAt))) continue;
+    const returnedAt = Date.parse(lease.returnedAt);
+    if (!Number.isFinite(returnedAt) || returnedAt > now || now - returnedAt > HOUR_MS) continue;
+    if (lease.lastEvent) continue;
+    count += 1;
+  }
+  return count;
+}
+
 // Returns one row per node, in input order. nextExpiryMin is whole minutes (rounded up) until the soonest live lent lease ends, or null.
-function summarizeNodes(nodes, leases, now) {
+// options.skipped (optional): the skipped array claimNext filled; its 'previously-failed' entries are counted. Absent gives null (shown as unavailable).
+// The returned array carries a summary property ({ previouslyFailed, lentReturnedWithoutEvent }) that formatSummary prints.
+function summarizeNodes(nodes, leases, now, options = {}) {
   if (!Array.isArray(nodes)) throw new TypeError('nodes must be an array');
   if (!Array.isArray(leases)) throw new TypeError('leases must be an array');
   if (!Number.isFinite(now)) throw new TypeError('now must be a finite number');
@@ -57,6 +75,13 @@ function summarizeNodes(nodes, leases, now) {
     const at = soonest.get(row.id);
     if (at !== undefined) row.nextExpiryMin = Math.ceil((at - now) / MINUTE_MS);
   }
+  const skipped = options && Array.isArray(options.skipped) ? options.skipped : null;
+  const previouslyFailed = skipped ? skipped.filter((s) => s && s.reason === 'previously-failed').length : null;
+  // Non-enumerable so the rows still compare equal as plain arrays (tests and callers that deep-compare rows).
+  Object.defineProperty(rows, 'summary', {
+    value: { previouslyFailed, lentReturnedWithoutEvent: countLentReturnedWithoutEvent(leases, now) },
+    enumerable: false,
+  });
   return rows;
 }
 
@@ -65,6 +90,13 @@ function formatSummary(rows) {
   const lines = [HEADER];
   for (const r of rows) {
     lines.push([r.id, r.status, r.load, r.freeRamGb, r.lentNow, r.returned, r.expired, r.merged, r.nextExpiryMin].map(cell).join(' '));
+  }
+  // The two summary lines appear only for rows from summarizeNodes (which attaches rows.summary); a plain row array keeps the original output.
+  if (rows.summary) {
+    const summary = rows.summary;
+    const previous = summary.previouslyFailed === null || summary.previouslyFailed === undefined ? 'unavailable' : String(summary.previouslyFailed);
+    lines.push(`previously-failed: ${previous}`);
+    lines.push(`lent-and-returned-without-event: ${summary.lentReturnedWithoutEvent} in the last hour`);
   }
   return lines.join('\n');
 }
