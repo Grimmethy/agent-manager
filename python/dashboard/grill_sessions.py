@@ -164,7 +164,7 @@ def submit_answer(second_brain_dir: Path, session_id: str, answer: str):
     # not a guarantee, and "a hint alone doesn't reliably stop it" is the exact failure
     # this cap exists to fix (see MAX_EXCHANGES's own comment).
     if force_complete:
-        parsed["complete"] = True
+        parsed = {"complete": True, "text": parsed["text"] if parsed["complete"] else ""}
     session["transcript"].append({"role": "assistant", "text": parsed["text"]})
     if parsed["complete"]:
         session["status"] = "complete"
@@ -206,7 +206,7 @@ def enrich_note(second_brain_dir: Path, session_id: str):
     stamp = time.strftime("%Y-%m-%d", time.gmtime())
     heading = "Grill Me" if session["mode"] == "grill-me" else "Grill With Docs"
     entry = f"\n\n## {heading} session -- {stamp}\n\n{summary}\n"
-    if note_file.is_file():
+    if note_file.is_file() and summary.strip():
         note_file.write_text(note_file.read_text(encoding="utf-8") + entry, encoding="utf-8")
     session["enrichedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     sessions[session_id] = session
