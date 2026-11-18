@@ -3180,3 +3180,35 @@ Either include the external module in this community if it's closely related, or
 
 Benefits:
 Reduces cross-community coupling, makes dependencies explicit, and ensures that changes to shared functionality are properly tracked and tested.
+
+### AC-254 · Tight coupling between `incident-amplification.js` and its grep/filing dependencies
+Strength: Strong
+Files: src/incident-amplification.js, src/grep-codebase-tool.js, src/side-finding.js
+
+Problem:
+`incident-amplification.js` directly imports and calls `grepCodebase` from `grep-codebase-tool.js` and `writeSideFindingInbox` from `side-finding.js`. This creates a hard dependency on two external modules that could change independently. If `grepCodebase`'s interface changes (e.g., different return format, new parameters) or `writeSideFindingInbox`'s signature evolves, `incident-amplification.js` must be updated in lockstep. The module also has no abstraction layer between the grep operation and the filing operation, making it difficult to swap implementations (e.g., use a different search backend or a different filing mechanism) without touching the amplification logic itself.
+
+Solution:
+Introduce a thin abstraction layer or configuration object that encapsulates the dependencies. For example, pass the grep function and the filing function as parameters to `runAmplificationSweep`, or use a dependency injection pattern where the module accepts a "sweep strategy" object. This decouples `incident-amplification.js` from the specific implementations of `grepCodebase` and `writeSideFindingInbox`, making it easier to test, swap, or mock these dependencies.
+
+Benefits:
+- Reduces coupling between `incident-amplification.js` and external modules
+- Makes it easier to test the amplification logic in isolation
+- Allows swapping implementations (e.g., different search backends) without modifying the core amplification code
+- Clarifies the module's actual responsibilities vs. its dependencies
+
+### AC-255 · Mixed concerns in `git-ownership.js` blur rules, detection, and filtering
+Strength: Worth exploring
+Files: src/lib/git-ownership.js
+
+Problem:
+`git-ownership.js` contains a mix of concerns: prompt text (`GIT_OWNERSHIP_RULE`), regex patterns for detecting git-write criteria (`GIT_WRITE_CRITERION_RE`), regex patterns for detecting git-write requests (`GIT_WRITE_TITLE_RE`, `GIT_WRITE_INSTRUCTION_RE`), and utility functions (`dropGitWriteCriteria`, `isGitWriteRequest`). While these are related, they serve different purposes (prompt generation, validation, filtering) and could be organized more clearly. The file currently mixes "what to tell the model" with "how to detect violations," which could lead to confusion about the module's primary responsibility.
+
+Solution:
+Split the file into focused sub-modules or organize the content more clearly by concern. For example: `git-ownership-rules.js` for `GIT_OWNERSHIP_RULE`, `git-write-detector.js` for the regex patterns and `isGitWriteRequest`, and `git-write-filter.js` for `dropGitWriteCriteria` and `GIT_WRITE_REQUEST_REFUSAL`. Alternatively, if keeping a single file, add clearer section headers and comments to delineate the different concerns.
+
+Benefits:
+- Improves readability by separating concerns
+- Makes it easier to find and modify specific functionality
+- Reduces cognitive load when reading the file
+- Clarifies the module's API surface
