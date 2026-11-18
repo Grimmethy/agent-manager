@@ -955,6 +955,15 @@ test('detectMissingTargetReport: detects missing target signals', () => {
   assert.equal(detectMissingTargetReport(null), null);
 });
 
+test('detectMissingTargetReport: detects the accessible-root misdirection phrases from real reports, but not genuine infra failures', () => {
+  const { detectMissingTargetReport } = require('./agentic-draft-common.js');
+  assert.ok(detectMissingTargetReport('the feature-forge repo is not registered as an accessible root in this session'));
+  assert.ok(detectMissingTargetReport('the feature-forge repo is not accessible from this session'));
+  assert.ok(detectMissingTargetReport('list_roots returned only the primary root'));
+  assert.equal(detectMissingTargetReport('npm install failed with ECONNRESET'), null);
+  assert.equal(detectMissingTargetReport('edit_file failed: ETIMEDOUT while writing the file'), null);
+});
+
 test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error WITH partial work landed -> continuation', () => {
   withRealRepo((wt) => {
     fs.writeFileSync(path.join(wt, 'a.txt'), 'partial work landed\n');
