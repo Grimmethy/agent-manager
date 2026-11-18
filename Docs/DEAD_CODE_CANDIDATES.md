@@ -109,3 +109,23 @@ Benefits:
 Eliminates unused metadata that adds no value to the running codebase, reduces surface area for future maintenance, and removes a misleading constant that could confuse readers into thinking the contract spec is actively consumed.
 
 ---
+
+### AC-9 · Remove unused OUTPUT_PATH export from contract spec
+Strength: Strong
+Files: src/decompose-question-surface.contract.js
+Symbol: OUTPUT_PATH
+
+Problem:
+The constant `OUTPUT_PATH` is a static string describing a path expression (`'path.join(pipelineDir, "queue", "awaiting-confirm", ...)'`) that serves as documentation metadata, not runtime code. The file `src/decompose-question-surface.contract.js` is not imported by any code in the repository, and no code references `OUTPUT_PATH` directly. It is a documentation artifact in a machine-readable contract spec that describes where files *should* be written, but no tooling, function, or process consumes this value.
+
+Solution:
+Remove the `OUTPUT_PATH` constant definition on line 60 of `src/decompose-question-surface.contract.js`, and remove the `OUTPUT_PATH` entry from the `module.exports` object on line 93. No call sites need updating since the symbol is never referenced anywhere in the codebase.
+
+Benefits:
+Eliminates one piece of unused documentation metadata from an otherwise-unused contract file, reducing surface area and preventing future readers from wondering whether this path expression is still authoritative or has been superseded.
+
+---
+
+**GENUINE — `OUTPUT_PATH` is genuinely dead code.**
+
+The constant is a static documentation string in a file that is not imported anywhere. It describes a path expression for human/machine reference but is never consumed by any function, tooling, or code generator. Removing it requires only deleting the constant definition and its export entry — no call sites exist to update.
