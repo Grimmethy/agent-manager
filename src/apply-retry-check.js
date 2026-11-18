@@ -76,6 +76,19 @@ function isFindStringMiss(task) {
   return isApplyFailure(task) && FIND_NOT_FOUND_RE.test(String(task.blockedReason || ''));
 }
 
+// A record that already carries an approved review: localVerdict 'approved' with two real votes (localVotes shape assumed, see the
+// review writer before relying on it further). Such a record's draft is good; only the apply step failed.
+function isApprovedRecord(task) {
+  return task.localVerdict === 'approved' && Array.isArray(task.localVotes) && task.localVotes.length >= 2;
+}
+
+// Transient network failure during apply (e.g. a DNS blip). Redrafting cannot fix this, so an approved record is re-applied, not redrafted.
+const NETWORK_APPLY_RE = /could not resolve host|temporary failure in name resolution|connection (timed out|refused|reset)|network is unreachable/i;
+function isNetworkApplyFailure(task) {
+  return isApplyFailure(task) && NETWORK_APPLY_RE.test(String(task.blockedReason || ''));
+}
+const APPLY_NETWORK_MAX_RELEASES = 4;
+
 // 2026-09-23 (change_review backlog incident): a dirty apply clone aborts `git checkout -B` / `git rebase`
 // ("Your local changes to the following files would be overwritten", "cannot rebase: You have unstaged
 // changes", or git-runner.js's own assertCleanTree "apply clone is dirty"). That is INFRASTRUCTURE -- the
@@ -345,6 +358,26 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approv
         }
       }
 
+      // Approved record hit a transient network error at apply: re-apply the approved result (never redraft it). Bounded by its own counter,
+      // which never touches applyRetryCount, so a long outage cannot burn the redraft budget.
+      if (isApprovedRecord(task) && isNetworkApplyFailure(task) && approvedDirResolved) {
+        if ((Number(task.applyNetworkReleases) || 0) < APPLY_NETWORK_MAX_RELEASES) {
+          const reason = String(task.blockedReason || '').slice(0, 200);
+          task.applyNetworkReleases = (Number(task.applyNetworkReleases) || 0) + 1;
+          delete task.blockedReason;
+          delete task.blockedStage;
+          task.status = 'approved';
+          appendHistoryEvent(task, 'approved', `apply retried after ${reason}`);
+          fs.mkdirSync(approvedDirResolved, { recursive: true });
+          fs.writeFileSync(path.join(approvedDirResolved, name), JSON.stringify(task, null, 2));
+          fs.unlinkSync(filePath);
+          summary.released++;
+        } else {
+          summary.held++;
+        }
+        continue;
+      }
+
       const retryCount = Number(task.applyRetryCount) || 0;
       if (retryCount >= MAX_APPLY_RETRIES) {
         const alreadyStamped = Array.isArray(task.history) && task.history.some((h) => h.stage === 'exhausted');
@@ -380,6 +413,13 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approv
       }
 
       task.applyRetryCount = retryCount + 1;
+
+      // Redraft after a real content/conflict failure: clear the approved draft's fields together so the redraft never mixes two authors' work.
+      if (isApprovedRecord(task)) {
+        const cleared = ['rawDiff', 'localVotes', 'acceptanceResults', 'planResponse', 'implementResponse'].filter((k) => task[k] !== undefined);
+        for (const k of cleared) delete task[k];
+        if (cleared.length) appendHistoryEvent(task, 'draft-fields-cleared', `redraft after apply failure: cleared ${cleared.join(', ')}`);
+      }
 
       // A find-string miss redrafts with the REAL nearby lines (lib/find-recheck.js), not just "find string not found": the redraft that failed this way
       // (TaxHarvest AC-271) invented its `find`, and the bare reason gave it nothing to copy. Best-effort; a task with no parseable edit set is unchanged.
