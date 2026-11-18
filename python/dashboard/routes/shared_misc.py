@@ -1,4 +1,5 @@
 from flask import Blueprint, abort, jsonify, request
+from werkzeug.exceptions import HTTPException
 
 import socket
 import json
@@ -144,6 +145,20 @@ def api_tasks_completed():
 
 @shared_misc_bp.route("/api/queue/<state>")
 def api_queue_state(state):
+    """Route wrapper: an unexpected failure in the handler body returns {"error": ...} with
+    HTTP 500 instead of Flask's HTML 500 page. HTTPException (e.g. abort(404) for an unknown
+    state) is re-raised so its own status code is kept."""
+    from app import logger
+    try:
+        return _api_queue_state_impl(state)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Queue state handler failed: state=%s", state)
+        return jsonify({"error": str(exc) or exc.__class__.__name__}), 500
+
+
+def _api_queue_state_impl(state):
     """Returns {items: [...], total: N}. Incremental loading (2026-07-26, Grimmethy:
     "long task lists take a while to load"): optional ?limit=N&offset=M page the result --
     file METADATA is sorted first (cheap, no content read) and only the requested slice
