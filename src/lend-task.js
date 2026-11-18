@@ -13,7 +13,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const { lendLease, cancelLease, expireLeases } = require('./lease-ledger.js');
+const { lendLease, cancelLease, expireLeases, listLeases } = require('./lease-ledger.js');
+const { appendHistoryEvent } = require('./task-history.js');
 const { httpPost } = require('./review-package.js');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
 
@@ -65,18 +66,48 @@ async function lendTask({ taskId, nodeId, pipelineDir, url, tokenFile, post = ht
   return { ok: true, reason: '', lease };
 }
 
-// Expires due leases and takes the tasks back. Returns the expired leases.
-function reclaimExpired({ pipelineDir, now = Date.now(), env = process.env } = {}) {
-  const expired = expireLeases({ now, env });
-  for (const lease of expired) {
-    const file = findRecordFile(pipelineDir, lease.taskId);
+// Drops `leasedTo` from the record of taskId in every pipeline dir, but only where it still names nodeId. Returns the files changed.
+function clearLeasedToInDirs(pipelineDirs, taskId, nodeId, note) {
+  const changed = [];
+  for (const dir of pipelineDirs) {
+    const file = findRecordFile(dir, taskId);
     const record = file ? readJson(file) : null;
-    if (record && record.leasedTo === lease.nodeId) {
+    if (record && record.leasedTo === nodeId) {
       delete record.leasedTo;
+      if (note) appendHistoryEvent(record, note.stage, note.detail);
       writeJsonAtomicSync(file, record);
+      changed.push(file);
     }
   }
+  return changed;
+}
+
+// Expires due leases and takes the tasks back. pipelineDirs (an array) takes the record back in EVERY dir: expireLeases hands each expired
+// lease out once, so a caller that loops over dirs and calls this per dir only ever cleared the first dir (wok kept leasedTo on the others,
+// 2026-11-18). A single pipelineDir still works. Returns the expired leases.
+function reclaimExpired({ pipelineDir, pipelineDirs, now = Date.now(), env = process.env } = {}) {
+  const dirs = Array.isArray(pipelineDirs) && pipelineDirs.length ? pipelineDirs : [pipelineDir];
+  const expired = expireLeases({ now, env });
+  for (const lease of expired) clearLeasedToInDirs(dirs.filter(Boolean), lease.taskId, lease.nodeId);
   return expired;
+}
+
+// The node reported the task blocked (its record sits in the node's queue/blocked or queue/needs-clarification): take the task back and
+// leave a trace on wok's record, history 'node-blocked <nodeId>' with the node's reason. Returns the files changed.
+function applyNodeBlock({ pipelineDirs, taskId, nodeId, reason = '' } = {}) {
+  const detail = reason ? `${nodeId}: ${reason}` : String(nodeId);
+  return clearLeasedToInDirs((pipelineDirs || []).filter(Boolean), taskId, nodeId, { stage: `node-blocked ${nodeId}`, detail });
+}
+
+// Heals a record that still names a node while the ledger row for it is no longer 'lent' (expired or returned): clears leasedTo. Runs from
+// the claim path, no timer. Only lease rows are walked (a few hundred), never the queue directories. Returns the task ids healed.
+function releaseStaleLeasedTo({ pipelineDirs = [], env = process.env } = {}) {
+  const healed = [];
+  for (const row of listLeases(env)) {
+    if (!row || row.state === 'lent' || !row.taskId || !row.nodeId) continue;
+    if (clearLeasedToInDirs(pipelineDirs.filter(Boolean), row.taskId, row.nodeId).length) healed.push(row.taskId);
+  }
+  return healed;
 }
 
 function flag(argv, name) {
@@ -105,4 +136,4 @@ async function main(argv, env = process.env, deps = {}, out = (s) => process.std
 
 if (require.main === module) main(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 
-module.exports = { lendTask, reclaimExpired, findRecordFile, main, POST_TIMEOUT_MS };
+module.exports = { lendTask, reclaimExpired, applyNodeBlock, releaseStaleLeasedTo, clearLeasedToInDirs, findRecordFile, main, POST_TIMEOUT_MS };

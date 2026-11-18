@@ -75,6 +75,14 @@ function skipPremiumFrom(env = process.env) {
   return ['true', '1', 'on'].includes(String(env.AGENT_MANAGER_NODE_SKIP_PREMIUM || '').trim().toLowerCase());
 }
 
+// How many times a node reported this task blocked (history stage 'node-blocked <nodeId>', written by lend-task applyNodeBlock). A node that
+// blocked it MAX_NODE_BLOCKS times is not offered the task again, so a task a node cannot do does not bounce between wok and that node.
+const MAX_NODE_BLOCKS = 2;
+function nodeBlockedCount(task, nodeId) {
+  if (!task || !Array.isArray(task.history) || !nodeId) return 0;
+  return task.history.filter((h) => h && h.stage === `node-blocked ${nodeId}`).length;
+}
+
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return null; }
 }
@@ -175,6 +183,10 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
         }
         seen.add(taskId);
         if (leasedIds.has(taskId)) continue; // leased (unexpired)
+        if (nodeBlockedCount(task, claimant) >= MAX_NODE_BLOCKS) {
+          skipped.push({ taskId, reason: 'node-blocked-twice' }); // this node reported it blocked twice: another node (or wok) should try
+          continue;
+        }
         if (task.pinnedWorker && task.pinnedWorker !== claimant) continue; // pinned to another worker
         if (Array.isArray(task.dependsOn) && task.dependsOn.some((dep) => !isDependencySatisfied(pipelineDir, dep))) continue;
         if (Array.isArray(classes) && !classes.includes(taskClassOf(task))) continue;
