@@ -87,6 +87,7 @@ const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api
 const { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, withApplyLock, runBashTool, LIST_DIR_MAX_ENTRIES, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS } = require('./local-tool-fs-tools.js');
 const { isSecretLookingPath } = require('./accessible-roots.js');
 const { searchTasksAllProjects, taskSummary, formatTaskHistory, windowSectionText, readTaskTool, candidateTaskFiles, archivedTaskFiles, searchTasksTool, queueReviewedTaskTool, READ_TASK_SECTIONS, MAX_SEARCH_TASK_RESULTS } = require('./local-tool-task-tools.js');
+const { createRedTestsGuard } = require('./lib/red-tests-guard.js');
 
 // nextOffset = returnedThrough + 1, so paging visits every line exactly once. A first line that alone exceeds the ceiling is shown as a prefix and paging continues with the NEXT line.
 // -> { slice, truncated, returnedThrough }
@@ -1245,7 +1246,7 @@ function resolveToolName(name, handlerNames) {
   return scored[0].h;
 }
 
-async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, toolCallLog) {
+async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, toolCallLog, redTestsGuard) {
   messages.push(assistantMessage);
   for (const toolCall of toolCalls) {
     let name = toolCall.function && toolCall.function.name;
@@ -1278,6 +1279,11 @@ async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messa
     }
     toolCallLog.push({ tool: name, args, result, ...(repairedFrom ? { repairedFrom } : {}) });
     messages.push({ role: 'tool', content: capToolResultForHistory(result) }); // the full result stays in toolCallLog above
+    // Per-call red-tests guard: observe only run_bash results (the only tool that runs
+    // test commands). The guard tracks red/green state across the turn loop.
+    if (redTestsGuard && name === 'run_bash') {
+      redTestsGuard.observe(name, args, result);
+    }
   }
 }
 
@@ -1291,6 +1297,7 @@ async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messa
 // re-verification a retry can do, rather than trying to argue the model out of doing it.
 async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], readOnlyRoots: rawReadOnlyRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, allowAmplification = false, taskId = null, stage = null, conceptId = null, contextLogSessionId = null, orientTurnLimit = ORIENT_TURN_LIMIT }) {
   const { pipelineDir, repoRoot } = getConfig();
+  const redTestsGuard = createRedTestsGuard(process.env);
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
   const killSwitchPath = path.join(pipelineDir, 'queue',
@@ -1860,7 +1867,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     }
     const toolLogStart = toolCallLog.length;
     const execT0 = Date.now();
-    await executeToolCalls(message, toolCalls, toolHandlers, messages, toolCallLog);
+    await executeToolCalls(message, toolCalls, toolHandlers, messages, toolCallLog, redTestsGuard);
     if (activeTimingEntry) activeTimingEntry.toolExecMs += Date.now() - execT0;
     logToolOutcomes(turn, toolCallLog.slice(toolLogStart));
   }
