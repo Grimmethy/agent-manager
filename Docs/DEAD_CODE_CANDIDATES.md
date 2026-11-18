@@ -79,3 +79,33 @@ Delete the `const LABEL_RE = /^HUB\d{4,}(?:-\d+)?/;` declaration from src/hub-se
 
 Benefits:
 Eliminates a misleading unused constant that invites future readers to wonder why it exists or to mistakenly reuse it. Reduces surface area in a module that already handles file locking and monotonic serial allocation -- one fewer regex to maintain, test, or misinterpret.
+
+### AC-7 · Remove orphaned `selectDraftStrategy` extraction from src/local-draft.js
+Strength: Strong
+Files: src/local-draft.js
+Symbol: selectDraftStrategy
+
+Problem:
+`selectDraftStrategy` (defined at src/local-draft.js line 1464) is an orphaned extraction: the docstring explicitly states it is "the multi-way backend selection that currently sits inline in runDraftPasses, extracted as an isolated, table-testable unit" — but the wiring to actually call it was never completed. A grep across the entire codebase found zero call sites for the symbol `selectDraftStrategy`. The inline backend-selection logic still lives inside `runDraftPasses` and is the live execution path. The function is only "alive" because it appears in the `module.exports` object at line 2050; 96+ files reference the module but none import this specific export. It is dead code by every practical measure: zero callers, a docstring that admits the refactoring was never finished, and a definition that exists solely to satisfy an incomplete migration.
+
+Solution:
+Remove the `selectDraftStrategy` symbol from src/local-draft.js in its entirety: delete the function definition (lines 1446–1500 approximately, including the leading comment block and the function body), and remove `selectDraftStrategy` from the `module.exports` object at line 2050. No call-site cleanup is needed because the pre-check confirmed zero references to the symbol anywhere in the codebase. The inline backend-selection logic in `runDraftPasses` (which the docstring itself confirms still exists) is the true live path and must not be touched.
+
+Benefits:
+Eliminates a misleading, half-finished abstraction that any future reader would have to untangle to understand why it's not wired in. Reduces the public surface of `src/local-draft.js` by one function and one export, shrinking the chance of accidental misuse. Removes a docstring that actively misinforms by claiming an extraction is "currently" in progress when it never was completed — future maintainers will no longer wonder whether the wiring was forgotten or deliberately disabled.
+
+### AC-8 · Remove SOURCE_CONTRACT from decompose-question-surface.contract.js
+Strength: Strong
+Files: src/decompose-question-surface.contract.js
+Symbol: SOURCE_CONTRACT
+
+Problem:
+The `SOURCE_CONTRACT` constant in `src/decompose-question-surface.contract.js` is a dead export with zero call sites. The file itself is not imported anywhere in the codebase (confirmed by the "Files that name this module: none found" result), so all its exports—including `SOURCE_CONTRACT`, `SOURCE_GATE`, `GATE_CONDITION`, `INPUT_FIELDS`, `OUTPUT_PATH`, `IDEMPOTENCY_KEY`, `RETURN_SHAPE`, and `DIR_AUTO_CREATE`—are unused. `SOURCE_CONTRACT` is a metadata string documenting provenance (`'src/decompose-question-surface.js (surfaceDecomposeDesignQuestion, lines 58-98)'`) and serves no runtime purpose.
+
+Solution:
+Remove `SOURCE_CONTRACT` from the exports in `src/decompose-question-surface.contract.js` by deleting line 88 (`const SOURCE_CONTRACT = 'src/decompose-question-surface.js (surfaceDecomposeDesignQuestion, lines 58-98)';`) and removing `SOURCE_CONTRACT,` from the `module.exports` object at line 98. Consider whether the entire file is still needed—if no code imports it, it may be a documentation artifact that should be moved to a docs directory or removed entirely.
+
+Benefits:
+Eliminates unused metadata that adds no value to the running codebase, reduces surface area for future maintenance, and removes a misleading constant that could confuse readers into thinking the contract spec is actively consumed.
+
+---
