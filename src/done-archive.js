@@ -84,6 +84,11 @@ function monthBucket(d) {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
+// Single source of truth for the queue/done/_archived/<YYYY-MM>/ destination both passes use.
+function archiveDestDir(pipelineDir, now) {
+  return path.join(pipelineDir, 'queue', 'done', ARCHIVE_DIRNAME, monthBucket(new Date(now)));
+}
+
 /**
  * Scans queue/done/ TOP LEVEL ONLY (fs.readdirSync is non-recursive by nature -- never
  * descends into _archived_no_action/ or the dated _archived/<YYYY-MM>/ folders this itself
@@ -105,7 +110,7 @@ function archiveDoneTasks({ pipelineDir, now = Date.now() }) {
     return result;
   }
 
-  const destDir = path.join(doneDir, ARCHIVE_DIRNAME, monthBucket(new Date(now)));
+  const destDir = archiveDestDir(pipelineDir, now);
   let destDirEnsured = false;
 
   for (const entry of entries) {
@@ -156,7 +161,7 @@ function archiveDoneTasks({ pipelineDir, now = Date.now() }) {
  */
 function archiveSpecificDoneTasks({ pipelineDir, taskIds, now = Date.now() }) {
   const doneDir = path.join(pipelineDir, 'queue', 'done');
-  const destDir = path.join(doneDir, ARCHIVE_DIRNAME, monthBucket(new Date(now)));
+  const destDir = archiveDestDir(pipelineDir, now);
   const result = { moved: 0, missing: 0, errors: [] };
   let destDirEnsured = false;
 
