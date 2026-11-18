@@ -3040,6 +3040,26 @@ function writeTask(task) {
   return file;
 }
 
+// In-memory store of WHY a task was left unclaimed, keyed by task id. Each value is
+// {code, text} or null (null removes the entry). Written synchronously at claim evaluation;
+// no timer, scan, or poll is involved.
+const unclaimedReasons = new Map();
+
+function setUnclaimedReason(taskId, value) {
+  if (value === null) {
+    unclaimedReasons.delete(taskId);
+    return;
+  }
+  if (!value || typeof value !== 'object' || !('code' in value) || !('text' in value)) {
+    throw new TypeError('setUnclaimedReason: value must be {code, text} or null');
+  }
+  unclaimedReasons.set(taskId, value);
+}
+
+function getUnclaimedReason(taskId) {
+  return unclaimedReasons.get(taskId) ?? null;
+}
+
 module.exports = {
   getNextTask, writeTask, taskIdExistsInQueue, isBrainDumpEntrySortable,
   nextTroubleLogTask, nextAdhocTask, nextDerivedTask, nextSecondBrainTask,
@@ -3062,6 +3082,7 @@ module.exports = {
   nextProductSpecSectionTask,
   nextBacklogDecompositionTask,
   existingQueuedTaskTitles,
+  setUnclaimedReason, getUnclaimedReason,
   // Exported for the out-of-tree hygiene plugin (agent-manager-hygiene): its register.js
   // passes taskPriority through as an injected dep so plugin sources honor
   // AGENT_MANAGER_TASK_PRIORITIES overrides exactly like the built-ins do.
