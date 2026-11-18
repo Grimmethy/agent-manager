@@ -11,6 +11,7 @@ const BRANCH_VERDICT_FILTERS = [
   { key: 'all', label: 'All' },
   { key: 'unverified', label: 'Unverified' },
   { key: 'merge', label: 'Ready to merge' },
+  { key: 'reverify', label: 'Needs re-verify' },
   { key: 'needs-work', label: 'Needs work' },
   { key: 'hold', label: 'Hold' },
   { key: 'discard', label: 'Discard' },
@@ -25,7 +26,31 @@ try { heldHubsOpen = localStorage.getItem(HELD_HUBS_OPEN_KEY) === '1'; } catch (
 // The bucket a branch falls in. A stale verdict is "unverified" -- it vouches for an older commit.
 function branchVerdictKey(b) {
   if (!b || b.stale || !b.verdict) return 'unverified';
+  // A 'merge' verdict the server (branch_reverify.py) says cannot be trusted now (conflicts, far behind, unfinished hub piece) is not "Ready to merge".
+  if (b.verdict === 'merge' && b.reverify && Array.isArray(b.reverify.reasons) && b.reverify.reasons.length) return 'reverify';
   return ['merge', 'needs-work', 'hold', 'discard'].includes(b.verdict) ? b.verdict : 'unverified';
+}
+
+// "verdict 3 h old" / "verdict 6 days old" from verdictAgeHours (hours since the verdict was recorded); '' when unknown.
+function branchVerdictAgeText(b) {
+  const h = b && typeof b.verdictAgeHours === 'number' && isFinite(b.verdictAgeHours) ? b.verdictAgeHours : null;
+  if (h === null) return '';
+  if (h < 1) return 'verdict under an hour old';
+  return h < 48 ? `verdict ${Math.floor(h)} h old` : `verdict ${Math.floor(h / 24)} days old`;
+}
+
+// "duplicate of agent/x, agent/y" when other open branches name the same task; '' otherwise.
+function branchDuplicateText(b) {
+  const d = b && Array.isArray(b.duplicateOf) ? b.duplicateOf.filter(Boolean) : [];
+  return d.length ? `duplicate of ${d.join(', ')}` : '';
+}
+
+// The lines under the badge: every reason on a re-verify card (the first reason otherwise), then the verdict age and the duplicate notice. Placed before _bvEscape on purpose:
+// scripts/size-ratchet-check.js mis-measures the span after it (the regex literal), so code after it may not grow.
+function _bvNotesHtml(b, key, first) {
+  const reasons = key === 'reverify' ? b.reverify.reasons.filter(Boolean) : (first ? [first] : []);
+  return reasons.map((r) => `<div class="meta" style="font-size:12px">${_bvEscape(r)}</div>`).join('')
+    + [branchVerdictAgeText(b), branchDuplicateText(b)].filter(Boolean).map((n) => `<div class="meta" data-verdict-note style="font-size:12px">${_bvEscape(n)}</div>`).join('');
 }
 
 // Inline style for the card border: none. The card falls back to the shared .worker-card border (2px solid var(--border)). Kept as a function so the
@@ -38,8 +63,8 @@ function _bvEscape(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 }
 
-const _BV_BADGE_CLASS = { merge: 'ok', 'needs-work': 'warn', hold: 'hold', discard: 'bad' };
-const _BV_WORD = { merge: 'merge', 'needs-work': 'needs work', hold: 'hold', discard: 'discard' };
+const _BV_BADGE_CLASS = { merge: 'ok', reverify: 'warn', 'needs-work': 'warn', hold: 'hold', discard: 'bad' };
+const _BV_WORD = { merge: 'merge', reverify: 're-verify', 'needs-work': 'needs work', hold: 'hold', discard: 'discard' };
 
 // Badge with the verdict word plus a one-line reason under the title.
 function branchVerdictBadgeHtml(b) {
@@ -51,7 +76,7 @@ function branchVerdictBadgeHtml(b) {
   }
   const src = b.source ? ` title="${_bvEscape('source: ' + b.source)}"` : '';
   return `<span class="badge ${_BV_BADGE_CLASS[key]}" data-verdict="${key}"${src}>${_BV_WORD[key]}</span>`
-    + (first ? `<div class="meta" style="font-size:12px">${_bvEscape(first)}</div>` : '');
+    + _bvNotesHtml(b, key, first);
 }
 
 // Full reasons list, for the detail view.
@@ -244,4 +269,4 @@ function refreshHeldHubsPanel(main) {
   else main.insertAdjacentHTML('beforeend', html);
 }
 
-if (typeof module !== 'undefined') module.exports = { branchVerdictKey, branchVerdictBorderStyle, branchVerdictBadgeHtml, branchVerdictDetailHtml, filterBranchesByVerdict, branchVerdictFilterBarHtml, BRANCH_VERDICT_FILTERS, heldHubsHtml, heldHubsToggleHtml, discardAllCandidates, discardAllButtonHtml, DISCARD_ALL_INSET_PX, discardAllDialogText, discardAllConfirmOk, discardAllPayload, discardAllResultText, discardOpenHubBranches };
+if (typeof module !== 'undefined') module.exports = { branchVerdictKey, branchVerdictAgeText, branchDuplicateText, branchVerdictBorderStyle, branchVerdictBadgeHtml, branchVerdictDetailHtml, filterBranchesByVerdict, branchVerdictFilterBarHtml, BRANCH_VERDICT_FILTERS, heldHubsHtml, heldHubsToggleHtml, discardAllCandidates, discardAllButtonHtml, DISCARD_ALL_INSET_PX, discardAllDialogText, discardAllConfirmOk, discardAllPayload, discardAllResultText, discardOpenHubBranches };
