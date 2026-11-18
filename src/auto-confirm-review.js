@@ -321,10 +321,23 @@ function handleInconclusiveOutcome(record, ctx) {
   const reason = `no confident CONFIRM/DENY majority (votes: ${ctx.vote.realVoteCount}/${ctx.vote.requestedVotes})`;
   record.autoConfirmReviewedAt = ctx.now;
   record.autoConfirmDecision = 'escalate';
+  record.reviewVoteSplit = true;
+  record.reviewInconclusive = true;
   record.autoConfirmReviewNote = reason;
   appendHistoryEvent(record, 'advisory', `auto-confirm review inconclusive (${reason}) -- held for a human`);
   try { fs.writeFileSync(ctx.file, JSON.stringify(record, null, 2)); ctx.summary.escalated += 1; }
   catch { ctx.summary.errors += 1; }
+}
+
+// One bounded re-roll on a non-confident vote. The first vote is kept if it is confident;
+// otherwise the vote is re-run once. bothInconclusive is true only when neither vote reached
+// a confident CONFIRM/DENY majority -- the only case that stamps and is left for a human.
+async function voteWithOneReroll(voteOpts, majorityVoteFn) {
+  const first = await majorityVoteFn(voteOpts);
+  if (first.confident) return { ...first, bothInconclusive: false };
+  const second = await majorityVoteFn(voteOpts);
+  if (second.confident) return { ...second, bothInconclusive: false };
+  return { ...second, bothInconclusive: true };
 }
 
 async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote, candidatesPath }) {
@@ -389,14 +402,14 @@ async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote
 
     let vote;
     try {
-      vote = await majorityVote({
+      vote = await voteWithOneReroll({
         prompt,
         classify: classifyVote(['CONFIRM', 'DENY'], 15),
         n: isDebrief ? DEBRIEF_VOTES : AUTO_CONFIRM_VOTES,
         minAgreeing: isDebrief ? DEBRIEF_MIN_AGREEING : AUTO_CONFIRM_MIN_AGREEING,
         temperature: 0.2,
         source: task.source,
-      });
+      }, majorityVote);
     } catch (e) {
       if (isForgePause(e)) { summary.paused = true; break; }   // the Forge family holds the GPU: stop this sweep quietly -- no history note, no stamp
       // Every vote hard-failed (infra). Do NOT stamp -- next tick retries.
@@ -411,8 +424,8 @@ async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote
       handleConfirmOutcome(task, { file, name, summary, approvedDir, vote, now, gateStamp });
     } else if (vote.confident && vote.verdict === 'DENY') {
       handleDenyOutcome(task, { file, name, summary, archiveDir, vote, now, gateStamp });
-    } else {
-      // No confident majority -- leave for a human.
+    } else if (vote.bothInconclusive) {
+      // Double-inconclusive even after the one re-roll -- the only inconclusive case that stamps and is left for a human.
       handleInconclusiveOutcome(task, { file, name, summary, vote, now, gateStamp });
     }
   }
