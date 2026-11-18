@@ -233,8 +233,9 @@ function detectClaimedKind(symbol, draftText) {
     const clause = clauseAround(draftText, m.index, m.index + m[0].length);
     if (/\bTypedDict\b/.test(clause)) return 'TypedDict';
     if (/\bEnum\b/.test(clause)) return 'Enum';
-    if (/\bclass\b/.test(clause)) return 'class';
+    if (/\bclass\b(?!-like\b)/.test(clause)) return 'class';
     if (/\b(function|method)s?\b/.test(clause)) return 'function';
+    if (/\bclass\b/.test(clause)) return 'class';
   }
   return null;
 }
