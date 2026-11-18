@@ -666,7 +666,7 @@ while :; do                                                                     
   # when the switch flips finishes first (the check is once per tick).
   if worker_switched_off "$INSTANCE_ID"; then
     if (( SWITCHED_OFF_TICKS == 0 )); then
-      printf '[worker-%s] switched off by the operator (Workers tab) -- claiming nothing until it is switched back on.\n' "$INSTANCE_ID" >&2
+      printf '[worker-%s] %s\n' "$INSTANCE_ID" "$(worker_switch_message "$INSTANCE_ID")" >&2
     fi
     SWITCHED_OFF_TICKS=$((SWITCHED_OFF_TICKS + 1))
     write_heartbeat_file "$INSTANCE_ID" "disabled" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
