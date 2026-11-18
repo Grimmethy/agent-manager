@@ -3310,3 +3310,54 @@ None — the original concern was based on unverifiable claims.
 ---
 
 NOTE: The original draft's AC-804 was corrected to accurately describe the behavior (propagates errors, doesn't swallow them). AC-805 was revised to acknowledge the fallback is intentional. AC-806 was removed as the concern was based on unverifiable claims about the heuristic's behavior.
+
+### AC-807 · Tightly coupled error-handling logic in `applyDirectToMainBatch`
+Strength: Strong
+Files: src/lib/apply-main-batch.js
+
+Problem:
+The `applyDirectToMainBatch` function contains a large inline block that handles three distinct artifact states (`stale`, `skipped`, `needsConfirmation`) with specific error-handling and logging logic. This logic is tightly coupled to the function's control flow and is not extracted into a reusable helper. If the error-handling semantics change (e.g., adding a new artifact state, modifying the logging format, or changing how `closeOriginatingBrainDumpEntry` is invoked), the change must be made in this single location, but the logic is buried in the middle of a larger function, making it harder to locate and verify. The inline nature also means the function's primary loop body is cluttered with error-handling concerns that are distinct from the core "apply and stage" workflow.
+
+Solution:
+Extract the artifact state handling into a dedicated helper function (e.g., `handleArtifactOutcome(task, artifact, results, brainDumpPath, pipelineDir)`) that encapsulates the three-state logic and its associated side effects. The main loop then calls this helper, keeping the loop body focused on the primary workflow.
+
+Benefits:
+- **Locality:** Error-handling logic is grouped together in one place, making it easier to locate and modify.
+- **Readability:** The main loop becomes shorter and more focused on the core "apply and stage" workflow.
+- **Maintainability:** Changes to error-handling semantics are isolated to a single helper, reducing the risk of missing a case or introducing inconsistencies.
+
+---
+
+### AC-808 · Duplicated "close originating brain dump entry" pattern
+Strength: Strong
+Files: src/lib/apply-main-batch.js
+
+Problem:
+The call to `closeOriginatingBrainDumpEntry(task, brainDumpPath, ...)` appears in at least four distinct locations within `applyDirectToMainBatchOnBranch`: when a task is skipped, when it's marked as local-only, when it's queued on the triage branch, and when it's committed to main. Each invocation passes a different reason string and is embedded in different control-flow branches. This duplication means that if the signature of `closeOriginatingBrainDumpEntry` changes, or if additional parameters are needed (e.g., a timestamp, a status code, or a structured reason object), every call site must be updated. The pattern is also error-prone: the reason strings are inconsistent in format and level of detail across the call sites.
+
+Solution:
+Extract a small helper (e.g., `recordApplyOutcome(task, brainDumpPath, reason)`) that wraps the `closeOriginatingBrainDumpEntry` call and normalizes the reason string. All call sites in the function then use this helper, ensuring consistent invocation and making it easier to modify the behavior in the future.
+
+Benefits:
+- **Consistency:** Reason strings and invocation patterns are normalized across all call sites.
+- **Maintainability:** Changes to `closeOriginatingBrainDumpEntry`'s signature or behavior require updating only the helper.
+- **Reduced duplication:** The pattern is expressed once instead of four times, making the codebase easier to reason about.
+
+---
+
+### AC-809 · Missing abstraction for triage batch commit message construction
+Strength: Strong
+Files: src/lib/apply-main-batch.js
+
+Problem:
+The construction of the commit message for a triage batch is inline and tightly coupled to the structure of the `staged` array. The message format includes a header, a list of task titles and IDs, task-log references, and a co-author trailer. If the commit message format changes (e.g., adding a new field, reordering sections, or changing the trailer format), the change must be made in this single location, but the logic is buried in the middle of a larger function. The inline construction also makes it harder to test the message format independently of the broader apply workflow.
+
+Solution:
+Extract the commit message construction into a dedicated helper (e.g., `buildTriageBatchCommitMessage(staged)`) that returns the formatted message string. The main function then writes this message to a temp file and passes it to `gitRunner.commit()`.
+
+Benefits:
+- **Locality:** Commit message construction is grouped together in one place.
+- **Testability:** The message format can be tested independently of the broader apply workflow.
+- **Maintainability:** Changes to the commit message format are isolated to a single helper, reducing the risk of missing a case or introducing inconsistencies.
+
+NOTE: The CRITIQUE section reported "NO ISSUES FOUND" with no specific flags to address, so no changes to the draft were necessary.
