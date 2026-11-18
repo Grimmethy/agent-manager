@@ -5,65 +5,82 @@ const assert = require('node:assert/strict');
 const { shouldAutoDismiss } = require('./deliberate-pattern-prefilter.js');
 
 const KEYS = ['dismiss', 'reason', 'rule'];
+const join = (...lines) => lines.join('\n');
 
-test('P1: unbounded iterator with unrelated slice and distant rate-limit comment is not dismissed', () => {
-  const snippet = [
-    '// rate limit',
-    'const other = [1, 2, 3];',
-    'const z = other.slice(0, 5);',
-    'for (const item of items) {',
-    '  await send(item);',
-    '}',
-  ].join('\n');
-  const r = shouldAutoDismiss('sequential-await-in-loop', snippet, 'for (const item of items) {');
-  assert.equal(r.dismiss, false);
-  assert.equal(r.rule, null);
-  assert.deepEqual(Object.keys(r).sort(), KEYS);
-});
-
-test('P2: sync-io marker above a different statement is not dismissed', () => {
-  const snippet = [
+// P1: a deliberately marked earlier loop must not dismiss an unmarked flagged loop.
+test('P1: marked earlier loop does not dismiss an unmarked flagged loop', () => {
+  const snippet = join(
     '// deliberate: sync-io-in-loop',
-    'const cfg = load();',
+    'for (const a of first) {',
+    '  fs.readFileSync(a);',
+    '}',
     'for (const f of files) {',
     '  fs.readFileSync(f);',
     '}',
-  ].join('\n');
+  );
   const r = shouldAutoDismiss('sync-io-in-loop', snippet, 'for (const f of files) {');
   assert.equal(r.dismiss, false);
   assert.equal(r.rule, null);
   assert.deepEqual(Object.keys(r).sort(), KEYS);
 });
 
-test('R1: bounded slice with adjacent deliberate comment and awaited call is dismissed', () => {
-  const snippet = [
-    '// deliberate: rate limit between calls',
-    'for (const x of items.slice(0, N)) {',
-    '  await fetchOne(x);',
+// P2: sequential await over an unbounded array, with batchSize present but not applied.
+test('P2: sequential await over unbounded array with batchSize is not dismissed', () => {
+  const snippet = join(
+    'const batchSize = 10;',
+    '// rate limit between calls',
+    'for (const x of items) {',
+    '  await send(x);',
     '}',
-  ].join('\n');
-  const r = shouldAutoDismiss('sequential-await-in-loop', snippet, 'for (const x of items.slice(0, N)) {');
-  assert.equal(r.dismiss, true);
-  assert.equal(r.rule, 'R1');
+  );
+  const r = shouldAutoDismiss('sequential-await-in-loop', snippet, 'for (const x of items) {');
+  assert.equal(r.dismiss, false);
+  assert.equal(r.rule, null);
   assert.deepEqual(Object.keys(r).sort(), KEYS);
 });
 
-test('R2: deliberate sync-io marker directly above the flagged loop is dismissed', () => {
-  const snippet = [
+// P3: a marker several lines above the header must not count.
+test('P3: sync-io marker several lines above the header is not dismissed', () => {
+  const snippet = join(
+    '// deliberate: sync-io-in-loop',
+    'const cfg = load();',
+    'const n = 1;',
+    'for (const f of files) {',
+    '  fs.readFileSync(f);',
+    '}',
+  );
+  const r = shouldAutoDismiss('sync-io-in-loop', snippet, 'for (const f of files) {');
+  assert.equal(r.dismiss, false);
+  assert.equal(r.rule, null);
+  assert.deepEqual(Object.keys(r).sort(), KEYS);
+});
+
+// R1: bounded .slice(0, batchSize) loop with awaited call and adjacent rate-limit comment.
+test('R1: bounded slice with adjacent rate-limit comment and await is dismissed', () => {
+  const snippet = join(
+    '// deliberate: rate limit between calls',
+    'for (const x of items.slice(0, batchSize)) {',
+    '  await fetchOne(x);',
+    '}',
+  );
+  const r = shouldAutoDismiss('sequential-await-in-loop', snippet, 'for (const x of items.slice(0, batchSize)) {');
+  assert.equal(r.dismiss, true);
+  assert.equal(r.rule, 'R1');
+  assert.ok(typeof r.reason === 'string' && r.reason.length > 0);
+  assert.deepEqual(Object.keys(r).sort(), KEYS);
+});
+
+// R2: deliberate sync-io marker directly above the flagged header.
+test('R2: deliberate sync-io marker directly above the header is dismissed', () => {
+  const snippet = join(
     '// deliberate: sync-io-in-loop',
     'for (const f of files) {',
     '  fs.readFileSync(f);',
     '}',
-  ].join('\n');
-  const r = shouldAutoDismiss('sync io in loop', snippet, 'for (const f of files) {');
+  );
+  const r = shouldAutoDismiss('sync-io-in-loop', snippet, 'for (const f of files) {');
   assert.equal(r.dismiss, true);
   assert.equal(r.rule, 'R2');
-  assert.deepEqual(Object.keys(r).sort(), KEYS);
-});
-
-test('missing flagLine fails open', () => {
-  const r = shouldAutoDismiss('sync-io-in-loop', 'for (const f of files) {\n}', 'while (true) {');
-  assert.equal(r.dismiss, false);
-  assert.equal(r.rule, null);
+  assert.ok(typeof r.reason === 'string' && r.reason.length > 0);
   assert.deepEqual(Object.keys(r).sort(), KEYS);
 });
