@@ -45,3 +45,9 @@ Removing this export eliminates dead code from the public API surface, reducing 
 ---
 
 **VERDICT: GENUINE -- safe to remove.**
+
+### AC-4 · CONTEXT_LOG_INSTRUCTION false positive
+Strength: Strong
+Symbol: CONTEXT_LOG_INSTRUCTION
+
+The symbol is genuinely used at line 64 of its own file inside `injectContextLogInstruction()` via template literal interpolation (`${CONTEXT_LOG_INSTRUCTION}`), which naive grep-based dead-code detectors commonly miss. The constant is a module-internal implementation detail of this actively-consumed module (5 consumers), and removing it would break the function's contract without providing meaningful cleanup. The zero-external-calls result is expected design, not evidence of death.
