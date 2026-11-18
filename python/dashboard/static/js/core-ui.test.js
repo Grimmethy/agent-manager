@@ -126,8 +126,35 @@ function loadDashboardScripts(overrides = {}) {
     pending.set(url, [...(pending.get(url) || []), d]);
     return d.promise;
   };
-  return { ctx, main, fetchCalls, resolve: (url, value) => pending.get(url).shift().resolve(value) };
+  const resolve = (url, value) => {
+    const queue = pending.get(url);
+    if (!queue || queue.length === 0) {
+      const reason = queue ? 'already consumed' : 'never fetched';
+      const open = [...pending.entries()].filter(([, q]) => q.length > 0).map(([u]) => u);
+      throw new Error(`resolve(): ${url} was ${reason}. Pending URLs: ${open.length ? open.join(', ') : '(none)'}`);
+    }
+    queue.shift().resolve(value);
+  };
+  return { ctx, main, fetchCalls, resolve };
 }
+
+test('resolve: an unfetched URL fails with a readable message naming it', () => {
+  const { resolve } = loadDashboardScripts();
+  assert.throws(
+    () => resolve('/api/never-fetched', {}),
+    (e) => /\/api\/never-fetched.*never fetched/.test(e.message) && !/Cannot read properties/.test(e.message),
+  );
+});
+
+test('resolve: resolving the same URL twice fails on the second call naming it as already consumed', () => {
+  const { ctx, resolve } = loadDashboardScripts();
+  ctx.fetchJson('/api/double');
+  resolve('/api/double', {});
+  assert.throws(
+    () => resolve('/api/double', {}),
+    (e) => /\/api\/double.*already consumed/.test(e.message) && !/Cannot read properties/.test(e.message),
+  );
+});
 
 test('real switchToTab + renderAdhocTasksTab: a render that resolves AFTER a tab switch does not paint over #main', async () => {
   const { ctx, main, resolve } = loadDashboardScripts();
