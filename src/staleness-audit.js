@@ -27,7 +27,7 @@
 
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { REASON_CATEGORIES } = require('./pipeline-self-audit.js');
+const { REASON_CATEGORIES } = require('./blocked-task-classifiers.js');
 const { extractFilePaths, resolveAgainstRepo } = require('./fact-checker.js');
 const { isStaleByAge, isFabricationRepeat, hasExhaustedRetries, alreadyImplementedSignal, invalidPremiseSignal, isDecomposeLoop, candidateFilePaths, distinctivePhrases, extractCreatedSymbols, lastActivityTs, stalenessThresholdMs, symbolDefinedInRepo, envDays, FABRICATION_KEYWORDS, GIT_LOG_TIMEOUT_MS, CREATE_VERB_RE, DEFAULT_STALENESS_THRESHOLD_DAYS, GENERATED_DOC_RE, MS_PER_DAY, NON_PROGRESS_STAGES, TITLE_PREFIX_RE } = require('./staleness-audit-signals.js');
 const { normalizeTaskTokens, dupSimilarityThreshold, bdLineage, findDuplicateTask } = require('./staleness-audit-dedup.js');
