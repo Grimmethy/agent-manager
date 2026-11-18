@@ -79,7 +79,7 @@ test('dry-run reports wouldRestore, restores nothing, and still counts the files
   assert.equal(d.restored.length, 0); assert.equal(d.wouldRestore.length, 1); assert.equal(d.other.length, 1);
   assert.equal(fs.readFileSync(pyc(repo, 'a'), 'utf8'), 'v2');
   const o = healGeneratedDirt(run, { mode: 'off' });
-  assert.deepEqual(o, { mode: 'off', restored: [], wouldRestore: [], other: [] });
+  assert.deepEqual(o, { mode: 'off', restored: [], wouldRestore: [], other: [], restoreError: null });
 });
 
 test('healMode: default dry-run; env switch honoured', () => {
@@ -89,6 +89,29 @@ test('healMode: default dry-run; env switch honoured', () => {
     process.env.AGENT_MANAGER_APPLY_CLONE_HEAL = 'on'; assert.equal(healMode(), 'on');
     process.env.AGENT_MANAGER_APPLY_CLONE_HEAL = 'off'; assert.equal(healMode(), 'off');
   } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_APPLY_CLONE_HEAL; else process.env.AGENT_MANAGER_APPLY_CLONE_HEAL = prev; }
+});
+
+test('on: a failed checkout is reported via restoreError and one stderr line; files stay in other', () => {
+  const realWrite = process.stderr.write;
+  const writes = [];
+  process.stderr.write = (s) => { writes.push(String(s)); return true; };
+  try {
+    const r = healGeneratedDirt((args) => {
+      if (args[0] === 'status') return ' M __pycache__/a.pyc\n';
+      throw new Error('index.lock exists');
+    }, { mode: 'on' });
+    assert.deepEqual(r.restored, []);
+    assert.equal(typeof r.restoreError, 'string'); assert.ok(r.restoreError.length > 0);
+    assert.ok(r.other.includes(' M __pycache__/a.pyc'));
+    assert.equal(writes.length, 1); assert.ok(writes[0].includes('index.lock exists'));
+  } finally { process.stderr.write = realWrite; }
+});
+
+test('on: a successful checkout returns restored and restoreError null', () => {
+  const r = healGeneratedDirt((args) => (args[0] === 'status' ? ' M __pycache__/a.pyc\n' : ''), { mode: 'on' });
+  assert.deepEqual(r.restored, ['__pycache__/a.pyc']);
+  assert.equal(r.restoreError, null);
+  assert.deepEqual(r.other, []);
 });
 
 test('a failing run() never throws out of healGeneratedDirt', () => {
