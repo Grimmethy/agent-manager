@@ -1,7 +1,8 @@
 'use strict';
 
 // Node status client (FF-3 wiring): asks a node where a task is, over the node intake's POST /status (src/node-intake-server.js).
-//   makeAskNode({env, post, readRegistry}) -> async askNode(nodeId, taskId) -> 'merged' | 'in-progress' | 'unknown'
+//   makeAskNode({env, post, readRegistry}) -> async askNode(nodeId, taskId) -> 'merged' | 'in-progress' | 'unknown' | { answer: 'blocked', reason }
+// 'blocked' (the task sits in the node's queue/blocked or queue/needs-clarification) comes back as an object so the node's reason travels with it.
 // This is the askNode that settleExpired (src/lease-ledger.js) calls for an overdue lease. The address comes from the node registry
 // (nodes.json), the bearer token from AGENT_MANAGER_LENDER_TOKEN_FILE (trimmed), the port from AGENT_MANAGER_INTAKE_PORT (default 7472).
 // ANY problem (unknown node, no address, no token, a non-2xx answer, bad JSON, a timeout, a throw) answers 'unknown' and nothing here throws:
@@ -55,6 +56,10 @@ function makeAskNode({ env = process.env, post = defaultPost, readRegistry = (e)
       if (status < 200 || status >= 300) return 'unknown';
       const parsed = typeof res.body === 'string' ? JSON.parse(res.body) : res.body;
       const answer = parsed && parsed.ok === true && parsed.tasks ? parsed.tasks[taskId] : undefined;
+      if (answer === 'blocked') {
+        const reason = parsed.reasons && typeof parsed.reasons[taskId] === 'string' ? parsed.reasons[taskId].slice(0, 300) : '';
+        return { answer: 'blocked', reason };
+      }
       return answer === 'merged' || answer === 'in-progress' ? answer : 'unknown';
     } catch (e) {
       return 'unknown';
