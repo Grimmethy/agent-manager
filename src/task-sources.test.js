@@ -2910,7 +2910,7 @@ test('windowFetchedFileContent windows all occurrences of a repeated helper name
 
 test('windowFetchedFileContent skips a backtick symbol that is too generic (appears everywhere) as an anchor', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-window-test-'));
-  const { collectAnchorHits } = require('./sdk/candidate-fulfillment.js');
+  const { collectAnchorHits } = require('./sdk/lib/file-grounding.js');
   freshTaskSources(dir);
   const content = Array.from({ length: 30 }, () => 'const result = get();').join('\n') + '\nfunction theOneThing() {}\n';
   const hits = collectAnchorHits(content, 'Solution:\nfix `result` handling in `theOneThing`.');
