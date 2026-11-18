@@ -924,11 +924,42 @@ function reusePriorPlanForContinuation(task, attempt) {
   return true;
 }
 
+// Deterministic-checklist plan skip (2026-11-18): an adhoc task whose acceptance criteria
+// already arrive as a fully-specified checklist (>=3 items, each naming a repo path and a
+// checkable literal/command/exit code) does not need a plan model call -- the criteria ARE
+// the plan. Any item that fails the shape test keeps the plan pass running. The plan-critique
+// re-plan (_planCritiqueRevised) is a deliberate second plan and is never skipped.
+// Kill switch: AGENT_MANAGER_ADHOC_CHECKLIST_SKIP=false.
+const DETERMINISTIC_PATH_RE = /(?:^|[\s`(])[\w.-]+\/[\w./-]+|\b[\w-]+\.(?:js|ts|py|md|json|sh|yml|yaml)\b/;
+const DETERMINISTIC_CHECK_RE = /`|\bexits?\s+(?:0|\d+)\b|\bexit code\b|\bequals?\b|\bcontains?\b|\bis\s+\d{3}\b/i;
+
+function isDeterministicChecklist(task) {
+  if (process.env.AGENT_MANAGER_ADHOC_CHECKLIST_SKIP === 'false') return false;
+  if (resolveSourceName(task) !== 'adhoc' || task._planCritiqueRevised) return false;
+  const { criteria } = resolveAcceptanceCriteria(task);
+  if (criteria.length < 3) return false;
+  return criteria.every((c) => DETERMINISTIC_PATH_RE.test(c) && DETERMINISTIC_CHECK_RE.test(c));
+}
+
+// Returns true when the plan pass was skipped (no model call); the criteria become the plan.
+function skipPlanForDeterministicChecklist(task, attempt) {
+  if (!isDeterministicChecklist(task)) return false;
+  const { criteria } = resolveAcceptanceCriteria(task);
+  const text = `CRITERIA:\n${criteria.map((c) => `- ${c}`).join('\n')}`;
+  task.planResponse = capPlanForTask(task, text, appendHistoryEvent);
+  task.lastGoodPlan = text;
+  applyPlanAcceptanceCriteria(task);
+  recordPlan(attempt, { text, seededFromPrior: false });
+  appendHistoryEvent(task, 'plan-done', `skipped plan pass: deterministic checklist (${criteria.length} items) -- ${criteria.map((c) => c.slice(0, 80)).join(' | ')}`);
+  return true;
+}
+
 async function runPlanPass(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
   runOrientPassFn = runOrientPass, recordModelCall,
 }) {
   if (reusePriorPlanForContinuation(task, attempt)) return { blocked: false };
+  if (skipPlanForDeterministicChecklist(task, attempt)) return { blocked: false };
   // Plan-cap context derived once per pass and threaded to every plan write site below.
   const { ruleId, expectedDisposition } = derivePlanCapContext(task);
   // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
@@ -2418,7 +2449,7 @@ function tryGroundingRefreshFallback(task) {
   }
 }
 
-module.exports = { reusePriorPlanForContinuation, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, SPLIT_TRUNCATION_MAX_RETRIES, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback, attemptSeedReroll };
+module.exports = { reusePriorPlanForContinuation, isDeterministicChecklist, runPlanPass, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, SPLIT_TRUNCATION_MAX_RETRIES, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback, attemptSeedReroll };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on

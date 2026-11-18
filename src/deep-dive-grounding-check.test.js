@@ -267,6 +267,25 @@ test('checkTypeFidelity flags a TypedDict assigned via MyConfig = TypedDict(...)
   assert.equal(checkTypeFidelity(t, 'The `MyConfig` class is the entry point.').length, 1);
 });
 
+test('checkTypeFidelity excuses a real Enum described as a class and records the excusal', () => {
+  const t = typedDictTask({ promptContext: { files: [{ path: 'c.py', content: 'class Color(Enum):\n    RED = 1' }] } });
+  const suppressed = [];
+  assert.deepEqual(checkTypeFidelity(t, 'The `Color` class holds the palette.', (s) => suppressed.push(s)), []);
+  assert.equal(suppressed.length, 1);
+  assert.equal(suppressed[0].reason, 'class-subkind');
+  assert.equal(suppressed[0].symbol, 'Color');
+});
+
+test('checkTypeFidelity still flags a function described as a class', () => {
+  const t = typedDictTask({ promptContext: { files: [{ path: 'c.py', content: 'def make_color():\n    return 1' }] } });
+  assert.equal(checkTypeFidelity(t, 'The `make_color` class builds colors.').length, 1);
+});
+
+test('checkTypeFidelity still flags an Enum described as a function', () => {
+  const t = typedDictTask({ promptContext: { files: [{ path: 'c.py', content: 'class Color(Enum):\n    RED = 1' }] } });
+  assert.equal(checkTypeFidelity(t, 'The `Color` function builds the palette.').length, 1);
+});
+
 test('checkTypeFidelity does not flag a real class correctly described as a class', () => {
   const t = typedDictTask({ promptContext: { files: [{ path: 'c.py', content: 'class RealClass:\n    pass' }] } });
   assert.deepEqual(checkTypeFidelity(t, 'The `RealClass` class converts inputs.'), []);

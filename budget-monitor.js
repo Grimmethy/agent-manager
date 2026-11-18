@@ -254,14 +254,33 @@ function currentWindowStartMs(lastRateLimit, now) {
 // earlier in its window, not that the cap is lower.
 function estimateBudgetCeiling(allEntries) {
   const windowMs = 5 * 60 * 60 * 1000;
-  const samples = [];
-  for (const entry of allEntries) {
+  // Two-pointer sliding window over a time-sorted copy: O(N log N) for the sort, then a
+  // single O(N) pass. The window for hit `e` is entries with _ts in (e._ts - windowMs, e._ts].
+  // `end` adds entries up to the current hit; `start` drops entries at or before the window
+  // start. Both only move forward because hits are visited in ascending time order.
+  const sorted = [...allEntries].sort((a, b) => a._ts - b._ts);
+  const hitTokens = new Map();
+  let start = 0;
+  let end = 0;
+  let windowTokens = 0;
+  for (const entry of sorted) {
     if (entry.error !== 'rate_limit' && entry.apiErrorStatus !== 429) continue;
     const windowStart = entry._ts - windowMs;
-    const tokens = allEntries
-      .filter((e) => e._ts > windowStart && e._ts <= entry._ts)
-      .reduce((sum, e) => sum + usageTokenCount(e.message?.usage), 0);
-    if (tokens > 0) samples.push({ at: new Date(entry._ts).toISOString(), tokens });
+    while (end < sorted.length && sorted[end]._ts <= entry._ts) {
+      windowTokens += usageTokenCount(sorted[end].message?.usage);
+      end++;
+    }
+    while (start < end && sorted[start]._ts <= windowStart) {
+      windowTokens -= usageTokenCount(sorted[start].message?.usage);
+      start++;
+    }
+    if (windowTokens > 0) hitTokens.set(entry, windowTokens);
+  }
+  // Emit samples in the caller's original order (not the sorted order) so the output is unchanged.
+  const samples = [];
+  for (const entry of allEntries) {
+    const tokens = hitTokens.get(entry);
+    if (tokens !== undefined) samples.push({ at: new Date(entry._ts).toISOString(), tokens });
   }
   if (samples.length === 0) return { ceilingTokens: null, sampleCount: 0, samples: [] };
   const ceilingTokens = Math.max(...samples.map((s) => s.tokens));

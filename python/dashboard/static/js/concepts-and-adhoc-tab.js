@@ -40,7 +40,14 @@ async function renderAdhocTasksTab() {
   });
 }
 
+// Per-concept special panels, keyed by concept ID. Concepts not listed here get no special panel.
+const CONCEPT_CARD_CONFIG = {
+  'concept-ghost-in-the-machine-0dbeea': { ghostTelemetry: true },
+  'concept-adhoc-task-lifecycle-64935e': { lifecycleFlow: true },
+};
+
 function renderConceptCard(concept) {
+  const cardConfig = CONCEPT_CARD_CONFIG[concept.id] || {};
   const isStable = CONCEPT_STABLE_STATUSES.has(concept.status);
   const statusBadge = `<span class="badge ${isStable ? 'ok' : 'idle'}">${escapeHtml(concept.status || 'open')}</span>`;
   const researchChip = concept.researchForkCount > 0
@@ -78,7 +85,7 @@ function renderConceptCard(concept) {
   // clicked Requeue) vs. mechanism recoveries (a watchdog sweep, no one in the loop),
   // plus the count of failure classes that currently have NO deterministic recovery
   // (Part B's ghost-debt register). Lazily hydrated in renderConceptsTab.
-  const ghostPanel = concept.id === 'concept-ghost-in-the-machine-0dbeea'
+  const ghostPanel = cardConfig.ghostTelemetry
     ? `<div class="ghost-telemetry meta" data-ghost-telemetry-for="${escapeAttr(concept.id)}" style="margin-top:6px">Loading requeue telemetry…</div>`
     : '';
   // Adhoc Task Lifecycle (2026-09-27, brain-dump bd-1790466365924): same hardcoded-id
@@ -99,7 +106,7 @@ function renderConceptCard(concept) {
     { label: 'applying', detail: 'apply-task.js: applyTask() → real branch/commit' },
     { label: 'done / blocked', detail: 'status: done (mergedAt set) or blocked (blockedReason set)' },
   ];
-  const lifecyclePanel = concept.id === 'concept-adhoc-task-lifecycle-64935e'
+  const lifecyclePanel = cardConfig.lifecycleFlow
     ? `<div class="meta" style="margin-top:8px;display:flex;flex-wrap:wrap;align-items:center;gap:4px">
         ${LIFECYCLE_STAGES.map((s, i) => `
           <span style="display:inline-block;border:1px solid var(--muted);border-radius:4px;padding:4px 8px;font-size:12px;line-height:1.3">
