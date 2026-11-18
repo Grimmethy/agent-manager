@@ -16,6 +16,7 @@
 const { execFileSync } = require('child_process');
 
 const CHECK_URL = 'https://api.github.com';
+const CHECK_HOST = new URL(CHECK_URL).host;
 const TIMEOUT_SECONDS = 3;
 const CACHE_MS = 30000;
 
@@ -56,4 +57,4 @@ function isOnline({ forceRefresh = false, probe = probeOnce } = {}) {
   return online;
 }
 
-module.exports = { isOnline, probeOnce, CACHE_MS };
+module.exports = { isOnline, probeOnce, CACHE_MS, CHECK_HOST };
