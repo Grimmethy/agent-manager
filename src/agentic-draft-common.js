@@ -25,6 +25,7 @@ const { checkLeftoverReferences, makeGrepBase } = require('./lib/leftover-refere
 const { writeSideFindingInbox } = require('./side-finding.js');
 const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
 const { validProposalFiles } = require('./proposal-files.js');
+const { validateDecomposition } = require('./decomposition-schema.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const { gitTimeoutMs } = require('./lib/git-timeout.js');
@@ -594,6 +595,48 @@ function resolveNoResolutionUnforced(ctx) {
 // for the many case) which the dispatch in resolveAgenticDraft adds. The bodies are
 // the moved inline code verbatim -- no behavior change.
 
+/** Decompose, format failure: the sub-task array failed validateDecomposition. Non-infra: a retryable format block, bounded by decomposeBlockCount. Filters out invalid sub-tasks; dispatches only valid ones if any remain. */
+function resolveDecomposeFormatError(ctx) {
+  const { task, summary, meta, bestEffortDiff, error, subTasks } = ctx;
+  task.formatError = error;
+  task.decomposeBlockCount = (Number(task.decomposeBlockCount) || 0) + 1;
+  task.retryableDraftBlock = true;
+  // Filter sub-tasks: only those with valid title and rawText fields are dispatched.
+  // The validator is all-or-nothing; this pass filters so partial success is possible.
+  const validSubTasks = (subTasks || []).filter((s) => {
+    if (!s || typeof s !== 'object' || Array.isArray(s)) return false;
+    if (typeof s.title !== 'string' || s.title.trim() === '') return false;
+    if (typeof s.rawText !== 'string' || s.rawText.trim() === '') return false;
+    return true;
+  });
+  // If some sub-tasks are valid, dispatch them instead of blocking entirely.
+  if (validSubTasks.length > 0) {
+    task.subTaskProposals = validSubTasks;
+    task.adhocResolution = 'decompose';
+    task.rawDiff = '';
+    task.implementResponse = `${summary}\n\n(NOTE: some sub-tasks were filtered out for missing required fields; only valid ones are being dispatched.)`;
+    return { succeeded: true, blocked: false, ...meta };
+  }
+  // All sub-tasks invalid: emit format reminder for retry through local-client path.
+  // The retry mechanism (local-agentic-write-draft.js) reads this and appends the
+  // reminder to the prompt on the next attempt, bounded by decomposeBlockCount.
+  task.decomposeFormatReminder = 'The decomposition must be a JSON array of objects with non-empty "title" and "rawText" fields. Example: [{"title": "Sub-task title", "rawText": "Description of what to do"}].';
+  // Backstop: if decomposeBlockCount reaches 3, escalate to human instead of looping.
+  if (task.decomposeBlockCount >= 3) {
+    task.adhocResolution = 'needs-human-decision';
+    task.rawDiff = '';
+    task.implementResponse = `${summary}\n\n(Decomposition failed format validation ${task.decomposeBlockCount} times without producing valid sub-tasks -- needs a human to split.)`;
+    return { succeeded: true, blocked: false, needsClarification: true, ...meta };
+  }
+  return {
+    succeeded: true,
+    blocked: true,
+    blockedReason: `format-error: decomposition did not match the required sub-task JSON shape (${error}); retrying with format reminder`,
+    ...meta,
+    capturedDiff: bestEffortDiff(),
+  };
+}
+
 /** Decompose, n === 0: said "split it" but produced no usable sub-task JSON. */
 function resolveDecomposeZero(ctx) {
   const { task, summary, meta, bestEffortDiff } = ctx;
@@ -965,6 +1008,10 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
     // (declared above this function; HUB0080 2/3) so each case is independently
     // testable. `dctx` extends the shared `ctx` with the two values
     // only this branch needs (the zero/one cases never read them).
+    if (n > 0) {
+      const formatCheck = validateDecomposition(subTasks);
+      if (!formatCheck.ok) return resolveDecomposeFormatError({ task, summary, meta, bestEffortDiff, error: formatCheck.error, subTasks });
+    }
     const dctx = { ...ctx, subTasks, resolution };
     switch (n) {
       case 0: return resolveDecomposeZero(dctx);
