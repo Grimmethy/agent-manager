@@ -780,7 +780,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
     if (echoMarkers.has(field)) continue;
     if (templatePlaceholders.has(field)) continue;
     if (isPlatformConstant(field)) continue;
-    if (sourceText.includes(field)) continue;
+    if (sourceText.toLowerCase().includes(field.toLowerCase())) continue;
     if (existsLiterallyInRepo(field, repoRoot, ref)) continue;
     flags.push({ type: 'ungrounded-field', detail: field });
   }
