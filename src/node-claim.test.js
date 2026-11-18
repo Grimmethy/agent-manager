@@ -319,3 +319,26 @@ test('filtered dir: an ineligible copy does not shadow an eligible same-id copy 
   assert.strictEqual(r.repo.root, pipe2);
   assert.deepStrictEqual(skipped, [{ taskId: 'dup-task', reason: 'not-eligible-for-node' }]);
 });
+
+test('claimNext skips a task the claimant node already reported blocked twice, and offers it to another claimant', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'node-claim-blocked-'));
+  const pipelineDir = path.join(dir, 'pipe');
+  fs.mkdirSync(path.join(pipelineDir, 'queue', 'adhoc'), { recursive: true });
+  const env = { HOME: '/nonexistent-home', AGENT_MANAGER_NODES_DIR: path.join(dir, 'nodes'), AGENT_MANAGER_NODE_ID: 'wok' };
+  const record = { id: 'tb1', title: 'tb1', domain: 'adhoc', source: 'manual', history: [{ stage: 'node-blocked grimm' }, { stage: 'node-blocked grimm' }] };
+  fs.writeFileSync(path.join(pipelineDir, 'queue', 'adhoc', 'tb1.json'), JSON.stringify(record));
+  const skipped = [];
+  assert.equal(claimNext({ claimant: 'grimm', pipelineDirs: [pipelineDir], env, skipped }), null);
+  assert.ok(skipped.some((x) => x.taskId === 'tb1' && x.reason === 'node-blocked-twice'));
+  const other = claimNext({ claimant: 'other-node', pipelineDirs: [pipelineDir], env });
+  assert.equal(other.task.id, 'tb1');
+});
+
+test('claimNext still offers a task the claimant node reported blocked only once', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'node-claim-blocked1-'));
+  const pipelineDir = path.join(dir, 'pipe');
+  fs.mkdirSync(path.join(pipelineDir, 'queue', 'adhoc'), { recursive: true });
+  const env = { HOME: '/nonexistent-home', AGENT_MANAGER_NODES_DIR: path.join(dir, 'nodes'), AGENT_MANAGER_NODE_ID: 'wok' };
+  fs.writeFileSync(path.join(pipelineDir, 'queue', 'adhoc', 'tb2.json'), JSON.stringify({ id: 'tb2', title: 'tb2', domain: 'adhoc', source: 'manual', history: [{ stage: 'node-blocked grimm' }] }));
+  assert.equal(claimNext({ claimant: 'grimm', pipelineDirs: [pipelineDir], env }).task.id, 'tb2');
+});

@@ -97,7 +97,8 @@ function validateStatusBody(body) {
 // Detects where a task is in the pipeline without modifying anything.
 // 'in-progress' = record is in queue/adhoc, pending, drafting, review, approved, node-outbox or coordinating.
 // 'merged' = record is in queue/done with mergedAt, OR history has applied stage and branch is ancestor of origin/<base>.
-// 'unknown' = anything else.
+// 'blocked' = record is in queue/blocked or queue/needs-clarification (and is not merged): the node cannot go on with it, so wok should take it back.
+// 'unknown' = anything else (awaiting-confirm, absent).
 function detectTaskState(taskId, pipelineDir, gitFn, repoDir = process.cwd(), { env = process.env, baseGitFn = defaultBaseGitFn } = {}) {
   const queueDir = path.join(pipelineDir, 'queue');
   const inProgressStates = ['adhoc', 'pending', 'drafting', 'review', 'approved', 'node-outbox', 'coordinating'];
@@ -126,7 +127,25 @@ function detectTaskState(taskId, pipelineDir, gitFn, repoDir = process.cwd(), { 
     const base = resolveBase(repo, env, baseGitFn);
     try { if (gitFn(applied.detail, `origin/${base}`, repo)) return 'merged'; } catch (e) { /* not merged */ }
   }
+  if (recordState === 'blocked' || recordState === 'needs-clarification') return 'blocked';
   return 'unknown';
+}
+
+// The reason a task sits in queue/blocked or queue/needs-clarification on this node: the record's blockedReason (blocked) or its
+// needs-clarification openQuestions, trimmed and capped at MAX_REASON_CHARS; '' when there is none or the record cannot be read.
+const MAX_REASON_CHARS = 300;
+function blockedReasonOf(taskId, pipelineDir) {
+  for (const state of ['blocked', 'needs-clarification']) {
+    const file = path.join(pipelineDir, 'queue', state, `${taskId}.json`);
+    if (!fs.existsSync(file)) continue;
+    try {
+      const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const nc = record && record.needsClarification && typeof record.needsClarification === 'object' ? record.needsClarification.openQuestions : '';
+      const raw = (record && typeof record.blockedReason === 'string' && record.blockedReason) || (typeof nc === 'string' ? nc : '');
+      return raw.replace(/\s+/g, ' ').trim().slice(0, MAX_REASON_CHARS);
+    } catch (e) { return ''; }
+  }
+  return '';
 }
 
 // Runs one read-only git command in repoDir and returns its trimmed stdout, or '' when git fails. Never fetches, checks out or writes.
@@ -200,10 +219,12 @@ function createServer({ env = process.env, gitFn, repoDir = process.cwd() } = {}
     if (!validation.ok) return send(res, validation.status, { ok: false, error: validation.error });
     const git = typeof gitFn === 'function' ? gitFn : defaultGitFn;
     const tasks = {};
+    const reasons = {};
     for (const taskId of payload.taskIds) {
       tasks[taskId] = detectTaskState(taskId, pipelineDir, git, repoDir, { env });
+      if (tasks[taskId] === 'blocked') reasons[taskId] = blockedReasonOf(taskId, pipelineDir);
     }
-    return send(res, 200, { ok: true, tasks });
+    return send(res, 200, { ok: true, tasks, reasons });
   };
 
   const routes = {
@@ -248,4 +269,4 @@ if (require.main === module) {
   server.listen(port, host, () => process.stdout.write(`node intake listening on ${host}:${port}\n`));
 }
 
-module.exports = { createServer, normalizeIp, bearer, sameToken, writeAdhoc, TASK_ID_RE, MAX_BODY_BYTES, validateStatusBody, detectTaskState, defaultGitFn, resolveBase, defaultBaseGitFn };
+module.exports = { createServer, blockedReasonOf, normalizeIp, bearer, sameToken, writeAdhoc, TASK_ID_RE, MAX_BODY_BYTES, validateStatusBody, detectTaskState, defaultGitFn, resolveBase, defaultBaseGitFn };

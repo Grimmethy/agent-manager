@@ -109,14 +109,34 @@ test('applied history with an ancestor branch answers merged, otherwise unknown'
   assert.ok(seen.some((c) => c.branch === 'agent/t-yes' && c.base.startsWith('origin/')));
 });
 
-test('blocked, needs-clarification and awaiting-confirm answer unknown', async (t) => {
+test('blocked and needs-clarification answer blocked with the node\'s reason, awaiting-confirm answers unknown', async (t) => {
   const { pipelineDir, server } = setup(t);
-  const states = ['blocked', 'needs-clarification', 'awaiting-confirm'];
-  states.forEach((s) => put(pipelineDir, s, `t-${s}`));
+  put(pipelineDir, 'blocked', 't-blocked', { blockedReason: 'draft call failed 5 times in a row\n(HTTP 429)' });
+  put(pipelineDir, 'needs-clarification', 't-nc', { needsClarification: { reason: 'design-decision', openQuestions: 'Which matcher?' } });
+  put(pipelineDir, 'awaiting-confirm', 't-await');
   const port = await serve(t, server);
-  const ids = states.map((s) => `t-${s}`);
-  const res = await post(port, { taskIds: ids });
-  for (const id of ids) assert.equal(res.body.tasks[id], 'unknown', id);
+  const res = await post(port, { taskIds: ['t-blocked', 't-nc', 't-await'] });
+  assert.deepEqual(res.body.tasks, { 't-blocked': 'blocked', 't-nc': 'blocked', 't-await': 'unknown' });
+  assert.deepEqual(res.body.reasons, { 't-blocked': 'draft call failed 5 times in a row (HTTP 429)', 't-nc': 'Which matcher?' });
+});
+
+test('a blocked record whose applied branch is already merged still answers merged', async (t) => {
+  const { pipelineDir, server } = setup(t, () => true);
+  put(pipelineDir, 'blocked', 't-late', { blockedReason: 'x', history: [{ stage: 'applied', detail: 'agent/t-late' }] });
+  const port = await serve(t, server);
+  const res = await post(port, { taskIds: ['t-late'] });
+  assert.deepEqual(res.body.tasks, { 't-late': 'merged' });
+  assert.deepEqual(res.body.reasons, {});
+});
+
+test('a blocked reason is capped at 300 characters and a blocked record with no reason gives an empty string', async (t) => {
+  const { pipelineDir, server } = setup(t);
+  put(pipelineDir, 'blocked', 't-long', { blockedReason: 'y'.repeat(900) });
+  put(pipelineDir, 'blocked', 't-none');
+  const port = await serve(t, server);
+  const res = await post(port, { taskIds: ['t-long', 't-none'] });
+  assert.equal(res.body.reasons['t-long'].length, 300);
+  assert.equal(res.body.reasons['t-none'], '');
 });
 
 test('a mix of states answers each id, and an absent id is unknown', async (t) => {
