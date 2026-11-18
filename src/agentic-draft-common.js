@@ -211,6 +211,9 @@ const MISSING_TARGET_SIGNALS = [
   /requested path.*not found in/i,
   /target\s+\S+\s+does not exist/i,
   /the\s+\S+\s+branch does not exist/i,
+  /not registered as an accessible root/i,
+  /is not accessible from this session/i,
+  /list_roots returned only the primary root/i,
 ];
 
 function detectMissingTargetReport(summary) {
