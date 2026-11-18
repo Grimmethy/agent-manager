@@ -3,7 +3,32 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock, detectContradictoryLiteralAcceptance, declaredEditFiles, dropSingleFileScopeContradictions } = require('./acceptance-criteria.js');
+const { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock, detectContradictoryLiteralAcceptance, declaredEditFiles, dropSingleFileScopeContradictions, shouldSkipPlanStage } = require('./acceptance-criteria.js');
+
+test('shouldSkipPlanStage: bugfix with file, symbol, and contextual "near line 88" does NOT skip', () => {
+  const r = shouldSkipPlanStage({ acceptanceCriteria: [
+    'Fix the off-by-one in `parseRange` in `src/acceptance-criteria.js` near line 88',
+    'keep `resolveAcceptanceCriteria` normalizing lists',
+  ] });
+  assert.equal(r.skip, false);
+  assert.match(r.reason, /insertion point/);
+});
+
+test('shouldSkipPlanStage: directive file + symbol + insert-after-line spec skips', () => {
+  const r = shouldSkipPlanStage({ acceptanceCriteria: [
+    'Insert after line 120 in `src/acceptance-criteria.js` the function `shouldSkipPlanStage` that returns the gate result',
+  ] });
+  assert.equal(r.skip, true);
+  assert.equal(r.matched.file, 'src/acceptance-criteria.js');
+  assert.equal(r.matched.symbol, 'shouldSkipPlanStage');
+});
+
+test('shouldSkipPlanStage: file and symbol without an insertion point does NOT skip', () => {
+  const r = shouldSkipPlanStage({ acceptanceCriteria: [
+    'Add to `src/acceptance-criteria.js` a `shouldSkipPlanStage` export',
+  ] });
+  assert.equal(r.skip, false);
+});
 const { runAcceptanceCommand } = require('./acceptance-command-gate.js');
 
 test('resolveAcceptanceCriteria: promptContext array', () => {

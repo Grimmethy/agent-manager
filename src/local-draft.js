@@ -40,7 +40,7 @@ const path = require('path');
 const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt } = require('./prompts.js');
 const { buildPlanGrounding } = require('./plan-grounding.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
-const { resolveAcceptanceCriteria, parseCriteriaBlock } = require('./acceptance-criteria.js');
+const { resolveAcceptanceCriteria, parseCriteriaBlock, shouldSkipPlanStage } = require('./acceptance-criteria.js');
 const { filterCriteriaForSandbox } = require('./lib/draft-sandbox.js');
 const { runOrientPass } = require('./orient-pass.js');
 const { runPlanCritique } = require('./plan-critique.js');
@@ -954,12 +954,50 @@ function skipPlanForDeterministicChecklist(task, attempt) {
   return true;
 }
 
+// shouldSkipPlanStage gate (acceptance-criteria.js): an adhoc task whose own criteria name the
+// file, symbol, and insertion point skips the plan model call; the criteria become the plan.
+// Every skip is appended to logs/stage-skips.jsonl.
+function recordStageSkip(task, gate) {
+  const fs = require('fs');
+  const path = require('path');
+  const logFile = path.join(getConfig().repoRoot, 'logs', 'stage-skips.jsonl');
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  const acceptanceCriteria = task.acceptanceCriteria != null
+    ? task.acceptanceCriteria
+    : ((task.promptContext && task.promptContext.acceptanceCriteria) || null);
+  fs.appendFileSync(logFile, JSON.stringify({
+    at: new Date().toISOString(),
+    taskId: task.taskId || task.id || null,
+    debriefTaskId: task.debriefTaskId || null,
+    reason: gate.reason,
+    matched: gate.matched,
+    acceptanceCriteria,
+  }) + '\n');
+}
+
+function skipPlanForSpecifiedAcceptance(task, attempt) {
+  if (resolveSourceName(task) !== 'adhoc' || task._planCritiqueRevised) return false;
+  const gate = shouldSkipPlanStage(task);
+  if (!gate.skip) return false;
+  const { criteria } = resolveAcceptanceCriteria(task);
+  if (!criteria.length) return false;
+  recordStageSkip(task, gate);
+  const text = `CRITERIA:\n${criteria.map((c) => `- ${c}`).join('\n')}`;
+  task.planResponse = capPlanForTask(task, text, appendHistoryEvent);
+  task.lastGoodPlan = text;
+  applyPlanAcceptanceCriteria(task);
+  recordPlan(attempt, { text, seededFromPrior: false });
+  appendHistoryEvent(task, 'plan-done', `skipped plan pass: acceptance criteria already name ${gate.matched.file} / ${gate.matched.symbol} / ${gate.matched.insertion}`);
+  return true;
+}
+
 async function runPlanPass(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
   runOrientPassFn = runOrientPass, recordModelCall,
 }) {
   if (reusePriorPlanForContinuation(task, attempt)) return { blocked: false };
   if (skipPlanForDeterministicChecklist(task, attempt)) return { blocked: false };
+  if (skipPlanForSpecifiedAcceptance(task, attempt)) return { blocked: false };
   // Plan-cap context derived once per pass and threaded to every plan write site below.
   const { ruleId, expectedDisposition } = derivePlanCapContext(task);
   // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma

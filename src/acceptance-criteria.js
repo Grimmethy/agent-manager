@@ -199,4 +199,51 @@ function detectContradictoryLiteralAcceptance(task) {
   };
 }
 
-module.exports = { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock, normalizeList, MAX_CRITERIA, detectContradictoryLiteralAcceptance, declaredEditFiles, dropSingleFileScopeContradictions };
+// shouldSkipPlanStage (pure: no I/O, no model call). Returns skip:true only when the task's
+// own acceptance criteria name (a) a target file in directive form ("in", "modify",
+// "add to", "insert into"), (b) a symbol in backticks or as "function `X`"/"method `X`", and
+// (c) an insertion point in directive form ("insert after/before line N" or "L120-140").
+// Contextual mentions such as "near line 88" do not count, so bugfix-style criteria still
+// reach the plan stage.
+const SKIP_PATH_TOKEN = '(?:[\\w.@-]+(?:\\/[\\w.@-]+)+|[\\w-]+\\.(?:js|ts|jsx|tsx|py|sh|go|rb|rs|java))';
+const SKIP_FILE_RE = new RegExp('\\b(?:in|modify|add to|insert into)\\s+[`\'"]?(' + SKIP_PATH_TOKEN + ')[`\'"]?', 'i');
+const SKIP_SYMBOL_RE = /(?:\b(?:function|method)\s+)`([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\(?\)?`|`([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\(?\)?`/g;
+const SKIP_NOT_SYMBOL_RE = /\.(?:js|ts|jsx|tsx|py|sh|go|rb|rs|java|json|md)$/i;
+const SKIP_INSERT_RE = /\binsert\s+(?:after|before)\s+line\s+\d+\b|\bL\d+\s*-\s*L?\d+\b/i;
+
+function shouldSkipPlanStage(task) {
+  const raw = task && task.acceptanceCriteria != null
+    ? task.acceptanceCriteria
+    : (task && task.promptContext ? task.promptContext.acceptanceCriteria : null);
+  const criteria = normalizeList(raw);
+  let file = null;
+  let symbol = null;
+  let insertion = null;
+  for (const c of criteria) {
+    if (!file) {
+      const m = c.match(SKIP_FILE_RE);
+      if (m) file = m[1];
+    }
+    if (!symbol) {
+      for (const m of c.matchAll(SKIP_SYMBOL_RE)) {
+        const s = m[1] || m[2];
+        if (s && !SKIP_NOT_SYMBOL_RE.test(s)) { symbol = s; break; }
+      }
+    }
+    if (!insertion) {
+      const m = c.match(SKIP_INSERT_RE);
+      if (m) insertion = m[0];
+    }
+  }
+  const matched = { file, symbol, insertion };
+  const missing = [];
+  if (!file) missing.push('target file (directive form)');
+  if (!symbol) missing.push('named symbol');
+  if (!insertion) missing.push('insertion point or line range (directive form)');
+  if (missing.length) {
+    return { skip: false, reason: `missing: ${missing.join(', ')}`, matched };
+  }
+  return { skip: true, reason: 'acceptance criteria name the file, symbol, and insertion point', matched };
+}
+
+module.exports = { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock, normalizeList, MAX_CRITERIA, detectContradictoryLiteralAcceptance, declaredEditFiles, dropSingleFileScopeContradictions, shouldSkipPlanStage };
