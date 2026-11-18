@@ -195,6 +195,7 @@ finding from here before re-deriving it from scratch.
 | Reviewing an unmerged branch (hub membership, sibling sub-tasks) | `docs/agents/unmerged-branch-review.md` |
 | Enabling and operating the cloud lane (Claude Haiku through the cloud-providers gateway: billing, spend cap, what it skips) | `docs/agents/cloud-lane.md` |
 | Designing a scheduled / employee-style agent, a daily list, or a held-outbound rule (and which repo owns each pattern) | `docs/agents/business-agent-patterns.md` |
+| Pressure-testing an AGENTS.md / CLAUDE.md rule with adversarial subagent scenarios, and logging whether it held | `docs/agents/pressure-test-rules.md` |
 
 ## Known gaps
 
