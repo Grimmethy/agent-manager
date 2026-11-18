@@ -157,6 +157,17 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
 
   const { sourceEligibleHere, activeRepoIsCore } = require('./lib/source-scope.js');
   const coreActive = activeRepoIsCore();
+  // Core gate: a scope:'core' source (a pipeline self-audit) audits agent-manager itself; on any other project it is not claimable,
+  // even if one is already sitting in pending/ (src/lib/source-scope.js). Returns null (no state touched) when the candidate is blocked.
+  // resolveSourceName() covers aliases (deadcode_triage -> unused_export). An unresolvable source is not gated.
+  const coreGate = (t) => {
+    if (!t) return true; // unreadable task -- not gated here
+    try {
+      const entry = getRegisteredSource(resolveSourceName(t));
+      if (entry && entry.scope === 'core' && !sourceEligibleHere({ scope: 'core' }, coreActive)) return null;
+    } catch (_) { /* unresolvable source -- not gated */ }
+    return t;
+  };
   // Lane avoidance (premium-rotation.js): how many lanes exist decides whether a task may skip one. 0 on any error = never skip.
   let laneCount = 0;
   // This instance's own lane definition, for the task-class allowlist below (null for a non-lane instance, or on any error = unrestricted).
@@ -191,6 +202,10 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
       pinned.push({ name, mtimeMs, premium });
       continue;
     }
+
+    // Core gate runs before lane avoidance / reservation (auditReservation writes), so a blocked core task causes no state write.
+    // An explicit operator pin (handled above) still wins.
+    if (coreGate(task) === null) continue;
 
     // A task that degenerated on THIS lane (task.avoidLanes, stamped by reject-retry-check.js) is left to another lane while one exists.
     // An explicit pin to this lane was handled above and still wins.
@@ -256,13 +271,6 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
         if (routing.cfg.mode === 'enforce') continue;
       }
     }
-
-    // A scope:'core' source (a pipeline self-audit) audits agent-manager itself; on any other project it is
-    // not claimable, even if one is already sitting in pending/ (src/lib/source-scope.js). An explicit
-    // operator pin (handled above) still wins.
-    try {
-      if (task && !sourceEligibleHere(getRegisteredSource(resolveSourceName(task)), coreActive)) continue;
-    } catch (_) { /* unresolvable source -- not gated */ }
 
     // Within one source-priority band, order a live hub's children by their owning hub's
     // key (explicit hubPriority asc, then hub createdAt asc) so this path can't contradict
