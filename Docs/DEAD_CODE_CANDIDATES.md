@@ -27,3 +27,21 @@ Replace line 33 with a literal regex: `const CAUSE_RE = /CAUSE:\s*(transient-inf
 
 Benefits:
 Eliminates a misleading constant that future readers may assume is an exported API. Also sidesteps the subtle `\b` fragility noted in the analysis (hyphens are word characters in JS regex), since the literal form is easier to audit and, if the vocabulary ever grows, simpler to swap to a negative-lookahead pattern without re-introducing a dead intermediate array.
+
+### AC-3 · Remove unused CONCEPT_BUILD_INSTRUCTION export from src/concepts.js
+Strength: Strong
+Files: src/concepts.js
+Symbol: CONCEPT_BUILD_INSTRUCTION
+
+Problem:
+The string constant `CONCEPT_BUILD_INSTRUCTION` (lines 241-247) is exported on line 280 but never consumed by any importer. A full grep across the codebase found zero references to this symbol by name, confirming it is dead code. The constant is only used internally on line 254 within `injectConceptBuildInstruction`, which is the proper API surface -- consumers don't need the raw string. The barrel export pattern here is just "export everything" rather than "export everything consumers need."
+
+Solution:
+Remove `CONCEPT_BUILD_INSTRUCTION,` from the `module.exports` object on line 280 in src/concepts.js. Keep the constant definition (lines 241-247) and the `injectConceptBuildInstruction` function (lines 251-255) since they are used internally. No changes to any importer are needed since none reference this symbol by name.
+
+Benefits:
+Removing this export eliminates dead code from the public API surface, reducing confusion for future readers who might wonder why the raw string is exposed when only the injection function is needed. It also prevents potential misuse where a consumer might hardcode the string instead of using the injection function, which handles deduplication logic (line 253 checks for existing markers).
+
+---
+
+**VERDICT: GENUINE -- safe to remove.**
