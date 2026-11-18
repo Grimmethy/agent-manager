@@ -3450,6 +3450,7 @@ from routes.needswork_worker import needswork_worker_bp  # noqa: E402
 from routes.pipeline_ops_workers import pipeline_ops_workers_bp  # noqa: E402
 from routes.context_worker import context_worker_bp  # noqa: E402
 from routes.event_stream import event_stream_bp  # noqa: E402
+from routes.new_task import new_task_bp  # noqa: E402
 
 app.register_blueprint(reports_bp)
 app.register_blueprint(event_stream_bp)
@@ -3479,6 +3480,7 @@ app.register_blueprint(task_anywhere_other_pipelines_bp)
 app.register_blueprint(pipeline_1_more_bp)
 app.register_blueprint(branch_verdicts_bp)
 app.register_blueprint(plugins_bp)
+app.register_blueprint(new_task_bp)
 app.register_blueprint(cloud_meter_bp)
 app.register_blueprint(cloud_dial_bp)
 app.register_blueprint(stalled_worker_bp)
