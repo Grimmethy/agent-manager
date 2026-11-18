@@ -623,6 +623,7 @@ const TOOLS = [
           state: { type: 'string', description: 'Optional: scope the search to one location -- a QUEUE_STATES name (pending, review, approved, blocked, done, needs-clarification, awaiting-confirm, coordinating), "adhoc", "drafting" (every worker lane), or "drafting:<lane>" for one lane. Omit to search everywhere live.' },
           includeArchived: { type: 'boolean', description: 'Also search done/_archived*/ (every dated month) -- slower, only needed for an old/completed task search.' },
           project: { type: 'string', description: 'Label or repo root of the project whose queue to search (from list_projects), or "all" to search every registered project (each hit is tagged with its project); omit for agent-manager itself.' },
+          source: { type: 'string', description: 'Optional: only return tasks whose source field matches this value.' },
         },
         required: ['query'],
       },
@@ -666,7 +667,7 @@ function buildToolHandlers(allowedRoots, pipelineDir, readOnlyRoots = []) {
       return t.error ? { error: t.error } : readTaskTool(t.pipelineDir, { taskId: args.taskId, section: args.section, offset: args.offset, limit: args.limit });
     },
     search_tasks: (args) => {
-      const search = { query: args.query, state: args.state, includeArchived: args.includeArchived };
+      const search = { query: args.query, state: args.state, includeArchived: args.includeArchived, source: args.source };
       if (typeof args.project === 'string' && args.project.trim().toLowerCase() === 'all') return searchTasksAllProjects(search);
       const t = pipelineFor(args.project, { pipelineDir });
       return t.error ? { error: t.error } : searchTasksTool(t.pipelineDir, search);
