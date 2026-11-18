@@ -552,6 +552,16 @@ async function reviewTask(task, opts = {}) {
   const result = await runReview(task, opts);
   if (result && result.succeeded && (result.verdict === 'approved' || result.verdict === 'blocked')) {
     task.status = result.verdict;
+    if (result.verdict === 'approved') {
+      // A later approving review supersedes any stale block left by an earlier cycle: capture
+      // the old block before clearing it, then record the unblock in the task history.
+      const hadBlock = task.blockedReason != null || task.blockedStage != null || task.blockedAt != null;
+      const oldReason = task.blockedReason;
+      delete task.blockedReason;
+      delete task.blockedStage;
+      delete task.blockedAt;
+      if (hadBlock) appendHistoryEvent(task, 'unblocked-by-review', String(oldReason ?? '').slice(0, 120));
+    }
   }
   return result;
 }
