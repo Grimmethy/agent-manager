@@ -369,10 +369,17 @@ def api_task_rereview(state, task_id):
         abort(400, description="only a blocked or needs-clarification task can be re-reviewed")
     body = request.get_json(silent=True) or {}
     reason = (body.get("reason") or "").strip() or "re-review requested from the dashboard"
+    qdir, scope = _qdir_for_request(body)
+    if not qdir:
+        abort(404)
+    project = (scope or {}).get("label") or request.args.get("project") or body.get("project")
     script = PACKAGE_ROOT / "src" / "rereview-task.js"
+    cmd = ["node", str(script), task_id, "--state", state, "--reason", reason]
+    if project:
+        cmd += ["--pipeline-dir", str(qdir.parent), "--project", str(project)]
     try:
         cp = subprocess.run(
-            ["node", str(script), task_id, "--state", state, "--reason", reason],
+            cmd,
             capture_output=True, text=True, timeout=30,
             env={**os.environ, **read_env_file(ENV_FILE_PATH)},
         )
@@ -390,10 +397,11 @@ def api_task_staleness_keep(state, task_id):
     task is still valid. Clears the flag and writes a `stalenessKeep` cooldown so the sweep
     does not re-flag it for AGENT_MANAGER_STALENESS_COOLDOWN_DAYS (default 21). The task
     stays exactly where it is -- this only affects the flag."""
-    from app import queue_dir
+    body = request.get_json(silent=True) or {}
     if state not in ("blocked", "needs-clarification"):
         abort(400, description="staleness flags only exist on blocked / needs-clarification tasks")
-    qdir = queue_dir()
+    qdir, scope = _qdir_for_request(body)
+    project = (scope or {}).get("label") or request.args.get("project") or body.get("project")
     if not qdir:
         abort(404)
     src = qdir / state / f"{task_id}.json"
@@ -409,7 +417,7 @@ def api_task_staleness_keep(state, task_id):
     data["stalenessKeep"] = {"until": until.isoformat(), "by": "human", "at": datetime.now(timezone.utc).isoformat()}
     data.setdefault("history", []).append({
         "stage": "advisory", "at": datetime.now(timezone.utc).isoformat(),
-        "detail": f"staleness flag dismissed by a human -- keep until {until.date().isoformat()}",
+        "detail": f"staleness flag dismissed by a human -- keep until {until.date().isoformat()}" + (f" (project {project})" if project else ""),
     })
     src.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return jsonify({"id": task_id, "kept": True, "until": until.isoformat()})
@@ -422,10 +430,11 @@ def api_task_context_trim_keep(state, task_id):
     flag and writes a `contextTrimKeep` cooldown so the sweep does not re-flag it for
     AGENT_MANAGER_CONTEXT_TRIM_SWEEP_KEEP_COOLDOWN_DAYS (default 21). The task stays exactly
     where it is -- this only affects the flag, same as staleness-keep above."""
-    from app import queue_dir
+    body = request.get_json(silent=True) or {}
     if state != "blocked":
         abort(400, description="context-trim flags only exist on blocked tasks")
-    qdir = queue_dir()
+    qdir, scope = _qdir_for_request(body)
+    project = (scope or {}).get("label") or request.args.get("project") or body.get("project")
     if not qdir:
         abort(404)
     src = qdir / state / f"{task_id}.json"
@@ -441,7 +450,7 @@ def api_task_context_trim_keep(state, task_id):
     data["contextTrimKeep"] = {"until": until.isoformat(), "by": "human", "at": datetime.now(timezone.utc).isoformat()}
     data.setdefault("history", []).append({
         "stage": "advisory", "at": datetime.now(timezone.utc).isoformat(),
-        "detail": f"context-trim flag dismissed by a human -- keep until {until.date().isoformat()}",
+        "detail": f"context-trim flag dismissed by a human -- keep until {until.date().isoformat()}" + (f" (project {project})" if project else ""),
     })
     src.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return jsonify({"id": task_id, "kept": True, "until": until.isoformat()})

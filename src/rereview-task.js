@@ -43,7 +43,7 @@ function isRereviewable(task) {
   return !!task && task.blockedStage === 'review' && hasDraft(task);
 }
 
-async function rereviewTask({ pipelineDir, taskId, state, reason, repoRoot, actor = 'operator-manual' }) {
+async function rereviewTask({ pipelineDir, taskId, state, reason, repoRoot, project, actor = 'operator-manual' }) {
   if (!pipelineDir || !taskId) return { ok: false, error: 'rereviewTask requires pipelineDir and taskId' };
   const states = state ? [state] : REREVIEWABLE_STATES;
   if (state && !REREVIEWABLE_STATES.includes(state)) {
@@ -78,7 +78,8 @@ async function rereviewTask({ pipelineDir, taskId, state, reason, repoRoot, acto
   const priorReason = task.blockedReason;
   for (const f of STALE_REVIEW_FIELDS) delete task[f];
   task.status = 'needs-review';
-  appendHistoryEvent(task, 'requeued', `re-review: ${why} -- draft kept, sent back to queue/review/ (no redraft)`);
+  const projectNote = project ? ` (project ${project})` : '';
+  appendHistoryEvent(task, 'requeued', `re-review: ${why}${projectNote} -- draft kept, sent back to queue/review/ (no redraft)`);
   try {
     await classifyRequeue(task, { reasonHint: `re-review: ${why}${priorReason ? ` (was: ${String(priorReason).slice(0, 160)})` : ''}`, blockedStage: 'review', requeueWriter: 'rereview-task', actor, repoRoot, skipFallbackModel: true });
   } catch { /* attribution must never block a real requeue */ }
@@ -88,7 +89,7 @@ async function rereviewTask({ pipelineDir, taskId, state, reason, repoRoot, acto
   fs.writeFileSync(tmp, JSON.stringify(task, null, 2));
   fs.renameSync(tmp, dest);
   fs.unlinkSync(src);
-  return { ok: true, id: taskId, from, to: 'review', path: dest };
+  return { ok: true, id: taskId, from, to: 'review', path: dest, project: project || null };
 }
 
 function parseArgs(argv) {
@@ -96,20 +97,24 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--state') out.state = argv[++i];
     else if (argv[i] === '--reason') out.reason = argv[++i];
+    else if (argv[i] === '--pipeline-dir') out.pipelineDir = argv[++i];
+    else if (argv[i] === '--project') out.project = argv[++i];
     else if (!out.taskId) out.taskId = argv[i];
   }
   return out;
 }
 
 async function main() {
-  const { taskId, state, reason } = parseArgs(process.argv.slice(2));
+  const parsed = parseArgs(process.argv.slice(2));
+  const { taskId, state, reason } = parsed;
   if (!taskId) {
     process.stdout.write(`${JSON.stringify({ ok: false, error: 'Usage: node rereview-task.js <taskId> [--state s] [--reason why]' })}\n`);
     process.exit(1);
   }
   const { getConfig } = require('./config.js');
-  const { pipelineDir, repoRoot } = getConfig();
-  const result = await rereviewTask({ pipelineDir, taskId, state, reason, repoRoot });
+  const cfg = getConfig();
+  const pipelineDir = parsed.pipelineDir || cfg.pipelineDir;
+  const result = await rereviewTask({ pipelineDir, taskId, state, reason, repoRoot: cfg.repoRoot, project: parsed.project });
   process.stdout.write(`${JSON.stringify(result)}\n`);
   if (!result.ok) process.exit(2);
 }
