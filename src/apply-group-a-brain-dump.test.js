@@ -99,6 +99,41 @@ test('applyBrainDumpSort stale no-op: status moved off captured since drafting -
   assert.equal(entries[0].sortAttempt, undefined);
 });
 
+test('applyBrainDumpSort stale no-op: actioned entry with sortAttempt 0 -> no research or adhoc queueing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-stale-actioned-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  const pipelineDir = path.join(dir, 'pipeline');
+  fs.mkdirSync(pipelineDir, { recursive: true });
+  const brainDumpEntryId = 'bd-act';
+  const brainDumpPath = writeBrainDump(dir, [
+    { id: brainDumpEntryId, capturedAt: '2026-07-22T00:00:00.000Z', rawText: 'original', status: 'actioned', sortAttempt: 0 },
+  ]);
+
+  // Drafted against 'original' while the entry was still 'captured'; the entry has since been actioned.
+  const task = { promptContext: { brainDumpEntryId, rawText: 'original' } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.stale, true);
+  assert.equal(result.success, false);
+  assert.equal(result.researchQueued, undefined);
+  assert.equal(result.queuedTaskId, undefined);
+
+  // Neither the research write path (queueResearchTask) nor any adhoc/derived/needs-clarification path may write.
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue')), false, 'no queue directory written under pipelineDir');
+  for (const sub of ['research', 'adhoc', 'derived', 'needs-clarification']) {
+    assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', sub)), false, `no queue/${sub} written`);
+  }
+  assert.equal(fs.existsSync(secondBrainDir), false, 'no note filed');
+
+  // Entry left exactly as-is: still actioned, sortAttempt unchanged, no queuedTaskId written.
+  const saved = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0];
+  assert.equal(saved.status, 'actioned');
+  assert.equal(saved.sortAttempt, 0);
+  assert.equal(saved.queuedTaskId, undefined);
+});
+
 // 2026-09-16, pipeline hardening (brain_dump_sort possibleDuplicateOf false matches):
 // applyBrainDumpSort's guard (apply-group-a-brain-dump.js) nulls result.possibleDuplicateOf
 // BEFORE the duplicate-gate routing whenever the classifier's claimed title matches NOTHING
