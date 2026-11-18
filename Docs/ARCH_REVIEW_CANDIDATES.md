@@ -3389,3 +3389,46 @@ Benefits:
 Failures become visible at initialization rather than manifesting as silent downstream errors. Clearer documentation of the gitRunner contract through explicit interface definitions. Easier to identify when a gitRunner implementation is incompatible. Reduced risk of silent data loss or corruption from missing quarantine functionality.
 
 NOTE: AC-003 was removed entirely because it was based on a fundamental misunderstanding — it conflated signature production functions (`signatureForTask`, `signatureForClarificationTask`) with signature parsing logic, and misattributed the actual parsing duplication to `blocked-drain.js` when it resides in `pipeline-self-audit.js` (already covered by AC-243 in the existing candidates tail).
+
+### AC-812 · `fetchJson` is tightly coupled to `Date.now()` with no time override
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+
+Problem:
+The `fetchJson` function calls `Date.now()` directly for cache expiration logic, with no injectable clock or time override. This makes the cache behavior deterministic only relative to the wall clock, which cannot be controlled in tests. Test code must monkey-patch `ctx.Date = { now: () => clock.t }` after loading the script, a fragile workaround that couples test infrastructure to an implementation detail and makes cache expiration hard to test deterministically.
+
+Solution:
+Extract a `now` parameter into `fetchJson` (defaulting to `Date.now` for backward compatibility) so that cache expiration is driven by an injectable clock. This makes the time dependency explicit in the function signature and allows tests to use a fake clock without mutating globals.
+
+Benefits:
+The cache expiration logic becomes testable without global mutation. The function's dependency on time becomes part of its public contract. Future changes to cache behavior (e.g., adding a `maxAge` parameter) are easier to reason about when the time source is explicit.
+
+---
+
+### AC-813 · `core-ui.js` is a monolithic file with many unrelated concerns
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+
+Problem:
+`core-ui.js` bundles fetch wrapping, concurrency guarding, stale-render detection, tab switching, adhoc task rendering, dashboard refresh, navigation ordering, navigation rendering, and fetch dedupe/failure memory into a single file. The test comments describe it as "a plain global <script> with no module system, DOM calls throughout, and heavy fetch/localStorage/document usage," which is a classic monolithic code smell. This makes the file hard to navigate, hard to test in isolation, and hard to reason about because every change touches a file with many responsibilities.
+
+Solution:
+Split `core-ui.js` into smaller, focused modules (e.g., `fetch-json.js`, `tab-switcher.js`, `nav-order.js`, `render.js`) and have `core-ui.js` re-export the public API. This localizes each concern to its own file and makes the dependencies between concerns explicit.
+
+Benefits:
+Each concern can be tested in isolation without mocking unrelated functionality. Changes to one concern (e.g., fetch dedupe) no longer risk breaking unrelated concerns (e.g., tab switching). New contributors can focus on one file at a time instead of navigating a large, multi-responsibility file.
+
+---
+
+### AC-814 · `fetchJson` is not exported, forcing test workarounds
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+
+Problem:
+`fetchJson` is defined inside `core-ui.js` but is not part of its public API, which is a sign that it is an internal helper that got too complex to test in isolation. The test has to load the entire `core-ui.js` into a vm context just to test `fetchJson`, which is a workaround that couples the test to the module's internal structure. This also suggests that `fetchJson` is used by other modules in `core-ui.js` but is not meant to be used by external consumers, which is a design smell.
+
+Solution:
+If `fetchJson` is used by other modules in `core-ui.js`, export it as a public helper (e.g., `core-ui.fetchJson`). If it is only used internally, consider extracting it into its own module (e.g., `fetch-json.js`) and having `core-ui.js` import it. This makes the function's scope and usage explicit.
+
+Benefits:
+The function's scope and usage become explicit instead of implicit. Tests no longer need to load the entire `core-ui.js` to test `fetchJson`. The function can be reasoned about independently of `core-ui.js`'s other concerns.
