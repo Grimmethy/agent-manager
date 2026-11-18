@@ -104,19 +104,26 @@ function recordEvent(taskId, event, { now = Date.now(), env = process.env } = {}
   return lease;
 }
 
-// Settles every 'lent' lease that is past expiresAt by asking the node: askNode(nodeId, taskId) answers 'merged', 'in-progress' or
-// 'unknown' (a throw or any other answer counts as unknown). merged closes the lease, in-progress renews it for another ttl, unknown
-// puts the task back in the pool (the lease row becomes 'expired' and the record's leasedTo is cleared by lend-task's reclaimExpired,
-// once per directory in pipelineDirs). Returns { merged, renewed, released } with the rows.
+// Settles every 'lent' lease that is past expiresAt by asking the node: askNode(nodeId, taskId) answers 'merged', 'in-progress', 'unknown' or
+// { answer: 'blocked', reason } (a throw or any other answer counts as unknown). merged closes the lease, in-progress renews it for another ttl,
+// blocked closes it as 'returned' (lastEvent 'blocked', blockedReason kept on the row) and puts the task back in the pool with a
+// 'node-blocked <node>' history event on wok's record, unknown puts the task back in the pool (the lease row becomes 'expired' and the record's
+// leasedTo is cleared by lend-task's reclaimExpired in every dir of pipelineDirs at once). Returns { merged, renewed, released } with the rows, plus blocked when the node reported any.
 async function settleExpired({ askNode, pipelineDirs = [], now = Date.now(), env = process.env } = {}) {
   const due = listLeases(env).filter((l) => l && l.state === 'lent' && !(Date.parse(l.expiresAt) > now));
   const answers = new Map();
+  const reasons = new Map();
   for (const lease of due) {
     let answer = 'unknown';
     try { answer = await askNode(lease.nodeId, lease.taskId); } catch (e) { answer = 'unknown'; }
-    answers.set(lease.taskId, answer === 'merged' || answer === 'in-progress' ? answer : 'unknown');
+    if (answer && typeof answer === 'object' && answer.answer === 'blocked') {
+      reasons.set(lease.taskId, typeof answer.reason === 'string' ? answer.reason : '');
+      answer = 'blocked';
+    }
+    answers.set(lease.taskId, answer === 'merged' || answer === 'in-progress' || answer === 'blocked' ? answer : 'unknown');
   }
   const result = { merged: [], renewed: [], released: [] };
+  const blocked = [];
   const leases = load(env);
   for (const lease of due) {
     const row = leases[lease.taskId];
@@ -130,18 +137,24 @@ async function settleExpired({ askNode, pipelineDirs = [], now = Date.now(), env
       row.expiresAt = new Date(now + defaultTtlMs(env)).toISOString();
       row.renewedAt = new Date(now).toISOString();
       result.renewed.push(row);
+    } else if (answer === 'blocked') {
+      row.state = 'returned';
+      row.returnedAt = new Date(now).toISOString();
+      row.lastEvent = 'blocked';
+      row.lastEventAt = row.returnedAt;
+      if (reasons.get(lease.taskId)) row.blockedReason = reasons.get(lease.taskId);
+      blocked.push(row);
     }
   }
-  if (result.merged.length || result.renewed.length) save(leases, env);
-  if (due.some((l) => answers.get(l.taskId) === 'unknown')) {
-    const { reclaimExpired } = require('./lend-task.js'); // lazy: lend-task requires this file
-    const released = [];
-    for (const dir of pipelineDirs.length ? pipelineDirs : [null]) {
-      const rows = dir ? reclaimExpired({ pipelineDir: dir, now, env }) : expireLeases({ now, env });
-      for (const r of rows) if (!released.some((x) => x.taskId === r.taskId)) released.push(r);
-      if (!dir) break;
+  if (result.merged.length || result.renewed.length || blocked.length) save(leases, env);
+  if (blocked.length) result.blocked = blocked;
+  if (blocked.length || due.some((l) => answers.get(l.taskId) === 'unknown')) {
+    const { reclaimExpired, applyNodeBlock } = require('./lend-task.js'); // lazy: lend-task requires this file
+    for (const row of blocked) applyNodeBlock({ pipelineDirs, taskId: row.taskId, nodeId: row.nodeId, reason: row.blockedReason || '' });
+    if (due.some((l) => answers.get(l.taskId) === 'unknown')) {
+      const rows = pipelineDirs.length ? reclaimExpired({ pipelineDirs, now, env }) : expireLeases({ now, env });
+      result.released = rows.filter((r, i) => rows.findIndex((x) => x.taskId === r.taskId) === i);
     }
-    result.released = released;
   }
   return result;
 }

@@ -17,6 +17,17 @@ import time
 
 shared_misc_bp = Blueprint("shared-misc-bp", __name__)
 
+# Keys the adhoc/drafting row builder (api_adhoc_tasks.task_row) reads directly from a
+# task record: the displayed title and the createdAt sort key. id, domain and dependsOn
+# are read with defaults (filename stem / None), so they are deliberately NOT required.
+_TASK_RECORD_KEYS = ("title", "createdAt")
+
+
+def is_task_record(data) -> bool:
+    """True only for a dict containing every key in _TASK_RECORD_KEYS. Guards the
+    drafting rglob scan against non-task JSON (lists, strings, partial dicts)."""
+    return isinstance(data, dict) and all(k in data for k in _TASK_RECORD_KEYS)
+
 @shared_misc_bp.route("/api/ping")
 def api_ping():
     # Identity endpoint for the companion app's server-list health check. Shape mirrors
@@ -341,7 +352,7 @@ def api_adhoc_tasks():
     how fast any one request actually was in isolation. done/ tasks aren't what this
     view exists to track anyway -- the whole point is active (in-progress) and stuck
     (blocked) work, both already excluded from that giant folder."""
-    from app import QUEUE_STATES, _adhoc_task_excerpt, queue_dir, read_json_safe
+    from app import QUEUE_STATES, _adhoc_task_excerpt, logger, queue_dir, read_json_safe
     qdir = queue_dir()
     if not qdir:
         return jsonify({"tasks": []})
@@ -393,7 +404,8 @@ def api_adhoc_tasks():
     if drafting_root.is_dir():
         for f in drafting_root.rglob("*.json"):
             data = read_json_safe(f)
-            if not data:
+            if not is_task_record(data):
+                logger.warning("skipping non-task JSON in drafting scan: %s", f)
                 continue
             task_id = data.get("id", f.stem)
             if not is_adhoc(data, task_id):

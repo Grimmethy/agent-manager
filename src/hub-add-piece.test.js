@@ -177,6 +177,65 @@ test('without any concurrent write the entry is listed once and the write is sti
   assert.equal(readHub(p).subTasks.filter((x) => x.id === r.id).length, 1);
 });
 
+// Insertion point (--before / --after <pieceId>). Piece ids from makePipeline: P1 is done, P2 and P3 are adhoc.
+const P1 = 'HUB0900-01-piece-1';
+const P2 = 'HUB0900-02-piece-2';
+const P3 = 'HUB0900-03-piece-3';
+const subIds = (p) => readHub(p).subTasks.map((s) => s.id);
+function moveTo(p, id, state) {
+  const dir = path.join(p.dir, 'queue', state);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.renameSync(path.join(p.dir, 'queue', 'adhoc', `${id}.json`), path.join(dir, `${id}.json`));
+}
+
+test('insert-before an unstarted sibling puts the new piece just ahead of it', () => {
+  const p = makePipeline();
+  const r = add(p, { before: P2 });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(subIds(p), [P1, r.id, P2, P3]);
+});
+
+test('insert-after an unstarted sibling puts the new piece just behind it', () => {
+  const p = makePipeline();
+  const r = add(p, { after: P2 });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(subIds(p), [P1, P2, r.id, P3]);
+});
+
+test('insert-before or insert-after a started or done sibling is refused and the error names its state', () => {
+  const p = makePipeline();
+  moveTo(p, P2, 'review');
+  const cases = [[{ before: P1 }, 'done'], [{ after: P1 }, 'done'], [{ before: P2 }, 'review'], [{ after: P2 }, 'review']];
+  for (const [anchor, state] of cases) {
+    const r = add(p, anchor);
+    assert.equal(r.ok, false, JSON.stringify(anchor));
+    assert.match(r.error, new RegExp(`is in state ${state}\\b`), JSON.stringify(anchor));
+    assert.deepEqual(subIds(p), [P1, P2, P3], `hub unchanged after ${JSON.stringify(anchor)}`);
+  }
+});
+
+test('supplying both before and after is rejected and changes nothing', () => {
+  const p = makePipeline();
+  const r = add(p, { before: P2, after: P2 });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /mutually exclusive/);
+  assert.deepEqual(subIds(p), [P1, P2, P3]);
+  const pc = path.join(p.dir, 'pc-both.json');
+  fs.writeFileSync(pc, JSON.stringify({ rawText: 'Both anchors.' }));
+  const script = path.join(__dirname, 'hub-add-piece.js');
+  const cli = spawnSync('node', [script, p.hubId, '--pipeline-dir', p.dir, '--title', 'x', '--prompt-context-file', pc, '--before', P2, '--after', P2], { encoding: 'utf8' });
+  assert.equal(cli.status, 1, cli.stdout + cli.stderr);
+  assert.match(JSON.parse(cli.stdout.trim().split('\n').at(-1)).error, /mutually exclusive/);
+  assert.deepEqual(subIds(p), [P1, P2, P3]);
+});
+
+test('append with no anchor still lands the new piece last', () => {
+  const p = makePipeline();
+  const r = add(p);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.deepEqual(subIds(p), [P1, P2, P3, r.id]);
+});
+
 test('the kill switch refuses and changes nothing', () => {
   const p = makePipeline();
   process.env.AGENT_MANAGER_HUB_ADD_PIECE = 'false';
