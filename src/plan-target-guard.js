@@ -72,8 +72,9 @@ function mentionIndexes(text, needle) {
 // `[\s*_]+` (not plain `\s+`) between words: a model routinely bolds "not" for emphasis
 // ("does **not** exist yet") -- confirmed live, this is the EXACT real phrasing that
 // caused the incident above, and a literal whitespace-only gap would miss it.
+// 2026-11-18: the "does not exist" form now requires "yet" ("does not exist yet" or "does not yet exist"). A bare "does not exist on the main branch" or "does not exist in this checkout" describes a file that exists on another branch or checkout, so it is not a create signal.
 // 2026-10-08: also "is absent" / "not present" / "not found" / "no such file" (HUB0011-02: the plan said `<path>` "is absent" for a task titled "Create <file>" and was blocked).
-const EXISTENCE_ACK_RE = /\b(?:does|do)[\s*_]+not[\s*_]+(?:yet[\s*_]+)?exist\b|\bdoesn'?t[\s*_]+(?:yet[\s*_]+)?exist\b|\bnot[\s*_]+yet[\s*_]+(?:present|created)\b|\b(?:is|are|was)[\s*_]+(?:currently[\s*_]+)?absent\b|\b(?:is|are)[\s*_]+not[\s*_]+(?:present|found)\b|\bno[\s*_]+such[\s*_]+file\b|\bonce[\s*_]+it[\s*_]+(?:exists|is[\s*_]+(?:created|written))\b/i;
+const EXISTENCE_ACK_RE = /\b(?:does|do)[\s*_]+not[\s*_]+(?:yet[\s*_]+exist|exist[\s*_]+yet)\b|\bdoesn'?t[\s*_]+(?:yet[\s*_]+)?exist\b|\bnot[\s*_]+yet[\s*_]+(?:present|created)\b|\b(?:is|are|was)[\s*_]+(?:currently[\s*_]+)?absent\b|\b(?:is|are)[\s*_]+not[\s*_]+(?:present|found)\b|\bno[\s*_]+such[\s*_]+file\b|\bonce[\s*_]+it[\s*_]+(?:exists|is[\s*_]+(?:created|written))\b/i;
 
 // taskText (optional, 2026-10-08): the TASK's own title + body. A task that itself says "Create <file>" has declared the file a create target no matter how the
 // plan words it; the plan-only signals above missed that when the plan named the file by its full path and called it "absent".

@@ -109,3 +109,17 @@ test('the default post really talks to a node intake: bearer header, JSON body a
   assert.equal(await askNode('n1', 't9'), 'merged');
   assert.deepEqual(seen, [{ url: '/status', method: 'POST', auth: 'Bearer secret-token', body: { taskIds: ['t9'] } }]);
 });
+
+test('a blocked answer comes back with the node\'s reason, capped at 300 characters', async (t) => {
+  const { env, readRegistry } = setup(t);
+  const body = JSON.stringify({ ok: true, tasks: { t1: 'blocked' }, reasons: { t1: 'z'.repeat(500) } });
+  const answer = await makeAskNode({ env, post: fakePost({ status: 200, body }).post, readRegistry })('grimm', 't1');
+  assert.equal(answer.answer, 'blocked');
+  assert.equal(answer.reason.length, 300);
+});
+
+test('a blocked answer without a reasons map has an empty reason', async (t) => {
+  const { env, readRegistry } = setup(t);
+  const answer = await makeAskNode({ env, post: fakePost(ok({ t1: 'blocked' })).post, readRegistry })('grimm', 't1');
+  assert.deepEqual(answer, { answer: 'blocked', reason: '' });
+});

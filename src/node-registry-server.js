@@ -34,7 +34,7 @@ const { readPause } = require('./worker-switch.js');
 const { claimNext } = require('./node-claim.js');
 const { leaseFor, returnLease, settleExpired } = require('./lease-ledger.js');
 const { makeAskNode } = require('./node-status-client.js');
-const { findRecordFile } = require('./lend-task.js');
+const { findRecordFile, releaseStaleLeasedTo } = require('./lend-task.js');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
 
 const MAX_BODY_BYTES = 8 * 1024;
@@ -144,6 +144,9 @@ function createServer({
     try {
       await settleExpired({ askNode: settleAskNode, pipelineDirs, now: now(), env });
     } catch (e) { /* settle is best effort: a failed settlement must not fail the claim */ }
+    try {
+      releaseStaleLeasedTo({ pipelineDirs, env });
+    } catch (e) { /* healing is best effort too: it never fails a claim */ }
     const result = claim({ nodeId: payload.id, claimant: payload.id, classes: payload.classes, pipelineDirs, env, now: now() });
     if (!result || !result.task) return idle();
     return send(res, 200, { ok: true, task: result.task, lease: result.lease, repo: result.repo });
