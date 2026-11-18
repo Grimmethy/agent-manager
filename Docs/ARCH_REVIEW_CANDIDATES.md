@@ -3542,3 +3542,38 @@ Benefits:
 The module actually achieves its stated goal of noticing rate-limit events within minutes rather than up to 5 minutes. The cache remains effective (no full scan on read) while providing the freshness guarantees the header promises.
 
 NOTE: AC-222 was not included because the critique correctly identified that the regex analysis was factually wrong — the `/i` flag on both the regex and the subsequent `/pm/i.test()` means case variations are handled correctly, so there is no ambiguity bug to fix.
+
+### AC-823 · 4 · `heldHubsHtml` and `heldHubsToggleHtml` mix rendering logic with data transformation, limiting reusability
+Strength: Strong
+Files: python/dashboard/static/js/branch-verdicts.js
+
+Problem:
+`heldHubsHtml` groups hubs by project label, sorts them, and renders HTML -- all in one function. `heldHubsToggleHtml` renders the toggle button with a count derived from the groups array. Both functions assume a specific data shape (`groups` with `project.label`, `progress.built/total`, `waitingOn`, `branches`) and produce HTML directly. This means:
+1. If the grouping logic changes (e.g., grouping by hub ID instead of project), both the toggle count and the panel rendering must be updated.
+2. If the data shape changes (e.g., `project.label` becomes `projectName`), both functions must be updated.
+3. The toggle button's count (`groups.length`) is computed in `heldHubsToggleHtml` but the grouping/sorting happens in `heldHubsHtml` -- there is no shared abstraction for "what is being displayed."
+
+Solution:
+Extract the grouping/sorting logic into a pure helper (e.g., `formatHeldHubs(groups) → { byProject: Map, total: number }`) and have both `heldHubsHtml` and `heldHubsToggleHtml` use it. The toggle function would use `total`, and the panel function would use `byProject`. This separates "what to display" from "how to display it."
+
+Benefits:
+- The grouping logic lives in one place, so changes to the data shape or grouping strategy require updates in only one function.
+- The toggle and panel rendering are decoupled: the toggle only needs the count, not the full grouped structure.
+- Makes it easier to add new display modes (e.g., a list view vs. grouped view) by reusing the same formatted data.
+
+---
+
+### AC-824 · 5 · `runDiscardAll` reaches into module-private globals, coupling the discard flow to external state
+Strength: Strong
+Files: python/dashboard/static/js/branch-verdicts.js
+
+Problem:
+`runDiscardAll` references `currentBranches` (a global defined elsewhere, presumably in `branches-joblist-hardware-tabs.js`) to compute candidates and to pass to `refreshBranchVerdictFilterBar`. It also references `DISCARD_TRIAGE_BRANCH` which is a `const` in this file (fine), but the branch enumeration relies on external state. This means the discard flow cannot be tested or reasoned about in isolation: you need the full tab state (`currentBranches`) to invoke it, and the function has side effects (calls `fetch`, updates `discardAllRunning`, calls `renderBranchesTab`) that depend on the browser environment. The function is internal but cannot be meaningfully unit-tested without a browser and the full tab context.
+
+Solution:
+Refactor `runDiscardAll` to accept `branches` as a parameter instead of reading `currentBranches` from the global scope. The signature would become `async function runDiscardAll(branches, main)` or similar. This makes the data dependency explicit and allows the function to be tested with synthetic branch data without setting up the full tab state.
+
+Benefits:
+- `runDiscardAll` becomes testable with mock data, not just in a live browser with real tab state.
+- The dependency on `currentBranches` is explicit rather than implicit, making the function's contract clearer.
+- Reduces the risk of `runDiscardAll` silently using stale or incorrect branch data if `currentBranches` is out of sync with the actual rendered state.
