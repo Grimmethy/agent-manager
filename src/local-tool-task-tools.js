@@ -142,7 +142,7 @@ function archivedTaskFiles(pipelineDir) {
   return out;
 }
 
-function searchTasksTool(pipelineDir, { query, state, includeArchived, similar = false } = {}) {
+function searchTasksTool(pipelineDir, { query, state, includeArchived, similar = false, source } = {}) {
   if (typeof query !== 'string' || !query.trim()) {
     return { error: 'search_tasks requires a non-empty "query" argument' };
   }
@@ -193,6 +193,8 @@ function searchTasksTool(pipelineDir, { query, state, includeArchived, similar =
     let data;
     try { data = JSON.parse(fs.readFileSync(fullPath, 'utf8')); } catch { continue; }
     const fallbackId = path.basename(fullPath, '.json');
+    // Optional top-level source filter (case-insensitive). Omitted (undefined/null) = no filter, so behavior is unchanged.
+    if (source != null && String(data.source ?? '').toLowerCase() !== String(source).toLowerCase()) continue;
     const haystack = `${data.title || ''} ${data.id || fallbackId}`;
     if (!lineMatches(haystack, query)) continue;
     results.push({ ...taskSummary(data, fallbackId), foundState });
