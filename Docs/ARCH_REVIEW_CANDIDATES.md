@@ -3471,3 +3471,74 @@ Replace the conditional checks with explicit registration or injection. At modul
 
 Benefits:
 Missing dependencies produce immediate, actionable errors instead of silent UI degradation. The contract between modules becomes explicit and auditable. Future refactors can rename or relocate dependencies without risking silent breakage.
+
+### AC-818 · Hardcoded concept-ID coupling in `CONCEPT_CARD_CONFIG`
+Strength: Worth exploring
+Files: python/dashboard/static/js/concepts-and-adhoc-tab.js
+
+Problem:
+`CONCEPT_CARD_CONFIG` maps literal concept UUIDs to feature flags, creating a brittle and undocumented extension point. If a concept's ID changes—for example, if the UUID suffix is regenerated—the special panels silently stop rendering with no error. There is no validation that the IDs are real, no way to discover which concepts have special panels, and no mechanism to register new ones beyond editing this object directly. The coupling is between a runtime data model (concept IDs) and a hardcoded configuration map, with no contract or validation layer.
+
+Solution:
+Introduce a small registration or lookup mechanism, such as a `registerConceptPanel(conceptId, config)` function that validates and stores the mapping, or a separate configuration file that is loaded and validated at startup. This makes the coupling explicit, discoverable, and resilient to ID changes.
+
+Benefits:
+Silent failures become loud through validation errors at registration time. New contributors can discover which concepts have special panels without reading source code. Concept ID changes no longer silently break UI features, reducing maintenance burden and improving reliability.
+
+---
+
+### AC-819 · Implicit global-scope coupling in `renderConceptCard`
+Strength: Worth exploring
+Files: python/dashboard/static/js/concepts-and-adhoc-tab.js, python/dashboard/static/js/concepts-and-adhoc-tab.test.js
+
+Problem:
+`renderConceptCard` depends on globals defined in other modules, including `escapeHtml` and `escapeAttr` from `core-ui.js`, `renderReportMarkdown` from `analytics-and-discovery.js`, and `CONCEPT_STABLE_STATUSES` from `index.html`. This is a real architectural issue because the function has no declared dependency contract—its signature does not reveal what it needs. In Node for testing, the globals must be manually stubbed onto `global`, as the test file does. In the browser, it relies on load order, meaning if `core-ui.js` loads after this file, the function fails silently.
+
+Solution:
+Either pass dependencies as parameters to the function, such as `renderConceptCard(concept, { escapeHtml, escapeAttr, renderReportMarkdown, CONCEPT_STABLE_STATUSES })`, or create a small dependency-injection module that wires up the globals in one place with explicit validation that all required symbols are present.
+
+Benefits:
+The function's dependencies become explicit and testable without global stubs. Load-order bugs become impossible because dependencies are validated at call time. The test file no longer needs to manually set up global state, making tests more maintainable and reliable.
+
+---
+
+### AC-820 · Hardcoded lifecycle flow chart must be manually synced with source
+Strength: Worth exploring
+Files: python/dashboard/static/js/concepts-and-adhoc-tab.js
+
+Problem:
+The `LIFECYCLE_STAGES` array is a static HTML representation of the adhoc task lifecycle. The comment explicitly acknowledges that it is not generated from the source, just written to match it at the time of authorship. This is a real maintenance hazard because the documentation will drift from reality as the actual code evolves. If a stage is renamed, a function is refactored, or a new stage is added, the flow chart becomes inaccurate without anyone realizing it.
+
+Solution:
+Either generate the flow chart from source code annotations, such as JSDoc tags or comments in the actual implementation files, or add a validation test that checks the flow chart against the actual function names and fields in the source.
+
+Benefits:
+The flow chart stays accurate as the code evolves, eliminating the manual sync burden on developers. The documentation becomes a reliable source of truth, reducing confusion and improving onboarding for new contributors.
+
+### AC-821 · `readCache()` performs a full recursive directory scan on every cache HIT, defeating the cache's purpose
+Strength: Worth exploring
+Files: budget-monitor.js
+
+Problem:
+`readCache()` is the fast path meant to avoid the expensive full scan that `computeBudgetHealthy()` performs. However, on every cache HIT it calls `listJsonlFiles(PROJECTS_DIR)`, which does a full recursive `readdirSync` over all of `PROJECTS_DIR` to build a file list, then calls `newestJsonlMtimeMs()` which does a `fs.statSync()` on every single file. The file's own comment acknowledges this is O(N) in the number of files, but the entire point of the cache is to avoid this cost. With 519 files and 114MB of transcripts (as noted in the header comment), this means every cache HIT still pays the full directory-traversal cost that the cache was designed to eliminate. The "cheap staleness check" is only cheap relative to a full JSON parse, but it's still O(files) syscalls on every read.
+
+Solution:
+Either (a) store the newest mtime in the cache itself and only re-scan when the cached mtime is older than the cache age, or (b) skip the staleness check entirely and rely on the TTL alone (the comment notes this was the prior behavior that had the rate-limit invisibility problem, but that problem could be solved differently — see AC-221).
+
+Benefits:
+The cache actually provides a meaningful performance improvement by avoiding the O(N) directory scan on reads. Currently the cache only avoids the O(N) JSON parse, which is a partial optimization.
+
+### AC-822 · TTL-only staleness check leaves rate-limit events invisible for up to CACHE_TTL_MS
+Strength: Must explore
+Files: budget-monitor.js
+
+Problem:
+The header comment states the module's purpose is to be a "hard gate" that notices rate-limit hits within "a few minutes." However, `CACHE_TTL_MS` defaults to 5 minutes, and the original TTL-only behavior (before the `listJsonlFiles` staleness check was added) meant a rate-limit event written to disk could remain invisible to all callers for up to 5 minutes. The comment explicitly calls this out: "a fixed TTL alone left a real rate-limit event invisible to every caller for up to CACHE_TTL_MS after Claude Code wrote it -- exactly the 'hard gate' this module's own header promises." The current staleness check (AC-220) attempts to fix this but reintroduces the full scan cost.
+
+Solution:
+Store the newest file mtime in the cache payload. On read, compare the cached mtime against the actual newest mtime (computed via a single `fs.statSync` on just the newest file, or by tracking the mtime of the last write). Alternatively, use a filesystem watch (e.g., `fs.watch`) to invalidate the cache immediately when any `.jsonl` file in `PROJECTS_DIR` is modified.
+
+Benefits:
+The module actually achieves its stated goal of noticing rate-limit events within minutes rather than up to 5 minutes. The cache remains effective (no full scan on read) while providing the freshness guarantees the header promises.
+
+NOTE: AC-222 was not included because the critique correctly identified that the regex analysis was factually wrong — the `/i` flag on both the regex and the subsequent `/pm/i.test()` means case variations are handled correctly, so there is no ambiguity bug to fix.
