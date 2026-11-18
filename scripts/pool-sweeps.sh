@@ -21,9 +21,20 @@ LABEL="$AGENT_MANAGER_BORROWING_FROM"
 QUEUE_DIR="${AGENT_MANAGER_PIPELINE_DIR}/queue"
 MARKER="${AGENT_MANAGER_PIPELINE_DIR}/instances/.pool-sweeps-last"   # project-local due marker (instances/ is per project for logs and markers)
 
+LOG_FILE="${HOME_LOGS}/pool-sweeps-decisions.log"   # one line per tick: not-due | due-swept | due-write-skipped
+logged=0
+log_decision() {
+  (( logged )) && return 0
+  logged=1
+  local ts
+  printf -v ts '%(%Y-%m-%dT%H:%M:%S%z)T' -1
+  printf '%s %s %s\n' "$ts" "$1" "$AGENT_MANAGER_PIPELINE_DIR" >> "$LOG_FILE" 2>/dev/null || true
+}
+
 interval="${AGENT_MANAGER_POOL_SWEEP_INTERVAL_SECS:-300}"
 now="$(date +%s)"
 if [[ "${POOL_SWEEPS_FORCE:-}" != "true" && -f "$MARKER" ]] && (( now - $(stat -c %Y "$MARKER" 2>/dev/null || echo 0) < interval )); then
+  log_decision not-due
   exit 0
 fi
 if [[ -d "$(dirname "$MARKER")" ]]; then
@@ -39,7 +50,7 @@ for d in blocked needs-clarification coordinating awaiting-confirm approved revi
   compgen -G "${QUEUE_DIR}/${d}/*.json" >/dev/null && { active=true; break; }
 done
 if ! "$active" && compgen -G "${QUEUE_DIR}/drafting/*/*.json" >/dev/null; then active=true; fi
-if ! "$active"; then exit 0; fi
+if ! "$active"; then log_decision due-write-skipped; exit 0; fi
 
 # A project whose queue did not change since its last pass has nothing new for ~20 node startups to find (CPU analysis 2026-11-07: 39 of 42 pool projects counted as "active" because
 # some blocked or needs-clarification file sits there, yet about half had not changed for hours or days, and each still paid the whole pass every interval). So the pass is skipped when
@@ -59,7 +70,7 @@ if [[ "${POOL_SWEEPS_FORCE:-}" != "true" ]]; then
   fi
   [[ "$fp_last" =~ ^[0-9]+$ ]] || fp_last=0
   (( fp_last > now )) && fp_last=0      # a stamp from the future (clock step, garbage) must not skip passes until then
-  if [[ -n "$fp_now" && "$fp_now" == "$fp_prev" ]] && (( now - fp_last < max_idle )); then exit 0; fi
+  if [[ -n "$fp_now" && "$fp_now" == "$fp_prev" ]] && (( now - fp_last < max_idle )); then log_decision due-write-skipped; exit 0; fi
   { printf '%s\n' "$now"; printf '%s' "$fp_now"; } > "$FP_FILE" 2>/dev/null || true
 fi
 
@@ -104,3 +115,4 @@ for s in "${SWEEPS[@]}"; do
 done
 node "${PACKAGE_SRC_DIR}/done-archive.js" --check-due >>"${HOME_LOGS}/pool-done-archive.log" 2>&1 || true
 node "${PACKAGE_SRC_DIR}/reclaim-orphaned-drafts.js" --retired-lanes >>"${HOME_LOGS}/pool-reclaim-orphaned-drafts.log" 2>&1 || true
+log_decision due-swept
