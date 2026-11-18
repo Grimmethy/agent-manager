@@ -61,9 +61,12 @@ def script_label(args):
 def origin_of(root, pid):
     """Which lane or daemon started this process, found by walking up its ancestors."""
     q = pid
+    script = None  # nearest node/python/git launch on the walk, used to label ollama descendants
     for _ in range(25):
         args = cmdline(root, q)
         joined = ' '.join(args)
+        if script is None and q != pid:
+            script = script_label(args)
         if args and os.path.basename(args[0]) == 'claude':
             return 'CLAUDE-SESSION'
         for name in LANE_SCRIPTS:
@@ -72,10 +75,10 @@ def origin_of(root, pid):
                 return name + (' ' + inst[0] if inst else '')
         if 'dashboard/app.py' in joined:
             return 'dashboard app.py'
+        if 'ollama' in joined:
+            return 'ollama ' + script if script else 'ollama'
         if 'plugin' in joined and 'server' in joined:
             return 'forge plugin server'
-        if 'ollama' in joined:
-            return 'ollama'
         parent, _ = ppid_and_start(root, q)
         if not parent or parent <= 1:
             break
