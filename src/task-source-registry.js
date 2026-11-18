@@ -52,6 +52,26 @@ const registry = {};
  */
 const sourceAliases = {};
 
+/** Markers for gated next() wrappers, so a function is never double-wrapped. */
+const gatedNextFns = new WeakSet();
+
+/**
+ * The single scope:'core' eligibility gate. Wraps a source's next() so EVERY caller -- retrieval
+ * (getRegisteredSource / getRegisteredSources) or direct invocation -- gets null on any other
+ * project. The predicate is read on each call, never cached at registration time.
+ * @param {Function} next - the source's next() implementation
+ * @returns {Function} the gated next()
+ */
+function gateCoreNext(next) {
+  if (gatedNextFns.has(next)) return next;
+  const gated = (...args) => {
+    const { sourceEligibleHere } = require('./lib/source-scope.js');
+    return sourceEligibleHere({ scope: 'core' }) ? next(...args) : null;
+  };
+  gatedNextFns.add(gated);
+  return gated;
+}
+
 /**
  * Register a task source.
  * @param {string} name - Unique identifier for the source.
@@ -66,9 +86,7 @@ function registerTaskSource(name, config) {
   // caller -- getNextTask, the always-run watchdog sweeps that call a source directly -- gets null on any
   // other project, not just the priority ladder.
   if (config && config.scope === 'core' && typeof config.next === 'function') {
-    const inner = config.next;
-    const { sourceEligibleHere } = require('./lib/source-scope.js');
-    config = { ...config, next: (...args) => (sourceEligibleHere({ scope: 'core' }) ? inner(...args) : null) };
+    config = { ...config, next: gateCoreNext(config.next) };
   }
   // Owner guard (per source, no shared state): when this source declares owners, each generation call checks whether the
   // running root is one of them via ownerAllows() from source-owner-guard.js. A mismatch returns null for this source only,
@@ -176,6 +194,12 @@ function resolveSourceName(task) {
 function updateTaskSource(name, partialConfig) {
   if (registry[name] === undefined) {
     throw new Error(`Cannot update unregistered task source: "${name}"`);
+  }
+  // Same gate as registration: a core source's next() must stay gated even when it is attached
+  // or replaced after registration, or when the entry is switched to scope:'core' later.
+  const merged = { ...registry[name], ...partialConfig };
+  if (merged.scope === 'core' && typeof merged.next === 'function' && !gatedNextFns.has(merged.next)) {
+    partialConfig = { ...partialConfig, next: gateCoreNext(merged.next) };
   }
   Object.assign(registry[name], partialConfig);
 }

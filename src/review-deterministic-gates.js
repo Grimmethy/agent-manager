@@ -361,7 +361,7 @@ function missingCodeShapeGate(ctx) {
       && !/^(?:---|\+\+\+|@@)/m.test(trimmedImplResponse)
       && !/^(?:\+|-)(?!\s*$)\S/m.test(trimmedImplResponse)
       && !namesExtractedPieces(trimmedImplResponse)) {
-    const reason = 'Deterministic gate: missing-code-diff -- candidate drafts from this source must show the concrete change as a fenced code block or diff hunk, not prose-only commentary describing what should change. No local-model review call spent on a draft with no code shape at all.';
+    const reason = 'Deterministic gate: missing-code-diff -- candidate drafts from this source must show the concrete change as a fenced code block or diff hunk, not prose-only commentary describing what should change. No local-model review call spent on a draft with no code shape at all. Redraft: name each extracted function as `name(params)` and its return shape, or give a ```diff``` hunk.';
     task.reviewProvider = 'deterministic-missing-code-diff';
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
     appendHistoryEvent(task, 'blocked', reason);

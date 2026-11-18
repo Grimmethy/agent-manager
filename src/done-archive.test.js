@@ -234,3 +234,26 @@ test('archiveSpecificDoneTasks lands in the SAME bucket location listArchivedMon
   assert.equal(dirs.length, 1);
   assert.ok(fs.existsSync(path.join(dirs[0], 'd1.json')));
 });
+
+// Protected case (7b): a FRESH task named explicitly must still move, even though the
+// time-based pass would skip it. The specific pass never checks age.
+test('archiveSpecificDoneTasks moves a fresh explicitly-named task out of done/ top level', () => {
+  const pipelineDir = makePipelineDir();
+  const now = Date.now();
+  writeDoneTask(pipelineDir, 'fresh-named', { mtimeMs: now });
+  const result = archiveSpecificDoneTasks({ pipelineDir, taskIds: ['fresh-named'], now });
+  assert.equal(result.moved, 1);
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'done', 'fresh-named.json')), false);
+  assert.ok(fs.existsSync(path.join(pipelineDir, 'queue', 'done', '_archived', monthBucket(new Date(now)), 'fresh-named.json')));
+});
+
+// Item 7c: a FRESH task NOT named explicitly stays at done/ top level, and the time pass counts it as skipped.
+test('archiveDoneTasks leaves a fresh unnamed task at done/ top level and increments skipped', () => {
+  const pipelineDir = makePipelineDir();
+  const now = Date.now();
+  writeDoneTask(pipelineDir, 'fresh-unnamed', { mtimeMs: now });
+  const result = archiveDoneTasks({ pipelineDir, now });
+  assert.equal(result.moved, 0);
+  assert.equal(result.skipped, 1);
+  assert.ok(fs.existsSync(path.join(pipelineDir, 'queue', 'done', 'fresh-unnamed.json')));
+});

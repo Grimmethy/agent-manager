@@ -429,6 +429,7 @@
   <span id="memory-chip" hidden></span>
   <span id="touchpoints-chip" hidden></span>
   <button class="action" id="global-brain-dump-btn" style="margin-left:auto" title="Capture a quick note to Brain Dump from any tab">+ Brain Dump</button>
+  <button class="action" id="global-new-task-btn" title="File a new task into a chosen repo">+ New task</button>
 </header>
 <div id="required-plugins-banner" role="alert" hidden></div>
 <div class="layout" id="layout">
@@ -886,6 +887,7 @@ const BENCH_RADAR_COLORS = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181
 // way. If the Brain Dump tab happens to be open behind this modal, refreshBrainDumpEntries
 // picks the new entry up on its own 5s cycle -- no extra plumbing needed here.
 document.getElementById('global-brain-dump-btn').onclick = openGlobalBrainDumpModal;
+document.getElementById('global-new-task-btn').onclick = openNewTaskModal;
 
 // Manual archive/requeue (Job Status > Blocked/Done tabs) and manual apply (Approved tab,
 // three-tier approval mode, 2026-07-26) -- per-row action buttons on renderQueueTab's

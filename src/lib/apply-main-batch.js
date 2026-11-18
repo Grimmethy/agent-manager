@@ -13,6 +13,13 @@ const { TRIAGE_BRANCH, ungatedMainPushAllowed } = require('./main-push-policy.js
 const { coAuthorTrailer, usesGroupB, applyCandidateSplit, writeArtifact, closeOriginatingBrainDumpEntry, assertStageableFiles } = require('./apply-core.js');
 const { checkRemoteExists } = require('./git-remote-check.js');
 
+// Single source of truth for the direct-to-main eligibility check. Both the batch loop and
+// mainPartition() route through here so the lookup and predicate cannot drift apart.
+function isDirectToMainEligible(task) {
+  const reg = getRegisteredSource(resolveSourceName(task));
+  return { eligible: !!(reg && reg.directToMain === true) };
+}
+
 // The shared checkout must never be left on the triage branch. That branch is based on whatever main was when it was first created and is only brought up to date by merging main in on the next apply tick (never rebased: a rewritten branch was never pushed and looped, see git-runner.js prepareStackedBranch), so a
 // checkout parked on it (2026-09-20, PF: 4 h, 40 commits behind main) makes every read of "the repo" (plan grounding, review's live content, the staleness
 // sweep) see ancient code: false "file absent" flags, stale rejections. Only the single fully-successful path used to return to main; a batch that staged
@@ -33,8 +40,7 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
   const results = {};
   const eligible = [];
   for (const task of tasks) {
-    const reg = getRegisteredSource(resolveSourceName(task));
-    if (reg && reg.directToMain === true) {
+    if (isDirectToMainEligible(task).eligible) {
       eligible.push(task);
     } else {
       results[task.id] = { succeeded: false, reason: 'source is not directToMain -- must be applied individually, not in the triage batch' };
@@ -213,8 +219,7 @@ function mainPartition() {
   for (const p of process.argv.slice(3)) {
     try {
       const t = JSON.parse(fs.readFileSync(p, 'utf8'));
-      const reg = getRegisteredSource(resolveSourceName(t));
-      if (reg && reg.directToMain === true) direct.push(p); else other.push(p);
+      if (isDirectToMainEligible(t).eligible) direct.push(p); else other.push(p);
     } catch (err) {
       process.stderr.write(`mainPartition: "${p}" defaulting to other: ${err.message}\n`);
       other.push(p);
