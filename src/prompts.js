@@ -1719,6 +1719,11 @@ updateTaskSource('pipeline_forensics_fix', { buildPlanPrompt: archReviewPlanProm
 // saw that feedback -- each redraft was a blind fresh roll, not an informed retry.
 // Domain-agnostic (lives in the two thin lookup functions below, not per-source
 // builders) so every task source benefits, not just adhoc.
+// PRIOR ART section (HUB0707 1/3): appended only when task._priorArt is truthy, so the
+// output is byte-identical to before when the field is absent.
+const PRIOR_ART_HEADER = 'PRIOR ART';
+const PRIOR_ART_INSTRUCTION = 'If an existing handler already covers this, say so and explain why the change is still needed; do not contradict a pinned behaviour without naming the test you are changing.';
+
 function buildPlanPrompt(task) {
   const sourceName = resolveSourceName(task);
   const source = getRegisteredSource(sourceName);
@@ -1726,7 +1731,10 @@ function buildPlanPrompt(task) {
   const base = source && typeof source.buildPlanPrompt === 'function'
     ? source.buildPlanPrompt(task)
     : genericFallbackPlanPrompt(task);
-  return prior ? prior + base : base;
+  const priorArt = task._priorArt
+    ? '\n\n' + PRIOR_ART_HEADER + '\n' + task._priorArt + '\n\n' + PRIOR_ART_INSTRUCTION
+    : '';
+  return (prior ? prior + base : base) + priorArt;
 }
 
 function buildImplementPrompt(task, planText, options) {
