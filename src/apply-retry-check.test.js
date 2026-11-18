@@ -405,3 +405,55 @@ test('applyRetryCheck: the find feedback is not appended twice for the same fail
   const second = JSON.parse(fs.readFileSync(path.join(pendingDir, 'dup.json'), 'utf8'));
   assert.equal(second.priorRejectionFeedback.length, 1);
 });
+
+// Approved-record apply handling (network release, redraft field clearing).
+const APPROVED_VOTES = [{ vote: 'approve' }, { vote: 'approve' }];
+
+test('approved record blocked on a network error returns to approved/ with its draft intact', () => {
+  const { root, blockedDir, pendingDir } = setupDirs();
+  const approvedDir = path.join(root, 'queue', 'approved');
+  writeBlockedTask(blockedDir, 'net-1', {
+    blockedReason: 'git fetch failed: Could not resolve host: github.com',
+    localVerdict: 'approved', localVotes: APPROVED_VOTES, rawDiff: 'DIFF-A', applyRetryCount: 0,
+  });
+  const summary = applyRetryCheck({ blockedDir, pendingDir, approvedDir, recordModelOutcome: () => {} });
+  assert.equal(summary.requeued, 0);
+  assert.equal(summary.released, 1);
+  assert.equal(fs.existsSync(path.join(pendingDir, 'net-1.json')), false, 'must not be redrafted');
+  const out = JSON.parse(fs.readFileSync(path.join(approvedDir, 'net-1.json'), 'utf8'));
+  assert.equal(out.rawDiff, 'DIFF-A');
+  assert.deepEqual(out.localVotes, APPROVED_VOTES);
+  assert.equal(out.applyRetryCount, 0, 'redraft budget untouched');
+  assert.ok(out.history.some((h) => /^apply retried after /.test(h.detail || '')));
+});
+
+test('approved record blocked on a content failure is requeued and its draft fields are cleared', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'conf-1', {
+    blockedReason: 'git apply failed: patch does not apply',
+    localVerdict: 'approved', localVotes: APPROVED_VOTES, rawDiff: 'DIFF-B',
+    acceptanceResults: [{ ok: true }], applyRetryCount: 0,
+  });
+  const summary = applyRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+  assert.equal(summary.requeued, 1);
+  const out = JSON.parse(fs.readFileSync(path.join(pendingDir, 'conf-1.json'), 'utf8'));
+  assert.equal(out.rawDiff, undefined);
+  assert.equal(out.localVotes, undefined);
+  assert.equal(out.acceptanceResults, undefined);
+  assert.equal(out.planResponse, undefined);
+  assert.equal(out.implementResponse, undefined);
+});
+
+test('approved record at applyNetworkReleases cap with a network error is held, not released again', () => {
+  const { root, blockedDir, pendingDir } = setupDirs();
+  const approvedDir = path.join(root, 'queue', 'approved');
+  writeBlockedTask(blockedDir, 'net-cap', {
+    blockedReason: 'git fetch failed: Could not resolve host: github.com',
+    localVerdict: 'approved', localVotes: APPROVED_VOTES, rawDiff: 'DIFF-C',
+    applyRetryCount: 0, applyNetworkReleases: 4,
+  });
+  const summary = applyRetryCheck({ blockedDir, pendingDir, approvedDir, recordModelOutcome: () => {} });
+  assert.equal(summary.released, 0);
+  assert.equal(summary.held, 1);
+  assert.ok(fs.existsSync(path.join(blockedDir, 'net-cap.json')));
+});
