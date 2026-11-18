@@ -29,6 +29,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { openQueueCache, readTaskCached } = require('./queue-cache.js');   // node built-ins only: safe to load from the bash-called CLI too
 const { unmetPrerequisiteHubs } = require('./hub-prerequisites.js');   // fs + path only: safe to load from the bash-called CLI
+const { sharedInstancesDir } = require('./instances-dir.js');   // fs + path only: safe to load from the bash-called CLI
 
 const PROJECTS_PATH = process.env.AGENT_MANAGER_PROJECTS_PATH || path.join(__dirname, '..', 'projects.json');
 
@@ -452,7 +453,7 @@ function poolEnvFor(project, homeInstancesDir) {
     AGENT_MANAGER_REPO_ROOT: project.repoRoot,
     AGENT_MANAGER_PIPELINE_DIR: project.pipelineDir,
     AGENT_MANAGER_DOMAINS_PATH: project.domainsPath,
-    AGENT_MANAGER_INSTANCES_DIR: homeInstancesDir,
+    AGENT_MANAGER_INSTANCES_DIR: homeInstancesDir || sharedInstancesDir(process.env.AGENT_MANAGER_PIPELINE_DIR || ''),
     AGENT_MANAGER_BORROWING_FROM: project.label,
   };
   const unset = [];
