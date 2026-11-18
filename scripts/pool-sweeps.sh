@@ -26,8 +26,12 @@ now="$(date +%s)"
 if [[ "${POOL_SWEEPS_FORCE:-}" != "true" && -f "$MARKER" ]] && (( now - $(stat -c %Y "$MARKER" 2>/dev/null || echo 0) < interval )); then
   exit 0
 fi
-mkdir -p "$(dirname "$MARKER")" 2>/dev/null || true
-touch "$MARKER" 2>/dev/null || true
+if [[ -d "$(dirname "$MARKER")" ]]; then
+  touch "$MARKER" 2>/dev/null || true
+else
+  ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+  printf '[pool-sweeps] %s: marker dir missing, due marker not written (%s)\n' "$ts" "$MARKER" >>"${HOME_LOGS}/pool-sweeps.log" 2>/dev/null || printf '[pool-sweeps] %s: marker dir missing, due marker not written (%s)\n' "$ts" "$MARKER" >&2
+fi
 
 # A project with nothing in any stage that housekeeping acts on costs nothing: skip the ~20 node startups.
 active=false
