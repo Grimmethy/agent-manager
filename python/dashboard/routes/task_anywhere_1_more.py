@@ -60,6 +60,19 @@ def api_task_anywhere(task_id):
     abort(404, description=f"task {task_id} not found in any queue state")
 
 
+def _registered_pipeline_adhoc_dirs():
+    """Each registered pipeline's queue/adhoc directory, in registry order. Reads the registry on every call (no cache)."""
+    import branch_projects
+    from app import get_active_repo_root
+    from pathlib import Path
+    out = []
+    for p in branch_projects.registered_projects(get_active_repo_root()):
+        pipeline_root = p.get("pipelineDir") or p.get("repoRoot")
+        if pipeline_root:
+            out.append(Path(pipeline_root) / "queue" / "adhoc")
+    return out
+
+
 @task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>/premium-priority", methods=["POST"])
 def api_task_set_premium_priority(task_id):
     """Persistent, cross-retry claim-priority override (2026-09-07, Grimmethy: "I'll need
@@ -77,7 +90,7 @@ def api_task_set_premium_priority(task_id):
     for "keep this at the front of the queue no matter which lane gets to it next."
 
     Pass ?project=<repoRoot> (or "project" in the body) to flag a task in another registered
-    project's queue; the default is the active project.
+    project's queue; the default is the active project. With no project given, a task not found in the active queue is searched for in each registered pipeline's queue/adhoc, in order, and the first match is used.
 
     Works on a task wherever it currently sits (pending, blocked, needs-clarification,
     drafting, adhoc, ...) -- an operator flagging a task that's mid-retry-cycle (like the
@@ -92,7 +105,9 @@ def api_task_set_premium_priority(task_id):
     must post here with "by": "operator-bulk"."""
     from app import _find_live_task_file, get_active_repo_root, queue_dir, read_json_safe
     body = request.get_json(silent=True) or {}
-    enabled = bool(body.get("enabled", True))
+    enabled = body.get("enabled", True)
+    if not isinstance(enabled, bool):
+        abort(400, description='"enabled" must be a JSON boolean')
     by = body.get("by", "operator-ui")
     if by not in ("operator-ui", "operator-bulk"):
         abort(400, description='"by" must be "operator-ui" or "operator-bulk"')
@@ -107,8 +122,16 @@ def api_task_set_premium_priority(task_id):
     if not qdir:
         abort(404)
     target = _find_live_task_file(qdir, task_id)
+    searched = [str(qdir)]
+    if not target and not (request.args.get("project") or body.get("project")):
+        for adhoc_dir in _registered_pipeline_adhoc_dirs():
+            searched.append(str(adhoc_dir))
+            candidate = adhoc_dir / f"{task_id}.json"
+            if candidate.is_file():
+                target = candidate
+                break
     if not target:
-        abort(404, description=f"'{task_id}' not found in any live queue state")
+        abort(404, description=f"'{task_id}' not found in any live queue state; searched: " + ", ".join(searched))
 
     data = read_json_safe(target)
     if not data:

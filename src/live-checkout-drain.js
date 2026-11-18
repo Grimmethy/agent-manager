@@ -146,7 +146,42 @@ function drainStep({ pipelineDir, repoDir, env = process.env, now = Date.now, pa
   return 'restarted';
 }
 
-module.exports = { requestPipelineRestart, drainStep, pendingPath, PENDING_FILE, OWN_SOURCE, PAUSE_TTL_MIN, DEFAULT_MAX_MIN };
+// Injectable entry point (FF-3/3c contract). One re-entrant step, no timer: records the pending restart for sha (when given), then runs drainStep with the injected deps.
+//   clock           () => ms (or a number); replaces Date.now. Drives the marker expiresAt refresh and the AGENT_MANAGER_LIVE_SYNC_DRAIN_MAX_MIN (default 30) limit.
+//   heartbeatReader () => array of lane statuses, or { statuses|lanes: [...], draftBusy?: boolean }. Replaces the lane status read.
+//   runner          ({repoDir, pipelineDir, env, newSha}) => {ok, error?}. Replaces the detached stop.sh + launch.sh spawn.
+//   logger          { info|log(msg) } optional; receives the step status.
+//   sha             40 hex sha of the new HEAD. paths: { pipelineDir, repoDir, changed? } (an array is taken as the changed paths).
+// Returns the drainStep status: none | stuck | blocked | waiting | failed | restarted.
+function drain({ clock, heartbeatReader, runner, logger, sha, paths, env = process.env, notify, fs } = {}) {
+  const dirs = Array.isArray(paths) ? { changed: paths } : (paths || {});
+  const pipelineDir = dirs.pipelineDir || dirs.repoDir;
+  const repoDir = dirs.repoDir || pipelineDir;
+  const extra = {};
+  if (notify) extra.notify = notify;
+  if (fs) extra.fs = fs;
+  if (clock != null) extra.now = clock;
+  if (runner) extra.run = runner;
+  if (heartbeatReader) {
+    const read = () => {
+      const value = heartbeatReader();
+      return Array.isArray(value) ? { statuses: value, draftBusy: false } : { statuses: (value && (value.statuses || value.lanes)) || [], draftBusy: Boolean(value && value.draftBusy) };
+    };
+    extra.lanes = () => read().statuses;
+    extra.drafts = () => read().draftBusy;
+  }
+  if (typeof sha === 'string' && pipelineDir) {
+    requestPipelineRestart({ pipelineDir, newSha: sha, paths: dirs.changed || [], ...(clock != null ? { now: clock } : {}), ...(fs ? { fs } : {}) });
+  }
+  const status = drainStep({ pipelineDir, repoDir, env, ...extra });
+  try {
+    const log = logger && (logger.info || logger.log);
+    if (log) log.call(logger, `live-checkout-drain: ${status}`);
+  } catch (e) { /* logging is best effort */ }
+  return status;
+}
+
+module.exports = { requestPipelineRestart, drainStep, drain, pendingPath, PENDING_FILE, OWN_SOURCE, PAUSE_TTL_MIN, DEFAULT_MAX_MIN };
 
 if (require.main === module) {
   const args = process.argv.slice(2);
