@@ -59,7 +59,7 @@ test('every function the inline script uses at load time is defined by a script 
   const mustExist = [
     'updateStaleTimers', 'renderWorkers', 'setWorkerModel', 'setWorkerTask', 'toggleWorkerExpand', 'renderCompletedTasksSection',
     'mountPersistentSidebarPlugins', 'sendTextToChat', 'renderClaudeSettingsPanel', 'wireClaudeSettingsPanel', 'renderClaudeUsagePanel', 'openGlobalBrainDumpModal',
-    'fetchJson', 'renderNav', 'showToast', 'postTaskAction', 'renderQueueTab', 'renderPluginsTab', 'safeSourceNames',
+    'fetchJson', 'renderNav', 'showToast', 'postTaskAction', 'renderQueueTab', 'renderPluginsTab', 'safeSourceNames', 'openNewTaskModal',
     'wireHubSort', 'setHubPriority', 'hubTag', 'hubProgressChip', 'wireQueueSourceFilter',
     'renderPluginsTab', 'pipelineFlagBadges',
     'renderModelsTab', 'buildBenchmarkPanelHtml', 'wireBenchmarkPanel', 'buildRadarChartSvg', 'buildResponseTable', 'renderDeepDiveTab', 'renderDiscoveryTab',
