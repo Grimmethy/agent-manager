@@ -26,6 +26,7 @@ const { injectAmplificationInstruction, extractAmplificationRequests } = require
 const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { readFastApproveMode, fastApproveDecision, appendShadowRecord } = require('./fast-approve.js');
 const { EventEmitter } = require('events');
 const emitter = new EventEmitter();
 
@@ -753,7 +754,7 @@ async function callUnrecorded(opts, maxRetries = 2) {
 // through the verdict itself (a REJECT reason), not a side-finding.
 // taskId/stage are still threaded through for call()'s hard-failure-audit log
 // (logHardFailureAudit keys off opts.taskId).
-async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage, fastApprove = readFastApproveMode(process.env), minReasoningChars }) {
   const votes = [];
   // Every vote records who cast it (feature cloud-agent-pool, FF-2b): provider 'cloud' when this process's OLLAMA_URL is a cloud-providers gateway (src/lanes.js isCloudEndpoint),
   // else 'ollama', and the model the pass used (call()'s own `model || LOCAL_MODEL` rule). Two keys added; nothing existing is renamed or reordered, and readers that ignore them are unaffected.
@@ -779,6 +780,12 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
     if (result.degenerate) continue;
     const verdict = classify(result.response);
     if (verdict) votes.push({ verdict, response: result.response, provider: voteProvider, model: voteModel });
+
+    // Fast-approve 'on': a first vote of APPROVE with enough reasoning is accepted without a full majority vote.
+    if (fastApprove === 'on' && votes.length === 1 && verdict &&
+        fastApproveDecision({ firstVote: verdict, reasoning: result.response.replace(verdict, ''), minReasoningChars })) {
+      return { verdict, confident: true, votes, realVoteCount: 1, requestedVotes: n, voteErrors, note: { fastApproved: true } };
+    }
 
     // Early-exit once any verdict has mathematically already secured minAgreeing votes
     // -- no remaining vote can change the outcome (adding to a losing verdict's tally, or
@@ -817,7 +824,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
     }
   }
 
-  return {
+  const normalResult = {
     verdict: winnerCount >= minAgreeing ? winner : null,
     confident: winnerCount >= minAgreeing,
     votes,
@@ -825,6 +832,22 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
     requestedVotes: n,
     voteErrors,
   };
+
+  // Fast-approve 'shadow': log what fast-approve would have decided; the returned verdict is never changed.
+  if (fastApprove === 'shadow') {
+    try {
+      const firstVote = votes.length ? votes[0].verdict : null;
+      const firstResponse = votes.length ? votes[0].response : '';
+      const reasoning = firstVote ? firstResponse.replace(firstVote, '') : '';
+      const wouldFastApprove = fastApproveDecision({ firstVote, reasoning, minReasoningChars });
+      const finalDecision = normalResult.verdict;
+      appendShadowRecord({ firstVote, wouldFastApprove, finalDecision, agreed: wouldFastApprove === (finalDecision === 'APPROVE') });
+    } catch (e) {
+      console.warn(`[local-client] majorityVote: fast-approve shadow log failed: ${e.message}`);
+    }
+  }
+
+  return normalResult;
 }
 
 module.exports = { call, callOnce, CALLER_RECORDED_STAGES, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, NEVER_EXPIRE, maxNumPredictThatFits, capNumPredictToFit, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD, onLocalModelReady };
