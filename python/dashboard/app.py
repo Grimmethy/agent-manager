@@ -3436,6 +3436,7 @@ from routes.internal_chat import internal_chat_bp  # noqa: E402
 from routes.plugin_proxy import plugin_proxy_bp  # noqa: E402
 from routes.project import project_bp  # noqa: E402
 from routes.task_anywhere_1_more import task_anywhere_1_more_bp  # noqa: E402
+from routes.task_anywhere_other_pipelines import task_anywhere_other_pipelines_bp  # noqa: E402
 from routes.pipeline_1_more import pipeline_1_more_bp  # noqa: E402
 from routes.branch_verdicts import branch_verdicts_bp  # noqa: E402
 from routes.plugins import plugins_bp  # noqa: E402
@@ -3474,6 +3475,7 @@ app.register_blueprint(internal_chat_bp)
 app.register_blueprint(plugin_proxy_bp)
 app.register_blueprint(project_bp)
 app.register_blueprint(task_anywhere_1_more_bp)
+app.register_blueprint(task_anywhere_other_pipelines_bp)
 app.register_blueprint(pipeline_1_more_bp)
 app.register_blueprint(branch_verdicts_bp)
 app.register_blueprint(plugins_bp)

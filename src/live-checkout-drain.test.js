@@ -74,8 +74,13 @@ test('requestPipelineRestart refuses a bad sha or no dir and never throws on an 
 test('no pending record: the step does nothing at all (no pause, no lanes read, no notice)', () => {
   const pauses = fakePauses();
   const lanes = () => { throw new Error('must not be read'); };
-  assert.equal(step(memFs(), { pauses, lanes, notify: notifier(), run: runner() }), 'none');
+  const run = runner();
+  const notify = notifier();
+  assert.equal(step(memFs(), { pauses, lanes, notify, run }), 'none');
   assert.deepEqual(pauses.state.sets, []);
+  assert.equal(pauses.state.clears, 0);
+  assert.deepEqual(run.calls, []);
+  assert.deepEqual(notify.calls, []);
   assert.equal(drainStep({}), 'none');
 });
 
@@ -200,7 +205,7 @@ test('the default restart is one detached bash that stops (keeping the dashboard
   const source = nodeFs.readFileSync(path.join(__dirname, 'live-checkout-drain.js'), 'utf8');
   assert.match(source, /scripts\/stop\.sh --keep-dashboard --keep-plugins; scripts\/launch\.sh/);
   assert.match(source, /detached: true/);
-  assert.equal(/setInterval|setTimeout/.test(source), false, 'no timer');
+  assert.equal(/set(Interval|Timeout)/.test(source), false, 'no timer');
 });
 
 test('with the real files: the record and the real worker-switch marker round-trip in a temp dir', () => {

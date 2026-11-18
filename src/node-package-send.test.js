@@ -130,13 +130,44 @@ test('a 400 moves the record to node-refused with a reason sidecar, counts refus
   assert.deepEqual(fs.readdirSync(s.outbox), []);
   assert.deepEqual(fs.readdirSync(refusedDir).sort(), ['a.json', 'a.json.reason.txt']);
   const reason = fs.readFileSync(path.join(refusedDir, 'a.json.reason.txt'), 'utf8');
-  assert.equal(reason, 'HTTP 400 at 2026-11-16T01:02:03.000Z\n');
+  assert.equal(reason, 'HTTP 400 at 2026-11-16T01:02:03.000Z: (no body)\n');
   assert.match(reason, /400/);
   let posts = 0;
   const again = await run(s, { post: async () => { posts += 1; return { status: 200 }; }, now });
   assert.equal(again.code, 0);
   assert.deepEqual(again.result, { sent: 0, failed: 0, refused: 0, remaining: 0 });
   assert.equal(posts, 0);
+});
+
+test('a 400 writes the response body into the reason file, truncated to 300 characters, and (no body) when the body is empty', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  put(s, 'b.json', REC('b'));
+  put(s, 'c.json', REC('c'));
+  const refusedDir = path.join(s.dir, 'queue', 'node-refused');
+  const bodies = { a: 'bad package: version', b: 'y'.repeat(350), c: '' };
+  const post = async (url, headers, body) => ({ status: 400, body: bodies[JSON.parse(body).taskId] });
+  const now = () => Date.UTC(2026, 10, 16, 1, 2, 3);
+  const r = await run(s, { post, now });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.result, { sent: 0, failed: 0, refused: 3, remaining: 0 });
+  assert.equal(fs.readFileSync(path.join(refusedDir, 'a.json.reason.txt'), 'utf8'), 'HTTP 400 at 2026-11-16T01:02:03.000Z: bad package: version\n');
+  assert.equal(fs.readFileSync(path.join(refusedDir, 'b.json.reason.txt'), 'utf8'), `HTTP 400 at 2026-11-16T01:02:03.000Z: ${'y'.repeat(300)}\n`);
+  assert.equal(fs.readFileSync(path.join(refusedDir, 'c.json.reason.txt'), 'utf8'), 'HTTP 400 at 2026-11-16T01:02:03.000Z: (no body)\n');
+});
+
+test('an undrafted record stays in the outbox unsent and is never posted, while a drafted record after it is still sent', async () => {
+  const s = setup();
+  put(s, 'a-undrafted.json', { ...REC('a'), implementResponse: '   ' });
+  put(s, 'b.json', REC('b'));
+  const posted = [];
+  const post = async (url, headers, body) => { posted.push(JSON.parse(body).taskId); return { status: 200 }; };
+  const r = await run(s, { post });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.result, { sent: 1, failed: 0, refused: 0, remaining: 1 });
+  assert.deepEqual(posted, ['b']);
+  assert.deepEqual(fs.readdirSync(s.outbox), ['a-undrafted.json']);
+  assert.match(r.errs.join(''), /a-undrafted\.json/);
 });
 
 test('a 400 whose refile into node-refused fails leaves the record in the outbox and counts it failed, not refused, exit 3', async () => {

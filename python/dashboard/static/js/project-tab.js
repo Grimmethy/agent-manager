@@ -195,6 +195,8 @@ async function refreshPipelineStatus() {
     }
   }
 
+  renderSwitchNoticeInto(panel, status);
+
   // Single button, reused for Start/Stop/Force Stop rather than a separate button per
   // state -- lives next to the path input, not in the panel above, since Start acts on
   // whatever's currently in that input.
@@ -236,6 +238,65 @@ async function refreshPipelineStatus() {
     startBtn.textContent = 'Start Pipeline';
     startBtn.onclick = startPipeline;
     startBtn.disabled = !projectPath;
+  }
+}
+
+// Switch project: shown when the dropdown's project differs from the one the running pipeline uses.
+let switchInFlight = false;
+let switchProgressText = '';
+
+function renderSwitchNoticeInto(panel, status) {
+  const selected = (document.getElementById('project-select') || {}).value || projectPath || '';
+  let html = renderProjectSwitchNoticeHtml(selected, status.activeRepoRoot || '', !!status.running, switchProgressText);
+  if (!html && switchInFlight) {
+    html = `<div class='meta' id='switch-project-progress'>${escapeHtml(switchProgressText)}</div>`;
+  }
+  if (!html) return;
+  panel.insertAdjacentHTML('beforeend', html);
+  const btn = document.getElementById('switch-project-btn');
+  if (btn) { btn.disabled = switchInFlight; btn.onclick = switchProject; }
+}
+
+async function switchProject() {
+  if (switchInFlight) return;
+  const selected = (document.getElementById('project-select') || {}).value || projectPath || '';
+  if (!selected) return;
+  switchInFlight = true;
+  switchProgressText = 'Stopping pipeline...';
+  await refreshPipelineStatus();
+  try {
+    await fetch('/api/pipeline/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force: false }),
+    });
+    let stillRunning = true;
+    for (let i = 0; i < 95 && stillRunning; i++) {
+      await switchSleepMs(1000);
+      const st = await fetchJson('/api/pipeline/status');
+      stillRunning = !!(st.running || st.stoppable);
+      switchProgressText = stillRunning
+        ? 'Waiting for graceful stop: ' + (i + 1) + 's / 90s'
+        : 'Stopped. Starting against ' + switchNoticeBaseName(selected) + '...';
+      await refreshPipelineStatus();
+    }
+    if (stillRunning) {
+      switchProgressText = 'Pipeline did not stop within 90s. Stop it manually, then try again.';
+    } else {
+      setProjectPath(selected);
+      const res = await fetch('/api/pipeline/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: selected, includeApply, skipPush }),
+      });
+      const data = await res.json().catch(() => ({}));
+      switchProgressText = res.ok ? '' : 'Start refused: ' + (data.reason || data.description || res.statusText);
+    }
+  } catch (e) {
+    switchProgressText = 'Switch failed: ' + e.message;
+  } finally {
+    switchInFlight = false;
+    await refreshPipelineStatus();
   }
 }
 

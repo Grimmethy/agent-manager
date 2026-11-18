@@ -230,9 +230,23 @@ process_drafting_file() {
   elif [[ "$draft_succeeded" == "true" ]] && node "${PACKAGE_SRC_DIR}/node-outbox.js" is-node; then
     # Multi-node (piece 7b): a worker on a NODE (AGENT_MANAGER_NODE_ID set and not wok) stops after the draft. The drafted record waits in queue/node-outbox/ for
     # src/node-package-send.js to ship it to wok, whose own queue/review/ runs the ordinary review, apply, verifier and merge. A wok worker never takes this branch.
-    mkdir -p "${QUEUE_DIR}/node-outbox" >/dev/null 2>&1
-    mv -n "$wpath" "${QUEUE_DIR}/node-outbox/${name}"
-    printf '[worker-%s] draft complete on a node, ready to send to wok: %s\n' "$INSTANCE_ID" "$task_id" >&2
+    # Draft-present gate (HUB0574): only move a drafted record into node-outbox/ when it actually carries draft content. Otherwise leave it in the node's queue and log the reason.
+    draft_content_gap="$(node -e '
+      try {
+        const o = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+        const nonEmpty = (v) => (typeof v === "string" ? v.trim() !== "" : !!v);
+        const nc = o.needsClarification;
+        const ncReason = nc && typeof nc === "object" ? nc.reason : nc;
+        if (!(nonEmpty(o.implementResponse) || nonEmpty(o.rawDiff) || nonEmpty(o.adhocResolution) || nonEmpty(ncReason))) console.log("no implementResponse, rawDiff, adhocResolution or needsClarification reason on the record");
+      } catch (e) { console.log("record unreadable: " + e.message); }
+    ' "$wpath" 2>/dev/null)"
+    if [[ -n "$draft_content_gap" ]]; then
+      printf '[worker-%s] draft succeeded for %s but it is not ready to send to wok (%s) -- left in the node queue\n' "$INSTANCE_ID" "$task_id" "$draft_content_gap" >&2
+    else
+      mkdir -p "${QUEUE_DIR}/node-outbox" >/dev/null 2>&1
+      mv -n "$wpath" "${QUEUE_DIR}/node-outbox/${name}"
+      printf '[worker-%s] draft complete on a node, ready to send to wok: %s\n' "$INSTANCE_ID" "$task_id" >&2
+    fi
   elif [[ "$draft_succeeded" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/review" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/review/${name}"

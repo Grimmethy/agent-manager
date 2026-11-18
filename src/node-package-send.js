@@ -8,7 +8,8 @@
 // Each record in the outbox (*.json, sorted by name) is sent with the node's token read from the file (never from the environment, never printed or logged). A 2xx
 // answer moves the record to node-sent/, a sibling of the outbox; any other answer, a send that cannot be made, a file that is not a JSON record with a string id,
 // or a move that fails leaves the file where it is and counts as failed. HTTP 400 is the exception: the package can never be accepted as it stands, so the file
-// is moved to node-refused/ (a sibling of node-sent/) with a <name>.reason.txt beside it reading `HTTP 400 at <ISO time>`, and counts as refused, not failed.
+// is moved to node-refused/ (a sibling of node-sent/) with a <name>.reason.txt beside it reading `HTTP 400 at <ISO time>: <first 300 chars of the response body>` (or `(no body)` when the body is empty), and counts as refused, not failed.
+// A record whose draft is empty (no implementResponse; see hasDraft in src/rereview-task.js) is skipped before it is built: it stays in the outbox, its file name and the reason are logged on stderr, and it counts as neither sent nor failed.
 // Prints one JSON line {sent, failed, refused, remaining}. Exit 0 when nothing failed (refused alone is 0), 3 when any failed, 2 for a missing argument, an
 // unreadable or empty token file, or an outbox that is not a directory (usage on stderr).
 
@@ -64,20 +65,24 @@ async function main(argv, env = process.env, deps = {}, out = (s) => process.std
   try { token = fs.readFileSync(tokenFile, 'utf8').trim(); } catch (e) { token = ''; }
   if (!token) { err('the token file is missing or empty\n'); return 2; }
   if (!fs.existsSync(outbox) || !fs.statSync(outbox).isDirectory()) { err('the outbox is not a directory\n'); return 2; }
+  // Loaded here, not at the top: rereview-task.js pulls in modules that read the home directory, so the usage path must not load it.
+  const { hasDraft } = require('./rereview-task.js');
   const sentDir = path.join(path.dirname(outbox), 'node-sent');
   const refusedDir = path.join(path.dirname(outbox), 'node-refused');
   const now = deps.now || Date.now;
   let sent = 0;
   let failed = 0;
   let refused = 0;
+  let skippedUndrafted = 0;
   for (const name of outboxFiles(outbox)) {
     const file = path.join(outbox, name);
     const record = readJson(file);
     if (!record || typeof record.id !== 'string' || !record.id) { failed += 1; continue; }
+    if (!hasDraft(record)) { skippedUndrafted += 1; err(`skipped ${name}: the record has no draft (implementResponse is empty); it stays in the outbox\n`); continue; }
     const pkg = buildRecordPackage({ record, nodeId, now: now() });
     const r = await sendPackage(pkg, { url, tokenFile, post: deps.post });
     if (r.ok) { if (moveToSent(file, sentDir)) sent += 1; else failed += 1; }
-    else if (r.status === 400) { if (moveToRefused(file, refusedDir, `HTTP 400 at ${new Date(now()).toISOString()}`)) refused += 1; else failed += 1; }
+    else if (r.status === 400) { const body = r.body ? String(r.body).slice(0, 300) : '(no body)'; if (moveToRefused(file, refusedDir, `HTTP 400 at ${new Date(now()).toISOString()}: ${body}`)) refused += 1; else failed += 1; }
     else failed += 1;
   }
   out(JSON.stringify({ sent, failed, refused, remaining: outboxFiles(outbox).length }));

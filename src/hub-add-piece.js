@@ -23,7 +23,7 @@
 // a short wait apart) and the entry re-applied if it vanished. Re-running the same command is idempotent.
 // Kill switch: AGENT_MANAGER_HUB_ADD_PIECE=false.
 //
-// CLI: node src/hub-add-piece.js <hubRecordId> --title "..." --prompt-context-file f.json [--files a,b] [--depends-on id] [--who name] [--reason "..."]
+// CLI: node src/hub-add-piece.js <hubRecordId> --title "..." --prompt-context-file f.json [--files a,b] [--depends-on id] [--before id | --after id] [--who name] [--reason "..."]
 //        node src/hub-add-piece.js <hubRecordId> --adopt <childId> [--who name] [--reason "..."]
 //      Pipeline dir: --pipeline-dir, else AGENT_MANAGER_PIPELINE_DIR. Prints one line of JSON: { ok, ... } or { ok:false, error }.
 
@@ -108,7 +108,7 @@ function ensureListed(hubFile, entry, sleep) {
   return !!(last && Array.isArray(last.subTasks) && last.subTasks.some((s) => s && s.id === entry.id));
 }
 
-function addPieceToHub({ pipelineDir, hubId, title, rawText, files, dependsOn, prerequisiteHubs, adopt, who, reason, now = () => new Date().toISOString(), sleep = (ms) => { if (ms) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } }) {
+function addPieceToHub({ pipelineDir, hubId, title, rawText, files, dependsOn, prerequisiteHubs, adopt, before, after, who, reason, now = () => new Date().toISOString(), sleep = (ms) => { if (ms) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } }) {
   if (!enabled()) return { ok: false, error: 'hub add-piece is switched off (AGENT_MANAGER_HUB_ADD_PIECE=false)' };
   if (!pipelineDir || !hubId) return { ok: false, error: 'pipelineDir and hubId are required' };
   const queueDir = path.join(pipelineDir, 'queue');
@@ -116,6 +116,21 @@ function addPieceToHub({ pipelineDir, hubId, title, rawText, files, dependsOn, p
   if (found.error) return { ok: false, error: found.error };
   const { file: hubFile, hub } = found;
   const by = who || 'operator';
+
+  // ---------------------------------------------------------------- insertion anchor (before/after a sibling; no anchor = append)
+  if (before && after) return { ok: false, error: '--before and --after are mutually exclusive: give one anchor piece, not both' };
+  const anchorId = before || after;
+  let at = null;
+  let anchorPrev = null;
+  if (anchorId) {
+    const idx = hub.subTasks.findIndex((s) => s && s.id === anchorId);
+    if (idx < 0) return { ok: false, error: `'${anchorId}' is not a piece of hub '${hub.id}'` };
+    const anchorRec = findTask(queueDir, anchorId);
+    const anchorState = anchorRec ? anchorRec.state : 'missing';
+    if (!['adhoc', 'pending', 'derived'].includes(anchorState)) return { ok: false, error: `anchor '${anchorId}' is in state ${anchorState}; it must be adhoc, pending or derived to insert beside it` };
+    at = before ? idx : idx + 1;
+    anchorPrev = hub.subTasks[at - 1] || null;
+  }
 
   // ---------------------------------------------------------------- adopt an existing child
   if (adopt) {
@@ -128,7 +143,7 @@ function addPieceToHub({ pipelineDir, hubId, title, rawText, files, dependsOn, p
     if (chain.error) return { ok: false, error: chain.error };
     if (chain.branch && rec.task.stacked && rec.task.stacked.branch && rec.task.stacked.branch !== chain.branch) return { ok: false, error: `'${adopt}' is stacked on ${rec.task.stacked.branch}, the hub's chain is ${chain.branch}` };
     const entry = { id: adopt, title: rec.task.title || adopt, status: 'pending' };
-    return finish({ hub, hubFile, entry, by, reason, now, sleep, adopted: true });
+    return finish({ hub, hubFile, entry, by, reason, now, sleep, adopted: true, at });
   }
 
   // ---------------------------------------------------------------- build a new child
@@ -151,7 +166,8 @@ function addPieceToHub({ pipelineDir, hubId, title, rawText, files, dependsOn, p
     const seq = Math.max(chain.maxSeq, hub.subTasks.length) + 1;
     record.stacked = { branch: chain.branch, seq, total: seq };
   }
-  const deps = Array.isArray(dependsOn) && dependsOn.length ? dependsOn : (chain.branch && last && last.id ? [last.id] : []);
+  const prior = at == null ? last : anchorPrev;
+  const deps = Array.isArray(dependsOn) && dependsOn.length ? dependsOn : (chain.branch && prior && prior.id ? [prior.id] : []);
   if (deps.length) record.dependsOn = deps;
   const declared = validProposalFiles(files);
   if (declared && !/^Files:/im.test(record.promptContext.rawText)) record.promptContext.rawText += `\nFiles: ${declared.join(', ')}`;
@@ -163,13 +179,16 @@ function addPieceToHub({ pipelineDir, hubId, title, rawText, files, dependsOn, p
   writeJsonAtomic(childFile, record);
   const entry = { id, title: record.title, status: 'pending' };
   const gate = ownerGateFor({ id, title: record.title, rawText: record.promptContext.rawText });
-  return finish({ hub, hubFile, entry, by, reason, now, sleep, gate, seq: record.stacked && record.stacked.seq });
+  return finish({ hub, hubFile, entry, by, reason, now, sleep, gate, seq: record.stacked && record.stacked.seq, at });
 }
 
-function finish({ hub, hubFile, entry, by, reason, now, sleep, gate, adopted, seq }) {
+function finish({ hub, hubFile, entry, by, reason, now, sleep, gate, adopted, seq, at }) {
   // Re-read just before writing so we extend the freshest copy; the coordinator may have rewritten the hub since `hub` was read.
   const fresh = readJson(hubFile) || hub;
-  if (!fresh.subTasks.some((s) => s && s.id === entry.id)) fresh.subTasks.push({ ...entry });
+  if (!fresh.subTasks.some((s) => s && s.id === entry.id)) {
+    if (at == null) fresh.subTasks.push({ ...entry });
+    else fresh.subTasks.splice(Math.min(at, fresh.subTasks.length), 0, { ...entry });
+  }
   if (gate) fresh.ownerGates = [...(Array.isArray(fresh.ownerGates) ? fresh.ownerGates : []), gate];
   appendHistoryEvent(fresh, 'advisory', `piece ${entry.id} ${adopted ? 'adopted into' : 'added to'} the hub by ${by}${reason ? `: ${reason}` : ''} -- the hub is not ready to merge until it is built`);
   fresh.piecesAddedAt = now();
@@ -193,6 +212,7 @@ function parseArgs(argv) {
 function main(argv) {
   const args = parseArgs(argv);
   const hubId = args._[0];
+  if (args.before === true || args.after === true) return { ok: false, error: '--before and --after each need a piece id' };
   const pipelineDir = args['pipeline-dir'] || process.env.AGENT_MANAGER_PIPELINE_DIR;
   let rawText = args['raw-text'];
   let files = typeof args.files === 'string' ? args.files.split(',').map((s) => s.trim()).filter(Boolean) : undefined;
@@ -207,7 +227,10 @@ function main(argv) {
   return addPieceToHub({
     pipelineDir, hubId, title: args.title, rawText, files, prerequisiteHubs,
     dependsOn: typeof args['depends-on'] === 'string' ? args['depends-on'].split(',').map((s) => s.trim()).filter(Boolean) : undefined,
-    adopt: typeof args.adopt === 'string' ? args.adopt : undefined, who: args.who, reason: typeof args.reason === 'string' ? args.reason : undefined,
+    adopt: typeof args.adopt === 'string' ? args.adopt : undefined,
+    before: typeof args.before === 'string' ? args.before : undefined,
+    after: typeof args.after === 'string' ? args.after : undefined,
+    who: args.who, reason: typeof args.reason === 'string' ? args.reason : undefined,
   });
 }
 
