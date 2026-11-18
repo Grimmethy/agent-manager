@@ -22,6 +22,8 @@ mapfile -t lane_env < <(node src/lanes.js --env worker-cloud)
 
 Each output line is one `KEY=VALUE` pair. Nothing is written to disk.
 
+If the `worker-cloud` entry in `<pipeline-dir>/lanes.json` still has `enabled` set to `false` (the state `scripts/provision-node.sh` writes), `src/lanes.js` does not list the lane and this command fails with `unknown lane: worker-cloud`. Set `enabled` to `true` first, as `multi-node-runbook.md` section 2, step 3 says.
+
 ## 3. Start the worker by hand
 
 ```
