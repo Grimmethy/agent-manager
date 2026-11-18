@@ -3154,3 +3154,29 @@ Benefits:
 The concept registry no longer depends on the internal structure of brain-dump or task-history. Schema changes in those stores don't ripple into the concept registry. Timeline logic can evolve independently.
 
 NOTE: AC-002 flag was not applied — the pre-check's "missing-file" lead for `marker-utils.js` is a false positive because the draft is creating this file (not claiming it already exists), which is explicitly permitted by the review guidance.
+
+### AC-252 · Orphaned utility module `src/lib/prompt-assembly.js`
+Strength: Strong
+Files: src/lib/prompt-assembly.js, src/brain-dump-sort-classify.js, src/test_project_search_zero_findings_prompt.js
+
+Problem:
+The module `src/lib/prompt-assembly.js` exports an `assemblePrompt` function but has no consumers within this community of files. The other files in the community (`src/brain-dump-sort-classify.js` and `src/test_project_search_zero_findings_prompt.js`) do not import from it. This suggests the module is either dead code, an incomplete extraction, or used only by files outside this community without proper wiring.
+
+Solution:
+Either remove the module if it's truly unused, or add documentation explaining its intended use and how it should be wired into the community. If it's meant to be used by `src/brain-dump-sort-classify.js`, add an import statement to make the dependency explicit.
+
+Benefits:
+Eliminates confusion about module ownership and usage, reduces maintenance burden of unused code, and makes the architecture more explicit and maintainable.
+
+### AC-253 · Test file has fragile cross-community dependency
+Strength: Strong
+Files: src/test_project_search_zero_findings_prompt.js, src/brain-dump-sort-classify.js, src/lib/prompt-assembly.js
+
+Problem:
+The test file `src/test_project_search_zero_findings_prompt.js` depends on a module outside this community, creating a fragile cross-community dependency. This means changes to the external module could break this test without any local indication, and the test's validity depends on the external module's API remaining stable.
+
+Solution:
+Either include the external module in this community if it's closely related, or add explicit documentation about the dependency and its stability guarantees. Consider extracting the tested functionality into a shared module that can be properly versioned and tested.
+
+Benefits:
+Reduces cross-community coupling, makes dependencies explicit, and ensures that changes to shared functionality are properly tracked and tested.
