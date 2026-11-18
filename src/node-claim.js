@@ -13,7 +13,7 @@
 // recorded in the skipped array; the scan continues with the next candidate.
 //
 // Filtered pipeline dirs (AGENT_MANAGER_NODE_FILTERED_DIRS, comma separated; AGENT_MANAGER_NODE_FILTER_SOURCES and AGENT_MANAGER_NODE_ALLOW_STACKED widen it, see eligibleForNode): a task in such a dir is claimed only when
-// eligibleForNode holds (source 'manual', not stacked, domain in AGENT_MANAGER_NODE_FILTER_DOMAINS (default ['adhoc']),
+// eligibleForNode holds (source 'manual', not stacked, domain in AGENT_MANAGER_NODE_FILTER_DOMAINS (default ['adhoc', 'default']),
 // and filed for this repo or unscoped). Other tasks there are recorded in skipped as 'not-eligible-for-node'.
 // Pipeline dirs not listed in AGENT_MANAGER_NODE_FILTERED_DIRS are unfiltered, exactly as before.
 // AGENT_MANAGER_NODE_SKIP_PREMIUM (true, 1 or on, trimmed and case-insensitive; default off) refuses tasks with premiumPriority true in every pipeline dir, filtered or not.
@@ -34,7 +34,7 @@ const { rankPriorityResolved } = require('./rank-priority.js');
 // non-manual sources, not tasks filed for another repo. Premium tasks (premiumPriority true) are refused when skipPremium is on (AGENT_MANAGER_NODE_SKIP_PREMIUM, default off). Two settings widen it (owner decision 2026-11-16, to
 // give grimm enough work): `sources` (AGENT_MANAGER_NODE_FILTER_SOURCES, default ['manual']) and `allowStacked` (AGENT_MANAGER_NODE_ALLOW_STACKED, default false).
 // The domain list and the same-repo rule always apply. A stacked piece that is allowed still goes through the hub rules below (sticky branch, dependsOn).
-function eligibleForNode(task, { pipelineDir, domains = ['adhoc'], sources = ['manual'], allowStacked = false, skipPremium = false } = {}) {
+function eligibleForNode(task, { pipelineDir, domains = ['adhoc', 'default'], sources = ['manual'], allowStacked = false, skipPremium = false } = {}) {
   if (!task || typeof task !== 'object') return false;
   if (skipPremium === true && task.premiumPriority === true) return false;
   if (!sources.includes(task.source)) return false;
@@ -53,10 +53,10 @@ function filteredDirs(env = process.env) {
   return splitList(env.AGENT_MANAGER_NODE_FILTERED_DIRS).map((d) => path.resolve(d));
 }
 
-// Domains a node may take from filtered dirs (AGENT_MANAGER_NODE_FILTER_DOMAINS). Unset or empty gives ['adhoc'].
+// Domains a node may take from filtered dirs (AGENT_MANAGER_NODE_FILTER_DOMAINS). Unset or empty gives ['adhoc', 'default'].
 function filterDomains(env = process.env) {
   const list = splitList(env.AGENT_MANAGER_NODE_FILTER_DOMAINS);
-  return list.length ? list : ['adhoc'];
+  return list.length ? list : ['adhoc', 'default'];
 }
 
 // Sources a node may take from filtered dirs (AGENT_MANAGER_NODE_FILTER_SOURCES). Unset or empty gives ['manual'].
