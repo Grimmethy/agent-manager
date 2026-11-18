@@ -436,7 +436,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { applyRetryCheck, isDivergedHistoryFailure, isInfraApplyFailure, isGitTimeoutFailure, defaultIsApplyCloneClean };
+module.exports = { applyRetryCheck, isDivergedHistoryFailure, isInfraApplyFailure, isGitTimeoutFailure, defaultIsApplyCloneClean, MAX_APPLY_RETRIES };
 
 if (require.main === module) {
   main();
