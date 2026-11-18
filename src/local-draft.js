@@ -2174,7 +2174,7 @@ async function runDraftPasses(task, attempt, {
 
     return { succeeded: true, blocked: false };
   } catch (e) {
-    console.error('[local-draft] draftTask failed:', e.stack || String(e));
+    console.error('[local-draft] runDraftPasses failed:', e.stack || String(e));
     if (e.cause) console.error('[local-draft] draftTask cause:', e.cause.stack || String(e.cause));
     return { succeeded: false, reason: e.message };
   }
