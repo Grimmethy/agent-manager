@@ -47,10 +47,16 @@ const registry = {};
  * task.source string -> registry name, for sources whose generated tasks carry a `source`
  * field that differs from the name they registered under (e.g. unused_export stamps
  * source: 'deadcode_triage'). A plugin declares its own quirk via registerSourceAlias()
- * instead of this file needing to know every consumer's naming; resolveSourceName() below
- * still has hardcoded fallbacks for this package's own built-in quirks + a legacy one.
+ * instead of this file needing to know every consumer's naming. This package's own built-ins
+ * ('manual' -> adhoc) are seeded through the same call by seedBuiltinAliases() at module load.
  */
 const sourceAliases = {};
+
+/** task.domain string -> registry name (e.g. 'adhoc' -> 'adhoc'). Filled via registerDomainAlias(). */
+const domainAliases = Object.create(null);
+
+/** Unresolved-task drops, keyed by task id + raw source + raw domain. */
+const unresolvedDrops = new Map();
 
 /** Markers for gated next() wrappers, so a function is never double-wrapped. */
 const gatedNextFns = new WeakSet();
@@ -149,11 +155,45 @@ function registerSourceAlias(fromField, toName) {
 }
 
 /**
- * Clear all registered sources (and source aliases). Useful for testing.
+ * Declare that tasks carrying `task.domain === domain` belong to the registry entry `toName`.
+ * Looked up at call time (never cached), so registration order between plugins does not matter.
+ * @param {string} domain - the value a task stamps on its `domain` field
+ * @param {string} toName - the registry key that source registered under
+ */
+function registerDomainAlias(domain, toName) {
+  domainAliases[domain] = toName;
+}
+
+/** Register this package's own built-in domain/source quirks through the public alias calls. */
+function seedBuiltinAliases() {
+  registerDomainAlias('adhoc', 'adhoc');
+  registerDomainAlias('secondbrain', 'secondbrain');
+  // See resolveSourceName(): source:'manual' is adhoc-shaped whatever domain landed on the task.
+  registerSourceAlias('manual', 'adhoc');
+}
+
+/**
+ * Clear all registered sources, source aliases, domain aliases and unresolved-drop records, then
+ * re-seed this package's own built-in aliases (they are not plugin-owned). Useful for testing.
  */
 function clearRegistry() {
   Object.keys(registry).forEach(key => delete registry[key]);
   Object.keys(sourceAliases).forEach(key => delete sourceAliases[key]);
+  Object.keys(domainAliases).forEach(key => delete domainAliases[key]);
+  unresolvedDrops.clear();
+  seedBuiltinAliases();
+}
+
+/** Total number of recorded unresolved-task drops (sum over all id/source/domain keys). */
+function getUnresolvedSourceCount() {
+  let n = 0;
+  for (const d of unresolvedDrops.values()) n += d.count;
+  return n;
+}
+
+/** Recorded unresolved drops: [{ taskId, source, domain, count }]. */
+function getUnresolvedSources() {
+  return [...unresolvedDrops.values()].map(d => ({ ...d }));
 }
 
 /**
@@ -173,14 +213,28 @@ function clearRegistry() {
  * source:'manual' is otherwise only ever set by queue-adhoc-task.js's CLI and
  * api_brain_dump_prioritize -- both adhoc-shaped regardless of which domain string
  * landed on the task -- so this is a safe, unambiguous second identifier, not a guess.
+ *
+ * Precedence: domain alias (registerDomainAlias), then source alias (registerSourceAlias),
+ * then task.source unchanged.
+ *
+ * REQUIRES AN INITIALIZED REGISTRY: it only resolves against what has been registered so far.
+ * Built-in aliases are seeded at module load; sources and plugin aliases register in their own
+ * registration files. Called earlier, it returns the unresolved result (task.source unchanged) --
+ * not an error, and the miss is never cached. When the registry has entries but the result is
+ * not one of them, one drop is recorded (see getUnresolvedSources()), keyed by task id, raw
+ * source and raw domain. With an empty registry nothing is recorded.
  * @param {object} task - The task record.
  * @returns {string} The registry name to look up.
  */
 function resolveSourceName(task) {
-  if (task.domain === 'adhoc' || task.source === 'manual') return 'adhoc';
-  if (task.domain === 'secondbrain') return 'secondbrain';
-  if (sourceAliases[task.source]) return sourceAliases[task.source];
-  return task.source;
+  const resolved = (task.domain !== undefined && domainAliases[task.domain]) || sourceAliases[task.source] || task.source;
+  if (registry[resolved] === undefined && Object.keys(registry).length > 0) {
+    const key = JSON.stringify([task.id ?? null, task.source ?? null, task.domain ?? null]);
+    const rec = unresolvedDrops.get(key);
+    if (rec) rec.count += 1;
+    else unresolvedDrops.set(key, { taskId: task.id ?? null, source: task.source ?? null, domain: task.domain ?? null, count: 1 });
+  }
+  return resolved;
 }
 
 /**
@@ -220,4 +274,6 @@ function getVariantsOf(parent) {
   return Object.keys(registry).filter((n) => variantParentOf(n) === parent);
 }
 
-module.exports = { variantParentOf, getVariantsOf, registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource, resolveSourceName, registerSourceAlias };
+seedBuiltinAliases();
+
+module.exports = { variantParentOf, getVariantsOf, registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource, resolveSourceName, registerSourceAlias, registerDomainAlias, getUnresolvedSourceCount, getUnresolvedSources };

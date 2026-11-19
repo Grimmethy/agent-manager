@@ -51,6 +51,7 @@ const MAX_DEBRIEF_ACTIONS = 3; // 2026-09-07: Easy Agile / Coveros retrospective
 const {
   REASON_CATEGORIES, categorizeBlockedReason, hasZeroHitHarnessSearch, signatureForTask, classifyBlockedTask,
 } = require('./blocked-task-classifiers.js');
+const { parseSignature } = require('./signature-parse.js');
 
 // coverage: { [signature]: { reportedAt, taskId } } -- signatures already turned into an
 // audit task are skipped forever (this module reports a pattern once; whether the
@@ -86,9 +87,7 @@ function findAuditClusters(blockedTasks, coverage = {}) {
 // never to queue/ task-state files.
 function buildAuditRawText(cluster) {
   const { signature, tasks } = cluster;
-  const sepIdx = signature.lastIndexOf('::');
-  const source = signature.slice(0, sepIdx);
-  const category = signature.slice(sepIdx + 2);
+  const { source, category } = parseSignature(signature);
   const examples = tasks.slice(0, MAX_EXAMPLES).map((t) => {
     const reason = (t.blockedReason || '(no blockedReason recorded)').slice(0, MAX_REASON_CHARS);
     return `- ${t.id}: ${reason}`;
@@ -139,9 +138,7 @@ function buildAuditRawText(cluster) {
 // pure functions.
 function buildAuditTask(cluster, domain) {
   const { signature } = cluster;
-  const sepIdx = signature.lastIndexOf('::');
-  const source = signature.slice(0, sepIdx);
-  const category = signature.slice(sepIdx + 2);
+  const { source, category } = parseSignature(signature);
   const id = `pipeline-self-audit-${source}-${category}-${Date.now()}`;
   return {
     id,
