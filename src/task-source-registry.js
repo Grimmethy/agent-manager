@@ -120,7 +120,8 @@ function registerTaskSource(name, config) {
  * @returns {object[]} Array of stored entries.
  */
 function getRegisteredSources() {
-  return Object.values(registry).sort((a, b) => {
+  // applyOnly entries (lib/apply-core.js dispatch targets) are not real task sources: never enumerate them.
+  return Object.values(registry).filter((s) => !s.applyOnly).sort((a, b) => {
     const pa = a.priority ?? Infinity;
     const pb = b.priority ?? Infinity;
     return pa - pb;

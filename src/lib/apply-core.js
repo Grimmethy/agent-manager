@@ -2,7 +2,7 @@
 
 // apply-core.js -- extracted from src/apply-task.js ([[hub-task-integration]] node-module decompose).
 
-const { getRegisteredSource, resolveSourceName } = require('../task-source-registry.js');
+const { getRegisteredSource, resolveSourceName, registerTaskSource } = require('../task-source-registry.js');
 const { getCandidateSplitHubFiler } = require('../candidate-split-hub-route.js');
 const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve, closeBrainDumpEntryResolved, applyResearchTask, isEffectivelyEmptyResponse, applyArchDiscoveryCandidates } = require('../apply-group-a.js');
 const { applyGroupB, batchContainsDeleteMode } = require('../apply-group-b.js');
@@ -79,56 +79,73 @@ function applyCandidateSplit(task, source) {
   return result;
 }
 
-function writeArtifact(task, repoRoot, pipelineDir) {
-  if (Array.isArray(task.candidateSplitProposals) && task.candidateSplitProposals.length > 0) {
-    // A split the draft routed to the hub system becomes real, ordered sub-tasks under a
-    // coordinator instead of more candidate-doc entries. applyCandidateSplitAsHub itself
-    // lives in the agent-manager-hub-tasks plugin (S4b of the hub-tasks extraction,
-    // 2026-09-25) -- see candidate-split-hub-route.js for the swap point.
-    if (task.candidateSplitRoute === 'hub') {
-      const filer = getCandidateSplitHubFiler();
-      if (!filer) {
-        throw new Error(`task ${task.id}: candidate split routed to a coordinator hub, but no hub-task filer is registered -- load/register the agent-manager-hub-tasks plugin (AGENT_MANAGER_REGISTER_PATH)`);
-      }
-      return filer.applyCandidateSplitAsHub(task, pipelineDir);
-    }
-    return applyCandidateSplit(task, getRegisteredSource(resolveSourceName(task)));
+// Apply-only registry entries (AC-212): writeArtifact is a single getRegisteredSource -> source.apply
+// dispatch. These entries carry applyOnly:true so getRegisteredSources() (task generation, priority
+// maps, domains, topology) never enumerates them as real task sources.
+function applyHubCandidateSplit({ task, pipelineDir }) {
+  // A split the draft routed to the hub system becomes real, ordered sub-tasks under a coordinator.
+  // applyCandidateSplitAsHub lives in the agent-manager-hub-tasks plugin; see candidate-split-hub-route.js.
+  // Never falls back to the plain split path.
+  const filer = getCandidateSplitHubFiler();
+  if (!filer) {
+    throw new Error(`task ${task.id}: candidate split routed to a coordinator hub, but no hub-task filer is registered -- load/register the agent-manager-hub-tasks plugin (AGENT_MANAGER_REGISTER_PATH)`);
   }
-  if (!usesGroupB(task)) {
-    const source = getRegisteredSource(resolveSourceName(task));
-    return source.apply({ implementResponse: task.implementResponse, repoRoot, pipelineDir, task });
-  }
-  // Confirmed live 2026-08-22: several Group B sources (arch_review, observability_fix,
-  // performance_fix, pipeline_self_audit, ...) are explicitly told to output the empty
-  // string when there's genuinely nothing to change (see prompts.js's own instructions,
-  // and review-task.js's EMPTY_APPROVAL_SOURCES, which already treats this exact case as
-  // a legitimate approved outcome at REVIEW time) -- but this apply stage had no matching
-  // check of its own, so an approved-empty task reached applyGroupB's JSON.parse
-  // unconditionally and threw "Invalid JSON in Group B implementResponse: Unexpected end
-  // of JSON input", landing the task in blocked/ instead of a clean, correct skip. Found
-  // as a real 6-task cluster in queue/blocked/ this same session -- invisible to
-  // pipeline_self_audit's own detector besides, since that error text matches none of its
-  // REASON_CATEGORIES keywords. Same {skipped, reason} shape apply-group-a.js's own
-  // applyVerdictOnly already uses for "nothing to write, that's a legitimate outcome."
-  if (isEffectivelyEmptyResponse(task.implementResponse)) {
+  return filer.applyCandidateSplitAsHub(task, pipelineDir);
+}
+
+function applyPlainCandidateSplit({ task }) {
+  return applyCandidateSplit(task, getRegisteredSource(resolveSourceName(task)));
+}
+
+function applyGroupBEntry({ implementResponse, repoRoot, pipelineDir }) {
+  // Several Group B sources are told to answer with the empty string when there is nothing to change;
+  // review already approves that, so apply must skip cleanly instead of failing in JSON.parse.
+  if (isEffectivelyEmptyResponse(implementResponse)) {
     return { skipped: true, reason: 'no code change needed (empty implement response, already approved at review)' };
   }
-  // Same failure shape as the empty-response gap above, one layer further out: a Group B
-  // source can legitimately answer with a plain-text refusal ("FALSE POSITIVE -- the real
-  // file already contains the fix the candidate described") instead of a change. Review
-  // can and does approve this prose as a genuinely correct answer -- unlike the
-  // empty-string case, nothing marks it specially at review time, so it reaches here as
-  // ordinary approved implementResponse text. Found live as a real 2-task cluster
-  // (observability-fix-ac-45/ac-59) in queue/blocked/: both correctly explained the flagged
-  // issue no longer exists, and both got "Invalid JSON in Group B implementResponse:
-  // Unexpected token 'F', \"FALSE POSI\"..." instead of the clean skip they deserved.
-  // Anchored to the START of the (trimmed) response -- real Group B JSON always begins
-  // with `[` or `{`, so this can never misfire on a legitimate change whose diff content
-  // happens to mention "false positive" somewhere inside a string value.
-  if (/^false[\s-]?positive\b/i.test(String(task.implementResponse || '').trim())) {
-    return { skipped: true, reason: `false positive (already fixed / no code change needed): ${String(task.implementResponse).trim().slice(0, 300)}` };
+  // A plain-text refusal ("FALSE POSITIVE -- ...") is a legitimate approved answer too. Anchored to the
+  // start of the trimmed response: real Group B JSON always begins with [ or {.
+  if (/^false[\s-]?positive\b/i.test(String(implementResponse || '').trim())) {
+    return { skipped: true, reason: `false positive (already fixed / no code change needed): ${String(implementResponse).trim().slice(0, 300)}` };
   }
-  return applyGroupB({ implementResponse: task.implementResponse, repoRoot, pipelineDir });
+  return applyGroupB({ implementResponse, repoRoot, pipelineDir });
+}
+
+const APPLY_ONLY_ENTRIES = {
+  'hub-candidate-split': applyHubCandidateSplit,
+  'candidate-split': applyPlainCandidateSplit,
+  'group-b': applyGroupBEntry,
+};
+
+function ensureApplyEntries() {
+  for (const [name, apply] of Object.entries(APPLY_ONLY_ENTRIES)) {
+    if (!getRegisteredSource(name)) registerTaskSource(name, { applyOnly: true, apply });
+  }
+}
+ensureApplyEntries();
+
+// The only place that inspects candidateSplitProposals / candidateSplitRoute / task group.
+// Most protected case first: a split must reach its proposals writer even when the origin source has its own apply.
+function applyEntryName(task) {
+  ensureApplyEntries(); // idempotent; survives clearRegistry() in tests
+  if (Array.isArray(task.candidateSplitProposals) && task.candidateSplitProposals.length > 0) {
+    return task.candidateSplitRoute === 'hub' ? 'hub-candidate-split' : 'candidate-split';
+  }
+  return usesGroupB(task) ? 'group-b' : resolveSourceName(task);
+}
+
+function writeArtifact(task, repoRoot, pipelineDir) {
+  const name = applyEntryName(task);
+  const source = getRegisteredSource(name);
+  if (!source || typeof source.apply !== 'function') {
+    throw new Error(`task ${task.id}: no registered apply entry "${name}"`);
+  }
+  try {
+    return source.apply({ implementResponse: task.implementResponse, repoRoot, pipelineDir, task });
+  } catch (e) {
+    if (e && typeof e.message === 'string') e.message = `[apply entry "${name}", task ${task.id}] ${e.message}`;
+    throw e;
+  }
 }
 
 function closeOriginatingBrainDumpEntry(task, brainDumpPath, note) {
@@ -153,4 +170,4 @@ function assertStageableFiles(task, files) {
   }
 }
 
-module.exports = { coAuthorTrailer, usesGroupB, applyCandidateSplit, writeArtifact, closeOriginatingBrainDumpEntry, assertStageableFiles };
+module.exports = { coAuthorTrailer, usesGroupB, applyCandidateSplit, applyEntryName, writeArtifact, closeOriginatingBrainDumpEntry, assertStageableFiles };
