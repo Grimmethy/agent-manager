@@ -3702,3 +3702,44 @@ Centralizes the queue-scanning logic, reducing the risk of divergent behavior if
 ---
 
 NOTE: The critique verified all three claims against the actual code and found no issues; the original draft was accurate and required no corrections.
+
+### AC-832 · Stacked-grounding resolution silently swallows fetch failures
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+`resolveGroundingRef` calls `runner.fetchBranch(branch)`, which is documented as best-effort and never throws, then returns the branch name if it exists on origin. When `fetchBranch` fails silently due to network errors, auth failures, or rate limits, the branch simply won't appear in `remoteBranchExists`, and the function returns `null`. Every caller then falls through to the non-stacked behavior (using `origin/<mainBranch>`), which is the documented default for non-stacked tasks. There is no way for a caller to distinguish "this task is stacked but the branch is genuinely absent" from "this task is stacked but we couldn't reach origin to check." This silent fallback has caused wrong-grounding bugs where stacked tasks silently revert to non-stacked paths.
+
+Solution:
+Add a distinct return value (e.g., a sentinel object `{ status: 'fetch-failed' }` or a three-state return: `null | string | 'unreachable'`) so callers can log or warn when the stacked branch couldn't be verified, rather than silently reverting to the non-stacked path. Alternatively, have `fetchBranch` throw on recoverable network errors so the failure surfaces at the call site instead of being swallowed.
+
+Benefits:
+Callers can distinguish "no stacked branch" from "couldn't verify stacked branch" and take different actions (log, retry, fail loudly). Network and auth issues that currently manifest as silent wrong-grounding become observable. The bug class is less likely to recur because the failure mode is no longer invisible.
+
+### AC-833 · Hidden side-effect dependency between apply-core and task-sources
+Strength: Strong
+Files: src/lib/apply-core.js, src/task-sources.js
+
+Problem:
+`apply-core.js` contains a side-effect-only require of `task-sources.js` with no assignment. This pattern registers sources into a global registry as a module initialization side effect, meaning `apply-core.js` depends on `task-sources.js` being loaded before it runs. There is no explicit dependency declaration, no import statement, and no guarantee that the require happens in the right order if the module graph is reorganized. If someone later extracts the registration logic or changes the load order, `apply-core.js` will silently fail to find registered sources. The `getRegisteredSource` calls would return `undefined`, causing `usesGroupB` to return `true` and routing all tasks through the Group B path even for sources that should be Group A.
+
+Solution:
+Make the dependency explicit: either have `apply-core.js` require a dedicated "initialize sources" function that it calls at module load, or document the side-effect dependency in a comment at the require site explaining why the side-effect require is needed and what happens if it's missing.
+
+Benefits:
+The hidden dependency becomes visible to anyone reading the file. Future refactors that change module load order won't silently break source registration. The contract between `apply-core.js` and `task-sources.js` is explicit rather than implicit.
+
+### AC-834 · COLLAPSIBLE_REPEAT_STAGES is a mutable global Set
+Strength: Strong
+Files: src/task-history.js
+
+Problem:
+`COLLAPSIBLE_REPEAT_STAGES` is exported as a `Set` and documented as a configuration constant, but it's a mutable reference. Any consumer that does `COLLAPSIBLE_REPEAT_STAGES.add('someStage')` or `COLLAPSIBLE_REPEAT_STAGES.delete('exhausted')` will silently change the collapse behavior for all tasks across all processes that share this module instance. The comment documents the rationale for the current value but doesn't prevent accidental mutation. If a future consumer adds a stage to the set without understanding the implications (e.g., adding 'plan-done' because they want consecutive plan-dones to collapse), it could silently hide real progress signals that other consumers (like `staleness-audit.js`) rely on to detect stuck tasks.
+
+Solution:
+Freeze the Set with `Object.freeze(COLLAPSIBLE_REPEAT_STAGES)` at module load, or export a getter function `getCollapsibleRepeatStages()` that returns a new Set copy each time, preventing mutation of the canonical set.
+
+Benefits:
+Prevents accidental mutation that could silently change collapse behavior. Makes the contract explicit: this is a configuration constant, not a shared mutable state. Future consumers can't accidentally break the collapse logic by adding stages without understanding the implications.
+
+NOTE: The critique found no issues with the draft, so no changes were applied.
