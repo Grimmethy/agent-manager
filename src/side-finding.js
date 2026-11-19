@@ -27,6 +27,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { writeJsonAtomicSync } = require('./atomic-write.js');
 
 // Instruction bar raised 2026-09-19 (Grimmethy: "this is creating work. Work should have
 // value" -- but "taking away the ability is the wrong move", reviewers do raise valid
@@ -159,7 +160,7 @@ function writeSideFindingInbox(finding, { source, taskId, stage, pipelineDir, co
       repoRoot: repoRoot || process.env.AGENT_MANAGER_REPO_ROOT || null,
       extractedAt: new Date().toISOString(),
     };
-    fs.writeFileSync(path.join(dir, name), JSON.stringify(record, null, 2));
+    writeJsonAtomicSync(path.join(dir, name), record);
   } catch (e) {
     console.warn('[side-finding] failed to write inbox entry (non-fatal):', e.message);
   }
