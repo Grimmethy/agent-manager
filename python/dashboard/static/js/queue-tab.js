@@ -128,6 +128,32 @@ function hubProgressChip(t) {
   return `<span style="color:var(--warn)">☑ ${built} / ${p.total} built${built > (p.done || 0) ? ` · ${p.done || 0} merged` : ''}</span>`;
 }
 
+// "Waits on..." control: prompt for a task id and POST it to /api/task-anywhere/<id>/depends-on.
+// Used on adhoc, pending, and needs-clarification rows to declare a dependency.
+// Uses window.prompt (not confirm) so the user never has to dismiss a misleading dialog
+// when they just want to add a dependency. Cancel or empty input sends nothing.
+async function setWaitsOn(id) {
+  const raw = window.prompt(`Enter task ID to wait on:`, '');
+  if (raw === null) return; // cancelled
+  const taskId = raw.trim();
+  if (taskId === '') return;
+  try {
+    const res = await fetch(`/api/task-anywhere/${encodeURIComponent(id)}/depends-on`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskId: taskId }),
+    });
+    if (!res.ok) {
+      const respBody = await res.json().catch(() => ({}));
+      throw new Error(respBody.description || `HTTP ${res.status}`);
+    }
+    alert(`Now waiting on '${taskId}'.`);
+    renderQueueTab(window.location.hash.replace('#', '') || 'pending');
+  } catch (e) {
+    alert(`Could not set dependency: ` + e.message);
+  }
+}
+
 async function renderQueueTab(state) {
   const isStale = renderStaleCheck();
   if (!queueLoadedCount[state]) queueLoadedCount[state] = QUEUE_PAGE_SIZE;
@@ -310,6 +336,7 @@ async function renderQueueTab(state) {
       ${showArchiveRequeue ? `<td>
         <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Archive</button>
         <button type="button" class="secondary task-requeue-btn" data-id="${escapeAttr(t.id)}">Requeue</button>
+        ${state === 'adhoc' || state === 'pending' ? `<button type="button" class="secondary task-waits-on-btn" data-id="${escapeAttr(t.id)}">Waits on...</button>` : ''}
         ${rereviewBtn}
         ${keepBtn}
         ${trimKeepBtn}
@@ -319,6 +346,7 @@ async function renderQueueTab(state) {
         <button type="button" class="secondary task-done-btn" data-id="${escapeAttr(t.id)}">Mark Done</button>
         <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Reject</button>
         <button type="button" class="secondary task-discuss-btn" data-id="${escapeAttr(t.id)}">Discuss</button>
+        ${state === 'needs-clarification' ? `<button type="button" class="secondary task-waits-on-btn" data-id="${escapeAttr(t.id)}">Waits on...</button>` : ''}
         ${rereviewBtn}
         ${keepBtn}
       </td>` : ''}
@@ -413,5 +441,11 @@ async function renderQueueTab(state) {
   });
   main.querySelectorAll('.task-apply-btn').forEach((btn) => {
     btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'apply', `Apply '${btn.dataset.id}' now? This runs the real git branch/commit/push (or vault-note write) for this one task.`); };
+  });
+  main.querySelectorAll('.task-waits-on-btn').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      setWaitsOn(btn.dataset.id);
+    };
   });
 }
