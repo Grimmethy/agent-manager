@@ -42,6 +42,14 @@ _TASK_TRAILER_RE = re.compile(r"^Task:\s*(\S+)", re.MULTILINE)
 _CONFLICT_RE = re.compile(r"^CONFLICT \([^)]+\):.*\bin (.+)$", re.MULTILINE)
 
 
+class VerdictReadbackError(RuntimeError):
+    """Raised when a verdict just written by record_owner_merge_verdict does not read back from the store."""
+    code = "verdict_readback_failed"
+
+
+OWNER_MERGE_REASON = "owner clicked Merge in the dashboard"
+
+
 def _now_iso():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -129,6 +137,21 @@ def record_verdict(queue_dir, branch, sha, verdict, reasons, source):
     save_verdicts(queue_dir, verdicts)
     _emit_verdict_event(queue_dir, branch, sha, verdict, source)
     return record, True
+
+
+def record_owner_merge_verdict(queue_dir, branch, sha):
+    """Record the owner's Merge click as a manual merge verdict for (branch, sha), then read it back.
+
+    Goes through record_verdict (the single store writer). Returns the row as read back from the store.
+    Raises VerdictReadbackError when the row is missing or does not match what was written.
+    """
+    record_verdict(queue_dir, branch, sha, "merge", [OWNER_MERGE_REASON], "manual")
+    stored = (load_verdicts(queue_dir).get(branch) or {}).get(sha)
+    if (not isinstance(stored, dict) or stored.get("verdict") != "merge"
+            or stored.get("source") != "manual" or stored.get("reasons") != [OWNER_MERGE_REASON]):
+        raise VerdictReadbackError(f"owner merge verdict for {branch} @ {sha} did not read back from {STORE_NAME}")
+    return {"branch": branch, "sha": sha, "verdict": stored["verdict"], "source": stored["source"],
+            "reason": OWNER_MERGE_REASON, "reasons": list(stored["reasons"]), "verifiedAt": stored.get("verifiedAt")}
 
 
 def clear_verdict(queue_dir, branch, sha):

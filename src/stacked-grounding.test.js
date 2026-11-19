@@ -106,8 +106,14 @@ test('resolveAtRef: exact path, code-dir prefix, and unique basename all resolve
   assert.equal(fs.existsSync(path.join(repoDir, 'src', 'lib', 'tileGrid.ts')), false, 'and the working tree (main) really does not have it');
 });
 
-test('resolveAtRef never throws: an unknown ref or empty path reads as not found', () => {
+test('resolveAtRef: absent path at a valid ref is null; empty path is null', () => {
   const { repoDir } = makeStackedRepo();
-  assert.equal(resolveAtRef(repoDir, 'agent/no-such-branch', 'stacked-only.js'), null);
+  assert.equal(resolveAtRef(repoDir, 'agent/stacked-family', 'stacked-only.js'), 'stacked-only.js');
+  assert.equal(resolveAtRef(repoDir, 'main', 'stacked-only.js'), null);
   assert.equal(resolveAtRef(repoDir, 'agent/stacked-family', ''), null);
+});
+
+test('resolveAtRef throws, naming the ref and path, for a nonexistent ref', () => {
+  const { repoDir } = makeStackedRepo();
+  assert.throws(() => resolveAtRef(repoDir, 'agent/no-such-branch', 'stacked-only.js'), /agent\/no-such-branch.*stacked-only\.js/);
 });

@@ -51,6 +51,17 @@ class BuildWorker(unittest.TestCase):
     def test_nothing_at_all_is_not_configured(self):
         self.assertEqual(build(trigger=None), {"configured": False, "name": "scout"})
 
+    def test_featuremanager_enabled_card_data(self):
+        p = build(rows=[row("a", "FILE-TASK", 50), row("b", "NO-NEW-POLLS", 40)], name="featuremanager")
+        self.assertTrue(p["configured"])
+        self.assertEqual(p["name"], "featuremanager")
+        self.assertEqual(p["decisions"], 2)
+        self.assertEqual(p["today"], {"FILE-TASK": 1, "NO-NEW-POLLS": 1})
+        self.assertEqual(p["items"]["total"], 2)
+
+    def test_featuremanager_unconfigured_is_hidden(self):
+        self.assertEqual(build(rows=(), trigger=None, switch=OFF, name="featuremanager"), {"configured": False, "name": "featuremanager"})
+
     def test_any_single_trace_is_enough(self):
         self.assertTrue(build(rows=[row("a", "NO-NEW-POLLS", 5)], trigger=None)["configured"])
         self.assertTrue(build(trigger=TRIG)["configured"])
@@ -124,7 +135,7 @@ class BuildWorker(unittest.TestCase):
         self.assertEqual(got["decisions"], 1)
 
     def test_workers_are_independent_and_named(self):
-        self.assertEqual(po.WORKERS, ("scout", "checker", "merger", "steward", "hub", "atomizer"))
+        self.assertEqual(po.WORKERS, ("scout", "checker", "merger", "steward", "hub", "atomizer", "featuremanager"))
         self.assertEqual(build(name="checker", trigger=TRIG)["name"], "checker")
 
 

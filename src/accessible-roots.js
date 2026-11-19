@@ -99,6 +99,37 @@ function resolveAccessibleRoots({ repoRoot } = {}) {
   return out.length ? out : [path.resolve(root)];
 }
 
+// Returns the single plugin root (the original entry from pluginRoots) that contains EVERY cited path, or null when any path
+// matches no root, the paths span more than one root, or the inputs are empty/invalid (fail closed). Pure: the caller passes the
+// roots (e.g. resolveAccessibleRoots()). Relative cited paths are interpreted against the process cwd via path.resolve.
+// Nested roots: the longest (most specific) matching root wins for each path.
+function findPluginRootForPaths(citedPaths, pluginRoots) {
+  if (!Array.isArray(citedPaths) || !Array.isArray(pluginRoots)) return null;
+  if (!citedPaths.length || !pluginRoots.length) return null;
+  const roots = pluginRoots
+    .filter((r) => typeof r === 'string' && r)
+    .map((r) => ({ orig: r, norm: realOrResolved(r) }));
+  if (!roots.length) return null;
+  const contains = (root, p) => {
+    if (p === root) return true;
+    const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+    return p.startsWith(prefix);
+  };
+  let found = null;
+  for (const cited of citedPaths) {
+    if (typeof cited !== 'string' || !cited) return null;
+    const p = realOrResolved(cited);
+    let best = null;
+    for (const r of roots) {
+      if (contains(r.norm, p) && (!best || r.norm.length > best.norm.length)) best = r;
+    }
+    if (!best) return null;
+    if (found === null) found = best;
+    else if (found.norm !== best.norm) return null;
+  }
+  return found ? found.orig : null;
+}
+
 // Sibling repos the implement pass may READ but never write (2026-10-16: the GPU broker verification tasks could not see /media/model-cache/github/videoforge
 // or promptforge-manual -- their worktree was the only root -- and concluded the repos were not on this machine). Same plugin set as resolveAccessibleRoots,
 // minus every root the pass must not touch or read: its own worktree, the live checkout, the core package root and the apply clone. A non-core active project
@@ -121,4 +152,4 @@ function isSecretLookingPath(p) {
   return SECRET_BASENAME_RE.test(path.basename(norm));
 }
 
-module.exports = { resolveAccessibleRoots, resolveReadOnlySiblingRoots, isSecretLookingPath, isCoreRepo };
+module.exports = { findPluginRootForPaths, resolveAccessibleRoots, resolveReadOnlySiblingRoots, isSecretLookingPath, isCoreRepo };
