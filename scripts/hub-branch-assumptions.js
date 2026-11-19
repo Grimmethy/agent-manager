@@ -51,6 +51,7 @@ function scan(root, deps) {
   const onSkip = (deps && typeof deps.onSkip === 'function') ? deps.onSkip : () => {};
   const counts = {};
   const skipped = [];
+  let excluded = 0;
   const record = (p, reason, size) => {
     const rec = { path: p, reason, size };
     skipped.push(rec);
@@ -62,7 +63,11 @@ function scan(root, deps) {
   for (const file of files) {
     const rel = path.relative(root, file).split(path.sep).join('/');
     const why = EXCLUDED.get(rel);
-    if (why) { bump(counts, why); continue; }
+    if (why) {
+      excluded++;
+      if (deps && typeof deps === 'object') deps.excluded = (Number(deps.excluded) || 0) + 1;
+      continue;
+    }
     let buf;
     let size;
     try {
@@ -87,7 +92,7 @@ function scan(root, deps) {
   }
   rows.sort((a, b) => cmp(a.path, b.path) || a.line - b.line || cmp(a.term, b.term));
   skipped.sort((a, b) => cmp(a.path, b.path) || cmp(a.reason, b.reason));
-  return { rows, skipped, counts };
+  return { rows, skipped, counts, excluded };
 }
 
 function collectRows(root, deps) {
@@ -110,7 +115,8 @@ function formatSkipped(skipInfo) {
     if (counts[reason] > 0) lines.push(reason + ': ' + counts[reason]);
   }
   const body = lines.length ? ['```text', ...lines, '```'].join('\n') : '(none)';
-  return '### Skipped (not scanned)\n' + body;
+  const excluded = Number(skipInfo.excluded) || 0;
+  return '### Skipped (not scanned)\n' + body + '\nExcluded (counted, not named): ' + excluded;
 }
 
 function buildBlock(rows, skipInfo) {
@@ -144,11 +150,11 @@ function spliceBlock(existing, block) {
 
 function run(root, deps) {
   const fs = (deps && deps.fs) || realFs;
-  const { rows, skipped, counts } = scan(root, deps);
+  const { rows, skipped, counts, excluded } = scan(root, deps);
   const docPath = path.join(root, DOC_REL);
   let existing = null;
   try { existing = fs.readFileSync(docPath, 'utf8'); } catch (_) { existing = null; }
-  const next = spliceBlock(existing, buildBlock(rows, { skipped, counts }));
+  const next = spliceBlock(existing, buildBlock(rows, { skipped, counts, excluded }));
   if (next !== existing) {
     fs.mkdirSync(path.dirname(docPath), { recursive: true });
     fs.writeFileSync(docPath, next);
