@@ -22,6 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
+const { injectMarker, extractMarker } = require('./protocol-markers.js');
 
 function conceptsPath(pipelineDir) {
   return path.join(pipelineDir, 'concepts.json');
@@ -246,26 +247,27 @@ const CONCEPT_BUILD_INSTRUCTION = (
   + 'chart, not graded -- be honest, not impressive.'
 );
 
-const CONCEPT_BUILD_MARKER_RE = /^CONCEPT-BUILD:\s*(scratch|adapted)\s*\|\s*(.+)$/im;
+const CONCEPT_BUILD_DEF = {
+  token: 'CONCEPT-BUILD:',
+  instruction: CONCEPT_BUILD_INSTRUCTION,
+  lineRe: /^CONCEPT-BUILD:\s*(scratch|adapted)\s*\|\s*(.+)$/im,
+  parseMatch(match) {
+    const detail = match[2].trim();
+    if (!detail) return null;
+    return { kind: match[1].toLowerCase(), detail };
+  },
+};
 
 function injectConceptBuildInstruction(text) {
-  const base = text || '';
-  if (base.includes('CONCEPT-BUILD:')) return base;
-  return `${base}\n\n${CONCEPT_BUILD_INSTRUCTION}`;
+  return injectMarker(text, CONCEPT_BUILD_DEF);
 }
 
 // Returns { cleanText, report: {kind, detail} | null }. Lenient: a missing/malformed
 // marker just means report is null, never thrown -- the real response must never be
 // held hostage by an optional audit tag the model forgot to include.
 function extractConceptBuildReport(text) {
-  const source = text || '';
-  const match = source.match(CONCEPT_BUILD_MARKER_RE);
-  if (!match) return { cleanText: source, report: null };
-  const kind = match[1].toLowerCase();
-  const detail = match[2].trim();
-  const cleanText = source.replace(match[0], '').replace(/\n{3,}/g, '\n\n').trim();
-  if (!detail) return { cleanText, report: null };
-  return { cleanText, report: { kind, detail } };
+  const { cleanText, items } = extractMarker(text, CONCEPT_BUILD_DEF);
+  return { cleanText, report: items[0] || null };
 }
 
 module.exports = {

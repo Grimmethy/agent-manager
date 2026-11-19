@@ -17,6 +17,7 @@
 // (allowAmplification, default false) -- see the 3 chokepoints' own headers for why.
 
 const path = require('path');
+const { injectMarker, extractMarker } = require('./protocol-markers.js');
 
 const AMPLIFICATION_INSTRUCTION = (
   'If you have just CONFIRMED (not merely suspected) that a blocked/stuck task\'s root '
@@ -42,12 +43,33 @@ const QUERY_RE = /^QUERY:\s*(.+)$/m;
 const DIR_RE = /^DIR:\s*(.+)$/m;
 const EXCLUDE_RE = /^EXCLUDE:\s*(.+)$/m;
 
+const AMPLIFICATION_DEF = {
+  token: 'AMPLIFY:',
+  instruction: AMPLIFICATION_INSTRUCTION,
+  splitRe: AMPLIFY_SPLIT_RE,
+  titleRe: AMPLIFY_TITLE_RE,
+  maxItems: MAX_AMPLIFY_REQUESTS_PER_RESPONSE,
+  parseBlock(titleMatch, scoped) {
+    const rootCauseSummary = titleMatch[1].trim();
+    const queryMatch = scoped.match(QUERY_RE);
+    if (!rootCauseSummary || !queryMatch) return null; // malformed -- QUERY is required, drop
+    const dirMatch = scoped.match(DIR_RE);
+    const excludeMatch = scoped.match(EXCLUDE_RE);
+    return {
+      rootCauseSummary,
+      query: queryMatch[1].trim(),
+      dir: dirMatch ? dirMatch[1].trim() : undefined,
+      exclude: excludeMatch
+        ? excludeMatch[1].split(',').map((s) => s.trim()).filter(Boolean).map((p) => path.normalize(p))
+        : [],
+    };
+  },
+};
+
 // Idempotent -- same reasoning as injectSideFindingInstruction (call() can retry the
 // identical prompt several times).
 function injectAmplificationInstruction(text) {
-  const base = text || '';
-  if (base.includes('AMPLIFY:')) return base;
-  return `${base}\n\n${AMPLIFICATION_INSTRUCTION}`;
+  return injectMarker(text, AMPLIFICATION_DEF);
 }
 
 // Returns { cleanText, requests: [{rootCauseSummary, query, dir, exclude}] }. Same
@@ -57,44 +79,8 @@ function injectAmplificationInstruction(text) {
 // extractSideFindings' body bound (so a real AMPLIFY block sitting before a
 // RESOLUTION:/OPTIONS: line doesn't swallow it).
 function extractAmplificationRequests(text) {
-  const source = text || '';
-  if (!source.includes('AMPLIFY:')) return { cleanText: source, requests: [] };
-
-  const blocks = source.split(AMPLIFY_SPLIT_RE);
-  const requests = [];
-  const cleanParts = [];
-
-  for (const block of blocks) {
-    const titleMatch = block.match(AMPLIFY_TITLE_RE);
-    if (!titleMatch) {
-      cleanParts.push(block);
-      continue;
-    }
-    const rootCauseSummary = titleMatch[1].trim();
-    const afterTitle = block.slice(block.indexOf(titleMatch[0]) + titleMatch[0].length);
-    const paraSplit = afterTitle.match(/\n\s*\n/);
-    const scoped = (paraSplit ? afterTitle.slice(0, paraSplit.index) : afterTitle);
-    const remainder = paraSplit ? afterTitle.slice(paraSplit.index) : '';
-    cleanParts.push(remainder);
-
-    const queryMatch = scoped.match(QUERY_RE);
-    if (!rootCauseSummary || !queryMatch) continue; // malformed -- QUERY is required, drop
-    if (requests.length >= MAX_AMPLIFY_REQUESTS_PER_RESPONSE) continue;
-
-    const dirMatch = scoped.match(DIR_RE);
-    const excludeMatch = scoped.match(EXCLUDE_RE);
-    requests.push({
-      rootCauseSummary,
-      query: queryMatch[1].trim(),
-      dir: dirMatch ? dirMatch[1].trim() : undefined,
-      exclude: excludeMatch
-        ? excludeMatch[1].split(',').map((s) => s.trim()).filter(Boolean).map((p) => path.normalize(p))
-        : [],
-    });
-  }
-
-  const cleanText = cleanParts.join('').replace(/\n{3,}/g, '\n\n').trim();
-  return { cleanText, requests };
+  const { cleanText, items } = extractMarker(text, AMPLIFICATION_DEF);
+  return { cleanText, requests: items };
 }
 
 module.exports = {
