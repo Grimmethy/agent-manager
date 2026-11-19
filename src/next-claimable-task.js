@@ -12,9 +12,12 @@ const { claimableOnNode } = require('./node-affinity.js'); // multi-node: a task
 
 // Extracted from scripts/local-worker.sh's inline claim-ranking script (the 2026-08-22
 // priority+mtime fix) -- now one tested module instead of an untested `node -e` block in the
-// shell script. There is no lane/tier filter any more (2026-09-19: lanes are one per GPU and every
-// lane claims any task by priority); this module adds the operator "assign this task to this worker"
-// override on top (2026-09-06, Grimmethy: "I need to be able to select the task I want
+// shell script. Lanes with a `taskClasses` allowlist are scoped: they only see tasks of
+// those sources, across all three candidate pools (pending/, other lanes' drafting/, adhoc/).
+// A scoped lane with no survivors returns [] and never falls back to the unfiltered list.
+// Reviewer lanes and lanes without a taskClasses allowlist remain unscoped (unchanged behaviour).
+// This module also adds the operator "assign this task to this worker" override on top
+// (2026-09-06, Grimmethy: "I need to be able to select the task I want
 // each worker to run... this should override the automated system").
 //
 // `pinnedWorker` on a pending task's JSON, when present, is an explicit operator
@@ -342,8 +345,33 @@ function pickNextPendingTask(pendingDir, instanceId) {
 // the assign route already short-circuits, no point cluttering the list with it), each
 // tagged with `location` so the dashboard can label a stolen in-flight task distinctly
 // from idle pending work.
-function listAssignableTasks(queueDir, instanceId) {
+function listAssignableTasks(queueDir, instanceId, opts = {}) {
   const out = [];
+
+  // Lane scope (2026-10-20, Grimmethy: "I need to be able to select the task I want
+  // each worker to run... this should override the automated system"). A lane with a
+  // `taskClasses` allowlist is scoped: it only sees tasks of those sources, from any
+  // of the three candidate pools (pending/, other lanes' drafting/, adhoc/). A scoped
+  // lane with no survivors returns [] -- never falls back to the unfiltered list. A
+  // reviewer lane or a lane without a taskClasses allowlist is unscoped and keeps the
+  // existing behaviour.
+  let targetLane = null;
+  let isScoped = false;
+  try {
+    const { getLanes, laneAllowsSource } = require('./lanes.js');
+    const allLanes = opts.lanes || getLanes();
+    // Find the lane matching this instanceId in the resolved lanes array.
+    targetLane = allLanes.find((l) => l.id === instanceId) || null;
+    // A lane is scoped when it has a non-empty taskClasses allowlist AND is not a reviewer lane.
+    // Reviewer lanes always see all tasks regardless of taskClasses.
+    isScoped = !!(targetLane && !targetLane.reviewer && Array.isArray(targetLane.taskClasses) && targetLane.taskClasses.length > 0);
+  } catch (_) { /* lanes.js unavailable -- treat as unscoped, unchanged behaviour */ }
+  const scopeFilter = isScoped ? ((task) => {
+    try {
+      const { laneAllowsSource } = require('./lanes.js');
+      return laneAllowsSource(targetLane, task && task.source);
+    } catch (_) { return true; }
+  }) : null;
 
   const pendingDir = path.join(queueDir, 'pending');
   let pendingNames = [];
@@ -374,6 +402,13 @@ function listAssignableTasks(queueDir, instanceId) {
       premiumPriority: !!task.premiumPriority,
     });
   }
+  if (scopeFilter) {
+    const before = out.length;
+    for (let i = out.length - 1; i >= 0; i--) {
+      if (!scopeFilter(out[i])) out.splice(i, 1);
+    }
+    if (out.length === 0) return [];
+  }
 
   const draftingDir = path.join(queueDir, 'drafting');
   let lanes = [];
@@ -399,6 +434,13 @@ function listAssignableTasks(queueDir, instanceId) {
         premiumPriority: !!task.premiumPriority,
       });
     }
+  }
+  if (scopeFilter) {
+    const before = out.length;
+    for (let i = out.length - 1; i >= 0; i--) {
+      if (!scopeFilter(out[i])) out.splice(i, 1);
+    }
+    if (out.length === 0) return [];
   }
 
   // queue/adhoc/ (2026-09-08, Grimmethy: "I also can't see the target when I try to
@@ -437,6 +479,14 @@ function listAssignableTasks(queueDir, instanceId) {
   const bandOf = (r) => (r.premiumPriority ? 0 : (hubTierIds.has(r.id) ? 1 : 2));
   adhocRows.sort((a, b) => bandOf(a) - bandOf(b));
   out.push(...adhocRows);
+
+  if (scopeFilter) {
+    const before = out.length;
+    for (let i = out.length - 1; i >= 0; i--) {
+      if (!scopeFilter(out[i])) out.splice(i, 1);
+    }
+    if (out.length === 0) return [];
+  }
 
   return out;
 }
