@@ -39,43 +39,7 @@ async function renderModelsTab() {
 
   const main = document.getElementById('main');
 
-  const sorted = models.slice().sort((a, b) => {
-    const av = a[modelsSortKey], bv = b[modelsSortKey];
-    if (av == null && bv == null) return 0;
-    if (av == null) return 1;   // nulls last regardless of direction
-    if (bv == null) return -1;
-    if (av < bv) return modelsSortDir === 'asc' ? -1 : 1;
-    if (av > bv) return modelsSortDir === 'asc' ? 1 : -1;
-    return 0;
-  });
-
-  const maxApprove = Math.max(...models.map(m => m.approveRate ?? 0), 0);
-  const maxTokS = Math.max(...models.map(m => m.avgTokensPerSec ?? 0), 0);
-
-  const headCells = MODELS_COLUMNS.map(col => {
-    if (!col.sortable) return `<th>${col.label}</th>`;
-    const arrow = modelsSortKey === col.key ? (modelsSortDir === 'asc' ? ' ▲' : ' ▼') : '';
-    return `<th class="sortable" data-key="${col.key}">${col.label}${arrow}</th>`;
-  }).join('');
-
-  const rows = sorted.map((m, i) => `
-    <tr class="${i === 0 ? 'top-row' : ''}">
-      <td>${m.model}</td>
-      <td>${m.callCount}</td>
-      <td>${renderBarCell(m.approveRate, maxApprove, 'ok', fmtPct)}</td>
-      <td>${renderBarCell(m.avgTokensPerSec, maxTokS, 'accent', (v) => fmtNum(v, 1))}</td>
-      <td>${fmtNum(m.minTokensPerSec, 1)}</td>
-      <td>${fmtNum(m.maxTokensPerSec, 1)}</td>
-      <td>${fmtNum(m.avgLatencyMs, 0)}</td>
-      <td>${m.degenerateCount}</td>
-      <td>${m.errorCount}</td>
-      <td>${fmtUsd(m.totalCostUsd)}</td>
-    </tr>
-  `).join('');
-
-  const implementTable = models.length === 0
-    ? '<div class="empty">No implement-pass stats yet -- set AGENT_MANAGER_CLAUDE_SOURCES or ORNITH_AB_MODELS to compare candidates.</div>'
-    : `<table><thead><tr>${headCells}</tr></thead><tbody>${rows}</tbody></table>`;
+  const implementTable = buildModelsTableHtml(models);
 
   // Estimated Anthropic API Cost (2026-08-23, Grimmethy: "Do we have any way of knowing
   // how much these tasks would cost using anthropic API?") -- claude-client.js's call()
@@ -138,6 +102,49 @@ async function renderModelsTab() {
   });
   wireBenchmarkPanel(benchModels, benchCases);
   window.scrollTo(0, scrollY);
+}
+
+// Pure string-building for the Implement-Pass Quality table: sorts a copy of the models by the
+// current modelsSortKey/modelsSortDir, computes the bar-scale maxima, and returns the table HTML
+// (or the empty-state message). Extracted from renderModelsTab (AC-203); no DOM access here.
+function buildModelsTableHtml(models) {
+  const sorted = models.slice().sort((a, b) => {
+    const av = a[modelsSortKey], bv = b[modelsSortKey];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;   // nulls last regardless of direction
+    if (bv == null) return -1;
+    if (av < bv) return modelsSortDir === 'asc' ? -1 : 1;
+    if (av > bv) return modelsSortDir === 'asc' ? 1 : -1;
+    return 0;
+  });
+
+  const maxApprove = Math.max(...models.map(m => m.approveRate ?? 0), 0);
+  const maxTokS = Math.max(...models.map(m => m.avgTokensPerSec ?? 0), 0);
+
+  const headCells = MODELS_COLUMNS.map(col => {
+    if (!col.sortable) return `<th>${col.label}</th>`;
+    const arrow = modelsSortKey === col.key ? (modelsSortDir === 'asc' ? ' ▲' : ' ▼') : '';
+    return `<th class="sortable" data-key="${col.key}">${col.label}${arrow}</th>`;
+  }).join('');
+
+  const rows = sorted.map((m, i) => `
+    <tr class="${i === 0 ? 'top-row' : ''}">
+      <td>${m.model}</td>
+      <td>${m.callCount}</td>
+      <td>${renderBarCell(m.approveRate, maxApprove, 'ok', fmtPct)}</td>
+      <td>${renderBarCell(m.avgTokensPerSec, maxTokS, 'accent', (v) => fmtNum(v, 1))}</td>
+      <td>${fmtNum(m.minTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.maxTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.avgLatencyMs, 0)}</td>
+      <td>${m.degenerateCount}</td>
+      <td>${m.errorCount}</td>
+      <td>${fmtUsd(m.totalCostUsd)}</td>
+    </tr>
+  `).join('');
+
+  return models.length === 0
+    ? '<div class="empty">No implement-pass stats yet -- set AGENT_MANAGER_CLAUDE_SOURCES or ORNITH_AB_MODELS to compare candidates.</div>'
+    : `<table><thead><tr>${headCells}</tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function buildBenchmarkPanelHtml(models, cases, status, runs, viewingRunId, resultsHtml) {
