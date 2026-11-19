@@ -232,6 +232,17 @@ elif [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]];
 
   bash "${SCRIPT_DIR}/setup-merge-drivers.sh" "$AGENT_MANAGER_REPO_ROOT" >/dev/null 2>&1 || true
 
+  # The apply clone is where agent/triage-queue is rebased (prepareStackedBranch in src/git-runner.js). A clone
+  # without the candidates-doc driver silently falls back to a plain text merge and fails the rebase. Idempotent.
+  if [[ -z "${AGENT_MANAGER_APPLY_REPO_ROOT:-}" ]]; then
+    printf '[launch] WARNING: AGENT_MANAGER_APPLY_REPO_ROOT is unset -- skipping merge-driver registration for the apply clone\n'
+  elif ! git -C "$AGENT_MANAGER_APPLY_REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf '[launch] WARNING: %s is not a git work tree -- skipping merge-driver registration for the apply clone\n' "$AGENT_MANAGER_APPLY_REPO_ROOT"
+  else
+    bash "${SCRIPT_DIR}/setup-merge-drivers.sh" "$AGENT_MANAGER_APPLY_REPO_ROOT" >/dev/null 2>&1 \
+      || { printf '[launch] ERROR: merge-driver registration failed for the apply clone %s\n' "$AGENT_MANAGER_APPLY_REPO_ROOT"; exit 1; }
+  fi
+
   # One worker lane per GPU, named for the GPU (src/lanes.js is the single definition -- the
   # watchdog's restart rule and the dashboard's expected-lane list read the same module). Every
   # lane claims ANY pending task by priority (unless the lane declares a taskClasses allowlist in the lanes registry, see

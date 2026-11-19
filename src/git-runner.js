@@ -110,6 +110,22 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
   function isAncestor(a, b) {
     try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
   }
+  // Pre-flight (2026-09-23/24 incident): .gitattributes names a merge driver but its COMMAND lives only in each clone's local .git/config.
+  // A clone without it silently falls back to a plain text merge and the candidate-doc rebase conflicts. Log a clear warning; never throws.
+  function warnIfMergeDriverMissing(probePath = 'Docs/CHANGE_REVIEW_CANDIDATES.md') {
+    try {
+      const out = String(run(['check-attr', 'merge', '--', probePath])).trim();
+      const m = /:\s*merge:\s*(\S+)\s*$/.exec(out);
+      const driver = m && m[1];
+      if (!driver || ['unspecified', 'unset', 'set'].includes(driver)) return null;
+      let cmd = '';
+      try { cmd = String(run(['config', '--get', `merge.${driver}.driver`])).trim(); } catch { cmd = ''; }
+      if (cmd) return null;
+      const msg = `[git-runner] WARNING: .gitattributes names merge driver '${driver}' for ${probePath} but merge.${driver}.driver is unset in ${repoRoot}; rebases will fall back to a plain text merge. Run scripts/setup-merge-drivers.sh ${repoRoot}`;
+      console.error(msg);
+      return msg;
+    } catch { return null; }
+  }
   // A push that hits the time cap may still have landed (2026-11-04: apply's `git push` of agent/<id> timed out after 60 s while the branch was arriving on GitHub; apply recorded
   // a failure for work that was already on origin, and the sanctioned retry then collided with its own first push as a non-fast-forward: 33 minutes of a 38 minute build).
   // After a TIMED-OUT push only, ask the remote what it holds: the push succeeded exactly when the remote tip of `name` is the local tip. Any doubt (no such branch there, a
@@ -406,7 +422,9 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
     //     "the whole prior chain already merged" fallback the seq===1 path already uses
     //     (2026-09-07 reasoning) -- now reached by an actual staleness check instead of
     //     by trusting whatever name happens to exist locally.
+    warnIfMergeDriverMissing,
     prepareStackedBranch: (name) => {
+      warnIfMergeDriverMissing();
       try {
         run(['fetch', 'origin', name]);
       } catch {
