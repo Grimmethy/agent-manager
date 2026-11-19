@@ -30,7 +30,7 @@ const { execFileSync } = require('child_process');
 const { REASON_CATEGORIES } = require('./pipeline-self-audit.js');
 const { extractFilePaths, resolveAgainstRepo } = require('./fact-checker.js');
 const { isStaleByAge, isFabricationRepeat, hasExhaustedRetries, alreadyImplementedSignal, invalidPremiseSignal, isDecomposeLoop, candidateFilePaths, distinctivePhrases, extractCreatedSymbols, lastActivityTs, stalenessThresholdMs, symbolDefinedInRepo, envDays, FABRICATION_KEYWORDS, GIT_LOG_TIMEOUT_MS, CREATE_VERB_RE, DEFAULT_STALENESS_THRESHOLD_DAYS, GENERATED_DOC_RE, MS_PER_DAY, NON_PROGRESS_STAGES, TITLE_PREFIX_RE } = require('./staleness-audit-signals.js');
-const { normalizeTaskTokens, dupSimilarityThreshold, bdLineage, findDuplicateTask } = require('./staleness-audit-dedup.js');
+const { normalizeTaskTokens, dupSimilarityThreshold, bdLineage, buildDupIndex, findDuplicateTask } = require('./staleness-audit-dedup.js');
 const { resolveGroundingRef, resolveAtRef } = require('./stacked-grounding.js');
 
 // Lowered from 14 (2026-08-23, Grimmethy: "Yes, lower the default" -- after confirming
@@ -242,6 +242,8 @@ function stackedExistsAtRef(repoRoot, task, cache) {
 }
 
 function findStalenessCandidates(tasks, coverage = {}, now = Date.now(), { repoRoot, corpusTasks } = {}) {
+  // One prefix-filter index per pass, so duplicate lookups don't rebuild it per task.
+  const dupIndex = corpusTasks ? buildDupIndex(corpusTasks) : null;
   const stackedRefCache = new Map();
   const threshold = stalenessThresholdMs();
   const cooldown = cooldownMs();
@@ -275,7 +277,7 @@ function findStalenessCandidates(tasks, coverage = {}, now = Date.now(), { repoR
       if (bad.hit) { reasons.push('invalid-premise'); evidence.push(...bad.evidence); }
     }
 
-    const dup = corpusTasks ? findDuplicateTask(task, corpusTasks) : null;
+    const dup = corpusTasks ? findDuplicateTask(task, corpusTasks, { index: dupIndex }) : null;
     if (dup) {
       reasons.push('duplicate-of');
       evidence.push(`~${Math.round(dup.sim * 100)}% token overlap with ${dup.id}${dup.state ? ` (${dup.state})` : ''}`);
