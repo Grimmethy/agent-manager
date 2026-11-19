@@ -3784,3 +3784,60 @@ Benefits:
 Misuse of the function is caught at development time rather than producing silent correctness bugs in production. The API contract is enforced at runtime, making the function's behavior explicit and predictable. Callers are forced to be intentional about input formatting.
 
 NOTE: The pre-check leads flagging `git-ownership-rules.js` and `git-ownership-detector.js` as "missing files" were not applied because the draft is creating these files as part of the proposed solution — it does not claim they exist or import from them as if they already exist.
+
+### AC-838 · Import cycle between `task-sources.js` and `task-selection.js` requires fragile initialization ordering
+Strength: Strong
+
+**Strength:** Strong  
+**Files:** `src/lib/task-selection.js`, `src/task-sources.js`
+
+**Problem:**  
+`task-selection.js` needs `nextAdhocTask` and `nextDerivedTask` from `task-sources.js` for premium/hub-tier preemption, but `task-sources.js` needs `task-selection.js` to register its sources. This creates an import cycle that the code explicitly acknowledges: "roadmap step 1, piece P3: that lazy require was an edge of the import cycle" (task-selection.js, line ~75). The workaround (`setPreemptLoaders`) requires `task-sources.js` to call `setPreemptLoaders` during its initialization, which means the modules must be loaded in a specific order, `task-sources.js` must know about `task-selection.js`'s API, and the initialization order is not enforced at compile time. If either module's dependencies change, the cycle might re-emerge.
+
+**Solution:**  
+Break the cycle by extracting the preemption logic into a third module (e.g., `src/lib/preemption.js`) that both modules can depend on without creating a cycle. Alternatively, use a dependency injection pattern where the preemption loaders are passed in at construction time rather than being required directly.
+
+**Benefits:**  
+Eliminates the fragile initialization ordering, makes the dependency graph acyclic and easier to reason about, allows the modules to be loaded in any order, and reduces the risk of the cycle re-emerging if dependencies change.
+
+### AC-839 · Core scope gate is applied redundantly at registration and selection time
+Strength: Strong
+
+**Strength:** Strong  
+**Files:** `src/task-source-registry.js`, `src/lib/task-selection.js`
+
+**Problem:**  
+For sources with `scope: 'core'`, the gate is applied twice: (1) at registration time via `gateCoreNext` in `task-source-registry.js`, which wraps `next()` to return `null` if not core, and (2) at selection time via `sourceEligibleHere` in `task-selection.js`, which skips the source entirely if not core. The `gateCoreNext` wrapper is redundant because `sourceEligibleHere` already ensures the source is only called when eligible. The wrapper adds complexity (a `WeakSet` to track wrapped functions, a `require` inside the wrapper) without providing additional safety. If the gate logic ever changes (e.g., adding a new condition), it must be updated in two places, creating a risk of divergence.
+
+**Solution:**  
+Remove the `gateCoreNext` wrapper and rely solely on `sourceEligibleHere` at selection time. If the wrapper is needed for other callers (e.g., direct invocation of `next()`), document this explicitly and ensure the gate logic is centralized.
+
+**Benefits:**  
+Eliminates redundant gate logic, reduces complexity (no `WeakSet`, no inline `require`), makes the gate logic easier to maintain (one place to update), and clarifies which gate is authoritative.
+
+### AC-840 · `resolveSourceName`'s short-circuit evaluation can miss valid source aliases
+Strength: Strong
+
+**Strength:** Worth exploring  
+**Files:** `src/task-source-registry.js`
+
+**Problem:**  
+The precedence logic uses short-circuit evaluation:
+```js
+const resolved = (task.domain !== undefined && domainAliases[task.domain]) || sourceAliases[task.source] || task.source;
+```
+If `domainAliases[task.domain]` returns a value that's not in the registry, the expression short-circuits and `sourceAliases[task.source]` is never evaluated. This means a task with an invalid domain alias will not be tried against the source alias, even if the source alias would resolve correctly. This can lead to unresolved drops for tasks that could have been resolved via source alias, which is confusing for debugging and makes the alias system fragile.
+
+**Solution:**  
+Change the precedence to try all aliases before falling back to `task.source`:
+```js
+const domainResolved = task.domain !== undefined && domainAliases[task.domain];
+const sourceResolved = sourceAliases[task.source];
+const resolved = domainResolved || sourceResolved || task.source;
+```
+The unresolved drop tracking should be updated to reflect this new behavior.
+
+**Benefits:**  
+Makes the alias system more robust (source alias is always tried), reduces unresolved drops for tasks with invalid domain aliases, makes the behavior more predictable and easier to debug, and aligns with the documented intent of "try all aliases before falling back."
+
+NOTE: The independent review's critique section reported "NO ISSUES FOUND" after verifying all three ACs against the codebase, so no changes to the draft were necessary.
