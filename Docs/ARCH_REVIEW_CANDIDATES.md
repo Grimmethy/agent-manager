@@ -3841,3 +3841,22 @@ The unresolved drop tracking should be updated to reflect this new behavior.
 Makes the alias system more robust (source alias is always tried), reduces unresolved drops for tasks with invalid domain aliases, makes the behavior more predictable and easier to debug, and aligns with the documented intent of "try all aliases before falling back."
 
 NOTE: The independent review's critique section reported "NO ISSUES FOUND" after verifying all three ACs against the codebase, so no changes to the draft were necessary.
+
+### AC-841 · Verify extraction wiring for fact-checker-text-utils.js
+Strength: Worth exploring
+Files: src/lib/fact-checker-text-utils.js, pre-validate-cited-paths.test.js
+
+Problem:
+`src/lib/fact-checker-text-utils.js` declares itself as "extracted from src/fact-checker.js" but `src/fact-checker.js` is not in this community, so I cannot verify whether the extraction was completed. The test file `pre-validate-cited-paths.test.js` imports from `./src/fact-checker.js` directly, not from the extracted text-utils module. If `fact-checker.js` was not updated to import from the extracted module, then the text-utils file is dead code or an incomplete extraction that leaves the original implementations duplicated or orphaned.
+
+Solution:
+Locate `src/fact-checker.js` and verify whether it imports from `src/lib/fact-checker-text-utils.js`. If it does not, either (a) update `fact-checker.js` to use the extracted module, or (b) remove the extraction comment and restore the utilities inline if the extraction was premature.
+
+Benefits:
+Eliminates uncertainty about whether the extraction was completed, preventing dead code or inconsistent implementations between the extracted module and its source.
+
+---
+
+The plan identified a side-finding about incomplete extraction verification. This candidate addresses that finding with "Worth exploring" strength since it cannot be fully verified from the files in this community alone.
+
+NOTE: No changes applied — the critique found no issues with the original draft.
