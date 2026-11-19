@@ -17,25 +17,29 @@
 // first research fork on a new topic creates its row), never by an autonomous
 // pipeline-driven task source -- see the plan's "explicitly out of scope" section for
 // why (mirrors the arch_import premise-check incident's risk shape).
+//
+// Persistence (2026-11-18, AC-208): this module holds business logic only. It does no
+// disk I/O itself. Every function that reads or writes the registry accepts an optional
+// `store` ({ load(), save(data) }, see concepts-store.js). Callers that pass nothing get
+// the JSON-file store for pipelineDir, so existing behaviour is unchanged.
 
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
-const { writeJsonAtomicSync } = require('./atomic-write.js');
+const { conceptsPath, brainDumpPath, createJsonStore } = require('./concepts-store.js');
 
-function conceptsPath(pipelineDir) {
-  return path.join(pipelineDir, 'concepts.json');
+// Resolves the store to use: an injected one wins, otherwise the JSON-file default.
+function resolveStore(pipelineDir, store) {
+  return store || createJsonStore(pipelineDir);
 }
 
 // Mirrors apply-group-a.js's loadBrainDump: never let a missing/corrupt file break a
 // caller -- an empty registry is always a safe fallback.
-function loadConcepts(pipelineDir) {
-  const filePath = conceptsPath(pipelineDir);
+function loadConcepts(pipelineDir, store) {
+  const s = resolveStore(pipelineDir, store);
   let data;
   try {
-    data = JSON.parse(fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '{"concepts":[]}');
+    data = s.load();
   } catch (err) {
-    console.error(`[loadConcepts] ${filePath}: ${err.message} -- returning empty store`);
+    console.error(`[loadConcepts] ${conceptsPath(pipelineDir)}: ${err.message} -- returning empty store`);
     data = { concepts: [] };
   }
   if (data === null || typeof data !== 'object') data = { concepts: [] };
@@ -43,10 +47,8 @@ function loadConcepts(pipelineDir) {
   return data;
 }
 
-function writeConcepts(pipelineDir, data) {
-  const filePath = conceptsPath(pipelineDir);
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  writeJsonAtomicSync(filePath, data);
+function writeConcepts(pipelineDir, data, store) {
+  resolveStore(pipelineDir, store).save(data);
 }
 
 function findConcept(data, id) {
@@ -68,8 +70,8 @@ function slugify(name) {
 // index.html's renderConceptCard. Omitted (undefined) for every existing caller and
 // every concept created before this, which is the point: a concept with no `kind` keeps
 // today's exact rendering, unaffected.
-function createConcept({ name, description, kind }, pipelineDir, { createdBy } = {}) {
-  const data = loadConcepts(pipelineDir);
+function createConcept({ name, description, kind }, pipelineDir, { createdBy, store } = {}) {
+  const data = loadConcepts(pipelineDir, store);
   const slug = slugify(name);
   const existing = data.concepts.find((c) => c && c.slug === slug);
   if (existing) return existing;
@@ -89,7 +91,7 @@ function createConcept({ name, description, kind }, pipelineDir, { createdBy } =
   };
   if (kind === 'reference') concept.kind = 'reference';
   data.concepts.push(concept);
-  writeConcepts(pipelineDir, data);
+  writeConcepts(pipelineDir, data, store);
   return concept;
 }
 
@@ -102,30 +104,30 @@ function createConcept({ name, description, kind }, pipelineDir, { createdBy } =
 // takes priority" must not silently flip it back to 'researched' and erase that decision.
 const STABLE_CONCEPT_STATUSES = new Set(['shelved', 'shipped']);
 
-function recordConceptResearch(pipelineDir, conceptId) {
+function recordConceptResearch(pipelineDir, conceptId, { store } = {}) {
   if (!conceptId) return null;
-  const data = loadConcepts(pipelineDir);
+  const data = loadConcepts(pipelineDir, store);
   const concept = findConcept(data, conceptId);
   if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
   concept.researchForkCount = (concept.researchForkCount || 0) + 1;
   concept.lastResearchedAt = new Date().toISOString();
   if (concept.status === 'open') concept.status = 'researched';
-  writeConcepts(pipelineDir, data);
+  writeConcepts(pipelineDir, data, store);
   return concept;
 }
 
 // kind: 'scratch' | 'adapted'. Self-reported by the implementing model -- deliberately
 // unverified in v1 (see plan's "explicitly out of scope"); the dashboard must label this
 // tally as such rather than presenting it as fact.
-function recordConceptBuildTally(pipelineDir, conceptId, kind) {
+function recordConceptBuildTally(pipelineDir, conceptId, kind, { store } = {}) {
   if (!conceptId || (kind !== 'scratch' && kind !== 'adapted')) return null;
-  const data = loadConcepts(pipelineDir);
+  const data = loadConcepts(pipelineDir, store);
   const concept = findConcept(data, conceptId);
   if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
   if (kind === 'scratch') concept.builtFromScratchCount = (concept.builtFromScratchCount || 0) + 1;
   else concept.adaptedFromResourceCount = (concept.adaptedFromResourceCount || 0) + 1;
   if (concept.status === 'researched' || concept.status === 'open') concept.status = 'in-progress';
-  writeConcepts(pipelineDir, data);
+  writeConcepts(pipelineDir, data, store);
   return concept;
 }
 
@@ -141,9 +143,9 @@ function recordConceptBuildTally(pipelineDir, conceptId, kind) {
 // up without re-deriving the same judgment call from scratch. statusBeforeShelve is
 // stashed so reopenConcept can restore real progress state (researched vs in-progress)
 // instead of resetting every reopened concept back to a blank slate.
-function shelveConcept(pipelineDir, conceptId, { reason, revisitCondition } = {}) {
+function shelveConcept(pipelineDir, conceptId, { reason, revisitCondition, store } = {}) {
   if (!conceptId || !reason) return null;
-  const data = loadConcepts(pipelineDir);
+  const data = loadConcepts(pipelineDir, store);
   const concept = findConcept(data, conceptId);
   if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
   concept.statusBeforeShelve = concept.status;
@@ -151,7 +153,7 @@ function shelveConcept(pipelineDir, conceptId, { reason, revisitCondition } = {}
   concept.shelvedAt = new Date().toISOString();
   concept.shelvedReason = String(reason).trim();
   concept.revisitCondition = revisitCondition ? String(revisitCondition).trim() : null;
-  writeConcepts(pipelineDir, data);
+  writeConcepts(pipelineDir, data, store);
   return concept;
 }
 
@@ -160,9 +162,9 @@ function shelveConcept(pipelineDir, conceptId, { reason, revisitCondition } = {}
 // was shelved, defaulting to 'researched' for a shipped concept reopened with no prior
 // shelve on record. Clears the shelve-specific fields rather than leaving stale ones
 // that would misleadingly suggest the concept is still parked.
-function reopenConcept(pipelineDir, conceptId) {
+function reopenConcept(pipelineDir, conceptId, { store } = {}) {
   if (!conceptId) return null;
-  const data = loadConcepts(pipelineDir);
+  const data = loadConcepts(pipelineDir, store);
   const concept = findConcept(data, conceptId);
   if (!concept || !STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
   concept.status = concept.statusBeforeShelve || 'researched';
@@ -170,21 +172,21 @@ function reopenConcept(pipelineDir, conceptId) {
   delete concept.shelvedAt;
   delete concept.shelvedReason;
   delete concept.revisitCondition;
-  writeConcepts(pipelineDir, data);
+  writeConcepts(pipelineDir, data, store);
   return concept;
 }
 
 // shipConcept: the concept's work is genuinely done, not just "some work happened"
 // (which 'in-progress' already means) -- a real terminal state a hub view can use to
 // stop surfacing a concept as active work.
-function shipConcept(pipelineDir, conceptId) {
+function shipConcept(pipelineDir, conceptId, { store } = {}) {
   if (!conceptId) return null;
-  const data = loadConcepts(pipelineDir);
+  const data = loadConcepts(pipelineDir, store);
   const concept = findConcept(data, conceptId);
   if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;
   concept.status = 'shipped';
   concept.shippedAt = new Date().toISOString();
-  writeConcepts(pipelineDir, data);
+  writeConcepts(pipelineDir, data, store);
   return concept;
 }
 
@@ -198,7 +200,7 @@ function getConceptTimeline(pipelineDir, conceptId, { loadBrainDump, listTaskHis
   if (typeof loadBrainDump === 'function') {
     let brainDump;
     try {
-      brainDump = loadBrainDump(path.join(pipelineDir, 'brain-dump.json'));
+      brainDump = loadBrainDump(brainDumpPath(pipelineDir));
     } catch { brainDump = { entries: [] }; }
     for (const entry of (brainDump.entries || [])) {
       if (entry && entry.raisedBy && entry.raisedBy.conceptId === conceptId) {
@@ -241,7 +243,7 @@ function getConceptTimeline(pipelineDir, conceptId, { loadBrainDump, listTaskHis
 const CONCEPT_BUILD_INSTRUCTION = (
   'This task is tied to tracked concept work. When you finish, end your response with '
   + 'one line: CONCEPT-BUILD: scratch|adapted | <one-sentence detail> -- "scratch" if you '
-  + "wrote this from nothing, \"adapted\" if you drew on a specific researched repo or "
+  + 'wrote this from nothing, "adapted" if you drew on a specific researched repo or '
   + 'design option, naming which one in the detail. This is a self-report for an audit '
   + 'chart, not graded -- be honest, not impressive.'
 );
@@ -284,4 +286,5 @@ module.exports = {
   shelveConcept,
   reopenConcept,
   shipConcept,
+  createJsonStore,
 };

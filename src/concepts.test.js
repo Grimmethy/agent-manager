@@ -277,3 +277,65 @@ test('shelveConcept/shipConcept are safe no-ops for an unknown conceptId', () =>
   assert.equal(shipConcept(dir, 'concept-does-not-exist'), null);
   assert.equal(reopenConcept(dir, 'concept-does-not-exist'), null);
 });
+
+// AC-208: persistence injection tests. Appended; existing tests above are untouched.
+{
+const { describe, it } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const concepts = require('./concepts.js');
+
+describe('persistence injection (AC-208)', () => {
+  it('createConcept with an injected in-memory store saves one row and is idempotent', () => {
+    let stored = { concepts: [] };
+    let saveCount = 0;
+    const store = {
+      load: () => JSON.parse(JSON.stringify(stored)),
+      save: (d) => { saveCount += 1; stored = JSON.parse(JSON.stringify(d)); },
+    };
+    const first = concepts.createConcept({ name: 'Injected Topic' }, '/unused-pipeline-dir', { store });
+    const second = concepts.createConcept({ name: 'Injected Topic' }, '/unused-pipeline-dir', { store });
+    assert.equal(second.id, first.id);
+    assert.equal(stored.concepts.length, 1);
+    assert.equal(saveCount, 1);
+  });
+
+  it('createJsonStore: missing file loads as an empty registry', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'concepts-'));
+    try {
+      assert.deepEqual(concepts.createJsonStore(dir).load(), { concepts: [] });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('createJsonStore: corrupt file logs via console.error and loads as an empty registry', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'concepts-'));
+    const origError = console.error;
+    const logged = [];
+    console.error = (...args) => logged.push(args.join(' '));
+    try {
+      fs.writeFileSync(path.join(dir, 'concepts.json'), '{not json');
+      assert.deepEqual(concepts.createJsonStore(dir).load(), { concepts: [] });
+      assert.equal(logged.length, 1);
+    } finally {
+      console.error = origError;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('createJsonStore: save then load round-trips', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'concepts-'));
+    try {
+      const store = concepts.createJsonStore(dir);
+      const payload = { concepts: [{ id: 'concept-x-000000', slug: 'x', name: 'X' }] };
+      store.save(payload);
+      assert.deepEqual(store.load(), payload);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+}
