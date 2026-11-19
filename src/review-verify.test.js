@@ -322,6 +322,52 @@ test('extractChangedSymbols reads added/removed declarations and the function na
   assert.deepEqual(extractChangedSymbols('+++ b/x.py\n--- a/x.py\n'), []);
 });
 
+test('extractChangedSymbols also captures module-level constants (Python UPPER_CASE and JS const UPPER_CASE)', () => {
+  const pyDiff = [
+    'diff --git a/python/dashboard/routes/pipeline_ops_workers.py b/python/dashboard/routes/pipeline_ops_workers.py',
+    '--- a/python/dashboard/routes/pipeline_ops_workers.py',
+    '+++ b/python/dashboard/routes/pipeline_ops_workers.py',
+    '@@ -50,3 +50,3 @@',
+    '-WORKERS = ("scout", "checker", "merger", "steward", "hub", "atomizer")',
+    '+WORKERS = ("scout", "checker", "merger", "steward", "hub", "atomizer", "featuremanager")',
+  ].join('\n');
+  assert.ok(extractChangedSymbols(pyDiff).includes('WORKERS'), 'Python constant WORKERS should be captured');
+  assert.equal(extractChangedSymbols(pyDiff).length, 1, 'only WORKERS should be captured, no other symbols');
+
+  const jsDiff = [
+    'diff --git a/src/some-module.js b/src/some-module.js',
+    '--- a/src/some-module.js',
+    '+++ b/src/some-module.js',
+    '@@ -10,3 +10,3 @@',
+    '-const MAX_RETRIES = 3;',
+    '+const MAX_RETRIES = 5;',
+  ].join('\n');
+  assert.ok(extractChangedSymbols(jsDiff).includes('MAX_RETRIES'), 'JS constant MAX_RETRIES should be captured');
+
+  // Annotated Python constant
+  const annotatedDiff = [
+    'diff --git a/src/annotated.py b/src/annotated.py',
+    '--- a/src/annotated.py',
+    '+++ b/src/annotated.py',
+    '@@ -5,3 +5,3 @@',
+    '-CONFIG: dict = {}',
+    '+CONFIG: dict = {"key": "value"}',
+  ].join('\n');
+  assert.ok(extractChangedSymbols(annotatedDiff).includes('CONFIG'), 'Annotated Python constant should be captured');
+
+  // Local variable (indented) should NOT be captured
+  const localDiff = [
+    'diff --git a/src/local.py b/src/local.py',
+    '--- a/src/local.py',
+    '+++ b/src/local.py',
+    '@@ -10,3 +10,3 @@',
+    ' def foo():',
+    '-    local_var = 1',
+    '+    local_var = 2',
+  ].join('\n');
+  assert.equal(extractChangedSymbols(localDiff).length, 0, 'indented local variable should not be captured');
+});
+
 function makeDashTree() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-verify-sym-'));
   const w = (rel, text) => { fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true }); fs.writeFileSync(path.join(root, rel), text); };
@@ -380,6 +426,32 @@ test('findTestsWithSymbolFallback caps the extra symbol tests at AGENT_MANAGER_R
     assert.equal(extraCoveringMax({ AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX: '3' }), 3);
   } finally {
     if (saved === undefined) delete process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX; else process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX = saved;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('findTestsWithSymbolFallback finds a test in the parent dir when a module-level constant is edited (the HUB0754-01 case)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-verify-const-'));
+  try {
+    // python/dashboard/routes/foo.py -- the changed file with a module-level constant
+    fs.mkdirSync(path.join(root, 'python/dashboard/routes'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'python/dashboard/routes/foo.py'), "WORKERS = ('a', 'b')\n");
+    // python/dashboard/test_foo_registry.py -- a test in the parent dir that mentions WORKERS
+    fs.writeFileSync(path.join(root, 'python/dashboard/test_foo_registry.py'), 'from routes.foo import WORKERS\nassert len(WORKERS) == 2\n');
+    // A diff that only edits the constant (no function/class changes)
+    const diff = [
+      'diff --git a/python/dashboard/routes/foo.py b/python/dashboard/routes/foo.py',
+      '--- a/python/dashboard/routes/foo.py',
+      '+++ b/python/dashboard/routes/foo.py',
+      '@@ -1,3 +1,3 @@',
+      '-WORKERS = ("a", "b")',
+      '+WORKERS = ("a", "b", "c")',
+    ].join('\n');
+    const result = findTestsWithSymbolFallback(root, ['python/dashboard/routes/foo.py'], diff);
+    assert.ok(result.py.includes('python/dashboard/test_foo_registry.py'), `expected test_foo_registry.py in ${JSON.stringify(result.py)}`);
+    // The symbol WORKERS must be in the extracted symbols for the fallback to work
+    assert.ok(extractChangedSymbols(diff).includes('WORKERS'), 'extractChangedSymbols must return WORKERS for the constant-only diff');
+  } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
