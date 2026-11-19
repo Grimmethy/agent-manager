@@ -216,8 +216,9 @@ function checkFilePaths(text, repoRoot, extraRoots = [], ref) {
     // working-tree-only check would flag the sibling's real file as fabricated. Mirrors the
     // ref treatment existsLiterallyInRepo already uses, and resolveAtRef's own tiers
     // (exact / extraRoot-prefix / unique basename): it returns the resolved repo-relative
-    // path or null, never throws, and its null result does NOT void the working-tree
-    // verdict below -- an unreadable ref degrades to exactly the pre-ref behavior.
+    // path or null (null = absent at a valid ref); a real git failure (unknown ref, timeout)
+    // throws and is caught below. Neither outcome voids the working-tree verdict -- an
+    // unreadable ref degrades to exactly the pre-ref behavior.
     if (ref) {
       try {
         const { resolveAtRef } = require('./stacked-grounding.js');
