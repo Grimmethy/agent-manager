@@ -15,11 +15,7 @@ const path = require('path');
 const { ungatedMainPushAllowed, assertMainWriteAllowed } = require('./lib/main-push-policy.js');
 const { healGeneratedDirt } = require('./lib/apply-clone-dirt.js');
 
-const GIT_ENV = {
-  ...process.env,
-  GIT_TERMINAL_PROMPT: '0',
-  GCM_INTERACTIVE: 'never',
-};
+const { GIT_ENV } = require('./git-env.js');
 const { gitTimeoutMs } = require('./lib/git-timeout.js');   // AGENT_MANAGER_GIT_TIMEOUT_MS (default 60000), read on each call
 const FETCH_RETRY_PAUSE_MS = 2000;
 const FETCH_RETRY_TIMEOUT_FACTOR = 3;
