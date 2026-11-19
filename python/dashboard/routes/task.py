@@ -749,6 +749,17 @@ def api_task_requeue(state, task_id):
         fresh["premiumSetBy"] = data["premiumSetBy"]
     if "premiumSetAt" in data:
         fresh["premiumSetAt"] = data["premiumSetAt"]
+    # Fresh read of the source file to ensure premium fields are preserved even if
+    # something between the initial read and this write modified the in-memory copy.
+    # This is the defensive pattern: re-read the file to get the canonical current
+    # values, then copy the premium fields from that fresh read.
+    current_src = read_json_safe(src) or {}
+    if "premiumPriority" in current_src:
+        fresh["premiumPriority"] = current_src["premiumPriority"]
+    if "premiumSetBy" in current_src:
+        fresh["premiumSetBy"] = current_src["premiumSetBy"]
+    if "premiumSetAt" in current_src:
+        fresh["premiumSetAt"] = current_src["premiumSetAt"]
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual",
