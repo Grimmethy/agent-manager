@@ -89,7 +89,11 @@ function ungroundedValueGate(ctx) {
     }
   }
   if (highPrecisionFlags.length > 0) {
-    const detail = highPrecisionFlags.map((f) => `${f.type}: ${f.detail}`).join('; ');
+    const sourceName = resolveSourceName(task);
+    const detail = highPrecisionFlags.map((f) => {
+      const ground = groundingRef ? `${sourceName} (ref: ${groundingRef})` : sourceName;
+      return `${f.type}: ${f.detail} in ${ground}`;
+    }).join('; ');
     const reason = `Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ${detail}. This fact-check flag is high-precision (almost never a false positive) and treated as disqualifying, not merely advisory context a vote could ignore -- no local-model review call spent on a draft already known to contain a hallucinated value.`;
     task.reviewProvider = 'deterministic-ungrounded-value';
     logFactCheckAudit(pipelineDir, { taskId: task.id, source: resolveSourceName(task), flags: highPrecisionFlags });

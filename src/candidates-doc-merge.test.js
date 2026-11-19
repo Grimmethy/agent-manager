@@ -155,3 +155,29 @@ test('a deletion on theirs does not disturb a same-slot collision elsewhere in t
   assert.match(merged, /### AC-9 · ours new fix/);
   assert.match(merged, /### AC-\d+ · theirs new fix/);
 });
+
+// Same-id duplicates: a single document carrying two headings with the same AC-N id cannot be
+// merged without silently dropping one candidate, so the merge must decline (return null).
+test('two AC-3 headings in theirs make mergeCandidatesDoc return null', () => {
+  const ancestor = doc(block(1, 'a'));
+  const ours = doc(block(1, 'a'));
+  const theirs = doc(block(1, 'a'), block(3, 'first AC-3'), block(3, 'second AC-3'));
+  assert.equal(mergeCandidatesDoc({ ancestorText: ancestor, oursText: ours, theirsText: theirs }), null);
+});
+
+test('two AC-3 headings in ours make mergeCandidatesDoc return null', () => {
+  const ancestor = doc(block(1, 'a'));
+  const ours = doc(block(1, 'a'), block(3, 'first AC-3'), block(3, 'second AC-3'));
+  const theirs = doc(block(1, 'a'));
+  assert.equal(mergeCandidatesDoc({ ancestorText: ancestor, oursText: ours, theirsText: theirs }), null);
+});
+
+test('a clean three-way merge with no duplicate ids still returns a non-null string', () => {
+  const ancestor = doc(block(1, 'a'), block(2, 'b'));
+  const ours = doc(block(1, 'a'), block(2, 'b changed by ours'));
+  const theirs = doc(block(1, 'a'), block(2, 'b'), block(3, 'new from theirs'));
+  const merged = mergeCandidatesDoc({ ancestorText: ancestor, oursText: ours, theirsText: theirs });
+  assert.equal(typeof merged, 'string');
+  assert.match(merged, /b changed by ours/);
+  assert.match(merged, /### AC-3 · new from theirs/);
+});
