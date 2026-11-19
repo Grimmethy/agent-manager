@@ -629,6 +629,30 @@ const REPO_GREP_TIMEOUT_MS = 15_000;
 // resolveGroundingRef -- null for any non-stacked task, so behavior there is unchanged),
 // checks the stacked branch's real tip via git's object database instead of the working
 // tree.
+// Detailed form of the non-ref git-grep check. Same command and timeout as before, but
+// reports the outcome instead of collapsing every failure to false. 'match' = exit 0,
+// 'no-match' = exit 1, 'git-error' = any other throw (timeout, bad cwd, git missing).
+function grepLiteralInRepoDetail(value, repoRoot) {
+  const { execFileSync } = require('child_process');
+  try {
+    execFileSync('git', ['grep', '-q', '-F', '-e', value], {
+      cwd: repoRoot, timeout: REPO_GREP_TIMEOUT_MS, stdio: 'ignore',
+    });
+    return { found: true, outcome: 'match', errorCode: null, exitStatus: 0, signal: null };
+  } catch (err) {
+    if (err.status === 1 && !err.signal) {
+      return { found: false, outcome: 'no-match', errorCode: null, exitStatus: 1, signal: null };
+    }
+    return {
+      found: false,
+      outcome: 'git-error',
+      errorCode: err.code ?? null,
+      exitStatus: err.status ?? null,
+      signal: err.signal ?? null,
+    };
+  }
+}
+
 function existsLiterallyInRepo(value, repoRoot, ref) {
   if (!repoRoot) return false;
   if (ref) {
@@ -639,15 +663,7 @@ function existsLiterallyInRepo(value, repoRoot, ref) {
       return false; // could not confirm against the stacked ref -- treat as unconfirmed, not grounded.
     }
   }
-  const { execFileSync } = require('child_process');
-  try {
-    execFileSync('git', ['grep', '-q', '-F', '-e', value], {
-      cwd: repoRoot, timeout: REPO_GREP_TIMEOUT_MS, stdio: 'ignore',
-    });
-    return true; // exit 0 -- git grep found at least one match.
-  } catch (e) {
-    return false; // exit 1 (no match) or any other failure -- treat as unconfirmed, not grounded.
-  }
+  return grepLiteralInRepoDetail(value, repoRoot).found;
 }
 
 // 2026-08-26, root-caused live via a real blocked adhoc task (the Job List family-
@@ -780,7 +796,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
     if (echoMarkers.has(field)) continue;
     if (templatePlaceholders.has(field)) continue;
     if (isPlatformConstant(field)) continue;
-    if (sourceText.includes(field)) continue;
+    if (sourceText.toLowerCase().includes(field.toLowerCase())) continue;
     if (existsLiterallyInRepo(field, repoRoot, ref)) continue;
     flags.push({ type: 'ungrounded-field', detail: field });
   }
@@ -1214,6 +1230,7 @@ module.exports = {
   resolveAgainstRepo,
   resolveAgainstRepoDetailed,
   findByBasename,
+  grepLiteralInRepoDetail,
 };
 
 if (require.main === module) {

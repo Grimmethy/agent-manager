@@ -83,7 +83,7 @@ function isApprovedRecord(task) {
 }
 
 // Transient network failure during apply (e.g. a DNS blip). Redrafting cannot fix this, so an approved record is re-applied, not redrafted.
-const NETWORK_APPLY_RE = /could not resolve host|temporary failure in name resolution|connection (timed out|refused|reset)|network is unreachable/i;
+const NETWORK_APPLY_RE = /could not resolve host|temporary failure in name resolution|connection (timed out|refused|reset)|network is unreachable|cannot lock ref|unable to create '[^']*\.lock'/i;
 function isNetworkApplyFailure(task) {
   return isApplyFailure(task) && NETWORK_APPLY_RE.test(String(task.blockedReason || ''));
 }
