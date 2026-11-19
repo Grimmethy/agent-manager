@@ -99,6 +99,9 @@ function formatRows(rows) {
 }
 
 function formatSkipped(skipInfo) {
+  // Accepts either an array of {path, reason, size} records or {skipped, counts}.
+  if (Array.isArray(skipInfo)) skipInfo = { skipped: skipInfo, counts: {} };
+  if (!skipInfo) skipInfo = {};
   const skipped = (skipInfo.skipped || []).slice()
     .sort((a, b) => cmp(a.path, b.path) || cmp(a.reason, b.reason));
   const counts = skipInfo.counts || {};
@@ -112,8 +115,8 @@ function formatSkipped(skipInfo) {
 
 function buildBlock(rows, skipInfo) {
   const body = rows.length ? ['```text', ...formatRows(rows), '```'].join('\n') : '(none)';
-  const extra = skipInfo ? '\n\n' + formatSkipped(skipInfo) : '';
-  return START + '\n' + body + extra + '\n' + END;
+  // The Skipped section is always emitted (with `(none)` when empty) so the block shape is stable.
+  return START + '\n' + body + '\n\n' + formatSkipped(skipInfo) + '\n' + END;
 }
 
 function count(s, needle) {
