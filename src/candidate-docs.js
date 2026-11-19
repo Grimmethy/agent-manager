@@ -293,7 +293,24 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   return { file: candidatesPath, candidateCount: candidates.length, candidateIds, ...(duplicatesSkipped.length ? { duplicatesSkipped: duplicatesSkipped.length } : {}), ...(droppedNonStrong ? { droppedNonStrong } : {}), ...(skippedByGate.length ? { skippedByGate } : {}) };
 }
 
+// Model-free grounding check: the `Snippet:` fence a candidate carries is the real code text the scanner read. A draft
+// that claims to describe that code must contain it (whitespace-insensitive). Returns null when there is nothing to
+// enforce or the snippet is present; otherwise { expected } so a caller can quote the missing text back (-612 class:
+// the draft said `except Exception` / `FALLBACK` where the code had `except OSError` / `_fallback_cache_paths(...)`).
+function snippetMismatch(candidate, draftText) {
+  let snippet = candidate && typeof candidate.snippet === 'string' ? candidate.snippet : '';
+  if (!snippet.trim() && candidate && typeof candidate.body === 'string') {
+    const m = candidate.body.match(/^Snippet:\s*\n```[^\n]*\n([\s\S]*?)\n```/m);
+    if (m) snippet = m[1];
+  }
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const want = norm(snippet);
+  if (!want) return null;
+  return norm(draftText).includes(want) ? null : { expected: snippet.trim() };
+}
+
 module.exports = {
+  snippetMismatch,
   isEffectivelyEmptyResponse,
   parseArchDiscoveryCandidates,
   nextAvailableCandidateId,
