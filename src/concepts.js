@@ -68,7 +68,7 @@ function slugify(name) {
 // index.html's renderConceptCard. Omitted (undefined) for every existing caller and
 // every concept created before this, which is the point: a concept with no `kind` keeps
 // today's exact rendering, unaffected.
-function createConcept({ name, description, kind }, pipelineDir, { createdBy } = {}) {
+function createConceptUnlocked({ name, description, kind }, pipelineDir, { createdBy } = {}) {
   const data = loadConcepts(pipelineDir);
   const slug = slugify(name);
   const existing = data.concepts.find((c) => c && c.slug === slug);
@@ -102,7 +102,7 @@ function createConcept({ name, description, kind }, pipelineDir, { createdBy } =
 // takes priority" must not silently flip it back to 'researched' and erase that decision.
 const STABLE_CONCEPT_STATUSES = new Set(['shelved', 'shipped']);
 
-function recordConceptResearch(pipelineDir, conceptId) {
+function recordConceptResearchUnlocked(pipelineDir, conceptId) {
   if (!conceptId) return null;
   const data = loadConcepts(pipelineDir);
   const concept = findConcept(data, conceptId);
@@ -117,7 +117,7 @@ function recordConceptResearch(pipelineDir, conceptId) {
 // kind: 'scratch' | 'adapted'. Self-reported by the implementing model -- deliberately
 // unverified in v1 (see plan's "explicitly out of scope"); the dashboard must label this
 // tally as such rather than presenting it as fact.
-function recordConceptBuildTally(pipelineDir, conceptId, kind) {
+function recordConceptBuildTallyUnlocked(pipelineDir, conceptId, kind) {
   if (!conceptId || (kind !== 'scratch' && kind !== 'adapted')) return null;
   const data = loadConcepts(pipelineDir);
   const concept = findConcept(data, conceptId);
@@ -141,7 +141,7 @@ function recordConceptBuildTally(pipelineDir, conceptId, kind) {
 // up without re-deriving the same judgment call from scratch. statusBeforeShelve is
 // stashed so reopenConcept can restore real progress state (researched vs in-progress)
 // instead of resetting every reopened concept back to a blank slate.
-function shelveConcept(pipelineDir, conceptId, { reason, revisitCondition } = {}) {
+function shelveConceptUnlocked(pipelineDir, conceptId, { reason, revisitCondition } = {}) {
   if (!conceptId || !reason) return null;
   const data = loadConcepts(pipelineDir);
   const concept = findConcept(data, conceptId);
@@ -160,7 +160,7 @@ function shelveConcept(pipelineDir, conceptId, { reason, revisitCondition } = {}
 // was shelved, defaulting to 'researched' for a shipped concept reopened with no prior
 // shelve on record. Clears the shelve-specific fields rather than leaving stale ones
 // that would misleadingly suggest the concept is still parked.
-function reopenConcept(pipelineDir, conceptId) {
+function reopenConceptUnlocked(pipelineDir, conceptId) {
   if (!conceptId) return null;
   const data = loadConcepts(pipelineDir);
   const concept = findConcept(data, conceptId);
@@ -177,7 +177,7 @@ function reopenConcept(pipelineDir, conceptId) {
 // shipConcept: the concept's work is genuinely done, not just "some work happened"
 // (which 'in-progress' already means) -- a real terminal state a hub view can use to
 // stop surfacing a concept as active work.
-function shipConcept(pipelineDir, conceptId) {
+function shipConceptUnlocked(pipelineDir, conceptId) {
   if (!conceptId) return null;
   const data = loadConcepts(pipelineDir);
   const concept = findConcept(data, conceptId);
@@ -266,6 +266,110 @@ function extractConceptBuildReport(text) {
   const cleanText = source.replace(match[0], '').replace(/\n{3,}/g, '\n\n').trim();
   if (!detail) return { cleanText, report: null };
   return { cleanText, report: { kind, detail } };
+}
+
+const LOCK_MAX_ATTEMPTS = 100000;
+const LOCK_DEADLINE_MS = 30000;
+const LOCK_STALE_UNREADABLE_MS = 10000;
+const SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepMs(ms) {
+  Atomics.wait(SLEEP_CELL, 0, 0, ms);
+}
+
+function removeLockFile(lockPath) {
+  try {
+    fs.unlinkSync(lockPath);
+    return true;
+  } catch (err) {
+    return err.code === 'ENOENT';
+  }
+}
+
+// Returns true when the stale lock was removed (or vanished), so the caller retries at once.
+function tryRemoveStaleLock(lockPath) {
+  let raw;
+  try {
+    raw = fs.readFileSync(lockPath, 'utf8');
+  } catch (err) {
+    return err.code === 'ENOENT';
+  }
+  const pid = parseInt(raw, 10);
+  if (Number.isInteger(pid) && pid > 0) {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (err) {
+      if (err.code !== 'ESRCH') return false;
+    }
+    return removeLockFile(lockPath);
+  }
+  let ageMs;
+  try {
+    ageMs = Date.now() - fs.statSync(lockPath).mtimeMs;
+  } catch (err) {
+    return err.code === 'ENOENT';
+  }
+  if (ageMs < LOCK_STALE_UNREADABLE_MS) return false;
+  return removeLockFile(lockPath);
+}
+
+// Cross-process mutual exclusion around a load -> modify -> write cycle. Forks are separate
+// processes, so an in-process mutex cannot protect concepts.json. NOT reentrant: fn must never
+// call another withConceptsLock-wrapped function.
+function withConceptsLock(pipelineDir, fn) {
+  fs.mkdirSync(pipelineDir, { recursive: true });
+  const lockPath = path.join(pipelineDir, 'concepts.json.lock');
+  const deadline = Date.now() + LOCK_DEADLINE_MS;
+  let fd = null;
+  let attempts = 0;
+  while (fd === null) {
+    try {
+      fd = fs.openSync(lockPath, 'wx');
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      if (attempts >= LOCK_MAX_ATTEMPTS || Date.now() >= deadline) {
+        throw new Error(`[withConceptsLock] could not acquire ${lockPath} after ${attempts} attempts (${LOCK_DEADLINE_MS}ms budget)`);
+      }
+      attempts += 1;
+      if (!tryRemoveStaleLock(lockPath)) sleepMs(1 + Math.floor(Math.random() * 10));
+    }
+  }
+  try {
+    fs.writeSync(fd, String(process.pid));
+  } catch (err) {
+    // pid is diagnostic only; the lock file's existence is what matters
+  }
+  try {
+    return fn();
+  } finally {
+    try { fs.closeSync(fd); } catch (err) { /* already closed */ }
+    removeLockFile(lockPath);
+  }
+}
+
+function createConcept(spec, pipelineDir, opts) {
+  return withConceptsLock(pipelineDir, () => createConceptUnlocked(spec, pipelineDir, opts));
+}
+
+function recordConceptResearch(pipelineDir, conceptId) {
+  return withConceptsLock(pipelineDir, () => recordConceptResearchUnlocked(pipelineDir, conceptId));
+}
+
+function recordConceptBuildTally(pipelineDir, conceptId, kind) {
+  return withConceptsLock(pipelineDir, () => recordConceptBuildTallyUnlocked(pipelineDir, conceptId, kind));
+}
+
+function shelveConcept(pipelineDir, conceptId, opts) {
+  return withConceptsLock(pipelineDir, () => shelveConceptUnlocked(pipelineDir, conceptId, opts));
+}
+
+function reopenConcept(pipelineDir, conceptId) {
+  return withConceptsLock(pipelineDir, () => reopenConceptUnlocked(pipelineDir, conceptId));
+}
+
+function shipConcept(pipelineDir, conceptId) {
+  return withConceptsLock(pipelineDir, () => shipConceptUnlocked(pipelineDir, conceptId));
 }
 
 module.exports = {
