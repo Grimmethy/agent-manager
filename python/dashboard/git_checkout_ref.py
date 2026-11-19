@@ -22,10 +22,12 @@ def _checkout_git_ref(plugin_dir: str, candidates: list[str]) -> str:
         The ref that was successfully checked out.
 
     Raises:
-        RuntimeError: If no candidate succeeds and ``origin/HEAD`` has no
-            default ref.
-        subprocess.CalledProcessError: If the fallback ref itself cannot be
-            checked out.
+        RuntimeError: If no candidate succeeds and the default-ref fallback
+            also fails (``origin/HEAD`` lookup fails, is empty, or its ref
+            cannot be checked out).
+        subprocess.CalledProcessError: Only from the initial ``git fetch``.
+        subprocess.TimeoutExpired, OSError: Propagated from the subprocess
+            seam unchanged.
     """
     from app import _run_plugin_subprocess
 
@@ -38,10 +40,16 @@ def _checkout_git_ref(plugin_dir: str, candidates: list[str]) -> str:
         except subprocess.CalledProcessError:
             continue
 
-    stdout, _ = _run_plugin_subprocess(
-        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        cwd=plugin_dir,
-    )
+    try:
+        stdout, _ = _run_plugin_subprocess(
+            ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            cwd=plugin_dir,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"No candidate ref succeeded for plugin_dir={plugin_dir}; "
+            f"refs tried: {candidates}; origin/HEAD lookup failed"
+        ) from exc
     default_ref = stdout.strip()
     if not default_ref:
         raise RuntimeError(
@@ -49,5 +57,11 @@ def _checkout_git_ref(plugin_dir: str, candidates: list[str]) -> str:
             f"refs tried: {candidates}; default ref is empty"
         )
 
-    _run_plugin_subprocess(["git", "checkout", default_ref], cwd=plugin_dir)
+    try:
+        _run_plugin_subprocess(["git", "checkout", default_ref], cwd=plugin_dir)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"No candidate ref succeeded for plugin_dir={plugin_dir}; "
+            f"refs tried: {candidates}; default ref {default_ref!r} failed to check out"
+        ) from exc
     return default_ref
