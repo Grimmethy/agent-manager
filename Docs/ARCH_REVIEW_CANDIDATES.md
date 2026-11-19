@@ -3649,3 +3649,56 @@ Additionally, `applyDirectToMainBatch` (the wrapper that handles triage-branch c
 
 **Testability:**
 The git-runner abstraction (`gitRunner.run`) already accepts a command and returns `{code, stdout, stderr}`, so each extracted push module can be tested by mocking `gitRunner.run` to simulate success, rebase conflicts, and push failures. The branch-context wrapper can be tested by mocking the git-runner to verify checkout/return-to-main sequencing without exercising push logic. No additional mocking infrastructure is required beyond what the existing test suite already uses.
+
+### AC-829 · Dead `ownerMismatchCounts` state in `task-source-registry.js`
+Strength: Strong
+
+**Strength:** Strong  
+**Files:** `src/task-source-registry.js`
+
+**Problem:**  
+`ownerMismatchCounts` is a plain object incremented in `recordOwnerMismatch()` but never read by any function in this file or anywhere in this community. It is the only per-source counter in the registry, yet it has no consumer. This creates a false impression that the count is used for throttling, alerting, or metrics, when in fact it is dead state. New readers will waste time tracing its usage, and future changes that assume the counter is meaningful (e.g., adding a threshold-based suppression) will inherit a misleading mental model.
+
+**Solution:**  
+Remove `ownerMismatchCounts` and the `ownerMismatchCounts[sourceName] = (ownerMismatchCounts[sourceName] || 0) + 1;` line from `recordOwnerMismatch()`. If the count is genuinely needed later, re-introduce it with a documented consumer.
+
+**Benefits:**  
+Eliminates dead state that obscures the module's actual behavior. Reduces cognitive load for readers who would otherwise assume the counter is used somewhere.
+
+---
+
+### AC-830 · Hidden runtime dependency on `config.js` in `task-source-registry.js`
+Strength: Strong
+
+**Strength:** Strong  
+**Files:** `src/task-source-registry.js`
+
+**Problem:**  
+`runningRootForOwnerGuard()` and `pipelineDirForHistory()` both inline `require('./config.js')` at call time rather than at module load. This creates a hidden runtime dependency: the module appears to be a pure registry, but its `recordOwnerMismatch()` function silently fails (returning `null` from the helper functions) if `config.js` cannot be loaded. The failure mode is opaque because the try/catch swallows the error and the calling code (`recordOwnerMismatch`) does not surface it. This violates the principle of explicit dependencies and makes the module's contract unclear.
+
+**Solution:**  
+Move the `require('./config.js')` to the top of the file (or to a dedicated config-loading helper) so the dependency is explicit. Alternatively, pass the config values as parameters to `recordOwnerMismatch()` or the registration function, making the dependency visible at the call site.
+
+**Benefits:**  
+Makes the module's dependencies explicit and its failure modes transparent. Reduces the risk of silent degradation when `config.js` is unavailable.
+
+---
+
+### AC-831 · Duplicated queue-scanning pattern in `task-selection.js`
+Strength: Strong
+
+**Strength:** Worth exploring  
+**Files:** `src/lib/task-selection.js`
+
+**Problem:**  
+`hasPremiumPriorityInQueue()` and `hasHubTierInQueue()` both implement the same five-step pattern: `fs.readdirSync(queueDir, { withFileTypes: true })`, iterate entries, check `e.isFile() && e.name.endsWith('.json')`, `JSON.parse(fs.readFileSync(...))`, and return `true` if a condition matches. The only difference is the predicate (checking `premiumPriority === true` vs. calling `isHubTierTask()`). This duplication means a change to the scanning logic (e.g., adding error handling for corrupt files, changing the file extension filter, or switching to async iteration) must be applied in two places.
+
+**Solution:**  
+Extract a shared `scanQueueForFlag(queueDir, predicate)` helper that encapsulates the `readdirSync` + `JSON.parse` loop and accepts a predicate function. Both `hasPremiumPriorityInQueue()` and `hasHubTierInQueue()` would call this helper with their respective predicates.
+
+**Benefits:**  
+Centralizes the queue-scanning logic, reducing the risk of divergent behavior if one call site is updated without the other. Makes the two functions' distinct purposes (premium vs. hub-tier) more explicit by isolating the shared mechanics.
+
+---
+
+NOTE: The critique verified all three claims against the actual code and found no issues; the original draft was accurate and required no corrections.
