@@ -22,6 +22,34 @@ shared_misc_bp = Blueprint("shared-misc-bp", __name__)
 # are read with defaults (filename stem / None), so they are deliberately NOT required.
 _TASK_RECORD_KEYS = ("title", "createdAt")
 
+# Per-file parse cache: keyed by (path str, st_mtime_ns, st_size). Each file is
+# read and JSON-parsed at most once per change, then served from memory on subsequent
+# requests. Failed parses (None from read_json_safe) are intentionally NOT cached so
+# a half-written file is retried next time. A vanished file evicts its entry via the
+# OSError branch. Bounded by file count under queue/ -- no timer, no scan, no eviction
+# policy needed.
+_parse_cache = {}
+_parse_cache_lock = threading.Lock()
+
+
+def _read_json_cached(path):
+    """Return the parsed JSON for `path`, caching by (path, mtime_ns, size)."""
+    from app import read_json_safe  # lazy to avoid top-level cycle
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        _parse_cache.pop(str(p), None)
+        return None
+    key = (str(p), st.st_mtime_ns, st.st_size)
+    cached = _parse_cache.get(key)
+    if cached is not None:
+        return cached
+    data = read_json_safe(p)
+    if data is not None:
+        _parse_cache[key] = data
+    return data
+
 
 def is_task_record(data) -> bool:
     """True only for a dict containing every key in _TASK_RECORD_KEYS. Guards the
@@ -152,28 +180,87 @@ def api_queue_state(state):
     from app import QUEUE_STATES, queue_dir, read_json_safe, task_summary
     project_raw = request.args.get("project")
     if project_raw is not None:
-        # Project-aware shape (HUB0485 2/2). Only taken when ?project= is supplied, so
-        # existing callers of /api/queue/<state> keep the {items, total} task-summary shape.
-        from routes.queue_project_filter import collect_pieces, parse_project_param, resolve_depends_on
+        # Project-aware shape (HUB0485 2/2, HUB0753 1/5 paged). Only taken when
+        # ?project= is supplied, so existing callers of /api/queue/<state> keep the
+        # {items, total} task-summary shape. Now honours limit/offset/sort/source and
+        # resolves project=active via queue_project_filter._queue_dir_for.
+        from routes.queue_project_filter import (
+            _STATE_DIRS, parse_project_param, _queue_dir_for,
+        )
         if state not in QUEUE_STATES and state != "drafting":
             abort(404)
         try:
             project_param = parse_project_param(project_raw)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        full_store = collect_pieces("all")
-        proj_items = []
-        for piece in collect_pieces(project_param):
-            if piece.get("state") != state:
+
+        qdir = _queue_dir_for(project_param)
+        if not qdir:
+            return jsonify({"items": [], "total": 0})
+
+        # Build a local by-id store from every state under this project's queue --
+        # needed so dependsOn entries resolve against files actually in this project
+        # (within a single project, a dependency can land in any state dir). Only
+        # touches files the cache hasn't served yet; stat-only sort happens first.
+        local_by_id = {}
+        for s in _STATE_DIRS:
+            sd = qdir / s
+            if not sd.is_dir():
                 continue
-            proj_items.append({
-                "id": piece.get("id"),
-                "title": piece.get("title"),
-                "state": piece.get("state"),
-                "project": piece.get("project"),
-                "dependsOn": resolve_depends_on(piece, full_store),
+            for f in sd.glob("*.json"):
+                data = _read_json_cached(f)
+                if data and isinstance(data, dict):
+                    tid = data.get("id") or f.stem
+                    if tid and tid not in local_by_id:
+                        local_by_id[tid] = data
+
+        # Stat-sort-then-page-then-read: same pattern the non-project branch uses.
+        # Files are stat()'d (cheap, no JSON parse) and sorted by mtime desc; only
+        # the requested page slice is JSON-parsed via the cache.
+        state_dir = qdir / state
+        if state_dir.is_dir():
+            files = sorted(state_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        else:
+            files = []
+
+        if source_filter:
+            filtered = []
+            for f in files:
+                data = _read_json_cached(f)
+                if data and isinstance(data, dict) and data.get("source") == source_filter:
+                    filtered.append((f, data))
+            total = len(filtered)
+            page = filtered[offset:offset + limit] if limit is not None else filtered[offset:]
+        else:
+            total = len(files)
+            page = files[offset:offset + limit] if limit is not None else files[offset:]
+
+        items = []
+        for f, data in (page if source_filter else [(f, _read_json_cached(f)) for f in page]):
+            if not data or not isinstance(data, dict):
+                continue
+            tid = data.get("id") or f.stem
+            deps_raw = data.get("dependsOn") or []
+            deps_list = []
+            if deps_raw and isinstance(deps_raw, list):
+                for dep_id in deps_raw:
+                    resolved = local_by_id.get(dep_id)
+                    if resolved:
+                        deps_list.append({
+                            "taskId": dep_id,
+                            "state": resolved.get("state"),
+                            "project": resolved.get("project"),
+                        })
+                    else:
+                        deps_list.append({"taskId": dep_id, "state": None, "project": None})
+            items.append({
+                "id": tid,
+                "title": data.get("title"),
+                "state": state,
+                "project": project_param,
+                "dependsOn": deps_list,
             })
-        return jsonify({"items": proj_items, "total": len(proj_items)})
+        return jsonify({"items": items, "total": total})
     qdir = queue_dir()
     if not qdir:
         return jsonify({"items": [], "total": 0})
@@ -217,7 +304,7 @@ def api_queue_state(state):
         by_id = {}
         if state_dir.is_dir():
             for f in state_dir.glob("*.json"):
-                data = read_json_safe(f)
+                data = _read_json_cached(f)
                 if data and (not source_filter or data.get("source") == source_filter):
                     by_id[data.get("id", f.stem)] = task_summary(data, f.stem)
         explicit_parent = {}
@@ -310,7 +397,7 @@ def api_queue_state(state):
             # request below keeps the cheap stat-only-sort-then-page-only-read behavior.
             filtered = []
             for f in files:
-                data = read_json_safe(f)
+                data = _read_json_cached(f)
                 if data and data.get("source") == source_filter:
                     filtered.append((f, data))
             total = len(filtered)
@@ -320,7 +407,7 @@ def api_queue_state(state):
             total = len(files)
             page = files[offset:offset + limit] if limit is not None else files[offset:]
             for f in page:
-                data = read_json_safe(f)
+                data = _read_json_cached(f)
                 if data:
                     entries.append(task_summary(data, f.stem))
     return jsonify({"items": entries, "total": total})
