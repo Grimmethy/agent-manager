@@ -919,7 +919,7 @@ async function renderHardwareTab() {
   if (data.available === false) {
     main.innerHTML = `
       <div class="empty">Hardware monitoring is off -- pick a plugin on the
-        <a href="#" onclick="activeTab='plugins'; renderNav(); renderMain(); return false;">Plugins tab</a>.</div>`;
+        <a href="#" onclick="switchToTab('plugins'); return false;">Plugins tab</a>.</div>`;
     return;
   }
   const watchChecklistHtml = renderWatchConfigChecklist(watchConfig || {});

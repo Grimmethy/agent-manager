@@ -128,6 +128,30 @@ async function runRefreshGuarded(fn, { now = Date.now, maxMs = 30000 } = {}) {
 }
 function _resetRenderStateForTest() { renderGeneration = 0; refreshRunningSince = 0; }
 
+// Per-browser-tab persistence of the active tab (sessionStorage: survives a reload or a tab
+// discard, and is not shared across windows). Storage can throw (private windows, quota), so
+// every access is guarded and a failure just means the tab is not remembered.
+const ACTIVE_TAB_STORAGE_KEY = 'dashboard.activeTab';
+function persistActiveTab(key) {
+  try { sessionStorage.setItem(ACTIVE_TAB_STORAGE_KEY, key); } catch (e) { /* no persistence */ }
+}
+function readStoredActiveTab() {
+  try { return sessionStorage.getItem(ACTIVE_TAB_STORAGE_KEY); } catch (e) { return null; }
+}
+
+// Restores the stored tab once, after the first successful plugin-tab merge (TABS starts
+// empty, so an earlier restore would fail findTabByKey and trip redirectFromGoneActiveTab).
+// An unknown or gone key leaves the current tab ('project' at startup) active.
+let activeTabRestoreDone = false;
+function restoreStoredActiveTabOnce() {
+  if (activeTabRestoreDone) return;
+  activeTabRestoreDone = true;
+  const stored = readStoredActiveTab();
+  if (!stored || stored === activeTab) return;
+  if (!findTabByKey(stored)) return;
+  switchToTab(stored);
+}
+
 function severityForTab(tabKey, count) {
   const thresholds = TAB_COUNT_SEVERITY_THRESHOLDS[tabKey];
   if (!thresholds || typeof count !== 'number') return null;
@@ -145,6 +169,7 @@ function severityForTab(tabKey, count) {
 function switchToTab(key) {
   bumpRenderGeneration(); // any in-flight render for the tab being left is now stale
   activeTab = key;
+  persistActiveTab(key);
   renderNav();
   if (typeof showTabSkeleton === 'function') showTabSkeleton();   // clear the previous tab's content at once; the tab's own render replaces this
   if (key === 'project') enterProjectTab();
@@ -292,6 +317,7 @@ async function syncPluginTabs() {
   try {
     const data = await fetchJson('/api/plugins');
     mergePluginTabs(data.plugins, data.manifestTabsEnabled);
+    restoreStoredActiveTabOnce(); // first successful merge only; a no-op on every later call
   } catch (e) {
     // Fail-safe: leave TABS as whatever it already was (CORE_TABS on the very first
     // failure) rather than let a plugin-listing error block the rest of the dashboard.

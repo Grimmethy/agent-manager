@@ -236,6 +236,18 @@ test('a move into node-sent that fails leaves the record in the outbox and count
   assert.deepEqual(r.result, { sent: 0, failed: 1, refused: 0, remaining: 1 });
 });
 
+test('a 400 whose refused move fails counts as failed, not refused, and the record stays in the outbox', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  const refusedDir = path.join(s.dir, 'queue', 'node-refused');
+  fs.writeFileSync(refusedDir, 'a plain file where the directory should be');
+  const r = await run(s, { post: async () => ({ status: 400 }) });
+  assert.equal(r.code, 3);
+  assert.deepEqual(r.result, { sent: 0, failed: 1, refused: 0, remaining: 1 });
+  assert.deepEqual(fs.readdirSync(s.outbox), ['a.json']);
+  assert.equal(fs.statSync(refusedDir).isFile(), true);
+});
+
 test('a record filed while the send is running is not sent this time and is counted as remaining', async () => {
   const s = setup();
   put(s, 'a.json', REC('a'));

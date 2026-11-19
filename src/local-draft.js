@@ -954,12 +954,63 @@ function skipPlanForDeterministicChecklist(task, attempt) {
   return true;
 }
 
+// Named-change plan skip: a lookup/substring check over the criteria text. A criterion has a
+// verified named target when it contains a repo path token that exists (fileExists lookup, which
+// also covers named test files) or a process.env.NAME expression. The plan is skipped only when
+// EVERY criterion has at least one verified target; any criterion without one (e.g. "update the
+// README usage section") keeps the plan pass running. Pure: fileExists is injected.
+// Kill switch: AGENT_MANAGER_ADHOC_NAMED_SKIP=false.
+const NAMED_PATH_RE = /(?:[\w.-]+\/)+[\w.-]+\.[A-Za-z]{1,5}\b/g;
+const NAMED_TEST_RE = /[\w./-]+\.test\.js/g;
+const NAMED_ENV_RE = /process\.env\.[A-Z][A-Z0-9_]+/g;
+
+function skipPlanForNamedChange(criteria, { fileExists } = {}) {
+  const list = Array.isArray(criteria) ? criteria.filter((c) => typeof c === 'string' && c.trim()) : [];
+  if (list.length === 0) return { skip: false, reason: 'no-criteria', targets: [], unmatched: [] };
+  const exists = typeof fileExists === 'function' ? fileExists : () => false;
+  const targets = [];
+  const unmatched = [];
+  for (const c of list) {
+    const found = [];
+    const pathTokens = new Set([...(c.match(NAMED_PATH_RE) || []), ...(c.match(NAMED_TEST_RE) || [])]);
+    for (const tok of pathTokens) { if (exists(tok)) found.push(tok); }
+    for (const env of (c.match(NAMED_ENV_RE) || [])) found.push(env);
+    if (found.length === 0) unmatched.push(c); else targets.push(...found);
+  }
+  if (unmatched.length) return { skip: false, reason: 'unnamed-criterion', targets, unmatched };
+  return { skip: true, reason: 'all-criteria-named', targets, unmatched };
+}
+
+// Returns true when the plan pass was skipped (no model call); the criteria become the plan.
+// Every decision is recorded as a plan-skip-named-change history event (reason, targets, unmatched).
+function applyNamedChangePlanSkip(task, attempt, fileExistsFn) {
+  if (process.env.AGENT_MANAGER_ADHOC_NAMED_SKIP === 'false') return false;
+  if (resolveSourceName(task) !== 'adhoc' || task._planCritiqueRevised) return false;
+  const { criteria } = resolveAcceptanceCriteria(task);
+  const repoRoot = getConfig().repoRoot;
+  const fileExists = fileExistsFn || ((p) => {
+    try { return fs.existsSync(require('path').join(repoRoot, p)); } catch (_) { return false; }
+  });
+  const d = skipPlanForNamedChange(criteria, { fileExists });
+  const evt = d.skip ? 'plan-skipped-named-change' : 'plan-not-skipped-named-change';
+  appendHistoryEvent(task, 'plan-skip-named-change', `${evt}: reason=${d.reason} targets=${JSON.stringify(d.targets)} unmatched=${JSON.stringify(d.unmatched.map((c) => c.slice(0, 120)))} criteria=${JSON.stringify(criteria.map((c) => c.slice(0, 120)))}`);
+  if (!d.skip) return false;
+  const text = `CRITERIA:\n${criteria.map((c) => `- ${c}`).join('\n')}`;
+  task.planResponse = capPlanForTask(task, text, appendHistoryEvent);
+  task.lastGoodPlan = text;
+  applyPlanAcceptanceCriteria(task);
+  recordPlan(attempt, { text, seededFromPrior: false });
+  appendHistoryEvent(task, 'plan-done', `skipped plan pass: named change (${criteria.length} items) -- ${d.targets.join(', ')}`);
+  return true;
+}
+
 async function runPlanPass(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
-  runOrientPassFn = runOrientPass, recordModelCall,
+  runOrientPassFn = runOrientPass, recordModelCall, fileExistsFn,
 }) {
   if (reusePriorPlanForContinuation(task, attempt)) return { blocked: false };
   if (skipPlanForDeterministicChecklist(task, attempt)) return { blocked: false };
+  if (applyNamedChangePlanSkip(task, attempt, fileExistsFn)) return { blocked: false };
   // Plan-cap context derived once per pass and threaded to every plan write site below.
   const { ruleId, expectedDisposition } = derivePlanCapContext(task);
   // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
@@ -2449,7 +2500,7 @@ function tryGroundingRefreshFallback(task) {
   }
 }
 
-module.exports = { reusePriorPlanForContinuation, isDeterministicChecklist, runPlanPass, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, SPLIT_TRUNCATION_MAX_RETRIES, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback, attemptSeedReroll };
+module.exports = { skipPlanForNamedChange, applyNamedChangePlanSkip, reusePriorPlanForContinuation, isDeterministicChecklist, runPlanPass, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, SPLIT_TRUNCATION_MAX_RETRIES, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback, attemptSeedReroll };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on

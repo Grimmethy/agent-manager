@@ -109,7 +109,7 @@ function parseCritique(text) {
 }
 
 // task, { call?, maybeLockedOn } -> { verdict: 'ok'|'gaps', gaps: string[], viaModel: bool }
-async function runPlanCritique(task, { call = localCall, maybeLockedOn } = {}) {
+async function decidePlanCritique(task, { call = localCall, maybeLockedOn } = {}) {
   const det = deterministicGaps(task);
   if (det.length) return { verdict: 'gaps', gaps: det.slice(0, MAX_GAPS), viaModel: false };
 
@@ -125,6 +125,13 @@ async function runPlanCritique(task, { call = localCall, maybeLockedOn } = {}) {
   }
   if (result && result.degenerate) return { verdict: 'ok', gaps: [], viaModel: true };
   return { ...parseCritique(result && result.response), viaModel: true };
+}
+
+// task, opts -> { verdict, gaps, viaModel, error? }; logs exactly one line per critique.
+async function runPlanCritique(task, opts = {}) {
+  const out = await decidePlanCritique(task, opts);
+  console.warn('[plan-critique] verdict=%s gaps=%d viaModel=%s', out.verdict, out.gaps.length, out.viaModel);
+  return out;
 }
 
 module.exports = { runPlanCritique, buildPlanCritiquePrompt, parseCritique, deterministicGaps, GAP_TAGS, MAX_GAPS };
