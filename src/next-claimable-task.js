@@ -155,7 +155,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   const hubKeyCache = new Map();
   const noHubKey = { rank: Infinity, createdAt: null };
 
-  const { sourceEligibleHere, activeRepoIsCore } = require('./lib/source-scope.js');
+  const { sourceEligibleHere, activeRepoIsCore, gateDisabled } = require('./lib/source-scope.js');
   const coreActive = activeRepoIsCore();
   // Lane avoidance (premium-rotation.js): how many lanes exist decides whether a task may skip one. 0 on any error = never skip.
   let laneCount = 0;
@@ -181,12 +181,21 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   const nodeId = opts.nodeId !== undefined ? opts.nodeId : process.env.AGENT_MANAGER_NODE_ID;
   const pinned = [];
   const rankable = [];
+  // Scope (src/lib/source-scope.js), built once per call from coreActive and applied to EVERY task below, pinned or not: a scope:'core' source is never
+  // claimable on a non-core project, and an operator pin does not exempt it. Rejections are counted in one integer; the loop never breaks early.
+  const scopeEligible = (task) => {
+    if (!task) return true;
+    try { return sourceEligibleHere(getRegisteredSource(resolveSourceName(task)), coreActive); } catch (_) { return true; } // unresolvable source -- not gated
+  };
+  const scopedLane = !coreActive && !gateDisabled();
+  let skippedByScope = 0;
   for (const name of names) {
     const { task, mtimeMs } = readTaskCached(cache, path.join(pendingDir, name));
     const premium = !!(task && task.premiumPriority === true); // same test the shell side used to re-read every file for
     const pinnedWorker = task && task.pinnedWorker;
     if (pinnedWorker && pinnedWorker !== instanceId) continue; // pinned to another instance -- not a candidate for this one
     if (!claimableOnNode(task, nodeId)) continue; // leased to another node, or unleased and this worker is not on the ledger owner
+    if (!scopeEligible(task)) { skippedByScope += 1; continue; } // scope:'core' on a non-core project: never claimable here, pinned or not
     if (pinnedWorker === instanceId) {
       pinned.push({ name, mtimeMs, premium });
       continue;
@@ -257,12 +266,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
       }
     }
 
-    // A scope:'core' source (a pipeline self-audit) audits agent-manager itself; on any other project it is
-    // not claimable, even if one is already sitting in pending/ (src/lib/source-scope.js). An explicit
-    // operator pin (handled above) still wins.
-    try {
-      if (task && !sourceEligibleHere(getRegisteredSource(resolveSourceName(task)), coreActive)) continue;
-    } catch (_) { /* unresolvable source -- not gated */ }
+    // Scope is enforced above (scopeEligible), before the pin check, so no rejection is counted twice here.
 
     // Within one source-priority band, order a live hub's children by their owning hub's
     // key (explicit hubPriority asc, then hub createdAt asc) so this path can't contradict
@@ -305,6 +309,11 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     let lanes = opts.lanes;
     if (!lanes) { try { lanes = require('./lanes.js').getLanes(); } catch (_) { lanes = []; } }
     if (preferredLaneIsIdle({ instanceId, instancesDir, lanes, now })) rankable.shift();
+  }
+  if (scopedLane) {
+    // One count per call on a scoped lane: a callback when the caller wants it, else one stderr line (stdout is the filename list read by local-worker.sh).
+    if (typeof opts.onScopeSkipped === 'function') opts.onScopeSkipped(skippedByScope);
+    else process.stderr.write(`scope: ${skippedByScope} task(s) skipped by scope\n`);
   }
   cache.save();
   const ordered = [...pinned, ...rankable];
