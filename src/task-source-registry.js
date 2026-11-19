@@ -73,6 +73,13 @@ function gateCoreNext(next) {
 }
 
 /**
+ * Ordered list of `{name, predicate}` entries. resolveSourceName() calls each predicate with the
+ * task in registration order; the first truthy predicate's name wins. Consulted before the
+ * hardcoded branches and sourceAliases.
+ */
+const sourceResolvers = [];
+
+/**
  * Register a task source.
  * @param {string} name - Unique identifier for the source.
  * @param {object} config - Configuration to store (no validation).
@@ -149,11 +156,33 @@ function registerSourceAlias(fromField, toName) {
 }
 
 /**
+ * Register a resolver predicate for resolveSourceName(). Re-registering an existing name replaces
+ * its predicate in place (keeps its position); a new name is appended.
+ * @param {string} name - Unique identifier for the resolver.
+ * @param {function} predicate - Called with the task; a truthy return makes resolveSourceName() return `name`.
+ */
+function registerSourceResolver(name, predicate) {
+  if (typeof name !== 'string' || name.trim() === '') {
+    throw new TypeError('registerSourceResolver: name must be a non-empty string');
+  }
+  if (typeof predicate !== 'function') {
+    throw new TypeError(`registerSourceResolver("${name}"): predicate must be a function`);
+  }
+  const i = sourceResolvers.findIndex(r => r.name === name);
+  if (i >= 0) {
+    sourceResolvers[i].predicate = predicate;
+  } else {
+    sourceResolvers.push({ name, predicate });
+  }
+}
+
+/**
  * Clear all registered sources (and source aliases). Useful for testing.
  */
 function clearRegistry() {
   Object.keys(registry).forEach(key => delete registry[key]);
   Object.keys(sourceAliases).forEach(key => delete sourceAliases[key]);
+  sourceResolvers.splice(0);
 }
 
 /**
@@ -177,6 +206,9 @@ function clearRegistry() {
  * @returns {string} The registry name to look up.
  */
 function resolveSourceName(task) {
+  for (const r of sourceResolvers) {
+    if (r.predicate(task)) return r.name;
+  }
   if (task.domain === 'adhoc' || task.source === 'manual') return 'adhoc';
   if (task.domain === 'secondbrain') return 'secondbrain';
   if (sourceAliases[task.source]) return sourceAliases[task.source];
@@ -220,4 +252,4 @@ function getVariantsOf(parent) {
   return Object.keys(registry).filter((n) => variantParentOf(n) === parent);
 }
 
-module.exports = { variantParentOf, getVariantsOf, registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource, resolveSourceName, registerSourceAlias };
+module.exports = { variantParentOf, getVariantsOf, registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource, resolveSourceName, registerSourceAlias, registerSourceResolver };

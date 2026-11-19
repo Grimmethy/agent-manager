@@ -14,7 +14,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { resolveSourceName, registerSourceAlias, clearRegistry } = require('./task-source-registry.js');
+const { resolveSourceName, registerSourceAlias, registerSourceResolver, clearRegistry } = require('./task-source-registry.js');
 
 test('resolveSourceName resolves domain:"adhoc" tasks to "adhoc" regardless of source', () => {
   assert.equal(resolveSourceName({ domain: 'adhoc', source: 'anything' }), 'adhoc');
@@ -58,4 +58,37 @@ test('registerSourceAlias: a plugin can declare its own source-field quirk witho
 test('deadcode_triage is NOT special-cased in core -- with no alias registered it passes through unchanged', () => {
   clearRegistry();
   assert.equal(resolveSourceName({ domain: 'default', source: 'deadcode_triage' }), 'deadcode_triage');
+});
+
+test('registerSourceResolver rejects a blank name or a non-function predicate with TypeError', () => {
+  clearRegistry();
+  assert.throws(() => registerSourceResolver('', () => true), TypeError);
+  assert.throws(() => registerSourceResolver('   ', () => true), TypeError);
+  assert.throws(() => registerSourceResolver('x', 'notfn'), TypeError);
+  clearRegistry();
+});
+
+test('a registered resolver takes precedence over the hardcoded adhoc branch', () => {
+  clearRegistry();
+  registerSourceResolver('probe_first', () => true);
+  assert.equal(resolveSourceName({ domain: 'adhoc', source: 'manual' }), 'probe_first');
+  clearRegistry();
+});
+
+test('re-registering a resolver name replaces its predicate and keeps its position', () => {
+  clearRegistry();
+  registerSourceResolver('a', () => false);
+  registerSourceResolver('b', () => true);
+  registerSourceResolver('a', () => true);
+  assert.equal(resolveSourceName({ source: 'q' }), 'a');
+  clearRegistry();
+});
+
+test('clearRegistry() empties the resolver list', () => {
+  clearRegistry();
+  const t = { source: 'x', domain: 'y' };
+  registerSourceResolver('probe', () => true);
+  assert.equal(resolveSourceName(t), 'probe');
+  clearRegistry();
+  assert.equal(resolveSourceName(t), 'x');
 });
