@@ -3577,3 +3577,52 @@ Benefits:
 - `runDiscardAll` becomes testable with mock data, not just in a live browser with real tab state.
 - The dependency on `currentBranches` is explicit rather than implicit, making the function's contract clearer.
 - Reduces the risk of `runDiscardAll` silently using stale or incorrect branch data if `currentBranches` is out of sync with the actual rendered state.
+
+### AC-825 · Audit trail gap in owner-mismatch suppression (src/task-source-registry.js)
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/task-selection.js
+
+Problem:
+`recordOwnerMismatch` logs a pipeline history event with `taskId: null` because the task does not exist yet at the gate. This creates a gap in the audit trail: you can see that a source was suppressed for owner mismatch, but you cannot correlate the suppression to a specific task. The comment acknowledges this ("taskId is not known at the gate"), but it does not explain why this is the right behavior or what the alternative would be.
+
+Solution:
+Consider whether the suppression should be logged at a different point in the pipeline (e.g., after a task is generated but before it is claimed) where a task ID is available. Alternatively, document the trade-off explicitly and consider adding a secondary log entry (e.g., to a separate "owner-mismatch" log) that includes more context (source name, running root, owners) to aid debugging.
+
+Benefits:
+- Makes the audit trail more actionable by correlating suppressions to specific tasks.
+- Reduces ambiguity about why a source was suppressed.
+- Clarifies the design trade-off between suppression timing and auditability.
+
+### AC-826 · Availability hazard in `runningRootForOwnerGuard` (src/task-source-registry.js)
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`runningRootForOwnerGuard` fails closed: if config is unreadable (e.g., during deployment, config file corruption, or permission issues), it returns `null`, which causes all owner-gated sources to be suppressed. This is a real availability hazard: if config is temporarily unavailable, the pipeline could be left with no work if all sources are owner-gated. The comment acknowledges this ("fails closed"), but it does not explain why this is the right behavior or what the alternative would be.
+
+Solution:
+Consider whether failing open (letting the source run) would be safer in this case. If failing closed is intentional (e.g., for security reasons), document the rationale explicitly and consider adding a warning log entry when config is unreadable to alert operators.
+
+Benefits:
+- Reduces the risk of pipeline starvation during config issues.
+- Makes the design trade-off explicit and documented.
+- Provides operators with visibility into config issues.
+
+### AC-827 · Inconsistent call patterns for `sourceEligibleHere` (src/task-source-registry.js vs src/lib/task-selection.js)
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/task-selection.js, src/lib/source-scope.js
+
+Problem:
+`sourceEligibleHere` is called with different call patterns in two places:
+- In `task-selection.js`'s `getNextTask`, it is called in a loop with `coreActive` pre-computed once.
+- In `task-source-registry.js`'s `gateCoreNext`, it is called without pre-computing `coreActive`, so it reads config on every call.
+
+This is an optimization inconsistency that could lead to confusion about which approach is "correct." The registry gate is called less frequently (only when a source is invoked directly, not during the full walk), so the performance impact is smaller, but the inconsistency remains.
+
+Solution:
+Consider whether the registry gate should also benefit from pre-computing `coreActive`. If the registry gate is called frequently enough to matter, pass `coreActive` as a parameter. If not, document why the inconsistency is acceptable.
+
+Benefits:
+- Reduces confusion about the "correct" call pattern.
+- Makes the optimization trade-off explicit.
+- Ensures consistent behavior across call sites.
