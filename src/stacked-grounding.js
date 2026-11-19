@@ -74,19 +74,27 @@ function grepAtRef(repoRoot, ref, pattern, paths) {
 
 // Does a CLAIMED path exist in a ref's tree? Mirrors fact-checker.js's resolveAgainstRepoDetailed tiers against git's object database instead of
 // the working tree: exact path, then each configured code dir (extraRoots) prefixed, then a unique basename match (or a unique one under an
-// extraRoot when the bare basename is ambiguous). Returns the resolved repo-relative path, or null. Never throws: an unreadable ref reads as
-// "not found", which leaves the caller's own working-tree verdict in force.
+// extraRoot when the bare basename is ambiguous). Returns the resolved repo-relative path, or null when the path is genuinely absent (or
+// ambiguous) at a valid ref. Contract matches grepAtRef: only the benign case maps to null; a real git failure (unknown/unfetched ref,
+// timeout) THROWS an Error naming the ref, so callers must catch and treat it as "unknown", not "absent".
 // 2026-09-20, PF HUB0005-01: a stacked task that MODIFIES a file only its chain branch has (tileGrid.ts) was blocked 3x by the plan-target
 // guard as a fabricated path, because that guard only looked at the shared checkout's working tree.
 function resolveAtRef(repoRoot, ref, candidatePath, extraRoots = []) {
+  const normalized = String(candidatePath || '').replace(/\\/g, '/').replace(/^\.?\//, '');
+  if (!normalized) return null;
   let files;
   try {
     files = execFileSync('git', ['ls-tree', '-r', '--name-only', `origin/${ref}`], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 })
       .split('\n').filter(Boolean);
-  } catch { return null; }
+  } catch (e) {
+    // A real git failure (unknown/unfetched ref, timeout, spawn error) is NOT "file absent" -- surface it
+    // with the ref attached, same as grepAtRef does for anything but its benign no-match exit.
+    const err = new Error(`resolveAtRef: git ls-tree failed for origin/${ref} (looking up ${normalized}): ${e && e.message ? e.message : e}`);
+    err.cause = e;
+    if (e && e.status !== undefined) err.status = e.status;
+    throw err;
+  }
   const set = new Set(files);
-  const normalized = String(candidatePath || '').replace(/\\/g, '/').replace(/^\.?\//, '');
-  if (!normalized) return null;
   if (set.has(normalized)) return normalized;
   for (const r of extraRoots || []) {
     const full = path.posix.join(String(r).replace(/\\/g, '/'), normalized);
