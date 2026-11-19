@@ -324,34 +324,7 @@ async function renderWorkers(isPoll) {
   const scrollY = window.scrollY;
   main.innerHTML = filterBar + (shown.length === 0
     ? '<div class="empty">No workers match this filter.</div>'
-    : shown.map(inst => `
-    <div class="worker-card clickable${typeof workerCardOffClass === 'function' ? workerCardOffClass(inst) : ''}" data-instance-id="${escapeAttr(inst.instanceId)}">
-      <div class="row">
-        <span class="id">${inst.instanceId}</span>
-        ${buildWorkerModelSelectHtml(inst, workerModels, overrides)}
-        ${canAssignTask(inst) ? buildTaskPickerHtml(inst, assignableByInstance[inst.instanceId] || [], selectedWorkerTaskType[inst.instanceId] || '') : ''}
-        <div class="badge-col">
-          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : statusLabel(inst.status)}</span>
-          ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
-          <span class="state-timer" id="state-timer-${inst.instanceId}">${inst.stateAgeSeconds != null ? 'in this state ' + fmtDuration(inst.stateAgeSeconds) : ''}</span>
-          ${typeof buildWorkerSwitchHtml === 'function' ? buildWorkerSwitchHtml(inst) : ''}
-        </div>
-      </div>
-      <div class="meta">
-        pid ${inst.pid ?? '-'} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
-        ${inst.currentTaskId && inst.projectLabel ? ' · <span class="badge ' + (inst.borrowed ? 'warn' : 'idle') + '" title="' + (inst.borrowed ? 'Borrowed: this lane is idle in the active project and is working a task of ' + escapeAttr(inst.projectLabel) + ' (idle-pool borrowing)' : 'This task belongs to the active project') + '">📁 ' + escapeHtml(inst.projectLabel) + (inst.borrowed ? ' (borrowed)' : '') + '</span>' : ''}
-        ${inst.currentTaskId && inst.hub ? ' · <span class="badge ok" title="This task belongs to hub ' + escapeAttr(inst.hub.label) + '" style="font-weight:700">🗂 ' + escapeHtml(hubTag(inst.hub)) + '</span>' : ''}
-        ${inst.currentTaskId ? ' · working on <strong><a href="#" data-open-task-anywhere="' + escapeAttr(inst.currentTaskId) + '">' + escapeHtml(inst.currentTaskId) + '</a></strong>' + (inst.currentPass ? ' (' + escapeHtml(inst.currentPass) + ')' : '') + ' · ' + trajectoryLinkHtml(inst.currentTaskId) : ''}
-        ${pendingWorkerAssign[inst.instanceId] ? ' · <strong>📌 pinned, waiting for ' + escapeAttr(inst.instanceId) + ' to pick it up…</strong>' : ''}
-        ${costByInstance[inst.instanceId] ? ' · ' + fmtUsd(costByInstance[inst.instanceId]) + ' est. API cost' : ''}
-      </div>
-      ${expandedWorkerId === inst.instanceId ? `
-      <div class="worker-recent-tasks">
-        <div class="meta" style="margin-top:8px; font-weight:600">${inst.instanceId === 'reviewer' ? 'Last 10 reviewed tasks' : 'Recent runs (every attempt, including failures)'}</div>
-        ${recentTasks ? (recentTasks.runs ? renderRunLogList(recentTasks.runs) : renderRecentTasksList(recentTasks.tasks || [])) : '<div class="meta">Loading…</div>'}
-      </div>` : ''}
-    </div>
-  `).join('')) + (typeof renderCloudSpendSection === 'function' ? renderCloudSpendSection(cloudMeter) : '') + (typeof renderStalledWorkerSection === 'function' ? renderStalledWorkerSection(stalledWorker) : '') + (typeof renderVerifierWorkerSection === 'function' ? renderVerifierWorkerSection(verifierWorker) : '') + (typeof renderNeedsworkWorkerSection === 'function' ? renderNeedsworkWorkerSection(needsworkWorker) : '') + (typeof renderContextWorkerSection === 'function' ? renderContextWorkerSection(contextMapWorker, contextMemoryWorker, Date.now(), contextImpactWorker) : '') + (typeof renderPipelineOpsWorkersSection === 'function' ? renderPipelineOpsWorkersSection(pipelineOpsWorkers) : '') + renderCompletedTasksSection();
+    : shown.map(inst => buildWorkerCard(inst, { workerModels, overrides, assignableByInstance, costByInstance, recentTasks })).join('')) + (typeof renderCloudSpendSection === 'function' ? renderCloudSpendSection(cloudMeter) : '') + (typeof renderStalledWorkerSection === 'function' ? renderStalledWorkerSection(stalledWorker) : '') + (typeof renderVerifierWorkerSection === 'function' ? renderVerifierWorkerSection(verifierWorker) : '') + (typeof renderNeedsworkWorkerSection === 'function' ? renderNeedsworkWorkerSection(needsworkWorker) : '') + (typeof renderContextWorkerSection === 'function' ? renderContextWorkerSection(contextMapWorker, contextMemoryWorker, Date.now(), contextImpactWorker) : '') + (typeof renderPipelineOpsWorkersSection === 'function' ? renderPipelineOpsWorkersSection(pipelineOpsWorkers) : '') + renderCompletedTasksSection();
   if (typeof rememberWorkersSignature === 'function' && renderSignature) rememberWorkersSignature(renderSignature);
   window.scrollTo(0, scrollY);
   setupCompletedTasksObserver();
@@ -407,6 +380,43 @@ async function renderWorkers(isPoll) {
   });
   if (typeof wireWorkersViewToggle === 'function') wireWorkersViewToggle(main);
   updateStaleTimers();
+}
+
+// Per-card builder (AC-204, extracted verbatim from renderWorkers' per-card map): the HTML
+// string for one worker card. A pure function of (inst, ctx) -- ctx carries the per-render
+// data this card reads (workerModels, overrides, assignableByInstance, costByInstance,
+// recentTasks). The module-level state (pendingWorkerAssign, selectedWorkerTaskType,
+// expandedWorkerId) is read exactly as before.
+function buildWorkerCard(inst, ctx) {
+  const { workerModels, overrides, assignableByInstance, costByInstance, recentTasks } = ctx;
+  return `
+    <div class="worker-card clickable${typeof workerCardOffClass === 'function' ? workerCardOffClass(inst) : ''}" data-instance-id="${escapeAttr(inst.instanceId)}">
+      <div class="row">
+        <span class="id">${inst.instanceId}</span>
+        ${buildWorkerModelSelectHtml(inst, workerModels, overrides)}
+        ${canAssignTask(inst) ? buildTaskPickerHtml(inst, assignableByInstance[inst.instanceId] || [], selectedWorkerTaskType[inst.instanceId] || '') : ''}
+        <div class="badge-col">
+          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : statusLabel(inst.status)}</span>
+          ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
+          <span class="state-timer" id="state-timer-${inst.instanceId}">${inst.stateAgeSeconds != null ? 'in this state ' + fmtDuration(inst.stateAgeSeconds) : ''}</span>
+          ${typeof buildWorkerSwitchHtml === 'function' ? buildWorkerSwitchHtml(inst) : ''}
+        </div>
+      </div>
+      <div class="meta">
+        pid ${inst.pid ?? '-'} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
+        ${inst.currentTaskId && inst.projectLabel ? ' · <span class="badge ' + (inst.borrowed ? 'warn' : 'idle') + '" title="' + (inst.borrowed ? 'Borrowed: this lane is idle in the active project and is working a task of ' + escapeAttr(inst.projectLabel) + ' (idle-pool borrowing)' : 'This task belongs to the active project') + '">📁 ' + escapeHtml(inst.projectLabel) + (inst.borrowed ? ' (borrowed)' : '') + '</span>' : ''}
+        ${inst.currentTaskId && inst.hub ? ' · <span class="badge ok" title="This task belongs to hub ' + escapeAttr(inst.hub.label) + '" style="font-weight:700">🗂 ' + escapeHtml(hubTag(inst.hub)) + '</span>' : ''}
+        ${inst.currentTaskId ? ' · working on <strong><a href="#" data-open-task-anywhere="' + escapeAttr(inst.currentTaskId) + '">' + escapeHtml(inst.currentTaskId) + '</a></strong>' + (inst.currentPass ? ' (' + escapeHtml(inst.currentPass) + ')' : '') + ' · ' + trajectoryLinkHtml(inst.currentTaskId) : ''}
+        ${pendingWorkerAssign[inst.instanceId] ? ' · <strong>📌 pinned, waiting for ' + escapeAttr(inst.instanceId) + ' to pick it up…</strong>' : ''}
+        ${costByInstance[inst.instanceId] ? ' · ' + fmtUsd(costByInstance[inst.instanceId]) + ' est. API cost' : ''}
+      </div>
+      ${expandedWorkerId === inst.instanceId ? `
+      <div class="worker-recent-tasks">
+        <div class="meta" style="margin-top:8px; font-weight:600">${inst.instanceId === 'reviewer' ? 'Last 10 reviewed tasks' : 'Recent runs (every attempt, including failures)'}</div>
+        ${recentTasks ? (recentTasks.runs ? renderRunLogList(recentTasks.runs) : renderRecentTasksList(recentTasks.tasks || [])) : '<div class="meta">Loading…</div>'}
+      </div>` : ''}
+    </div>
+  `;
 }
 
 function fmtDuration(sec) {
