@@ -25,7 +25,7 @@ from routes.worker_trigger import read_trigger
 
 pipeline_ops_workers_bp = Blueprint("pipeline-ops-workers-bp", __name__)
 
-WORKERS = ("scout", "checker", "merger", "steward", "hub", "atomizer")
+WORKERS = ("scout", "checker", "merger", "steward", "hub", "atomizer", "featuremanager")
 RECENT_COUNT = 8
 HOLDS_CAP = 50
 HOLD = "HOLD-FOR-OWNER"
