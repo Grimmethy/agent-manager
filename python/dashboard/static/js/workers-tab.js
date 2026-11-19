@@ -273,14 +273,14 @@ async function renderWorkers(isPoll) {
   // queue/pending/ -- a plain worker-model-style shared list can't express either of
   // those. Fetched only for worker-* instances (canAssignTask), in parallel.
   const assignableByInstance = {};
-  let assignableFetchFailed = false;
+  const assignableFailedIds = new Set();
   await Promise.all(instances.filter(canAssignTask).map(async (inst) => {
     try {
       const r = await fetchJson(`/api/instances/${encodeURIComponent(inst.instanceId)}/assignable-tasks`);
       assignableByInstance[inst.instanceId] = r.items || [];
     } catch (e) {
       console.warn(`[core-ui] Failed to fetch assignable-tasks for instance ${inst.instanceId}`, e);
-      assignableFetchFailed = true;
+      assignableFailedIds.add(inst.instanceId);
       assignableByInstance[inst.instanceId] = [];
     }
   }));
@@ -308,7 +308,7 @@ async function renderWorkers(isPoll) {
     }
   });
   // Nothing shown has changed since the last draw (only ages): a poll/event-driven redraw would rebuild the same page, so leave it alone (workers-render-signature.js).
-  const renderSignature = !assignableFetchFailed && typeof workersRenderSignature === 'function' ? workersRenderSignature(
+  const renderSignature = assignableFailedIds.size === 0 && typeof workersRenderSignature === 'function' ? workersRenderSignature(
     { instances, workerModels, costSummary, recentTasks, cloudMeter, stalledWorker, verifierWorker, needsworkWorker, contextMapWorker, contextMemoryWorker, contextImpactWorker, pipelineOpsWorkers, assignableByInstance },
     { expanded: expandedWorkerId, pinned: pendingWorkerAssign, chosen: selectedWorkerTaskType, completed: completedTasksLog.length, newest: completedTasksLog[0] ? (completedTasksLog[0].taskId || completedTasksLog[0].id || completedTasksLog[0].endedAt || null) : null }) : '';
   if (typeof workersCanSkipRender === 'function' && workersCanSkipRender(renderSignature, isPoll, main)) return;
@@ -329,7 +329,7 @@ async function renderWorkers(isPoll) {
       <div class="row">
         <span class="id">${inst.instanceId}</span>
         ${buildWorkerModelSelectHtml(inst, workerModels, overrides)}
-        ${canAssignTask(inst) ? buildTaskPickerHtml(inst, assignableByInstance[inst.instanceId] || [], selectedWorkerTaskType[inst.instanceId] || '') : ''}
+        ${canAssignTask(inst) ? buildTaskPickerHtml(inst, assignableByInstance[inst.instanceId] || [], selectedWorkerTaskType[inst.instanceId] || '', assignableFailedIds.has(inst.instanceId)) : ''}
         <div class="badge-col">
           <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : statusLabel(inst.status)}</span>
           ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}

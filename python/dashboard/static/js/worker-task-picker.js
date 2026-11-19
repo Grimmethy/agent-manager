@@ -2,7 +2,7 @@
 // original code (comments included) apart from its two inputs: `items` (that instance's assignable tasks) and `selectedType` (the type picked so far, '' for none) are parameters now instead of being
 // read from assignableByInstance and selectedWorkerTaskType. Used by the Workers tab cards and, later, the Graph node panel.
 // A plain global <script> holding only declarations, loaded by index.html before workers-tab.js; uses escapeHtml, escapeAttr and hubTag from the shared global scope.
-function buildTaskPickerHtml(inst, items, selectedType) {
+function buildTaskPickerHtml(inst, items, selectedType, fetchFailed = false) {
           items = items || [];
           // Grouped by source (task TYPE) so the picker shows "pipeline_debrief (7)"
           // etc first, rather than one flat list where a deep single-type backlog
@@ -24,7 +24,7 @@ function buildTaskPickerHtml(inst, items, selectedType) {
           if (selectedType && !sourceKeys.includes(selectedType)) sourceKeys.push(selectedType);
           sourceKeys.sort();
           const typeSelect = `<select class="worker-type-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Assign a specific task to this worker, overriding the automated priority/tier claim order -- includes tasks already claimed by other workers, tier-filtered for this worker type">
-            <option value="">(assign a task…)</option>
+            <option value="">${fetchFailed ? '(assignable tasks unavailable: fetch failed)' : '(assign a task…)'}</option>
             ${sourceKeys.map(k => `<option value="${escapeAttr(k)}" ${k === selectedType ? 'selected' : ''}>${escapeHtml(k)} (${(bySource[k] || []).length})</option>`).join('')}
           </select>`;
           if (!selectedType) return typeSelect;
