@@ -148,7 +148,7 @@ function hygieneFamilyDetail(f) {
     const statuses = ['waiting', 'blocked', 'queued', 'done', 'digest', 'suppressed', 'stale'];
     const shown = fl.items.filter((i) => hygieneFlagFilter === 'all' || i.status === hygieneFlagFilter);
     parts.push(`<div class="field-label" style="display:flex; justify-content:space-between">
-      <span title="${escapeAttr(statuses.map((s) => `${s}: ${HYGIENE_STATUS_HELP[s]}`).join('\n'))}">Scanner flags -- ${escapeHtml(statuses.map((s) => `${s} ${fl.counts[s] || 0}`).join(' · '))}</span>
+      <span title="${escapeAttr(statuses.map((s) => `${s}: ${HYGIENE_STATUS_HELP[s]}`).join('&#10;'))}">Scanner flags -- ${escapeHtml(statuses.map((s) => `${s} ${fl.counts[s] || 0}`).join(' · '))}</span>
       <select id="hyg-flag-filter" style="text-transform:none; letter-spacing:normal; font-size:12px">
         ${['waiting', 'all', ...statuses.filter((s) => s !== 'waiting')].map((s) => `<option value="${s}" ${hygieneFlagFilter === s ? 'selected' : ''}>${s}</option>`).join('')}
       </select></div>

@@ -22,6 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
+const { extractMarkers, CONCEPT_BUILD_OPTIONS } = require('./marker-extraction.js');
 
 function conceptsPath(pipelineDir) {
   return path.join(pipelineDir, 'concepts.json');
@@ -246,8 +247,6 @@ const CONCEPT_BUILD_INSTRUCTION = (
   + 'chart, not graded -- be honest, not impressive.'
 );
 
-const CONCEPT_BUILD_MARKER_RE = /^CONCEPT-BUILD:\s*(scratch|adapted)\s*\|\s*(.+)$/im;
-
 function injectConceptBuildInstruction(text) {
   const base = text || '';
   if (base.includes('CONCEPT-BUILD:')) return base;
@@ -258,14 +257,7 @@ function injectConceptBuildInstruction(text) {
 // marker just means report is null, never thrown -- the real response must never be
 // held hostage by an optional audit tag the model forgot to include.
 function extractConceptBuildReport(text) {
-  const source = text || '';
-  const match = source.match(CONCEPT_BUILD_MARKER_RE);
-  if (!match) return { cleanText: source, report: null };
-  const kind = match[1].toLowerCase();
-  const detail = match[2].trim();
-  const cleanText = source.replace(match[0], '').replace(/\n{3,}/g, '\n\n').trim();
-  if (!detail) return { cleanText, report: null };
-  return { cleanText, report: { kind, detail } };
+  return extractMarkers(text, CONCEPT_BUILD_OPTIONS);
 }
 
 module.exports = {

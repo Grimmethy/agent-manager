@@ -13,10 +13,15 @@
 //   DIR: <optional -- defaults to every searchable dir>
 //   EXCLUDE: <optional comma-separated files already fixed by this investigation>
 //
+// Block parsing is delegated to the shared helper in src/marker-extraction.js
+// (extractMarkers, block mode, AMPLIFY_OPTIONS). This module supplies only its own
+// per-response cap (env-driven) and path.normalize for EXCLUDE entries.
+//
 // Unlike SIDE-FINDING (on by default everywhere), this is opt-in per caller
 // (allowAmplification, default false) -- see the 3 chokepoints' own headers for why.
 
 const path = require('path');
+const { extractMarkers, AMPLIFY_OPTIONS } = require('./marker-extraction.js');
 
 const AMPLIFICATION_INSTRUCTION = (
   'If you have just CONFIRMED (not merely suspected) that a blocked/stuck task\'s root '
@@ -36,12 +41,6 @@ const AMPLIFICATION_INSTRUCTION = (
 
 const MAX_AMPLIFY_REQUESTS_PER_RESPONSE = Number(process.env.AGENT_MANAGER_MAX_AMPLIFY_REQUESTS_PER_RESPONSE) || 1;
 
-const AMPLIFY_SPLIT_RE = /(?=^AMPLIFY:\s*)/m;
-const AMPLIFY_TITLE_RE = /^AMPLIFY:\s*(.+)$/m;
-const QUERY_RE = /^QUERY:\s*(.+)$/m;
-const DIR_RE = /^DIR:\s*(.+)$/m;
-const EXCLUDE_RE = /^EXCLUDE:\s*(.+)$/m;
-
 // Idempotent -- same reasoning as injectSideFindingInstruction (call() can retry the
 // identical prompt several times).
 function injectAmplificationInstruction(text) {
@@ -53,48 +52,13 @@ function injectAmplificationInstruction(text) {
 // Returns { cleanText, requests: [{rootCauseSummary, query, dir, exclude}] }. Same
 // lenient, drop-malformed-not-fail-everything style as extractSideFindings -- a block
 // missing QUERY (the one truly required companion field) is dropped, never thrown.
-// A block's own scope is bounded to the first blank line, same reasoning as
-// extractSideFindings' body bound (so a real AMPLIFY block sitting before a
-// RESOLUTION:/OPTIONS: line doesn't swallow it).
+// A block's own scope is bounded to the first blank line (handled by the shared helper).
 function extractAmplificationRequests(text) {
-  const source = text || '';
-  if (!source.includes('AMPLIFY:')) return { cleanText: source, requests: [] };
-
-  const blocks = source.split(AMPLIFY_SPLIT_RE);
-  const requests = [];
-  const cleanParts = [];
-
-  for (const block of blocks) {
-    const titleMatch = block.match(AMPLIFY_TITLE_RE);
-    if (!titleMatch) {
-      cleanParts.push(block);
-      continue;
-    }
-    const rootCauseSummary = titleMatch[1].trim();
-    const afterTitle = block.slice(block.indexOf(titleMatch[0]) + titleMatch[0].length);
-    const paraSplit = afterTitle.match(/\n\s*\n/);
-    const scoped = (paraSplit ? afterTitle.slice(0, paraSplit.index) : afterTitle);
-    const remainder = paraSplit ? afterTitle.slice(paraSplit.index) : '';
-    cleanParts.push(remainder);
-
-    const queryMatch = scoped.match(QUERY_RE);
-    if (!rootCauseSummary || !queryMatch) continue; // malformed -- QUERY is required, drop
-    if (requests.length >= MAX_AMPLIFY_REQUESTS_PER_RESPONSE) continue;
-
-    const dirMatch = scoped.match(DIR_RE);
-    const excludeMatch = scoped.match(EXCLUDE_RE);
-    requests.push({
-      rootCauseSummary,
-      query: queryMatch[1].trim(),
-      dir: dirMatch ? dirMatch[1].trim() : undefined,
-      exclude: excludeMatch
-        ? excludeMatch[1].split(',').map((s) => s.trim()).filter(Boolean).map((p) => path.normalize(p))
-        : [],
-    });
-  }
-
-  const cleanText = cleanParts.join('').replace(/\n{3,}/g, '\n\n').trim();
-  return { cleanText, requests };
+  return extractMarkers(text || '', {
+    ...AMPLIFY_OPTIONS,
+    maxItems: MAX_AMPLIFY_REQUESTS_PER_RESPONSE,
+    normalizePath: path.normalize,
+  });
 }
 
 module.exports = {

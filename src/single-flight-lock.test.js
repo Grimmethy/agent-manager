@@ -206,6 +206,36 @@ test('freshness-gated: a STALE marker (past DISCUSS_MARKER_FRESH_MS) never backs
   });
 });
 
+test('withTaskMoveLock: a move-lock key skips the discuss-priority backoff even with a fresh marker present', () => {
+  const dir = makeInstancesDir();
+  assert.equal(taskMoveLockKey('T-skip'), 'move.T-skip');
+  fs.mkdirSync(path.join(dir, '.discuss-waiting'));
+  fs.writeFileSync(path.join(dir, '.discuss-waiting', 'active-session'), ''); // fresh mtime
+  // A short ceiling bounds the test: if backoff were NOT skipped, the child would wait ~1s+ here.
+  const env = { ...process.env, DISCUSS_PRIORITY_MAX_WAIT_SEC: '1' };
+  delete env.AGENT_MANAGER_PRIORITY_HOLDER;
+  const child = require('child_process').spawn('node', ['-e', `
+    const { withTaskMoveLock } = require(${JSON.stringify(require.resolve('./single-flight-lock.js'))});
+    const start = Date.now();
+    Promise.resolve(withTaskMoveLock(${JSON.stringify(dir)}, 'T-skip', () => {
+      process.stdout.write(String(Date.now() - start));
+    })).catch((e) => { process.stderr.write(String(e)); process.exitCode = 1; });
+  `], { env });
+  let out = '';
+  let err = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', (d) => { err += d; });
+  return new Promise((resolve) => {
+    child.on('exit', (code) => {
+      assert.equal(code, 0, `withTaskMoveLock child failed: ${err}`);
+      assert.match(out, /^\d+$/, 'the child must report its elapsed time');
+      const elapsedMs = Number(out);
+      assert.ok(elapsedMs < 800, `a move-lock key must skip priority backoff against a fresh marker, took ${elapsedMs}ms`);
+      resolve();
+    });
+  });
+});
+
 test('lockFilePath matches the exact bash lockfile name (interop depends on this)', () => {
   const dir = makeInstancesDir();
   assert.equal(lockFilePath(dir), path.join(dir, '.pipeline-single-flight.lock'));
