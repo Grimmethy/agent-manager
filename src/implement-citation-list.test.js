@@ -30,6 +30,27 @@ test('de-duplicates, sorts, and caps at max without mutating input', () => {
   assert.deepEqual(input, snapshot);
 });
 
+test('empty input returns an empty list', () => {
+  assert.deepEqual(buildClosedCitationList([], { max: 10 }), []);
+  assert.deepEqual(buildClosedCitationList([]), []);
+});
+
+test('non-array input is treated as empty', () => {
+  assert.deepEqual(buildClosedCitationList(undefined, { max: 10 }), []);
+  assert.deepEqual(buildClosedCitationList(null), []);
+  assert.deepEqual(buildClosedCitationList('src/a.js'), []);
+});
+
+test('an array of only rejected entries yields an empty list', () => {
+  assert.deepEqual(buildClosedCitationList(['/abs.js', '../x.js', 42, null, ''], { max: 10 }), []);
+});
+
+test('a missing or non-positive max returns every entry', () => {
+  const input = ['b.js', 'a.js', 'c.js'];
+  assert.deepEqual(buildClosedCitationList(input), ['a.js', 'b.js', 'c.js']);
+  assert.deepEqual(buildClosedCitationList(input, { max: 0 }), ['a.js', 'b.js', 'c.js']);
+});
+
 test('the spec example from the task', () => {
   const out = buildClosedCitationList(['src\\a.js', '/etc/x.js', '../b.ts', 'src/a.js', 'c.exe', 'd/e.md'], { max: 10 });
   assert.deepEqual(out, ['d/e.md', 'src/a.js']);
