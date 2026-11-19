@@ -71,7 +71,12 @@ class Reasons:
             reasons.append(f"verified {Age.text(age)} ago, {behind} commits behind {main}")
         hub = b.get("hub")
         if isinstance(hub, dict) and hub.get("state") and hub.get("state") not in HUB_FINISHED_STATES:
-            reasons.append("hub piece: an earlier piece or the hub is unfinished")
+            # A hub that is fully built stays `coordinating` until its merge
+            # lands, so `state not in HUB_FINISHED_STATES` alone would always
+            # attach the reason for a ready hub. `readyToMerge` is the only
+            # signal that clears before the merge it blocks.
+            if not hub.get("readyToMerge"):
+                reasons.append("hub piece: an earlier piece or the hub is unfinished")
         return reasons
 
 
