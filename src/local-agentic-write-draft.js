@@ -862,8 +862,50 @@ async function draftAdhocViaLocalAgenticWrite(task, {
     return verdict;
   } catch (e) {
     if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (local-draft.js, local-worker.sh) -- never turn it into a failed attempt
-    return { succeeded: false, reason: `local write-agentic draft failed: ${e.message}` };
+    const reason = `local write-agentic draft failed: ${e.message}`;
+    const limit = parsePlanLimit(e.message);
+    if (limit) {
+      return { succeeded: false, reason, deferred: true, resumeAtMs: limit.resumeAtMs, window: limit.window, statusText: limit.statusText };
+    }
+    return { succeeded: false, reason };
   }
+}
+
+// Detect whether an Ollama HTTP error indicates a plan/usage limit (HTTP 429 / "rate limit" /
+// "plan limit" / "quota exceeded") and, if so, extract a resume time. Returns null when the
+// failure is not a plan limit so callers can treat it as a plain transient error. The parser
+// is intentionally conservative: it only returns non-null when the error text gives a parseable
+// reset time, so downstream code never guesses at a resume point.
+function parsePlanLimit(reason) {
+  if (typeof reason !== 'string' || !reason) return null;
+  const lower = reason.toLowerCase();
+  // Plan-limit signals: HTTP 429, rate limit, plan limit, quota exceeded, usage limit.
+  const isLimit = /\b(429|rate[\s_-]?limit|plan[\s_-]?limit|quota[\s_-]?exceeded|usage[\s_-]?limit|too[\s_-]?many[\s_-]?requests)\b/i.test(lower);
+  if (!isLimit) return null;
+  // Try to find a resume/resetry time in seconds from now.
+  let retryAfter = null;
+  const secMatch = /\bretry[_-]?after[\s:]*(\d+)/i.exec(reason);
+  if (secMatch) retryAfter = Number(secMatch[1]);
+  if (retryAfter == null || !Number.isFinite(retryAfter) || retryAfter <= 0) {
+    // Try "reset_at" / "reset at" with an epoch-ms number.
+    const msMatch = /\b(reset[_-]?at|resume[_-]?at|retry[_-]?at)[\s:]*(\d{10,13})\b/i.exec(reason);
+    if (msMatch) retryAfter = Math.round((Number(msMatch[2]) - Date.now()) / 1000);
+  }
+  if (retryAfter == null || !Number.isFinite(retryAfter) || retryAfter <= 0) {
+    // Try "in X seconds" / "in X ms" / "X second(s)" patterns.
+    const inMatch = /\bin\s+(\d+)\s*(second|sec|ms)\b/i.exec(reason);
+    if (inMatch) {
+      const n = Number(inMatch[1]);
+      retryAfter = inMatch[2].toLowerCase().startsWith('s') ? n : Math.round(n / 1000);
+    }
+  }
+  if (retryAfter == null || !Number.isFinite(retryAfter) || retryAfter <= 0) return null;
+  const resumeAtMs = Date.now() + retryAfter * 1000;
+  return {
+    resumeAtMs,
+    window: retryAfter,
+    statusText: 'plan limit reached; retry after ~' + Math.round(retryAfter / 60) + ' min',
+  };
 }
 
 function modelStatsSafe(fn, args) {
