@@ -3743,3 +3743,44 @@ Benefits:
 Prevents accidental mutation that could silently change collapse behavior. Makes the contract explicit: this is a configuration constant, not a shared mutable state. Future consumers can't accidentally break the collapse logic by adding stages without understanding the implications.
 
 NOTE: The critique found no issues with the draft, so no changes were applied.
+
+### AC-835 · Side-finding inbox writes bypass the atomic-write contract, creating a silent corruption surface
+Strength: Strong
+Files: src/side-finding.js, src/atomic-write.js
+
+Problem:
+`writeSideFindingInbox()` imports `writeJsonAtomicSync` from `atomic-write.js` but wraps the call in a `try/catch` that swallows errors and logs only a warning, then continues. The surrounding codebase documents a hard requirement that all pipeline file writes use atomic semantics, and `atomic-write.js` explicitly states that non-atomic writes leave "truncated, unparseable file" states after crashes. However, `writeSideFindingInbox()` conflates "best-effort" with "silently ignore all errors," meaning if `writeJsonAtomicSync` throws (e.g., disk full, permissions), the finding is silently dropped with no audit trail. The inbox directory is created with `fs.mkdirSync(dir, { recursive: true })` without atomic guarantees, so a crash between directory creation and file write can leave an empty inbox directory with no files. This is a critical aggregation point for cross-task findings, and silent drops mean real defects can be lost without any signal to the operator.
+
+Solution:
+Make the error handling more visible by logging at `warn` level with the finding title, or writing to a separate error log file. Alternatively, add a retry mechanism for transient failures (network/disk). Document explicitly that silent drops are acceptable for this inbox (vs. other pipeline writes where they're not) if the first option is chosen.
+
+Benefits:
+Operators gain visibility into inbox failures, enabling debugging of inbox gaps. The "best-effort" contract is preserved for the filing step (crash shouldn't block the main task) but no longer silently swallows errors. Audit trails for dropped findings enable post-mortem analysis of infrastructure issues.
+
+### AC-836 · `git-ownership.js` contains both rule definitions and detection logic, creating a single-point-of-failure for git-safety
+Strength: Strong
+Files: src/lib/git-ownership.js
+
+Problem:
+This file bundles three distinct concerns into one module: prompt text (`GIT_OWNERSHIP_RULE`), regex patterns (`GIT_WRITE_CRITERION_RE`, `GIT_WRITE_TITLE_RE`, `GIT_WRITE_INSTRUCTION_RE`), and refusal message (`GIT_WRITE_REQUEST_REFUSAL`). The regex patterns are tightly coupled to the prompt text's wording (e.g., `GIT_WRITE_TITLE_RE` matches imperative verbs that appear in `GIT_OWNERSHIP_RULE`). If the prompt text changes (to clarify ambiguity, add new verbs, or fix false positives), the regexes must be updated in lockstep. There's no test or validation that the regexes actually cover the prompt's intent. Git operations are a safety boundary — the pipeline must never let a draft commit code. If the regexes drift out of sync with the prompt (e.g., a new verb is added to the rule but not the regex), drafts can slip through with git-write requests that the pipeline cannot execute, causing the sandbox errors documented in the file's own header.
+
+Solution:
+Split into two modules: `git-ownership-rules.js` (prompt text and refusal message — the "what to tell models") and `git-ownership-detector.js` (regex patterns and `isGitWriteRequest()` — the "how to detect violations"). Add a test that verifies every verb/concept in the prompt text is covered by at least one regex pattern. This makes drift detectable.
+
+Benefits:
+Changes to the prompt text no longer require manual verification that regexes are updated. Drift between rules and detection logic becomes a test failure rather than a silent safety bypass. The separation of concerns makes both modules easier to maintain and reason about.
+
+### AC-837 · `text-similarity.js`'s `distinctivePhrases()` has undocumented first-line-only semantics that silently truncate multi-line inputs
+Strength: Strong
+Files: src/text-similarity.js
+
+Problem:
+`distinctivePhrases()` calls `String(text || '').split('\n')[0]`, which silently discards everything after the first newline. The comment says this is "by design" because "every current caller" slices to the first line before calling. However, the function signature accepts any string with no runtime check that the input is single-line. Future callers (or refactors) can pass multi-line text (e.g., a multi-line `blockedReason` from `agentic-draft-common.js`) and get silently truncated results. The comment acknowledges this as a "revisit" item but doesn't enforce the constraint. If a caller passes a multi-line string (which is common for task descriptions, findings, or error messages), the function returns phrases from only the first line, potentially missing the actual content.
+
+Solution:
+Add a runtime assertion: `if (text.includes('\n')) throw new Error('distinctivePhrases() requires single-line input')`. This catches misuse immediately rather than silently producing wrong results.
+
+Benefits:
+Misuse of the function is caught at development time rather than producing silent correctness bugs in production. The API contract is enforced at runtime, making the function's behavior explicit and predictable. Callers are forced to be intentional about input formatting.
+
+NOTE: The pre-check leads flagging `git-ownership-rules.js` and `git-ownership-detector.js` as "missing files" were not applied because the draft is creating these files as part of the proposed solution — it does not claim they exist or import from them as if they already exist.
