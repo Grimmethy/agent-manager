@@ -219,6 +219,66 @@ def api_task_link(task_id):
     return jsonify({"id": task_id, "added": True, "links": links})
 
 
+@task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>/depends-on", methods=["POST"])
+def api_task_depends_on(task_id):
+    """Add or remove a task ID from this task's `dependsOn` list (a list of strings on the
+    record, not a link kind). Body: {"taskId": "<id to add/remove>", "remove": true|false
+    (optional)}.
+
+    Idempotent: adding an already-present ID does nothing (answers 200, dependsOn unchanged);
+    removing an absent ID does nothing. Pass ?project=<repoRoot> to reach another registered
+    project's queue. Refuses self-reference (taskId == task_id) and unknown target taskIds
+    with a 4xx and a message."""
+    from app import _find_live_task_file, get_active_repo_root, queue_dir, read_json_safe
+    body = request.get_json(silent=True) or {}
+    other = body.get("taskId")
+    if not isinstance(other, str) or not other.strip():
+        abort(400, description='"taskId" is required')
+    other = other.strip()
+    if other == task_id:
+        abort(400, description='"taskId" must not be the same as the source task')
+
+    remove = bool(body.get("remove", False))
+
+    import branch_projects
+    try:
+        scope = branch_projects.resolve_scope(request.args.get("project") or body.get("project"), get_active_repo_root())
+    except LookupError as e:
+        abort(404, description=str(e))
+    qdir = scope["qdir"] if scope else queue_dir()
+    if not qdir:
+        abort(404)
+    target = _find_live_task_file(qdir, task_id)
+    if not target:
+        abort(404, description=f"'{task_id}' not found in any queue state")
+    data = read_json_safe(target)
+    if not data:
+        abort(500, description="could not read the task file")
+
+    # Verify the target task (the one being depended on) actually exists.
+    other_target = _find_live_task_file(qdir, other)
+    if not other_target:
+        abort(400, description=f"task '{other}' not found")
+
+    depends_on = data.get("dependsOn")
+    if not isinstance(depends_on, list):
+        depends_on = []
+    if remove:
+        if other in depends_on:
+            depends_on.remove(other)
+    else:
+        if other not in depends_on:
+            depends_on.append(other)
+    data["dependsOn"] = depends_on
+    now_iso = datetime.now(timezone.utc).isoformat()
+    data.setdefault("history", []).append({
+        "stage": "advisory", "at": now_iso,
+        "detail": f"{'removed' if remove else 'added'} depends-on: {other}",
+    })
+    target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return jsonify({"id": task_id, "dependsOn": depends_on})
+
+
 @task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>/hub-priority", methods=["POST"])
 def api_task_set_hub_priority(task_id):
     """Operator-set priority for a coordinating HUB (2026-09-09, Grimmethy: "I'd like the
