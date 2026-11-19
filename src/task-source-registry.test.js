@@ -55,6 +55,17 @@ test('registerSourceAlias: a plugin can declare its own source-field quirk witho
   assert.equal(resolveSourceName({ source: 'my_weird_label' }), 'my_weird_label', 'clearRegistry() also clears aliases');
 });
 
+test('registerDomainAlias: plugin domain alias resolves, clearRegistry() removes it, built-ins survive and keep precedence', () => {
+  const { registerDomainAlias } = require('./task-source-registry.js');
+  clearRegistry();
+  registerDomainAlias('my_domain', 'my_real_source');
+  assert.equal(resolveSourceName({ domain: 'my_domain', source: 'x' }), 'my_real_source');
+  assert.equal(resolveSourceName({ domain: 'secondbrain', source: 'manual' }), 'adhoc', 'original precedence kept');
+  clearRegistry();
+  assert.equal(resolveSourceName({ domain: 'my_domain', source: 'x' }), 'x');
+  assert.equal(resolveSourceName({ domain: 'adhoc', source: 'x' }), 'adhoc');
+});
+
 test('deadcode_triage is NOT special-cased in core -- with no alias registered it passes through unchanged', () => {
   clearRegistry();
   assert.equal(resolveSourceName({ domain: 'default', source: 'deadcode_triage' }), 'deadcode_triage');

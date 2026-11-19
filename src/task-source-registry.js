@@ -48,9 +48,29 @@ const registry = {};
  * field that differs from the name they registered under (e.g. unused_export stamps
  * source: 'deadcode_triage'). A plugin declares its own quirk via registerSourceAlias()
  * instead of this file needing to know every consumer's naming; resolveSourceName() below
- * still has hardcoded fallbacks for this package's own built-in quirks + a legacy one.
+ * resolves through the ordered alias rules below (no literal source/domain comparisons inside it).
  */
 const sourceAliases = {};
+
+/**
+ * Ordered alias rules, first match wins: { kind: 'domain' | 'source', key, to }. The built-in rules
+ * (adhoc / secondbrain, whose domain or source differs from their registry name) are DATA, re-seeded
+ * by clearRegistry(); plugins add theirs via registerSourceAlias() / registerDomainAlias(). Seed order
+ * preserves the original precedence: adhoc (domain 'adhoc' or source 'manual'), then the secondbrain
+ * domain, then plugin aliases (appended in registration order).
+ */
+const BUILTIN_ALIAS_RULES = [
+  { kind: 'domain', key: 'adhoc', to: 'adhoc' },
+  { kind: 'source', key: 'manual', to: 'adhoc' },
+  { kind: 'domain', key: 'secondbrain', to: 'secondbrain' },
+];
+let aliasRules = BUILTIN_ALIAS_RULES.map((r) => ({ ...r }));
+
+function addAliasRule(kind, key, to) {
+  const existing = aliasRules.find((r) => r.kind === kind && r.key === key);
+  if (existing) existing.to = to;
+  else aliasRules.push({ kind, key, to });
+}
 
 /** Markers for gated next() wrappers, so a function is never double-wrapped. */
 const gatedNextFns = new WeakSet();
@@ -146,6 +166,16 @@ function getRegisteredSource(name) {
  */
 function registerSourceAlias(fromField, toName) {
   sourceAliases[fromField] = toName;
+  addAliasRule('source', fromField, toName);
+}
+
+/**
+ * Declare that tasks carrying `task.domain === domain` belong to registry entry `toName`.
+ * @param {string} domain - the value a task carries on its `domain` field
+ * @param {string} toName - the registry key the source registered under
+ */
+function registerDomainAlias(domain, toName) {
+  addAliasRule('domain', domain, toName);
 }
 
 /**
@@ -154,6 +184,7 @@ function registerSourceAlias(fromField, toName) {
 function clearRegistry() {
   Object.keys(registry).forEach(key => delete registry[key]);
   Object.keys(sourceAliases).forEach(key => delete sourceAliases[key]);
+  aliasRules = BUILTIN_ALIAS_RULES.map((r) => ({ ...r }));
 }
 
 /**
@@ -177,9 +208,9 @@ function clearRegistry() {
  * @returns {string} The registry name to look up.
  */
 function resolveSourceName(task) {
-  if (task.domain === 'adhoc' || task.source === 'manual') return 'adhoc';
-  if (task.domain === 'secondbrain') return 'secondbrain';
-  if (sourceAliases[task.source]) return sourceAliases[task.source];
+  for (const r of aliasRules) {
+    if (r.kind === 'domain' ? task.domain === r.key : task.source === r.key) return r.to;
+  }
   return task.source;
 }
 
@@ -220,4 +251,4 @@ function getVariantsOf(parent) {
   return Object.keys(registry).filter((n) => variantParentOf(n) === parent);
 }
 
-module.exports = { variantParentOf, getVariantsOf, registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource, resolveSourceName, registerSourceAlias };
+module.exports = { variantParentOf, getVariantsOf, registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource, resolveSourceName, registerSourceAlias, registerDomainAlias };
