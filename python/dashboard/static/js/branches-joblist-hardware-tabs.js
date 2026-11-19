@@ -891,7 +891,7 @@ function renderWatchConfigChecklist(watchConfig) {
   const categories = Object.keys(watchConfig);
   if (!categories.length) return ''; // plugin doesn't support this -- render nothing.
   const items = categories.map((cat) => `
-    <label style="display:inline-flex; align-items:center; gap:4px; margin-right:14px; cursor:pointer;">
+    <label style="display:inline-flex; align-items:center; gap:4px; margin-right:16px; cursor:pointer;">
       <input type="checkbox" ${watchConfig[cat] ? 'checked' : ''}
         onchange="toggleHardwareWatchCategory(this, '${cat}', this.checked)">
       <span class="meta">${escapeHtml(HARDWARE_WATCH_CATEGORY_LABELS[cat] || cat)}</span>
@@ -899,7 +899,7 @@ function renderWatchConfigChecklist(watchConfig) {
   return `
     <div class="field-label">Watching</div>
     <div style="margin-bottom:8px;">${items}</div>
-    <div class="meta" style="margin-bottom:14px;">Unchecked categories stop being measured
+    <div class="meta" style="margin-bottom:16px;">Unchecked categories stop being measured
       each tick (not just hidden here) -- on a CPU-constrained box, checking only CPU
       skips the plugin's own expensive probe call entirely.</div>`;
 }
@@ -981,16 +981,16 @@ async function renderHardwareTab() {
     ${cur.filesystems && cur.filesystems.length ? `
     <div class="field-label">Filesystems</div>
     <table style="width:100%; border-collapse:collapse;">
-      <tr><th class="meta" style="text-align:left; padding:2px 8px 2px 0;">Mount</th>
-          <th class="meta" style="text-align:left; padding:2px 8px;">Device</th>
-          <th class="meta" style="text-align:left; padding:2px 8px;">Type</th>
-          <th class="meta" style="text-align:right; padding:2px 0;">Used / total</th></tr>
+      <tr><th class="meta" style="text-align:left; padding:4px 8px 4px 0;">Mount</th>
+          <th class="meta" style="text-align:left; padding:4px 8px;">Device</th>
+          <th class="meta" style="text-align:left; padding:4px 8px;">Type</th>
+          <th class="meta" style="text-align:right; padding:4px 0;">Used / total</th></tr>
       ${cur.filesystems.map(fs => `
         <tr>
-          <td class="meta" style="padding:2px 8px 2px 0; word-break:break-all;">${escapeHtml(fs.mountPoint)}${fs.readOnly ? ' <span class="badge idle">ro</span>' : ''}</td>
-          <td class="meta" style="padding:2px 8px; font-family:monospace;">${escapeHtml(fs.device)}</td>
-          <td class="meta" style="padding:2px 8px;">${escapeHtml(fs.type)}</td>
-          <td class="meta" style="padding:2px 0; text-align:right;">${fmtBytes(fs.usedBytes)} / ${fmtBytes(fs.totalBytes)}</td>
+          <td class="meta" style="padding:4px 8px 4px 0; word-break:break-all;">${escapeHtml(fs.mountPoint)}${fs.readOnly ? ' <span class="badge idle">ro</span>' : ''}</td>
+          <td class="meta" style="padding:4px 8px; font-family:monospace;">${escapeHtml(fs.device)}</td>
+          <td class="meta" style="padding:4px 8px;">${escapeHtml(fs.type)}</td>
+          <td class="meta" style="padding:4px 0; text-align:right;">${fmtBytes(fs.usedBytes)} / ${fmtBytes(fs.totalBytes)}</td>
         </tr>`).join('')}
     </table>` : ''}
 
@@ -1002,42 +1002,42 @@ async function renderHardwareTab() {
         : ''}
     </div>
     ${cur.power && cur.power.rails && cur.power.rails.length ? `
-    <table style="width:100%; border-collapse:collapse; margin-top:6px;">
+    <table style="width:100%; border-collapse:collapse; margin-top:8px;">
       ${cur.power.rails.map(r => `
-        <tr><td class="meta" style="padding:2px 8px 2px 0;">${escapeHtml(r.name)}</td>
-            <td class="meta" style="padding:2px 0;">${r.watts.toFixed(2)} W</td></tr>`).join('')}
+        <tr><td class="meta" style="padding:4px 8px 4px 0;">${escapeHtml(r.name)}</td>
+            <td class="meta" style="padding:4px 0;">${r.watts.toFixed(2)} W</td></tr>`).join('')}
     </table>` : ''}
     ${cur.runaways && cur.runaways.length ? `
-    <table style="width:100%; border-collapse:collapse; margin-top:6px;">
+    <table style="width:100%; border-collapse:collapse; margin-top:8px;">
       ${cur.runaways.map(a => `
-        <tr><td class="meta" style="padding:2px 8px 2px 0; color:var(--bad);">pid ${a.pid}</td>
-            <td class="meta" style="padding:2px 0;">${escapeHtml(a.headline)}</td></tr>`).join('')}
-    </table>` : `<div class="meta" style="margin-top:6px;">No runaway processes detected.</div>`}
+        <tr><td class="meta" style="padding:4px 8px 4px 0; color:var(--bad);">pid ${a.pid}</td>
+            <td class="meta" style="padding:4px 0;">${escapeHtml(a.headline)}</td></tr>`).join('')}
+    </table>` : `<div class="meta" style="margin-top:8px;">No runaway processes detected.</div>`}
     ` : ''}
 
     ${cur.processes && cur.processes.length ? `
     <div class="field-label">Top processes by CPU</div>
     <table style="width:100%; border-collapse:collapse;">
-      <tr><th class="meta" style="text-align:left; padding:2px 8px 2px 0;">Process</th>
-          <th class="meta" style="text-align:right; padding:2px 8px;">PID</th>
-          <th class="meta" style="text-align:right; padding:2px 8px;">CPU</th>
-          <th class="meta" style="text-align:right; padding:2px 8px;">RAM</th>
-          <th class="meta" style="text-align:right; padding:2px 8px;">Threads</th>
-          <th class="meta" style="text-align:right; padding:2px 8px;">GPU</th>
-          <th class="meta" style="text-align:left; padding:2px 0;">User / scope</th></tr>
+      <tr><th class="meta" style="text-align:left; padding:4px 8px 4px 0;">Process</th>
+          <th class="meta" style="text-align:right; padding:4px 8px;">PID</th>
+          <th class="meta" style="text-align:right; padding:4px 8px;">CPU</th>
+          <th class="meta" style="text-align:right; padding:4px 8px;">RAM</th>
+          <th class="meta" style="text-align:right; padding:4px 8px;">Threads</th>
+          <th class="meta" style="text-align:right; padding:4px 8px;">GPU</th>
+          <th class="meta" style="text-align:left; padding:4px 0;">User / scope</th></tr>
       ${cur.processes.map(p => `
         <tr>
-          <td class="meta" style="padding:2px 8px 2px 0;">${escapeHtml(p.name)}</td>
-          <td class="meta" style="padding:2px 8px; text-align:right;">${p.pid}</td>
-          <td class="meta" style="padding:2px 8px; text-align:right;">${fmtPercent(p.cpuPercent)}</td>
-          <td class="meta" style="padding:2px 8px; text-align:right;">${fmtBytes(p.rssBytes)}</td>
-          <td class="meta" style="padding:2px 8px; text-align:right;">${p.threads}</td>
-          <td class="meta" style="padding:2px 8px; text-align:right;">${p.gpuPercent ? fmtPercent(p.gpuPercent) : '-'}</td>
-          <td class="meta" style="padding:2px 0;">${escapeHtml(p.user || '-')} &middot; ${escapeHtml(p.scopeLabel || '-')}</td>
+          <td class="meta" style="padding:4px 8px 4px 0;">${escapeHtml(p.name)}</td>
+          <td class="meta" style="padding:4px 8px; text-align:right;">${p.pid}</td>
+          <td class="meta" style="padding:4px 8px; text-align:right;">${fmtPercent(p.cpuPercent)}</td>
+          <td class="meta" style="padding:4px 8px; text-align:right;">${fmtBytes(p.rssBytes)}</td>
+          <td class="meta" style="padding:4px 8px; text-align:right;">${p.threads}</td>
+          <td class="meta" style="padding:4px 8px; text-align:right;">${p.gpuPercent ? fmtPercent(p.gpuPercent) : '-'}</td>
+          <td class="meta" style="padding:4px 0;">${escapeHtml(p.user || '-')} &middot; ${escapeHtml(p.scopeLabel || '-')}</td>
         </tr>`).join('')}
     </table>` : ''}
 
-    <div class="meta" style="margin-top:14px">${history.length} sample${history.length === 1 ? '' : 's'} in the last 24h &middot; sampled every 10s.</div>
+    <div class="meta" style="margin-top:16px">${history.length} sample${history.length === 1 ? '' : 's'} in the last 24h &middot; sampled every 10s.</div>
   `;
 }
 
