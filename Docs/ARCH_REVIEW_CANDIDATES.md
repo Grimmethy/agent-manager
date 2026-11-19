@@ -3875,3 +3875,26 @@ Benefits:
 Failures in brain dump bookkeeping are no longer silent -- operators can detect and investigate cases where the side effect failed, even if the primary task succeeded. This prevents the "task applied but brain dump not closed" state from accumulating unnoticed, which could lead to stale or orphaned brain dump entries over time.
 
 NOTE: AC-105 was removed because the critique correctly identified that the claimed control flow (writeArtifact → applyCandidateSplit → getRegisteredSource) is fabricated; the two getRegisteredSource calls are in separate branches of writeArtifact, not sequential, so the reported duplication problem does not exist.
+
+### AC-843 · Fragile singleton swap point in `decompose-pass-route.js`
+Strength: Strong
+
+**Status: REMOVED** — Flag accepted. The draft mischaracterized the design intent. The singleton swap point is intentional for hot-path performance, and `getDecomposePassRunner()` exists for discovery. The "anti-pattern" framing was incorrect; the codebase deliberately uses this pattern for single-swap hooks.
+
+---
+
+### AC-844 · Missing error handling in `stacked-grounding.js` `resolveGroundingRef`
+Strength: Strong
+
+**Status: REMOVED** — Flag accepted. The draft misunderstood the error handling. `runner.remoteBranchExists(branch)` is called after `fetchBranch` and correctly validates the branch exists on origin regardless of fetch success. The "best-effort" nature of `fetchBranch` is intentional and the fallback behavior is correct.
+
+---
+
+### AC-845 · Inconsistent JSON parsing strategy in `json-fence.js`
+Strength: Strong
+
+**Status: REMOVED** — Flag accepted. The draft was factually incorrect about `extractBalancedJson` capabilities. The function DOES handle prose + JSON without a code fence by scanning for the first `{` or `[` and finding the matching closing bracket. The claimed limitation (can't help with prose + JSON) does not exist.
+
+---
+
+NOTE: All three ACs were removed because the critique correctly identified factual errors in each — the singleton is intentional, the error handling is correct, and `extractBalancedJson` handles the case the draft claimed it couldn't.
