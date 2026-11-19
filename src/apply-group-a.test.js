@@ -790,6 +790,13 @@ test('applyBrainDumpSort gives a FIRST possible-duplicate flag one retry instead
   assert.equal(entry.status, 'captured', 'entry stays captured so a fresh classification pass picks it up again');
 });
 
+test('isValidDuplicateMatch: research-domain candidate matches a truncated "Research:" title via the structured domain branch', () => {
+  const existing = ['Research: Open WebUI opt-in context compa'];
+  const candidate = 'web research task for the dashboard settings pane';
+  assert.equal(isValidDuplicateMatch(candidate, existing, { domain: 'research' }), true);
+  assert.equal(isValidDuplicateMatch(candidate, existing, null), false);
+});
+
 test('isValidDuplicateMatch: exact match passes', () => {
   assert.equal(isValidDuplicateMatch('Fix the budget guard rounding bug', ['Fix the budget guard rounding bug']), true);
 });
