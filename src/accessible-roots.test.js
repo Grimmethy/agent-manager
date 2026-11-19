@@ -135,6 +135,53 @@ test('resolveReadOnlySiblingRoots: a non-core active project gets no siblings, a
   assert.deepEqual(noManifest.resolveReadOnlySiblingRoots({ repoRoot: coreRepo, worktreeDir: makeRepoDir() }), []);
 });
 
+test('resolveAccessibleRoots: cloud-lane worktree of the core repo gets the enabled plugin repos', () => {
+  const prevCore = process.env.AGENT_MANAGER_CORE_REPO_ROOT;
+  try {
+    const core = makeRepoDir();
+    const coreWtGit = path.join(core, '.git', 'worktrees', 'wt1');
+    fs.mkdirSync(coreWtGit, { recursive: true });
+    const worktree = makeRepoDir();
+    fs.writeFileSync(path.join(worktree, '.git'), `gitdir: ${coreWtGit}\n`);
+    process.env.AGENT_MANAGER_CORE_REPO_ROOT = core;
+    const pluginRepo = makeRepoDir();
+    const manifestPath = tmpManifest(JSON.stringify([
+      { name: 'cloud-plugin', registerPath: path.join(pluginRepo, 'register.js'), enabled: true },
+    ]));
+    const { resolveAccessibleRoots } = loadWith(manifestPath);
+    assert.deepEqual(resolveAccessibleRoots({ repoRoot: worktree }), [fs.realpathSync(worktree), fs.realpathSync(pluginRepo)]);
+  } finally {
+    if (prevCore === undefined) delete process.env.AGENT_MANAGER_CORE_REPO_ROOT; else process.env.AGENT_MANAGER_CORE_REPO_ROOT = prevCore;
+  }
+});
+
+test('resolveAccessibleRoots: a worktree of a DIFFERENT repo, a .git directory, and a plain dir get no plugin repos', () => {
+  const prevCore = process.env.AGENT_MANAGER_CORE_REPO_ROOT;
+  try {
+    const core = makeRepoDir();
+    fs.mkdirSync(path.join(core, '.git', 'worktrees', 'wt1'), { recursive: true });
+    process.env.AGENT_MANAGER_CORE_REPO_ROOT = core;
+    const other = makeRepoDir();
+    const otherWtGit = path.join(other, '.git', 'worktrees', 'wt2');
+    fs.mkdirSync(otherWtGit, { recursive: true });
+    const otherWorktree = makeRepoDir();
+    fs.writeFileSync(path.join(otherWorktree, '.git'), `gitdir: ${otherWtGit}\n`);
+    const gitDirRepo = makeRepoDir();
+    fs.mkdirSync(path.join(gitDirRepo, '.git'), { recursive: true });
+    const plainDir = makeRepoDir();
+    const pluginRepo = makeRepoDir();
+    const manifestPath = tmpManifest(JSON.stringify([
+      { name: 'p', registerPath: path.join(pluginRepo, 'register.js'), enabled: true },
+    ]));
+    const { resolveAccessibleRoots } = loadWith(manifestPath);
+    assert.deepEqual(resolveAccessibleRoots({ repoRoot: otherWorktree }), [fs.realpathSync(otherWorktree)]);
+    assert.deepEqual(resolveAccessibleRoots({ repoRoot: gitDirRepo }), [fs.realpathSync(gitDirRepo)]);
+    assert.deepEqual(resolveAccessibleRoots({ repoRoot: plainDir }), [fs.realpathSync(plainDir)]);
+  } finally {
+    if (prevCore === undefined) delete process.env.AGENT_MANAGER_CORE_REPO_ROOT; else process.env.AGENT_MANAGER_CORE_REPO_ROOT = prevCore;
+  }
+});
+
 test('isSecretLookingPath: credential-looking names and .ssh/.gnupg paths, but not ordinary source', () => {
   const { isSecretLookingPath } = loadWith(path.join(os.tmpdir(), 'definitely-missing-' + Date.now(), 'plugins.json'));
   for (const p of ['.env', 'a/b/.env.local', 'pf-db.env', 'server.pem', 'k/private.key', 'id_rsa', 'id_ed25519.pub', 'config/credentials.json', 'my-secret.txt', 'api_token.json', 'home/.ssh/config', 'x/.gnupg/pubring.kbx']) {
