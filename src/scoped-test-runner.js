@@ -243,7 +243,7 @@ function runNodeTests(repoRoot, files) {
   } catch (e) {
     const timedOut = e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT';
     const out = `${e.stdout || ''}${e.stderr || ''}`;
-    return { ran: files, passed: timedOut ? null : false, failures: parseNodeTestFailures(out), raw: out.slice(0, 4000), timedOut };
+    return { ran: files, passed: timedOut || e.code === 'ENOENT' ? null : false, failures: parseNodeTestFailures(out), raw: out.slice(0, 4000), timedOut };
   }
 }
 
@@ -262,7 +262,7 @@ function runVitestTests(repoRoot, pkgRel, files) {
   } catch (e) {
     const timedOut = e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT';
     const out = `${e.stdout || ''}${e.stderr || ''}`;
-    return { ran: files, passed: timedOut ? null : false, failures: require('./lib/js-test-runner.js').parseVitestFailures(out), raw: out.slice(0, 4000), timedOut };
+    return { ran: files, passed: timedOut || e.code === 'ENOENT' ? null : false, failures: require('./lib/js-test-runner.js').parseVitestFailures(out), raw: out.slice(0, 4000), timedOut };
   }
 }
 
@@ -311,7 +311,7 @@ function runPyTests(repoRoot, files, pythonBin) {
   } catch (e) {
     const timedOut = e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT';
     const out = `${e.stdout || ''}${e.stderr || ''}`;
-    return { ran: files, passed: timedOut ? null : false, failures: parsePyTestFailures(out), raw: out.slice(0, 4000), timedOut };
+    return { ran: files, passed: timedOut || e.code === 'ENOENT' ? null : false, failures: parsePyTestFailures(out), raw: out.slice(0, 4000), timedOut };
   }
 }
 
