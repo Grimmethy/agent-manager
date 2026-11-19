@@ -64,13 +64,18 @@ function scan(root, deps) {
     const why = EXCLUDED.get(rel);
     if (why) { bump(counts, why); continue; }
     let buf;
+    let size;
     try {
-      const size = fs.statSync(file).size;
-      if (size > MAX_BYTES) { record(rel, 'oversize', size); continue; }
+      size = fs.statSync(file).size;
       buf = fs.readFileSync(file);
     } catch (_) { bump(counts, 'unreadable'); continue; }
-    if (buf.length > MAX_BYTES) { record(rel, 'oversize', buf.length); continue; }
-    if (buf.includes(0)) { record(rel, 'binary', buf.length); continue; }
+    // Oversize and binary are independent: a file can be recorded for both reasons.
+    const oversize = size > MAX_BYTES || buf.length > MAX_BYTES;
+    const binary = buf.includes(0);
+    const recSize = Math.max(size || 0, buf.length);
+    if (oversize) record(rel, 'oversize', recSize);
+    if (binary) record(rel, 'binary', recSize);
+    if (oversize || binary) continue;
     const lines = buf.toString('utf8').split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
       for (const term of PATTERNS) {
