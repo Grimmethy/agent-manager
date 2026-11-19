@@ -85,6 +85,21 @@ def _clean_slate_for_fresh_adhoc_attempt(data):
     if data.get("status") == "blocked":
         data["status"] = "pending"
 
+
+_PREMIUM_FIELDS = ("premiumPriority", "premiumSetBy", "premiumSetAt")
+
+
+def _carry_premium_fields(src_path, data):
+    """Re-reads the source file (no lock helper exists in this module, so this is a fresh read
+    immediately before the write) and copies the premium fields into `data` in place, after any
+    clean-slate stripping, so a needs-clarification -> adhoc move never loses them."""
+    from app import read_json_safe
+    current_src = read_json_safe(src_path) or {}
+    for field in _PREMIUM_FIELDS:
+        if field in current_src:
+            data[field] = current_src[field]
+
+
 @task_bp.route("/api/task/<state>/<task_id>")
 def api_task_detail(state, task_id):
     from app import QUEUE_STATES, _files_touched_for, _incoming_task_links, _outgoing_task_links, _task_cost_summary, _task_input_summary, _work_log_for, queue_dir, read_json_safe
@@ -797,6 +812,7 @@ def api_task_resolve_clarification(task_id):
     dest = adhoc_dir / f"{task_id}.json"
     if dest.exists():
         abort(409, description=f"'{task_id}' already has a task in adhoc/")
+    _carry_premium_fields(src, data)
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint="needs-clarification resolved via the file-path picker", requeue_writer="operator-manual", pipeline_dir=scope["pipelineDir"] if scope else None)
@@ -876,6 +892,7 @@ def api_task_answer_clarification(task_id):
     dest = adhoc_dir / f"{task_id}.json"
     if dest.exists():
         abort(409, description=f"'{task_id}' already has a task in adhoc/")
+    _carry_premium_fields(src, data)
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint=f"needs-clarification answered from the picker: {answer[:200]}", requeue_writer="operator-manual", pipeline_dir=scope["pipelineDir"] if scope else None)
