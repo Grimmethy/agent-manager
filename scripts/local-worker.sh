@@ -265,6 +265,13 @@ process_drafting_file() {
     # The pattern is the FORGE_PAUSE_MESSAGE text (pinned by src/local-client-forge-pause.test.js so the copies cannot drift).
     printf '[worker-%s] draft paused for a Forge GPU session -- not counted as a failure; %s stays in drafting/ and resumes when the lease clears\n' "$INSTANCE_ID" "$task_id" >&2
     TICK_HAD_INFRA_FAILURE=true
+  elif quota_resume="$(printf '%s' "$draft_result" | node "${PACKAGE_SRC_DIR}/draft-quota.js" classify-and-defer "$wpath" 2>>"$LOG_FILE")"; [[ -n "$quota_resume" ]]; then
+    # Rate-limit / quota (HTTP 429: hourly token budget, five-hour plan limit) -- a TEMPORARY capacity condition, not a draft failure
+    # (src/draft-quota.js). classify-and-defer already wrote task.deferUntil; the item stays in drafting/ and the existing per-tick
+    # leftover-drafting pass skips it until then (no new timer or poll, ADR-0024). Deliberately NO draftFailureCount increment, NO
+    # infra-requeue round and NO block, so a quota window can never send the task to needs-clarification. This tick stops claiming.
+    printf '[worker-%s] draft deferred on a rate limit until %s -- not counted as a failure; %s stays in drafting/\n' "$INSTANCE_ID" "$quota_resume" "$task_id" >&2
+    TICK_HAD_INFRA_FAILURE=true
   else
     # Draft call itself failed (e.g. Ollama unreachable, or a real generation call timing
     # out under GPU contention) -- retry via the leftover-drafting resume pass at the top
@@ -830,6 +837,8 @@ while :; do                                                                     
       wpath="${drafting_instance_dir}/${name}"
       [[ -f "$wpath" && -s "$wpath" ]]                                        || continue
       if "$PREMIUM_ONLY" && ! is_premium_file "$wpath"; then continue; fi       # a premium-only borrowed tick leaves regular leftovers for later
+      # Rate-limit deferral (src/draft-quota.js): leave the item alone until its stated reset has passed. No failure was counted.
+      if node "${PACKAGE_SRC_DIR}/draft-quota.js" deferred "$wpath" 2>/dev/null; then continue; fi
       printf '[worker-%s] resuming leftover drafting item: %s\n' "$INSTANCE_ID" "$name"
       # A resumed item that predates the claimedAt stamp (or a chat-preempt requeue that
       # skipped drafting/) gets one now, set-once -- see the claim site's comment.
