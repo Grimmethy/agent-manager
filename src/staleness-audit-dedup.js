@@ -81,22 +81,78 @@ function namesDisjointFiles(a, b) {
   return !fb.some((p) => setA.has(p));
 }
 
+// Blocking index for the Jaccard duplicate decision. It is exact for the threshold:
+// Jaccard >= t implies the two token sets share a token within their prefixes under any
+// fixed global token order (prefix length n - ceil(t*n) + 1). Each record's token set is
+// computed once. A probe only compares against records that share a prefix token; the
+// existing jaccard check still decides every candidate, so blocking never changes which
+// pairs are flagged. Build it once per dedup pass and pass it as opts.index.
+function sortByGlobalOrder(tokens, df) {
+  return [...tokens].sort((x, y) => {
+    const dx = df.get(x) || 0;
+    const dy = df.get(y) || 0;
+    if (dx !== dy) return dx - dy;
+    if (x === y) return 0;
+    return x < y ? -1 : 1;
+  });
+}
+
+// The epsilon makes ceil() err toward a longer prefix, which can only add candidates.
+function prefixLength(n, threshold) {
+  return Math.max(1, n - Math.ceil(threshold * n - 1e-9) + 1);
+}
+
+function buildDupIndex(corpus, threshold = dupSimilarityThreshold()) {
+  const entries = [];
+  for (const other of corpus || []) {
+    if (!other || !other.id) continue;
+    entries.push({ other, tokens: normalizeTaskTokens(other) });
+  }
+  const df = new Map();
+  for (const e of entries) for (const tok of e.tokens) df.set(tok, (df.get(tok) || 0) + 1);
+  const postings = new Map();
+  entries.forEach((e, idx) => {
+    const sorted = sortByGlobalOrder(e.tokens, df);
+    const p = prefixLength(sorted.length, threshold);
+    for (let i = 0; i < p && i < sorted.length; i += 1) {
+      const list = postings.get(sorted[i]);
+      if (list) list.push(idx); else postings.set(sorted[i], [idx]);
+    }
+  });
+  return { threshold, entries, df, postings };
+}
+
+// Candidate entries for a probe token set, in ascending corpus order so ties resolve as
+// the brute-force scan would.
+function dupCandidates(mine, index) {
+  const sorted = sortByGlobalOrder(mine, index.df);
+  const p = prefixLength(sorted.length, index.threshold);
+  const hit = new Set();
+  for (let i = 0; i < p && i < sorted.length; i += 1) {
+    for (const idx of index.postings.get(sorted[i]) || []) hit.add(idx);
+  }
+  return [...hit].sort((a, b) => a - b).map((i) => index.entries[i]);
+}
+
 // `opts.relationCheck` / `opts.siblingCheck` / `opts.fileDisjointCheck` are test-only switches (default on):
 // a mutation test flips them off to prove the new guards are what suppress the pair.
-function findDuplicateTask(task, corpus, { relationCheck = true, siblingCheck = true, fileDisjointCheck = true } = {}) {
+// `opts.index` is an optional prebuilt buildDupIndex(corpus) for the same corpus.
+function findDuplicateTask(task, corpus, { relationCheck = true, siblingCheck = true, fileDisjointCheck = true, index = null } = {}) {
   const mine = normalizeTaskTokens(task);
   if (mine.size < 4) return null;
   const myLineage = bdLineage(task.id);
   const threshold = dupSimilarityThreshold();
+  const idx = index && index.entries && index.threshold === threshold ? index : buildDupIndex(corpus, threshold);
   let best = null;
-  for (const other of corpus || []) {
+  for (const cand of dupCandidates(mine, idx)) {
+    const other = cand.other;
     if (!other || !other.id || other.id === task.id) continue;
     if (/(^|-)(brain-dump-sort|product-spec-outline)-/.test(other.id)) continue;
     if (myLineage && bdLineage(other.id) === myLineage) continue; // same lineage, not a dup
     if (relationCheck && relatedAsHubAndChild(task, other)) continue; // hub/child, not a dup
     if (siblingCheck && relatedAsSiblings(task, other)) continue; // pieces of one hub chain share the contract text, not the work
     if (fileDisjointCheck && namesDisjointFiles(task, other)) continue; // different files, boilerplate overlap
-    const sim = jaccard(mine, normalizeTaskTokens(other));
+    const sim = jaccard(mine, cand.tokens);
     if (sim >= threshold && (!best || sim > best.sim)) {
       best = { id: other.id, state: other.state || other.status || null, sim: Number(sim.toFixed(2)) };
     }
@@ -104,4 +160,4 @@ function findDuplicateTask(task, corpus, { relationCheck = true, siblingCheck = 
   return best;
 }
 
-module.exports = { normalizeTaskTokens, dupSimilarityThreshold, bdLineage, findDuplicateTask, relatedAsHubAndChild, relatedAsSiblings, namesDisjointFiles };
+module.exports = { normalizeTaskTokens, dupSimilarityThreshold, bdLineage, buildDupIndex, findDuplicateTask, relatedAsHubAndChild, relatedAsSiblings, namesDisjointFiles };

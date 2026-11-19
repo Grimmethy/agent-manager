@@ -41,6 +41,33 @@ const PACKAGE_ROOT = path.join(__dirname, '..');
 function realOrResolved(p) {
   try { return fs.realpathSync(p); } catch { return path.resolve(p); }
 }
+// Linked git worktree of the core repo. Cloud lanes run each task in a per-task `git worktree`
+// whose `.git` is a FILE ("gitdir: <core>/.git/worktrees/<name>"). Kept separate from isCoreRepo so
+// isCoreRepo's branches stay untouched. Never throws; any failure reads as "not a core worktree".
+function coreGitDir() {
+  try {
+    const core = process.env.AGENT_MANAGER_CORE_REPO_ROOT || PACKAGE_ROOT;
+    const gitDir = path.join(core, '.git');
+    if (!fs.statSync(gitDir).isDirectory()) return null;
+    return realOrResolved(gitDir);
+  } catch { return null; }
+}
+function linkedWorktreeGitDir(root) {
+  try {
+    const dotGit = path.join(root, '.git');
+    if (!fs.lstatSync(dotGit).isFile()) return null;
+    const m = /^gitdir:\s*(.+)$/m.exec(fs.readFileSync(dotGit, 'utf8'));
+    if (!m) return null;
+    const wt = path.resolve(root, m[1].trim());
+    if (path.basename(path.dirname(wt)) !== 'worktrees') return null;
+    return realOrResolved(path.dirname(path.dirname(wt)));
+  } catch { return null; }
+}
+function isCoreWorktree(root) {
+  const core = coreGitDir();
+  return !!core && linkedWorktreeGitDir(root) === core;
+}
+
 function isCoreRepo(root) {
   const r = realOrResolved(root);
   if (r === realOrResolved(PACKAGE_ROOT)) return true;
@@ -50,7 +77,7 @@ function isCoreRepo(root) {
 
 function resolveAccessibleRoots({ repoRoot } = {}) {
   const root = repoRoot || require('./config.js').getConfig().repoRoot;
-  const manifest = isCoreRepo(root) ? readPluginsManifest() : null;
+  const manifest = (isCoreRepo(root) || isCoreWorktree(root)) ? readPluginsManifest() : null;
   const raw = [root, ...enabledRegisterPaths(manifest).map((rp) => path.dirname(rp))];
 
   const seen = new Set();
