@@ -3860,3 +3860,18 @@ Eliminates uncertainty about whether the extraction was completed, preventing de
 The plan identified a side-finding about incomplete extraction verification. This candidate addresses that finding with "Worth exploring" strength since it cannot be fully verified from the files in this community alone.
 
 NOTE: No changes applied — the critique found no issues with the original draft.
+
+### AC-842 · `closeOriginatingBrainDumpEntry()` silently swallows errors from bookkeeping
+Strength: Strong
+Files: src/lib/apply-core.js
+
+Problem:
+`closeOriginatingBrainDumpEntry()` wraps `closeBrainDumpEntryResolved()` in a try/catch that swallows all errors, with only a comment explaining the intent. This means if the brain dump entry closure fails (e.g., file write error, permission issue, malformed entry ID), the error is completely invisible -- the task appears to apply successfully even though the bookkeeping failed. There's no logging, no metric, no way to detect that the brain dump wasn't closed. This is particularly risky because brain dump closure is a side effect that doesn't affect the primary task outcome, so failures are easy to miss.
+
+Solution:
+Add error logging (e.g., `console.warn()`) inside the try/catch to surface brain dump closure failures. Consider whether the error should be re-thrown or whether a warning is sufficient, depending on whether brain dump closure is critical to the apply outcome.
+
+Benefits:
+Failures in brain dump bookkeeping are no longer silent -- operators can detect and investigate cases where the side effect failed, even if the primary task succeeded. This prevents the "task applied but brain dump not closed" state from accumulating unnoticed, which could lead to stale or orphaned brain dump entries over time.
+
+NOTE: AC-105 was removed because the critique correctly identified that the claimed control flow (writeArtifact → applyCandidateSplit → getRegisteredSource) is fabricated; the two getRegisteredSource calls are in separate branches of writeArtifact, not sequential, so the reported duplication problem does not exist.
