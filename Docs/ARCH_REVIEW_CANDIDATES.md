@@ -3626,3 +3626,26 @@ Benefits:
 - Reduces confusion about the "correct" call pattern.
 - Makes the optimization trade-off explicit.
 - Ensures consistent behavior across call sites.
+
+### AC-828 · Overloaded `apply-main-batch.js` with scattered push-policy logic
+Strength: Strong
+
+**Strength:** Strong
+**Files:** `src/lib/apply-main-batch.js`
+
+**Problem:**
+`apply-main-batch.js` (link-degree 9) is the largest file in this community and handles three distinct push scenarios (gated triage-branch, ungated direct-to-main, local-only with no origin) with complex, interleaved logic for each. The gated path includes triage-branch preparation, retracted-candidate pruning, fetch/rebase/push retry, and a "kept local" fallback. The ungated path has its own push-failure fallback. The local-only path short-circuits early. These three paths are woven together in `applyDirectToMainBatchOnBranch`, making the function long and forcing readers to track multiple state transitions (`enteredTriageBranch`, `hasOrigin`, `gated`, `recovered`) across the entire function. The comment at the top notes this file was "extracted from src/apply-task.js" as part of a decompose, but the remaining file still carries too many responsibilities.
+
+**Solution:**
+Extract the three push scenarios into three dedicated modules under `src/lib/apply-main-batch/` (e.g., `push-gated-triage.js`, `push-ungated-to-main.js`, `push-local-only.js`). Each module encapsulates its own fetch/rebase/push/fallback flow and exports a single function. The main file's `applyDirectToMainBatchOnBranch` becomes a small dispatcher that routes based on `gated` and `hasOrigin`.
+
+Additionally, `applyDirectToMainBatch` (the wrapper that handles triage-branch checkout and return-to-main logic) is a separate concern from the push policy. Extract it into its own helper, `src/lib/apply-main-batch/with-branch-context.js`, which accepts a `pushHandler` callback. This isolates the branch-lifecycle management (checkout → invoke push handler → return to main) from the push-policy decisions, so the dispatcher in `apply-main-batch.js` only needs to pick the right `pushHandler` and hand it off.
+
+**Benefits:**
+- Each push scenario becomes a self-contained unit of logic, easier to read and test.
+- The main file becomes a clear dispatcher plus a branch-context wrapper, reducing cognitive load.
+- Future changes to one push path don't risk accidentally affecting the others.
+- The link-degree of `apply-main-batch.js` decreases as logic moves to focused modules.
+
+**Testability:**
+The git-runner abstraction (`gitRunner.run`) already accepts a command and returns `{code, stdout, stderr}`, so each extracted push module can be tested by mocking `gitRunner.run` to simulate success, rebase conflicts, and push failures. The branch-context wrapper can be tested by mocking the git-runner to verify checkout/return-to-main sequencing without exercising push logic. No additional mocking infrastructure is required beyond what the existing test suite already uses.
