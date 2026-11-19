@@ -155,6 +155,23 @@ function citesEvidence(soWhat, completedNumbers, taskIds) {
   return citesFragment(soWhat.toLowerCase(), taskIds);
 }
 
+// 2026-11-18: pure helpers for the capability-ceiling finding. No gate change and no model call. citationTokensFor() is the closed set of real
+// citation tokens this task's evidence supports. attachSoWhatCitation() appends a deterministic "Evidence:" line naming only those real tokens when
+// the SO WHAT section has no citation of its own. Not wired into postImplementCheck: attach-versus-reject is a human decision.
+function citationTokensFor(task) {
+  const tokens = realCompletedNumbers(task).map((n) => `COMPLETED ${n}`);
+  for (const id of realTaskIds(task)) tokens.push(id);
+  return [...new Set(tokens)];
+}
+
+function attachSoWhatCitation(soWhatText, task) {
+  const text = String(soWhatText || '');
+  const tokens = citationTokensFor(task);
+  if (!tokens.length) return text;
+  if (citesEvidence(text, realCompletedNumbers(task), realTaskIds(task))) return text;
+  return `${text.replace(/\s+$/, '')}\nEvidence: ${tokens.slice(0, 5).join(', ')}`;
+}
+
 // task, implementResponse -> { verdict: 'ok'|'ungrounded', reason? }
 function runSoWhatCitationCheck(task, implementResponse) {
   if (!isEnabled()) return { verdict: 'ok' };
@@ -177,4 +194,4 @@ function runSoWhatCitationCheck(task, implementResponse) {
   };
 }
 
-module.exports = { runSoWhatCitationCheck, realCompletedNumbers, realTaskIds, extractSoWhatSection };
+module.exports = { runSoWhatCitationCheck, realCompletedNumbers, realTaskIds, extractSoWhatSection, citationTokensFor, attachSoWhatCitation };
