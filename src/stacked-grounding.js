@@ -21,8 +21,8 @@ const { createRealGitRunner } = require('./git-runner.js');
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
 
-function runGit(args, cwd) {
-  return execFileSync('git', args, { cwd, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+function runGit(args, cwd, opts = {}) {
+  return execFileSync('git', args, { cwd, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, ...opts });
 }
 
 // Returns the stacked branch's plain name (e.g. "agent/decompose-autodecomp-...") if
@@ -81,7 +81,7 @@ function grepAtRef(repoRoot, ref, pattern, paths) {
 function resolveAtRef(repoRoot, ref, candidatePath, extraRoots = []) {
   let files;
   try {
-    files = execFileSync('git', ['ls-tree', '-r', '--name-only', `origin/${ref}`], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 })
+    files = runGit(['ls-tree', '-r', '--name-only', `origin/${ref}`], repoRoot, { maxBuffer: 64 * 1024 * 1024 })
       .split('\n').filter(Boolean);
   } catch { return null; }
   const set = new Set(files);

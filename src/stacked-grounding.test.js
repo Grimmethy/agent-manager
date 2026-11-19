@@ -111,3 +111,47 @@ test('resolveAtRef never throws: an unknown ref or empty path reads as not found
   assert.equal(resolveAtRef(repoDir, 'agent/no-such-branch', 'stacked-only.js'), null);
   assert.equal(resolveAtRef(repoDir, 'agent/stacked-family', ''), null);
 });
+
+// --- runGit options (AC-124) ---------------------------------------------------------------------------------------------------------------
+// Load a fresh copy of the module with child_process.execFileSync stubbed (the module destructures it at load time).
+function loadWithStub(impl) {
+  const cp = require('child_process');
+  const orig = cp.execFileSync;
+  const calls = [];
+  cp.execFileSync = (cmd, args, options) => { calls.push({ cmd, args, options }); return impl(cmd, args, options); };
+  const modPath = require.resolve('./stacked-grounding.js');
+  delete require.cache[modPath];
+  let mod;
+  try { mod = require('./stacked-grounding.js'); } finally { cp.execFileSync = orig; }
+  delete require.cache[modPath];
+  return { mod, calls };
+}
+
+test('runGit defaults (timeout, env, encoding) reach git for the stacked-only file case, and resolveAtRef only overrides maxBuffer', () => {
+  const { mod, calls } = loadWithStub((cmd, args) => (args[0] === 'ls-tree' ? 'stacked-only.js\nmain-only.txt\n' : 'content'));
+  assert.equal(mod.readFileAtRef('/repo', 'agent/x', 'stacked-only.js'), 'content');
+  assert.equal(mod.grepAtRef('/repo', 'agent/x', 'pat'), 'content');
+  assert.equal(mod.resolveAtRef('/repo', 'agent/x', 'stacked-only.js'), 'stacked-only.js');
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[0].args, ['show', 'origin/agent/x:stacked-only.js']);
+  for (const c of calls) {
+    assert.equal(c.cmd, 'git');
+    assert.equal(c.options.cwd, '/repo');
+    assert.equal(c.options.timeout, 60000);
+    assert.equal(c.options.encoding, 'utf8');
+    assert.equal(c.options.env.GIT_TERMINAL_PROMPT, '0');
+  }
+  assert.equal(calls[0].options.maxBuffer, undefined, 'readFileAtRef passes no extra options');
+  assert.equal(calls[1].options.maxBuffer, undefined, 'grepAtRef passes no extra options');
+  assert.equal(calls[2].options.maxBuffer, 64 * 1024 * 1024, 'resolveAtRef override applied');
+  assert.deepEqual(calls[2].args, ['ls-tree', '-r', '--name-only', 'origin/agent/x']);
+});
+
+test('an opts override applies to one call only and does not leak into the next', () => {
+  const { mod, calls } = loadWithStub(() => 'a.js\n');
+  mod.resolveAtRef('/repo', 'r', 'a.js');
+  mod.readFileAtRef('/repo', 'r', 'a.js');
+  assert.equal(calls[0].options.maxBuffer, 64 * 1024 * 1024);
+  assert.equal(calls[1].options.maxBuffer, undefined);
+  assert.equal(calls[1].options.timeout, 60000);
+});
