@@ -25,5 +25,14 @@
     "taskClasses": ["tuning_experiment"],
     "preempt": "never",
     "enabled": false
+  },
+  {
+    "gpu": "reasoning",
+    "ollamaUrl": "http://reasoning:11434",
+    "model": "qwen3:72b",
+    "taskClasses": ["brain_dump_sort"],
+    "projects": ["core"],
+    "raisedFromPrefix": ["core/"],
+    "preempt": "never"
   }
 ]
