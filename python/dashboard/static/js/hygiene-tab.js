@@ -115,7 +115,7 @@ function renderHygiene() {
       <tbody>${(d.families || []).map((f) => hygieneFamilyRows(f)).join('')}</tbody>
     </table>
     ${hygieneFileLength(d.fileLength)}
-    <div class="stat" style="margin-top:14px">Flag counts are approximate: the review re-locates each flag against the current file and can discard it as stale when it gets there. Candidate "stuck" reasons mirror the real fulfillment rules.</div>
+    <div class="stat stat-note">Flag counts are approximate: the review re-locates each flag against the current file and can discard it as stale when it gets there. Candidate "stuck" reasons mirror the real fulfillment rules.</div>
   `;
   const btn = document.getElementById('hygiene-refresh');
   if (btn) btn.onclick = async () => { btn.disabled = true; btn.textContent = 'Refreshing...'; await loadHygiene({ refresh: true }); };
@@ -180,6 +180,6 @@ function hygieneFamilyDetail(f) {
 
 function hygieneFileLength(fl) {
   if (!fl || !fl.total) return '';
-  return `<div class="stat" style="margin-top:14px"><strong style="color:var(--text)">${fl.total}</strong> oversized file(s) flagged by the advisory file-length scan -- nothing tasks these automatically.
+  return `<div class="stat stat-note"><strong style="color:var(--text)">${fl.total}</strong> oversized file(s) flagged by the advisory file-length scan -- nothing tasks these automatically.
     ${escapeHtml((fl.items || []).slice(0, 8).map((i) => i.file + (i.lines ? ` (${i.lines})` : '')).join(', '))}${fl.total > 8 ? ', ...' : ''}</div>`;
 }
