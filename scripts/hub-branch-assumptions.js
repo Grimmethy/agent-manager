@@ -15,6 +15,7 @@ const SKIP_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', 'coverage', '__pycache__', '.venv',
   'project_cache', '.agent-manager-cache', 'graphify-out',
 ]);
+const SKIP_FILES = new Set(['hub-branch-assumptions.test.js']);
 const MAX_BYTES = 1048576;
 const MAX_TEXT = 160;
 const DOC_REL = 'Docs/PARALLEL_HUB_BRANCHES.md';
@@ -31,6 +32,7 @@ function walk(fs, dir, out) {
       if (SKIP_DIRS.has(e.name) || e.name.startsWith('.venv-broken-')) continue;
       walk(fs, full, out);
     } else if (e.isFile()) {
+      if (SKIP_FILES.has(e.name)) continue;
       out.push(full);
     }
   }
