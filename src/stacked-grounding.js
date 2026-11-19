@@ -78,20 +78,27 @@ function grepAtRef(repoRoot, ref, pattern, paths) {
 // "not found", which leaves the caller's own working-tree verdict in force.
 // 2026-09-20, PF HUB0005-01: a stacked task that MODIFIES a file only its chain branch has (tileGrid.ts) was blocked 3x by the plan-target
 // guard as a fabricated path, because that guard only looked at the shared checkout's working tree.
+// True only when `p` is a blob (file, not directory) at origin/<ref>. Object-database lookup, no full tree listing.
+function refHasBlob(repoRoot, ref, p) {
+  try {
+    return execFileSync('git', ['cat-file', '-t', `origin/${ref}:${p}`], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] }).trim() === 'blob';
+  } catch { return false; }
+}
+
 function resolveAtRef(repoRoot, ref, candidatePath, extraRoots = []) {
+  const normalized = String(candidatePath || '').replace(/\\/g, '/').replace(/^\.?\//, '');
+  if (!normalized) return null;
+  // Exact and extraRoot-prefixed hits are answered by direct object lookups; the full tree listing below runs only on a miss.
+  if (refHasBlob(repoRoot, ref, normalized)) return normalized;
+  for (const r of extraRoots || []) {
+    const full = path.posix.join(String(r).replace(/\\/g, '/'), normalized);
+    if (refHasBlob(repoRoot, ref, full)) return full;
+  }
   let files;
   try {
     files = execFileSync('git', ['ls-tree', '-r', '--name-only', `origin/${ref}`], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 })
       .split('\n').filter(Boolean);
   } catch { return null; }
-  const set = new Set(files);
-  const normalized = String(candidatePath || '').replace(/\\/g, '/').replace(/^\.?\//, '');
-  if (!normalized) return null;
-  if (set.has(normalized)) return normalized;
-  for (const r of extraRoots || []) {
-    const full = path.posix.join(String(r).replace(/\\/g, '/'), normalized);
-    if (set.has(full)) return full;
-  }
   const base = path.posix.basename(normalized);
   const matches = files.filter((f) => path.posix.basename(f) === base);
   if (matches.length === 1) return matches[0];
