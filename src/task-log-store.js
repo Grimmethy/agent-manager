@@ -30,6 +30,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { getTaskCompute } = require('./task-compute.js');
+const { sanitizeDeep } = require('./name-sanitizer.js');
 
 const TASK_LOG_DIR = 'task-logs';
 
@@ -77,7 +78,7 @@ function buildTaskLogRecord(task, { compute } = {}) {
   }
   // HUB0280-04: the per-task model compute rollup (src/task-compute.js), display-only; absent when there is none so an old record is unchanged.
   if (compute && typeof compute === 'object') record.compute = compute;
-  return record;
+  return sanitizeDeep(record);
 }
 
 // Writes (or overwrites -- see mergeAppendEvent below for the post-merge update path)
