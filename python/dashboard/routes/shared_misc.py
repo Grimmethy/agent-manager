@@ -326,8 +326,24 @@ def api_queue_state(state):
     return jsonify({"items": entries, "total": total})
 
 
-@shared_misc_bp.route("/api/adhoc-tasks")
-def api_adhoc_tasks():
+# Short SWR cache for the cross-cutting adhoc list. Two keys: one for the
+# default (done/ excluded) view and one for the opt-in (done/ included) view.
+# A failed compute never overwrites the stored value; a failed background
+# refresh only records last_error. Every return value is a deep copy, so the
+# route can slice it without aliasing the cache.
+from adhoc_tasks_cache import SwrListCache, page_tasks
+
+
+def _adhoc_cache_compute(key):
+    """Translate a cache key into an include_done flag and re-use the renamed body."""
+    include_done = key.endswith("_done")
+    return _compute_adhoc_tasks(include_done)
+
+
+_adhoc_cache = SwrListCache(_adhoc_cache_compute)
+
+
+def _compute_adhoc_tasks(include_done):
     """Every domain:'adhoc' task across the whole pipeline, in one flat list, with
     whichever queue state it's currently sitting in -- the cross-cutting view
     api_task_anywhere already has the right traversal shape for (drafting/ first,
@@ -351,12 +367,14 @@ def api_adhoc_tasks():
     concurrent requests (nav badge polling, other tabs, the phone app) regardless of
     how fast any one request actually was in isolation. done/ tasks aren't what this
     view exists to track anyway -- the whole point is active (in-progress) and stuck
-    (blocked) work, both already excluded from that giant folder."""
+    (blocked) work, both already excluded from that giant folder.
+
+    Returns the full sorted list; the route layers paging on top via page_tasks().
+    """
     from app import QUEUE_STATES, _adhoc_task_excerpt, logger, queue_dir, read_json_safe
     qdir = queue_dir()
     if not qdir:
-        return jsonify({"tasks": []})
-    include_done = request.args.get("includeDone") == "1"
+        return []
 
     def is_adhoc(data, task_id):
         return data.get("domain") == "adhoc" or task_id.startswith("adhoc-")
@@ -428,7 +446,32 @@ def api_adhoc_tasks():
             tasks.append(task_row(data, task_id, state))
 
     tasks.sort(key=lambda t: t.get("createdAt") or "", reverse=True)
-    return jsonify({"tasks": tasks})
+    return tasks
+
+
+@shared_misc_bp.route("/api/adhoc-tasks")
+def api_adhoc_tasks():
+    """Cross-cutting view of every adhoc task, served through a short SWR cache.
+    With no ?limit, returns {"tasks": [...]}. With ?limit, returns
+    {"tasks": page, "total": N} using the paging rules from adhoc_tasks_cache.page_tasks."""
+    include_done = request.args.get("includeDone") == "1"
+    key = "adhoc_tasks_done" if include_done else "adhoc_tasks"
+    tasks = _adhoc_cache.get(key)
+    limit = request.args.get("limit")
+    if limit is not None:
+        try:
+            limit = int(limit)
+        except ValueError:
+            limit = None
+    offset = request.args.get("offset", "0")
+    try:
+        offset = int(offset)
+    except ValueError:
+        offset = 0
+    if limit is None:
+        return jsonify({"tasks": tasks[offset:]})
+    page, total = page_tasks(tasks, limit, offset)
+    return jsonify({"tasks": page, "total": total})
 
 
 # /api/summary is polled every 5s per open browser tab and used to json-parse every record in
