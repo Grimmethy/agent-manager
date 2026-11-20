@@ -256,10 +256,12 @@ function extractChangedSymbols(diff) {
     if (name && name.length >= 5 && !SYMBOL_STOPLIST.has(name) && !found.includes(name)) found.push(name);
   };
   const declRe = /^(?:async\s+)?(?:function\*?\s+|def\s+|class\s+)([A-Za-z_$][\w$]*)|^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/;
+  const constRes = [/^([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)/, /^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=(?!.*=>)/]; // module-level constants: matched on the UNTRIMMED line, so indented assignments never match
   for (const line of String(diff || '').split('\n')) {
     let body = null;
     if (line.startsWith('@@')) body = (line.match(/^@@[^@]*@@\s*(.*)$/) || [])[1];      // hunk header: the function the hunk sits in
     else if ((line[0] === '+' || line[0] === '-' || line[0] === ' ') && !/^(?:\+\+\+|---)/.test(line)) body = line.slice(1).trimStart();   // changed OR context: an edit inside a function shows its def as context
+    if ((line[0] === '+' || line[0] === '-') && !/^(?:\+\+\+|---)/.test(line)) for (const re of constRes) { const c = line.slice(1).match(re); if (c) add(c[1]); }
     if (!body) continue;
     const m = body.match(declRe);
     if (m) add(m[1] || m[2]);
