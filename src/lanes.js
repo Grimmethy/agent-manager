@@ -178,6 +178,32 @@ function laneFromEntry(raw, index) {
     if (!list.length) { warnOnce(`${where} (${id}) taskClasses must be a non-empty array of task source names; skipped`); return null; }
     taskClasses = [...new Set(list)];
   }
+  let projects = null;
+  if (raw.projects !== undefined && raw.projects !== null) {
+    if (!Array.isArray(raw.projects)) { warnOnce(`${where} (${id}) projects must be an array of project labels; skipped`); return null; }
+    const list = [];
+    for (const p of raw.projects) {
+      if (typeof p !== 'string') { warnOnce(`${where} (${id}) projects entry must be a string; skipped`); return null; }
+      const t = p.trim();
+      if (!t) { warnOnce(`${where} (${id}) projects entry must be a non-empty string; skipped`); return null; }
+      list.push(t);
+    }
+    if (!list.length) { warnOnce(`${where} (${id}) projects must be a non-empty array of project labels; skipped`); return null; }
+    projects = [...new Set(list)];
+  }
+  let raisedFromPrefix = null;
+  if (raw.raisedFromPrefix !== undefined && raw.raisedFromPrefix !== null) {
+    if (!Array.isArray(raw.raisedFromPrefix)) { warnOnce(`${where} (${id}) raisedFromPrefix must be an array of strings; skipped`); return null; }
+    const list = [];
+    for (const p of raw.raisedFromPrefix) {
+      if (typeof p !== 'string') { warnOnce(`${where} (${id}) raisedFromPrefix entry must be a string; skipped`); return null; }
+      const t = p.trim();
+      if (!t) { warnOnce(`${where} (${id}) raisedFromPrefix entry must be a non-empty string; skipped`); return null; }
+      list.push(t);
+    }
+    if (!list.length) { warnOnce(`${where} (${id}) raisedFromPrefix must be a non-empty array of strings; skipped`); return null; }
+    raisedFromPrefix = [...new Set(list)];
+  }
   if (raw.reviews !== undefined && typeof raw.reviews !== 'boolean') { warnOnce(`${where} (${id}) reviews must be true or false; skipped`); return null; }
   const reviews = cloud ? (raw.reviews === undefined ? true : raw.reviews) : undefined;
   return {
@@ -197,6 +223,8 @@ function laneFromEntry(raw, index) {
     reviewerId: `reviewer-${gpu}`,
     preempt,
     taskClasses,
+    projects,
+    raisedFromPrefix,
     model,
     tier,
     reserve,
@@ -289,6 +317,20 @@ function laneAllowsSource(lane, sourceName) {
   return typeof sourceName === 'string' && lane.taskClasses.includes(sourceName);
 }
 
+// May this lane claim a task with these attributes? Scope is ignored for reviewer lanes.
+// A reviewer (reviewer:true or role==='reviewer') always returns true. Otherwise the lane's
+// projects (if set) must contain `project` exactly, and raisedFromPrefix (if set) must have an
+// entry that `raisedFrom` starts with; both project and raisedFrom must be present. taskClasses
+// still applies (fail closed).
+function laneAllowsTask(lane, { source, project, raisedFrom }) {
+  if (lane && (lane.reviewer === true || lane.role === 'reviewer')) return true;
+  if (!laneAllowsSource(lane, source)) return false;
+  if (!project || !raisedFrom) return false;
+  if (lane.projects && !lane.projects.includes(project)) return false;
+  if (lane.raisedFromPrefix && !lane.raisedFromPrefix.some((p) => raisedFrom.startsWith(p))) return false;
+  return true;
+}
+
 // Is `url` the Ollama endpoint of a lane marked slow? Used by the client modules, which only know their own OLLAMA_URL.
 function isSlowEndpoint(url, env = process.env) {
   if (!url) return false;
@@ -318,7 +360,7 @@ function isSlowLane(id, env = process.env) {
   try { const l = laneById(id, env); return !!(l && l.slow); } catch { return false; }
 }
 
-module.exports = { reviewerLanes, getLanes, laneById, laneAllowsSource, isSlowEndpoint, isCloudEndpoint, isScriptEndpoint, isSlowLane, gpuSlugFromName, lanesRegistryPath };
+module.exports = { reviewerLanes, getLanes, laneById, laneAllowsSource, laneAllowsTask, isSlowEndpoint, isCloudEndpoint, isScriptEndpoint, isSlowLane, gpuSlugFromName, lanesRegistryPath };
 
 if (require.main === module) {
   const [flag, arg] = process.argv.slice(2);
@@ -344,6 +386,10 @@ if (require.main === module) {
     for (const [k, v] of Object.entries(lane.env)) console.log(`${k}=${v}`);
     // The lane's claim allowlist and reviewer daemon, so the worker can re-read them each tick. Empty = claims any source / no reviewer.
     console.log(`LANE_TASK_CLASSES=${lane.taskClasses ? lane.taskClasses.join(',') : ''}`);
+    // Lane scope (feature lane-scope-let-a-lane-claim-only-named-projects-or-one-feature): projects and raisedFromPrefix, comma-joined, empty when unscoped.
+    // The worker re-reads these every tick via reload_lane_rules (scripts/agent-manager-common.sh).
+    console.log(`LANE_PROJECTS=${(lane.projects || []).join(',')}`);
+    console.log(`LANE_RAISED_FROM_PREFIX=${(lane.raisedFromPrefix || []).join(',')}`);
     console.log(`LANE_REVIEWS=${lane.reviewer ? lane.reviewerId : ''}`);
     // A cloud lane's `reviews` flag (default true): may this lane take review work before it drafts (feature cloud-agent-pool). Printed for cloud lanes only, so every other lane's output is unchanged.
     if (lane.cloud) console.log(`LANE_CLOUD_REVIEWS=${lane.reviews === false ? 'false' : 'true'}`);
