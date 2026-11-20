@@ -3898,3 +3898,18 @@ Strength: Strong
 ---
 
 NOTE: All three ACs were removed because the critique correctly identified factual errors in each — the singleton is intentional, the error handling is correct, and `extractBalancedJson` handles the case the draft claimed it couldn't.
+
+### AC-846 · Duplicated mkdir/rename/error-track sequence in `done-archive.js`
+Strength: Strong
+
+**Strength:** Strong  
+**Files:** `src/done-archive.js`
+
+**Problem:**  
+`archiveDoneTasks` and `archiveSpecificDoneTasks` each independently implement the same five-step move sequence: check a `destDirEnsured` flag, call `ensureArchiveDir(destDir)` (which internally invokes `fs.mkdirSync(destDir, { recursive: true })`), call `fs.renameSync(src, dest)`, catch the rename error, and push a formatted message into `result.errors`. The only difference is how `src` is determined (a directory-scan entry vs. an explicit task-ID string). If the archiving mechanics change — for example, adding per-source subdirectories, switching to copy-then-delete for cross-filesystem safety, or adjusting the error-message format — both functions must be updated identically, creating a maintenance hazard where one path can drift from the other.
+
+**Solution:**  
+Extract a small `moveToArchive(srcPath, destDir, destDirEnsuredRef, result)` helper that encapsulates the mkdir/rename/error-track sequence, and call it from both public functions. The two public functions then differ only in how they enumerate source files, each focusing on its distinct responsibility while delegating the shared mechanics.
+
+**Benefits:**  
+A change to the archiving mechanics is made in one helper rather than in two parallel code paths, eliminating the risk of divergence. The public functions become shorter and more readable, each expressing a single concern (enumeration vs. move semantics), which makes future refactors — such as adding logging, metrics, or cross-filesystem fallback — straightforward and localized.
