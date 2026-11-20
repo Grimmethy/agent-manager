@@ -137,12 +137,20 @@ function recordHubTierAudit(rankable, instancesDir) {
 // resolved source priority ascending, then mtime ascending. The caller
 // (local-worker.sh) iterates this list attempting an atomic claim (mv -n) on each in
 // turn, same as it did with the old inline script's output.
+// Attaches the scope-skip count to a result array as a non-enumerable property (the array's contents and iteration are unchanged) and, when the
+// caller passed opts.stats, writes it there too.
+function withScopeSkipCount(result, count, opts) {
+  Object.defineProperty(result, 'scopeSkipCount', { value: count, enumerable: false, configurable: true, writable: true });
+  if (opts && opts.stats && typeof opts.stats === 'object') opts.stats.scopeSkipCount = count;
+  return result;
+}
+
 function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   // The task files come through the RAM cache (queue-cache.js): a tick that finds the directory unchanged reads no task file. names() is [] for an
   // unreadable directory, like the readdir it replaces; with nothing listed nothing below could be returned or recorded, so stop here (this early return is an optimisation: the result is [] either way).
   const cache = openQueueCache(pendingDir);
   const names = cache.names();
-  if (names.length === 0) return [];
+  if (names.length === 0) return withScopeSkipCount([], 0, opts);
 
   // Side-effect requires: task-sources.js's registerTaskSource() calls populate
   // task-source-registry.js's registry as a load-time side effect -- must be required
@@ -192,6 +200,10 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   };
   const scopedLane = !coreActive && !gateDisabled();
   let skippedByScope = 0;
+  // Per-task lane / raised-from scope (opts.scopeLanes, opts.raisedFromPrefix). Unscoped calls leave both flags false, so nothing below changes for them.
+  const laneScoped = Array.isArray(opts.scopeLanes) && opts.scopeLanes.length > 0;
+  const prefixScoped = typeof opts.raisedFromPrefix === 'string' && opts.raisedFromPrefix.length > 0;
+  let scopeSkipCount = 0;
   for (const name of names) {
     const { task, mtimeMs } = readTaskCached(cache, path.join(pendingDir, name));
     const premium = !!(task && task.premiumPriority === true); // same test the shell side used to re-read every file for
@@ -201,6 +213,20 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     if (!scopeEligible(task)) { skippedByScope += 1; continue; } // scope:'core' on a non-core project: never claimable here, pinned or not
     if (pinnedWorker === instanceId) {
       pinned.push({ name, mtimeMs, premium });
+      continue;
+    }
+
+    // Per-task lane scope (opts.scopeLanes: array of lane names / classes such as 'premium'; the scope form of the task's "opts.lanes", renamed because
+    // opts.lanes is already the lane-object list) and raised-from prefix (opts.raisedFromPrefix). Each skip is a plain continue for this one task; an unscoped call skips nothing.
+    // An operator pin to this instance was handled above and is never scope-skipped.
+    if (laneScoped && !(task && (opts.scopeLanes.includes(task.lane) || (premium && opts.scopeLanes.includes('premium'))))) {
+      scopeSkipCount += 1;
+      if (typeof opts.onSkip === 'function') opts.onSkip((task && task.id) || name.replace(/\.json$/, ''), 'lane-scope-mismatch');
+      continue;
+    }
+    if (prefixScoped && !(task && typeof task.raisedFrom === 'string' && task.raisedFrom.startsWith(opts.raisedFromPrefix))) {
+      scopeSkipCount += 1;
+      if (typeof opts.onSkip === 'function') opts.onSkip((task && task.id) || name.replace(/\.json$/, ''), 'raised-from-prefix');
       continue;
     }
 
@@ -321,7 +347,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   cache.save();
   const ordered = [...pinned, ...rankable];
   // opts.withPremium: rows { name, premium } instead of names, so a caller that wants only the premium tasks (a premium-only borrowed tick) needs no second read of every file.
-  return opts.withPremium ? ordered.map((r) => ({ name: r.name, premium: r.premium })) : ordered.map((r) => r.name);
+  return withScopeSkipCount(opts.withPremium ? ordered.map((r) => ({ name: r.name, premium: r.premium })) : ordered.map((r) => r.name), scopeSkipCount, opts);
 }
 
 // Single-winner convenience form. local-worker.sh itself uses pickClaimableTasks()
