@@ -45,7 +45,7 @@ def _bump_stat(key):
     The counter is consulted by monitoring dashboards to flag tasks whose
     dependsOn references an id that no longer exists in any queue state.
     """
-    from queue_project_filter import queue_filter_stats
+    from routes.queue_project_filter import queue_filter_stats
 
     queue_filter_stats[key] = queue_filter_stats.get(key, 0) + 1
 
@@ -138,7 +138,19 @@ def _compute_signature(project_slugs):
                 mtime = state_dir.stat().st_mtime_ns
             except OSError:
                 mtime = 0
-            sig.append((slug, state, mtime))
+            # Per-file mtimes: an in-place edit does not change the dir mtime.
+            files_sig = 0
+            try:
+                with os.scandir(state_dir) as scan:
+                    for entry in scan:
+                        if entry.name.endswith(".json"):
+                            try:
+                                files_sig ^= hash((entry.name, entry.stat().st_mtime_ns))
+                            except OSError:
+                                pass
+            except OSError:
+                pass
+            sig.append((slug, state, mtime, files_sig))
     sig.sort()
     return tuple(sig)
 
