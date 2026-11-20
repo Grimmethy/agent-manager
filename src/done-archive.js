@@ -85,8 +85,12 @@ function monthBucket(d) {
 }
 
 // Single source of truth for the queue/done/_archived/<YYYY-MM>/ destination both passes use.
-function archiveDestDir(pipelineDir, now) {
-  return path.join(pipelineDir, 'queue', 'done', ARCHIVE_DIRNAME, monthBucket(new Date(now)));
+function archiveDestDir(doneDir, now) {
+  return path.join(doneDir, ARCHIVE_DIRNAME, monthBucket(new Date(now)));
+}
+
+function ensureArchiveDir(destDir) {
+  fs.mkdirSync(destDir, { recursive: true });
 }
 
 /**
@@ -110,7 +114,7 @@ function archiveDoneTasks({ pipelineDir, now = Date.now() }) {
     return result;
   }
 
-  const destDir = archiveDestDir(pipelineDir, now);
+  const destDir = archiveDestDir(doneDir, now);
   let destDirEnsured = false;
 
   for (const entry of entries) {
@@ -132,7 +136,7 @@ function archiveDoneTasks({ pipelineDir, now = Date.now() }) {
     }
 
     if (!destDirEnsured) {
-      fs.mkdirSync(destDir, { recursive: true });
+      ensureArchiveDir(destDir);
       destDirEnsured = true;
     }
     try {
@@ -161,7 +165,7 @@ function archiveDoneTasks({ pipelineDir, now = Date.now() }) {
  */
 function archiveSpecificDoneTasks({ pipelineDir, taskIds, now = Date.now() }) {
   const doneDir = path.join(pipelineDir, 'queue', 'done');
-  const destDir = archiveDestDir(pipelineDir, now);
+  const destDir = archiveDestDir(doneDir, now);
   const result = { moved: 0, missing: 0, errors: [] };
   let destDirEnsured = false;
 
@@ -169,7 +173,7 @@ function archiveSpecificDoneTasks({ pipelineDir, taskIds, now = Date.now() }) {
     const src = path.join(doneDir, `${id}.json`);
     if (!fs.existsSync(src)) { result.missing++; continue; }
     if (!destDirEnsured) {
-      fs.mkdirSync(destDir, { recursive: true });
+      ensureArchiveDir(destDir);
       destDirEnsured = true;
     }
     try {
@@ -220,7 +224,7 @@ function listArchivedMonthDirs(pipelineDir) {
 }
 
 module.exports = {
-  archiveDoneTasks, archiveSpecificDoneTasks, checkDue, listArchivedMonthDirs, retentionMs, statePath, monthBucket, ARCHIVE_DIRNAME,
+  archiveDoneTasks, archiveSpecificDoneTasks, checkDue, listArchivedMonthDirs, retentionMs, statePath, monthBucket, archiveDestDir, ensureArchiveDir, ARCHIVE_DIRNAME,
 };
 
 if (require.main === module) {
