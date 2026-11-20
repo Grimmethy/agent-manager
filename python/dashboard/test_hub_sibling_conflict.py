@@ -26,6 +26,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 import app  # noqa: E402
+from apply_lock_test_mixin import ApplyLockTestMixin  # noqa: E402
 
 
 def _reset_cache():
@@ -94,8 +95,9 @@ def make_repo_with_conflicting_siblings():
     return repo, bare, task_a, task_b
 
 
-class TestHubSiblingConflict(unittest.TestCase):
+class TestHubSiblingConflict(ApplyLockTestMixin, unittest.TestCase):
     def setUp(self):
+        super().setUp()
         _reset_cache()
         self._sync_patch = mock.patch.object(app, "_sync_live_checkout", return_value={"synced": False})
         self._sync_patch.start()
