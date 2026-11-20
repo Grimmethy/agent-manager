@@ -59,3 +59,56 @@ test('deadcode_triage is NOT special-cased in core -- with no alias registered i
   clearRegistry();
   assert.equal(resolveSourceName({ domain: 'default', source: 'deadcode_triage' }), 'deadcode_triage');
 });
+
+const { registerTaskSource, registerDomainAlias, getUnresolvedSourceCount, getUnresolvedSources } = require('./task-source-registry.js');
+
+test('built-ins survive clearRegistry(): adhoc/secondbrain domains and source:manual still resolve', () => {
+  clearRegistry();
+  assert.equal(resolveSourceName({ domain: 'adhoc', source: 'x' }), 'adhoc');
+  assert.equal(resolveSourceName({ domain: 'secondbrain', source: 'inbox' }), 'secondbrain');
+  assert.equal(resolveSourceName({ domain: 'default', source: 'manual' }), 'adhoc');
+});
+
+test('registerDomainAlias: a plugin domain resolves via the alias map, and clearRegistry() removes it', () => {
+  clearRegistry();
+  assert.equal(resolveSourceName({ domain: 'custom', source: 's' }), 's');
+  registerDomainAlias('custom', 'custom_src');
+  assert.equal(resolveSourceName({ domain: 'custom', source: 's' }), 'custom_src');
+  clearRegistry();
+  assert.equal(resolveSourceName({ domain: 'custom', source: 's' }), 's');
+});
+
+test('quirk source resolves before registration as unresolved, then to the alias once registered', () => {
+  clearRegistry();
+  assert.equal(resolveSourceName({ domain: 'default', source: 'deadcode_triage' }), 'deadcode_triage');
+  registerSourceAlias('deadcode_triage', 'unused_export');
+  assert.equal(resolveSourceName({ domain: 'default', source: 'deadcode_triage' }), 'unused_export');
+  clearRegistry();
+});
+
+test('adhoc-domain task whose source is a registered quirk name is still resolved, not dropped', () => {
+  clearRegistry();
+  registerTaskSource('adhoc', { priority: 1 });
+  registerTaskSource('unused_export', { priority: 2 });
+  registerSourceAlias('deadcode_triage', 'unused_export');
+  assert.equal(resolveSourceName({ id: 'a', domain: 'adhoc', source: 'deadcode_triage' }), 'adhoc');
+  assert.equal(resolveSourceName({ id: 'b', domain: 'default', source: 'deadcode_triage' }), 'unused_export');
+  assert.equal(getUnresolvedSourceCount(), 0);
+  clearRegistry();
+});
+
+test('an unresolved task records one drop with its id, raw source and domain', () => {
+  clearRegistry();
+  registerTaskSource('known', { priority: 1 });
+  assert.equal(resolveSourceName({ id: 'T-1', domain: 'dx', source: 'ghost' }), 'ghost');
+  assert.equal(getUnresolvedSourceCount(), 1);
+  assert.deepEqual(getUnresolvedSources(), [{ taskId: 'T-1', source: 'ghost', domain: 'dx', count: 1 }]);
+  clearRegistry();
+  assert.equal(getUnresolvedSourceCount(), 0);
+});
+
+test('empty registry: resolves by aliases/fallback and records nothing', () => {
+  clearRegistry();
+  assert.equal(resolveSourceName({ id: 'T-2', source: 'ghost' }), 'ghost');
+  assert.equal(getUnresolvedSourceCount(), 0);
+});

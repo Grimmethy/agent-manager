@@ -38,8 +38,9 @@ const poWorkerInfo = {
   steward: { label: '📉 idle-cost steward', does: 'files a task for the worst rising idle-cost originator' },
   hub: { label: '🧩 hub worker', does: 'drains the hidden hubs: answers or requeues stuck pieces, replaces abandoned ones, retires dead hubs' },
   atomizer: { label: '⚛️ task atomizer', does: 'built on src/worker-kit.js (HUB0014, docs/task-atomizer.md): replays a loop\'s model stages on smaller models and files the next step: lower a stage, split it, or ask the owner' },
+  featuremanager: { label: '🧭 feature manager', does: 'built on src/worker-kit.js: decides the next step for each feature and records it in the ledger' },
 };
-const poWorkerOrder = ['scout', 'checker', 'merger', 'steward', 'hub', 'atomizer'];
+const poWorkerOrder = ['scout', 'checker', 'merger', 'steward', 'hub', 'atomizer', 'featuremanager'];
 
 function poWorkerLabel(name) {
   return poWorkerInfo[name] ? poWorkerInfo[name].label : name;

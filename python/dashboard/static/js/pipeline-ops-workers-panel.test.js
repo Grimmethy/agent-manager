@@ -62,6 +62,15 @@ test('the task atomizer has a card after the hub worker, with its own name and w
   assert.equal(section({ workers: { atomizer: { configured: false, name: 'atomizer' } } }).includes('po-worker-panel-atomizer'), false);
 });
 
+test('the feature manager has a card after the task atomizer, with its own name and what it does', () => {
+  const html = section({ workers: { custom: live({ name: 'custom' }), featuremanager: live({ name: 'featuremanager' }), atomizer: live({ name: 'atomizer' }), hub: live({ name: 'hub' }), scout: live() } });
+  const ids = [...html.matchAll(/id="po-worker-panel-([a-z]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(ids, ['scout', 'hub', 'atomizer', 'featuremanager', 'custom']);
+  assert.match(html, /🧭 feature manager/);
+  assert.match(html, /decides the next step for each feature and records it in the ledger/);
+  assert.equal(section({ workers: { featuremanager: { configured: false, name: 'featuremanager' } } }).includes('po-worker-panel-featuremanager'), false);
+});
+
 test('the card has the id, the mode and trigger badges, the age of the last tick, the meta line and the switch', () => {
   const html = build('scout', live());
   assert.match(html, /<span class="id">🔎 poll scout<\/span>/);

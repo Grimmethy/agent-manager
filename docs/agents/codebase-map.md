@@ -89,6 +89,7 @@ Registry shape: `{tabs:[{id,name,open,width,lastActivatedAt}], order:[id]}`. Use
 | Needs-clarification flow | `/api/task/needs-clarification/<id>/resolve`, `/answer`, `/done`, `/discuss/*`, `/api/discuss/<session_id>*` | `app.py:3168-3292, 4421-4672` | Human-in-the-loop Q&A thread attached to a blocked task; opened from the Job List task-detail modal, not its own tab. |
 | Model benchmark panel | `/api/benchmark/*` | `app.py:2190-2373` | Launches/polls background model benchmark runs. |
 | Pipeline status/control | `/api/pipeline/status`, `/start`, `/stop` | `app.py:6680-7082, 8097-8148` | Overall daemon status and start/stop controls, surfaced inline on the Project tab rather than as a separate route-driven tab. |
+| Pipeline-ops workers panel (featuremanager card) | `/api/pipeline-ops-workers`, `/api/pipeline-ops-workers/<name>/enabled` | `python/dashboard/routes/pipeline_ops_workers.py` (`WORKERS` tuple) | Per-worker cards drawn by `pipeline-ops-workers-panel.js` (`poWorkerOrder`); `featuremanager` is the Feature Forge manager worker and its card follows the task atomizer's. A card shows only when the worker is configured; adding a worker means adding its name to `WORKERS` and `poWorkerOrder`. |
 
 ## Section 4 — Core pipeline mechanisms (seed section)
 
