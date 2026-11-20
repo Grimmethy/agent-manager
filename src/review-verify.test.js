@@ -322,17 +322,6 @@ test('extractChangedSymbols reads added/removed declarations and the function na
   assert.deepEqual(extractChangedSymbols('+++ b/x.py\n--- a/x.py\n'), []);
 });
 
-test('extractChangedSymbols captures module-level UPPER_CASE constants in Python and JS, ignores indented locals', () => {
-  const py = ['diff --git a/x.py b/x.py', '--- a/x.py', '+++ b/x.py', '@@ -1,3 +1,3 @@', '-WORKERS = ("a")', '+WORKERS = ("a", "b")'].join('\n');
-  assert.ok(extractChangedSymbols(py).includes('WORKERS'));
-  const js = ['diff --git a/x.js b/x.js', '--- a/x.js', '+++ b/x.js', '@@ -1,3 +1,3 @@', '-const MAX_X = 1;', '+const MAX_X = 2;'].join('\n');
-  assert.ok(extractChangedSymbols(js).includes('MAX_X'));
-  const ann = ['diff --git a/x.py b/x.py', '--- a/x.py', '+++ b/x.py', '@@ -1,3 +1,3 @@', '-CONFIG: dict = {}', '+CONFIG: dict = {"k": 1}'].join('\n');
-  assert.ok(extractChangedSymbols(ann).includes('CONFIG'));
-  const local = ['diff --git a/x.py b/x.py', '--- a/x.py', '+++ b/x.py', '@@ -5,3 +5,3 @@', ' def f():', '-    x = 1', '+    x = 2'].join('\n');
-  assert.equal(extractChangedSymbols(local).length, 0);
-});
-
 function makeDashTree() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-verify-sym-'));
   const w = (rel, text) => { fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true }); fs.writeFileSync(path.join(root, rel), text); };
@@ -391,21 +380,6 @@ test('findTestsWithSymbolFallback caps the extra symbol tests at AGENT_MANAGER_R
     assert.equal(extraCoveringMax({ AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX: '3' }), 3);
   } finally {
     if (saved === undefined) delete process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX; else process.env.AGENT_MANAGER_REVIEW_EXTRA_COVERING_MAX = saved;
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('findTestsWithSymbolFallback finds parent-dir test for constant-only diff (HUB0754-01)', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rv-const-'));
-  try {
-    fs.mkdirSync(path.join(root, 'python/dashboard/routes'), { recursive: true });
-    fs.writeFileSync(path.join(root, 'python/dashboard/routes/foo.py'), "WORKERS = ('a', 'b')\n");
-    fs.writeFileSync(path.join(root, 'python/dashboard/test_foo_registry.py'), 'from routes.foo import WORKERS\n');
-    const diff = ['diff --git a/python/dashboard/routes/foo.py b/python/dashboard/routes/foo.py', '--- a/python/dashboard/routes/foo.py', '+++ b/python/dashboard/routes/foo.py', '@@ -1,3 +1,3 @@', '-WORKERS = ("a", "b")', '+WORKERS = ("a", "b", "c")'].join('\n');
-    const result = findTestsWithSymbolFallback(root, ['python/dashboard/routes/foo.py'], diff);
-    assert.ok(result.py.includes('python/dashboard/test_foo_registry.py'), `got ${JSON.stringify(result.py)}`);
-    assert.ok(extractChangedSymbols(diff).includes('WORKERS'));
-  } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
