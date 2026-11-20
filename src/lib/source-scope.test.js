@@ -55,7 +55,7 @@ test('the seven pipeline-self sources are registered scope:core; project-level s
 test('registry wraps a core source\'s next(): null on another project, real result on agent-manager itself', () => {
   const { registerTaskSource, clearRegistry } = require('../task-source-registry.js');
   clearRegistry();
-  registerTaskSource('probe_core', { priority: 1, scope: 'core', next: () => ({ id: 'core-task' }) });
+  registerTaskSource('probe_core', { priority: 1, scope: 'core', gate: () => sourceEligibleHere({ scope: 'core' }), next: () => ({ id: 'core-task' }) });
   registerTaskSource('probe_plain', { priority: 2, next: () => ({ id: 'plain-task' }) });
   const { getRegisteredSource } = require('../task-source-registry.js');
   withRepo(otherProject(), () => {
@@ -70,7 +70,7 @@ test('getNextTask skips core sources on another project and falls through to the
   const { registerTaskSource, clearRegistry } = require('../task-source-registry.js');
   const { getNextTask } = require('./task-selection.js');
   clearRegistry();
-  registerTaskSource('audit_core', { priority: 22, scope: 'core', next: () => ({ id: 'audit' }) });
+  registerTaskSource('audit_core', { priority: 22, scope: 'core', gate: () => sourceEligibleHere({ scope: 'core' }), next: () => ({ id: 'audit' }) });
   registerTaskSource('hygiene', { priority: 28, next: () => ({ id: 'hygiene' }) });
   withRepo(otherProject(), () => assert.equal(getNextTask().id, 'hygiene', 'the priority-22 self-audit must not win on another project'));
   withRepo(PACKAGE_ROOT, () => assert.equal(getNextTask().id, 'audit'));

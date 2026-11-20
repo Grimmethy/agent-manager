@@ -19,6 +19,7 @@ const { execSync, execFileSync } = require('child_process');
 const { detectDefaultBranch } = require('./git-runner.js');
 const { registerTaskSource, getRegisteredSources, getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { reasoningTierFor } = require('./model-provider.js');
+const { sourceEligibleHere } = require('./lib/source-scope.js');
 const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
 const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-dump-existing-work.js');
@@ -2560,7 +2561,7 @@ registerTaskSource('project_search', {
 // right above. apply-task.js's own explicit `task.source === 'pipeline_self_audit'`
 // awaiting-confirm gate (added the same day) still holds any real resulting diff for
 // human confirmation, independent of domain.
-registerTaskSource('pipeline_self_audit', { scope: 'core', priority: taskPriority('pipeline_self_audit', 65), next: nextPipelineSelfAuditTask, emptyApproval: true, harnessSearch: 'archImport' });
+registerTaskSource('pipeline_self_audit', { scope: 'core', gate: () => sourceEligibleHere({ scope: 'core' }), priority: taskPriority('pipeline_self_audit', 65), next: nextPipelineSelfAuditTask, emptyApproval: true, harnessSearch: 'archImport' });
 // pipeline_forensics (2026-09-01) -- the deep, report-producing sibling. advisoryProse:
 // its implement pass writes a ranked root-cause report, never a diff (see
 // pipelineForensicsImplementPrompt). reasoningTier:'low' -- runs on the local model like
@@ -2578,7 +2579,7 @@ registerTaskSource('pipeline_self_audit', { scope: 'core', priority: taskPriorit
 // signature forever, or a 21-day cooldown per low-value source), so ranking it high has no
 // crowd-out cost. pipeline_forensics_fix sits just below it so a confirmed fix lands
 // promptly too.
-registerTaskSource('pipeline_forensics', { scope: 'core',
+registerTaskSource('pipeline_forensics', { scope: 'core', gate: () => sourceEligibleHere({ scope: 'core' }),
   priority: taskPriority('pipeline_forensics', 44),
   next: nextPipelineForensicsTask,
   apply: applyForensicsReport,
@@ -2607,7 +2608,7 @@ registerTaskSource('pipeline_forensics', { scope: 'core',
 // and never starves a task that would otherwise fix something actually broken.
 // capability_debrief (2026-10-17): priority 96, one below pipeline_debrief -- the least urgent source in the file. `probe: false` keeps the capability
 // probing (capability-routing.js) from ever handing it to a small lane: explaining why a task does not fit a small model is a larger model's job.
-registerTaskSource('capability_debrief', { scope: 'core',
+registerTaskSource('capability_debrief', { scope: 'core', gate: () => sourceEligibleHere({ scope: 'core' }),
   priority: taskPriority('capability_debrief', 96),
   next: nextCapabilityDebriefTask,
   apply: applyCapabilityDebriefReport,
@@ -2619,7 +2620,7 @@ registerTaskSource('capability_debrief', { scope: 'core',
   reviewGuidance: CAPABILITY_DEBRIEF_REVIEW_GUIDANCE,
   reviewCompletenessQuestion: CAPABILITY_DEBRIEF_COMPLETENESS_QUESTION,
 });
-registerTaskSource('pipeline_debrief', { scope: 'core',
+registerTaskSource('pipeline_debrief', { scope: 'core', gate: () => sourceEligibleHere({ scope: 'core' }),
   priority: taskPriority('pipeline_debrief', 95),
   next: nextPipelineDebriefTask,
   apply: applyDebriefReport,
@@ -2644,7 +2645,7 @@ registerTaskSource('pipeline_debrief', { scope: 'core',
 // so it sits below the candidate-fulfillment tier (70-73) and self_audit(65)'s own
 // blocked-task-pattern urgency, well above the large background-generation sources
 // (79-91) that would otherwise crowd it out indefinitely.
-registerTaskSource('doc_drift_fix', { scope: 'core',
+registerTaskSource('doc_drift_fix', { scope: 'core', gate: () => sourceEligibleHere({ scope: 'core' }),
   priority: taskPriority('doc_drift_fix', 68),
   next: nextDriftFixTask,
   // NOT emptyApproval: drift-fix.js's own fixableFlags() already guarantees a real,
@@ -2661,13 +2662,13 @@ registerTaskSource('doc_drift_fix', { scope: 'core',
 // costing real throughput/compute for as long as it goes unnoticed, closer in urgency to
 // staleness_audit's "is this still worth chasing" recheck than pipeline_self_audit's
 // slower blocked-task-cluster pattern.
-registerTaskSource('pipeline_health_audit', { scope: 'core', priority: taskPriority('pipeline_health_audit', 90), next: nextPipelineHealthAuditTask, emptyApproval: true, harnessSearch: 'archImport' });
+registerTaskSource('pipeline_health_audit', { scope: 'core', gate: () => sourceEligibleHere({ scope: 'core' }), priority: taskPriority('pipeline_health_audit', 90), next: nextPipelineHealthAuditTask, emptyApproval: true, harnessSearch: 'archImport' });
 // Priority 63, just under staleness_audit's own recheck neighborhood but well above the
 // large background-generation sources (arch_import/arch_discovery etc, 79-83) -- a
 // missing-UI finding is a real gap worth surfacing promptly, but (unlike
 // pipeline_health_audit) it's never actively costing throughput or compute the way a
 // live operational incident is, so it doesn't need to outrank those.
-registerTaskSource('ui_visibility_audit', { scope: 'core', priority: taskPriority('ui_visibility_audit', 63), next: nextUiVisibilityAuditTask, emptyApproval: true, harnessSearch: 'archImport' });
+registerTaskSource('ui_visibility_audit', { scope: 'core', gate: () => sourceEligibleHere({ scope: 'core' }), priority: taskPriority('ui_visibility_audit', 63), next: nextUiVisibilityAuditTask, emptyApproval: true, harnessSearch: 'archImport' });
 // apply: applyStalenessAuditVerdict (2026-08-23, Grimmethy: "We need to remove the human
 // part of that step") -- this source's implement pass writes an advisory report, never a
 // diff (see stalenessAuditImplementPrompt, prompts.js), so there is nothing for Group B's
@@ -2944,7 +2945,7 @@ registerTaskSource('backlog_fulfillment', {
 // neither ever hand-builds the feature the original failed task was chasing. NOT
 // emptyApproval: an empty fix draft means "couldn't produce the fix" -> reject -> retry ->
 // block for a human, not a silent auto-close (same reasoning as observability_fix).
-registerTaskSource('pipeline_forensics_fix', { scope: 'core',
+registerTaskSource('pipeline_forensics_fix', { scope: 'core', gate: () => sourceEligibleHere({ scope: 'core' }),
   priority: taskPriority('pipeline_forensics_fix', 43), // just below pipeline_forensics(44) -- see its comment
   next: () => {
     const task = nextCandidateFulfillmentTask(getConfig().pipelineFixCandidatesPath, 'pipeline_forensics_fix');
