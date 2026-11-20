@@ -636,6 +636,12 @@ def api_task_requeue(state, task_id):
                 "again to proceed anyway."
             ))
 
+    # circuitBreaker (set by src/review-task.js when the fact-check rejection counter trips): a manual requeue would redo
+    # the same failing work, so refuse here. This runs before any branch handling or write to queue/pending/, so the task
+    # file stays in queue/blocked/. A missing or non-True field is a no-op.
+    if data.get("circuitBreaker") is True:
+        return jsonify({"error": "circuit_breaker"}), 409
+
     # If this task was already applied to a branch that never merged (task-disposition.js's
     # 'pending-merge' -- an agent/<id> branch exists, ahead of main, unmerged), a requeue is
     # about to redo the same work from scratch on a FRESH branch, so the old one is now
