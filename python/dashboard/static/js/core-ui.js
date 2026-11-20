@@ -83,7 +83,25 @@ async function fetchJsonUncached(url, timeoutMs) {
   return r.json();
 }
 
-async function fetchJson(url, { timeoutMs = 8000 } = {}) {
+// Queue list fetch: no 8 s abort and no 'timed out after' error. QueueSlowFetch.fetchList only
+// calls onSlow at slowMs and rejects on network/HTTP failure. Non-OK responses are still
+// remembered in fetchFailures. Dedupe sharers get the first caller's onSlow.
+async function fetchQueueListUncached(url, onSlow) {
+  try {
+    return await QueueSlowFetch.fetchList(url, { slowMs: 8000, onSlow });
+  } catch (e) {
+    if (e && typeof e.message === 'string' && e.message.indexOf('HTTP ') === 0) {
+      fetchFailures.set(url, { message: e.message, at: Date.now() });
+    }
+    throw e;
+  }
+}
+
+function isQueueListUrl(url) {
+  return typeof url === 'string' && url.indexOf('/api/queue/') === 0;
+}
+
+async function fetchJson(url, { timeoutMs = 8000, queueList = isQueueListUrl(url), onSlow } = {}) {
   const failure = fetchFailures.get(url);
   if (failure) {
     if (Date.now() - failure.at < FETCH_FAILURE_MEMORY_MS) throw new Error(failure.message);
@@ -91,7 +109,8 @@ async function fetchJson(url, { timeoutMs = 8000 } = {}) {
   }
   const pending = fetchInFlight.get(url);
   if (pending) return pending;
-  const promise = fetchJsonUncached(url, timeoutMs).finally(() => fetchInFlight.delete(url));
+  const useQueueList = queueList && typeof QueueSlowFetch !== 'undefined';
+  const promise = (useQueueList ? fetchQueueListUncached(url, onSlow) : fetchJsonUncached(url, timeoutMs)).finally(() => fetchInFlight.delete(url));
   fetchInFlight.set(url, promise);
   return promise;
 }
