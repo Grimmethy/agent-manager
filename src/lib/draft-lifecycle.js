@@ -9,12 +9,31 @@ const { resolveSourceName, getRegisteredSource } = require('../task-source-regis
 // Defined in ./ollama-lock-key.js (shared with the interactive chat); re-exported below under the same name.
 const { localOllamaLockKey } = require('./ollama-lock-key.js');
 
+const PREMIUM_KEYS = ['premiumPriority', 'premiumSetBy', 'premiumSetAt'];
+
 function writeTaskJson(taskPath, task) {
+  // Premium fields are carried forward from the on-disk record when the incoming task leaves
+  // them undefined, so a stage move or persist-hook write cannot drop the flag. An explicit
+  // value (including null/false) from the caller always wins. The caller's object is not mutated.
+  const out = { ...task };
+  let existing = null;
+  try {
+    existing = JSON.parse(fs.readFileSync(taskPath, 'utf8'));
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      process.stderr.write(`writeTaskJson: could not read existing record ${taskPath} for premium carry-forward: ${err.message}\n`);
+    }
+  }
+  if (existing && typeof existing === 'object') {
+    for (const k of PREMIUM_KEYS) {
+      if (out[k] === undefined && existing[k] !== undefined) out[k] = existing[k];
+    }
+  }
   // Atomic write: the history persist hook (see main()) rewrites this file on every
   // checkpoint while a draft is in flight, and the dashboard polls it concurrently -- a
   // half-written file must never be observable. Same-dir tmp keeps the rename on one fs.
   const tmp = `${taskPath}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(task, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(out, null, 2));
   fs.renameSync(tmp, taskPath);
 }
 

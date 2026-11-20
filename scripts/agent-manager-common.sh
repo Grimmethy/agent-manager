@@ -159,6 +159,16 @@ worker_switched_off() {
   node "$switch_js" is-disabled "$id" 2>/dev/null
 }
 
+# worker_switch_message <instance_id> -> prints WHY the worker is off: the node/global pause marker's own reason and start time, or the Workers tab text for a per-worker
+# marker (src/worker-switch-message.js). Any failure prints the Workers tab text, so the log line is never empty.
+worker_switch_message() {
+  local id="${1:-}" msg_js msg=""
+  msg_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/worker-switch-message.js"
+  [[ -f "$msg_js" ]] && msg="$(node "$msg_js" "$id" 2>/dev/null)"
+  [[ -n "$msg" ]] || msg='switched off by the operator (Workers tab) -- claiming nothing until it is switched back on.'
+  printf '%s' "$msg"
+}
+
 # cloud_take_review <instance_id> -> exit 0 when this cloud worker just reviewed one waiting item (the caller then ends the tick), 1 when it did not and should go on to
 # draft. Owner rule (cloud-agent-pool): cloud agents review before they draft, and when every waiting review is already claimed the agent takes a draft. Only a worker-cloud /
 # worker-cloudN instance reviews, and not when its lane says reviews:false (LANE_RULES_CLOUD_REVIEWS, kept fresh by reload_lane_rules; unset counts as true). No spawn at all

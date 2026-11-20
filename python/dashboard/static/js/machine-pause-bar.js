@@ -12,9 +12,17 @@ function machinePauseUntil(iso) {
   return 'until ' + two(d.getHours()) + ':' + two(d.getMinutes());
 }
 
+function machinePauseSince(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const two = (n) => String(n).padStart(2, '0');
+  return ', since ' + two(d.getHours()) + ':' + two(d.getMinutes());
+}
+
 function machinePauseNote(marker, label) {
   if (!marker) return '';
-  const text = label + ' paused' + (marker.source ? ' by ' + marker.source : '') + (marker.reason ? ' (' + marker.reason + ')' : '') + ', ' + machinePauseUntil(marker.expiresAt);
+  const text = label + ' paused' + (marker.source ? ' by ' + marker.source : '') + (marker.reason ? ' (' + marker.reason + ')' : '') + machinePauseSince(marker.setAt) + ', ' + machinePauseUntil(marker.expiresAt);
   return ' <span class="badge warn machine-pause-note" title="Workers on ' + (label === 'Everything' ? 'every machine' : 'this machine') + ' claim nothing new while this lasts; tasks in flight finish">' + workerSwitchEsc(text) + '</span>';
 }
 

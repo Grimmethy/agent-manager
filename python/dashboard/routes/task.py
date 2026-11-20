@@ -85,6 +85,21 @@ def _clean_slate_for_fresh_adhoc_attempt(data):
     if data.get("status") == "blocked":
         data["status"] = "pending"
 
+
+_PREMIUM_FIELDS = ("premiumPriority", "premiumSetBy", "premiumSetAt")
+
+
+def _carry_premium_fields(src_path, data):
+    """Re-reads the source file (no lock helper exists in this module, so this is a fresh read
+    immediately before the write) and copies the premium fields into `data` in place, after any
+    clean-slate stripping, so a needs-clarification -> adhoc move never loses them."""
+    from app import read_json_safe
+    current_src = read_json_safe(src_path) or {}
+    for field in _PREMIUM_FIELDS:
+        if field in current_src:
+            data[field] = current_src[field]
+
+
 @task_bp.route("/api/task/<state>/<task_id>")
 def api_task_detail(state, task_id):
     from app import QUEUE_STATES, _files_touched_for, _incoming_task_links, _outgoing_task_links, _task_cost_summary, _task_input_summary, _work_log_for, queue_dir, read_json_safe
@@ -621,6 +636,12 @@ def api_task_requeue(state, task_id):
                 "again to proceed anyway."
             ))
 
+    # circuitBreaker (set by src/review-task.js when the fact-check rejection counter trips): a manual requeue would redo
+    # the same failing work, so refuse here. This runs before any branch handling or write to queue/pending/, so the task
+    # file stays in queue/blocked/. A missing or non-True field is a no-op.
+    if data.get("circuitBreaker") is True:
+        return jsonify({"error": "circuit_breaker"}), 409
+
     # If this task was already applied to a branch that never merged (task-disposition.js's
     # 'pending-merge' -- an agent/<id> branch exists, ahead of main, unmerged), a requeue is
     # about to redo the same work from scratch on a FRESH branch, so the old one is now
@@ -749,6 +770,17 @@ def api_task_requeue(state, task_id):
         fresh["premiumSetBy"] = data["premiumSetBy"]
     if "premiumSetAt" in data:
         fresh["premiumSetAt"] = data["premiumSetAt"]
+    # Fresh read of the source file to ensure premium fields are preserved even if
+    # something between the initial read and this write modified the in-memory copy.
+    # This is the defensive pattern: re-read the file to get the canonical current
+    # values, then copy the premium fields from that fresh read.
+    current_src = read_json_safe(src) or {}
+    if "premiumPriority" in current_src:
+        fresh["premiumPriority"] = current_src["premiumPriority"]
+    if "premiumSetBy" in current_src:
+        fresh["premiumSetBy"] = current_src["premiumSetBy"]
+    if "premiumSetAt" in current_src:
+        fresh["premiumSetAt"] = current_src["premiumSetAt"]
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual",
@@ -786,6 +818,7 @@ def api_task_resolve_clarification(task_id):
     dest = adhoc_dir / f"{task_id}.json"
     if dest.exists():
         abort(409, description=f"'{task_id}' already has a task in adhoc/")
+    _carry_premium_fields(src, data)
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint="needs-clarification resolved via the file-path picker", requeue_writer="operator-manual", pipeline_dir=scope["pipelineDir"] if scope else None)
@@ -865,6 +898,7 @@ def api_task_answer_clarification(task_id):
     dest = adhoc_dir / f"{task_id}.json"
     if dest.exists():
         abort(409, description=f"'{task_id}' already has a task in adhoc/")
+    _carry_premium_fields(src, data)
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint=f"needs-clarification answered from the picker: {answer[:200]}", requeue_writer="operator-manual", pipeline_dir=scope["pipelineDir"] if scope else None)

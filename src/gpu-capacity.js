@@ -58,12 +58,9 @@ function laneNumBatch(env = process.env) {
   return Number.isInteger(n) && n >= 32 && n <= 8192 ? n : null;
 }
 
-// Kept so existing callers keep working: there is no longer a separate, larger tier.
-const EXTENDED_NUM_CTX = PINNED_NUM_CTX;
-
 // OLLAMA_KV_CACHE_TYPE (e.g. a lower-precision KV cache dtype) is an additional VRAM
 // lever that is not yet enabled in this deployment. Do not raise NUM_CTX (PINNED_NUM_CTX
-// / EXTENDED_NUM_CTX above) until a quality regression check has been run against the
+// above) until a quality regression check has been run against the
 // resulting output on this model -- a larger context or a quantized KV cache that
 // degrades quality would only show up in the actual answers, not in the VRAM math here.
 
@@ -188,7 +185,6 @@ module.exports = {
   DEFAULT_PINNED_NUM_CTX,
   laneNumCtx,
   laneNumBatch,
-  EXTENDED_NUM_CTX,
   HARD_TIMEOUT_CEILING_MS,
   MIN_TIMEOUT_MS,
   DEFAULT_TIMEOUT_MS,

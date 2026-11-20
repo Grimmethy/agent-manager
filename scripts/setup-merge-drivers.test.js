@@ -91,6 +91,18 @@ test('idempotent: a second run changes nothing and adds no duplicate line', () =
   assert.equal(info.split('\n').filter((l) => l === LINE).length, 1);
 });
 
+test('unset driver is restored by a rerun; a second run leaves the config unchanged', () => {
+  const repo = makeRepo();
+  setup(repo);
+  git(repo, 'config', '--unset-all', 'merge.candidates-doc.driver');
+  assert.throws(() => git(repo, 'config', '--get', 'merge.candidates-doc.driver'));
+  setup(repo);
+  const first = git(repo, 'config', '--get', 'merge.candidates-doc.driver');
+  assert.match(first, /candidates-doc-merge-driver\.js/);
+  setup(repo);
+  assert.equal(git(repo, 'config', '--get', 'merge.candidates-doc.driver'), first);
+});
+
 test('survives `git stash -u` (the apply-clone reset path)', () => {
   const repo = makeRepo();
   setup(repo);
