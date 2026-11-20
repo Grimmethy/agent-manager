@@ -118,3 +118,89 @@ test('end to end with real git: stale checkout, file on origin/main -> requeued;
   assert.deepEqual(s.requeued.map((r) => r.id), ['arch-discovery-community-5']);
   assert.ok(has(dir, 'blocked', 'inv'));
 });
+
+// ---- Unchanged-grounding guard (HUB0769 3/4): real gatherGroundingEvidence over a fixture repo ----
+const ugr = require('./ungrounded-import-resolution.js');
+const NOW = new Date('2026-11-20T00:00:00Z');
+const fixtureRepo = (files = []) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fprs-repo-'));
+  fs.mkdirSync(path.join(root, 'src', 'lib'), { recursive: true });
+  for (const f of files) fs.writeFileSync(path.join(root, 'src', 'lib', f), '//');
+  return root;
+};
+const fpOf = (task, root) => {
+  const e = ugr.gatherGroundingEvidence(task, root, []);
+  return ugr.resolveUngroundedImport({ citedPaths: [...e.existingPaths, ...e.missingPaths], existingPaths: e.existingPaths, evidenceFiles: e.evidenceFiles, hitCount: e.hitCount }).fingerprint;
+};
+const guarded = (over = {}) => blocked({ rawText: 'Files: src/lib/dealCsv.ts', ...over });
+const runG = (dir, root, over = {}) => run(dir, { repoRoot: root, now: NOW, ...over });
+const readState = (dir, state, id) => JSON.parse(fs.readFileSync(path.join(dir, 'queue', state, `${id}.json`), 'utf8'));
+const stages = (t) => t.history.map((h) => h.stage);
+
+test('unchanged fingerprint: no requeue, suppression recorded in history', () => {
+  const root = fixtureRepo(['dealCsvHelper.ts']);
+  const t = guarded(); t.groundingFingerprint = fpOf(t, root);
+  const dir = pipeline([['blocked', t]]);
+  const s = runG(dir, root);
+  assert.equal(s.requeued.length, 0);
+  assert.ok(has(dir, 'blocked', t.id));
+  assert.ok(!has(dir, 'pending', t.id));
+  assert.ok(stages(readState(dir, 'blocked', t.id)).includes('requeue-suppressed-unchanged-grounding'));
+  runG(dir, root);
+  assert.equal(stages(readState(dir, 'blocked', t.id)).filter((x) => x === 'requeue-suppressed-unchanged-grounding').length, 1);
+});
+
+test('changed fingerprint (new fixture file): requeued with the new evidence', () => {
+  const root = fixtureRepo(['dealCsvHelper.ts']);
+  const t = guarded(); t.groundingFingerprint = fpOf(t, root);
+  fs.writeFileSync(path.join(root, 'src', 'lib', 'dealCsvExtra.ts'), '//');
+  const dir = pipeline([['blocked', t]]);
+  const s = runG(dir, root);
+  assert.equal(s.requeued.length, 1);
+  assert.ok(!has(dir, 'blocked', t.id));
+  const fresh = readState(dir, 'pending', t.id);
+  assert.notEqual(fresh.groundingFingerprint, t.groundingFingerprint);
+  assert.ok(fresh.groundingEvidence.includes('src/lib/dealCsvExtra.ts'));
+});
+
+test('legacy task with no stored fingerprint is still requeued', () => {
+  const root = fixtureRepo(['dealCsvHelper.ts']);
+  const t = guarded();
+  const dir = pipeline([['blocked', t]]);
+  assert.equal(runG(dir, root).requeued.length, 1);
+  assert.ok(has(dir, 'pending', t.id));
+});
+
+test('zero evidence and unchanged fingerprint: archived with reason, not left blocked', () => {
+  const root = fixtureRepo([]);
+  const t = guarded(); t.groundingFingerprint = fpOf(t, root);
+  const dir = pipeline([['blocked', t]]);
+  const s = runG(dir, root);
+  assert.equal(s.requeued.length, 0);
+  assert.equal(s.archived.length, 1);
+  assert.equal(s.counters.ungrounded_import_archived, 1);
+  assert.ok(!has(dir, 'blocked', t.id));
+  const a = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', '_archived', '2026-11', `${t.id}.json`), 'utf8'));
+  assert.ok(stages(a).includes('archived-ungrounded-import'));
+  assert.match(a.archivedReason, /dealCsv\.ts/);
+});
+
+test('no task is left blocked with fabricated-path text and no pending resolution', () => {
+  const root = fixtureRepo(['dealCsvHelper.ts']);
+  const empty = fixtureRepo([]);
+  const withEv = guarded({ id: 'ev' }); withEv.groundingFingerprint = fpOf(withEv, root);
+  const noEv = guarded({ id: 'noev' }); noEv.groundingFingerprint = fpOf(noEv, empty);
+  const dir = pipeline([['blocked', withEv]]);
+  runG(dir, root);
+  const dir2 = pipeline([['blocked', noEv]]);
+  runG(dir2, empty);
+  const resolved = new Set(['requeue-suppressed-unchanged-grounding', 'archived-ungrounded-import']);
+  for (const d of [dir, dir2]) {
+    const bdir = path.join(d, 'queue', 'blocked');
+    const names = fs.existsSync(bdir) ? fs.readdirSync(bdir) : [];
+    for (const name of names) {
+      const t = JSON.parse(fs.readFileSync(path.join(bdir, name), 'utf8'));
+      assert.ok(stages(t).some((x) => resolved.has(x)), `${t.id} left blocked without a resolution event`);
+    }
+  }
+});

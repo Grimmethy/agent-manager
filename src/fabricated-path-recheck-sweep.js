@@ -19,7 +19,8 @@ const fs = require('fs');
 const path = require('path');
 const { failureText } = require('./known-fixed-failures.js');
 const { destinationDir, freshShape } = require('./fix-signature-sweep.js');
-const { parseFabricatedPaths, resolveCitedFileAtMain } = require('./candidate-path-grounding.js');
+const { parseFabricatedPaths, resolveCitedFileAtMain, formatFabricatedReason } = require('./candidate-path-grounding.js');
+const { gatherGroundingEvidence, resolveUngroundedImport } = require('./ungrounded-import-resolution.js');
 const { readJsonSafe } = require('./task-anywhere.js');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
 
@@ -32,8 +33,8 @@ const DIRS = ['blocked', 'needs-clarification'];
 const enabled = () => process.env.AGENT_MANAGER_FABRICATED_PATH_RECHECK !== 'false';
 
 // existsAtMain(claimedPath) -> truthy is injectable so tests need no real repo.
-function sweepFabricatedPathRecheck({ pipelineDir, repoRoot, mainBranch = 'main', extraRoots = [], now = new Date(), dryRun = false, existsAtMain, fetch = true } = {}) {
-  const summary = { checked: 0, requeued: [], skipped: 0 };
+function sweepFabricatedPathRecheck({ pipelineDir, repoRoot, mainBranch = 'main', extraRoots = [], now = new Date(), dryRun = false, existsAtMain, fetch = true, gatherEvidence = gatherGroundingEvidence, resolveImport = resolveUngroundedImport } = {}) {
+  const summary = { checked: 0, requeued: [], skipped: 0, archived: [], suppressed: [], counters: { ungrounded_import_archived: 0 } };
   if (!enabled() || !pipelineDir) return summary;
   const queueDir = path.join(pipelineDir, 'queue');
   const nowIso = now.toISOString();
@@ -70,8 +71,50 @@ function sweepFabricatedPathRecheck({ pipelineDir, repoRoot, mainBranch = 'main'
       const dest = path.join(destinationDir(queueDir, task), name);
       // Same rule as fix-signature-sweep: a stale same-name copy in derived/ is this task's own origin record; in pending/ or adhoc/ it is a real duplicate.
       if (fs.existsSync(dest) && path.basename(path.dirname(dest)) !== 'derived') { summary.skipped += 1; continue; }
+      // Grounding guard: if the grounding fingerprint (cited paths + evidence files) equals the one stored on the task, a requeue would repeat the
+      // same failure. Archive when there is no evidence at all, otherwise record the suppression. A missing stored fingerprint or any error = requeue.
+      let g = null; let fp = null;
+      try {
+        g = gatherEvidence(task, repoRoot, extraRoots);
+        const res = resolveImport({
+          citedPaths: [...g.existingPaths, ...g.missingPaths], existingPaths: g.existingPaths, evidenceFiles: g.evidenceFiles, hitCount: g.hitCount,
+          priorFailure: failureText(task), priorFingerprint: task.groundingFingerprint || null,
+        });
+        fp = (res && res.fingerprint) || null;
+      } catch { g = null; fp = null; }
+      const stored = typeof task.groundingFingerprint === 'string' && task.groundingFingerprint ? task.groundingFingerprint : null;
+      if (g && fp && stored && fp === stored) {
+        const history = Array.isArray(task.history) ? task.history : [];
+        if (!(g.evidenceFiles.length || g.hitCount > 0)) {
+          const reason = formatFabricatedReason(paths.map((claimedPath) => ({ claimedPath })));
+          summary.counters.ungrounded_import_archived += 1;
+          summary.archived.push({ id: task.id, from: dir, paths, reason });
+          if (!dryRun) {
+            const archDir = path.join(queueDir, 'done', '_archived', nowIso.slice(0, 7));
+            fs.mkdirSync(archDir, { recursive: true });
+            writeJsonAtomicSync(path.join(archDir, name), {
+              ...task, archivedReason: reason, archivedAt: nowIso, groundingFingerprint: fp,
+              history: [...history, { stage: 'archived-ungrounded-import', event: 'archived-ungrounded-import', at: nowIso, detail: reason }],
+            });
+            fs.unlinkSync(filePath);
+          }
+        } else {
+          summary.suppressed.push({ id: task.id, from: dir, paths });
+          summary.skipped += 1;
+          const last = history[history.length - 1];
+          if (!dryRun && !(last && last.stage === 'requeue-suppressed-unchanged-grounding')) {
+            writeJsonAtomicSync(filePath, {
+              ...task,
+              history: [...history, { stage: 'requeue-suppressed-unchanged-grounding', event: 'requeue-suppressed-unchanged-grounding', at: nowIso, detail: 'same fabricated-path failure and same grounding evidence as the prior attempt' }],
+            });
+          }
+        }
+        continue;
+      }
       if (!dryRun) {
         const fresh = freshShape(task, ENTRY, dir, nowIso);
+        if (fp) fresh.groundingFingerprint = fp;
+        if (g && Array.isArray(g.evidenceFiles) && g.evidenceFiles.length) fresh.groundingEvidence = g.evidenceFiles.slice();
         fresh.history[fresh.history.length - 1].detail = `auto-requeued from ${dir}/: every path the grounding gate called fabricated (${paths.join(', ')}) exists on origin/${mainBranch}, so the block was a stale-checkout false alarm`;
         fs.mkdirSync(path.dirname(dest), { recursive: true });
         writeJsonAtomicSync(dest, fresh);
@@ -93,5 +136,5 @@ if (require.main === module) {
   const s = sweepFabricatedPathRecheck({
     pipelineDir: cfg.pipelineDir, repoRoot: cfg.repoRoot, mainBranch: detectDefaultBranch(cfg.repoRoot), extraRoots: cfg.grepAllowedDirs || [], dryRun,
   });
-  process.stdout.write(`checked=${s.checked} requeued=${s.requeued.length}${s.requeued.length ? ` [${s.requeued.map((r) => r.id).join(', ')}]` : ''} skipped=${s.skipped}${dryRun ? ' (dry run)' : ''}\n`);
+  process.stdout.write(`checked=${s.checked} requeued=${s.requeued.length}${s.requeued.length ? ` [${s.requeued.map((r) => r.id).join(', ')}]` : ''} skipped=${s.skipped} archived=${s.archived.length}${dryRun ? ' (dry run)' : ''}\n`);
 }
