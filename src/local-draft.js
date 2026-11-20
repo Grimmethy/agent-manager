@@ -1627,6 +1627,25 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
     task.priorRejectionFeedback.push(blockedReason);
     return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
   }
+  // Deterministic decompose structure gate (src/decompose-structure-check.js, no LLM call): a RESOLUTION: decompose draft without a valid
+  // JSON array of {title, rawText} sub-tasks is bounced here, before any review vote is spent on it. Deterministic defect, so like the size
+  // gate it goes through the normal reject-retry loop (no reviewInconclusive). A throwing gate is advisory and never blocks a draft.
+  let decomposeGate = null;
+  try {
+    decomposeGate = require('./decompose-structure-check.js').runDecomposeStructureCheck(task, task.implementResponse);
+  } catch (e) {
+    decomposeGate = null;
+  }
+  if (decomposeGate && decomposeGate.verdict === 'blocked') {
+    const blockedReason = String(decomposeGate.reason || '(no detail)').slice(0, 500);
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: blockedReason });
+    appendHistoryEvent(task, 'blocked', blockedReason);
+    task.blockedStage = 'review';
+    task.blockedReason = blockedReason;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(blockedReason);
+    return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
+  }
   if (postImplementEntry && typeof postImplementEntry.postImplementCheck === 'function') {
     let grounding;
     try {
