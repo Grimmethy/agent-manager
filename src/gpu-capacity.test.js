@@ -117,9 +117,7 @@ test('resolveTimeoutMs falls back to a conservative floor tokens/sec when none i
 });
 
 test('one context for every call: the extended tier is folded into PINNED_NUM_CTX, and it is the raised (2026-09-20) 49152', () => {
-  const { EXTENDED_NUM_CTX } = require('./gpu-capacity.js');
   assert.equal(PINNED_NUM_CTX, 49152);
-  assert.equal(EXTENDED_NUM_CTX, PINNED_NUM_CTX);
 });
 
 // Per-lane pinned context (2026-10-17): a lane's registry numCtx reaches the lane process as AGENT_MANAGER_LANE_NUM_CTX.

@@ -43,11 +43,15 @@ def refusal(st, vm):
         return ["already in forge mode"]
     reasons = []
     avail = st.get("memAvailMB")
-    freed = VM_FREES_MB if vm == "off" and (st.get("vm") or {}).get("state") == "running" else 0
+    vm_mb = VM_FREES_MB if vm == "off" and (st.get("vm") or {}).get("state") == "running" else 0
+    models_mb = st.get("modelsMB") or 0   # resident Ollama models that Forge mode evicts (status --json, same reading as on() in src/forge-mode.js)
+    models_err = st.get("modelsError")
+    freed = vm_mb + models_mb
     if avail is None:
         reasons.append("MemAvailable is unreadable")
     elif avail + freed < MIN_AVAIL_MB:
-        reasons.append(f"MemAvailable {avail} MB + {freed} MB freed by the plan is under the {MIN_AVAIL_MB} MB needed")
+        counted = f"VM {vm_mb} MB + resident models {models_mb} MB" + (f"; models not counted, {models_err}" if models_err else "")
+        reasons.append(f"MemAvailable {avail} MB + {freed} MB freed by the plan is under the {MIN_AVAIL_MB} MB needed ({counted})")
     io = st.get("ioSome10")
     if io is not None and io >= MAX_IO_SOME10:
         reasons.append(f"I/O pressure (some, 10 s) is {io}%, the limit is under {MAX_IO_SOME10}%")
@@ -73,7 +77,8 @@ def handle(method, body):
     st = status()
     reasons = refusal(st, vm)
     if reasons:
-        return {"started": False, "reasons": reasons, "status": st}, 409
+        counted = {"memAvailMB": st.get("memAvailMB"), "modelsMB": st.get("modelsMB") or 0, "modelsError": st.get("modelsError"), "vmFreesMB": VM_FREES_MB if vm == "off" and (st.get("vm") or {}).get("state") == "running" else 0}
+        return {"started": False, "reasons": reasons, "counted": counted, "status": st}, 409
     start_background(["on", "--vm", vm])
     return {"started": True, "action": "on", "vm": vm}, 202
 
