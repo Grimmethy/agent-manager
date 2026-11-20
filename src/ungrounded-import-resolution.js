@@ -31,7 +31,7 @@ function fingerprintOf(cited, evidence) {
     .digest('hex');
 }
 
-function resolveUngroundedImport({
+function resolveLegacy({
   citedPaths = [], existingPaths = [], evidenceFiles = [], hitCount = 0,
   priorFailure = null, priorFingerprint = null,
 } = {}) {
@@ -126,7 +126,7 @@ function searchTerms(roots, terms, existing) {
 }
 
 // Assumes the task text lives in title/rawText/description/promptContext.rawText.
-function gatherGroundingEvidence(task, repoRoot, extraRoots = []) {
+function gatherLegacy(task, repoRoot, extraRoots = []) {
   const empty = { existingPaths: [], missingPaths: [], evidenceFiles: [], hitCount: 0 };
   if (!repoRoot) return empty;
   const text = taskText(task);
@@ -151,4 +151,75 @@ function gatherGroundingEvidence(task, repoRoot, extraRoots = []) {
   return { existingPaths, missingPaths, evidenceFiles, hitCount };
 }
 
-module.exports = { resolveUngroundedImport, gatherGroundingEvidence };
+// ---- Contract API (HUB0774) layered over the legacy evidence/decision functions above. ----
+// Dispatch is by argument shape so existing callers/tests keep working.
+const IMPORTED_TYPES = ['arch_import', 'arch_discovery', 'deep_dive'];
+const ARCHIVED_COUNTER = 'ungrounded_import_archived';
+
+function normalizeCitedPath(p) {
+  if (typeof p !== 'string') return '';
+  let s = p.trim();
+  while (s.startsWith('./')) s = s.slice(2);
+  return s.replace(/:\d+(?::\d+)?$/, '');
+}
+
+function normalizeList(paths) {
+  const out = [];
+  for (const p of Array.isArray(paths) ? paths : []) {
+    const n = normalizeCitedPath(p);
+    if (n && !out.includes(n)) out.push(n);
+  }
+  return out.sort();
+}
+
+function fingerprintRejection(taskId, rejectedPaths) {
+  return `${taskId}|${normalizeList(rejectedPaths).join(',')}`;
+}
+
+function pathExists(rel) {
+  if (!rel || path.isAbsolute(rel) || rel.split('/').includes('..')) return false;
+  try { return fs.statSync(path.resolve(process.cwd(), rel)).isFile(); } catch { return false; }
+}
+
+async function gatherEvidenceContract(task, rejectedPaths) {
+  const evidenceFiles = normalizeList(rejectedPaths).filter(pathExists).slice(0, MAX_EVIDENCE_FILES);
+  return { evidenceFiles };
+}
+
+function gatherGroundingEvidence(task, second, extraRoots) {
+  if (Array.isArray(second)) return gatherEvidenceContract(task, second);
+  return gatherLegacy(task, second, extraRoots);
+}
+
+function resolveContract({ task, rejectedPaths, fingerprint, counters }) {
+  const t = task || {};
+  const paths = normalizeList(rejectedPaths);
+  if (!IMPORTED_TYPES.includes(t.type)) return { action: 'redraft', task: t };
+  if (paths.some(pathExists)) return { action: 'redraft', task: t };
+  const fp = fingerprint || fingerprintRejection(t.id, paths);
+  const c = counters && typeof counters === 'object' ? counters : null;
+  if (!c || !(c[fp] > 0)) {
+    if (c) c[fp] = 1;
+    return { action: 'redraft', task: t };
+  }
+  const reason = formatFabricatedReason(paths.map((claimedPath) => ({ claimedPath })));
+  c[ARCHIVED_COUNTER] = (c[ARCHIVED_COUNTER] || 0) + 1;
+  return {
+    action: 'archive',
+    task: { ...t, state: 'archived', archivedReason: reason },
+    reason,
+    historyEvent: {
+      type: 'archived-ungrounded-import', taskId: t.id, fingerprint: fp, rejectedPaths: paths, reason,
+    },
+  };
+}
+
+function resolveUngroundedImport(args = {}) {
+  const a = args || {};
+  if (!('citedPaths' in a) && ('task' in a || 'rejectedPaths' in a)) return resolveContract(a);
+  return resolveLegacy(a);
+}
+
+module.exports = {
+  resolveUngroundedImport, gatherGroundingEvidence, normalizeCitedPath, fingerprintRejection, IMPORTED_TYPES,
+};
