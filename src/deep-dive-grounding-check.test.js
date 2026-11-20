@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 
 const {
   runGroundingCheck, checkFabricatedSymbols, parseGroundingVerdict, checkTypeFidelity,
+  detectClaimedKind,
 } = require('./deep-dive-grounding-check.js');
 
 // Real incident shape: the draft cites `TextFileConverter`/`ConversionError`, but the
@@ -311,6 +312,23 @@ test('checkTypeFidelity does not flag a function correctly described as a functi
 test('checkTypeFidelity does not flag a symbol whose window contains BOTH words (draft is accurate)', () => {
   const r = checkTypeFidelity(typedDictTask(), '`MyConfig` is a class in the typing sense -- specifically a TypedDict.');
   assert.deepEqual(r, []);
+});
+
+test('detectClaimedKind: class-like before function resolves to function', () => {
+  assert.equal(detectClaimedKind('parse', 'the `parse` class-like function'), 'function');
+});
+
+test('detectClaimedKind: class-like with no other kind word still resolves to class', () => {
+  assert.equal(detectClaimedKind('Parser', 'the `Parser` class-like wrapper'), 'class');
+});
+
+test('detectClaimedKind: TypedDict still wins over class', () => {
+  assert.equal(detectClaimedKind('Config', 'the `Config` TypedDict class'), 'TypedDict');
+});
+
+test('detectClaimedKind: plain class and plain function are unchanged', () => {
+  assert.equal(detectClaimedKind('Parser', 'the `Parser` class'), 'class');
+  assert.equal(detectClaimedKind('parse', 'the `parse` function'), 'function');
 });
 
 test('checkTypeFidelity does not flag a bare citation with no kind word nearby', () => {
