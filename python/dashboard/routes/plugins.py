@@ -6,6 +6,8 @@ import urllib.request
 from pathlib import Path
 import subprocess
 
+from git_checkout_ref import _checkout_git_ref
+
 # The app.py helpers these views call (PLUGINS_MANIFEST_PATH, _installed_plugin_version, _pipeline_running, _plugin_name_from_path, _plugins_install_dir, _read_plugin_catalog, _read_plugins_manifest, _restart_pipeline, _run_plugin_subprocess, _version_tuple, _wait_for_plugin_health, _write_plugins_manifest) are
 # imported lazily inside each view: app.py imports THIS module to register the
 # blueprint, so a top-level `from app import ...` is a circular import that only
@@ -285,33 +287,12 @@ def api_plugins_update():
 
     try:
         if source["type"] == "git":
-            _run_plugin_subprocess(["git", "fetch", "--tags", "--prune"], plugin_dir)
-            candidates = [c for c in (source.get("ref"), new_version) if c]
-            checked_out = False
-            for ref in candidates:
-                try:
-                    _run_plugin_subprocess(["git", "checkout", ref], plugin_dir)
-                    checked_out = True
-                    break
-                except subprocess.CalledProcessError:
-                    continue
-            if not checked_out:
-                # No usable ref/tag -- fall back to origin's default branch.
-                out, _ = _run_plugin_subprocess(
-                    ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], plugin_dir
-                )
-                default_ref = out.strip()
-                if not default_ref:
-                    raise subprocess.CalledProcessError(
-                        1, "git checkout",
-                        stderr="no source.ref, no version tag, and no origin/HEAD default",
-                    )
-                _run_plugin_subprocess(["git", "checkout", default_ref], plugin_dir)
+            _checkout_git_ref(plugin_dir, [c for c in (source.get('ref'), new_version) if c])
         else:  # npm
             pkg = (source.get("url") or "").strip() or plugin_id
             _run_plugin_subprocess(["npm", "update", pkg], plugin_dir)
         _run_plugin_subprocess(["npm", "install"], plugin_dir)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as e:
         detail = (getattr(e, "stderr", None) or getattr(e, "stdout", None) or str(e)).strip()
         return jsonify({
             "id": plugin_id,
