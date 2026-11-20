@@ -23,7 +23,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const { normalizeTokens, jaccardSimilarity, sharesDistinctivePhrase } = require('./text-similarity.js');
+const { normalizeTokens, jaccardSimilarity } = require('./text-similarity.js');
+const { sharesDistinctivePhrase } = require('./distinctive-phrases');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
 const { loadBrainDump } = require('./apply-group-a.js');
 const { inboxDir } = require('./side-finding.js');
