@@ -129,8 +129,31 @@ function resolveCitedFileAtMain(repoRoot, claimed, extraRoots = [], mainBranch =
 // extraRoots is fact-checker.js's own param shape: repoRoot-relative code dirs
 // (getConfig().grepAllowedDirs) so `Files: local-client.js` still resolves to
 // `src/local-client.js` and is NOT flagged.
+const NO_SUPPORTING_FILE = 'NO_SUPPORTING_FILE';
+const CREATE_LABEL = /^create\s+(\S.*)$/i;
+
+// kind: 'sentinel' (NO_SUPPORTING_FILE), 'create' (`create <path>`: a file the change will add, so it is
+// never "fabricated"), or 'path' (an existing-file citation, checked as before).
+function classifyFilesLineEntry(raw) {
+  const entry = cleanEntry(raw);
+  if (entry === NO_SUPPORTING_FILE) return { kind: 'sentinel' };
+  const m = CREATE_LABEL.exec(entry);
+  if (m) return { kind: 'create', path: cleanEntry(m[1]) };
+  return { kind: 'path', entry };
+}
+
 function checkCitedPaths(filesLine, repoRoot, extraRoots = [], { mainBranch = null } = {}) {
   if (!filesLine || !repoRoot) return { fabricated: [], checked: [] };
+  const created = [];
+  {
+    const parts = splitFilesLineEntries(filesLine);
+    const classes = parts.map(classifyFilesLineEntry);
+    if (classes.some((c) => c.kind !== 'path')) {
+      for (const c of classes) if (c.kind === 'create' && c.path) created.push(c.path);
+      filesLine = parts.filter((_, i) => classes[i].kind === 'path').join(',');
+      if (!filesLine.trim()) return { fabricated: [], checked: [], created };
+    }
+  }
   const checked = checkFilePaths(filesLine, repoRoot, extraRoots);
   // Extension-less entries (see resolveCitedFile's header): the regex above never sees them.
   const seen = new Set(checked.map((r) => r.claimedPath));
@@ -148,7 +171,70 @@ function checkCitedPaths(filesLine, repoRoot, extraRoots = [], { mainBranch = nu
     if (hit) { r.exists = true; r.resolvedPath = path.join(repoRoot, hit); r.resolvedVia = 'origin-main'; }
   }
   const fabricated = checked.filter((r) => r.exists === false);
-  return { fabricated, checked };
+  return created.length ? { fabricated, checked, created } : { fabricated, checked };
+}
+
+const REGROUND_MAX_CANDIDATES = 40;
+const IGNORED_TOKENS = new Set(['js', 'ts', 'md', 'json', 'src', 'tsx', 'jsx', 'mjs', 'cjs', 'py']);
+
+function pathTokens(p) {
+  return String(p || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[\s/._-]+/)
+    .map((t) => t.toLowerCase())
+    .filter((t) => t.length >= 3 && !IGNORED_TOKENS.has(t));
+}
+
+function rankCandidatesByMissingTokens(candidates, missingPaths) {
+  const tokens = new Set();
+  for (const m of missingPaths) for (const t of pathTokens(m)) tokens.add(t);
+  return candidates
+    .map((c, i) => {
+      const p = typeof c === 'string' ? c : (c && c.path) || '';
+      const lower = p.toLowerCase();
+      let score = 0;
+      for (const t of tokens) if (lower.includes(t)) score++;
+      return { p, score, i };
+    })
+    .filter((x) => x.p)
+    .sort((a, b) => b.score - a.score || a.i - b.i)
+    .map((x) => x.p);
+}
+
+// One re-ground attempt: ask the model (via the injected callModel) to fix a Files: line that cited
+// missing paths. Returns the revised Files: value, or null on any failure. Exactly one model call.
+async function regroundOnce({ draft, missingPaths, repoRoot, candidates, callModel } = {}) {
+  try {
+    if (typeof callModel !== 'function') return null;
+    const missing = (missingPaths || []).map(String).filter(Boolean);
+    let list = candidates;
+    if (!Array.isArray(list)) {
+      list = [];
+      try {
+        const { listGroundingCandidates } = require('./grounding-candidates.js');
+        const got = listGroundingCandidates(repoRoot, missing);
+        if (Array.isArray(got)) list = got;
+      } catch { /* module absent or failed: proceed with no candidates */ }
+    }
+    const ranked = rankCandidatesByMissingTokens(list, missing).slice(0, REGROUND_MAX_CANDIDATES);
+    const prompt = [
+      'Your draft cited file paths that do NOT exist in the repository:',
+      ...missing.map((m) => `- ${m}`),
+      '',
+      'Real files that may be relevant (most relevant first):',
+      ...(ranked.length ? ranked.map((c) => `- ${c}`) : ['- (none found)']),
+      '',
+      'Draft:',
+      String(draft || ''),
+      '',
+      `Reply with ONLY a corrected line of the form "Files: a, b". Use real paths from the list, "create <path>" for a file the change will add, or ${NO_SUPPORTING_FILE} if nothing fits.`,
+    ].join('\n');
+    const out = await callModel(prompt);
+    const line = extractFilesLine(typeof out === 'string' ? out : '');
+    return line || null;
+  } catch {
+    return null;
+  }
 }
 
 // Inverse of formatFabricatedReason: the paths a "fabricated file path(s): a, b -- not present anywhere in the target repo" reason names,
@@ -374,6 +460,9 @@ function citedContextFiles({ section, declaredFiles = [], repoRoot, max = 3 } = 
 }
 
 module.exports = {
+  NO_SUPPORTING_FILE,
+  classifyFilesLineEntry,
+  regroundOnce,
   citedContextFiles,
   resolveCitedFile,
   resolveCitedFileAtMain,

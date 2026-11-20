@@ -455,3 +455,38 @@ test('citedContextFiles: a specifier that climbs out of the repo is ignored, and
   assert.deepEqual(citedContextFiles({ section: "require('../../../../etc/passwd')", declaredFiles: ['a/main.js'], repoRoot: root }), []);
   for (const args of [undefined, {}, { section: 5 }, { section: 'x', repoRoot: '/nonexistent-root-xyz' }, { section: "require('./x')", declaredFiles: [null, 3], repoRoot: root }]) assert.deepEqual(citedContextFiles(args), []);
 });
+
+// --- create label / NO_SUPPORTING_FILE / regroundOnce ---------------------------------
+
+test('checkCitedPaths: `create <path>` label is not fabricated; invented path still is', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cpg-create-'));
+  fs.mkdirSync(path.join(root, 'src'));
+  fs.writeFileSync(path.join(root, 'src', 'real.js'), 'x');
+  const ok = require('./candidate-path-grounding.js').checkCitedPaths('create src/new-thing.js, src/real.js', root);
+  assert.deepEqual(ok.fabricated, []);
+  assert.deepEqual(ok.created, ['src/new-thing.js']);
+  const bad = require('./candidate-path-grounding.js').checkCitedPaths('create src/new-thing.js, src/invented-zzz.js', root);
+  assert.deepEqual(bad.fabricated.map((f) => f.claimedPath), ['src/invented-zzz.js']);
+});
+
+test('checkCitedPaths: NO_SUPPORTING_FILE sentinel is recognised', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cpg-sent-'));
+  const m = require('./candidate-path-grounding.js');
+  assert.equal(m.NO_SUPPORTING_FILE, 'NO_SUPPORTING_FILE');
+  assert.deepEqual(m.checkCitedPaths('NO_SUPPORTING_FILE', root).fabricated, []);
+});
+
+test('regroundOnce: ranks candidates by missing-path tokens, returns revised Files line, null on failure', async () => {
+  const { regroundOnce } = require('./candidate-path-grounding.js');
+  let prompt = '';
+  const callModel = async (p) => { prompt = p; return 'Files: src/real.js'; };
+  const out = await regroundOnce({
+    draft: 'Files: src/widget-cache.js', missingPaths: ['src/widget-cache.js'], repoRoot: '/x',
+    candidates: ['src/unrelated.js', { path: 'src/widget-store.js' }], callModel,
+  });
+  assert.equal(out, 'src/real.js');
+  assert.ok(prompt.includes('src/widget-cache.js'));
+  assert.ok(prompt.indexOf('- src/widget-store.js') < prompt.indexOf('- src/unrelated.js'));
+  assert.equal(await regroundOnce({ draft: 'd', missingPaths: ['a.js'], candidates: [], callModel: async () => { throw new Error('x'); } }), null);
+  assert.equal(await regroundOnce({ draft: 'd', missingPaths: ['a.js'], callModel: async () => 'no line' }), null);
+});
