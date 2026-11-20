@@ -20,11 +20,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${1:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 DRIVER="node ${SCRIPT_DIR}/candidates-doc-merge-driver.js %O %A %B"
 
-git -C "$REPO_ROOT" config merge.candidate-doc.name "structural merge for *.doc files" 2>/dev/null || true
-git -C "$REPO_ROOT" config merge.candidate-doc.driver "$DRIVER"
+# Drop the singular keys an earlier version wrote, so they do not linger beside the name the versioned attribute uses.
+git -C "$REPO_ROOT" config --unset-all merge.candidate-doc.name 2>/dev/null || true
+git -C "$REPO_ROOT" config --unset-all merge.candidate-doc.driver 2>/dev/null || true
+git -C "$REPO_ROOT" config merge.candidates-doc.name "structural merge for candidate docs" 2>/dev/null || true
+git -C "$REPO_ROOT" config merge.candidates-doc.driver "$DRIVER"
 
 # Driver line format: <file-pattern> merge=<driver-name>
-LINE="*.doc merge=candidate-doc"
+LINE="Docs/*_CANDIDATES.md merge=candidates-doc"
 ATTRS_FILE="${REPO_ROOT}/.gitattributes"
 
 # 1. Undo what earlier versions of this script did to the working-tree .gitattributes -- but ONLY when the
