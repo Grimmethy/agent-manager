@@ -17,6 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 import app  # noqa: E402
+from apply_lock_test_mixin import ApplyLockTestMixin  # noqa: E402
 
 
 def _git(args, cwd):
@@ -52,8 +53,9 @@ def make_repo_with_pushed_branch(branch_name="agent/discard-test-1", extra_main_
     return repo
 
 
-class TestDiscardBranch(unittest.TestCase):
+class TestDiscardBranch(ApplyLockTestMixin, unittest.TestCase):
     def setUp(self):
+        super().setUp()
         app._invalidate_branch_cache()
         self.client = app.app.test_client()
 
@@ -499,11 +501,12 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestBranchRemovalLedger(unittest.TestCase):
+class TestBranchRemovalLedger(ApplyLockTestMixin, unittest.TestCase):
     """Every in-app path that deletes a branch records WHY in queue/branch-removals.jsonl, so a later
     task-log-reconcile no longer has to call the vanished branch a bare "work lost"."""
 
     def setUp(self):
+        super().setUp()
         app._invalidate_branch_cache()
         self.client = app.app.test_client()
 

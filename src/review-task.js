@@ -92,7 +92,25 @@ function writeTaskJson(taskPath, task) {
   // concurrently -- never leave a half-written file visible. Same-dir tmp so the rename
   // stays on one filesystem.
   const tmp = `${taskPath}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(task, null, 2));
+  // Premium flags can be changed on disk (dashboard/chat) while review runs; the in-memory
+  // task is stale, so carry them from the current on-disk record. Missing file = first write.
+  // Any other read/parse failure throws BEFORE the tmp write, leaving taskPath untouched.
+  // The read-then-rename window is small but not atomic: a concurrent change landing
+  // between them can still be lost.
+  let disk = null;
+  try {
+    disk = JSON.parse(fs.readFileSync(taskPath, 'utf8'));
+  } catch (e) {
+    if (!e || e.code !== 'ENOENT') throw e;
+  }
+  const out = { ...task };
+  if (disk && typeof disk === 'object') {
+    for (const key of ['premiumPriority', 'premiumSetBy', 'premiumSetAt']) {
+      if (Object.prototype.hasOwnProperty.call(disk, key)) out[key] = disk[key];
+      else delete out[key];
+    }
+  }
+  fs.writeFileSync(tmp, JSON.stringify(out, null, 2));
   fs.renameSync(tmp, taskPath);
 }
 
@@ -621,7 +639,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { namesExtractedPieces, getDomainConfig, EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview, INERT_MAX_ITEMS };
+module.exports = { writeTaskJson, namesExtractedPieces, getDomainConfig, EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview, INERT_MAX_ITEMS };
 
 if (require.main === module) {
   main();
