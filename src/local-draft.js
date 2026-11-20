@@ -58,6 +58,10 @@ const { providerFor, labelFor, resolveModelProfile } = require('./model-provider
 const { isForgePause } = require('./gpu-guard.js');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { missingFileCheck } = require('./draft-file-guard.js');
+const {
+  resolveUngroundedImport, gatherGroundingEvidence, fingerprintRejection, normalizeCitedPath, IMPORTED_TYPES,
+} = require('./ungrounded-import-resolution.js');
+const { checkCitedPaths, formatFabricatedReason, extractFilesLine } = require('./candidate-path-grounding.js');
 const { planImportBindingProblem } = require('./adhoc-diff-sanity.js');
 const { planTargetGuard } = require('./plan-target-guard.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
@@ -1852,6 +1856,61 @@ function selectDraftStrategy(task, injectedFns = {}) {
   };
 }
 
+// Grounding gate for imported task types (arch_import / arch_discovery / deep_dive). Runs before the model call (on the
+// task's own cited Files: line) and after it (on the draft's). A missing cited path is resolved through
+// resolveUngroundedImport: 'redraft' stamps the fingerprint + rejected paths + evidence on the task and feeds them to the next
+// attempt via priorRejectionFeedback; 'archive' applies the archived state, history event and ungrounded_import_archived counter.
+function isImportedGroundingTask(task) {
+  if (!task) return false;
+  let src = null;
+  try { src = resolveSourceName(task); } catch (_) { src = null; }
+  return [task.type, task.source, task.domain, src].some((v) => v && IMPORTED_TYPES.includes(v));
+}
+
+function findMissingCitedPaths(text) {
+  const repoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  if (!repoRoot || !text) return [];
+  try {
+    const filesLine = extractFilesLine(String(text));
+    if (!filesLine) return [];
+    const extra = (getConfig() || {}).grepAllowedDirs || [];
+    const { fabricated } = checkCitedPaths(filesLine, repoRoot, extra);
+    return fabricated.map((f) => normalizeCitedPath(f.claimedPath)).filter(Boolean);
+  } catch (_) { return []; }
+}
+
+async function applyUngroundedImportGate(task, rejectedPaths) {
+  const paths = [...new Set((rejectedPaths || []).map(normalizeCitedPath).filter(Boolean))].sort();
+  if (!paths.length) return null;
+  const fp = fingerprintRejection(task.id, paths);
+  if (!task.ungroundedImportCounters || typeof task.ungroundedImportCounters !== 'object') task.ungroundedImportCounters = {};
+  const counters = task.ungroundedImportCounters;
+  const res = resolveUngroundedImport({ task, rejectedPaths: paths, fingerprint: fp, counters });
+  if (res.action === 'archive') {
+    Object.assign(task, res.task);
+    task.status = 'archived';
+    task.archivedReason = res.reason || task.archivedReason;
+    const ev = res.historyEvent || { type: 'archived-ungrounded-import' };
+    appendHistoryEvent(task, ev.type, String(res.reason || '').slice(0, 300));
+    return { succeeded: true, blocked: false, archived: true, archivedReason: task.archivedReason, counter: 'ungrounded_import_archived' };
+  }
+  let evidenceFiles = [];
+  try { evidenceFiles = ((await gatherGroundingEvidence(task, paths)) || {}).evidenceFiles || []; } catch (_) { evidenceFiles = []; }
+  task.ungroundedImportFingerprint = fp;
+  task.ungroundedImportRejectedPaths = paths;
+  task.ungroundedImportEvidenceFiles = evidenceFiles;
+  const reason = formatFabricatedReason(paths.map((claimedPath) => ({ claimedPath })));
+  task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+  task.priorRejectionFeedback.push(
+    `Your previous draft cited file path(s) that do not exist: ${paths.join(', ')}. `
+    + (evidenceFiles.length ? `Real files found for grounding: ${evidenceFiles.join(', ')}. ` : '')
+    + 'Cite only paths that exist in the repo.');
+  appendHistoryEvent(task, 'ungrounded-import-redraft', `${fp} ${reason}`.slice(0, 300));
+  task.blockedStage = 'review';
+  task.blockedReason = `Ungrounded draft: ${reason}`;
+  return { succeeded: true, blocked: true, blockedReason: task.blockedReason, blockedStage: 'review', ungroundedImportRedraft: true };
+}
+
 async function draftTask(task, deps = {}) {
   // Pre-dispatch gate: a deterministic 'archive' verdict ends the drafting here, before
   // beginDraftAttempt/resolveDraftContext ever touch the task-source registry. It is expressed as a model-free
@@ -1902,8 +1961,17 @@ async function draftTask(task, deps = {}) {
   // to disk -- including on the succeeded:false path, where main()'s own terminal
   // writeTaskJson is skipped. Without this, a task that fails N times in a row keeps only
   // the LAST attempt's planResponse (overwritten every run) and none of the tier detail.
+  const importedGrounding = isImportedGroundingTask(task);
+  if (importedGrounding) {
+    const pre = await applyUngroundedImportGate(task, findMissingCitedPaths([task.title, task.rawText, task.description].filter(Boolean).join('\n')));
+    if (pre) return pre;
+  }
   const attempt = beginDraftAttempt(task);
-  const result = await runDraftPasses(task, attempt, deps);
+  let result = await runDraftPasses(task, attempt, deps);
+  if (importedGrounding && result && !result.blocked && result.succeeded !== false) {
+    const post = await applyUngroundedImportGate(task, findMissingCitedPaths(task.implementResponse));
+    if (post) result = post;
+  }
   // network_unavailable: the offline gate aborted the draft before it ran at all --
   // the task never got a real attempt, so requeue WITHOUT stamping task.draftAttempts
   // (a blocked network_unavailable task must not consume a draft-attempt slot).
