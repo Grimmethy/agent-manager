@@ -354,7 +354,9 @@ function buildStalenessEvidenceText(candidate, now = Date.now()) {
 // names a concrete file:line so the audit can target real code.
 function titleHasFileLineRef(title) {
   if (!title) return false;
-  return /\S+:\d+/.test(title);
+  // Requires a real file extension (letter-led, e.g. .js:12) before the line number,
+  // so version-like text such as 'v1.2:3' does not count as a file:line reference.
+  return /\.[A-Za-z]\w{0,9}:\d+/.test(title);
 }
 
 // domain must be the consumer's real defaultDomain (task-sources.js's getConfig() value),

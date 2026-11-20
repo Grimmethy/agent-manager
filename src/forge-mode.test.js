@@ -193,6 +193,47 @@ test('status: what is paused, who holds the GPU, memory, I/O and the age', async
 });
 
 // ---- the real script ----
+test('on counts the resident Ollama model memory as freed: 7853 MB avail + one 3.7 GB model -> accepted', async () => {
+  const w = world({ availMB: 7853 });
+  w.io.modelsMB = async () => 3789;
+  assert.equal(await fm.on({ vm: 'keep' }, w.io), 0);
+  assert.deepEqual(w.steps(), ['acquire:forge-mode:marker=true']);
+});
+
+test('on with no resident model and 7853 MB avail is refused with the numbers and what was counted', async () => {
+  const w = world({ availMB: 7853 });
+  w.io.modelsMB = async () => 0;
+  assert.equal(await fm.on({ vm: 'keep' }, w.io), 1);
+  assert.match(w.logs(), /refused: MemAvailable 7853 MB \+ 0 MB freed by the plan = 7853 MB, under the 10240 MB needed \(VM 0 MB \+ resident models 0 MB\)/);
+  assert.deepEqual(w.steps(), []);
+});
+
+test('a failing models reading is reported in the refusal, never silently counted as 0', async () => {
+  const w = world({ availMB: 7853 });
+  w.io.modelsMB = async () => { throw new Error('Ollama /api/ps unreachable (ECONNREFUSED)'); };
+  assert.equal(await fm.on({ vm: 'keep' }, w.io), 1);
+  assert.match(w.logs(), /models not counted, Ollama \/api\/ps unreachable \(ECONNREFUSED\)/);
+});
+
+test('VM off + keep: VM memory is still counted only with --vm off and a running VM, next to the models', async () => {
+  const keep = world({ availMB: 6500, vm: 'running' });
+  assert.equal(await fm.on({ vm: 'keep' }, keep.io), 1);
+  const off = world({ availMB: 6500, vm: 'running' });
+  assert.equal(await fm.on({ vm: 'off' }, off.io), 0);
+  const both = world({ availMB: 3000, vm: 'running' });
+  both.io.modelsMB = async () => 3789;
+  assert.equal(await fm.on({ vm: 'off' }, both.io), 0);
+});
+
+test('status --json carries modelsMB and modelsError', async () => {
+  const w = world();
+  w.io.modelsMB = async () => 3789;
+  assert.equal((await fm.status(w.io)).modelsMB, 3789);
+  w.io.modelsMB = async () => { throw new Error('nope'); };
+  const s = await fm.status(w.io);
+  assert.deepEqual([s.modelsMB, s.modelsError], [0, 'nope']);
+});
+
 test('scripts/forge-mode.sh is a thin wrapper over src/forge-mode.js', () => {
   const sh = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'forge-mode.sh'), 'utf8');
   assert.match(sh, /exec node ".*\/\.\.\/src\/forge-mode\.js" "\$@"/);

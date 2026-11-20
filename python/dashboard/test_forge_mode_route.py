@@ -41,6 +41,34 @@ class Refusal(unittest.TestCase):
         self.assertEqual(len(forge_mode.refusal({**GOOD, "memAvailMB": None}, "keep")), 1)
         self.assertEqual(len(forge_mode.refusal({"error": "boom"}, "keep")), 1)
 
+    def test_resident_model_memory_counts_as_freed(self):
+        st = {**GOOD, "memAvailMB": 7853, "modelsMB": 3789}
+        self.assertEqual(forge_mode.refusal(st, "keep"), [])
+
+    def test_no_resident_model_is_refused_with_the_numbers(self):
+        r = forge_mode.refusal({**GOOD, "memAvailMB": 7853, "modelsMB": 0}, "keep")
+        self.assertEqual(len(r), 1)
+        self.assertIn("7853 MB", r[0])
+        self.assertIn("resident models 0 MB", r[0])
+
+    def test_models_reading_error_is_shown_in_the_refusal(self):
+        r = forge_mode.refusal({**GOOD, "memAvailMB": 7853, "modelsMB": 0, "modelsError": "Ollama unreachable"}, "keep")
+        self.assertIn("Ollama unreachable", r[0])
+
+    def test_python_gate_agrees_with_the_script_preflight_numbers(self):
+        # same readings as the JS test 'on counts the resident Ollama model memory': avail 7853 + 3789 models >= 10240
+        for avail, models, vm_state, vm, ok in [(7853, 3789, "shut off", "keep", True), (7853, 0, "shut off", "keep", False), (6500, 0, "running", "off", True), (3000, 3789, "running", "off", True), (6500, 0, "running", "keep", False)]:
+            st = {**GOOD, "memAvailMB": avail, "modelsMB": models, "vm": {"state": vm_state}}
+            self.assertEqual(forge_mode.refusal(st, vm) == [], ok, (avail, models, vm_state, vm))
+
+    def test_handle_409_payload_says_what_was_counted(self):
+        st = {**GOOD, "memAvailMB": 7853, "modelsMB": 0, "modelsError": "Ollama unreachable"}
+        with mock.patch.object(forge_mode, "status", return_value=st):
+            payload, code = forge_mode.handle("POST", {"on": True, "vm": "keep"})
+        self.assertEqual(code, 409)
+        self.assertEqual(payload["counted"]["modelsError"], "Ollama unreachable")
+        self.assertEqual(payload["counted"]["modelsMB"], 0)
+
     def test_already_paused_is_refused(self):
         self.assertEqual(forge_mode.refusal({**GOOD, "paused": True}, "keep"), ["already in forge mode"])
 
