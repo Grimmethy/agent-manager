@@ -7,6 +7,13 @@
 // URL ?project=, then selected, then 'active'.
 var queueProjectFilter = { active: 'active', pending: 'active', done: 'active', all: 'all' };
 
+// Render sequence counter (2026-10-18, HUB0771 slow-state): incremented on every
+// renderQueueTab call. Captured at the start of the function; after the async fetch
+// resolves we compare against the live counter. If they differ, a newer render started
+// (e.g. from a Retry click) and we discard the stale result. Prevents a slow response
+// from overwriting UI laid down by a fresh fetch.
+var _queueRenderSeq = 0;
+
 async function postTaskAction(state, id, action, confirmMessage, body) {
   if (confirmMessage && !confirm(confirmMessage)) return;
   try {
@@ -144,8 +151,43 @@ async function renderQueueTab(state) {
     : '';
   const sortQS = hubSort ? `&sort=${encodeURIComponent(hubSort)}` : '';
   let tasks, total;
+  // Blocked, Needs Clarification, and Pending lists use QueueSlowFetch so a busy server
+  // shows "Still loading, the server is busy" with a Retry button instead of a hard timeout.
+  const slowStates = ['blocked', 'needs-clarification', 'pending'];
+  const url = `/api/queue/${state}?limit=${queueLoadedCount[state]}&offset=0${filterQS}${sortQS}`;
+  // Capture the render sequence number before the await. If a newer renderQueueTab call
+  // happens (e.g. from Retry), the sequence number increments; the old call sees the
+  // mismatch and discards its result.
+  const thisSeq = ++_queueRenderSeq;
+  let slowShown = false;
+  let fetchPromise;
+  if (slowStates.includes(state)) {
+    fetchPromise = QueueSlowFetch.fetchList(url, {
+      onSlow: () => {
+        if (slowShown) return;
+        slowShown = true;
+        const main = document.getElementById('main');
+        if (!main) return;
+        main.innerHTML = `<div class="empty">Still loading, the server is busy<button type="button" class="queue-retry-btn" data-state="${escapeAttr(state)}">Retry</button></div>`;
+        document.addEventListener('click', function onRetry(e) {
+          if (e.target.classList.contains('queue-retry-btn')) {
+            document.removeEventListener('click', onRetry);
+            // A new renderQueueTab call increments _queueRenderSeq, so the old fetch's
+            // thisSeq will no longer match the live counter.
+            renderQueueTab(state);
+          }
+        });
+      },
+    });
+  } else {
+    fetchPromise = fetchJson(url);
+  }
   try {
-    const resp = await fetchJson(`/api/queue/${state}?limit=${queueLoadedCount[state]}&offset=0${filterQS}${sortQS}`);
+    const resp = await fetchPromise;
+    // Stale response guard: if a newer fetch started (e.g. from Retry), drop this result.
+    if (slowStates.includes(state) && resp !== undefined && _queueRenderSeq !== thisSeq) {
+      return;
+    }
     tasks = resp.items;
     total = resp.total;
   } finally {
