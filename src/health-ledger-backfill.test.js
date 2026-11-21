@@ -59,18 +59,18 @@ test('a seeded day gets exactly one row that passes the real validator, with the
   assert.deepEqual(row.items, { released: [], held: [], filed: [] });
 });
 
-test('the real schema rejects null...', () => {
+test('the real schema accepts null for unmeasured fields and backfill writes null', () => {
   const { dir, dbPath } = seeded();
   backfill({ pipelineDir: dir, dbPath, from: DAY, to: DAY, now: NOW, log: quiet });
   const row = readRows(dir)[0];
-  assert.equal(validateRow({ ...row, metric: { name: 'backfill', before: null, after: null } }).ok, true, 'a null metric is valid in the real schema');
-  assert.equal(validateRow({ ...row, cost: { ...row.cost, gpu_minutes: null } }).ok, true);
-  assert.deepEqual(row.verdict.inputs.unknown_fields, ['metric.before', 'metric.after', 'cost.gpu_minutes', 'cost.peak_ram_mb']);
   assert.equal(row.metric.before, null);
   assert.equal(row.metric.after, null);
   assert.equal(row.cost.gpu_minutes, null);
   assert.equal(row.cost.peak_ram_mb, null);
+  assert.equal(typeof row.cost.model_calls, 'number');
+  assert.notEqual(row.cost.model_calls, null);
   assert.equal(validateRow(row).ok, true, 'the full backfilled row with null fields is valid');
+  assert.deepEqual(row.verdict.inputs.unknown_fields, ['metric.before', 'metric.after', 'cost.gpu_minutes', 'cost.peak_ram_mb']);
   assert.match(row.note, /are null: not measured/);
 });
 
