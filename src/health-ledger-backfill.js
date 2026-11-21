@@ -15,7 +15,7 @@
 // Schema fit: the real validator (health-ledger-schema.js validateRow) accepts a finite NUMBER or null for metric.before/after and cost.gpu_minutes/peak_ram_mb (cost.model_calls must stay a finite number),
 // so a backfilled row writes null in those four fields for "not measured" and says so
 // explicitly: the note says those fields are null because they were not measured, so a reader never mistakes them for a measured zero. NULL token/cost
-// columns in model_calls are counted per column, never summed as zero.
+// columns in model_calls are counted per column, never summed as zero. The validator's null acceptance for these four fields is provided by sibling task HUB0286.
 
 const fs = require('fs');
 const path = require('path');
