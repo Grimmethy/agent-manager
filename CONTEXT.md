@@ -75,5 +75,14 @@ _Avoid_: direct commit, auto-merge (both are the ungated behavior this replaced)
 **Adhoc**:
 The special task source (priority 10, always wins the priority ladder) for tasks injected directly into `queue/adhoc/`, bypassing normal generation. Tasks from it carry `source: 'manual'`.
 
-**Candidate**:
-A proposed finding written by a discovery-style task source (e.g. `arch_discovery`) into a doc for later action, self-rated Strong or Weak, for a human or a consumer task source to act on.
+**Candidate**:\nA proposed finding written by a discovery-style task source (e.g. `arch_discovery`) into a doc for later action, self-rated Strong or Weak, for a human or a consumer task source to act on.
+
+## Design Records
+
+**2026-10-24 · Review as a claimable stage of the lane worker loop (review-first ordering)**
+
+Review is a claimable stage of the lane worker loop, not a separate daemon. The ordering is **review-first**: when `queue/review/` holds an item no live reviewer has claimed, the lane reviews ONE item and ends the tick; when every waiting review is already claimed, or there is none, it falls through to draft. A premium-only borrowed tick never reviews.
+
+Implementation: `scripts/agent-manager-common.sh` (`cloud_take_review`, around line 173) and `scripts/local-worker.sh` (around line 751, the `worker_review_stage` call gated on `! "$did_work" && ! "$TICK_HAD_INFRA_FAILURE"`).
+
+Rationale (measurement-based): on an RX 580 8 GB with `qwen3-vl:8b`, `numCtx=49152` yields 10.6 tok/s at 80% GPU while `numCtx=16384` yields 26.2 tok/s at 100% GPU (`docs/agents/lanes.md:40`); prompt processing at default `numBatch` is 26 tok/s but `numBatch=1024` pushes it to 178 tok/s with generation unchanged at 25 tok/s (`docs/agents/lanes.md:41`). A dedicated review daemon would serialize every review behind the host GPU's single Ollama endpoint, compounding the already-measured token/s cost of review calls on smaller cards. Keeping review inside the lane loop lets it share the lane's endpoint key (via `single-flight-lock`), claim atomically alongside drafts, and — critically — skip review when the lane is already spending its budget on a draft, so the 10.6→26.2 tok/s headroom on the RX 580 is reserved for the pass that needs it most (drafting), not a parallel review that would have to wait its turn anyway.
