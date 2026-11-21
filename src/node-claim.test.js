@@ -235,8 +235,8 @@ test('filteredDirs and filterDomains parse, trim, drop blanks, and apply the def
     filteredDirs({ AGENT_MANAGER_NODE_FILTERED_DIRS: ' /tmp/a , ,/tmp/b/ ,' }),
     [path.resolve('/tmp/a'), path.resolve('/tmp/b')],
   );
-  assert.deepStrictEqual(filterDomains({}), ['adhoc']);
-  assert.deepStrictEqual(filterDomains({ AGENT_MANAGER_NODE_FILTER_DOMAINS: '  ' }), ['adhoc']);
+  assert.deepStrictEqual(filterDomains({}), ['adhoc', 'default']);
+  assert.deepStrictEqual(filterDomains({ AGENT_MANAGER_NODE_FILTER_DOMAINS: '  ' }), ['adhoc', 'default']);
   assert.deepStrictEqual(filterDomains({ AGENT_MANAGER_NODE_FILTER_DOMAINS: ' adhoc , review ,' }), ['adhoc', 'review']);
 });
 
@@ -273,6 +273,37 @@ test('unlisted dir: claimNext claims the first record exactly as before, with no
   assert.strictEqual(skipped.filter((s) => s.reason === 'not-eligible-for-node').length, 0);
 });
 
+// ---- Four tests for the widened default domain list (owner decision 2026-11-16): default must include 'default' so the swarm can take Feature Forge tasks ----
+
+test('eligibleForNode: a manual, non-stacked, domain default record is claimable with the default domains', () => {
+  const opts = { pipelineDir: '/tmp/some-pipe', domains: ['adhoc', 'default'] };
+  const base = { source: 'manual', domain: 'default' };
+  assert.strictEqual(eligibleForNode(base, opts), true);
+  assert.strictEqual(eligibleForNode({ ...base, stacked: { branch: 'feat' } }, opts), false);
+  assert.strictEqual(eligibleForNode({ ...base, source: 'hub' }, opts), false);
+  assert.strictEqual(eligibleForNode({ ...base, generatedForRepoRoot: '/tmp/another-repo' }, opts), false);
+});
+
+test('eligibleForNode: a non-manual, domain default record is not claimable', () => {
+  const opts = { pipelineDir: '/tmp/some-pipe', domains: ['adhoc', 'default'] };
+  assert.strictEqual(eligibleForNode({ source: 'hub', domain: 'default' }, opts), false);
+  assert.strictEqual(eligibleForNode({ source: 'deep_dive', domain: 'default' }, opts), false);
+  assert.strictEqual(eligibleForNode({ source: 'derived_task', domain: 'default' }, opts), false);
+});
+
+test('eligibleForNode: a stacked, domain default record is not claimable', () => {
+  const opts = { pipelineDir: '/tmp/some-pipe', domains: ['adhoc', 'default'] };
+  assert.strictEqual(eligibleForNode({ source: 'manual', domain: 'default', stacked: { branch: 'feat' } }, opts), false);
+  assert.strictEqual(eligibleForNode({ source: 'manual', domain: 'default', stacked: true }, opts), false);
+});
+
+test('filterDomains: an explicit AGENT_MANAGER_NODE_FILTER_DOMAINS=adhoc still excludes default', () => {
+  const opts = { pipelineDir: '/tmp/some-pipe', domains: filterDomains({ AGENT_MANAGER_NODE_FILTER_DOMAINS: 'adhoc' }) };
+  assert.deepStrictEqual(opts.domains, ['adhoc']);
+  assert.strictEqual(eligibleForNode({ source: 'manual', domain: 'default' }, opts), false);
+  assert.strictEqual(eligibleForNode({ source: 'manual', domain: 'adhoc' }, opts), true);
+});
+
 test('filtered dir: an ineligible copy does not shadow an eligible same-id copy in an unlisted dir', () => {
   const { root, pipe, pending, env } = setup();
   const pipe2 = path.join(root, 'pipe2');
@@ -287,4 +318,27 @@ test('filtered dir: an ineligible copy does not shadow an eligible same-id copy 
   assert.strictEqual(r.task.id, 'dup-task');
   assert.strictEqual(r.repo.root, pipe2);
   assert.deepStrictEqual(skipped, [{ taskId: 'dup-task', reason: 'not-eligible-for-node' }]);
+});
+
+test('claimNext skips a task the claimant node already reported blocked twice, and offers it to another claimant', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'node-claim-blocked-'));
+  const pipelineDir = path.join(dir, 'pipe');
+  fs.mkdirSync(path.join(pipelineDir, 'queue', 'adhoc'), { recursive: true });
+  const env = { HOME: '/nonexistent-home', AGENT_MANAGER_NODES_DIR: path.join(dir, 'nodes'), AGENT_MANAGER_NODE_ID: 'wok' };
+  const record = { id: 'tb1', title: 'tb1', domain: 'adhoc', source: 'manual', history: [{ stage: 'node-blocked grimm' }, { stage: 'node-blocked grimm' }] };
+  fs.writeFileSync(path.join(pipelineDir, 'queue', 'adhoc', 'tb1.json'), JSON.stringify(record));
+  const skipped = [];
+  assert.equal(claimNext({ claimant: 'grimm', pipelineDirs: [pipelineDir], env, skipped }), null);
+  assert.ok(skipped.some((x) => x.taskId === 'tb1' && x.reason === 'node-blocked-twice'));
+  const other = claimNext({ claimant: 'other-node', pipelineDirs: [pipelineDir], env });
+  assert.equal(other.task.id, 'tb1');
+});
+
+test('claimNext still offers a task the claimant node reported blocked only once', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'node-claim-blocked1-'));
+  const pipelineDir = path.join(dir, 'pipe');
+  fs.mkdirSync(path.join(pipelineDir, 'queue', 'adhoc'), { recursive: true });
+  const env = { HOME: '/nonexistent-home', AGENT_MANAGER_NODES_DIR: path.join(dir, 'nodes'), AGENT_MANAGER_NODE_ID: 'wok' };
+  fs.writeFileSync(path.join(pipelineDir, 'queue', 'adhoc', 'tb2.json'), JSON.stringify({ id: 'tb2', title: 'tb2', domain: 'adhoc', source: 'manual', history: [{ stage: 'node-blocked grimm' }] }));
+  assert.equal(claimNext({ claimant: 'grimm', pipelineDirs: [pipelineDir], env }).task.id, 'tb2');
 });

@@ -123,6 +123,31 @@ function validateArgs({ branch, sha, verdict, reasons }) {
   return null;
 }
 
+// Verification-claim guard. A reason that says "no conflicts", "tests pass", "tests passed" or
+// "all tests" must name the run that backs it: a backtick-quoted command, a command verb
+// (git/node/npm/grep/sed) or a path with an extension. A claim without that evidence is
+// REWRITTEN, not rejected: the reason text gets the marker
+//   NOT RUN: claim "<phrase>" was not backed by a named command in this verdict
+// appended. Rewriting instead of refusing the verdict keeps the reviewer's reasoning on the
+// record and makes the gap visible to whoever reads the card. The marker has to reach the
+// dashboard, which is why recordBranchVerdictTool posts the rewritten reasons.
+// Pure: returns a new array and never mutates its input.
+const CLAIM_PHRASES = ['no conflicts', 'tests pass', 'tests passed', 'all tests'];
+const RUN_EVIDENCE = [
+  /`[^`]+`/,
+  /\b(git|node|npm|grep|sed)\b/i,
+  /[\w.-]+\.(js|cjs|mjs|ts|py|json|md|sh)\b/i,
+];
+function checkVerificationClaims(reasons) {
+  return reasons.map((reason) => {
+    const text = String(reason);
+    const lower = text.toLowerCase();
+    const phrase = CLAIM_PHRASES.find((p) => lower.includes(p));
+    if (!phrase || RUN_EVIDENCE.some((re) => re.test(text))) return reason;
+    return `${reason} NOT RUN: claim "${phrase}" was not backed by a named command in this verdict`;
+  });
+}
+
 // A merge verdict has to rest on evidence: the stored result of check_branch for this exact head must be docs-only, or have run the covering tests with
 // every entry green. Returns null when the merge may be recorded, else the relayable reason it may not. needs-work and discard never come here.
 function mergeRefusal(check) {
@@ -177,7 +202,7 @@ async function recordBranchVerdictTool(args = {}, opts = {}) {
   const route = `/api/git/branches/${branch.split('/').map(encodeURIComponent).join('/')}/verdict${repoRoot ? `?project=${encodeURIComponent(repoRoot)}` : ''}`;
   let res;
   try {
-    res = await request('POST', route, { verdict: args.verdict, reasons: args.reasons.map((r) => r.trim()), source: 'chat', sha: row.headSha });
+    res = await request('POST', route, { verdict: args.verdict, reasons: checkVerificationClaims(args.reasons).map((r) => r.trim()), source: 'chat', sha: row.headSha });
   } catch (e) {
     return { ok: false, error: `the dashboard did not answer the verdict request (${e.message}); nothing was recorded` };
   }
@@ -236,4 +261,4 @@ async function recordBranchVerdictTool(args = {}, opts = {}) {
   return { ok: false, status: res.status, error: `the dashboard refused the verdict: ${why}`, ...(json && json.headSha ? { headSha: json.headSha } : {}) };
 }
 
-module.exports = { listUnverifiedBranchesTool, recordBranchVerdictTool, VERDICTS, fetchRows, projectMatches, httpRequest };
+module.exports = { listUnverifiedBranchesTool, recordBranchVerdictTool, checkVerificationClaims, VERDICTS, fetchRows, projectMatches, httpRequest };

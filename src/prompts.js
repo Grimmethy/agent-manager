@@ -23,6 +23,14 @@ const { anchorFilesPromptBlock, backtickIdentifiers } = require('./task-anchor-f
 const { CANONICAL_TOP_LEVEL } = require('./brain-dump-sort-classify.js');
 require('./task-sources.js');
 const { statedAcceptanceBlock, fixedLiteralsBlock, priorRejectionBlock, priorVerdictBlock, strictCiteConstraintBlock } = require('./lib/prompt-blocks.js');
+
+// Retry hygiene rules: prepended to a retry prompt so the model returns only the deliverable,
+// with no meta-commentary and no reference to earlier attempts.
+const RETRY_HYGIENE_PREFIX = [
+  'Output only the deliverable requested.',
+  'Do not include meta-commentary about the task, your process, or your reasoning.',
+  'Do not refer to, acknowledge, or explain any prior attempt, previous draft, earlier critique, or retry.',
+].join('\n');
 const { assemblePrompt } = require('./lib/prompt-assembly.js');
 const { troubleLogPlanPrompt, secondbrainPlanPrompt, brainDumpSortPlanPrompt, pathPrefetchResolvePlanPrompt, researchPlanPrompt, pipelineSelfAuditPlanPrompt, pipelineHealthAuditPlanPrompt, uiVisibilityAuditPlanPrompt, stalenessAuditPlanPrompt, productSpecPlanPrompt, backlogDecompositionPlanPrompt } = require('./lib/prompt-planning.js');
 const { pathPrefetchResolveImplementPrompt, deepDiveImplementPrompt, backlogDecompositionImplementPrompt, brainDumpSortImplementPrompt } = require('./lib/prompt-implementation.js');
@@ -1808,7 +1816,7 @@ module.exports = {
   // backlog_fulfillment.
   archReviewPlanPrompt, archReviewImplementPrompt,
   archDiscoveryPlanPrompt, archDiscoveryImplementPrompt,
-  archImportPlanPrompt, archImportImplementPrompt,
+  RETRY_HYGIENE_PREFIX, archImportPlanPrompt, archImportImplementPrompt,
   unusedExportPlanPrompt, unusedExportImplementPrompt,
   productSpecOutlinePlanPrompt, productSpecOutlineImplementPrompt,
   productSpecSectionPlanPrompt, productSpecSectionImplementPrompt,

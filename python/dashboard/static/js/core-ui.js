@@ -49,20 +49,51 @@ function renderHistoryPanel() {
   });
 }
 
-async function fetchJson(url, { timeoutMs = 8000 } = {}) {
+// Failure memory (HUB0531 1/4): a timeout, AbortError, or non-OK response for a URL is
+// remembered with Date.now() and identical requests get that stored error back for
+// FETCH_FAILURE_MEMORY_MS. Expiry is checked only when a new call arrives -- no timer.
+const FETCH_FAILURE_MEMORY_MS = 15000;
+// In-flight GET dedupe: concurrent calls for the same URL share one promise, cleared on
+// settle. Note: the key is the URL alone, so sharers get the first caller's timeoutMs and
+// the same parsed JSON object reference -- a caller that mutates the result affects the others.
+const fetchInFlight = new Map();
+const fetchFailures = new Map();
+
+async function fetchJsonUncached(url, timeoutMs) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   let r;
   try {
     r = await fetch(url, { signal: controller.signal });
   } catch (e) {
-    if (e.name === 'AbortError') throw new Error(url + ' -> timed out after ' + (timeoutMs / 1000) + 's');
+    if (e.name === 'AbortError') {
+      const message = url + ' -> timed out after ' + (timeoutMs / 1000) + 's';
+      fetchFailures.set(url, { message, at: Date.now() });
+      throw new Error(message);
+    }
     throw e;
   } finally {
     clearTimeout(timeoutId);
   }
-  if (!r.ok) throw new Error(url + ' -> ' + r.status);
+  if (!r.ok) {
+    const message = url + ' -> ' + r.status;
+    fetchFailures.set(url, { message, at: Date.now() });
+    throw new Error(message);
+  }
   return r.json();
+}
+
+async function fetchJson(url, { timeoutMs = 8000 } = {}) {
+  const failure = fetchFailures.get(url);
+  if (failure) {
+    if (Date.now() - failure.at < FETCH_FAILURE_MEMORY_MS) throw new Error(failure.message);
+    fetchFailures.delete(url);
+  }
+  const pending = fetchInFlight.get(url);
+  if (pending) return pending;
+  const promise = fetchJsonUncached(url, timeoutMs).finally(() => fetchInFlight.delete(url));
+  fetchInFlight.set(url, promise);
+  return promise;
 }
 
 // Stale-render guard (2026-09-29, "display stutters and switches to the wrong tab"): every
@@ -97,6 +128,30 @@ async function runRefreshGuarded(fn, { now = Date.now, maxMs = 30000 } = {}) {
 }
 function _resetRenderStateForTest() { renderGeneration = 0; refreshRunningSince = 0; }
 
+// Per-browser-tab persistence of the active tab (sessionStorage: survives a reload or a tab
+// discard, and is not shared across windows). Storage can throw (private windows, quota), so
+// every access is guarded and a failure just means the tab is not remembered.
+const ACTIVE_TAB_STORAGE_KEY = 'dashboard.activeTab';
+function persistActiveTab(key) {
+  try { sessionStorage.setItem(ACTIVE_TAB_STORAGE_KEY, key); } catch (e) { /* no persistence */ }
+}
+function readStoredActiveTab() {
+  try { return sessionStorage.getItem(ACTIVE_TAB_STORAGE_KEY); } catch (e) { return null; }
+}
+
+// Restores the stored tab once, after the first successful plugin-tab merge (TABS starts
+// empty, so an earlier restore would fail findTabByKey and trip redirectFromGoneActiveTab).
+// An unknown or gone key leaves the current tab ('project' at startup) active.
+let activeTabRestoreDone = false;
+function restoreStoredActiveTabOnce() {
+  if (activeTabRestoreDone) return;
+  activeTabRestoreDone = true;
+  const stored = readStoredActiveTab();
+  if (!stored || stored === activeTab) return;
+  if (!findTabByKey(stored)) return;
+  switchToTab(stored);
+}
+
 function severityForTab(tabKey, count) {
   const thresholds = TAB_COUNT_SEVERITY_THRESHOLDS[tabKey];
   if (!thresholds || typeof count !== 'number') return null;
@@ -114,6 +169,7 @@ function severityForTab(tabKey, count) {
 function switchToTab(key) {
   bumpRenderGeneration(); // any in-flight render for the tab being left is now stale
   activeTab = key;
+  persistActiveTab(key);
   renderNav();
   if (typeof showTabSkeleton === 'function') showTabSkeleton();   // clear the previous tab's content at once; the tab's own render replaces this
   if (key === 'project') enterProjectTab();
@@ -261,6 +317,7 @@ async function syncPluginTabs() {
   try {
     const data = await fetchJson('/api/plugins');
     mergePluginTabs(data.plugins, data.manifestTabsEnabled);
+    restoreStoredActiveTabOnce(); // first successful merge only; a no-op on every later call
   } catch (e) {
     // Fail-safe: leave TABS as whatever it already was (CORE_TABS on the very first
     // failure) rather than let a plugin-listing error block the rest of the dashboard.
@@ -309,8 +366,19 @@ function findTabByKey(key) {
 // disable just took its replaced CORE_TABS row down with it. Either way the handling is the
 // same: switchToTab() runs the real leave/enter transition rather than just reassigning
 // activeTab, so the tab we're leaving still gets its own cleanup hook.
+// Two-strike rule: a single miss is not enough to redirect, because the tab list can be
+// briefly incomplete mid-update. goneActiveTabStrikes counts consecutive misses; a hit resets
+// it, and the redirect fires on the 2nd consecutive miss (then the counter resets). No timer
+// is involved -- the caller's own poll is what re-invokes this.
+let goneActiveTabStrikes = 0;
 function redirectFromGoneActiveTab(fallbackKey = 'project') {
-  if (findTabByKey(activeTab)) return false;
+  if (findTabByKey(activeTab)) {
+    goneActiveTabStrikes = 0;
+    return false;
+  }
+  goneActiveTabStrikes += 1;
+  if (goneActiveTabStrikes < 2) return false;
+  goneActiveTabStrikes = 0;
   switchToTab(fallbackKey);
   return true;
 }

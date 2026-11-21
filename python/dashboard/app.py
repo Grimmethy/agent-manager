@@ -199,6 +199,8 @@ from app_branch_helpers import (  # noqa: F401
     partition_held_hub_branches,
 )
 
+from branch_projects import failed_project_labels  # noqa: E402
+
 # Moved verbatim into app_source_plugin_helpers.py (2026-10-01 breakdown); re-exported so every importer of app.X is unchanged.
 from app_source_plugin_helpers import (  # noqa: F401
     ALWAYS_ACTIVE_SOURCES,
@@ -241,6 +243,18 @@ app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.after_request(compress_response)
 
 
+@app.route("/api/queue")
+def api_queue_project_filter():
+    # GET /api/queue?project=active|<slug>|all. Filter and dependency logic lives in
+    # routes/queue_project_filter.py. An unknown project becomes HTTP 400.
+    from routes.queue_project_filter import parse_project_param, queue_response
+    try:
+        project_param = parse_project_param(request.args.get("project"))
+    except ValueError as exc:
+        abort(400, description=str(exc))
+    return jsonify(queue_response(project_param))
+
+
 @app.errorhandler(HTTPException)
 def handle_http_exception(e):
     # Every route here is called by the dashboard's fetch()-based JS, which always does
@@ -281,6 +295,21 @@ def lan_mutation_gate():
             "set on the dashboard and supplied as a Bearer token."
         ))
     abort(401, description="Bad or missing Bearer token.")
+
+
+@app.after_request
+def add_branch_projects_failed_header(resp):
+    """Name the projects whose last unmerged-branches refresh failed, beside the route's X-Branch-Projects-Pending header. Omitted when none failed."""
+    if request.path != "/api/git/unmerged-branches":
+        return resp
+    try:
+        labels = [str(label).replace("\r", "").replace("\n", "") for label in failed_project_labels()]
+    except Exception as exc:  # noqa: BLE001 -- a header must never break the response
+        print(f"[branches] failed-project labels unavailable (non-fatal): {exc}", file=sys.stderr)
+        return resp
+    if labels:
+        resp.headers["X-Branch-Projects-Failed"] = ",".join(labels)
+    return resp
 
 
 import logging
@@ -424,18 +453,80 @@ def is_claude_token_configured() -> bool:
 PROJECT_REGISTRY_PATH = PACKAGE_ROOT / "projects.json"
 
 
+# Problems found by the most recent registry read(s): list of {entry, reason}. Replaced
+# (not appended) on every read so repeated reads never accumulate duplicates.
+_REGISTRY_WARNINGS: list = []
+# True when the last read found the file corrupt / not a list. record_project_registry_entry()
+# refuses to rewrite the file in that state, so a corrupt registry is never clobbered.
+_REGISTRY_CORRUPT = False
+
+
+def get_registry_warnings() -> list:
+    """Copy of the registry warnings store: list of {entry, reason}."""
+    return [dict(w) for w in _REGISTRY_WARNINGS]
+
+
+def _set_registry_warnings(items: list) -> None:
+    global _REGISTRY_WARNINGS
+    _REGISTRY_WARNINGS = list(items)
+
+
+def validate_project_entry(entry) -> list:
+    """Problem strings for one projects.json entry. An empty list means usable."""
+    if not isinstance(entry, dict):
+        return ["entry is not an object"]
+    problems = []
+    for key in ("repoRoot", "pipelineDir", "domainsPath"):
+        value = entry.get(key)
+        if not value or not isinstance(value, str):
+            problems.append(f"missing required key: {key}")
+    if problems:
+        return problems
+    if os.path.realpath(entry["pipelineDir"]) == os.path.realpath(entry["repoRoot"]):
+        problems.append("pipelineDir must differ from repoRoot")
+    if not os.path.isdir(entry["repoRoot"]):
+        problems.append(f"repoRoot is not an existing directory: {entry['repoRoot']}")
+    if not os.path.exists(entry["domainsPath"]):
+        problems.append(f"domainsPath does not exist: {entry['domainsPath']}")
+    return problems
+
+
 def read_project_registry() -> list:
     """List of {repoRoot, pipelineDir, domainsPath, label} for every project ever started
     via the Project tab -- project-history.json only stores a bare repo path, which isn't
-    enough to locate a non-active project's queue/task-domains.json later. Corrupt/missing
-    file -> empty list, never a 500."""
+    enough to locate a non-active project's queue/task-domains.json later. Missing file ->
+    empty list with no warning. Corrupt file, unreadable file, or non-list data -> empty
+    list plus an explicit warning (never a 500, never silent). Every dict entry is validated
+    with validate_project_entry; problems go to get_registry_warnings(), and the entry is
+    still returned so callers decide what to do with it."""
+    global _REGISTRY_CORRUPT
+    _REGISTRY_CORRUPT = False
+    warnings: list = []
+    path_str = str(PROJECT_REGISTRY_PATH)
     if not PROJECT_REGISTRY_PATH.is_file():
+        _set_registry_warnings(warnings)
         return []
     try:
         data = json.loads(PROJECT_REGISTRY_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError as exc:
+        _REGISTRY_CORRUPT = True
+        warnings.append({"entry": path_str, "reason": f"corrupt JSON: {exc}"})
+        _set_registry_warnings(warnings)
         return []
+    except OSError as exc:
+        warnings.append({"entry": path_str, "reason": f"unreadable: {exc}"})
+        _set_registry_warnings(warnings)
+        return []
+    if not isinstance(data, list):
+        _REGISTRY_CORRUPT = True
+        warnings.append({"entry": path_str, "reason": "registry is not a JSON list"})
+        _set_registry_warnings(warnings)
+        return []
+    for e in data:
+        for problem in validate_project_entry(e):
+            warnings.append({"entry": e, "reason": problem})
+    _set_registry_warnings(warnings)
+    return data
 
 
 def record_project_registry_entry(repo_root: str, pipeline_dir: str, domains_path: str):
@@ -446,6 +537,11 @@ def record_project_registry_entry(repo_root: str, pipeline_dir: str, domains_pat
     try:
         normalized_root = os.path.normpath(repo_root)
         entries = read_project_registry()
+        if _REGISTRY_CORRUPT:
+            # Refuse to overwrite a corrupt/unreadable registry: the reader already recorded
+            # the reason in get_registry_warnings(); rewriting would discard the user's data.
+            logger.warning("Not rewriting corrupt project registry at %s", PROJECT_REGISTRY_PATH)
+            return False
         prior = next((e for e in entries if os.path.normpath(e.get("repoRoot", "")) == normalized_root), {})
         entries = [e for e in entries if os.path.normpath(e.get("repoRoot", "")) != normalized_root]
         entry = {
@@ -1773,22 +1869,34 @@ def _chat_roots() -> list:
     plugin's repo (dirname of its register.js) and each projects.json repoRoot. A fresh
     clone with no plugins.json / projects.json just yields [agent-manager]."""
     raw = [str(PACKAGE_ROOT)]
+    extra_warnings: list = []
     for e in _read_plugins_manifest():
         rp = e.get("registerPath")
         if rp and e.get("enabled") is not False:
             raw.append(os.path.dirname(rp))
+    # read_project_registry() resets the warnings store and records validation problems;
+    # the skips below are appended to it so get_registry_warnings() reports both.
     for e in read_project_registry():
-        if e.get("repoRoot"):
-            raw.append(e["repoRoot"])
+        # read_project_registry() already recorded every problem for this entry; an entry
+        # that fails validation (or is not an object) is skipped as a chat root, not added.
+        if not isinstance(e, dict) or not e.get("repoRoot"):
+            continue
+        raw.append(e["repoRoot"])
     seen, out = set(), []
     for p in raw:
         try:
             real = os.path.realpath(p)
         except OSError:
+            extra_warnings.append({"entry": p, "reason": "path could not be resolved; skipped as a chat root"})
             continue
-        if real not in seen and os.path.isdir(real):
-            seen.add(real)
-            out.append(real)
+        if real in seen:
+            continue
+        if not os.path.isdir(real):
+            extra_warnings.append({"entry": p, "reason": "not an existing directory; skipped as a chat root"})
+            continue
+        seen.add(real)
+        out.append(real)
+    _set_registry_warnings(get_registry_warnings() + extra_warnings)
     return out or [os.path.realpath(str(PACKAGE_ROOT))]
 
 
@@ -2364,13 +2472,19 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
 
         conflict = memo(repo_root, base_sha, head_sha, "conflict", lambda: _check_merge_conflict(repo_root, main_branch, branch), final=lambda v: v.get("checked") is True)
 
-        label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
-        candidate_count = _triage_candidate_count(repo_root, main_branch, full_ref, subject, label)
         try:
-            trailers = memo(repo_root, base_sha, head_sha, "trailers", lambda: branch_trailer_ids(_run_git, repo_root, main_branch, full_ref))
-        except (RuntimeError, subprocess.SubprocessError, OSError):
-            trailers = []
-        hub = get_hub_data_provider().hub_for_branch(qdir, branch, list(dict.fromkeys([task_id, *trailers])))
+            label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
+            candidate_count = _triage_candidate_count(repo_root, main_branch, full_ref, subject, label)
+            try:
+                trailers = memo(repo_root, base_sha, head_sha, "trailers", lambda: branch_trailer_ids(_run_git, repo_root, main_branch, full_ref))
+            except (RuntimeError, subprocess.SubprocessError, OSError):
+                trailers = []
+            hub = get_hub_data_provider().hub_for_branch(qdir, branch, list(dict.fromkeys([task_id, *trailers])))
+        except Exception as exc:  # noqa: BLE001 -- one malformed task record must not blank the whole project's list
+            print(f"[branches] label/hub for {branch} failed (non-fatal): {type(exc).__name__}: {exc}", file=sys.stderr)
+            label = {"title": subject.strip(), "domain": None, "source": None, "matchedTaskState": None, "description": None}
+            candidate_count = 0
+            hub = None
         branches.append({
             "branch": branch,
             "taskId": task_id,
@@ -2380,6 +2494,7 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
             "matchedTaskState": label["matchedTaskState"],
             "description": label["description"],
             "subject": subject.strip(),
+            "headSha": head_sha,
             **({"candidateCount": candidate_count} if candidate_count else {}),
             "pushedAt": pushed_at,
             "ahead": ahead,
@@ -2422,7 +2537,42 @@ def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_
     return branches
 
 
+_parked_apply_active = False
+
+
+def _apply_parked_verdicts_to(branches):
+    """Apply parked verdicts to THIS list before it is cached, then mark the rows that still have a parked verdict (verdictPending). The list_fn handed to the apply returns `branches` and never recomputes, so the apply cannot re-enter the listing; the flag drops any nested call."""
+    global _parked_apply_active
+    with _branch_cache_lock:
+        if _parked_apply_active:
+            return
+        _parked_apply_active = True
+    try:
+        import branch_verdicts_pending as bvp
+        import branch_verdicts as bv
+        qdir = queue_dir()
+        repo_root = get_active_repo_root() if qdir else None
+        if qdir and repo_root:
+            parked = len(bvp.list_pending_verdicts(qdir))
+            # A miss refreshes once through the normal path; the _parked_apply_active flag makes the nested store skip this apply (re-entry guard).
+            bvp.apply_pending_verdicts(qdir, repo_root, lambda force=False: list_unmerged_branches(force=True) if force else branches, _run_git, bv)
+            if len(bvp.list_pending_verdicts(qdir)) != parked:
+                bv.enrich_branches_with_verdicts(qdir, repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
+            still_parked = {p.get("branch") for p in bvp.list_pending_verdicts(qdir)}
+            for b in branches:
+                if b.get("branch") in still_parked:
+                    b["verdictPending"] = True
+                else:
+                    b.pop("verdictPending", None)
+    except Exception as exc:  # noqa: BLE001 -- a parked verdict must never fail the listing
+        print(f"[branches] pending verdict apply failed (non-fatal): {exc}", file=sys.stderr)
+    finally:
+        with _branch_cache_lock:
+            _parked_apply_active = False
+
+
 def _store_branch_list(branches):
+    _apply_parked_verdicts_to(branches)      # verdicts apply BEFORE the write, so the stored and returned list reflects them
     with _branch_cache_lock:
         _branch_cache["at"] = time.time()
         _branch_cache["branches"] = branches
@@ -2432,17 +2582,7 @@ def _store_branch_list(branches):
         _branch_cache["digest"] = fingerprint
     if changed:
         event_stream.announce("branch-list-changed", project="active")      # the Branches tab re-reads the cached list (a recompute that found nothing new says nothing)
-    # Apply any pending verdicts for branches that are now in the listing
-    try:
-        import branch_verdicts_pending as bvp
-        import branch_verdicts as bv
-        qdir = queue_dir()
-        if qdir:
-            repo_root = get_active_repo_root()
-            if repo_root:
-                bvp.apply_pending_verdicts(qdir, repo_root, list_unmerged_branches, _run_git, bv)
-    except Exception as exc:
-        print(f"[branches] pending verdict apply failed (non-fatal): {exc}", file=sys.stderr)
+    # Parked verdicts were already applied before the cache write (_apply_parked_verdicts_to).
 
 
 def _refresh_branch_list_in_background():
@@ -2818,18 +2958,47 @@ def _seed_plugins_manifest() -> list:
     return entries
 
 
+# Last successfully parsed plugins.json contents. Served back when the file is later
+# unreadable or corrupt, so one bad write can't blank the Plugins tab or the plugin
+# resolver. None means no good copy exists yet in this process.
+_plugins_manifest_last_good = None
+_plugins_manifest_fallback_logged = False
+
+
 def _read_plugins_manifest() -> list:
+    global _plugins_manifest_last_good, _plugins_manifest_fallback_logged
     if not PLUGINS_MANIFEST_PATH.is_file():
         return _seed_plugins_manifest()
     try:
         parsed = json.loads(PLUGINS_MANIFEST_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as exc:
+        if not _plugins_manifest_fallback_logged:
+            _plugins_manifest_fallback_logged = True
+            logger.warning("Plugins manifest %s unreadable, using last-known-good copy: %s", PLUGINS_MANIFEST_PATH, exc)
+        if _plugins_manifest_last_good is not None:
+            return list(_plugins_manifest_last_good)
         return []
-    return parsed if isinstance(parsed, list) else []
+    if not isinstance(parsed, list):
+        return []
+    _plugins_manifest_last_good = parsed
+    _plugins_manifest_fallback_logged = False
+    return parsed
 
 
 def _write_plugins_manifest(entries: list) -> None:
-    PLUGINS_MANIFEST_PATH.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+    # Atomic write: temp file in the same directory, fsync, then os.replace onto the target.
+    target = PLUGINS_MANIFEST_PATH
+    tmp = target.with_name(f".plugins.json.tmp-{os.getpid()}-{time.time_ns()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(entries, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp)
+        raise
 
 
 def _resolve_plugin_root(name: str):
@@ -3267,10 +3436,12 @@ from routes.internal_chat import internal_chat_bp  # noqa: E402
 from routes.plugin_proxy import plugin_proxy_bp  # noqa: E402
 from routes.project import project_bp  # noqa: E402
 from routes.task_anywhere_1_more import task_anywhere_1_more_bp  # noqa: E402
+from routes.task_anywhere_other_pipelines import task_anywhere_other_pipelines_bp  # noqa: E402
 from routes.pipeline_1_more import pipeline_1_more_bp  # noqa: E402
 from routes.branch_verdicts import branch_verdicts_bp  # noqa: E402
 from routes.plugins import plugins_bp  # noqa: E402
 from routes.task import task_bp  # noqa: E402
+from routes.task_amend import task_amend_bp  # noqa: E402
 from routes.shared_misc import shared_misc_bp  # noqa: E402
 from routes.cloud_meter import cloud_meter_bp  # noqa: E402
 from routes.cloud_dial import cloud_dial_bp  # noqa: E402
@@ -3280,6 +3451,7 @@ from routes.needswork_worker import needswork_worker_bp  # noqa: E402
 from routes.pipeline_ops_workers import pipeline_ops_workers_bp  # noqa: E402
 from routes.context_worker import context_worker_bp  # noqa: E402
 from routes.event_stream import event_stream_bp  # noqa: E402
+from routes.new_task import new_task_bp  # noqa: E402
 
 app.register_blueprint(reports_bp)
 app.register_blueprint(event_stream_bp)
@@ -3305,9 +3477,11 @@ app.register_blueprint(internal_chat_bp)
 app.register_blueprint(plugin_proxy_bp)
 app.register_blueprint(project_bp)
 app.register_blueprint(task_anywhere_1_more_bp)
+app.register_blueprint(task_anywhere_other_pipelines_bp)
 app.register_blueprint(pipeline_1_more_bp)
 app.register_blueprint(branch_verdicts_bp)
 app.register_blueprint(plugins_bp)
+app.register_blueprint(new_task_bp)
 app.register_blueprint(cloud_meter_bp)
 app.register_blueprint(cloud_dial_bp)
 app.register_blueprint(stalled_worker_bp)
@@ -3316,6 +3490,7 @@ app.register_blueprint(needswork_worker_bp)
 app.register_blueprint(pipeline_ops_workers_bp)
 app.register_blueprint(context_worker_bp)
 app.register_blueprint(task_bp)
+app.register_blueprint(task_amend_bp)
 app.register_blueprint(shared_misc_bp)
 
 

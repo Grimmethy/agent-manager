@@ -25,22 +25,26 @@ function parseBlocks(text) {
   const preamble = HEADING_RE.test(parts[0].trimStart()) ? '' : parts[0];
   const blocks = new Map(); // id (number) -> block text (trimmed, heading included)
   const order = [];
+  const duplicates = []; // ids that appear more than once in this text (a Map would silently keep only the last)
   for (const part of parts) {
     const trimmed = part.trim();
     if (!trimmed) continue;
     const m = trimmed.match(HEADING_RE);
     if (!m) continue;
     const id = parseInt(m[1], 10);
+    if (blocks.has(id)) duplicates.push(id);
     blocks.set(id, trimmed);
     order.push(id);
   }
-  return { preamble, blocks, order };
+  return { preamble, blocks, order, duplicates };
 }
 
 /**
  * @returns {string|null} merged text, or null if the input doesn't look like a candidates
  *   doc at all (no AC-N headings anywhere) -- callers should treat null as "could not
- *   resolve structurally," and fall back to a real conflict rather than guessing.
+ *   resolve structurally," and fall back to a real conflict rather than guessing. Also
+ *   null when ours or theirs contains the same AC-N id more than once (a same-id duplicate
+ *   cannot be merged without silently dropping one candidate).
  */
 function mergeCandidatesDoc({ ancestorText, oursText, theirsText }) {
   const ancestor = parseBlocks(ancestorText);
@@ -48,6 +52,7 @@ function mergeCandidatesDoc({ ancestorText, oursText, theirsText }) {
   const theirs = parseBlocks(theirsText);
 
   if (ours.blocks.size === 0 && theirs.blocks.size === 0) return null;
+  if (ours.duplicates.length || theirs.duplicates.length) return null;
 
   let nextId = 1;
   for (const id of [...ours.blocks.keys(), ...theirs.blocks.keys(), ...ancestor.blocks.keys()]) {

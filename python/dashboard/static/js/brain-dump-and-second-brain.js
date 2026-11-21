@@ -173,7 +173,7 @@ function wireBrainDumpCardHandlers(el) {
         await fetch('/api/brain-dump/' + encodeURIComponent(btn.dataset.delete), { method: 'DELETE' });
         await refreshBrainDumpEntries(true);
       } catch (e) {
-        alert('Could not delete: ' + e.message);
+        alert('Could not delete: ' + e.message); btn.disabled = false;
       }
     };
   });

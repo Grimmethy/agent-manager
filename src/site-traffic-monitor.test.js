@@ -126,9 +126,9 @@ test('config defaults and overrides', () => {
   assert.equal(config({ AGENT_MANAGER_SITE_PROBE_MARKER: '/x/m', AGENT_MANAGER_SITE_PROBE_TTL_S: '30' }).probeMarker, '/x/m');
   assert.equal(config({ AGENT_MANAGER_SITE_PROBE_TTL_S: '30' }).probeTtlS, 30);
   const { probeMarker, probeTtlS, ...rest } = config({});
-  assert.deepEqual(rest, { idleMin: 5, maxLoad: 3, minFreeGb: 3, pollS: 10, stuckHours: 6 });
+  assert.deepEqual(rest, { idleMin: 5, maxLoad: 3, minFreeGb: 3, pollS: 10, stuckHours: 6, minSockets: 1 });
   const c = config({ AGENT_MANAGER_SITE_IDLE_MIN: '2', AGENT_MANAGER_SITE_MAX_LOAD: '1.5', AGENT_MANAGER_SITE_MIN_FREE_GB: '4', AGENT_MANAGER_SITE_POLL_S: '30', AGENT_MANAGER_SITE_STUCK_HOURS: '1' });
-  assert.deepEqual({ ...c, probeMarker: undefined, probeTtlS: undefined }, { idleMin: 2, maxLoad: 1.5, minFreeGb: 4, pollS: 30, stuckHours: 1, probeMarker: undefined, probeTtlS: undefined });
+  assert.deepEqual({ ...c, probeMarker: undefined, probeTtlS: undefined }, { idleMin: 2, maxLoad: 1.5, minFreeGb: 4, pollS: 30, stuckHours: 1, minSockets: 1, probeMarker: undefined, probeTtlS: undefined });
   assert.equal(config({ AGENT_MANAGER_SITE_IDLE_MIN: '0' }).idleMin, 5);
   assert.equal(config({ AGENT_MANAGER_SITE_MAX_LOAD: 'x' }).maxLoad, 3);
 });

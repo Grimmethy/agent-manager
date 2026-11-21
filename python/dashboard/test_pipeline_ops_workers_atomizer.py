@@ -28,7 +28,7 @@ class AtomizerCard(unittest.TestCase):
         self.client = app.app.test_client()
 
     def test_the_atomizer_is_a_worker_after_the_hub(self):
-        self.assertEqual(po.WORKERS[-2:], ("hub", "atomizer"))
+        self.assertEqual(po.WORKERS[-3:], ("hub", "atomizer", "featuremanager"))
 
     def test_its_paths_follow_the_worker_name(self):
         env = {"HOME": "/h"}

@@ -58,6 +58,21 @@ test('laneDegraded reads the latest fresh verdict; stale or unknown never blocks
   assert.equal(H.laneDegradedBetween(dir, 'worker-rx580', new Date(now - 9000000).toISOString(), new Date(now - 8000000).toISOString()), false);
 });
 
+test('the probe keep_alive is the same resolver output the lane uses for the same LOCAL_KEEP_ALIVE / ORNITH_KEEP_ALIVE env (never a literal)', async () => {
+  const { resolveKeepAlive } = require('./keep-alive.js');
+  const origWarn = console.warn;
+  console.warn = () => {};
+  try {
+    for (const [local, ornith] of [[undefined, undefined], ['30m', undefined], ['8760h', undefined], [undefined, '2h'], ['9000h', '1h']]) {
+      let body;
+      await H.probeEndpoint({ url: 'http://x', model: 'm', keepAlive: resolveKeepAlive(local, ornith), post: async (u, b) => { body = b; return { eval_count: 40, eval_duration: 1e9 }; } });
+      assert.equal(body.keep_alive, resolveKeepAlive(local, ornith));
+    }
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
 test('probeEndpoint turns Ollama timing into tokens/s and fails soft', async () => {
   const good = await H.probeEndpoint({ url: 'http://x', model: 'm', post: async () => ({ eval_count: 52, eval_duration: 2e9 }) });
   assert.equal(good.ok, true);

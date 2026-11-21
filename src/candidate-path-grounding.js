@@ -373,6 +373,27 @@ function citedContextFiles({ section, declaredFiles = [], repoRoot, max = 3 } = 
   return out;
 }
 
+// Check a flat list of claimed paths against the repo and return the ones that do not resolve.
+// Reuses resolveCitedFile (the single shared resolver) and flags anything that:
+//   - is an absolute path (never valid as a cited repo-relative path),
+//   - has exists === false from the resolver, or
+//   - resolves to a real filesystem path outside repoRoot (cross-repo contamination).
+// Synchronous, side-effect free.
+function findMissingCitedPaths(repoRoot, citedPaths) {
+  if (!Array.isArray(citedPaths)) return [];
+  const missing = [];
+  for (const claimed of citedPaths) {
+    if (typeof claimed !== 'string') continue;
+    if (path.isAbsolute(claimed)) { missing.push(claimed); continue; }
+    const r = resolveCitedFile(repoRoot, claimed);
+    if (!r.exists) { missing.push(claimed); continue; }
+    if (r.resolvedPath && !r.resolvedPath.startsWith(path.resolve(repoRoot) + path.sep) && r.resolvedPath !== path.resolve(repoRoot)) {
+      missing.push(claimed);
+    }
+  }
+  return missing;
+}
+
 module.exports = {
   citedContextFiles,
   resolveCitedFile,
@@ -389,4 +410,5 @@ module.exports = {
   splitCandidateEntries,
   checkCitedSymbolsPerEntry,
   formatFabricatedSymbolsReason,
+  findMissingCitedPaths,
 };

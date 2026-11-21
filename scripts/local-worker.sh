@@ -230,9 +230,23 @@ process_drafting_file() {
   elif [[ "$draft_succeeded" == "true" ]] && node "${PACKAGE_SRC_DIR}/node-outbox.js" is-node; then
     # Multi-node (piece 7b): a worker on a NODE (AGENT_MANAGER_NODE_ID set and not wok) stops after the draft. The drafted record waits in queue/node-outbox/ for
     # src/node-package-send.js to ship it to wok, whose own queue/review/ runs the ordinary review, apply, verifier and merge. A wok worker never takes this branch.
-    mkdir -p "${QUEUE_DIR}/node-outbox" >/dev/null 2>&1
-    mv -n "$wpath" "${QUEUE_DIR}/node-outbox/${name}"
-    printf '[worker-%s] draft complete on a node, ready to send to wok: %s\n' "$INSTANCE_ID" "$task_id" >&2
+    # Draft-present gate (HUB0574): only move a drafted record into node-outbox/ when it actually carries draft content. Otherwise leave it in the node's queue and log the reason.
+    draft_content_gap="$(node -e '
+      try {
+        const o = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+        const nonEmpty = (v) => (typeof v === "string" ? v.trim() !== "" : !!v);
+        const nc = o.needsClarification;
+        const ncReason = nc && typeof nc === "object" ? nc.reason : nc;
+        if (!(nonEmpty(o.implementResponse) || nonEmpty(o.rawDiff) || nonEmpty(o.adhocResolution) || nonEmpty(ncReason))) console.log("no implementResponse, rawDiff, adhocResolution or needsClarification reason on the record");
+      } catch (e) { console.log("record unreadable: " + e.message); }
+    ' "$wpath" 2>/dev/null)"
+    if [[ -n "$draft_content_gap" ]]; then
+      printf '[worker-%s] draft succeeded for %s but it is not ready to send to wok (%s) -- left in the node queue\n' "$INSTANCE_ID" "$task_id" "$draft_content_gap" >&2
+    else
+      mkdir -p "${QUEUE_DIR}/node-outbox" >/dev/null 2>&1
+      mv -n "$wpath" "${QUEUE_DIR}/node-outbox/${name}"
+      printf '[worker-%s] draft complete on a node, ready to send to wok: %s\n' "$INSTANCE_ID" "$task_id" >&2
+    fi
   elif [[ "$draft_succeeded" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/review" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/review/${name}"
@@ -250,6 +264,13 @@ process_drafting_file() {
     # top while the lease holds. Without this branch the failure counting below could permanently block a good task.
     # The pattern is the FORGE_PAUSE_MESSAGE text (pinned by src/local-client-forge-pause.test.js so the copies cannot drift).
     printf '[worker-%s] draft paused for a Forge GPU session -- not counted as a failure; %s stays in drafting/ and resumes when the lease clears\n' "$INSTANCE_ID" "$task_id" >&2
+    TICK_HAD_INFRA_FAILURE=true
+  elif quota_resume="$(printf '%s' "$draft_result" | node "${PACKAGE_SRC_DIR}/draft-quota.js" classify-and-defer "$wpath" 2>>"$LOG_FILE")"; [[ -n "$quota_resume" ]]; then
+    # Rate-limit / quota (HTTP 429: hourly token budget, five-hour plan limit) -- a TEMPORARY capacity condition, not a draft failure
+    # (src/draft-quota.js). classify-and-defer already wrote task.deferUntil; the item stays in drafting/ and the existing per-tick
+    # leftover-drafting pass skips it until then (no new timer or poll, ADR-0024). Deliberately NO draftFailureCount increment, NO
+    # infra-requeue round and NO block, so a quota window can never send the task to needs-clarification. This tick stops claiming.
+    printf '[worker-%s] draft deferred on a rate limit until %s -- not counted as a failure; %s stays in drafting/\n' "$INSTANCE_ID" "$quota_resume" "$task_id" >&2
     TICK_HAD_INFRA_FAILURE=true
   else
     # Draft call itself failed (e.g. Ollama unreachable, or a real generation call timing
@@ -652,7 +673,7 @@ while :; do                                                                     
   # when the switch flips finishes first (the check is once per tick).
   if worker_switched_off "$INSTANCE_ID"; then
     if (( SWITCHED_OFF_TICKS == 0 )); then
-      printf '[worker-%s] switched off by the operator (Workers tab) -- claiming nothing until it is switched back on.\n' "$INSTANCE_ID" >&2
+      printf '[worker-%s] %s\n' "$INSTANCE_ID" "$(worker_switch_message "$INSTANCE_ID")" >&2
     fi
     SWITCHED_OFF_TICKS=$((SWITCHED_OFF_TICKS + 1))
     write_heartbeat_file "$INSTANCE_ID" "disabled" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
@@ -816,6 +837,8 @@ while :; do                                                                     
       wpath="${drafting_instance_dir}/${name}"
       [[ -f "$wpath" && -s "$wpath" ]]                                        || continue
       if "$PREMIUM_ONLY" && ! is_premium_file "$wpath"; then continue; fi       # a premium-only borrowed tick leaves regular leftovers for later
+      # Rate-limit deferral (src/draft-quota.js): leave the item alone until its stated reset has passed. No failure was counted.
+      if node "${PACKAGE_SRC_DIR}/draft-quota.js" deferred "$wpath" 2>/dev/null; then continue; fi
       printf '[worker-%s] resuming leftover drafting item: %s\n' "$INSTANCE_ID" "$name"
       # A resumed item that predates the claimedAt stamp (or a chat-preempt requeue that
       # skipped drafting/) gets one now, set-once -- see the claim site's comment.

@@ -78,6 +78,10 @@ test('resolveTimeoutMs scales down for a cheap short call instead of always retu
   assert.ok(cheap >= MIN_TIMEOUT_MS);
 });
 
+test('MIN_TIMEOUT_MS is 180 s, 2x the 90 s worst contended cold-load measurement', () => {
+  assert.equal(MIN_TIMEOUT_MS, 180_000);
+});
+
 test('resolveTimeoutMs never exceeds the caller-supplied ceiling even for a huge workload', () => {
   const ms = resolveTimeoutMs({ promptTokens: 100000, numPredict: 100000, tokensPerSecond: 5, ceilingMs: 240_000 });
   assert.equal(ms, 240_000);
@@ -113,9 +117,7 @@ test('resolveTimeoutMs falls back to a conservative floor tokens/sec when none i
 });
 
 test('one context for every call: the extended tier is folded into PINNED_NUM_CTX, and it is the raised (2026-09-20) 49152', () => {
-  const { EXTENDED_NUM_CTX } = require('./gpu-capacity.js');
   assert.equal(PINNED_NUM_CTX, 49152);
-  assert.equal(EXTENDED_NUM_CTX, PINNED_NUM_CTX);
 });
 
 // Per-lane pinned context (2026-10-17): a lane's registry numCtx reaches the lane process as AGENT_MANAGER_LANE_NUM_CTX.

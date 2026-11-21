@@ -76,7 +76,34 @@ function candidateKey(candidate) {
   return `${files.join('|')}::${ident}`;
 }
 
-// A doc text -> [{ id: 'AC-51', key }] for every "### AC-N · Title" entry that has a key.
+// First non-empty line of a snippet, whitespace-collapsed and lower-cased; '' when shorter than 12 chars.
+function snippetFirstLine(snippetText) {
+  if (typeof snippetText !== 'string') return '';
+  const line = snippetText.split(/\r?\n/).map((l) => l.replace(/\s+/g, ' ').trim()).find(Boolean) || '';
+  const norm = line.toLowerCase();
+  return norm.length >= 12 ? norm : '';
+}
+
+// { files, snippet } -> 'snip:<files>::<first line>', or null when either part is missing.
+function snippetKey(candidate) {
+  if (!candidate) return null;
+  const files = normalizeFiles(candidate.files);
+  const line = snippetFirstLine(candidate.snippet);
+  if (files.length === 0 || !line) return null;
+  return `snip:${files.join('|')}::${line}`;
+}
+
+// Identifier key when there is one, else the snippet key, else null.
+function dedupeKey(candidate) {
+  const id = candidateKey(candidate);
+  if (id) return { kind: 'identifier', key: id };
+  const sk = snippetKey(candidate);
+  if (sk) return { kind: 'snippet', key: sk };
+  return null;
+}
+
+// A doc text -> [{ id: 'AC-51', key, snippetKey? }] for every "### AC-N · Title" entry that has an identifier
+// key and/or a snippet key. `key` is null when only the snippet key exists; `snippetKey` is omitted when absent.
 function entriesIn(text) {
   const out = [];
   const blocks = String(text || '').split(/(?=^###\s*AC-\d+)/m);
@@ -86,7 +113,12 @@ function entriesIn(text) {
     const filesMatch = block.match(/^Files:\s*(.+)$/m);
     const symbolMatch = block.match(/^Symbol:\s*(.+)$/m);
     const key = candidateKey({ title: head[2], files: filesMatch ? filesMatch[1] : '', symbol: symbolMatch ? symbolMatch[1] : '' });
-    if (key) out.push({ id: head[1], key });
+    const snipMatch = block.match(/^Snippet:[ \t]*\r?\n```[^\n]*\n([\s\S]*?)\n```/m);
+    const sKey = snippetKey({ files: filesMatch ? filesMatch[1] : '', snippet: snipMatch ? snipMatch[1] : '' });
+    if (!key && !sKey) continue;
+    const entry = { id: head[1], key: key || null };
+    if (sKey) entry.snippetKey = sKey;
+    out.push(entry);
   }
   return out;
 }
@@ -94,13 +126,13 @@ function entriesIn(text) {
 // candidate + [{ ref, text }] -> { duplicateOf: 'AC-N', ref } for the first doc that already has the same
 // key, else null. `ref` is a label only ('working-tree', 'master', 'agent/...'), used in the skip reason.
 function findDuplicateCandidate(candidate, docTexts) {
-  const key = candidateKey(candidate);
-  if (!key) return null;
+  const dk = dedupeKey(candidate);
+  if (!dk) return null;
   for (const { ref, text } of docTexts || []) {
-    const hit = entriesIn(text).find((e) => e.key === key);
-    if (hit) return { duplicateOf: hit.id, ref };
+    const hit = entriesIn(text).find((e) => (dk.kind === 'identifier' ? e.key === dk.key : e.snippetKey === dk.key));
+    if (hit) return { duplicateOf: hit.id, ref, matchedBy: dk.kind };
   }
   return null;
 }
 
-module.exports = { candidateKey, entriesIn, findDuplicateCandidate, normalizeFiles, titleIdentifier, fallbackTitleIdentifier };
+module.exports = { candidateKey, snippetKey, dedupeKey, snippetFirstLine, entriesIn, findDuplicateCandidate, normalizeFiles, titleIdentifier, fallbackTitleIdentifier };

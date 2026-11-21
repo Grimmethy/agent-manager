@@ -6,11 +6,19 @@ const fs = require('fs');
 const path = require('path');
 const { resolveAnchors, extractKeywords } = require('./path-prefetch.js');
 const { resolveGraphPath, getSecondBrainDir } = require('./config.js');
+// isResearchDomainTask (draft-lifecycle.js) owns the "Research:" title-prefix convention
+// -- the one part of a research task's identity that survives existingQueuedTaskTitles()'s
+// 140-char title truncation, and the structured tag this file's duplicate gate now matches
+// on when free-text can't (see isValidDuplicateMatch's header). draft-lifecycle.js itself
+// requires only task-history.js / task-source-registry.js / ollama-lock-key.js (all
+// dependency-free), so pulling it in here adds no cycle.
+const { isResearchDomainTask } = require('./lib/draft-lifecycle.js');
 const { writeAtomicSync, writeJsonAtomicSync } = require('./atomic-write.js');
 const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-dump-existing-work.js');
 const { checkEntryTargets, isEnabled: targetCheckEnabled } = require('./brain-dump-target-check.js');
 const { checkBrainDumpDuplicate, isEnabled: duplicateCheckEnabled } = require('./lib/brain-dump-duplicate-check.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { handOffJournalEntry } = require('./journalforge-handoff.js');
 const { normalizeTokens, jaccardSimilarity } = require('./text-similarity.js');
 const {
   CANONICAL_TOP_LEVEL,
@@ -65,9 +73,15 @@ function originProjectFor(entry, registry) {
 // title still passes; anything below that bar is almost certainly a hallucination, not a
 // real duplicate the classifier actually found.
 const DUPLICATE_MATCH_JACCARD_THRESHOLD = 0.5;
-function isValidDuplicateMatch(candidate, existingTitles) {
+function isValidDuplicateMatch(candidate, existingTitles, candidateTask) {
   const c = String(candidate || '').trim();
   if (!c || !Array.isArray(existingTitles) || existingTitles.length === 0) return false;
+  // Research-domain branch (2026-09-16): existingQueuedTaskTitles() cuts every title to 140
+  // chars, so a "Research: ..." title can lose the words a free-text check needs. The
+  // "Research:" prefix (isResearchDomainTask) survives that truncation, so when the candidate
+  // is research-domain and some queued title is too, that structured signal decides.
+  const candidateIsResearch = !!candidateTask && (candidateTask.domain === 'research' || isResearchDomainTask({ title: c }));
+  if (candidateIsResearch && existingTitles.some((t) => isResearchDomainTask({ title: String(t || '') }))) return true;
   const cLower = c.toLowerCase();
   const cTokens = normalizeTokens(c);
   return existingTitles.some((title) => {
@@ -510,7 +524,7 @@ function applyDuplicateGate(ctx, matchedProject, built) {
   // Validate BEFORE trusting it -- see isValidDuplicateMatch's own header for the
   // incident this closes. A classifier answer that matches nothing in the real
   // candidate list it was shown is treated as no match at all, not a duplicate flag.
-  if (result.possibleDuplicateOf && !isValidDuplicateMatch(result.possibleDuplicateOf, existingQueuedTitles)) {
+  if (result.possibleDuplicateOf && !isValidDuplicateMatch(result.possibleDuplicateOf, existingQueuedTitles, result.requiresResearch ? { domain: 'research' } : null)) {
     console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that does not match any real candidate title shown to the classifier -- discarding as a hallucinated match, not routing to needs-clarification`);
     result.possibleDuplicateOf = null;
   }
@@ -724,7 +738,17 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
     return queueProjectTask(ctx, matchedProject);
   }
 
-  return filePassiveNote(ctx);
+  const filed = filePassiveNote(ctx);
+  // JournalForge keep-and-resurface handoff (journal loop). Runs only AFTER the vault note is
+  // filed, and can never change the filing or the sort result: any failure is caught here.
+  try {
+    const handoff = handOffJournalEntry({ entry, result, capturedAt: entry.capturedAt, pipelineDir });
+    if (handoff.handed) {
+      fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+      writeJsonAtomicSync(brainDumpPath, data);
+    }
+  } catch { /* handoff is best-effort; the note is already filed */ }
+  return filed;
 }
 
 function closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId, note }) {

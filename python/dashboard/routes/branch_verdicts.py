@@ -48,6 +48,15 @@ def api_git_record_branch_verdict(branch):
         real, match = branch_projects.find_or_refresh_other_project_branch(scope, branch)
     else:
         match = next((b for b in list_unmerged_branches(force=False) if b["branch"] == branch), None)
+        # One forced refresh, active project only, on a miss or a claimed-sha mismatch: the cached list can lag a fresh push.
+        # A failed refresh is non-fatal and keeps the cached result.
+        claimed = body.get("sha")
+        if not match or (claimed and claimed != match.get("headSha")):
+            try:
+                match = next((b for b in list_unmerged_branches(force=True) if b["branch"] == branch), None)
+            except Exception as e:
+                import logging
+                logging.getLogger("branch-verdicts").warning(f"[branches] refresh for verdict on {branch} failed (non-fatal): {e}")
     if not match:
         # Check if the branch exists on origin (held hub branch or listing hasn't caught up yet)
         try:
@@ -59,7 +68,8 @@ def api_git_record_branch_verdict(branch):
             if claimed and claimed != head_sha:
                 return jsonify({"succeeded": False, "reason": "verdict is for an older commit; the branch head has moved", "headSha": head_sha}), 409
             bvp.store_pending_verdict(qdir, branch, head_sha, verdict, reasons, source)
-            return jsonify({"succeeded": True, "pending": True, "headSha": head_sha}), 200
+            return jsonify({"succeeded": True, "recorded": False, "pending": True, "headSha": head_sha,
+                            "reason": "branch is on origin but not yet listed after refresh; verdict parked until it appears"}), 200
         except (RuntimeError, OSError):
             # Branch doesn't exist on origin, 404 as before
             abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
@@ -86,7 +96,9 @@ def api_git_record_branch_verdict(branch):
             logging.getLogger("branch-verdicts").warning(f"Failed to patch verdict cache for {branch}: {err}")
     else:
         _invalidate_branch_cache(refetch=False)  # a verdict moves no remote ref: drop the cached cards (they carry the verdict) but skip the fetch
-    return jsonify({"succeeded": True, "written": written, "headSha": head_sha, **bv.get_verdict(qdir, branch, head_sha)})
+    view = dict(bv.get_verdict(qdir, branch, head_sha))
+    view.pop("pending", None)  # a recorded response must not carry a pending key; the verdict view's flag is not part of this contract
+    return jsonify({**view, "succeeded": True, "recorded": True, "written": written, "headSha": head_sha})
 
 
 @branch_verdicts_bp.route("/api/git/branches/verdicts", methods=["POST"])

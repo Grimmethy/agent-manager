@@ -27,6 +27,22 @@ The owner's steps, in order. Nothing here starts by itself.
 
 A node never merges, pushes or deploys: its output is a record that wok reviews.
 
+### 2b. Node claim filter (the dirs, sources and domains a node may take)
+
+Three env vars shape which tasks a node may claim from a pipeline dir listed in `AGENT_MANAGER_NODE_FILTERED_DIRS` (comma-separated, absolute paths; unset gives `[]`). The three vars and their defaults:
+
+- `AGENT_MANAGER_NODE_FILTERED_DIRS` — comma-separated absolute paths of pipeline dirs this node **filters**. A dir not listed here is unfiltered and every task there is eligible (subject only to the global premium gate). Unset or empty gives `[]`.
+- `AGENT_MANAGER_NODE_FILTER_SOURCES` — which `source` values are eligible inside a filtered dir (default `['manual']`). Unset or empty gives `['manual']`.
+- `AGENT_MANAGER_NODE_FILTER_DOMAINS` — which `domain` values are eligible inside a filtered dir (default `['adhoc', 'default']`). Unset or empty gives `['adhoc', 'default']`.
+
+The same-repo rule always applies: a task in a filtered dir is claimed only when `generatedForRepoRoot` resolves to that dir or is unset. `AGENT_MANAGER_NODE_ALLOW_STACKED` (default off) and `AGENT_MANAGER_NODE_SKIP_PREMIUM` (default off) also apply.
+
+The live registry unit sets `AGENT_MANAGER_NODE_FILTER_DOMAINS=adhoc,default` (owner order 2026-11-16) so the swarm can take Feature Forge tasks (source `manual`, domain `default`) in addition to adhoc. To restrict a node further, set `AGENT_MANAGER_NODE_FILTER_DOMAINS` to a subset (for example `AGENT_MANAGER_NODE_FILTER_DOMAINS=adhoc` excludes `default`); the explicit value always wins over the default.
+
+### Code routes (the node pulls wok's code)
+
+The package intake also answers two read-only routes for a node that pulls wok's published code instead of being sent it: `GET /code/latest` (the list in `latest.json` of the code publish directory, `AGENT_MANAGER_CODE_PUBLISH_DIR`, default `<pipeline dir>/code-publish`) and `GET /code/<name>.bundle` (a bundle file named by an entry of that list, and nothing else). Both need the node's bearer token in `Authorization` and the node id in `X-Node-Id`, and both only answer the address the node was registered with. They are LAN only, with no TLS, so they never write and never serve a path outside the list. The manual way stays: `scp` a bundle, or a shared directory, and `scripts/import-repo-bundle.sh`.
+
 ### Review of a node's draft under swap-only critical memory pressure
 The reviewer lanes normally yield their tick while the memory marker is critical. The marker can be critical through the swap backstop alone (swap free under 128 MB with under 4096 MB of RAM and any I/O stall). When that is the only cause, a draft that a node sent (a record in `queue/review` with `fromNode`) is reviewed anyway, one per tick: swap free under 128 MB, at least 1024 MB available, memory full stall under 5, I/O full stall under 10. Anything else critical still yields. Kill switch: `AGENT_MANAGER_NODE_DRAFT_REVIEW_UNDER_SWAP_CRITICAL=false`. Code: `nodeDraftMayRunUnderPressure` in `src/node-draft-pressure.js`, used by `scripts/review-runner.sh`.
 
@@ -40,6 +56,20 @@ A node has no GitHub access, so a repo reaches it as a bundle file, and the clou
 4. **Import the gateway the same way**, for example into `~/cloud-providers` on the node.
 5. **Write the gateway unit:** `scripts/provision-node-gateway.sh <cloud-providers-dir> ~/.config/systemd/user` (an optional third argument is the port, default 7450). It refuses anything that is not an absolute path or a port from 1024 to 65535. It writes `am-cloud-gateway.service`, which runs the gateway on the logged-in Claude account **without** the confirmation, and `am-cloud-gateway.confirm-subscription.conf.example`, a template that systemd does not read. The gateway refuses to start without the confirmation.
 6. **Your decisions and commands** (the scripts do none of them): run `claude auth login` on the node; copy the template to `~/.config/systemd/user/am-cloud-gateway.service.d/confirm-subscription.conf` **only if you accept** that Anthropic's consumer terms may not permit automated use of a Pro login (`cloud-lane.md`, "Billing"); then `systemctl --user daemon-reload` and `systemctl --user enable --now am-cloud-gateway.service`; check `curl http://127.0.0.1:7450/health`; and last set `enabled` to `true` on the cloud lane in `<pipeline-dir>/lanes.json` and restart the node's workers.
+
+### One-time conversion of a plain-copy node checkout (owner step)
+
+Use this when a node's checkout is a plain directory of files, not a git clone: `git -C <node-repo-dir> rev-parse HEAD` says not a git repository, and `ls -a` shows no `.git` (grimm, 2026-11-17). Until it is done, `applyCode` in `src/node-code-apply.js` refuses with reason `not-a-git-work-tree`, writes one audit line per refusal and one NOTICE per process, and changes nothing. Every step is yours; the agent does not run them.
+
+1. **Inventory:** `cd <node-repo-dir> && ls -a`. List the node-local files that are not in the published repo, such as `agent-manager.env` and any queue or pipeline state. Those are the only files copied back in step 5.
+2. **Drain the node units:** stop the workers through the drain before touching the directory. Check the usage line of `src/node-code-drain.js` first.
+3. **Back up:** `mv <node-repo-dir> <node-repo-dir>.bak-$(date +%Y%m%d)`. Nothing is deleted.
+4. **Import the current master bundle into an empty directory:** `mkdir <node-repo-dir> && scripts/import-repo-bundle.sh <bundle-file> <node-repo-dir>`. The bundle comes from wok (`scripts/export-repo-bundle.sh`). It prints `head=<sha> dest=<path>`; the clone has no remote.
+5. **Copy back only the inventoried node-local files** from the backup with `cp -p`. Do not copy back the backup's `src/`, `scripts/` or `.git`.
+6. **Check the entry files:** `node --check` on each entry file the units run (the ExecStart targets of the node units).
+7. **Restart the units through the drain**, then check that `git -C <node-repo-dir> rev-parse HEAD` equals the `head=` value from step 4 and that the registry codeSha is the same.
+
+**Rollback:** stop the units through the drain, `mv <node-repo-dir> <node-repo-dir>.failed-$(date +%Y%m%d)`, `mv <node-repo-dir>.bak-YYYYMMDD <node-repo-dir>` (the dated name from step 3), then restart the units.
 
 ## 3. The trial (the 80 percent bar)
 

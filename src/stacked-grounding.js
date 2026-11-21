@@ -74,23 +74,49 @@ function grepAtRef(repoRoot, ref, pattern, paths) {
 
 // Does a CLAIMED path exist in a ref's tree? Mirrors fact-checker.js's resolveAgainstRepoDetailed tiers against git's object database instead of
 // the working tree: exact path, then each configured code dir (extraRoots) prefixed, then a unique basename match (or a unique one under an
-// extraRoot when the bare basename is ambiguous). Returns the resolved repo-relative path, or null. Never throws: an unreadable ref reads as
-// "not found", which leaves the caller's own working-tree verdict in force.
+// extraRoot when the bare basename is ambiguous). Returns the resolved repo-relative path, or null when the path is genuinely absent (or
+// ambiguous) at a valid ref. Same contract as grepAtRef: an unknown/unfetched ref or any real git failure (timeout, spawn error) THROWS an
+// Error naming the ref and path, so callers must catch and treat it as "unknown", not "absent".
 // 2026-09-20, PF HUB0005-01: a stacked task that MODIFIES a file only its chain branch has (tileGrid.ts) was blocked 3x by the plan-target
 // guard as a fabricated path, because that guard only looked at the shared checkout's working tree.
+// True only when `p` is a blob (file, not directory) at origin/<ref>. Object-database lookup, no full tree listing.
+// Callers must have verified the ref (refExists) first, so a git answer of non-zero here means the path is absent.
+function refHasBlob(repoRoot, ref, p) {
+  try {
+    return execFileSync('git', ['cat-file', '-t', `origin/${ref}:${p}`], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] }).trim() === 'blob';
+  } catch (e) {
+    if (e && typeof e.status === 'number' && !e.signal) return false;
+    throw new Error(`resolveAtRef: git cat-file failed for origin/${ref}:${p}: ${e && e.message ? e.message : e}`, { cause: e });
+  }
+}
+
+// True when origin/<ref> resolves to a commit. Exit 1 (--quiet, unknown ref) is false; any other failure rethrows.
+function refExists(repoRoot, ref) {
+  try {
+    execFileSync('git', ['rev-parse', '--verify', '--quiet', `origin/${ref}^{commit}`], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] });
+    return true;
+  } catch (e) {
+    if (e && e.status === 1 && !e.signal && !e.code) return false;
+    throw new Error(`resolveAtRef: git failed verifying ref '${ref}': ${e && e.message ? e.message : e}`, { cause: e });
+  }
+}
+
 function resolveAtRef(repoRoot, ref, candidatePath, extraRoots = []) {
+  const normalized = String(candidatePath || '').replace(/\\/g, '/').replace(/^\.?\//, '');
+  if (!normalized) return null;
+  if (!refExists(repoRoot, ref)) throw new Error(`resolveAtRef: ref '${ref}' not found (path '${normalized}')`);
+  // Exact and extraRoot-prefixed hits are answered by direct object lookups; the full tree listing below runs only on a miss.
+  if (refHasBlob(repoRoot, ref, normalized)) return normalized;
+  for (const r of extraRoots || []) {
+    const full = path.posix.join(String(r).replace(/\\/g, '/'), normalized);
+    if (refHasBlob(repoRoot, ref, full)) return full;
+  }
   let files;
   try {
     files = execFileSync('git', ['ls-tree', '-r', '--name-only', `origin/${ref}`], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 })
       .split('\n').filter(Boolean);
-  } catch { return null; }
-  const set = new Set(files);
-  const normalized = String(candidatePath || '').replace(/\\/g, '/').replace(/^\.?\//, '');
-  if (!normalized) return null;
-  if (set.has(normalized)) return normalized;
-  for (const r of extraRoots || []) {
-    const full = path.posix.join(String(r).replace(/\\/g, '/'), normalized);
-    if (set.has(full)) return full;
+  } catch (e) {
+    throw new Error(`resolveAtRef: git ls-tree failed for origin/${ref} (looking up ${normalized}): ${e && e.message ? e.message : e}`, { cause: e });
   }
   const base = path.posix.basename(normalized);
   const matches = files.filter((f) => path.posix.basename(f) === base);

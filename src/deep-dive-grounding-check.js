@@ -233,8 +233,9 @@ function detectClaimedKind(symbol, draftText) {
     const clause = clauseAround(draftText, m.index, m.index + m[0].length);
     if (/\bTypedDict\b/.test(clause)) return 'TypedDict';
     if (/\bEnum\b/.test(clause)) return 'Enum';
-    if (/\bclass\b/.test(clause)) return 'class';
+    if (/\bclass\b(?!-like\b)/.test(clause)) return 'class';
     if (/\b(function|method)s?\b/.test(clause)) return 'function';
+    if (/\bclass\b/.test(clause)) return 'class';
   }
   return null;
 }
@@ -245,7 +246,15 @@ function detectClaimedKind(symbol, draftText) {
 // excluded on purpose: those are import/file citations, not kind claims.
 const TYPE_FIDELITY_SYMBOL_RE = /`([A-Za-z_][A-Za-z0-9_]*)`/g;
 
-function checkTypeFidelity(task, text) {
+// Enum is a subkind of class: a draft calling `class X(Enum)` a "class" is accurate. Only
+// that pair is excused. A TypedDict described as a class stays a mismatch (see the test at
+// src/deep-dive-grounding-check.test.js for the TypedDict-as-class case).
+function isCompatibleKind(claimed, actual) {
+  if (claimed === actual) return true;
+  return claimed === 'class' && actual === 'Enum';
+}
+
+function checkTypeFidelity(task, text, onSuppressed = () => {}) {
   const files = realFilesOf(task);
   if (!files.length) return [];
   const sourceText = files.map((f) => f.content).join('\n');
@@ -260,7 +269,10 @@ function checkTypeFidelity(task, text) {
     const actual = detectActualKind(symbol, sourceText);
     if (!actual) continue; // absent or undetectable -- checkFabricatedSymbols' lane, or no call
     const claimed = detectClaimedKind(symbol, text);
-    if (claimed && claimed !== actual) {
+    if (claimed && claimed === 'class' && actual === 'Enum') {
+      onSuppressed({ symbol, claimed, actual, reason: 'class-subkind' });
+    }
+    if (claimed && !isCompatibleKind(claimed, actual)) {
       mismatches.push({
         kind: 'type-mismatch',
         detail: `the draft calls \`${symbol}\` a ${claimed}, but the real fetched source declares it as a ${actual}`,

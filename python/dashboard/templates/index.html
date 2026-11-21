@@ -429,6 +429,7 @@
   <span id="memory-chip" hidden></span>
   <span id="touchpoints-chip" hidden></span>
   <button class="action" id="global-brain-dump-btn" style="margin-left:auto" title="Capture a quick note to Brain Dump from any tab">+ Brain Dump</button>
+  <button class="action" id="global-new-task-btn" title="File a new task into a chosen repo">+ New task</button>
 </header>
 <div id="required-plugins-banner" role="alert" hidden></div>
 <div class="layout" id="layout">
@@ -451,7 +452,10 @@
 <script src="/static/js/forge-navigate.js"></script>
 <script src="/static/js/nav-icons.js"></script>
 <script src="/static/js/nav-sections.js"></script>
+<script src="/static/js/queue-filter.js"></script>
+<script src="{{ url_for('static', filename='js/queue-slow-fetch.js') }}"></script>
 <script src="/static/js/queue-tab.js"></script>
+<script src="/static/js/queue-view.js"></script>
 <script src="/static/js/plugins-tab.js"></script>
 <script src="/static/js/worker-task-picker.js"></script>
 <script src="/static/js/worker-model-select.js"></script>
@@ -477,6 +481,7 @@
 <script src="/static/js/context-worker-panel.js"></script>
 <script src="/static/js/pipeline-ops-workers-panel.js"></script>
 <script src="/static/js/sidebar-and-claude-panels.js"></script>
+<script src="{{ url_for('static', filename='js/reports-paging.js') }}"></script>
 <script src="{{ url_for('static', filename='js/analytics-and-discovery.js') }}"></script>
 <script src="/static/js/models-tab.js"></script>
 <script src="/static/js/concepts-and-adhoc-tab.js"></script>
@@ -489,8 +494,10 @@
 <script src="/static/js/branches-joblist-hardware-tabs.js"></script>
 <script src="/static/js/merge-outcome.js"></script>
 <script src="/static/js/project-options.js"></script>
+<script src="/static/js/project-switch-state.js"></script>
 <script src="/static/js/project-tab.js"></script>
 <script src="/static/js/brain-dump-chips.js"></script>
+<script src="/static/js/filed-findings-paging.js"></script>
 <script src="/static/js/brain-dump-and-second-brain.js"></script>
 <script src="/static/js/hygiene-tab.js"></script>
 <script src="/static/js/touchpoints-card.js"></script>
@@ -881,6 +888,7 @@ const BENCH_RADAR_COLORS = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181
 // way. If the Brain Dump tab happens to be open behind this modal, refreshBrainDumpEntries
 // picks the new entry up on its own 5s cycle -- no extra plumbing needed here.
 document.getElementById('global-brain-dump-btn').onclick = openGlobalBrainDumpModal;
+document.getElementById('global-new-task-btn').onclick = openNewTaskModal;
 
 // Manual archive/requeue (Job Status > Blocked/Done tabs) and manual apply (Approved tab,
 // three-tier approval mode, 2026-07-26) -- per-row action buttons on renderQueueTab's

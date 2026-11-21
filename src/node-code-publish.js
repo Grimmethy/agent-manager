@@ -9,6 +9,7 @@ const nodeFs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
+const { writeJsonAtomicSync } = require('./atomic-write');
 
 const GIT_TIMEOUT_MS = 25000;
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
@@ -80,4 +81,92 @@ function buildBundle(options) {
   return { sha, bundle: bundleName, branch };
 }
 
-module.exports = { buildBundle };
+const KEEP_PER_REPO = 3;
+const LATEST_NAME = 'latest.json';
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Reads latest.json through the injected fs. Missing, unparsable or non-array content gives []; never throws.
+function readList(outDir, fs) {
+  try {
+    const parsed = JSON.parse(String(fs.readFileSync(path.join(outDir, LATEST_NAME), 'utf8')));
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((e) => e && typeof e === 'object' && typeof e.repo === 'string');
+  } catch (_) {
+    return [];
+  }
+}
+
+function resolveOutDir(opts) {
+  if (opts.outDir) return opts.outDir;
+  if (process.env.AGENT_MANAGER_CODE_PUBLISH_DIR) return process.env.AGENT_MANAGER_CODE_PUBLISH_DIR;
+  const pipelineDir = opts.pipelineDir || process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT;
+  if (!pipelineDir) {
+    throw new Error('node-code-publish: outDir, AGENT_MANAGER_CODE_PUBLISH_DIR or AGENT_MANAGER_PIPELINE_DIR is required');
+  }
+  return path.join(pipelineDir, 'code-publish');
+}
+
+// Keeps the KEEP_PER_REPO newest bundles for this repo (plus the one latest.json names). Other repos are never touched.
+function pruneOld(outDir, repo, keepName, fs) {
+  try {
+    const re = new RegExp('^' + escapeRegExp(repo) + '-[0-9a-f]{8}\\.bundle$');
+    const mine = fs.readdirSync(outDir).filter((n) => re.test(n)).map((name) => {
+      let mtime = 0;
+      try { mtime = fs.statSync(path.join(outDir, name)).mtimeMs; } catch (_) { /* treat as oldest */ }
+      return { name, mtime };
+    });
+    mine.sort((a, b) => (b.mtime - a.mtime) || (a.name < b.name ? 1 : a.name > b.name ? -1 : 0));
+    const keep = new Set([keepName]);
+    for (const m of mine) {
+      if (keep.size >= KEEP_PER_REPO) break;
+      keep.add(m.name);
+    }
+    for (const m of mine) {
+      if (keep.has(m.name)) continue;
+      try { fs.unlinkSync(path.join(outDir, m.name)); } catch (_) { /* best effort */ }
+    }
+  } catch (_) {
+    // a prune failure must not fail the publish
+  }
+}
+
+// Builds the bundle first, then writes latest.json. Same current sha with the bundle present writes nothing.
+function publishCode(options) {
+  const opts = options || {};
+  const repo = opts.repo === undefined ? 'agent-manager' : opts.repo;
+  const branch = opts.branch === undefined ? 'master' : opts.branch;
+  const run = opts.run || defaultRun;
+  const fs = opts.fs || nodeFs;
+  if (!opts.repoDir || typeof opts.repoDir !== 'string') throw new Error('node-code-publish: repoDir is required');
+  checkName('repo', repo);
+  checkName('branch', branch);
+  const outDir = resolveOutDir(opts);
+
+  const currentSha = String(run(['rev-parse', '--verify', 'refs/remotes/origin/' + branch], opts.repoDir)).trim();
+  const existing = readList(outDir, fs).find((e) => e.repo === repo);
+  if (existing && existing.sha === currentSha && typeof existing.bundle === 'string'
+      && fs.existsSync(path.join(outDir, path.basename(existing.bundle)))) {
+    return { reason: 'current', sha: currentSha, bundle: existing.bundle, branch };
+  }
+
+  const result = buildBundle({ ...opts, repo, branch, outDir, run, fs });
+  const entry = { repo, sha: result.sha, bundle: path.basename(result.bundle), branch: result.branch };
+  const others = readList(outDir, fs).filter((e) => e.repo !== repo);
+  writeJsonAtomicSync(path.join(outDir, LATEST_NAME), [...others, entry]);
+  pruneOld(outDir, repo, entry.bundle, fs);
+  return { reason: 'published', sha: result.sha, bundle: entry.bundle, branch: result.branch };
+}
+
+// Returns this repo's entry from latest.json, or null. Never throws.
+function readPublished(outDir, repo) {
+  try {
+    return readList(outDir, nodeFs).find((e) => e.repo === repo) || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+module.exports = { buildBundle, publishCode, readPublished };

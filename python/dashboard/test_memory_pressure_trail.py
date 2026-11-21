@@ -132,6 +132,36 @@ class TestFold(TrailBase):
         self.assertTrue(all("kind" in e for e in entries))
         self.assertEqual(entries[-1]["event"], "pause")
 
+    def test_offenders_by_day_gives_per_day_shares(self):
+        def ts(day, hour):
+            midnight = NOW.replace(hour=0, minute=0, second=0, microsecond=0)
+            return (midnight + timedelta(days=day - 12, hours=hour)).timestamp()
+
+        def ep(start, *procs):
+            entry = {"kind": "relief", "event": "pause", "_ts": start, "state": "tight", "reason": "r", "numbers": {}}
+            if procs:
+                entry["top"] = [{"pid": i, "rss_mb": mb, "cmd": cmd} for i, (cmd, mb) in enumerate(procs)]
+            return [entry, {"kind": "relief", "event": "resume", "_ts": start + 10, "pause_s": 10.0}]
+
+        entries = (ep(ts(10, 1), (QEMU, 4000), (OLLAMA, 1000)) + ep(ts(10, 2), (QEMU, 4100)) + ep(ts(11, 1), (OLLAMA, 2800))
+                   + ep(ts(11, 2), (OLLAMA, 2600)) + ep(ts(12, 1)))
+        f = fold_mod.fold(entries)
+        days = f["offenders_by_day"]
+        self.assertEqual([d["date"] for d in days], [datetime.fromtimestamp(ts(d, 1), timezone.utc).strftime("%Y-%m-%d") for d in (10, 11, 12)])
+        self.assertEqual([d["episodes"] for d in days], [2, 2, 1])
+        day1 = {o["label"]: o for o in days[0]["offenders"]}
+        self.assertEqual((day1["qemu:p40-passthrough"]["share"], day1["llama-server"]["share"]), (1.0, 0.5))
+        self.assertEqual((day1["qemu:p40-passthrough"]["avg_mb"], day1["qemu:p40-passthrough"]["max_mb"]), (4050.0, 4100))
+        self.assertEqual([(o["label"], o["share"]) for o in days[1]["offenders"]], [("llama-server", 1.0)])
+        self.assertEqual(days[2]["offenders"], [])
+        # sum over days of share x episodes equals the all-window episode count per label
+        for label, n in {o["label"]: o["episodes"] for o in f["summary"]["top_offenders"]}.items():
+            total = sum(o["share"] * d["episodes"] for d in days for o in d["offenders"] if o["label"] == label)
+            self.assertAlmostEqual(total, n)
+        # existing keys are still there with the same fixture values
+        self.assertEqual(f["summary"]["episodes"], 5)
+        self.assertEqual(f["summary"]["by_day"][0]["episodes"], 2)
+
     def test_a_missing_file_is_empty(self):
         self.assertEqual(trail.read_entries(os.path.join(self._tmp.name, "nope.jsonl")), ([], False))
         s = fold_mod.fold([])["summary"]

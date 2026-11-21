@@ -30,11 +30,12 @@ async function start(s) {
   return { port: server.address().port, close: () => new Promise((r) => { server.close(r); server.closeAllConnections(); }) };
 }
 
-function call(port, { method = 'POST', url = '/package', token, body } = {}) {
+function call(port, { method = 'POST', url = '/package', token, body, headers: extra } = {}) {
   return new Promise((resolve, reject) => {
     const data = body === undefined ? '' : (typeof body === 'string' ? body : JSON.stringify(body));
     const headers = { 'Content-Length': Buffer.byteLength(data) };
     if (token) headers.Authorization = `Bearer ${token}`;
+    Object.assign(headers, extra);
     const req = http.request({ host: '127.0.0.1', port, method, path: url, headers, agent: false }, (res) => {
       let text = '';
       res.on('data', (c) => { text += c; });
@@ -367,5 +368,99 @@ test('a stop-shaped record for an unleased task returns 409: nothing is stored o
     assert.equal(fs.existsSync(reviewFile(s)), false);
     assert.equal(fs.existsSync(needsClarificationFile(s)), false);
     assert.equal(s.notices.length, 0);
+  } finally { await srv.close(); }
+});
+
+// GET /code/latest: the list wok published, read-only and token checked.
+const PUBLISHED = [{ repo: 'agent-manager', sha: 'd'.repeat(40), bundle: 'agent-manager-dddddddd.bundle', branch: 'master' }];
+const publishDir = (s) => path.join(s.env.AGENT_MANAGER_PIPELINE_DIR, 'code-publish');
+function publish(s, content) {
+  fs.mkdirSync(publishDir(s), { recursive: true });
+  fs.writeFileSync(path.join(publishDir(s), 'latest.json'), typeof content === 'string' ? content : JSON.stringify(content));
+}
+const getLatest = (srv, s, extra = {}) => call(srv.port, { method: 'GET', url: '/code/latest', token: s.token, headers: { 'X-Node-Id': 'grimm' }, ...extra });
+
+test('GET /code/latest with a valid token and node id answers 200 with the published list', async () => {
+  const s = setup();
+  publish(s, PUBLISHED);
+  const srv = await start(s);
+  try {
+    const r = await getLatest(srv, s);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json, PUBLISHED);
+  } finally { await srv.close(); }
+});
+
+test('GET /code/latest reads AGENT_MANAGER_CODE_PUBLISH_DIR when it is set', async () => {
+  const s = setup();
+  const other = path.join(s.dir, 'elsewhere');
+  fs.mkdirSync(other, { recursive: true });
+  fs.writeFileSync(path.join(other, 'latest.json'), JSON.stringify(PUBLISHED));
+  s.env.AGENT_MANAGER_CODE_PUBLISH_DIR = other;
+  const srv = await start(s);
+  try {
+    assert.deepEqual((await getLatest(srv, s)).json, PUBLISHED);
+  } finally { await srv.close(); }
+});
+
+test('GET /code/latest is a 401 for a wrong token, a missing token, a missing node id and another node\'s token with this node\'s id', async () => {
+  const s = setup();
+  publish(s, PUBLISHED);
+  const srv = await start(s);
+  try {
+    assert.equal((await getLatest(srv, s, { token: 'wrong' })).status, 401);
+    assert.equal((await getLatest(srv, s, { token: undefined })).status, 401);
+    assert.equal((await getLatest(srv, s, { headers: {} })).status, 401);
+    const otherToken = registerNode({ id: 'third', address: '', cores: 1, ramGb: 1, concurrencyCap: 1 }, s.env).token;
+    assert.equal((await getLatest(srv, s, { token: otherToken })).status, 401);
+    assert.equal((await getLatest(srv, s, { headers: { 'X-Node-Id': 'nobody' } })).status, 401);
+  } finally { await srv.close(); }
+});
+
+test('GET /code/latest is a 403 from an address other than the registered one', async () => {
+  const s = setup({ address: '10.9.9.9' });
+  publish(s, PUBLISHED);
+  const srv = await start(s);
+  try {
+    const r = await getLatest(srv, s);
+    assert.equal(r.status, 403);
+    assert.equal(r.text.includes('dddddddd'), false);
+  } finally { await srv.close(); }
+});
+
+test('other methods on /code/latest are a 405', async () => {
+  const s = setup();
+  publish(s, PUBLISHED);
+  const srv = await start(s);
+  try {
+    for (const method of ['POST', 'PUT', 'DELETE']) {
+      assert.equal((await call(srv.port, { method, url: '/code/latest', token: s.token, headers: { 'X-Node-Id': 'grimm' }, body: {} })).status, 405);
+    }
+  } finally { await srv.close(); }
+});
+
+test('GET /code/latest is a 503 nothing published when the file is missing, unparsable or not a list', async () => {
+  const s = setup();
+  const srv = await start(s);
+  try {
+    let r = await getLatest(srv, s);
+    assert.equal(r.status, 503);
+    assert.equal(r.json.error, 'nothing published');
+    publish(s, '{not json');
+    assert.equal((await getLatest(srv, s)).status, 503);
+    publish(s, { sha: 'd'.repeat(40) });
+    assert.equal((await getLatest(srv, s)).status, 503);
+  } finally { await srv.close(); }
+});
+
+test('another path under /code is still a 404 and the existing POST /package route is unchanged', async () => {
+  const s = setup();
+  publish(s, PUBLISHED);
+  lendLease('HUB1-05-x', 'grimm', { env: s.env });
+  const srv = await start(s);
+  try {
+    assert.equal((await call(srv.port, { method: 'GET', url: '/code/other', token: s.token, headers: { 'X-Node-Id': 'grimm' } })).status, 404);
+    assert.equal((await call(srv.port, { method: 'GET', url: '/code', token: s.token, headers: { 'X-Node-Id': 'grimm' } })).status, 404);
+    assert.equal((await call(srv.port, { token: s.token, body: s.pkg })).status, 200);
   } finally { await srv.close(); }
 });

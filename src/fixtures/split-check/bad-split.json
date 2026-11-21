@@ -1,0 +1,10 @@
+{
+  "root": ".",
+  "parentFiles": ["app/helper.js", "app/consumer.js", "app/cli.js"],
+  "children": [
+    { "id": "C1", "files": ["app/helper.js"], "removes": ["legacyHelper"], "changesSignature": ["sharedRun"] },
+    { "id": "C2", "files": ["app/consumer.js"] },
+    { "id": "C3", "files": ["tests/new_test.py"] },
+    { "id": "C5", "files": ["app/cli.js"] }
+  ]
+}

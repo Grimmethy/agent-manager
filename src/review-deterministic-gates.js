@@ -89,7 +89,11 @@ function ungroundedValueGate(ctx) {
     }
   }
   if (highPrecisionFlags.length > 0) {
-    const detail = highPrecisionFlags.map((f) => `${f.type}: ${f.detail}`).join('; ');
+    const sourceName = resolveSourceName(task);
+    const detail = highPrecisionFlags.map((f) => {
+      const ground = groundingRef ? `${sourceName} (ref: ${groundingRef})` : sourceName;
+      return `${f.type}: ${f.detail} in ${ground}`;
+    }).join('; ');
     const reason = `Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ${detail}. This fact-check flag is high-precision (almost never a false positive) and treated as disqualifying, not merely advisory context a vote could ignore -- no local-model review call spent on a draft already known to contain a hallucinated value.`;
     task.reviewProvider = 'deterministic-ungrounded-value';
     logFactCheckAudit(pipelineDir, { taskId: task.id, source: resolveSourceName(task), flags: highPrecisionFlags });
@@ -193,7 +197,7 @@ function emptyOutcomeGate(ctx) {
     task.reviewProvider = 'deterministic-empty-fail';
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
     appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+    return { succeeded: true, verdict: 'blocked', blockedReason: 'empty-payload-no-grounding', blockedStage: 'review', factCheckVerdict };
   }
   if (emptyOutcome === 'approve') {
     task.reviewedAt = new Date().toISOString();
@@ -361,7 +365,7 @@ function missingCodeShapeGate(ctx) {
       && !/^(?:---|\+\+\+|@@)/m.test(trimmedImplResponse)
       && !/^(?:\+|-)(?!\s*$)\S/m.test(trimmedImplResponse)
       && !namesExtractedPieces(trimmedImplResponse)) {
-    const reason = 'Deterministic gate: missing-code-diff -- candidate drafts from this source must show the concrete change as a fenced code block or diff hunk, not prose-only commentary describing what should change. No local-model review call spent on a draft with no code shape at all.';
+    const reason = 'Deterministic gate: missing-code-diff -- candidate drafts from this source must show the concrete change as a fenced code block or diff hunk, not prose-only commentary describing what should change. No local-model review call spent on a draft with no code shape at all. Redraft: name each extracted function as `name(params)` and its return shape, or give a ```diff``` hunk.';
     task.reviewProvider = 'deterministic-missing-code-diff';
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
     appendHistoryEvent(task, 'blocked', reason);

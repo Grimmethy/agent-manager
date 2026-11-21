@@ -12,10 +12,11 @@
 // list order. A candidate that isHubBlocked (src/hub-stickiness.js) or that cannot be lent is skipped and
 // recorded in the skipped array; the scan continues with the next candidate.
 //
-// Filtered pipeline dirs (AGENT_MANAGER_NODE_FILTERED_DIRS, comma separated): a task in such a dir is claimed only when
-// eligibleForNode holds (source 'manual', not stacked, domain in AGENT_MANAGER_NODE_FILTER_DOMAINS (default ['adhoc']),
+// Filtered pipeline dirs (AGENT_MANAGER_NODE_FILTERED_DIRS, comma separated; AGENT_MANAGER_NODE_FILTER_SOURCES and AGENT_MANAGER_NODE_ALLOW_STACKED widen it, see eligibleForNode): a task in such a dir is claimed only when
+// eligibleForNode holds (source 'manual', not stacked, domain in AGENT_MANAGER_NODE_FILTER_DOMAINS (default ['adhoc', 'default']),
 // and filed for this repo or unscoped). Other tasks there are recorded in skipped as 'not-eligible-for-node'.
 // Pipeline dirs not listed in AGENT_MANAGER_NODE_FILTERED_DIRS are unfiltered, exactly as before.
+// AGENT_MANAGER_NODE_SKIP_PREMIUM (true, 1 or on, trimmed and case-insensitive; default off) refuses tasks with premiumPriority true in every pipeline dir, filtered or not.
 
 const fs = require('fs');
 const path = require('path');
@@ -29,12 +30,15 @@ const { readRemoteUrl } = require('./remote-url.js');
 const { workerNode } = require('./node-affinity.js');
 const { rankPriorityResolved } = require('./rank-priority.js');
 
-// Node eligibility (filtered pipeline dirs only): plain manual work this node may take. Not stacked hub pieces, not
-// non-manual sources, not tasks filed for another repo. Premium priority is not a restriction.
-function eligibleForNode(task, { pipelineDir, domains = ['adhoc'] } = {}) {
+// Node eligibility (filtered pipeline dirs only): work this node may take. By default plain manual work: not stacked hub pieces, not
+// non-manual sources, not tasks filed for another repo. Premium tasks (premiumPriority true) are refused when skipPremium is on (AGENT_MANAGER_NODE_SKIP_PREMIUM, default off). Two settings widen it (owner decision 2026-11-16, to
+// give grimm enough work): `sources` (AGENT_MANAGER_NODE_FILTER_SOURCES, default ['manual']) and `allowStacked` (AGENT_MANAGER_NODE_ALLOW_STACKED, default false).
+// The domain list and the same-repo rule always apply. A stacked piece that is allowed still goes through the hub rules below (sticky branch, dependsOn).
+function eligibleForNode(task, { pipelineDir, domains = ['adhoc', 'default'], sources = ['manual'], allowStacked = false, skipPremium = false } = {}) {
   if (!task || typeof task !== 'object') return false;
-  if (task.source !== 'manual') return false;
-  if (task.stacked) return false;
+  if (skipPremium === true && task.premiumPriority === true) return false;
+  if (!sources.includes(task.source)) return false;
+  if (task.stacked && !allowStacked) return false;
   if (!domains.includes(task.domain)) return false;
   if (task.generatedForRepoRoot && path.resolve(task.generatedForRepoRoot) !== path.resolve(pipelineDir)) return false;
   return true;
@@ -49,10 +53,34 @@ function filteredDirs(env = process.env) {
   return splitList(env.AGENT_MANAGER_NODE_FILTERED_DIRS).map((d) => path.resolve(d));
 }
 
-// Domains a node may take from filtered dirs (AGENT_MANAGER_NODE_FILTER_DOMAINS). Unset or empty gives ['adhoc'].
+// Domains a node may take from filtered dirs (AGENT_MANAGER_NODE_FILTER_DOMAINS). Unset or empty gives ['adhoc', 'default'].
 function filterDomains(env = process.env) {
   const list = splitList(env.AGENT_MANAGER_NODE_FILTER_DOMAINS);
-  return list.length ? list : ['adhoc'];
+  return list.length ? list : ['adhoc', 'default'];
+}
+
+// Sources a node may take from filtered dirs (AGENT_MANAGER_NODE_FILTER_SOURCES). Unset or empty gives ['manual'].
+function filterSources(env = process.env) {
+  const list = splitList(env.AGENT_MANAGER_NODE_FILTER_SOURCES);
+  return list.length ? list : ['manual'];
+}
+
+// True when a node may take stacked hub pieces from filtered dirs (AGENT_MANAGER_NODE_ALLOW_STACKED = true, 1 or on). Anything else is false.
+function allowStackedFrom(env = process.env) {
+  return ['true', '1', 'on'].includes(String(env.AGENT_MANAGER_NODE_ALLOW_STACKED || '').trim().toLowerCase());
+}
+
+// True when a node must refuse premium-priority tasks (AGENT_MANAGER_NODE_SKIP_PREMIUM = true, 1 or on). Anything else, including unset, is false.
+function skipPremiumFrom(env = process.env) {
+  return ['true', '1', 'on'].includes(String(env.AGENT_MANAGER_NODE_SKIP_PREMIUM || '').trim().toLowerCase());
+}
+
+// How many times a node reported this task blocked (history stage 'node-blocked <nodeId>', written by lend-task applyNodeBlock). A node that
+// blocked it MAX_NODE_BLOCKS times is not offered the task again, so a task a node cannot do does not bounce between wok and that node.
+const MAX_NODE_BLOCKS = 2;
+function nodeBlockedCount(task, nodeId) {
+  if (!task || !Array.isArray(task.history) || !nodeId) return 0;
+  return task.history.filter((h) => h && h.stage === `node-blocked ${nodeId}`).length;
 }
 
 function readJson(file) {
@@ -123,6 +151,9 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
   // Computed once per call: which pipeline dirs are filtered, and the domains allowed there.
   const filtered = new Set(filteredDirs(env));
   const allowedDomains = filterDomains(env);
+  const allowedSources = filterSources(env);
+  const stackedAllowed = allowStackedFrom(env);
+  const skipPremium = skipPremiumFrom(env);
 
   // One ordered list per pipeline dir and sub-directory. pickClaimableTasks keeps its own order within each list.
   const lists = [];
@@ -141,12 +172,21 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
         if (seen.has(taskId)) continue;
         // Deliberately before seen.add (not after the classes check): an ineligible copy in a filtered dir must not
         // shadow an eligible same-id record in a later, unfiltered dir.
-        if (filtered.has(path.resolve(pipelineDir)) && !eligibleForNode(task, { pipelineDir, domains: allowedDomains })) {
+        // Premium gate for every pipeline dir (filtered or not), so unfiltered dirs cannot lend premium tasks when the knob is on.
+        if (skipPremium && task.premiumPriority === true) {
+          skipped.push({ taskId, reason: 'premium-skipped' });
+          continue;
+        }
+        if (filtered.has(path.resolve(pipelineDir)) && !eligibleForNode(task, { pipelineDir, domains: allowedDomains, sources: allowedSources, allowStacked: stackedAllowed, skipPremium })) {
           skipped.push({ taskId, reason: 'not-eligible-for-node' });
           continue;
         }
         seen.add(taskId);
         if (leasedIds.has(taskId)) continue; // leased (unexpired)
+        if (nodeBlockedCount(task, claimant) >= MAX_NODE_BLOCKS) {
+          skipped.push({ taskId, reason: 'node-blocked-twice' }); // this node reported it blocked twice: another node (or wok) should try
+          continue;
+        }
         if (task.pinnedWorker && task.pinnedWorker !== claimant) continue; // pinned to another worker
         if (Array.isArray(task.dependsOn) && task.dependsOn.some((dep) => !isDependencySatisfied(pipelineDir, dep))) continue;
         if (Array.isArray(classes) && !classes.includes(taskClassOf(task))) continue;
@@ -188,9 +228,14 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
       continue;
     }
     const remoteUrl = readRemote(c.pipelineDir);
-    return { task: { ...record, leasedTo: claimant }, lease, repo: { root: c.pipelineDir, remoteUrl }, skipped };
+    // Handed-out copy only (the wok file above keeps dependsOn). The deps were verified satisfied on wok by the filter
+    // above, so their ids are passed as dependsOnResolved, stamped with the same 'now' claimNext already uses.
+    const { dependsOn, ...rest } = record;
+    const verifiedIds = Array.isArray(dependsOn) ? dependsOn.slice() : [];
+    const lent = { ...rest, leasedTo: claimant, dependsOnResolved: { ids: verifiedIds, checkedAt: now } };
+    return { task: lent, lease, repo: { root: c.pipelineDir, remoteUrl }, skipped };
   }
   return null;
 }
 
-module.exports = { claimNext, eligibleForNode, filteredDirs, filterDomains };
+module.exports = { claimNext, eligibleForNode, filteredDirs, filterDomains, filterSources, allowStackedFrom, skipPremiumFrom };

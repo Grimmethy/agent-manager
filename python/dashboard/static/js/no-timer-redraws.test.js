@@ -27,6 +27,7 @@ const ALLOWED = {
   'branches-joblist-hardware-tabs.js': { setInterval: 0, setTimeout: 1, why: 'one re-render 1.5 s after a merge that restarts the dashboard, waiting for the restart: one-shot, started by a user action' },
   'forge-navigate.js': { setInterval: 0, setTimeout: 1, why: 'a 10 s give-up for the PromptForge frame to load after a forge-navigate message (the frame is waited for by its load event and a MutationObserver, not polled): one-shot, started by a user action, cleared on success' },
   'task-detail-modal.js': { setInterval: 0, setTimeout: 1, why: 'closes the modal 1.2 s after ending a discussion: one-shot, started by a user action' },
+  'queue-slow-fetch.js': { setInterval: 0, setTimeout: 1, why: 'one-shot slow-state notifier per list fetch, cleared on settle, never re-arms' },
 };
 
 // Whole-line and trailing // comments go first: a comment such as "queue/*-flags.json" must not open a block comment.

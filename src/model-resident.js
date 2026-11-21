@@ -1,6 +1,6 @@
 'use strict';
 // Residency gate (owner decision 2026-11-06, disk-I/O pass). A cold load of the 21 GB local model takes ~2m20s-2m30s on this box while it saturates
-// the SSD, and callers' request timeouts (gpu-capacity.js MIN_TIMEOUT_MS = 150 s) fired mid-load: Ollama threw the half-loaded model away ("Load
+// the SSD, and callers' request timeouts (gpu-capacity.js MIN_TIMEOUT_MS was 150 s then) fired mid-load: Ollama threw the half-loaded model away ("Load
 // failed ... context canceled", HTTP 499) and the next request started the 21 GB read again, 29 times in 3 hours. The rule here: never send work
 // to a model that is not resident. ensureResident() asks GET /api/ps; if the model is not there at the wanted context it takes ONE cross-process
 // warm-up lock (single-flight-lock.js, key 'model-warmup'), sends a one-token warm-up whose client timeout is the load timeout (30 min, the same

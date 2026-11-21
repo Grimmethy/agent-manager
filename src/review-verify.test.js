@@ -1185,12 +1185,12 @@ test('narrowed-first: the tests a diff adds to a file run on their own first; if
   const f = fakeDeps({
     findTests: () => ({ js: ['src/b.test.js'], py: [] }),
     prepare: baseTree(['src/b.js', 'src/b.test.js']),
-    run: (a) => { calls.push(a); return a.args.includes('--test-name-pattern') ? { ran: true, exitCode: 0, timedOut: false, output: '' } : { ran: true, exitCode: null, timedOut: true, output: '' }; },
+    run: (a) => { calls.push(a); return a.args.some((x) => x.startsWith('--test-name-pattern=')) ? { ran: true, exitCode: 0, timedOut: false, output: '' } : { ran: true, exitCode: null, timedOut: true, output: '' }; },
   });
   const r = verifyDiff({ ...base, rawDiff: ADDS, deps: f.deps });
-  const narrowed = calls.find((c) => c.args.includes('--test-name-pattern'));
+  const narrowed = calls.find((c) => c.args.some((x) => x.startsWith('--test-name-pattern=')));
   assert.ok(narrowed, 'a narrowed run happened');
-  assert.equal(narrowed.args[narrowed.args.indexOf('--test-name-pattern') + 1], 'the gate blocks \\(a\\.b\\)', 'the pattern is regex-escaped');
+  assert.equal(narrowed.args.find((x) => x.startsWith('--test-name-pattern=')), '--test-name-pattern=' + 'the gate blocks \\(a\\.b\\)', 'the pattern is regex-escaped');
   assert.equal(calls.indexOf(narrowed), 0, 'and it ran BEFORE the whole file');
   assert.equal(r.status, 'inconclusive');
   assert.deepEqual(r.tests.timedOutFiles, ['src/b.test.js']);
@@ -1204,7 +1204,7 @@ test('narrowed-first: a diff-added test that FAILS is a real failure (the base h
     findTests: () => ({ js: ['src/b.test.js'], py: [] }),
     prepare: baseTree(['src/b.js', 'src/b.test.js']),
     unapplyDiff: () => { onBase = true; return { applied: true }; },
-    run: (a) => (a.args.includes('--test-name-pattern') && !onBase ? { ran: true, exitCode: 1, timedOut: false, output: 'not ok 1 - the gate blocks (a.b)\n' } : { ran: true, exitCode: 0, timedOut: false, output: '' }),
+    run: (a) => (a.args.some((x) => x.startsWith('--test-name-pattern=')) && !onBase ? { ran: true, exitCode: 1, timedOut: false, output: 'not ok 1 - the gate blocks (a.b)\n' } : { ran: true, exitCode: 0, timedOut: false, output: '' }),
   });
   const r = verifyDiff({ ...base, rawDiff: ADDS, deps: f.deps });
   assert.equal(r.status, 'failed');
