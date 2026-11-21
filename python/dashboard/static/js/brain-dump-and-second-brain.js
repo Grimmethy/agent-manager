@@ -617,7 +617,7 @@ async function handleSetActiveProject(btn, repoPath) {
   btn.disabled = true;
   btn.textContent = 'Switching...';
   try {
-    await fetch('/api/pipeline/stop', { method: 'POST' });
+    const stopResp = await fetch('/api/pipeline/stop', { method: 'POST' }); if (!stopResp.ok) throw new Error('Could not stop the running pipeline: HTTP ' + stopResp.status);
     const resp = await fetch('/api/pipeline/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
