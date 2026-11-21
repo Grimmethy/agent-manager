@@ -197,7 +197,7 @@ function emptyOutcomeGate(ctx) {
     task.reviewProvider = 'deterministic-empty-fail';
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
     appendHistoryEvent(task, 'blocked', reason);
-    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+    return { succeeded: true, verdict: 'blocked', blockedReason: 'empty-payload-no-grounding', blockedStage: 'review', factCheckVerdict };
   }
   if (emptyOutcome === 'approve') {
     task.reviewedAt = new Date().toISOString();
