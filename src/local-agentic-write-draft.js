@@ -387,6 +387,22 @@ function priorInvestigationBlock(task) {
   ].join('\n');
 }
 
+// Prior orientation (HUB0558): carries the grep hits and already-read files from a real prior draft attempt so the model does not re-orient from scratch. Returns '' unless the task was seeded from a prior attempt AND has a non-empty _planGrounding. Null entries are skipped; if both lists are empty the heading still renders with no entries.
+function priorOrientationBlock(task) {
+  if (!task || task._seededFromPrior !== true) return '';
+  const g = task._planGrounding;
+  if (!g || typeof g !== 'object' || Object.keys(g).length === 0) return '';
+  const grepHits = Array.isArray(g.grepHits) ? g.grepHits : [];
+  const readFiles = Array.isArray(g.readFiles) ? g.readFiles : [];
+  const lines = ['Prior orientation -- a real prior draft attempt on this task already located the following:', ''];
+  lines.push('Grep hits (file:line):');
+  for (const h of grepHits) if (h) lines.push(`- ${h.file}:${h.line}`);
+  lines.push('', 'Already-read files:');
+  for (const f of readFiles) if (f) lines.push(`- ${f.path}`);
+  lines.push('', 'Do NOT re-grep or re-read the items listed above. Treat them as verified starting points and go make the change.', '');
+  return lines.join('\n');
+}
+
 // See hub-status-grounding.js's own header for the real incident this closes. Computed
 // fresh on every call (never cached on the task), unlike the plan pass's own transient
 // _planGrounding field, since this is the pass that actually produced the wrong
@@ -532,6 +548,7 @@ function buildWriteAgenticPromptBase(task, { orientTurnLimit = ORIENT_TURN_LIMIT
     externalDepAdvisoryBlock(task),
     blindPlanBlock(task),
     priorInvestigationBlock(task),
+    priorOrientationBlock(task),
     acceptanceCriteriaBlock(task),
     priorAttemptAnalysisBlock(task),
     preFilterFlagsBlock(task),
@@ -871,6 +888,7 @@ function modelStatsSafe(fn, args) {
 }
 
 module.exports = {
+  priorOrientationBlock,
   draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS, budgetBlockEnabled, buildTimeBudgetLine,
   isLeafTask, leafDecomposeLocked, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
   detectExternalDependency, classifyExternalDependency, externalDependencyAdvisory, scopeComplexityGate, EXTERNAL_DEP_MARKERS, partialDiffFallbackPrompt,
