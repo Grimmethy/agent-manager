@@ -17,6 +17,16 @@ import tempfile
 
 task_bp = Blueprint("task-bp", __name__)
 
+# Optional operator feedback on a manual requeue (api_task_requeue's "feedback" body key): one more entry of the array-of-strings priorRejectionFeedback.
+REQUEUE_FEEDBACK_MAX_CHARS = 2000
+_REQUEUE_FEEDBACK_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _clean_requeue_feedback(raw):
+    # Strip C0 control characters and DEL, trim, cap the length. None when nothing usable remains.
+    cleaned = _REQUEUE_FEEDBACK_CONTROL_RE.sub("", raw).strip()
+    return cleaned[:REQUEUE_FEEDBACK_MAX_CHARS] or None
+
 
 def _qdir_for_request(body=None, queue_only=False):
     """(queue dir, scope) for the project a request names (2026-10-30). `?project=<repoRoot>` (or "project" in a JSON body) selects another registered
@@ -590,6 +600,12 @@ def api_task_requeue(state, task_id):
     human moved to _archived_no_action/ by hand; see done-archive.js's own header on the
     same "always reversible" promise this endpoint already exists to uphold."""
     from app import _record_manual_requeue, _repeated_blocker_match, get_active_repo_root, logger, read_json_safe
+    requeue_feedback = None
+    _requeue_body = request.get_json(silent=True) or {}
+    if "feedback" in _requeue_body:
+        if not isinstance(_requeue_body["feedback"], str):
+            abort(400, description="feedback must be a string")
+        requeue_feedback = _clean_requeue_feedback(_requeue_body["feedback"])
     if state not in ("blocked", "needs-clarification", "done", "archived"):
         abort(400, description="only a blocked, needs-clarification, done, or archived task can be requeued")
     qdir, scope = _qdir_for_request(request.get_json(silent=True) or {})   # ?project=<repoRoot>: that registered project's queue, repo and pipeline
@@ -781,6 +797,20 @@ def api_task_requeue(state, task_id):
         fresh["premiumSetBy"] = current_src["premiumSetBy"]
     if "premiumSetAt" in current_src:
         fresh["premiumSetAt"] = current_src["premiumSetAt"]
+    if requeue_feedback is not None:
+        # Array of strings: absent -> [feedback]; list -> appended; legacy non-empty string -> wrapped first. Readers are unchanged.
+        prior = data.get("priorRejectionFeedback")
+        if isinstance(prior, list):
+            prior_list = list(prior)
+        elif isinstance(prior, str) and prior:
+            prior_list = [prior]
+        else:
+            prior_list = []
+        fresh["priorRejectionFeedback"] = prior_list + [requeue_feedback]
+        for ev in reversed(fresh.get("history") or []):
+            if isinstance(ev, dict) and ev.get("stage") == "requeued":
+                ev["requeueFeedback"] = requeue_feedback
+                break
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual",
