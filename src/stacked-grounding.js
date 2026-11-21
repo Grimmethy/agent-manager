@@ -107,6 +107,9 @@ function resolveAtRef(repoRoot, ref, candidatePath, extraRoots = []) {
 
 const fs = require('fs');
 
+// Status constant: "waiting for stacked sibling to land"
+const WAITING = 'waiting';
+
 // The hub branch name for a stacked task, or null (non-stacked, or the branch doesn't resolve).
 function resolveStackedBase(task, repoRoot) {
   if (!task || !task.stacked) return null;
@@ -155,35 +158,76 @@ function appliedSiblingFiles(task, repoRoot) {
   return out;
 }
 
-// Hub ref first (resolveAtRef), then the base checkout, then Files lines of applied lower-seq siblings.
-function fileExistsForTask(task, repoRoot, filePath) {
-  const p = normPath(filePath);
+// Does a FILE exist in the world a stacked piece builds on?
+// Checks hub tip (groundingRef) first, then each sibling ref in order.
+// `repoRoot` and `groundingRef` are required; missing either returns false.
+// `siblingRefs` defaults to [] (tip-only behavior).
+// Treats a missing or unreadable ref as 'not found there', never an exception.
+function fileExistsForTask(path, { groundingRef, siblingRefs = [], repoRoot }) {
+  const p = normPath(path);
   if (!p) return false;
-  const ref = stackedRefResolver(task, repoRoot);
-  if (ref) {
-    try { if (resolveAtRef(repoRoot, ref, p)) return true; } catch { /* fall through */ }
+  if (!repoRoot || !groundingRef) return false;
+  
+  // Check hub tip first
+  try {
+    if (resolveAtRef(repoRoot, groundingRef, p)) return true;
+  } catch { /* fall through: unreadable ref = not found */ }
+  
+  // Then each sibling ref in order, return on first hit
+  for (const ref of siblingRefs || []) {
+    try {
+      if (resolveAtRef(repoRoot, ref, p)) return true;
+    } catch { /* fall through: unreadable ref = not found */ }
   }
-  try { if (fs.existsSync(path.join(repoRoot, p))) return true; } catch { /* fall through */ }
-  if (ref && appliedSiblingFiles(task, repoRoot).has(p)) return true;
+  
   return false;
 }
 
-// Hub ref first (grepAtRef), then the base checkout.
-function symbolExistsForTask(task, repoRoot, symbol) {
+// Does a SYMBOL exist in the world a stacked piece builds on?
+// Checks hub tip (groundingRef) first, then each sibling ref in order.
+// `repoRoot` and `groundingRef` are required; missing either returns false.
+// `siblingRefs` defaults to [] (tip-only behavior).
+// Treats a missing or unreadable ref as 'not found there', never an exception.
+function symbolExistsForTask(symbol, { groundingRef, siblingRefs = [], repoRoot }) {
   const sym = String(symbol || '');
   if (!sym) return false;
-  const ref = stackedRefResolver(task, repoRoot);
-  if (ref) {
-    try { if (String(grepAtRef(repoRoot, ref, sym)).trim()) return true; } catch { /* fall through */ }
-  }
+  if (!repoRoot || !groundingRef) return false;
+  
+  // Check hub tip first
   try {
-    return !!String(runGit(['grep', '-I', '-F', '-e', sym], repoRoot)).trim();
-  } catch {
-    return false;
+    if (String(grepAtRef(repoRoot, groundingRef, sym)).trim()) return true;
+  } catch { /* fall through: unreadable ref = not found */ }
+  
+  // Then each sibling ref in order, return on first hit
+  for (const ref of siblingRefs || []) {
+    try {
+      if (String(grepAtRef(repoRoot, ref, sym)).trim()) return true;
+    } catch { /* fall through: unreadable ref = not found */ }
   }
+  
+  return false;
+}
+
+// Pure function: decides how to route a stacked premise that may be stale.
+// - found on tip OR on an applied sibling → 'requeue-tip'
+//   (treat found-on-applied-sibling like found-on-tip: the premise is grounded)
+// - not found but unapplied siblings remain → 'waiting'
+// - missing everywhere with no unapplied sibling → 'escalate'
+function decideStackedPremiseRoute({ foundOnTip, foundOnAppliedSibling, unappliedSiblingCount }) {
+  if (foundOnTip || foundOnAppliedSibling) {
+    // Found on an applied sibling is treated like found on tip: the premise is
+    // grounded in the shared branch and the work can proceed.
+    return 'requeue-tip';
+  }
+  if (unappliedSiblingCount > 0) {
+    return 'waiting';
+  }
+  return 'escalate';
 }
 
 module.exports = {
+  WAITING,
   resolveGroundingRef, readFileAtRef, grepAtRef, resolveAtRef,
   resolveStackedBase, isLiveHub, fileExistsForTask, symbolExistsForTask, setStackedRefResolverForTest,
+  decideStackedPremiseRoute,
 };
