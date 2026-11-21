@@ -31,6 +31,21 @@ function isLockError(err) { return Boolean(err) && LOCK_ERROR_RE.test(String(err
 
 // Stable prefix of the error assertCleanTree() throws. apply-retry-check.js matches on it to treat the
 // failure as INFRASTRUCTURE (a git-state problem, not a draft-quality one): no retry burned, no redraft.
+// Thrown by resetToMain when local main and origin/main have diverged and the rescue branch could not be created.
+class DivergedMainError extends Error {
+  constructor({ mainBranch, remote, cause, reason = 'automatic recovery failed', localOnly = [], remoteOnly = [] }) {
+    super(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- automatic recovery failed, needs a human to reconcile, not an automatic reset. Nothing was preserved; local ${mainBranch} is not reconciled with ${remote}: ${cause}`);
+    this.name = 'DivergedMainError';
+    this.reason = reason;
+    this.localOnly = localOnly;
+    this.remoteOnly = remoteOnly;
+  }
+}
+// Short SHA list for a git rev-list range; empty array when unknown.
+function revListShas(run, range) {
+  try { return String(run(['rev-list', range])).split('\n').map((s) => s.trim()).filter(Boolean); } catch { return []; }
+}
+
 const DIRTY_CLONE_ERROR_PREFIX = 'apply clone is dirty';
 
 /**
@@ -306,7 +321,7 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
         if (!a || a !== b) throw new Error(`rescue ref ${rescue} does not match local ${mainBranch}`);
         preserved = rescue;
       } catch (e) {
-        throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- automatic recovery failed, needs a human to reconcile, not an automatic reset. Nothing was preserved; local ${mainBranch} is not reconciled with ${remote}: ${e.message}`);
+        throw new DivergedMainError({ mainBranch, remote, cause: e.message, reason: 'rescue branch could not be created', localOnly: revListShas(run, `${remote}..${mainBranch}`), remoteOnly: revListShas(run, `${mainBranch}..${remote}`) });
       }
       divergedRescue = preserved;
       try { run(['push', '-u', 'origin', preserved]); } catch { /* best-effort: the local rescue branch still exists */ }
@@ -719,4 +734,4 @@ function createFakeGitRunner(opts = {}) {
   };
 }
 
-module.exports = { createRealGitRunner, createFakeGitRunner, detectDefaultBranch, annotateGitTimeout, DIRTY_CLONE_ERROR_PREFIX };
+module.exports = { createRealGitRunner, createFakeGitRunner, detectDefaultBranch, annotateGitTimeout, DIRTY_CLONE_ERROR_PREFIX, DivergedMainError };
