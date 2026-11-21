@@ -79,6 +79,7 @@ function parseArchDiscoveryCandidates(implementResponse) {
       const anchorIdx = block.indexOf(bodyAnchor);
       const body = block.slice(anchorIdx + bodyAnchor.length).trim();
       return {
+        headingId: ((headingLine.match(/AC-(\d+)/) || [])[1]) || null,
         title: titleMatch[1].trim(),
         strength: strengthMatch ? strengthMatch[1].trim() : 'Strong',
         source: sourceMatch ? sourceMatch[1].trim() : '',
@@ -89,6 +90,22 @@ function parseArchDiscoveryCandidates(implementResponse) {
       };
     })
     .filter((c) => c && c.title && c.body);
+}
+
+// Retraction-note gate (2026-11-16, AC-60..62 incident): a block that merely RETRACTS an earlier
+// candidate (title struck through or marked RETRACTED/Withdrawn, or a body whose first non-metadata
+// line is a 'Status:' saying it is not a defect) is a model's own critique text leaking into the
+// implement response, never a real finding. Returns the rule name that fires, or null. Prose that
+// merely mentions 'retracted' later in the body is NOT a rule.
+const RETRACTION_STATUS_RE = /^Status:\s*(withdrawn|retracted|no defect|not a defect|no action required)\b/i;
+const CANDIDATE_METADATA_LINE_RE = /^(Strength|Depends-On-Index|Files|Source|Split-Depth|Symbol|Snippet):/i;
+function retractionGateReason(c) {
+  const title = String((c && c.title) || '').trim();
+  if (title.startsWith('~~') || /\b(RETRACTED|Withdrawn)\b/.test(title)) return 'R1';
+  const lines = String((c && c.body) || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const first = lines.find((l) => !CANDIDATE_METADATA_LINE_RE.test(l));
+  if (first && RETRACTION_STATUS_RE.test(first)) return 'R2';
+  return null;
 }
 
 function nextAvailableCandidateId(existingText) {
@@ -199,6 +216,17 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   if (candidates.length === 0) {
     return { skipped: true, reason: 'no candidates in implement response -- nothing to apply' };
   }
+  // Retraction-note gate (see retractionGateReason): drop blocks that retract an earlier candidate before anything else sees them.
+  const skippedByGate = [];
+  candidates = candidates.filter((c) => {
+    const rule = retractionGateReason(c);
+    if (!rule) return true;
+    skippedByGate.push({ id: c.headingId ? `AC-${c.headingId}` : null, title: String(c.title).slice(0, 80), rule, reason: `retraction-gate:${rule}` });
+    return false;
+  });
+  if (candidates.length === 0) {
+    return { skipped: true, reason: `skipped: ${skippedByGate.length} retraction note(s) rejected by retraction-gate -- nothing appended`, skippedByGate };
+  }
   let droppedNonStrong = 0;
   if (typeof requireStrength === 'string' && requireStrength.trim()) {
     const required = requireStrength.trim();
@@ -221,23 +249,25 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   let duplicatesSkipped = [];
   if (dedupe && process.env.AGENT_MANAGER_CANDIDATE_DEDUPE !== 'false') {
     try {
-      const { findDuplicateCandidate, candidateKey } = require('./lib/candidate-dedupe.js');
+      const { findDuplicateCandidate, dedupeKey } = require('./lib/candidate-dedupe.js');
       const views = dedupeDocViews(candidatesPath, text);
       const seenKeys = new Set();
       candidates = candidates.filter((c) => {
-        const key = candidateKey(c);
-        const dup = findDuplicateCandidate(c, views) || (key && seenKeys.has(key) ? { duplicateOf: 'an earlier candidate in this batch', ref: 'this batch' } : null);
+        const dk = dedupeKey(c);
+        const seenId = dk ? `${dk.kind}:${dk.key}` : null;
+        const dup = findDuplicateCandidate(c, views) || (seenId && seenKeys.has(seenId) ? { duplicateOf: 'an earlier candidate in this batch', ref: 'this batch', matchedBy: dk.kind } : null);
         if (dup) { duplicatesSkipped.push(dup); return false; }
-        if (key) seenKeys.add(key);
+        if (seenId) seenKeys.add(seenId);
         return true;
       });
     } catch { duplicatesSkipped = []; /* fail-open: append as before */ }
     if (candidates.length === 0 && duplicatesSkipped.length > 0) {
       const first = duplicatesSkipped[0];
+      const via = first.matchedBy === 'snippet' ? 'file+snippet line' : 'identifier';
       return {
         skipped: true,
         duplicateOf: first.duplicateOf,
-        reason: `skipped: candidate already exists as ${first.duplicateOf} (${first.ref}) -- not appended again`,
+        reason: `skipped: candidate already exists as ${first.duplicateOf} (${first.ref}) (matched by ${via}) -- not appended again`,
       };
     }
   }
@@ -260,10 +290,27 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   fs.mkdirSync(path.dirname(candidatesPath), { recursive: true });
   writeAtomicSync(candidatesPath, text);
 
-  return { file: candidatesPath, candidateCount: candidates.length, candidateIds, ...(duplicatesSkipped.length ? { duplicatesSkipped: duplicatesSkipped.length } : {}), ...(droppedNonStrong ? { droppedNonStrong } : {}) };
+  return { file: candidatesPath, candidateCount: candidates.length, candidateIds, ...(duplicatesSkipped.length ? { duplicatesSkipped: duplicatesSkipped.length } : {}), ...(droppedNonStrong ? { droppedNonStrong } : {}), ...(skippedByGate.length ? { skippedByGate } : {}) };
+}
+
+// Model-free grounding check: the `Snippet:` fence a candidate carries is the real code text the scanner read. A draft
+// that claims to describe that code must contain it (whitespace-insensitive). Returns null when there is nothing to
+// enforce or the snippet is present; otherwise { expected } so a caller can quote the missing text back (-612 class:
+// the draft said `except Exception` / `FALLBACK` where the code had `except OSError` / `_fallback_cache_paths(...)`).
+function snippetMismatch(candidate, draftText) {
+  let snippet = candidate && typeof candidate.snippet === 'string' ? candidate.snippet : '';
+  if (!snippet.trim() && candidate && typeof candidate.body === 'string') {
+    const m = candidate.body.match(/^Snippet:\s*\n```[^\n]*\n([\s\S]*?)\n```/m);
+    if (m) snippet = m[1];
+  }
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const want = norm(snippet);
+  if (!want) return null;
+  return norm(draftText).includes(want) ? null : { expected: snippet.trim() };
 }
 
 module.exports = {
+  snippetMismatch,
   isEffectivelyEmptyResponse,
   parseArchDiscoveryCandidates,
   nextAvailableCandidateId,

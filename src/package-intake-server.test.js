@@ -30,11 +30,12 @@ async function start(s) {
   return { port: server.address().port, close: () => new Promise((r) => { server.close(r); server.closeAllConnections(); }) };
 }
 
-function call(port, { method = 'POST', url = '/package', token, body } = {}) {
+function call(port, { method = 'POST', url = '/package', token, body, headers: extra } = {}) {
   return new Promise((resolve, reject) => {
     const data = body === undefined ? '' : (typeof body === 'string' ? body : JSON.stringify(body));
     const headers = { 'Content-Length': Buffer.byteLength(data) };
     if (token) headers.Authorization = `Bearer ${token}`;
+    Object.assign(headers, extra);
     const req = http.request({ host: '127.0.0.1', port, method, path: url, headers, agent: false }, (res) => {
       let text = '';
       res.on('data', (c) => { text += c; });
@@ -292,5 +293,174 @@ test('a hand-built version 2 package that still carries a lease stamp and a hist
     const draft = JSON.parse(fs.readFileSync(reviewFile(s), 'utf8'));
     assert.equal('leasedTo' in draft, false);
     assert.deepEqual(draft.history.map((h) => h.stage), ['draft-done', 'node-draft-received']);
+  } finally { await srv.close(); }
+});
+
+const needsClarificationFile = (s) => path.join(s.env.AGENT_MANAGER_PIPELINE_DIR, 'queue', 'needs-clarification', 'HUB1-05-x.json');
+
+const STOP_RECORD = { id: 'HUB1-05-x', title: 'T', status: 'drafting', leasedTo: 'grimm', needsClarification: { reason: 'which branch to use?', openQuestions: ['main', 'develop'] }, localVotes: [1], history: [{ stage: 'draft-done' }] };
+
+test('a stop record for a leased task returns 200 and routes to needs-clarification with node-stop-received, the original is gone, the lease is returned and marked blocked', async () => {
+  const s = setup();
+  lendLease('HUB1-05-x', 'grimm', { env: s.env });
+  seedOriginal(s, 'pending');
+  const pkg = buildRecordPackage({ record: STOP_RECORD, nodeId: 'grimm', now: Date.UTC(2026, 10, 11) });
+  const srv = await start(s);
+  try {
+    const r = await call(srv.port, { token: s.token, body: pkg });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json, { ok: true, taskId: 'HUB1-05-x' });
+    assert.equal(fs.existsSync(path.join(s.env.AGENT_MANAGER_PIPELINE_DIR, 'queue', 'pending', 'HUB1-05-x.json')), false);
+    assert.equal(fs.existsSync(reviewFile(s)), false);
+    const landed = JSON.parse(fs.readFileSync(needsClarificationFile(s), 'utf8'));
+    assert.equal(landed.needsClarification.reason, 'which branch to use?');
+    assert.deepEqual(landed.needsClarification.openQuestions, ['main', 'develop']);
+    assert.equal('leasedTo' in landed, false);
+    assert.equal(landed.fromNode, 'grimm');
+    assert.equal(landed.status, 'drafting');
+    assert.equal(landed.history.length, 1);
+    assert.equal(landed.history[0].stage, 'node-stop-received');
+    assert.equal(landed.history[0].detail, 'stopped on grimm: which branch to use?');
+    assert.match(landed.history[0].at, /^\d{4}-\d\d-\d\dT/);
+    assert.deepEqual(JSON.parse(fs.readFileSync(stored(s), 'utf8')), pkg);
+    assert.equal(leaseFor('HUB1-05-x', s.env).state, 'returned');
+    assert.equal(leaseFor('HUB1-05-x', s.env).lastEvent, 'blocked');
+    assert.match(leaseFor('HUB1-05-x', s.env).lastEventAt, /^\d{4}-\d\d-\d\dT/);
+    assert.equal(s.notices.length, 1);
+    assert.equal(s.notices[0].level, 'summary');
+    assert.equal(s.notices[0].key, 'node-package:HUB1-05-x');
+    assert.match(s.notices[0].title, /stopped/);
+  } finally { await srv.close(); }
+});
+
+test('a normal record still lands in queue/review unchanged: no regression for the draft path', async () => {
+  const s = setup();
+  lendLease('HUB1-05-x', 'grimm', { env: s.env });
+  seedOriginal(s, 'adhoc');
+  const pkg = buildRecordPackage({ record: DRAFT, nodeId: 'grimm', now: Date.UTC(2026, 10, 11) });
+  const srv = await start(s);
+  try {
+    const r = await call(srv.port, { token: s.token, body: pkg });
+    assert.equal(r.status, 200);
+    assert.equal(fs.existsSync(path.join(s.env.AGENT_MANAGER_PIPELINE_DIR, 'queue', 'adhoc', 'HUB1-05-x.json')), false);
+    const landed = JSON.parse(fs.readFileSync(reviewFile(s), 'utf8'));
+    assert.equal(landed.status, 'needs-review');
+    assert.equal(landed.fromNode, 'grimm');
+    assert.equal(landed.rawDiff, 'diff --git a b');
+    assert.equal(landed.history[0].stage, 'node-draft-received');
+    assert.equal(landed.history[0].detail, 'drafted on grimm');
+    assert.equal(leaseFor('HUB1-05-x', s.env).state, 'returned');
+    assert.equal(leaseFor('HUB1-05-x', s.env).lastEvent, undefined);
+    assert.equal(fs.existsSync(needsClarificationFile(s)), false);
+  } finally { await srv.close(); }
+});
+
+test('a stop-shaped record for an unleased task returns 409: nothing is stored or filed', async () => {
+  const s = setup();
+  seedOriginal(s, 'pending');
+  const pkg = buildRecordPackage({ record: STOP_RECORD, nodeId: 'grimm', now: Date.UTC(2026, 10, 11) });
+  const srv = await start(s);
+  try {
+    const r = await call(srv.port, { token: s.token, body: pkg });
+    assert.equal(r.status, 409);
+    assert.match(r.json.error, /no lease/);
+    assert.equal(fs.existsSync(stored(s)), false);
+    assert.equal(fs.existsSync(reviewFile(s)), false);
+    assert.equal(fs.existsSync(needsClarificationFile(s)), false);
+    assert.equal(s.notices.length, 0);
+  } finally { await srv.close(); }
+});
+
+// GET /code/latest: the list wok published, read-only and token checked.
+const PUBLISHED = [{ repo: 'agent-manager', sha: 'd'.repeat(40), bundle: 'agent-manager-dddddddd.bundle', branch: 'master' }];
+const publishDir = (s) => path.join(s.env.AGENT_MANAGER_PIPELINE_DIR, 'code-publish');
+function publish(s, content) {
+  fs.mkdirSync(publishDir(s), { recursive: true });
+  fs.writeFileSync(path.join(publishDir(s), 'latest.json'), typeof content === 'string' ? content : JSON.stringify(content));
+}
+const getLatest = (srv, s, extra = {}) => call(srv.port, { method: 'GET', url: '/code/latest', token: s.token, headers: { 'X-Node-Id': 'grimm' }, ...extra });
+
+test('GET /code/latest with a valid token and node id answers 200 with the published list', async () => {
+  const s = setup();
+  publish(s, PUBLISHED);
+  const srv = await start(s);
+  try {
+    const r = await getLatest(srv, s);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json, PUBLISHED);
+  } finally { await srv.close(); }
+});
+
+test('GET /code/latest reads AGENT_MANAGER_CODE_PUBLISH_DIR when it is set', async () => {
+  const s = setup();
+  const other = path.join(s.dir, 'elsewhere');
+  fs.mkdirSync(other, { recursive: true });
+  fs.writeFileSync(path.join(other, 'latest.json'), JSON.stringify(PUBLISHED));
+  s.env.AGENT_MANAGER_CODE_PUBLISH_DIR = other;
+  const srv = await start(s);
+  try {
+    assert.deepEqual((await getLatest(srv, s)).json, PUBLISHED);
+  } finally { await srv.close(); }
+});
+
+test('GET /code/latest is a 401 for a wrong token, a missing token, a missing node id and another node\'s token with this node\'s id', async () => {
+  const s = setup();
+  publish(s, PUBLISHED);
+  const srv = await start(s);
+  try {
+    assert.equal((await getLatest(srv, s, { token: 'wrong' })).status, 401);
+    assert.equal((await getLatest(srv, s, { token: undefined })).status, 401);
+    assert.equal((await getLatest(srv, s, { headers: {} })).status, 401);
+    const otherToken = registerNode({ id: 'third', address: '', cores: 1, ramGb: 1, concurrencyCap: 1 }, s.env).token;
+    assert.equal((await getLatest(srv, s, { token: otherToken })).status, 401);
+    assert.equal((await getLatest(srv, s, { headers: { 'X-Node-Id': 'nobody' } })).status, 401);
+  } finally { await srv.close(); }
+});
+
+test('GET /code/latest is a 403 from an address other than the registered one', async () => {
+  const s = setup({ address: '10.9.9.9' });
+  publish(s, PUBLISHED);
+  const srv = await start(s);
+  try {
+    const r = await getLatest(srv, s);
+    assert.equal(r.status, 403);
+    assert.equal(r.text.includes('dddddddd'), false);
+  } finally { await srv.close(); }
+});
+
+test('other methods on /code/latest are a 405', async () => {
+  const s = setup();
+  publish(s, PUBLISHED);
+  const srv = await start(s);
+  try {
+    for (const method of ['POST', 'PUT', 'DELETE']) {
+      assert.equal((await call(srv.port, { method, url: '/code/latest', token: s.token, headers: { 'X-Node-Id': 'grimm' }, body: {} })).status, 405);
+    }
+  } finally { await srv.close(); }
+});
+
+test('GET /code/latest is a 503 nothing published when the file is missing, unparsable or not a list', async () => {
+  const s = setup();
+  const srv = await start(s);
+  try {
+    let r = await getLatest(srv, s);
+    assert.equal(r.status, 503);
+    assert.equal(r.json.error, 'nothing published');
+    publish(s, '{not json');
+    assert.equal((await getLatest(srv, s)).status, 503);
+    publish(s, { sha: 'd'.repeat(40) });
+    assert.equal((await getLatest(srv, s)).status, 503);
+  } finally { await srv.close(); }
+});
+
+test('another path under /code is still a 404 and the existing POST /package route is unchanged', async () => {
+  const s = setup();
+  publish(s, PUBLISHED);
+  lendLease('HUB1-05-x', 'grimm', { env: s.env });
+  const srv = await start(s);
+  try {
+    assert.equal((await call(srv.port, { method: 'GET', url: '/code/other', token: s.token, headers: { 'X-Node-Id': 'grimm' } })).status, 404);
+    assert.equal((await call(srv.port, { method: 'GET', url: '/code', token: s.token, headers: { 'X-Node-Id': 'grimm' } })).status, 404);
+    assert.equal((await call(srv.port, { token: s.token, body: s.pkg })).status, 200);
   } finally { await srv.close(); }
 });

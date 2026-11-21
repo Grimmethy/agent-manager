@@ -183,6 +183,10 @@ const BRANCH_DETAIL_RE = /^agent\//;
 function isNoopApplyDetail(detail) {
   const text = String(detail || '');
   if (BRANCH_DETAIL_RE.test(text.trim())) return false;
+  // pipeline_debrief's own apply detail is real archival work, never a no-op, even when an
+  // embedded error string happens to contain a NOOP_RE word (e.g. "skipped"). Without this,
+  // apply-task.js stamped a second `noop` event right after the `applied` one.
+  if (DEBRIEF_ARCHIVED_RE.test(text.trim())) return false;
   return NOOP_RE.test(text);
 }
 const DIRECT_RE = /committed to (?:master|main)|triage batch/i;

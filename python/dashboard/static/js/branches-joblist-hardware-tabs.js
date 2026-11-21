@@ -129,8 +129,22 @@ function wireBranchCard(card) {
         });
         const result = await resp.json();
         if (!resp.ok || !result.succeeded) throw new Error(result.reason || `HTTP ${resp.status}`);
+        // Show the live-sync outcome for EVERY merge, not only restartTriggered ones. This file is a
+        // classic script (shared global scope, no import mechanism), so mergeOutcomeText (sibling 3/6)
+        // is called as a global. Until it lands, the guard falls back to mergeNoticeText, plus a generic
+        // line for synced:false so that case is never dropped silently. The alert blocks until OK, which
+        // is the owner's dismissal.
+        const outcome = typeof mergeOutcomeText === 'function' ? mergeOutcomeText(result) : '';
         const notice = mergeNoticeText(result);
-        if (notice) alert(notice);
+        const fallback = result.liveSync && result.liveSync.synced === false
+          ? 'Merged, but the live dashboard was not synced (no reason given).'
+          : '';
+        const shown = outcome
+          ? (notice && notice !== outcome ? outcome + '\n\n' + notice : outcome)
+          : (notice || fallback);
+        if (shown) alert(shown);
+        // Record the owner's dismissal (alert() returns only on OK). No timer, no poll.
+        if (shown) document.dispatchEvent(new CustomEvent('merge-outcome-dismissed', { detail: { synced: result.liveSync ? result.liveSync.synced : undefined, restartTriggered: !!(result.liveSync && result.liveSync.restartTriggered), text: shown } }));
         if (result.liveSync && result.liveSync.restartTriggered) {
           mergeBtn.textContent = 'Merged -- dashboard reloading...';
           // Werkzeug's reloader restart is near-instant but not synchronous with this
@@ -905,7 +919,7 @@ async function renderHardwareTab() {
   if (data.available === false) {
     main.innerHTML = `
       <div class="empty">Hardware monitoring is off -- pick a plugin on the
-        <a href="#" onclick="activeTab='plugins'; renderNav(); renderMain(); return false;">Plugins tab</a>.</div>`;
+        <a href="#" onclick="switchToTab('plugins'); return false;">Plugins tab</a>.</div>`;
     return;
   }
   const watchChecklistHtml = renderWatchConfigChecklist(watchConfig || {});

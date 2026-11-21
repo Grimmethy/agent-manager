@@ -17,7 +17,7 @@ async function start(opts = {}) {
   const env = { HOME: '/nonexistent-home', AGENT_MANAGER_NODES_DIR: dir, AGENT_MANAGER_DISABLED_WORKERS_DIR: path.join(dir, 'switch') };
   const { token } = registerNode({ id: 'grimm', address: opts.address === undefined ? '127.0.0.1' : opts.address, cores: 4 }, env);
   const sweeps = [];
-  const server = createServer({ env, now: () => T0, sweep: opts.sweep || (async () => { sweeps.push(1); }) });
+  const server = createServer({ env, now: () => T0, sweep: opts.sweep || (async () => { sweeps.push(1); }), ...(opts.server || {}) });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const port = server.address().port;
   const post = (body, headers = {}, urlPath = '/heartbeat', method = 'POST') => new Promise((resolve, reject) => {
@@ -123,6 +123,76 @@ test('a sweep that throws does not fail the heartbeat', async () => {
     const r = await s.post({ id: 'grimm' }, s.auth);
     assert.equal(r.status, 200);
     assert.equal(loadNodes(s.env).grimm.lastSeen, '2026-11-11T12:00:00.000Z');
+  } finally { await s.close(); }
+});
+
+test('/claim answers idle with task null and a 60 second retry when the queue is empty', async () => {
+  const s = await start({ server: { claimNext: () => null } });
+  try {
+    const r = await s.post({ id: 'grimm' }, s.auth, '/claim');
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, { ok: true, task: null, retryAfterSec: 60 });
+  } finally { await s.close(); }
+});
+
+test('/claim never calls claimNext for a paused node and answers idle', async () => {
+  let calls = 0;
+  const s = await start({ server: { claimNext: () => { calls += 1; return { task: { id: 'T1' }, lease: {}, repo: '/repo' }; } } });
+  try {
+    await s.post({ id: 'grimm', state: 'up', paused: true }, s.auth);
+    const r = await s.post({ id: 'grimm' }, s.auth, '/claim');
+    assert.deepEqual(r.body, { ok: true, task: null, retryAfterSec: 60 });
+    assert.equal(calls, 0);
+  } finally { await s.close(); }
+});
+
+test('/claim with a claimable task answers the task, lease and repo and passes the node id and classes', async () => {
+  const seen = [];
+  const s = await start({ server: { claimNext: (args) => { seen.push(args); return { task: { id: 'T1' }, lease: { taskId: 'T1' }, repo: '/repo' }; } } });
+  try {
+    const r = await s.post({ id: 'grimm', classes: ['adhoc'] }, s.auth, '/claim');
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, { ok: true, task: { id: 'T1' }, lease: { taskId: 'T1' }, repo: '/repo' });
+    assert.equal(seen[0].nodeId, 'grimm');
+    assert.equal(seen[0].claimant, 'grimm');
+    assert.deepEqual(seen[0].classes, ['adhoc']);
+  } finally { await s.close(); }
+});
+
+test('/event answers 503 without recordEvent, 400 on an event outside the six, and calls recordEvent otherwise', async () => {
+  const bare = await start();
+  try {
+    const r = await bare.post({ id: 'grimm', taskId: 'T1', event: 'merged' }, bare.auth, '/event');
+    assert.equal(r.status, 503);
+    assert.equal(r.body.error, 'events unavailable');
+  } finally { await bare.close(); }
+  const recorded = [];
+  const s = await start({ server: { recordEvent: async (e) => { recorded.push(e); } } });
+  try {
+    assert.equal((await s.post({ id: 'grimm', taskId: 'T1', event: 'exploded' }, s.auth, '/event')).status, 400);
+    const ok = await s.post({ id: 'grimm', taskId: 'T1', event: 'merged' }, s.auth, '/event');
+    assert.deepEqual(ok.body, { ok: true });
+    assert.deepEqual(recorded, [{ id: 'grimm', taskId: 'T1', event: 'merged' }]);
+  } finally { await s.close(); }
+});
+
+test('/release returns the lease only when this node holds it, and answers 409 when returnLease reports nothing lent', async () => {
+  const returned = [];
+  let holder = 'grimm';
+  let lent = true;
+  const s = await start({ server: {
+    leaseFor: () => (holder ? { nodeId: holder } : null),
+    returnLease: (taskId) => { returned.push(taskId); return lent; },
+  } });
+  try {
+    assert.deepEqual((await s.post({ id: 'grimm', taskId: 'T1' }, s.auth, '/release')).body, { ok: true });
+    assert.deepEqual(returned, ['T1']);
+    holder = 'someone-else';
+    assert.equal((await s.post({ id: 'grimm', taskId: 'T1' }, s.auth, '/release')).status, 409);
+    assert.deepEqual(returned, ['T1'], 'a lease held by another node is not returned');
+    holder = 'grimm';
+    lent = false;
+    assert.equal((await s.post({ id: 'grimm', taskId: 'T1' }, s.auth, '/release')).status, 409);
   } finally { await s.close(); }
 });
 

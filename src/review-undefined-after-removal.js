@@ -155,7 +155,7 @@ function boundNames(text) {
 }
 
 // Lines of `post` that USE `name`: not a member access (`.name`), not an object key (`{ name:` / `, name:`), not inside a comment or string. A spread (`...name`) is a use.
-function usesOf(post, name) {
+function usesOf(post, name, ignoredDefs) {
   const stripped = stripNonCode(post).split('\n');
   const original = String(post).split('\n');
   const re = new RegExp(`(?<![\\w$])${name.replace(/[$]/g, '\\$')}(?![\\w$])`, 'g');
@@ -170,6 +170,12 @@ function usesOf(post, name) {
       if (/(?<!\.)\.\s*$/.test(before)) continue;                                  // member access (`obj.name`, `obj?.name`)
       if (/[{,]\s*$/.test(before) && /^\s*:(?!:)/.test(after)) continue;           // object-literal key
       if (/(?:^|[^\w$])(?:const|let|var|function|class)\s+$/.test(before)) continue; // a declaration, not a use
+      // a method definition at statement start (`name(a, b) {`, `async name() {`, `static name() {`): a class/object member, not a use of a top-level binding.
+      // The parameter list may hold no parentheses, so a bare call such as `name(function () {` or `name(() => {` is still a use.
+      if (/^\s*(?:(?:async|static|get|set)\s+)*\*?\s*$/.test(before) && /^\s*\([^()]*\)\s*\{/.test(after)) {
+        if (Array.isArray(ignoredDefs)) ignoredDefs.push({ name, line: i + 1 });
+        continue;
+      }
       out.push({ line: i + 1, text: String(original[i] || '').trim().slice(0, 140) });
       break;
     }
@@ -263,7 +269,7 @@ function postImageOf(change, base) {
  * @returns {{ considered: number, unknown: number, uses: Array<{ file: string, name: string, lines: Array<{ line: number, text: string }> }> }}
  */
 function findUndefinedAfterRemoval({ rawDiff, edits, repoRoot, baseRef, readBase } = {}) {
-  const result = { considered: 0, unknown: 0, uses: [] };
+  const result = { considered: 0, unknown: 0, uses: [], ignoredMethodDefs: [] };
   try {
     const read = readBase || ((file) => defaultReadBase(repoRoot, baseRef, file));
     const all = [...parseDiffChanges(rawDiff).filter((c) => !c.isRename), ...changesFromEdits(edits)];
@@ -281,7 +287,9 @@ function findUndefinedAfterRemoval({ rawDiff, edits, repoRoot, baseRef, readBase
         if (result.considered >= MAX_NAMES) return result;
         result.considered += 1;
         if (postBound.has(name)) continue;
-        const lines = usesOf(post, name);
+        const skipped = [];
+        const lines = usesOf(post, name, skipped);
+        for (const s of skipped) result.ignoredMethodDefs.push({ file: change.file, name: s.name, line: s.line });
         if (lines.length) result.uses.push({ file: change.file, name, lines: lines.slice(0, MAX_LINES) });
       }
     }

@@ -275,3 +275,106 @@ function openGlobalBrainDumpModal() {
   document.getElementById('global-bd-capture-btn').onclick = submit;
   input.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
 }
+
+// Mirror of openGlobalBrainDumpModal for filing a new task into a chosen repo. Shares the
+// same modal-backdrop / modal-content pair, so it reuses the close() flow. The dialog has a
+// title input, a repo select populated from /api/projects/history (paths escaped), a
+// multi-line text area, a premium checkbox (unchecked by default) and an optional
+// raised-from input. On submit it POSTs to /api/new-task; on success it renders the returned
+// task id with a link, using textContent (never innerHTML) for every echoed value.
+async function openNewTaskModal() {
+  const backdrop = document.getElementById('modal-backdrop');
+  const content = document.getElementById('modal-content');
+  // Fetch the registered project list so the repo select can be populated before the
+  // modal is shown -- without this the user would see an empty dropdown until the
+  // request resolves (a bad UX).
+  let projects = [];
+  try {
+    const data = await fetchJson('/api/projects/history');
+    projects = (data.projects || []).filter(Boolean);
+  } catch (e) {
+    // Best-effort: a dashboard with no project history yet has nothing to offer.
+  }
+  const projectOpts = projects
+    .map((p) => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`)
+    .join('');
+  content.innerHTML = `
+    <button class="close" onclick="closeDetail()">&times;</button>
+    <h2>New task</h2>
+    <div class="field-label">Title</div>
+    <input id="nt-title" placeholder="Task title" autocomplete="off" style="width:100%;box-sizing:border-box;padding:6px 10px;border:2px solid var(--border);border-radius:6px;font-family:inherit;font-size:14px">
+    <div class="field-label" style="margin-top:10px">Repo</div>
+    <select id="nt-repo" style="flex:1;padding:6px 10px;border:2px solid var(--border);border-radius:6px;font-family:inherit;font-size:14px;background:var(--panel);color:var(--text)">
+      <option value="">-- pick a repo --</option>
+      ${projectOpts}
+    </select>
+    <div class="field-label" style="margin-top:10px">Description</div>
+    <textarea id="nt-description" rows="6" placeholder="What should be done and why..." style="width:100%;box-sizing:border-box;padding:6px 10px;border:2px solid var(--border);border-radius:6px;font-family:monospace;font-size:13px;resize:vertical"></textarea>
+    <div class="field-label" style="margin-top:10px">Optional</div>
+    <div class="row" style="gap:10px;align-items:center">
+      <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="nt-premium"> Premium</label>
+    </div>
+    <div class="field-label" style="margin-top:10px">Raised from (optional)</div>
+    <input id="nt-raised-from" placeholder="Task id or brain-dump serial" autocomplete="off" style="width:100%;box-sizing:border-box;padding:6px 10px;border:2px solid var(--border);border-radius:6px;font-family:inherit;font-size:14px">
+    <div style="margin-top:14px">
+      <button class="action" id="nt-submit-btn">File task</button>
+    </div>
+    <div id="nt-result" style="margin-top:14px" hidden></div>
+  `;
+  backdrop.classList.add('open');
+  document.getElementById('nt-title').focus();
+  const submit = async () => {
+    const title = document.getElementById('nt-title').value.trim();
+    const repo = document.getElementById('nt-repo').value;
+    const description = document.getElementById('nt-description').value;
+    const premium = document.getElementById('nt-premium').checked;
+    const raisedFrom = document.getElementById('nt-raised-from').value.trim() || undefined;
+    if (!title || !repo) {
+      alert('Title and repo are required.');
+      return;
+    }
+    const btn = document.getElementById('nt-submit-btn');
+    btn.disabled = true;
+    btn.textContent = 'Filing...';
+    try {
+      const body = { title, repo, description, premium };
+      if (raisedFrom) body.raised_from = raisedFrom;
+      const r = await fetch('/api/new-task', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.description || err.detail || ('HTTP ' + r.status));
+      }
+      const result = await r.json();
+      const task = result.task || result;
+      const taskId = task.id || task.taskId || '';
+      const resultEl = document.getElementById('nt-result');
+      resultEl.hidden = false;
+      // Use textContent throughout -- never innerHTML -- so any returned id/description is
+      // safely escaped even if it contains HTML-like characters.
+      if (taskId) {
+        const link = document.createElement('a');
+        link.href = '/queue/' + encodeURIComponent(taskId);
+        link.textContent = 'Task ' + taskId + ' filed';
+        link.style.color = 'var(--ok)';
+        resultEl.appendChild(link);
+      }
+      if (task.description) {
+        const desc = document.createElement('div');
+        desc.className = 'meta';
+        desc.textContent = task.description;
+        resultEl.appendChild(desc);
+      }
+      closeDetail();
+    } catch (e) {
+      alert('Could not file task: ' + e.message);
+      btn.disabled = false;
+      btn.textContent = 'File task';
+    }
+  };
+  document.getElementById('nt-submit-btn').onclick = submit;
+  document.getElementById('nt-title').onkeydown = (e) => { if (e.key === 'Enter') document.getElementById('nt-repo').focus(); };
+}

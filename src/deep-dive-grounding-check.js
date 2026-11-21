@@ -100,6 +100,23 @@ function citedIdentifier(symbol) {
   return FILE_EXT_SEGMENT_RE.test(last) && parts.length > 1 ? parts[parts.length - 2] : last;
 }
 
+// A package initializer (`pkg/__init__.py`) is grounded when fetched structure establishes the
+// package: (a) the exact path is in the fetched listing, (b) a fetched file is a direct child of
+// that package directory, or (c) a fetched file imports the package by its dotted name.
+function packageInitEstablished(symbol, files, combined) {
+  const pkgDir = symbol.replace(/\/?__init__\.py$/, '');
+  const pathOf = (f) => String(f.path || f.file || f.name || '');
+  if (files.some((f) => pathOf(f) === symbol || pathOf(f).endsWith(`/${symbol}`))) return true;
+  if (files.some((f) => {
+    const p = pathOf(f);
+    const idx = p.lastIndexOf('/');
+    return pkgDir ? idx !== -1 && p.slice(0, idx) === pkgDir : idx === -1;
+  })) return true;
+  if (!pkgDir) return false;
+  const dotted = escapeRe(pkgDir.replace(/\//g, '.'));
+  return new RegExp(`\\b(?:from|import)\\s+${dotted}\\b`).test(combined);
+}
+
 function checkFabricatedSymbols(task, implementResponse) {
   const files = realFilesOf(task);
   if (!files.length) return [];
@@ -126,6 +143,13 @@ function checkFabricatedSymbols(task, implementResponse) {
   while ((m = PATH_SHAPED_SYMBOL_RE.exec(implementResponse))) {
     const symbol = m[1];
     if (isKnownExternalPath(symbol, task)) continue;
+    if (/(^|\/)__init__\.py$/.test(symbol)) {
+      // Never the substring test: any `def __init__` in any file would vouch for every package.
+      if (!packageInitEstablished(symbol, files, combined)) {
+        flag('import', symbol, `the draft cites \`${symbol}\`, but that package initializer is not established by any fetched file listing or import (no fetched path or import names the package)`);
+      }
+      continue;
+    }
     const finalSegment = citedIdentifier(symbol);
     if (!combined.includes(symbol) && !combined.includes(finalSegment)) {
       flag('import', symbol, `the draft cites \`${symbol}\`, but neither that path nor its final segment (\`${finalSegment}\`) appears anywhere in the real fetched content of any file in this community`);
@@ -209,8 +233,9 @@ function detectClaimedKind(symbol, draftText) {
     const clause = clauseAround(draftText, m.index, m.index + m[0].length);
     if (/\bTypedDict\b/.test(clause)) return 'TypedDict';
     if (/\bEnum\b/.test(clause)) return 'Enum';
-    if (/\bclass\b/.test(clause)) return 'class';
+    if (/\bclass\b(?!-like\b)/.test(clause)) return 'class';
     if (/\b(function|method)s?\b/.test(clause)) return 'function';
+    if (/\bclass\b/.test(clause)) return 'class';
   }
   return null;
 }
@@ -221,7 +246,15 @@ function detectClaimedKind(symbol, draftText) {
 // excluded on purpose: those are import/file citations, not kind claims.
 const TYPE_FIDELITY_SYMBOL_RE = /`([A-Za-z_][A-Za-z0-9_]*)`/g;
 
-function checkTypeFidelity(task, text) {
+// Enum is a subkind of class: a draft calling `class X(Enum)` a "class" is accurate. Only
+// that pair is excused. A TypedDict described as a class stays a mismatch (see the test at
+// src/deep-dive-grounding-check.test.js for the TypedDict-as-class case).
+function isCompatibleKind(claimed, actual) {
+  if (claimed === actual) return true;
+  return claimed === 'class' && actual === 'Enum';
+}
+
+function checkTypeFidelity(task, text, onSuppressed = () => {}) {
   const files = realFilesOf(task);
   if (!files.length) return [];
   const sourceText = files.map((f) => f.content).join('\n');
@@ -236,7 +269,10 @@ function checkTypeFidelity(task, text) {
     const actual = detectActualKind(symbol, sourceText);
     if (!actual) continue; // absent or undetectable -- checkFabricatedSymbols' lane, or no call
     const claimed = detectClaimedKind(symbol, text);
-    if (claimed && claimed !== actual) {
+    if (claimed && claimed === 'class' && actual === 'Enum') {
+      onSuppressed({ symbol, claimed, actual, reason: 'class-subkind' });
+    }
+    if (claimed && !isCompatibleKind(claimed, actual)) {
       mismatches.push({
         kind: 'type-mismatch',
         detail: `the draft calls \`${symbol}\` a ${claimed}, but the real fetched source declares it as a ${actual}`,

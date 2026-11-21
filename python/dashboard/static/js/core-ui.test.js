@@ -126,8 +126,35 @@ function loadDashboardScripts(overrides = {}) {
     pending.set(url, [...(pending.get(url) || []), d]);
     return d.promise;
   };
-  return { ctx, main, fetchCalls, resolve: (url, value) => pending.get(url).shift().resolve(value) };
+  const resolve = (url, value) => {
+    const queue = pending.get(url);
+    if (!queue || queue.length === 0) {
+      const reason = queue ? 'already consumed' : 'never fetched';
+      const open = [...pending.entries()].filter(([, q]) => q.length > 0).map(([u]) => u);
+      throw new Error(`resolve(): ${url} was ${reason}. Pending URLs: ${open.length ? open.join(', ') : '(none)'}`);
+    }
+    queue.shift().resolve(value);
+  };
+  return { ctx, main, fetchCalls, resolve };
 }
+
+test('resolve: an unfetched URL fails with a readable message naming it', () => {
+  const { resolve } = loadDashboardScripts();
+  assert.throws(
+    () => resolve('/api/never-fetched', {}),
+    (e) => /\/api\/never-fetched.*never fetched/.test(e.message) && !/Cannot read properties/.test(e.message),
+  );
+});
+
+test('resolve: resolving the same URL twice fails on the second call naming it as already consumed', () => {
+  const { ctx, resolve } = loadDashboardScripts();
+  ctx.fetchJson('/api/double');
+  resolve('/api/double', {});
+  assert.throws(
+    () => resolve('/api/double', {}),
+    (e) => /\/api\/double.*already consumed/.test(e.message) && !/Cannot read properties/.test(e.message),
+  );
+});
 
 test('real switchToTab + renderAdhocTasksTab: a render that resolves AFTER a tab switch does not paint over #main', async () => {
   const { ctx, main, resolve } = loadDashboardScripts();
@@ -228,4 +255,93 @@ test('real renderNav on a phone puts the Forges header first, followed by its ta
   assert.match(text(buttons[1]), /PromptForge/);
   assert.match(text(buttons[2]), /StageForge/);
   assert.match(text(buttons[3]), /Project/);
+});
+
+// --- fetchJson in-flight dedupe + failure memory (HUB0531 2/4). fetchJson is not exported from
+// core-ui.js, so every test loads the REAL core-ui.js into a fresh vm context (fresh module state:
+// fetchInFlight and fetchFailures start empty). fetchJson calls Date.now() directly and has no
+// now() override, so the fake clock is the context's own Date global, swapped in after load.
+// No timer is added to the code under test. fetch is a stub: destructive URLs throw (tripwire).
+
+const DESTRUCTIVE_URL = /pipeline\/(stop|start)|\/workers?\/.*\/(enable|disable)|\/pause/;
+
+function loadFetchJson() {
+  const clock = { t: 1000 };
+  const calls = [];
+  const destructiveHits = [];
+  let behaviour = () => ({ ok: true, status: 200, json: async () => ({ ok: true }) });
+  const ctx = vm.createContext({
+    console,
+    AbortController, setTimeout, clearTimeout,
+    localStorage: { getItem: () => null, setItem() {} },
+    document: { getElementById: () => null, createElement: () => ({}) },
+    window: { matchMedia: () => ({ matches: false, addEventListener() {} }) },
+    counts: {}, activeTab: 'project', severityForTab: () => '', TAB_COUNT_SEVERITY_THRESHOLDS: {}, switchToTab() {},
+  });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'core-ui.js'), 'utf8'), ctx, { filename: 'core-ui.js' });
+  ctx.Date = { now: () => clock.t };
+  ctx.fetch = async (url) => {
+    calls.push(url);
+    if (DESTRUCTIVE_URL.test(url)) {
+      destructiveHits.push(url);
+      throw new Error('tripwire: destructive URL ' + url);
+    }
+    return behaviour(url);
+  };
+  return {
+    fetchJson: ctx.fetchJson, calls, destructiveHits, clock,
+    setBehaviour(fn) { behaviour = fn; },
+  };
+}
+
+const okResponse = () => ({ ok: true, status: 200, json: async () => ({ ok: true }) });
+const failResponse = () => ({ ok: false, status: 500, json: async () => ({}) });
+
+test('fetchJson: concurrent identical calls make one fetch and share one result', async () => {
+  const h = loadFetchJson();
+  const gate = deferred();
+  h.setBehaviour(async () => { await gate.promise; return okResponse(); });
+  const a = h.fetchJson('/api/x');
+  const b = h.fetchJson('/api/x');
+  assert.equal(h.calls.length, 1, 'second identical call shares the in-flight fetch');
+  gate.resolve();
+  const [ra, rb] = await Promise.all([a, b]);
+  assert.equal(ra, rb);
+  assert.deepEqual(h.calls, ['/api/x']);
+  assert.equal(h.destructiveHits.length, 0);
+});
+
+test('fetchJson: a recent failure is returned without a second fetch', async () => {
+  const h = loadFetchJson();
+  h.setBehaviour(() => failResponse());
+  await assert.rejects(h.fetchJson('/api/y'), /\/api\/y -> 500/);
+  await assert.rejects(h.fetchJson('/api/y'), /\/api\/y -> 500/);
+  assert.deepEqual(h.calls, ['/api/y'], 'the second call was served from failure memory');
+  assert.equal(h.destructiveHits.length, 0);
+});
+
+test('fetchJson: after 15 s on a fake clock a new fetch happens', async () => {
+  const h = loadFetchJson();
+  let fail = true;
+  h.setBehaviour(() => (fail ? failResponse() : okResponse()));
+  await assert.rejects(h.fetchJson('/api/z'), /-> 500/);
+  h.clock.t += 14999;
+  await assert.rejects(h.fetchJson('/api/z'), /-> 500/);
+  assert.equal(h.calls.length, 1, 'at 14999 ms the stored failure is still served');
+  h.clock.t += 1;
+  fail = false;
+  const ok = await h.fetchJson('/api/z');
+  assert.deepEqual(ok, { ok: true });
+  assert.equal(h.calls.length, 2, 'at 15000 ms the failure expires and a new fetch runs');
+  assert.equal(h.destructiveHits.length, 0);
+});
+
+test('fetchJson: a different URL is unaffected by a failure on another URL', async () => {
+  const h = loadFetchJson();
+  h.setBehaviour((url) => (url === '/api/a' ? failResponse() : okResponse()));
+  await assert.rejects(h.fetchJson('/api/a'), /-> 500/);
+  const b = await h.fetchJson('/api/b');
+  assert.deepEqual(b, { ok: true });
+  assert.deepEqual(h.calls, ['/api/a', '/api/b']);
+  assert.equal(h.destructiveHits.length, 0);
 });

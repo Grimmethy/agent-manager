@@ -18,7 +18,7 @@ hold() { printf 'import-repo-bundle: %s\n' "$1" >&2; exit 3; }
 BUNDLE="$1"; DEST="$2"; BRANCH="${3:-master}"
 [[ -n "$BUNDLE" && -n "$DEST" && -n "$BRANCH" ]] || refuse "an argument is empty"
 [[ -f "$BUNDLE" && -r "$BUNDLE" ]] || refuse "cannot read the bundle: $BUNDLE"
-BUNDLE="$(cd "$(dirname "$BUNDLE")" && pwd)/$(basename "$BUNDLE")"
+BUNDLE="$(cd "$(dirname "$BUNDLE")" && pwd -P)/$(basename "$BUNDLE")"
 
 CHECK_DIR="$(mktemp -d)"
 trap 'rm -rf "$CHECK_DIR"' EXIT
@@ -37,7 +37,7 @@ if [[ ! -e "$DEST" ]] || { [[ -d "$DEST" ]] && [[ -z "$(ls -A "$DEST")" ]]; }; t
 elif is_clone; then
   [[ -z "$(git -C "$DEST" status --porcelain)" ]] || hold "the clone has uncommitted changes: $DEST"
   [[ "$(git -C "$DEST" symbolic-ref --short -q HEAD || true)" == "$BRANCH" ]] || hold "the clone is not on branch $BRANCH: $DEST"
-  git -C "$DEST" fetch -q "$BUNDLE" "refs/heads/$BRANCH" >/dev/null 2>&1 || { printf 'import-repo-bundle: git fetch failed\n' >&2; exit 1; }
+  git -C "$DEST" fetch -q "$BUNDLE" "refs/heads/$BRANCH" >/dev/null 2>&1 || refuse "git fetch failed: $BUNDLE"
   if git -C "$DEST" merge-base --is-ancestor FETCH_HEAD HEAD; then
     :
   elif git -C "$DEST" merge-base --is-ancestor HEAD FETCH_HEAD; then

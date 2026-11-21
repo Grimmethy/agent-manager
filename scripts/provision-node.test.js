@@ -40,9 +40,12 @@ test('a first run creates the nine queue directories, the domains, one disabled 
   assert.equal(lanes[0].enabled, false);
   assert.deepEqual(lanes[0].taskClasses, ['adhoc']);
   assert.equal(lanes[0].preempt, 'never');
-  assert.equal(read(path.join(t.pipe, 'node.env')), [
-    'AGENT_MANAGER_NODE_ID=grimm', `AGENT_MANAGER_PIPELINE_DIR=${t.pipe}`, `AGENT_MANAGER_REPO_ROOT=${t.repo}`, `AGENT_MANAGER_DOMAINS_PATH=${t.pipe}/task-domains.json`, `AGENT_MANAGER_LANES_PATH=${t.pipe}/lanes.json`, '',
-  ].join('\n'));
+  const env = read(path.join(t.pipe, 'node.env'));
+  assert.deepEqual(env.split('\n').filter((l) => l !== '' && !l.startsWith('#')), [
+    'AGENT_MANAGER_NODE_ID=grimm', `AGENT_MANAGER_PIPELINE_DIR=${t.pipe}`, `AGENT_MANAGER_REPO_ROOT=${t.repo}`, `AGENT_MANAGER_DOMAINS_PATH=${t.pipe}/task-domains.json`, `AGENT_MANAGER_LANES_PATH=${t.pipe}/lanes.json`,
+  ]);
+  assert.deepEqual(env.split('\n').filter((l) => l.startsWith('#')), ['# AGENT_MANAGER_CLAIM_URL=', '# AGENT_MANAGER_NODE_TOKEN_FILE=', '# AGENT_MANAGER_NODE_REPOS_DIR=', '# AGENT_MANAGER_PACKAGE_URL=']);
+  assert.ok(env.endsWith('\n'));
   assert.deepEqual(fs.readdirSync(t.pipe).sort(), ['lanes.json', 'node.env', 'queue', 'task-domains.json']);
   assert.match(r.stdout, /Nothing was started/);
   assert.match(r.stdout, /does not exist yet/);
@@ -55,7 +58,9 @@ test('no file the script writes mentions a token, and the note about a missing r
   const r = provision(['grimm', t.pipe, t.repo]);
   assert.equal(r.status, 0, r.stderr);
   assert.doesNotMatch(r.stdout, /does not exist yet/);
-  for (const f of ['task-domains.json', 'lanes.json', 'node.env']) assert.doesNotMatch(read(path.join(t.pipe, f)), /token/i, f);
+  for (const f of ['task-domains.json', 'lanes.json']) assert.doesNotMatch(read(path.join(t.pipe, f)), /token/i, f);
+  // node.env carries the commented AGENT_MANAGER_NODE_TOKEN_FILE key (a path setting, not a token), so that one line is excluded.
+  assert.doesNotMatch(read(path.join(t.pipe, 'node.env')).split('\n').filter((l) => !l.startsWith('# AGENT_MANAGER_NODE_TOKEN_FILE=')).join('\n'), /token/i, 'node.env');
 });
 
 test('a second run keeps everything: files unchanged, an edited lanes.json untouched, no backup made, node.env rewritten identically', () => {
@@ -72,7 +77,8 @@ test('a second run keeps everything: files unchanged, an edited lanes.json untou
   assert.equal(read(path.join(t.pipe, 'node.env')), before.env);
   assert.equal(fs.readFileSync(path.join(t.pipe, 'queue', 'adhoc', 'keep-me.json'), 'utf8'), '{}');
   assert.deepEqual(fs.readdirSync(t.pipe).sort(), ['lanes.json', 'node.env', 'queue', 'task-domains.json']);
-  assert.equal((r.stdout.match(/^kept /gm) || []).length, QUEUES.length + 1);
+  // the queue folders, lanes.json and (since units are never overwritten) the five unit files
+  assert.equal((r.stdout.match(/^kept /gm) || []).length, QUEUES.length + 1 + 5);
   assert.doesNotMatch(r.stdout, /^created /m);
 });
 
@@ -126,7 +132,7 @@ test('the shortest and the longest allowed ids are accepted', () => {
 
 test('a missing or extra argument exits 2 with the usage line and creates nothing', () => {
   const t = tmp();
-  for (const args of [[], ['grimm'], ['grimm', t.pipe], ['grimm', t.pipe, t.repo, 'extra'], ['grimm', '', t.repo], ['grimm', t.pipe, '']]) {
+  for (const args of [[], ['grimm'], ['grimm', t.pipe], ['grimm', t.pipe, t.repo, `${t.root}/units`, 'extra'], ['grimm', '', t.repo], ['grimm', t.pipe, '']]) {
     const r = provision(args);
     assert.equal(r.status, 2, JSON.stringify(args));
     assert.match(r.stderr, /usage|absolute/);

@@ -22,6 +22,10 @@ an existing sweep). Hand-editing `queue/` or committing a fix straight to a stuc
 branch is the exception that needs a stated reason, not the default move. If no mechanism
 fits, the deliverable is a proposal for one — surface it, don't paper over it.
 
+## Filing friction tasks: premium at filing
+
+Friction tasks that block work are filed premium at filing, by the filing agent, without being asked. Blocking = a stage cannot complete (claim, lease, dependsOn, draft, review, apply, merge), a UI step cannot be done, or a task waits on the fix. Cosmetic/product-feedback friction stays non-premium and the report says which. A hub's premium does not reach its pieces yet (premium route per unfinished piece). Report lists each friction task with premium yes/no and a reason.
+
 ## Second principle: build for after-the-fact audit, not just correctness
 
 Grimmethy has said this directly, more than once: *"you know how much I love being able

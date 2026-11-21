@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { getLanes, laneById, laneAllowsSource, isSlowEndpoint, isSlowLane, gpuSlugFromName } = require('./lanes.js');
+const { getLanes, laneById, laneAllowsSource, laneAllowsTask, isSlowEndpoint, isSlowLane, gpuSlugFromName } = require('./lanes.js');
 
 // A throwaway registry file; returns the env that points getLanes at it. Never reads the real <repo>/lanes.json.
 function withRegistry(content, base = { AGENT_MANAGER_LOCAL_GPU: '3090' }) {
@@ -57,7 +57,7 @@ test('registry: one entry adds a lane with the full env, defaults id/preempt, cl
   const lanes = getLanes(withRegistry([RX580]));
   assert.deepEqual(lanes.map((l) => l.id), ['worker-3090', 'worker-rx580']);
   assert.deepEqual(lanes[1], {
-    id: 'worker-rx580', gpu: 'rx580', local: false, slow: false, numCtx: null, numBatch: null, reviewer: false, reviewerId: 'reviewer-rx580', preempt: 'never', taskClasses: null, model: 'qwen3-vl:8b-instruct', tier: 8, reserve: 'auto',
+    id: 'worker-rx580', gpu: 'rx580', local: false, slow: false, numCtx: null, numBatch: null, reviewer: false, reviewerId: 'reviewer-rx580', preempt: 'never', taskClasses: null, projects: null, raisedFromPrefix: null, model: 'qwen3-vl:8b-instruct', tier: 8, reserve: 'auto',
     env: { OLLAMA_URL: 'http://100.96.112.78:11434', LOCAL_MODEL: 'qwen3-vl:8b-instruct', AGENT_MANAGER_GPU_YIELD_APPS: '' },
   });
 });
@@ -138,7 +138,7 @@ test('CLI: --ids and --env print the registry lane for launch.sh', () => {
   const ids = execFileSync('node', [path.join(__dirname, 'lanes.js'), '--ids'], { env, encoding: 'utf8' }).trim().split('\n');
   assert.deepEqual(ids, ['worker-3090', 'worker-rx580']);
   const lines = execFileSync('node', [path.join(__dirname, 'lanes.js'), '--env', 'worker-rx580'], { env, encoding: 'utf8' }).trim().split('\n');
-  assert.deepEqual(lines, ['OLLAMA_URL=http://100.96.112.78:11434', 'LOCAL_MODEL=qwen3-vl:8b-instruct', 'AGENT_MANAGER_GPU_YIELD_APPS=', 'LANE_TASK_CLASSES=', 'LANE_REVIEWS=']);
+  assert.deepEqual(lines, ['OLLAMA_URL=http://100.96.112.78:11434', 'LOCAL_MODEL=qwen3-vl:8b-instruct', 'AGENT_MANAGER_GPU_YIELD_APPS=', 'LANE_TASK_CLASSES=', 'LANE_PROJECTS=', 'LANE_RAISED_FROM_PREFIX=', 'LANE_REVIEWS=']);
 });
 
 test('slow: a registry lane may be marked slow (true/false only); the P40 always is; the host never is', () => {
@@ -459,4 +459,103 @@ test('isScriptEndpoint: true only for an enabled script lane endpoint (trailing 
   assert.equal(isScriptEndpoint('http://127.0.0.1:7449', withRegistry([{ ...SCRIPT, enabled: false }])), false);
   assert.equal(isScriptEndpoint('http://127.0.0.1:7449', withRegistry('{ not json')), false);
   assert.equal(isCloudEndpoint('http://127.0.0.1:7449', env), false, 'and a script endpoint is not a cloud endpoint');
+});
+
+test('CLI --env: a cloud lane prints LANE_CLOUD_REVIEWS (true by default, false when reviews is false); other lanes print nothing extra', () => {
+  const { execFileSync } = require('node:child_process');
+  const env = { ...process.env, ...withRegistry([
+    CLOUD,
+    { ...CLOUD, gpu: 'cloud2', ollamaUrl: 'http://127.0.0.1:7480', reviews: false },
+    RX580,
+  ]) };
+  const envLines = (id) => execFileSync('node', [path.join(__dirname, 'lanes.js'), '--env', id], { env, encoding: 'utf8' }).trim().split('\n');
+  assert.ok(envLines('worker-cloud').includes('LANE_CLOUD_REVIEWS=true'), 'default is true');
+  assert.ok(envLines('worker-cloud2').includes('LANE_CLOUD_REVIEWS=false'));
+  assert.equal(envLines('worker-cloud').filter((l) => l.startsWith('LANE_CLOUD_REVIEWS=')).length, 1);
+  assert.equal(envLines('worker-rx580').some((l) => l.startsWith('LANE_CLOUD_REVIEWS=')), false, 'a non-cloud lane keeps its exact output');
+});
+
+// ---- lane scope (projects / raisedFromPrefix) ----
+const SCOPED = { gpu: 'scoped', ollamaUrl: 'http://scoped:11434', model: 'qwen3:8b', projects: ['core'], raisedFromPrefix: ['core/'] };
+
+test('scope: absent projects and raisedFromPrefix -> lane is unscoped (null on both keys)', () => {
+  const lane = getLanes(withRegistry([RX580]))[1];
+  assert.equal(lane.projects, null);
+  assert.equal(lane.raisedFromPrefix, null);
+});
+
+test('scope: valid projects and raisedFromPrefix are trimmed, de-duplicated, and carried on the lane', () => {
+  const lane = getLanes(withRegistry([{ ...SCOPED, projects: [' core ', 'core', 'infra'], raisedFromPrefix: [' core/', 'core/'] }]))[1];
+  assert.deepEqual(lane.projects, ['core', 'infra']);
+  assert.deepEqual(lane.raisedFromPrefix, ['core/']);
+});
+
+test('scope: empty array drops the lane (projects)', () => {
+  assert.deepEqual(getLanes(withRegistry([{ ...RX580, projects: [] }])).map((l) => l.id), ['worker-3090']);
+});
+
+test('scope: empty array drops the lane (raisedFromPrefix)', () => {
+  assert.deepEqual(getLanes(withRegistry([{ ...RX580, raisedFromPrefix: [] }])).map((l) => l.id), ['worker-3090']);
+});
+
+test('scope: non-array drops the lane (projects)', () => {
+  assert.deepEqual(getLanes(withRegistry([{ ...RX580, projects: 'core' }])).map((l) => l.id), ['worker-3090']);
+});
+
+test('scope: non-array drops the lane (raisedFromPrefix)', () => {
+  assert.deepEqual(getLanes(withRegistry([{ ...RX580, raisedFromPrefix: 'core/' }])).map((l) => l.id), ['worker-3090']);
+});
+
+test('scope: non-string entry drops the lane (projects)', () => {
+  assert.deepEqual(getLanes(withRegistry([{ ...RX580, projects: ['core', 42] }])).map((l) => l.id), ['worker-3090']);
+});
+
+test('scope: non-string entry drops the lane (raisedFromPrefix)', () => {
+  assert.deepEqual(getLanes(withRegistry([{ ...RX580, raisedFromPrefix: ['core/', null] }])).map((l) => l.id), ['worker-3090']);
+});
+
+test('scope: both keys together, valid', () => {
+  const lane = getLanes(withRegistry([SCOPED]))[1];
+  assert.deepEqual(lane.projects, ['core']);
+  assert.deepEqual(lane.raisedFromPrefix, ['core/']);
+});
+
+test('scope: laneAllowsTask fails on project mismatch', () => {
+  const lane = getLanes(withRegistry([SCOPED]))[1];
+  assert.equal(laneAllowsTask(lane, { source: 'brain_dump_sort', project: 'infra', raisedFrom: 'infra/fix' }), false);
+});
+
+test('scope: laneAllowsTask fails when raisedFrom is missing', () => {
+  const lane = getLanes(withRegistry([SCOPED]))[1];
+  assert.equal(laneAllowsTask(lane, { source: 'brain_dump_sort', project: 'core' }), false);
+  assert.equal(laneAllowsTask(lane, { source: 'brain_dump_sort', raisedFrom: 'core/fix' }), false);
+});
+
+test('scope: laneAllowsTask succeeds when both match', () => {
+  const lane = getLanes(withRegistry([SCOPED]))[1];
+  assert.equal(laneAllowsTask(lane, { source: 'brain_dump_sort', project: 'core', raisedFrom: 'core/fix' }), true);
+  assert.equal(laneAllowsTask(lane, { source: 'brain_dump_sort', project: 'core', raisedFrom: 'core/another' }), true);
+});
+
+test('scope: laneAllowsTask ignores scope for a reviewer lane', () => {
+  const lane = getLanes(withRegistry([SCOPED]))[1];
+  const reviewer = { ...lane, reviewer: true };
+  assert.equal(laneAllowsTask(reviewer, { source: 'brain_dump_sort', project: 'wrong', raisedFrom: 'wrong/x' }), true);
+  assert.equal(laneAllowsTask(reviewer, { source: 'brain_dump_sort', raisedFrom: 'wrong/x' }), true, 'missing project is OK for reviewer');
+});
+
+test('scope: laneAllowsTask fails closed when project is null', () => {
+  const lane = getLanes(withRegistry([SCOPED]))[1];
+  assert.equal(laneAllowsTask(lane, { source: 'brain_dump_sort', project: null, raisedFrom: 'core/x' }), false);
+});
+
+test('scope: CLI --env prints LANE_PROJECTS and LANE_RAISED_FROM_PREFIX (empty for unscoped, comma-joined for scoped)', () => {
+  const { execFileSync } = require('node:child_process');
+  const env = { ...process.env, ...withRegistry([RX580, SCOPED]) };
+  const unscoped = execFileSync('node', [path.join(__dirname, 'lanes.js'), '--env', 'worker-rx580'], { env, encoding: 'utf8' }).trim().split('\n');
+  const scoped = execFileSync('node', [path.join(__dirname, 'lanes.js'), '--env', 'worker-scoped'], { env, encoding: 'utf8' }).trim().split('\n');
+  assert.ok(unscoped.includes('LANE_PROJECTS='), 'unscoped lane prints LANE_PROJECTS=');
+  assert.ok(unscoped.includes('LANE_RAISED_FROM_PREFIX='), 'unscoped lane prints LANE_RAISED_FROM_PREFIX=');
+  assert.ok(scoped.includes('LANE_PROJECTS=core'), 'scoped lane prints its projects');
+  assert.ok(scoped.includes('LANE_RAISED_FROM_PREFIX=core/'), 'scoped lane prints its raisedFromPrefix');
 });

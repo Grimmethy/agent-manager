@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 
 const {
   runGroundingCheck, checkFabricatedSymbols, parseGroundingVerdict, checkTypeFidelity,
+  detectClaimedKind,
 } = require('./deep-dive-grounding-check.js');
 
 // Real incident shape: the draft cites `TextFileConverter`/`ConversionError`, but the
@@ -267,6 +268,25 @@ test('checkTypeFidelity flags a TypedDict assigned via MyConfig = TypedDict(...)
   assert.equal(checkTypeFidelity(t, 'The `MyConfig` class is the entry point.').length, 1);
 });
 
+test('checkTypeFidelity excuses a real Enum described as a class and records the excusal', () => {
+  const t = typedDictTask({ promptContext: { files: [{ path: 'c.py', content: 'class Color(Enum):\n    RED = 1' }] } });
+  const suppressed = [];
+  assert.deepEqual(checkTypeFidelity(t, 'The `Color` class holds the palette.', (s) => suppressed.push(s)), []);
+  assert.equal(suppressed.length, 1);
+  assert.equal(suppressed[0].reason, 'class-subkind');
+  assert.equal(suppressed[0].symbol, 'Color');
+});
+
+test('checkTypeFidelity still flags a function described as a class', () => {
+  const t = typedDictTask({ promptContext: { files: [{ path: 'c.py', content: 'def make_color():\n    return 1' }] } });
+  assert.equal(checkTypeFidelity(t, 'The `make_color` class builds colors.').length, 1);
+});
+
+test('checkTypeFidelity still flags an Enum described as a function', () => {
+  const t = typedDictTask({ promptContext: { files: [{ path: 'c.py', content: 'class Color(Enum):\n    RED = 1' }] } });
+  assert.equal(checkTypeFidelity(t, 'The `Color` function builds the palette.').length, 1);
+});
+
 test('checkTypeFidelity does not flag a real class correctly described as a class', () => {
   const t = typedDictTask({ promptContext: { files: [{ path: 'c.py', content: 'class RealClass:\n    pass' }] } });
   assert.deepEqual(checkTypeFidelity(t, 'The `RealClass` class converts inputs.'), []);
@@ -292,6 +312,23 @@ test('checkTypeFidelity does not flag a function correctly described as a functi
 test('checkTypeFidelity does not flag a symbol whose window contains BOTH words (draft is accurate)', () => {
   const r = checkTypeFidelity(typedDictTask(), '`MyConfig` is a class in the typing sense -- specifically a TypedDict.');
   assert.deepEqual(r, []);
+});
+
+test('detectClaimedKind: class-like before function resolves to function', () => {
+  assert.equal(detectClaimedKind('parse', 'the `parse` class-like function'), 'function');
+});
+
+test('detectClaimedKind: class-like with no other kind word still resolves to class', () => {
+  assert.equal(detectClaimedKind('Parser', 'the `Parser` class-like wrapper'), 'class');
+});
+
+test('detectClaimedKind: TypedDict still wins over class', () => {
+  assert.equal(detectClaimedKind('Config', 'the `Config` TypedDict class'), 'TypedDict');
+});
+
+test('detectClaimedKind: plain class and plain function are unchanged', () => {
+  assert.equal(detectClaimedKind('Parser', 'the `Parser` class'), 'class');
+  assert.equal(detectClaimedKind('parse', 'the `parse` function'), 'function');
 });
 
 test('checkTypeFidelity does not flag a bare citation with no kind word nearby', () => {

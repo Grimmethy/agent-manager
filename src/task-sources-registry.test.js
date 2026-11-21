@@ -21,7 +21,7 @@ const FROZEN = [
   ["product_spec_section", 13, null, "function", "undefined", "candidateDocTitle,candidateFulfillment,candidatesPath,harnessSearch,name,next,priority"],
   ["product_spec_outline", 14, null, "function", "function", "apply,emptyApproval,harnessSearch,name,next,priority"],
   ["product_spec", 15, null, "function", "undefined", "name,next,priority"],
-  ["backlog_fulfillment", 16, null, "function", "undefined", "candidateDocTitle,candidateFulfillment,candidatesPath,emptyApproval,name,next,priority"],
+  ["backlog_fulfillment", 16, null, "function", "undefined", "candidateDocTitle,candidateFulfillment,candidatesPath,name,next,priority"],
   ["backlog_decomposition", 17, null, "function", "function", "apply,name,next,priority"],
   ["trouble_log", 20, null, "function", "undefined", "name,next,priority"],
   ["secondbrain", 40, null, "function", "undefined", "name,next,priority"],
@@ -51,6 +51,13 @@ function snapshot() {
 test('the registry holds the same sources in the same order with the same priority, scope, next/apply kinds and config keys', () => {
   const frozen = FROZEN.map(([name, def, scope, next, apply, keys]) => [name, taskPriority(name, def), scope, next, apply, keys]);
   assert.deepEqual(snapshot(), frozen);
+});
+
+test('backlog_fulfillment does not auto-approve an empty draft (no emptyApproval flag)', () => {
+  const src = getRegisteredSources().find((c) => c.name === 'backlog_fulfillment');
+  assert.ok(src, 'backlog_fulfillment is registered');
+  assert.equal(src.emptyApproval, undefined);
+  assert.equal(src.candidateFulfillment, true);
 });
 
 test('the registry has exactly the 26 frozen source names, each once', () => {
