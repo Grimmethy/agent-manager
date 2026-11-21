@@ -57,6 +57,48 @@ const MAX_FULL_ATTEMPTS = 6;
 // Cap on how many fact-check warnings a single attempt record keeps (the full list
 // also lives on task.preFilterFlags for the live pass -- this is the durable copy).
 const FACTCHECK_WARNING_CAP = 30;
+// Cap on grep hits and read-file entries kept in a plan-grounding record (buildPlanGrounding below).
+const GROUNDING_ENTRY_CAP = 25;
+
+// Pure parser: pulls 'file.ext:line' hits and the 'Files already read:' list out of the
+// investigation text. Returns { grepHits: [{file, line}], readFiles: [{path}] }, or null when
+// neither list has an entry. Never throws for non-string input; it returns null instead.
+function buildPlanGrounding(investigationText) {
+  if (typeof investigationText !== 'string' || !investigationText) return null;
+  const grepHits = [];
+  const seenHits = new Set();
+  const hitRe = /([\w./-]+\.[A-Za-z0-9]+):(\d+)/g;
+  let m;
+  while ((m = hitRe.exec(investigationText)) !== null && grepHits.length < GROUNDING_ENTRY_CAP) {
+    const key = `${m[1]}:${m[2]}`;
+    if (seenHits.has(key)) continue;
+    seenHits.add(key);
+    grepHits.push({ file: m[1], line: Number(m[2]) });
+  }
+  const readFiles = [];
+  const seenReads = new Set();
+  const readLine = investigationText.split('\n').find((l) => /^\s*Files already read:/i.test(l));
+  if (readLine) {
+    const rest = readLine.replace(/^\s*Files already read:/i, '');
+    for (const raw of rest.split(',')) {
+      if (readFiles.length >= GROUNDING_ENTRY_CAP) break;
+      const p = raw.trim().replace(/^`+|`+$/g, '').trim();
+      if (!p || seenReads.has(p)) continue;
+      seenReads.add(p);
+      readFiles.push({ path: p });
+    }
+  }
+  if (grepHits.length === 0 && readFiles.length === 0) return null;
+  return { grepHits, readFiles };
+}
+
+// Stamps attempt._planGrounding from the investigation text. Never throws.
+function recordPlanGrounding(attempt, text) {
+  try {
+    if (!attempt || typeof attempt !== 'object') return;
+    attempt._planGrounding = buildPlanGrounding(text);
+  } catch { /* never throws */ }
+}
 
 function cap(text, max) {
   const s = typeof text === 'string' ? text : String(text == null ? '' : text);
@@ -176,7 +218,10 @@ function recordPlan(attempt, info = {}) {
   }
   if (info.attempts != null) plan.attempts = info.attempts;
   if (info.reRolled) plan.reRolled = true;
-  if (info.seededFromPrior) plan.seededFromPrior = true;
+  if (info.seededFromPrior) {
+    plan.seededFromPrior = true;
+    recordPlanGrounding(attempt, info.investigationText);
+  }
   if (info.thin) plan.thin = true;
   if (info.grounded) {
     plan.grounded = true;
@@ -383,4 +428,6 @@ module.exports = {
   RESPONSE_TEXT_CAP,
   DIFF_TEXT_CAP,
   MAX_FULL_ATTEMPTS,
+  buildPlanGrounding,
+  recordPlanGrounding,
 };
