@@ -43,12 +43,16 @@ function buildTriggersMemoryHtml(body, days) {
     `<tr><td>${triggersEsc(o.label)}</td><td>${triggersEsc(o.episodes)}</td><td>${triggersBar(o.share)} ${Math.round(o.share * 100)}%</td><td>${triggersEsc(o.avg_rss_mb)}</td><td>${triggersEsc(o.max_rss_mb)}</td></tr>`));
   const byDay = triggersTable(['Day (UTC)', 'Episodes', 'Paused', 'Peak'], (s.by_day || []).slice().reverse().map((d) =>
     `<tr><td>${triggersEsc(d.day)}</td><td>${triggersEsc(d.episodes)}</td><td>${triggersBar(d.paused_s / 86400)} ${triggersDuration(d.paused_s)}</td><td>${triggersLevelBadge(d.peak_level)}</td></tr>`));
+  const dayOffenders = Array.isArray(s.offenders_by_day) ? `<h3>By day: top offenders</h3>${triggersTable(['Day (UTC)', 'Episodes', 'Top three: process share avg'], s.offenders_by_day.slice().sort((a, b) => String(b.date).localeCompare(String(a.date))).map((d) => {
+    const top = (d.offenders || []).slice(0, 3).map((o) => `${triggersEsc(o.label)} ${Math.round(o.share * 100)}% ${triggersEsc(o.avg_mb)} MB`).join(', ');
+    return `<tr><td>${triggersEsc(d.date)}</td><td>${triggersEsc(d.episodes)}</td><td>${top || 'no process data'}</td></tr>`;
+  }))}` : '';
   const reasons = triggersTable(['Why it triggered', 'Count'], (s.reasons || []).map((r) => `<tr><td>${triggersEsc(r.reason)}</td><td>${triggersEsc(r.count)}</td></tr>`));
   const recent = triggersTable(['Started', 'Length', 'Level', 'Lowest available', 'Reason', 'Biggest at the time'], (b.episodes || []).slice(0, 25).map((e) =>
     `<tr><td>${triggersEsc(e.start)}</td><td>${triggersDuration(e.pause_s)}</td><td>${triggersLevelBadge(e.level)}</td><td>${e.min_available_mb == null ? '-' : triggersEsc(e.min_available_mb) + ' MB'}</td><td>${triggersEsc(e.reason)}</td>` +
     `<td>${(e.top || []).slice(0, 3).map((p) => triggersEsc(p.label) + ' ' + triggersEsc(p.rss_mb) + ' MB').join(', ')}</td></tr>`));
   return head + `<div style="display:flex;flex-wrap:wrap;gap:10px">${cards}</div>`
-    + `<h3>What was biggest when pressure hit</h3><div class="meta" style="margin-bottom:6px">The five largest processes at the moment each episode opened: what to optimise.</div>${offenders}`
+    + `<h3>What was biggest when pressure hit</h3><div class="meta" style="margin-bottom:6px">The five largest processes at the moment each episode opened: what to optimise.</div>${offenders}${dayOffenders}`
     + `<h3>By day</h3>${byDay}<h3>Why it triggered</h3>${reasons}<h3>Recent episodes</h3>${recent}`;
 }
 
