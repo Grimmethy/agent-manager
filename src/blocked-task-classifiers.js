@@ -138,6 +138,31 @@ function buildFabricatedFilePathQuestion(task) {
   ].join('\n');
 }
 
+// Pure helper: derive a stable change-detection key from the structured list of
+// fabricated paths (task.fabricatedFilePaths). Used to decide whether the resolution
+// step has already run (stored fingerprint matches a fresh recomputation) or is still
+// due (missing or drifted). Deliberately non-cryptographic -- this is a diff key, not
+// a security primitive.
+function computeFabricatedFilePathsFingerprint(task) {
+  const paths = Array.isArray(task && task.fabricatedFilePaths) ? task.fabricatedFilePaths : [];
+  if (paths.length === 0) return '';
+  return JSON.stringify([...paths].sort());
+}
+
+// Returns true only when a redraft/archive step is still due for this fabricated-path
+// block. Pending when:
+//   - No stored fingerprint (resolution has never run), OR
+//   - A fresh fingerprint was supplied and it differs from the stored one (drift).
+// Returns false (terminal) when a stored fingerprint is present and matches the fresh
+// value -- the resolution step has already run against this exact set of paths.
+function isFabricatedPathPending(task, freshFingerprint) {
+  const stored = task && task.groundingFingerprint;
+  if (!stored) return true; // missing fingerprint -> resolution still due
+  const fresh = freshFingerprint || '';
+  if (!fresh) return false; // no fresh value supplied -> assume terminal (no drift detected)
+  return stored !== fresh;
+}
+
 // candidate-path-grounding.js's checkCitedSymbols -- the same deterministic-fabrication
 // reasoning as hasFabricatedFilePath above, one level down: the Files: line resolved to a
 // real file, but the write-up's prose cites a specific symbol that grep confirms is not
@@ -334,9 +359,25 @@ const CLASSIFIERS = [
     // the "fabricated file path" reason also contains "ungrounded"/"fabricat", which the
     // retryable `fabricated-ungrounded-claim` keyword classifier would otherwise shadow it
     // with. See hasFabricatedFilePath's comment.
+    //
+    // Pending vs terminal: a fabricated-path block is "pending automatic resolution"
+    // while a redraft/archive step is still due (no stored fingerprint, or the stored
+    // fingerprint differs from a fresh recomputation of task.fabricatedFilePaths). Once
+    // the resolution step has run and the fingerprint matches, the task is terminal and
+    // reads as needing a human.
     name: 'fabricated-file-path',
     classify(task) {
       if (hasFabricatedFilePath(task)) {
+        const freshFingerprint = computeFabricatedFilePathsFingerprint(task);
+        if (isFabricatedPathPending(task, freshFingerprint)) {
+          return {
+            category: 'fabricated-file-path',
+            faultSide: 'model',
+            retryable: false,
+            resolution: 'pending',
+            pendingReason: task.groundingFingerprint ? 'fingerprint-drift' : 'missing-fingerprint',
+          };
+        }
         return { category: 'fabricated-file-path', faultSide: 'model', retryable: false };
       }
       return null;
@@ -432,6 +473,8 @@ module.exports = {
   hasFabricatedFilePath,
   hasFabricatedSymbolCitation,
   hasNoContextFiles,
+  computeFabricatedFilePathsFingerprint,
+  isFabricatedPathPending,
   isInfraError,
   signatureForTask,
   findClassifier,

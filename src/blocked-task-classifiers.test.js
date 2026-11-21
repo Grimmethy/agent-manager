@@ -46,8 +46,12 @@ test('findClassifier("invalid-premise") has a buildQuestion that quotes the bloc
   assert.match(question, /the AC-13a gate was never built/);
 });
 
-test('classifyBlockedTask recognizes a "fabricated file path(s)" grounding block as model-side, NON-retryable', () => {
-  const task = { blockedReason: 'Ungrounded draft: fabricated file path(s): src/agent-manager/task-queue.js -- not present anywhere in the target repo. A redraft cannot make an invented path real; re-file with an accurate citation, or archive if nothing applies.' };
+test('classifyBlockedTask recognizes a "fabricated file path(s)" grounding block as model-side, NON-retryable (terminal -- fingerprint matches)', () => {
+  const task = {
+    blockedReason: 'Ungrounded draft: fabricated file path(s): src/agent-manager/task-queue.js -- not present anywhere in the target repo. A redraft cannot make an invented path real; re-file with an accurate citation, or archive if nothing applies.',
+    fabricatedFilePaths: ['src/agent-manager/task-queue.js'],
+    groundingFingerprint: JSON.stringify(['src/agent-manager/task-queue.js']),
+  };
   const result = classifyBlockedTask(task);
   assert.deepEqual(result, { category: 'fabricated-file-path', faultSide: 'model', retryable: false, classifierName: 'fabricated-file-path' });
 });
@@ -75,6 +79,80 @@ test('findClassifier("fabricated-file-path").buildQuestion names the paths and s
   assert.match(q, /src\/agent-manager\/task-queue\.js/);
   assert.match(q, /blind redraft cannot fix this/i);
   assert.match(q, /Archive/);
+});
+
+test('computeFabricatedFilePathsFingerprint: same paths -> same fingerprint; different paths -> different; empty -> empty string', () => {
+  const { computeFabricatedFilePathsFingerprint } = require('./blocked-task-classifiers.js');
+  const a = computeFabricatedFilePathsFingerprint({ fabricatedFilePaths: ['src/a.js', 'src/b.js'] });
+  const b = computeFabricatedFilePathsFingerprint({ fabricatedFilePaths: ['src/b.js', 'src/a.js'] });
+  const c = computeFabricatedFilePathsFingerprint({ fabricatedFilePaths: ['src/a.js', 'src/c.js'] });
+  const d = computeFabricatedFilePathsFingerprint({ fabricatedFilePaths: [] });
+  const e = computeFabricatedFilePathsFingerprint({});
+  assert.equal(a, b, 'same paths in different order -> same fingerprint');
+  assert.notEqual(a, c, 'different paths -> different fingerprint');
+  assert.equal(d, '', 'empty array -> empty string');
+  assert.equal(e, '', 'missing field -> empty string');
+});
+
+test('isFabricatedPathPending: missing fingerprint -> pending; matching -> terminal; drifted -> pending; no fresh -> terminal', () => {
+  const { isFabricatedPathPending } = require('./blocked-task-classifiers.js');
+  assert.equal(isFabricatedPathPending({}, 'abc'), true, 'no stored fingerprint -> pending');
+  assert.equal(isFabricatedPathPending({ groundingFingerprint: null }, 'abc'), true, 'null stored -> pending');
+  assert.equal(isFabricatedPathPending({ groundingFingerprint: '' }, 'abc'), true, 'empty stored -> pending');
+  assert.equal(isFabricatedPathPending({ groundingFingerprint: 'abc' }, 'abc'), false, 'matching -> terminal');
+  assert.equal(isFabricatedPathPending({ groundingFingerprint: 'abc' }, 'xyz'), true, 'drifted -> pending');
+  assert.equal(isFabricatedPathPending({ groundingFingerprint: 'abc' }, undefined), false, 'no fresh value -> terminal');
+  assert.equal(isFabricatedPathPending({ groundingFingerprint: 'abc' }, ''), false, 'empty fresh -> terminal');
+});
+
+test('classifyBlockedTask: fabricated path with missing fingerprint reports pending', () => {
+  const result = classifyBlockedTask({
+    blockedReason: 'Ungrounded draft: fabricated file path(s): src/x.js',
+    fabricatedFilePaths: ['src/x.js'],
+  });
+  assert.equal(result.category, 'fabricated-file-path');
+  assert.equal(result.resolution, 'pending');
+  assert.equal(result.pendingReason, 'missing-fingerprint');
+  assert.equal(result.faultSide, 'model');
+  assert.equal(result.retryable, false);
+  assert.equal(result.classifierName, 'fabricated-file-path');
+});
+
+test('classifyBlockedTask: fabricated path with drifting fingerprint reports pending', () => {
+  const result = classifyBlockedTask({
+    blockedReason: 'Ungrounded draft: fabricated file path(s): src/x.js',
+    fabricatedFilePaths: ['src/x.js'],
+    groundingFingerprint: JSON.stringify(['src/other.js']),
+  });
+  assert.equal(result.category, 'fabricated-file-path');
+  assert.equal(result.resolution, 'pending');
+  assert.equal(result.pendingReason, 'fingerprint-drift');
+});
+
+test('classifyBlockedTask: fabricated path with matching fingerprint reports terminal (no resolution field)', () => {
+  const fingerprint = JSON.stringify(['src/x.js']);
+  const result = classifyBlockedTask({
+    blockedReason: 'Ungrounded draft: fabricated file path(s): src/x.js',
+    fabricatedFilePaths: ['src/x.js'],
+    groundingFingerprint: fingerprint,
+  });
+  assert.equal(result.category, 'fabricated-file-path');
+  assert.equal(result.resolution, undefined, 'terminal has no resolution field');
+  assert.equal(result.pendingReason, undefined, 'terminal has no pendingReason field');
+  assert.equal(result.faultSide, 'model');
+  assert.equal(result.retryable, false);
+  assert.equal(result.classifierName, 'fabricated-file-path');
+});
+
+test('classifyBlockedTask: non-matching prefix returns no resolution field, unchanged', () => {
+  const result = classifyBlockedTask({
+    blockedReason: 'Ungrounded draft: fabricated symbol citation(s): `ghostFn`',
+    fabricatedFilePaths: ['src/x.js'],
+    groundingFingerprint: 'abc',
+  });
+  assert.equal(result.category, 'fabricated-symbol-citation');
+  assert.equal(result.resolution, undefined);
+  assert.equal(result.classifierName, 'fabricated-symbol-citation');
 });
 
 test('classifyBlockedTask recognizes a "fabricated symbol citation(s)" grounding block as model-side, NON-retryable', () => {
