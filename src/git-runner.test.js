@@ -196,17 +196,45 @@ test('gated default: pushMain refuses outright', () => {
 });
 
 
-test('resetToMain throws instead of discarding history when local and origin have genuinely diverged', () => {
-  const { bareDir, repoDir } = makeRepoWithOrigin();
-  const runner = createRealGitRunner(repoDir);
+// --- diverged recovery: rescue-then-align (HUB0767) ---------------------------------------
+// Every test below runs with a temp HOME + state dir and with fetch/http(s).request
+// replaced by throwing guards, so nothing here can ever reach 127.0.0.1:11434 (Ollama).
+function withIsolatedEnv(fn) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'git-runner-test-home-'));
+  const state = fs.mkdtempSync(path.join(os.tmpdir(), 'git-runner-test-state-'));
+  const keys = ['HOME', 'USERPROFILE', 'AGENT_MANAGER_STASH_BACKUP_DIR', 'AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH'];
+  const saved = {};
+  for (const k of keys) saved[k] = process.env[k];
+  const http = require('http');
+  const https = require('https');
+  const savedNet = { fetch: globalThis.fetch, h: http.request, hs: https.request };
+  const blocked = () => { throw new Error('network access is forbidden in git-runner tests'); };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  process.env.AGENT_MANAGER_STASH_BACKUP_DIR = path.join(state, 'stash-backup');
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  globalThis.fetch = blocked;
+  http.request = blocked;
+  https.request = blocked;
+  try {
+    return fn({ home, state });
+  } finally {
+    for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    globalThis.fetch = savedNet.fetch;
+    http.request = savedNet.h;
+    https.request = savedNet.hs;
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(state, { recursive: true, force: true });
+  }
+}
 
-  // Local commits a fix...
+// Local commits a fix while origin independently receives a different commit.
+function makeDivergedRepo() {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
   fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'local fix\n');
   git(['add', 'tracked.txt'], repoDir);
   git(['commit', '-m', 'local fix'], repoDir);
-
-  // ...while origin independently received a DIFFERENT commit in the meantime (e.g. a
-  // human pushed straight to GitHub) -- a genuine divergence, not a simple fast-forward.
+  const localCommit = git(['rev-parse', 'HEAD'], repoDir).trim();
   const otherClone = fs.mkdtempSync(path.join(os.tmpdir(), 'git-runner-test-other-clone-'));
   git(['clone', bareDir, otherClone]);
   git(['config', 'user.email', 'test@example.com'], otherClone);
@@ -214,12 +242,102 @@ test('resetToMain throws instead of discarding history when local and origin hav
   fs.writeFileSync(path.join(otherClone, 'tracked.txt'), 'someone else\'s change\n');
   git(['commit', '-am', 'a different change pushed independently'], otherClone);
   git(['push', 'origin', 'main'], otherClone);
+  return { bareDir, repoDir, localCommit };
+}
 
-  assert.throws(() => runner.resetToMain(), /diverged/);
+function rescueBranches(repoDir) {
+  return git(['branch', '--list', 'agent/rescued-main-*'], repoDir)
+    .split('\n').map(l => l.replace(/^[* +]+/, '').trim()).filter(Boolean);
+}
 
-  // Neither side got silently thrown away -- the local commit is still right there.
-  const log = git(['log', '--oneline', 'main'], repoDir);
-  assert.match(log, /local fix/);
+function quietly(fn) {
+  const orig = console.error;
+  console.error = () => {};
+  try { return fn(); } finally { console.error = orig; }
+}
+
+test('diverged: resetToMain rescues the local-only commit to a branch, then aligns main to origin/main', () => {
+  withIsolatedEnv(() => {
+    const { repoDir, localCommit } = makeDivergedRepo();
+    const runner = createRealGitRunner(repoDir);
+
+    assert.doesNotThrow(() => quietly(() => runner.resetToMain()));
+
+    const originMain = git(['rev-parse', 'origin/main'], repoDir).trim();
+    assert.equal(git(['rev-parse', 'main'], repoDir).trim(), originMain, 'local main equals origin/main');
+    const branches = rescueBranches(repoDir);
+    assert.equal(branches.length, 1, 'exactly one rescue branch');
+    assert.equal(git(['rev-parse', branches[0]], repoDir).trim(), localCommit);
+    assert.doesNotThrow(() => git(['merge-base', '--is-ancestor', localCommit, branches[0]], repoDir));
+    assert.equal(git(['rev-list', 'origin/main..main'], repoDir).trim(), '', 'nothing on main that origin lacks');
+    assert.equal(git(['stash', 'list'], repoDir).trim(), '');
+  });
+});
+
+test('diverged: when the rescue branch cannot be created, resetToMain throws and local main keeps the local commit', () => {
+  withIsolatedEnv(() => {
+    const { repoDir, localCommit } = makeDivergedRepo();
+    // Deterministic failure: the exec stub rejects rescue-branch creation (no clock reliance).
+    const failingExec = (cmd, args, opts) => {
+      if (cmd === 'git' && args[0] === 'branch' && String(args[1]).startsWith('agent/rescued-main-')) {
+        throw new Error('fatal: cannot lock ref (simulated ref conflict)');
+      }
+      return execFileSync(cmd, args, opts);
+    };
+    const runner = createRealGitRunner(repoDir, { exec: failingExec });
+
+    assert.throws(() => quietly(() => runner.resetToMain()), /diverged/);
+
+    assert.equal(git(['rev-parse', 'main'], repoDir).trim(), localCommit, 'main was not reset away');
+    assert.deepEqual(rescueBranches(repoDir), [], 'no rescue branch was created');
+  });
+});
+
+test('diverged: a rescue-branch name collision gets a unique suffix and nothing is overwritten', () => {
+  withIsolatedEnv(() => {
+    const { repoDir, localCommit } = makeDivergedRepo();
+    let collided = null;
+    // Deterministic collision: report the first candidate name as already existing.
+    const collidingExec = (cmd, args, opts) => {
+      if (cmd === 'git' && args[0] === 'rev-parse' && args.includes('--verify') &&
+          String(args[args.length - 1]).startsWith('refs/heads/agent/rescued-main-') && !collided) {
+        collided = String(args[args.length - 1]).replace('refs/heads/', '');
+        return '';
+      }
+      return execFileSync(cmd, args, opts);
+    };
+    const runner = createRealGitRunner(repoDir, { exec: collidingExec });
+
+    assert.doesNotThrow(() => quietly(() => runner.resetToMain()));
+
+    assert.ok(collided, 'collision path was exercised');
+    const branches = rescueBranches(repoDir);
+    assert.equal(branches.length, 1);
+    assert.notEqual(branches[0], collided);
+    assert.ok(branches[0].startsWith(`${collided}-`), 'suffix appended to the colliding name');
+    assert.equal(git(['rev-parse', branches[0]], repoDir).trim(), localCommit);
+    assert.equal(git(['rev-parse', 'main'], repoDir).trim(), git(['rev-parse', 'origin/main'], repoDir).trim());
+  });
+});
+
+test('ahead-only regression: a strictly-ahead local main is rescued (never pushed to origin main) and aligned', () => {
+  withIsolatedEnv(() => {
+    const { bareDir, repoDir } = makeRepoWithOrigin();
+    const originBefore = git(['rev-parse', 'main'], bareDir).trim();
+    fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v2 ahead only\n');
+    git(['commit', '-am', 'ahead-only local commit'], repoDir);
+    const localCommit = git(['rev-parse', 'HEAD'], repoDir).trim();
+    const runner = createRealGitRunner(repoDir);
+
+    assert.doesNotThrow(() => quietly(() => runner.resetToMain()));
+
+    assert.equal(git(['rev-parse', 'main'], bareDir).trim(), originBefore, 'origin main untouched');
+    assert.equal(git(['rev-parse', 'main'], repoDir).trim(), originBefore, 'local main aligned');
+    assert.equal(git(['rev-list', 'origin/main..main'], repoDir).trim(), '');
+    const branches = rescueBranches(repoDir);
+    assert.equal(branches.length, 1);
+    assert.equal(git(['rev-parse', branches[0]], repoDir).trim(), localCommit);
+  });
 });
 
 test('resetToMain fast-forwards when local is simply behind origin (an out-of-band push to master)', () => {
