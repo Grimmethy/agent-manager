@@ -53,7 +53,31 @@ def fold(entries):
         episodes.append(current)
     for ep in episodes:
         ep.pop("_start", None)
-    return {"episodes": episodes, "summary": _summary(episodes, entries)}
+    return {"episodes": episodes, "summary": _summary(episodes, entries), "offenders_by_day": _offenders_by_day(episodes)}
+
+
+def _offenders_by_day(episodes):
+    """Per day that has episodes, oldest first: the five largest offenders by average RSS, share = episodes in top / episodes that day."""
+    days = {}
+    for ep in episodes:
+        days.setdefault(ep["start"][:10], []).append(ep)
+    out = []
+    for day in sorted(days):
+        eps = days[day]
+        seen = {}
+        for ep in eps:
+            for label in {p["label"] for p in ep["top"]}:
+                sizes = [p.get("rss_mb") for p in ep["top"] if p["label"] == label and isinstance(p.get("rss_mb"), (int, float))]
+                rec = seen.setdefault(label, {"label": label, "episodes_in_top": 0, "_sizes": []})
+                rec["episodes_in_top"] += 1
+                rec["_sizes"].extend(sizes)
+        ranked = []
+        for rec in seen.values():
+            sizes = rec.pop("_sizes")
+            ranked.append(dict(rec, share=round(rec["episodes_in_top"] / len(eps), 3), avg_mb=round(sum(sizes) / len(sizes), 1) if sizes else 0, max_mb=max(sizes, default=0)))
+        ranked.sort(key=lambda o: (-o["avg_mb"], o["label"]))
+        out.append({"date": day, "episodes": len(eps), "offenders": ranked[:5]})
+    return out
 
 
 def _summary(episodes, entries):
