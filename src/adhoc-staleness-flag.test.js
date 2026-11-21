@@ -248,3 +248,84 @@ test('coordinating task with a fresh flag within TTL is not re-stamped', async (
   assert.equal(t.stalenessFlag.flaggedAt, flaggedAt, 'flaggedAt unchanged (fresh guard skipped re-stamp)');
   assert.equal((t.history || []).length, histLen, 'history length unchanged');
 });
+
+// --- same-hub sibling guard ------------------------------------------------------------
+// Siblings share one large paragraph (the hub contract) and differ only in a short unique
+// paragraph. Protected cases: different parent, and both parents missing, must NOT be suppressed.
+
+const SHARED_PARA = 'The shared contract requires the sweep to read every queued task file, classify each candidate by its deterministic evidence, stamp flags in place, and never move archive or delete any queue file while human review remains the only path to retirement for ambiguous work across every piece of the hub.';
+
+const noVote = async () => { throw new Error('majorityVote must not run in sibling tests'); };
+
+function siblingTask(id, promptExtra, uniqueText) {
+  return {
+    id, source: 'manual', domain: 'adhoc', status: 'needs-clarification',
+    title: 'sibling piece of the hub contract',
+    createdAt: new Date().toISOString(),
+    promptContext: { rawText: `${SHARED_PARA}\n\n${uniqueText}`, ...promptExtra },
+  };
+}
+
+test('same-hub siblings with a large shared paragraph are suppressed and not retire-flagged', async () => {
+  const dir = tmpPipeline();
+  writeTask(dir, 'needs-clarification', siblingTask('adhoc-sib-a', { decomposedFrom: 'HUB0437' }, 'Piece one adds the banana ledger column.'));
+  writeTask(dir, 'needs-clarification', siblingTask('adhoc-sib-b', { decomposedFrom: 'HUB0437' }, 'Piece two wires the orange export button.'));
+  const s = await sweep({ pipelineDir: dir, repoRoot: null, majorityVote: noVote, now: Date.now() });
+  assert.equal(s.sameHubSuppressed, 1, 'the sibling pair is counted as one suppression');
+  for (const id of ['adhoc-sib-a', 'adhoc-sib-b']) {
+    const f = readTask(dir, 'needs-clarification', id).stalenessFlag;
+    assert.ok(!f || f.disposition !== 'retire', `${id} must not carry a retire flag`);
+  }
+});
+
+test('suppressed sibling pair writes exactly one advisory history event per task and counts one suppression', async () => {
+  const dir = tmpPipeline();
+  writeTask(dir, 'needs-clarification', siblingTask('adhoc-hist-a', { decomposedFrom: 'HUB0437' }, 'Piece one adds the cherry ledger column.'));
+  writeTask(dir, 'needs-clarification', siblingTask('adhoc-hist-b', { decomposedFrom: 'HUB0437' }, 'Piece two wires the lemon export button.'));
+  const s = await sweep({ pipelineDir: dir, repoRoot: null, majorityVote: noVote, now: Date.now() });
+  assert.equal(s.sameHubSuppressed, 1, 'one pair, one suppression');
+  for (const id of ['adhoc-hist-a', 'adhoc-hist-b']) {
+    const adv = (readTask(dir, 'needs-clarification', id).history || [])
+      .filter((h) => h && h.stage === 'advisory' && String(h.detail).startsWith('duplicate-of suppressed'));
+    assert.equal(adv.length, 1, `${id} gets exactly one suppression advisory event`);
+  }
+});
+
+test('protected: a duplicate of a done task from a different parent is still retire/high', async () => {
+  const dir = tmpPipeline();
+  const text = 'wire the plugin marketplace catalog panel with search filters and pagination';
+  writeTask(dir, 'needs-clarification', exhaustedTask('adhoc-xp-a', { title: text, promptContext: { rawText: text, decomposedFrom: 'HUB0100' } }));
+  writeTask(dir, 'done', { id: 'adhoc-xp-b', title: text, status: 'merged', createdAt: new Date().toISOString(), promptContext: { rawText: text, decomposedFrom: 'HUB0200' } });
+  const s = await sweep({ pipelineDir: dir, repoRoot: null, majorityVote: noVote, now: Date.now() });
+  const t = readTask(dir, 'needs-clarification', 'adhoc-xp-a');
+  assert.equal(t.stalenessFlag.disposition, 'retire');
+  assert.equal(t.stalenessFlag.confidence, 'high');
+  assert.equal(s.sameHubSuppressed, 0, 'different parents are never suppressed');
+});
+
+test('protected: two tasks with both parent fields missing are not siblings and are still evaluated', async () => {
+  const dir = tmpPipeline();
+  const text = 'add the orchard harvest report page with weekly totals';
+  const mk = (id) => ({ id, source: 'manual', domain: 'adhoc', status: 'needs-clarification', title: text, createdAt: new Date().toISOString(), promptContext: { rawText: text } });
+  writeTask(dir, 'needs-clarification', mk('adhoc-np-a'));
+  writeTask(dir, 'needs-clarification', mk('adhoc-np-b'));
+  const s = await sweep({ pipelineDir: dir, repoRoot: null, majorityVote: noVote, now: Date.now() });
+  assert.equal(s.sameHubSuppressed, 0, 'undefined parent fields never match');
+  const f = readTask(dir, 'needs-clarification', 'adhoc-np-a').stalenessFlag;
+  assert.ok(f, 'still evaluated and flagged');
+  assert.equal(f.reason, 'duplicate-of');
+});
+
+test('protected: unrelated tasks with no shared parent and the same overlap are still flagged', async () => {
+  const dir = tmpPipeline();
+  const text = 'add the vineyard irrigation schedule editor with per-block timers';
+  writeTask(dir, 'needs-clarification', { id: 'adhoc-ur-a', source: 'manual', domain: 'adhoc', status: 'needs-clarification', title: text, createdAt: new Date().toISOString(), promptContext: { rawText: text } });
+  writeTask(dir, 'needs-clarification', { id: 'adhoc-ur-b', source: 'manual', domain: 'adhoc', status: 'needs-clarification', title: text, createdAt: new Date().toISOString(), promptContext: { rawText: text } });
+  const s = await sweep({ pipelineDir: dir, repoRoot: null, majorityVote: noVote, now: Date.now() });
+  assert.equal(s.sameHubSuppressed, 0, 'unrelated tasks are never suppressed');
+  for (const id of ['adhoc-ur-a', 'adhoc-ur-b']) {
+    const f = readTask(dir, 'needs-clarification', id).stalenessFlag;
+    assert.ok(f, `${id} still flagged`);
+    assert.equal(f.reason, 'duplicate-of');
+  }
+});

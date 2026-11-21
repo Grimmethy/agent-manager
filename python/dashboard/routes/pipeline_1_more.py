@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import json
-import subprocess, drain_registry   # drain_registry: the detached plugin drains (python/dashboard/drain_registry.py); edits here stay line-neutral, the functions below are size-ratcheted
+import subprocess, drain_registry, stale_branch_lookup   # drain_registry: the detached plugin drains (python/dashboard/drain_registry.py); edits here stay line-neutral, the functions below are size-ratcheted
 
 # The app.py helpers these views call (ENV_FILE_PATH, _COMMIT_LOG_FIELD_SEP, _COMMIT_LOG_RECORD_SEP, _TASK_TRAILER_RE, _acquire_apply_lock, _archive_task_file, _find_task_log_anywhere, _find_task_record_anywhere, _invalidate_branch_cache, _pipeline_running, _pipeline_stoppable, _release_apply_lock, _run_git, _start_pipeline, _stop_pipeline, _summarize_task_record, _sync_live_checkout, get_active_repo_root, get_hub_data_provider, get_pipeline_dir, list_unmerged_branches, logger, queue_dir, read_env_file, read_json_safe) are
 # imported lazily inside each view: app.py imports THIS module to register the
@@ -332,6 +332,24 @@ def api_git_merge_held_hub_branch_early(branch):
         _release_apply_lock(lock_fd)
 
 
+def _registered_projects_payload():
+    """Read-only list of projects.json entries for the browser: {label, repoRoot, realRoot?}.
+    Re-reads the registry on every call (no cache). pipelineDir/domainsPath are not exposed."""
+    from app import read_project_registry
+    out = []
+    for e in read_project_registry() or []:
+        root = e.get("repoRoot") if isinstance(e, dict) else None
+        if not isinstance(root, str) or not root.strip():
+            continue
+        item = {"label": e.get("label") or os.path.basename(root.rstrip("/\\")) or root, "repoRoot": root}
+        try:
+            item["realRoot"] = os.path.realpath(root)
+        except (OSError, ValueError):
+            pass
+        out.append(item)
+    return out
+
+
 @pipeline_1_more_bp.route("/api/pipeline/status")
 def api_pipeline_status():
     from app import ENV_FILE_PATH, _pipeline_running, _pipeline_stoppable, get_active_repo_root, read_env_file
@@ -339,7 +357,7 @@ def api_pipeline_status():
     running = _pipeline_running()
     return jsonify({
         "activeRepoRoot": get_active_repo_root(),
-        "running": running, "drains": drain_registry.running_drains(),
+        "running": running, "drains": drain_registry.running_drains(), "registeredProjects": _registered_projects_payload(),
         # "stoppable" is looser than "running": true whenever a real daemon process
         # exists, even if every heartbeat says otherwise. The frontend gates its Stop
         # control on (running || stoppable) so a wrong "running" can never hide the only
@@ -422,6 +440,40 @@ def api_git_unmerged_branches():
     resp.headers["Cache-Control"] = "no-cache"
     resp.set_etag(hashlib.sha256(resp.get_data() + b"\0" + resp.headers["X-Branch-Projects-Pending"].encode() + b"\0" + resp.headers["X-Branch-Refreshing"].encode()).hexdigest())
     return resp.make_conditional(request)
+
+
+@pipeline_1_more_bp.route("/api/git/stale-branch-candidates")
+def api_git_stale_branch_candidates():
+    """Read-only: unmerged branches far behind main that no live owner covers (see branch_staleness.py).
+    Rows come from the same cached list the unmerged-branches route serves (already verdict-enriched) plus
+    the other registered projects. This view performs no writes."""
+    import json
+    import branch_projects
+    import branch_staleness
+    from app import _find_task_record_anywhere, get_active_repo_root, get_pipeline_dir, list_unmerged_branches
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+    qdir = Path(get_pipeline_dir()) / "queue"
+    branches = list_unmerged_branches(force=False, stale_ok=True)
+    branches, _pending = branch_projects.combined_branches(branches, repo_root)
+
+    def find_by_id(task_id):
+        data, _state = _find_task_record_anywhere(qdir, task_id)
+        return data
+
+    def find_by_sha(head_sha):
+        for f in sorted((qdir / "done").glob("*.json")):
+            try:
+                data = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("headSha") == head_sha:
+                return data
+        return None
+
+    threshold = branch_staleness.stale_threshold(os.environ)
+    return jsonify(branch_staleness.stale_candidates(branches, threshold, find_by_id, find_by_sha))
 
 
 @pipeline_1_more_bp.route("/api/git/held-hub-branches")
@@ -846,7 +898,7 @@ def _git_busy_response(step, exc, changed):
 
 @pipeline_1_more_bp.route("/api/git/branches/<path:branch>/merge", methods=["POST"])
 def api_git_merge_branch(branch):
-    from app import get_active_repo_root
+    from app import get_active_repo_root, logger
     repo_root = get_active_repo_root()
     if not repo_root:
         abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
@@ -862,8 +914,11 @@ def api_git_merge_branch(branch):
     if scope:
         repo_root = scope["repoPath"]
 
+    _t_start = time.monotonic()
     try:
+        _t_validate = time.monotonic()
         context = _validate_and_authorize_merge(repo_root, branch, force, scope)
+        validateS = round(time.monotonic() - _t_validate, 1)
     except LookupError as e:
         abort(404, description=str(e))
     except PermissionError as e:
@@ -872,7 +927,9 @@ def api_git_merge_branch(branch):
         return _git_busy_response("checking the branch", e, changed=False)
 
     try:
+        _t_merge = time.monotonic()
         _execute_git_merge(context)
+        mergeS = round(time.monotonic() - _t_merge, 1)
     except MergeLockBusy:
         abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
     except subprocess.TimeoutExpired as e:
@@ -884,29 +941,61 @@ def api_git_merge_branch(branch):
     # failure becomes a warning, and the later steps still run (the task record must be stamped even when the live-checkout sync was too slow).
     warnings = []
     qdir = scope["qdir"] if scope else None
-    live_sync = _guarded_post_merge_step("syncing the dashboard checkout", warnings, lambda: _apply_post_merge_side_effects(context))
+    try:
+        _t_livesync = time.monotonic()
+        live_sync = _guarded_post_merge_step("syncing the dashboard checkout", warnings, lambda: _apply_post_merge_side_effects(context))
+        liveSyncS = round(time.monotonic() - _t_livesync, 1)
+    except Exception:
+        liveSyncS = 0.0
     if live_sync is None:
         live_sync = {"synced": False, "reason": warnings[-1]}
-    _guarded_post_merge_step("stamping the task record", warnings, lambda: _record_merge_in_task_file(branch, context["main_branch"], qdir))
-    _guarded_post_merge_step("closing the task log", warnings, lambda: _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir))
+    try:
+        _t_stamp = time.monotonic()
+        _guarded_post_merge_step("stamping the task record", warnings, lambda: _record_merge_in_task_file(branch, context["main_branch"], qdir))
+        stampS = round(time.monotonic() - _t_stamp, 1)
+    except Exception:
+        stampS = 0.0
+    try:
+        _t_tasklog = time.monotonic()
+        _guarded_post_merge_step("closing the task log", warnings, lambda: _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir))
+        taskLogS = round(time.monotonic() - _t_tasklog, 1)
+    except Exception:
+        taskLogS = 0.0
 
     # Check which plugins are behind after merge (if the merged repo is a plugin's repo).
     # Mirrors the pattern in routes/plugins.py: iterate manifest, call behind_checkout,
     # set restartNeeded field on each plugin entry.
     restart_needed = []
+    pluginsBehindS = 0.0
+    pluginsChecked = 0
     try:
+        _t_plugins = time.monotonic()
         from app import _read_plugins_manifest
         import plugin_process_manager
         manifest = _read_plugins_manifest()
         pm = plugin_process_manager.PluginProcessManager()
         for p in manifest:
             if p.get("slot") or p.get("processName"):
+                pluginsChecked += 1
                 behind_info = pm.behind_checkout(p)
                 p["restartNeeded"] = bool(behind_info.get("behind"))
                 if behind_info.get("behind"):
                     restart_needed.append(p.get("name") or p.get("slot") or str(p))
+        pluginsBehindS = round(time.monotonic() - _t_plugins, 1)
     except Exception:
         logger.warning("Non-fatal: could not check plugin behind-status after merge", exc_info=True)
+
+    totalS = round(time.monotonic() - _t_start, 1)
+
+    try:
+        logger.info(
+            f"merge timings branch={branch} total={totalS} "
+            f"validate={validateS} merge={mergeS} "
+            f"liveSync={liveSyncS} stamp={stampS} "
+            f"taskLog={taskLogS} plugins={pluginsBehindS}({pluginsChecked})"
+        )
+    except Exception:
+        pass
 
     return jsonify({
         "succeeded": True,
@@ -915,6 +1004,16 @@ def api_git_merge_branch(branch):
         "liveSync": live_sync,
         "warnings": warnings,
         "restartNeeded": restart_needed,
+        "timings": {
+            "validateS": validateS,
+            "mergeS": mergeS,
+            "liveSyncS": liveSyncS,
+            "stampS": stampS,
+            "taskLogS": taskLogS,
+            "pluginsBehindS": pluginsBehindS,
+            "pluginsChecked": pluginsChecked,
+            "totalS": totalS,
+        },
     })
 
 
@@ -953,7 +1052,7 @@ def api_git_discard_branch(branch):
     # Same "only act on what we ourselves already offered" gate api_git_merge_branch/
     # api_task_archive/api_task_requeue all already use (another project: ITS list, recomputed now).
     branches = branch_projects.refresh_branches(scope) if scope else list_unmerged_branches(force=True)
-    match = next((b for b in branches if b["branch"] == branch), None)
+    match = next((b for b in branches if b["branch"] == branch), None) or stale_branch_lookup.find_hidden_stale_branch(branch, repo_root)
     if not match:
         abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
 

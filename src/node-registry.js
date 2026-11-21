@@ -7,6 +7,14 @@
 //                      freeRamGb, paused}; written atomically.
 //   nodes-tokens.json  a map id -> token string, mode 600. A token is created when a node is registered and printed ONCE; it is never part of a node record.
 //
+// behindSince (node code sync, piece 5a): the heartbeat time at which a node's codeSha first differed from the sha wok published for agent-manager
+// (latest.json in AGENT_MANAGER_CODE_PUBLISH_DIR, default <AGENT_MANAGER_PIPELINE_DIR>/code-publish). Set on the first mismatch, kept while it lasts,
+// deleted when the shas match, left alone when either sha is unknown. Stored with the record, so a registry restart keeps the clock.
+//
+// behindTooLong / markBehindNotified (node code sync, piece 5b): a heartbeat whose behindSince is older than AGENT_MANAGER_NODE_BEHIND_MIN minutes (default 30)
+// earns ONE summary notice per episode (src/node-registry-server.js); behindNotified on the record holds the stamp already noticed, so the same episode is not
+// announced again, and it is what a later recovery notice checks. Neither runs on a timer: the heartbeat is the trigger.
+//
 // A heartbeat (recordHeartbeat) refreshes lastSeen and the reported state. The status of a node is computed, never stored:
 //   stale   no heartbeat for AGENT_MANAGER_NODE_STALE_MIN minutes (default 5), or never one
 //   off     the node reported state "off" (an operator turned it off on purpose)
@@ -26,6 +34,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { writeJsonAtomicSync } = require('./atomic-write.js');
 const { notify } = require('./notify.js');
+const { readPublished } = require('./node-code-publish.js');
 
 const NODE_ID_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 const HEARTBEAT_STATES = ['up', 'off'];
@@ -121,7 +130,21 @@ function numberOrNull(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-// Records a heartbeat for a registered node and returns its record. Throws on an unknown node, an unusable state or a non-boolean paused.
+// A node's code version: the HEAD sha of its checkout, exactly 40 lowercase hex characters, otherwise null (never throws).
+function codeShaOrNull(v) {
+  return typeof v === 'string' && /^[0-9a-f]{40}$/.test(v) ? v : null;
+}
+
+// The sha wok published for agent-manager, or null when nothing usable is published (never throws).
+function publishedSha(env) {
+  const dir = String(env.AGENT_MANAGER_CODE_PUBLISH_DIR || '').trim()
+    || (String(env.AGENT_MANAGER_PIPELINE_DIR || '').trim() ? path.join(String(env.AGENT_MANAGER_PIPELINE_DIR).trim(), 'code-publish') : '');
+  if (!dir) return null;
+  const entry = readPublished(dir, 'agent-manager');
+  return entry && typeof entry.sha === 'string' ? codeShaOrNull(entry.sha) : null;
+}
+
+// Records a heartbeat for a registered node and returns its record plus previousBehindSince (the stamp before this heartbeat, or null; not stored). Throws on an unknown node, an unusable state or a non-boolean paused.
 function recordHeartbeat(payload = {}, env = process.env, now = Date.now()) {
   const nodes = loadNodes(env);
   const record = nodes[payload.id];
@@ -137,10 +160,38 @@ function recordHeartbeat(payload = {}, env = process.env, now = Date.now()) {
     load: numberOrNull(payload.load),
     freeRamGb: numberOrNull(payload.freeRamGb),
     paused: payload.paused === true,
+    codeSha: codeShaOrNull(payload.codeSha),
   };
+  const wokSha = publishedSha(env);
+  if (wokSha && updated.codeSha) {
+    if (updated.codeSha === wokSha) delete updated.behindSince;
+    else if (!updated.behindSince) updated.behindSince = updated.lastSeen;
+  }
   nodes[payload.id] = updated;
   saveNodes(nodes, env);
-  return updated;
+  return { ...updated, previousBehindSince: record.behindSince || null };
+}
+
+const DEFAULT_BEHIND_MIN = 30;
+
+// Whole minutes a node has been behind when its stamp is parsable and strictly older than N minutes, else null. N comes from AGENT_MANAGER_NODE_BEHIND_MIN (a bad or
+// non-positive value gives 30). Pure.
+function behindTooLong(behindSince, now, env = process.env) {
+  const since = Date.parse(behindSince);
+  if (typeof behindSince !== 'string' || !Number.isFinite(since) || !Number.isFinite(now)) return null;
+  const limit = Number(env && env.AGENT_MANAGER_NODE_BEHIND_MIN);
+  const minutes = Number.isFinite(limit) && limit > 0 ? limit : DEFAULT_BEHIND_MIN;
+  return now - since > minutes * 60000 ? Math.floor((now - since) / 60000) : null;
+}
+
+// Records (or, with null, clears) the behindSince stamp already noticed for a node. Returns true when the record was written.
+function markBehindNotified(id, stamp, env = process.env) {
+  const nodes = loadNodes(env);
+  if (!nodes[id]) return false;
+  if (stamp === null) delete nodes[id].behindNotified;
+  else nodes[id].behindNotified = stamp;
+  saveNodes(nodes, env);
+  return true;
 }
 
 function statusOf(record, env = process.env, now = Date.now()) {
@@ -201,4 +252,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { nodesDir, staleMinutes, isValidNodeId, loadNodes, loadTokens, registerNode, verifyToken, recordHeartbeat, statusOf, listNodes, sweepStale, main };
+module.exports = { publishedSha, behindTooLong, markBehindNotified, nodesDir, staleMinutes, isValidNodeId, loadNodes, loadTokens, registerNode, verifyToken, recordHeartbeat, statusOf, listNodes, sweepStale, main };

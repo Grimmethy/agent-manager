@@ -212,9 +212,17 @@ process_drafting_file() {
     mv -n "$wpath" "${QUEUE_DIR}/blocked/${name}"
     printf '[worker-%s] blocked %s: %s\n' "$INSTANCE_ID" "$task_id" "$draft_result" >&2
   elif [[ "$draft_succeeded" == "true" && "$draft_needs_clarification" == "true" ]]; then
-    mkdir -p "${QUEUE_DIR}/needs-clarification" >/dev/null 2>&1
-    mv -n "$wpath" "${QUEUE_DIR}/needs-clarification/${name}"
-    printf '[worker-%s] %s needs a human decision -- moved to needs-clarification/\n' "$INSTANCE_ID" "$task_id" >&2
+    # A stop record (a question for a human, no diff) from a NODE worker goes to queue/node-outbox/ so src/node-package-send.js ships it to wok, which files it in its own
+    # queue/needs-clarification/ and ends the lease. A wok worker files it here, as before. The is-node check runs once, in this branch.
+    if node "${PACKAGE_SRC_DIR}/node-outbox.js" is-node; then
+      mkdir -p "${QUEUE_DIR}/node-outbox" >/dev/null 2>&1
+      mv -n "$wpath" "${QUEUE_DIR}/node-outbox/${name}"
+      printf '[worker-%s] %s stopped on a node with a question, ready to send to wok: %s\n' "$INSTANCE_ID" "$task_id" "$task_id" >&2
+    else
+      mkdir -p "${QUEUE_DIR}/needs-clarification" >/dev/null 2>&1
+      mv -n "$wpath" "${QUEUE_DIR}/needs-clarification/${name}"
+      printf '[worker-%s] %s needs a human decision -- moved to needs-clarification/\n' "$INSTANCE_ID" "$task_id" >&2
+    fi
   elif [[ "$draft_succeeded" == "true" && "$draft_recorded" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/done" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/done/${name}"
@@ -222,9 +230,23 @@ process_drafting_file() {
   elif [[ "$draft_succeeded" == "true" ]] && node "${PACKAGE_SRC_DIR}/node-outbox.js" is-node; then
     # Multi-node (piece 7b): a worker on a NODE (AGENT_MANAGER_NODE_ID set and not wok) stops after the draft. The drafted record waits in queue/node-outbox/ for
     # src/node-package-send.js to ship it to wok, whose own queue/review/ runs the ordinary review, apply, verifier and merge. A wok worker never takes this branch.
-    mkdir -p "${QUEUE_DIR}/node-outbox" >/dev/null 2>&1
-    mv -n "$wpath" "${QUEUE_DIR}/node-outbox/${name}"
-    printf '[worker-%s] draft complete on a node, ready to send to wok: %s\n' "$INSTANCE_ID" "$task_id" >&2
+    # Draft-present gate (HUB0574): only move a drafted record into node-outbox/ when it actually carries draft content. Otherwise leave it in the node's queue and log the reason.
+    draft_content_gap="$(node -e '
+      try {
+        const o = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+        const nonEmpty = (v) => (typeof v === "string" ? v.trim() !== "" : !!v);
+        const nc = o.needsClarification;
+        const ncReason = nc && typeof nc === "object" ? nc.reason : nc;
+        if (!(nonEmpty(o.implementResponse) || nonEmpty(o.rawDiff) || nonEmpty(o.adhocResolution) || nonEmpty(ncReason))) console.log("no implementResponse, rawDiff, adhocResolution or needsClarification reason on the record");
+      } catch (e) { console.log("record unreadable: " + e.message); }
+    ' "$wpath" 2>/dev/null)"
+    if [[ -n "$draft_content_gap" ]]; then
+      printf '[worker-%s] draft succeeded for %s but it is not ready to send to wok (%s) -- left in the node queue\n' "$INSTANCE_ID" "$task_id" "$draft_content_gap" >&2
+    else
+      mkdir -p "${QUEUE_DIR}/node-outbox" >/dev/null 2>&1
+      mv -n "$wpath" "${QUEUE_DIR}/node-outbox/${name}"
+      printf '[worker-%s] draft complete on a node, ready to send to wok: %s\n' "$INSTANCE_ID" "$task_id" >&2
+    fi
   elif [[ "$draft_succeeded" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/review" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/review/${name}"
@@ -242,6 +264,13 @@ process_drafting_file() {
     # top while the lease holds. Without this branch the failure counting below could permanently block a good task.
     # The pattern is the FORGE_PAUSE_MESSAGE text (pinned by src/local-client-forge-pause.test.js so the copies cannot drift).
     printf '[worker-%s] draft paused for a Forge GPU session -- not counted as a failure; %s stays in drafting/ and resumes when the lease clears\n' "$INSTANCE_ID" "$task_id" >&2
+    TICK_HAD_INFRA_FAILURE=true
+  elif quota_resume="$(printf '%s' "$draft_result" | node "${PACKAGE_SRC_DIR}/draft-quota.js" classify-and-defer "$wpath" 2>>"$LOG_FILE")"; [[ -n "$quota_resume" ]]; then
+    # Rate-limit / quota (HTTP 429: hourly token budget, five-hour plan limit) -- a TEMPORARY capacity condition, not a draft failure
+    # (src/draft-quota.js). classify-and-defer already wrote task.deferUntil; the item stays in drafting/ and the existing per-tick
+    # leftover-drafting pass skips it until then (no new timer or poll, ADR-0024). Deliberately NO draftFailureCount increment, NO
+    # infra-requeue round and NO block, so a quota window can never send the task to needs-clarification. This tick stops claiming.
+    printf '[worker-%s] draft deferred on a rate limit until %s -- not counted as a failure; %s stays in drafting/\n' "$INSTANCE_ID" "$quota_resume" "$task_id" >&2
     TICK_HAD_INFRA_FAILURE=true
   else
     # Draft call itself failed (e.g. Ollama unreachable, or a real generation call timing
@@ -416,6 +445,15 @@ process_drafting_file() {
         // process producing truly zero output is itself strong evidence of an external
         // kill/crash, not a content failure the model produced -- treated as infra-shaped
         // here for exactly that reason.
+        // Lane attribution (HUB0164 3/4): a failure is lane-attributable only when the module says so.
+        // Any load or parse error leaves laneAttributable false, so the bounded path behaves as before.
+        let laneAttributable = false;
+        let laneRecorder = null;
+        try {
+          const attrMod = require(process.argv[5]);
+          laneRecorder = attrMod.recordLaneFailure;
+          laneAttributable = attrMod.classifyInfraFailure({ failureText: draftResult, laneId: process.argv[6], primaryLaneId: process.argv[7] }).laneAttributable === true;
+        } catch (e) { laneAttributable = false; }
         const isInfra = INFRA_FAILURE_PATTERN.test(draftResult || "") || !(draftResult || "").trim();
         const infraRequeueCount = o.infraRequeueCount || 0;
         o.history = o.history || [];
@@ -428,7 +466,19 @@ process_drafting_file() {
           });
           fs.writeFileSync(p, JSON.stringify(o, null, 2));
           console.log("requeue");
-        } else if (isInfra && infraRequeueCount < infraRequeueLimit) {
+        } else if (laneAttributable === true) {
+          // Lane-attributable infra failure: record it against the failing lane and requeue
+          // without charging the task infraRequeueCount.
+          try { if (laneRecorder) laneRecorder(process.argv[6], { reason: draftResult, instancesDir: process.argv[8] }); } catch (e) { /* best-effort */ }
+          o.draftFailureCount = 0;
+          o.history.push({
+            stage: "requeued",
+            at: new Date().toISOString(),
+            detail: `draft call failed ${failureCount} times in a row on an infra failure attributable to lane ${process.argv[6]} (most recent: ${draftResult}) -- requeued without counting against this task`,
+          });
+          fs.writeFileSync(p, JSON.stringify(o, null, 2));
+          console.log("requeue");
+        } else if (isInfra && laneAttributable === false && infraRequeueCount < infraRequeueLimit) {
           o.infraRequeueCount = infraRequeueCount + 1;
           o.draftFailureCount = 0;
           o.history.push({
@@ -448,7 +498,7 @@ process_drafting_file() {
           fs.writeFileSync(p, JSON.stringify(o, null, 2));
           console.log("block");
         }
-      ' "$wpath" "$draft_result" "$failure_count" "${DRAFT_INFRA_REQUEUE_LIMIT:-3}")"
+      ' "$wpath" "$draft_result" "$failure_count" "${DRAFT_INFRA_REQUEUE_LIMIT:-3}" "${PACKAGE_SRC_DIR}/infra-attribution.js" "$INSTANCE_ID" "${AGENT_MANAGER_PRIMARY_LANE:-worker-0}" "$INSTANCES_DIR")"
 
       if [[ "$action" == "requeue" ]]; then
         mkdir -p "${QUEUE_DIR}/pending" >/dev/null 2>&1
@@ -499,6 +549,8 @@ fi
 # NOT an infra failure (a real success, a non-infra block, or a genuinely idle tick).
 CONSECUTIVE_INFRA_FAILURES=0
 SWITCHED_OFF_TICKS=0                                                     # consecutive ticks this worker has been switched off by the operator (worker_switched_off); only used to print one line on each transition
+DIAL_OFF_TICKS=0                                                         # consecutive ticks this cloud lane has been turned off by the cloud-agent dial (cloud_dial_off); only used to print one line on each transition
+LANE_RULES_STAMP="${TEMP_DIR:-${TMPDIR:-/tmp}}/lane-rules-${INSTANCE_ID}.stamp"   # reload_lane_rules (agent-manager-common.sh) re-reads this lane's taskClasses and reviews only when lanes.json is newer than this per-instance stamp; the tick is the trigger, no timer
 ENDPOINT_DOWN_TICKS=0                                                    # consecutive ticks the lane's Ollama endpoint did not answer (see the circuit breaker in the main loop)
 LAST_WAKE=""                                                            # how the last idle wait ended: event | timeout | sleep (see wait_for_queue_change)
 WAKE_RECONCILE_HITS=0                                                    # timeout wakes that then found work: a producer changed state without announcing it in a queue directory (ADR-0024 rule 6)
@@ -621,7 +673,7 @@ while :; do                                                                     
   # when the switch flips finishes first (the check is once per tick).
   if worker_switched_off "$INSTANCE_ID"; then
     if (( SWITCHED_OFF_TICKS == 0 )); then
-      printf '[worker-%s] switched off by the operator (Workers tab) -- claiming nothing until it is switched back on.\n' "$INSTANCE_ID" >&2
+      printf '[worker-%s] %s\n' "$INSTANCE_ID" "$(worker_switch_message "$INSTANCE_ID")" >&2
     fi
     SWITCHED_OFF_TICKS=$((SWITCHED_OFF_TICKS + 1))
     write_heartbeat_file "$INSTANCE_ID" "disabled" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
@@ -633,6 +685,23 @@ while :; do                                                                     
     printf '[worker-%s] switched back on after %s tick(s) off; resuming.\n' "$INSTANCE_ID" "$SWITCHED_OFF_TICKS" >&2
     SWITCHED_OFF_TICKS=0
   fi
+  # Cloud-agent dial (src/cloud-dial.js): a cloud lane ranked past the dial count claims nothing this tick, like a switched-off worker; a task already in drafting/ finishes first. Heartbeat
+  # status disabled with pass "dial" (so the Workers tab can tell it from the operator switch). No dial file (today) = this block never fires and spawns nothing.
+  if cloud_dial_off "$INSTANCE_ID"; then
+    if (( DIAL_OFF_TICKS == 0 )); then
+      printf '[worker-%s] turned off by the cloud-agent dial -- claiming nothing until the dial is raised.\n' "$INSTANCE_ID" >&2
+    fi
+    DIAL_OFF_TICKS=$((DIAL_OFF_TICKS + 1))
+    write_heartbeat_file "$INSTANCE_ID" "disabled" "$HEARTBEAT_MODEL" "" "dial" "$STARTED_AT"
+    if "$ONCE"; then exit 0; fi
+    sleep "${AGENT_MANAGER_SWITCHED_OFF_PAUSE_S:-${ORC_TICK_SECS:-30}}"
+    continue
+  fi
+  if (( DIAL_OFF_TICKS > 0 )); then
+    printf '[worker-%s] the cloud-agent dial now includes this lane after %s tick(s) off; resuming.\n' "$INSTANCE_ID" "$DIAL_OFF_TICKS" >&2
+    DIAL_OFF_TICKS=0
+  fi
+  reload_lane_rules "$INSTANCE_ID" || true                                      # a lanes.json edit (taskClasses, reviews) reaches this running worker without a restart; no node spawn while lanes.json is unchanged, and a failure never stops the tick. Sets LANE_RULES_TASK_CLASSES / LANE_RULES_REVIEWS for later pieces; nothing reads them yet.
   refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work -- see the function's own comment above the loop.
   printf '[worker-%s] tick at %s — searching for new drafts...\n' "$INSTANCE_ID" "$(date -u '+%FT%T.%NZ' 2>/dev/null)"    # status message at top of each iteration — same information PowerShell's Write-Verbose emits but using printf for format-safety (avoids issues if variable contents include '%' characters which would be interpreted as string-formatting directives by `echo -e` on some systems, breaking log output).
   write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"   # so the dashboard's Workers tab sees this instance exists even on a tick that claims nothing -- previously never called anywhere in this script, which is why no workers ever showed up regardless of whether the process was alive.
@@ -673,8 +742,18 @@ while :; do                                                                     
   # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
   if mem_pressure_high; then
     printf '[worker-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
+    write_heartbeat_file "$INSTANCE_ID" "paused" "$HEARTBEAT_MODEL" "" "ram" "$STARTED_AT"   # status paused, pass ram: the Workers tab and the cloud-dial counts can tell a RAM hold from a GPU-session pause (pass gpu-session) and from idle
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
+    continue
+  fi
+
+  # Cloud agents review before they draft (cloud_take_review, scripts/agent-manager-common.sh): when queue/review/ holds an item no live reviewer has claimed, this cloud lane
+  # reviews ONE item and ends the tick; when every waiting review is already claimed (or there is none) it goes on to draft. A premium-only borrowed tick never reviews.
+  if ! "$PREMIUM_ONLY" && cloud_take_review "$INSTANCE_ID"; then
+    did_work=true
+    if "$ONCE"; then exit 10; fi
+    end_of_tick_pause
     continue
   fi
 
@@ -758,6 +837,8 @@ while :; do                                                                     
       wpath="${drafting_instance_dir}/${name}"
       [[ -f "$wpath" && -s "$wpath" ]]                                        || continue
       if "$PREMIUM_ONLY" && ! is_premium_file "$wpath"; then continue; fi       # a premium-only borrowed tick leaves regular leftovers for later
+      # Rate-limit deferral (src/draft-quota.js): leave the item alone until its stated reset has passed. No failure was counted.
+      if node "${PACKAGE_SRC_DIR}/draft-quota.js" deferred "$wpath" 2>/dev/null; then continue; fi
       printf '[worker-%s] resuming leftover drafting item: %s\n' "$INSTANCE_ID" "$name"
       # A resumed item that predates the claimedAt stamp (or a chat-preempt requeue that
       # skipped drafting/) gets one now, set-once -- see the claim site's comment.

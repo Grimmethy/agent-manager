@@ -72,8 +72,9 @@ function mentionIndexes(text, needle) {
 // `[\s*_]+` (not plain `\s+`) between words: a model routinely bolds "not" for emphasis
 // ("does **not** exist yet") -- confirmed live, this is the EXACT real phrasing that
 // caused the incident above, and a literal whitespace-only gap would miss it.
+// 2026-11-18: the "does not exist" form now requires "yet" ("does not exist yet" or "does not yet exist"). A bare "does not exist on the main branch" or "does not exist in this checkout" describes a file that exists on another branch or checkout, so it is not a create signal.
 // 2026-10-08: also "is absent" / "not present" / "not found" / "no such file" (HUB0011-02: the plan said `<path>` "is absent" for a task titled "Create <file>" and was blocked).
-const EXISTENCE_ACK_RE = /\b(?:does|do)[\s*_]+not[\s*_]+(?:yet[\s*_]+)?exist\b|\bdoesn'?t[\s*_]+(?:yet[\s*_]+)?exist\b|\bnot[\s*_]+yet[\s*_]+(?:present|created)\b|\b(?:is|are|was)[\s*_]+(?:currently[\s*_]+)?absent\b|\b(?:is|are)[\s*_]+not[\s*_]+(?:present|found)\b|\bno[\s*_]+such[\s*_]+file\b|\bonce[\s*_]+it[\s*_]+(?:exists|is[\s*_]+(?:created|written))\b/i;
+const EXISTENCE_ACK_RE = /\b(?:does|do)[\s*_]+not[\s*_]+(?:yet[\s*_]+exist|exist[\s*_]+yet)\b|\bdoesn'?t[\s*_]+(?:yet[\s*_]+)?exist\b|\bnot[\s*_]+yet[\s*_]+(?:present|created)\b|\b(?:is|are|was)[\s*_]+(?:currently[\s*_]+)?absent\b|\b(?:is|are)[\s*_]+not[\s*_]+(?:present|found)\b|\bno[\s*_]+such[\s*_]+file\b|\bonce[\s*_]+it[\s*_]+(?:exists|is[\s*_]+(?:created|written))\b/i;
 
 // taskText (optional, 2026-10-08): the TASK's own title + body. A task that itself says "Create <file>" has declared the file a create target no matter how the
 // plan words it; the plan-only signals above missed that when the plan named the file by its full path and called it "absent".
@@ -149,6 +150,9 @@ function extractExplicitTypes(planText) {
   return types;
 }
 
+// Local wrapper over the existing create-intent check (the shared contract's name for it).
+const isCreateIntent = (planText, targetPath, taskText) => isDeclaredCreateTarget(planText, targetPath, taskText);
+
 function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef = null) {
   let targets = [];
   try { targets = extractDeclaredTargets(task, planText); } catch { targets = []; }
@@ -194,7 +198,7 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
     // Explicit type 'create' exempts the target
     if (explicitTypes.get(entry.claimedPath) === 'create') return false;
     // Heuristic fallback: isDeclaredCreateTarget for backward compatibility
-    if (isDeclaredCreateTarget(planText, entry.claimedPath, taskTextOf(task))) return false;
+    if (isCreateIntent(planText, entry.claimedPath, taskTextOf(task))) return false;
     return true;
   });
 
@@ -228,7 +232,15 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
   const candidateNote = ambiguous.length
     ? ' -- ambiguous, candidate paths: ' + ambiguous.map((e) => e.claimedPath + ' => ' + e.candidates.map((c) => c.split(repoRoot.replace(/\/$/, '') + '/').join('')).join(' | ')).join('; ')
     : '';
-  const feedback = ' -- mark as a create target (e.g. "create `' + paths[0] + '`)") or correct the path' + candidateNote;
+  const nearMatches = Array.isArray(task && task.nearMatches) ? task.nearMatches : [];
+  const nearNote = nearMatches.length ? ' -- near matches: ' + nearMatches.join(', ') : '';
+  const offers = paths.map((p) => 'mark ' + p + ' as create').join(' or ');
+  const feedback = ' -- mark as a create target (' + offers + ') or correct the path to an existing file' + candidateNote + nearNote;
+  // First attempt for this task: hand back a revise outcome so the caller can ask for a corrected plan. Second attempt blocks as before.
+  const revisionCount = Number.isFinite(task && task.revisionCount) ? task.revisionCount : 0;
+  if (revisionCount === 0) {
+    return { blocked: false, revise: { feedback: 'plan cites missing-file target(s): ' + paths.join(', ') + feedback, revisionCount: 1 } };
+  }
   
   return {
     blocked: true,

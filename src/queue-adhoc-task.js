@@ -10,6 +10,20 @@ function slugify(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
 }
 
+// Cap on the slug embedded in an adhoc task id (2026-11-14): an uncapped 230-character title made the
+// id, and so the queue file name <id>.json and branch agent/<id>, exceed the filesystem's 255-byte limit (ENAMETOOLONG).
+const MAX_SLUG = 100;
+
+// Shortens a slug to at most MAX_SLUG characters, cutting at the last '-' boundary when there is one.
+// A slug of MAX_SLUG characters or fewer is returned unchanged, so existing ids are byte-for-byte identical.
+function capSlug(slug) {
+  if (slug.length <= MAX_SLUG) return slug;
+  const head = slug.slice(0, MAX_SLUG + 1); // +1 lets a dash at index MAX_SLUG count as a boundary
+  const cut = head.lastIndexOf('-');
+  const out = cut > 0 ? head.slice(0, cut) : slug.slice(0, MAX_SLUG);
+  return out.replace(/-+$/, '');
+}
+
 // Port of app.py's default_task_domain() (2026-09-06): picking the first key in
 // task-domains.json with no regard for whether it's a sane generic default is what once
 // queued two real tasks with domain='adhoc' into a project whose task-domains.json
@@ -51,18 +65,25 @@ function normalizeStacked(stacked) {
   return { branch, seq, total };
 }
 
-function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority, premiumSetBy, project, generatedForRepoRoot, stacked }, { pipelineDir, domainsPath }) {
+function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority, premiumSetBy, project, generatedForRepoRoot, stacked, raisedFrom }, { pipelineDir, domainsPath }) {
   if (!title) throw new Error('queueAdhocTask: title is required');
   if (!promptContext) throw new Error('queueAdhocTask: promptContext is required');
   const cleanStacked = stacked === undefined || stacked === null ? undefined : normalizeStacked(stacked);
+  const cleanRaisedFrom = raisedFrom === undefined || raisedFrom === null ? undefined : raisedFrom;
+  if (cleanRaisedFrom !== undefined && (typeof cleanRaisedFrom !== 'string' || !cleanRaisedFrom.trim())) {
+    throw new Error('queueAdhocTask: raisedFrom must be a non-empty string');
+  }
 
   const validDomains = Object.keys(JSON.parse(fs.readFileSync(domainsPath, 'utf8')));
-  const resolvedDomain = domain || defaultTaskDomain(validDomains);
+  // A repair (stacked) task defaults to domain 'adhoc' when the caller names none and the project lists 'adhoc'
+  // (otherwise it would be refused as an unknown domain); ordinary tasks keep defaultTaskDomain() unchanged.
+  const stackedDefaultDomain = cleanStacked && validDomains.includes('adhoc') ? 'adhoc' : undefined;
+  const resolvedDomain = domain || stackedDefaultDomain || defaultTaskDomain(validDomains);
   if (!validDomains.includes(resolvedDomain)) {
     throw new Error(`Invalid domain '${resolvedDomain}'. Valid domains: ${validDomains.join(', ')}`);
   }
 
-  const id = `adhoc-${slugify(title)}-${Date.now()}`;
+  const id = `adhoc-${capSlug(slugify(title))}-${Date.now()}`;
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
   fs.mkdirSync(adhocDir, { recursive: true });
 
@@ -101,6 +122,8 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriori
     ...(generatedForRepoRoot ? { generatedForRepoRoot } : {}),
     // The branch a repair task rides on (see normalizeStacked); absent for every ordinary task.
     ...(cleanStacked ? { stacked: cleanStacked } : {}),
+    // raisedFrom: optional provenance label (e.g. 'brain-dump-<serial>'), top-level so brain-dump-existing-work.js's taskMatchesEntry() reads it; absent when not given.
+    ...(cleanRaisedFrom !== undefined ? { raisedFrom: cleanRaisedFrom } : {}),
   };
   const filePath = path.join(adhocDir, `${id}.json`);
   fs.writeFileSync(filePath, JSON.stringify(record, null, 2) + '\n');
@@ -116,6 +139,10 @@ function parseArgs(argv) {
     // rule below skips a flag whose next argument is falsy, which would silently turn `--stacked-branch ""` into an ORDINARY task off main.
     if (STACKED_FLAGS.includes(argv[i])) {
       args[argv[i]] = i + 1 < argv.length ? argv[++i] : '';
+      continue;
+    }
+    if (argv[i] === '--premium') {
+      args['--premium'] = true;
       continue;
     }
     if ((argv[i] === '--title' || argv[i] === '--prompt-context-file' || argv[i] === '--domain' || argv[i] === '--depends-on' || argv[i] === '--scratch' || argv[i] === '--repo-root') && argv[i + 1]) {
@@ -140,12 +167,22 @@ function stackedFromArgs(parsed) {
   return { branch, seq, total };
 }
 
+const USAGE = `Usage: node queue-adhoc-task.js --title <text> --prompt-context-file <path> [--domain <name>] [--depends-on id1,id2] [--scratch <dir>] [--repo-root <path>] [--stacked-branch <agent/branch> [--stacked-seq <n>] [--stacked-total <n>]] [--premium]
+
+Options:
+  --premium   mark the queued task premium priority; provenance recorded as premiumSetBy=cli`;
+
 if (require.main === module) {
   const rawArgs = process.argv.slice(2);
   const parsed = parseArgs(rawArgs);
 
+  if (rawArgs.includes('--help') || rawArgs.includes('-h')) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+
   if (!parsed['--title'] || !parsed['--prompt-context-file']) {
-    console.error('Usage: node queue-adhoc-task.js --title <text> --prompt-context-file <path> [--domain <name>] [--depends-on id1,id2] [--scratch <dir>] [--repo-root <path>] [--stacked-branch <agent/branch> [--stacked-seq <n>] [--stacked-total <n>]]');
+    console.error(USAGE);
     process.exit(1);
   }
 
@@ -199,7 +236,7 @@ if (require.main === module) {
     try {
       const { pipelineDir, domainsPath } = getConfig();
       const { filePath } = queueAdhocTask(
-        { title: parsed['--title'], promptContext, domain: 'adhoc', generatedForRepoRoot: parsed['--repo-root'], stacked: stackedTarget, dependsOn: parsed['--depends-on']
+        { title: parsed['--title'], promptContext, domain: 'adhoc', generatedForRepoRoot: parsed['--repo-root'], stacked: stackedTarget, premiumPriority: parsed['--premium'] === true, premiumSetBy: 'cli', dependsOn: parsed['--depends-on']
             ? parsed['--depends-on'].split(',').map((s) => s.trim()).filter(Boolean)
             : undefined },
         { pipelineDir, domainsPath },
@@ -226,7 +263,7 @@ if (require.main === module) {
 
     try {
       const { filePath } = queueAdhocTask(
-        { title: parsed['--title'], promptContext, domain: parsed['--domain'], dependsOn, stacked: stackedTarget },
+        { title: parsed['--title'], promptContext, domain: parsed['--domain'], dependsOn, stacked: stackedTarget, premiumPriority: parsed['--premium'] === true, premiumSetBy: 'cli' },
         { pipelineDir, domainsPath },
       );
       console.log(`queued adhoc task: ${filePath}`);

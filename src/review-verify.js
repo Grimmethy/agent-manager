@@ -256,10 +256,12 @@ function extractChangedSymbols(diff) {
     if (name && name.length >= 5 && !SYMBOL_STOPLIST.has(name) && !found.includes(name)) found.push(name);
   };
   const declRe = /^(?:async\s+)?(?:function\*?\s+|def\s+|class\s+)([A-Za-z_$][\w$]*)|^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/;
+  const constRes = [/^([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)/, /^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=(?!.*=>)/]; // module-level constants: matched on the UNTRIMMED line, so indented assignments never match
   for (const line of String(diff || '').split('\n')) {
     let body = null;
     if (line.startsWith('@@')) body = (line.match(/^@@[^@]*@@\s*(.*)$/) || [])[1];      // hunk header: the function the hunk sits in
     else if ((line[0] === '+' || line[0] === '-' || line[0] === ' ') && !/^(?:\+\+\+|---)/.test(line)) body = line.slice(1).trimStart();   // changed OR context: an edit inside a function shows its def as context
+    if ((line[0] === '+' || line[0] === '-') && !/^(?:\+\+\+|---)/.test(line)) for (const re of constRes) { const c = line.slice(1).match(re); if (c) add(c[1]); }
     if (!body) continue;
     const m = body.match(declRe);
     if (m) add(m[1] || m[2]);
@@ -465,10 +467,27 @@ function checkUnpinnedHunks({ worktreeDir, rawDiff, suites, run, d, deadline, py
     }
     if (verdict === 'skipped') { res.skipped += 1; continue; }
     res.checked += 1;
-    if (verdict === 'unpinned') res.hunks.push({ file: h.file, start: h.start, end: h.end });
+    if (verdict === 'unpinned') res.hunks.push({ file: h.file, start: h.start, end: h.end, lines: h.changed.length });
   }
   res.skipped += Math.max(0, candidates.length - MAX_UNPINNED_HUNKS);
   return res;
+}
+
+// Pure gate for the unpinned check. Blocks when the unpinned lines are at least 40% of the non-test lines changed, or when any single unpinned
+// hunk is at least 15 lines. `exempt` is set by the caller for docs-only, test-only or identity-verified pure-move diffs (no classifier exists here,
+// so the flag is accepted as given). AGENT_MANAGER_REVIEW_UNPINNED_BLOCK='false' disables the block; the hunks are still returned.
+const UNPINNED_BLOCK_RATIO = 0.40;
+const UNPINNED_BLOCK_HUNK_LINES = 15;
+function unpinnedBlockDecision({ unpinned, changedNonTestLines, exempt, env } = {}) {
+  const hunks = Array.isArray(unpinned) ? unpinned : [];
+  const killed = (env || {}).AGENT_MANAGER_REVIEW_UNPINNED_BLOCK === 'false';
+  if (killed || exempt || !hunks.length) return { block: false, hunks, reason: null };
+  const lineCount = (h) => Number(h.lines) || 0;
+  const unpinnedLines = hunks.reduce((sum, h) => sum + lineCount(h), 0);
+  const ratio = changedNonTestLines > 0 ? unpinnedLines / changedNonTestLines : 0;
+  const bigHunk = hunks.some((h) => lineCount(h) >= UNPINNED_BLOCK_HUNK_LINES);
+  const block = ratio >= UNPINNED_BLOCK_RATIO || bigHunk;
+  return { block, hunks, reason: block ? 'unpinned-core-change' : null };
 }
 
 // --- not reproduced (2026-10-24, discard analysis) ----------------------------------------------------------------------------------------------------
@@ -756,7 +775,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
             // vitest: -t is its name filter; --passWithNoTests keeps the control run on the base (where the added tests do not exist) at exit 0, like node's.
             const narrowed = s.label === 'vitest'
               ? { ...s, files: [file], buildArgs: (files) => [...vitestArgs(s.pkgRel, files), '-t', pattern, '--passWithNoTests'] }
-              : { ...s, files: [file], buildArgs: (files) => ['--test', '--test-name-pattern', pattern, ...files] };
+              : { ...s, files: [file], buildArgs: (files) => ['--test', `--test-name-pattern=${pattern}`, ...files] };
             const n = runOne(s.bin, narrowed.buildArgs([file]), TEST_TIMEOUT_MS, { tolerateTimeout: true, cwd: s.cwd });
             if (n.ran && !n.timedOut) {
               (result.tests.partial = result.tests.partial || []).push({ file, tests: added.slice(0, 12), count: added.length, passed: n.exitCode === 0 });
@@ -951,6 +970,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 }
 
 module.exports = {
+  unpinnedBlockDecision,
   extraCoveringMax,
   pythonTestArgs, checkChangedFilesSyntax, splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
   verifyDiff, addedTestNames, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,

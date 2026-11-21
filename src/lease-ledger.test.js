@@ -24,19 +24,19 @@ test('lend creates a lent lease that expires after the ttl and is written to lea
   assert.equal(L.leaseFor('nope', env), null);
 });
 
-test('the default ttl is six hours and AGENT_MANAGER_LEASE_TTL_MS overrides it; junk falls back', () => {
+test('the default ttl is one hour and AGENT_MANAGER_LEASE_TTL_MS overrides it; junk falls back', () => {
   const { env } = tmp();
-  assert.equal(L.defaultTtlMs(env), 6 * 3600 * 1000);
-  assert.equal(L.lendLease('a', 'grimm', { now: T0, env }).expiresAt, '2026-11-11T18:00:00.000Z');
+  assert.equal(L.defaultTtlMs(env), 3600 * 1000);
+  assert.equal(L.lendLease('a', 'grimm', { now: T0, env }).expiresAt, '2026-11-11T13:00:00.000Z');
   assert.equal(L.defaultTtlMs({ ...env, AGENT_MANAGER_LEASE_TTL_MS: '1000' }), 1000);
-  assert.equal(L.defaultTtlMs({ ...env, AGENT_MANAGER_LEASE_TTL_MS: 'soon' }), 6 * 3600 * 1000);
-  assert.equal(L.defaultTtlMs({ ...env, AGENT_MANAGER_LEASE_TTL_MS: '-5' }), 6 * 3600 * 1000);
+  assert.equal(L.defaultTtlMs({ ...env, AGENT_MANAGER_LEASE_TTL_MS: 'soon' }), 3600 * 1000);
+  assert.equal(L.defaultTtlMs({ ...env, AGENT_MANAGER_LEASE_TTL_MS: '-5' }), 3600 * 1000);
 });
 
 test('a ttl that is not a positive number falls back to the default instead of producing a broken expiry', () => {
   const { env } = tmp();
   for (const [i, bad] of [-5, 0, NaN, 'soon'].entries()) {
-    assert.equal(L.lendLease('t' + i, 'grimm', { ttlMs: bad, now: T0, env }).expiresAt, '2026-11-11T18:00:00.000Z', String(bad));
+    assert.equal(L.lendLease('t' + i, 'grimm', { ttlMs: bad, now: T0, env }).expiresAt, '2026-11-11T13:00:00.000Z', String(bad));
   }
 });
 
@@ -143,4 +143,34 @@ test('cancelLease deletes a lent lease and returns it; missing, returned and exp
   assert.equal(L.leaseFor('b', env).state, 'returned');
   assert.equal(L.leaseFor('d', env).state, 'lent', 'other leases are untouched');
   assert.ok(L.lendLease('keep', 'other', { now: T0, env }), 'a cancelled task can be lent again');
+});
+
+test('settleExpired: a blocked answer closes the lease as returned, keeps the reason, takes the record back in every dir and leaves a node-blocked trace', async () => {
+  const { dir, env } = tmp();
+  const dirs = ['a', 'b'].map((n) => { const d = path.join(dir, n); fs.mkdirSync(path.join(d, 'queue', 'pending'), { recursive: true }); return d; });
+  const file = path.join(dirs[1], 'queue', 'pending', 't1.json');
+  fs.writeFileSync(file, JSON.stringify({ id: 't1', leasedTo: 'grimm' }));
+  L.lendLease('t1', 'grimm', { ttlMs: 1000, now: T0, env });
+  const result = await L.settleExpired({ askNode: async () => ({ answer: 'blocked', reason: 'plan limit' }), pipelineDirs: dirs, now: T0 + 5000, env });
+  assert.equal(result.blocked.length, 1);
+  assert.deepEqual(result.released, []);
+  const row = L.leaseFor('t1', env);
+  assert.equal(row.state, 'returned');
+  assert.equal(row.lastEvent, 'blocked');
+  assert.equal(row.blockedReason, 'plan limit');
+  const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(rec.leasedTo, undefined);
+  assert.equal(rec.history[0].stage, 'node-blocked grimm');
+  assert.match(rec.history[0].detail, /plan limit/);
+});
+
+test('settleExpired: an unknown answer clears leasedTo in EVERY pipeline dir, not only the first', async () => {
+  const { dir, env } = tmp();
+  const dirs = ['a', 'b'].map((n) => { const d = path.join(dir, n); fs.mkdirSync(path.join(d, 'queue', 'adhoc'), { recursive: true }); return d; });
+  const file = path.join(dirs[1], 'queue', 'adhoc', 't2.json');
+  fs.writeFileSync(file, JSON.stringify({ id: 't2', leasedTo: 'grimm' }));
+  L.lendLease('t2', 'grimm', { ttlMs: 1000, now: T0, env });
+  const result = await L.settleExpired({ askNode: async () => 'unknown', pipelineDirs: dirs, now: T0 + 5000, env });
+  assert.equal(result.released.length, 1);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).leasedTo, undefined);
 });

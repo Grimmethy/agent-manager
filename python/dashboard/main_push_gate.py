@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 _MERGE_PATH = re.compile(r"^/api/git/(?:branches/(?P<regular>.+)/merge|held-hub-branches/(?P<early>.+)/merge-early)$")
 
 
+UI_MERGE_MARKER = "merge-button"
+
+
 def guard_merge_request(request):
     """None to let the request through, or a (json response, status) pair to refuse it. Fails closed on an unexpected error."""
     if request.method != "POST":
@@ -53,6 +56,16 @@ def guard_merge_request(request):
             head_sha = _run_git(["rev-parse", f"origin/{branch}"], repo_root).strip()
         except (RuntimeError, OSError):
             return None  # no such branch (or no such repository): the route answers for itself
+        if request.headers.get("X-Agent-Manager-Ui") == UI_MERGE_MARKER:
+            if body.get("headSha") != head_sha:
+                return jsonify({"succeeded": False, "code": "head_moved", "reason": "the branch head moved since this card was shown; reload and merge the current head"}), 409
+            try:
+                from branch_verdicts import record_owner_merge_verdict
+                row = record_owner_merge_verdict(qdir, branch, head_sha)
+            except Exception as exc:  # noqa: BLE001 -- a verdict that cannot be recorded must not reach the gate
+                return jsonify({"succeeded": False, "code": "verdict_readback_failed", "reason": f"the owner merge verdict could not be recorded ({exc})"}), 500
+            if not row:
+                return jsonify({"succeeded": False, "code": "verdict_readback_failed", "reason": "the owner merge verdict did not read back"}), 500
         assert_main_push_ready(qdir, branch, head_sha, caller="dashboard-merge-early" if found.group("early") else "dashboard-merge", task_id=branch.removeprefix("agent/"),
                                diff_facts_loader=lambda: read_diff_facts(_run_git, repo_root, head_sha))
         return None

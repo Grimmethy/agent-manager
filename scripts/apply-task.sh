@@ -81,6 +81,33 @@ move_task_file_locked() {
   fi
 }
 
+# The task id is the record's own `id` field, never its file name: a record can sit in
+# approved/ under any name (e.g. zz.task.json), and done/blocked/awaiting-confirm/coordinating
+# must file it as <id>.json or the coordinator sweep (findTaskRecordById) never finds it.
+# Falls back to the basename only when `id` is missing, not a string, or not a safe path segment.
+resolve_task_id() {
+  local f="$1" base id
+  base="$(basename "$f" .json)"
+  id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(typeof o.id==="string"&&o.id.trim()!=="")process.stdout.write(o.id.trim())}catch(e){}' "$f" 2>/dev/null)"
+  if [[ -z "$id" ]]; then
+    printf '%s' "$base"
+  elif [[ ! "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf '[apply-task] record file name '\''%s'\'' has unsafe task id '\''%s'\'': filing under the file name\n' "$base" "$id" >&2
+    printf '%s' "$base"
+  else
+    printf '%s' "$id"
+  fi
+}
+
+# Prints the one-line notice when a record's file name and its task id disagree.
+report_id_mismatch() {
+  local base
+  base="$(basename "$1" .json)"
+  if [[ "$base" != "$2" ]]; then
+    printf '[apply-task] record file name '\''%s'\'' differs from task id '\''%s'\'': filed as %s.json\n' "$base" "$2" "$2" >&2
+  fi
+}
+
 # Mutex: refuse to run if another apply-task.sh is already mid-apply. Confirmed live
 # 2026-08-17 (investigating a real queue/blocked/ backlog): every single apply-failed task
 # there showed the same symptom -- `git index.lock: File exists`, `fatal: branch 'agent/...'
@@ -204,7 +231,8 @@ if [[ ${#direct_files[@]} -gt 0 ]]; then
     } catch (e) { /* handled below: any direct_file not printed stays in approved/ for next tick */ }
   ' | while IFS=$'\t' read -r bpath bok bneedsconfirm bcoordinating bnote; do
       [[ -z "$bpath" ]] && continue
-      btid="$(basename "$bpath" .json)"
+      btid="$(resolve_task_id "$bpath")"
+      report_id_mismatch "$bpath" "$btid"
       if [[ "$bcoordinating" == "1" ]]; then
         move_task_file_locked "$btid" "$bpath" "${COORDINATING_DIR}/${btid}.json"
         printf '[apply-task] %s: coordinating sub-tasks (triage batch) -- %s\n' "$btid" "$bnote"
@@ -223,7 +251,8 @@ if [[ ${#direct_files[@]} -gt 0 ]]; then
 fi
 
 for file in "${other_files[@]}"; do
-  task_id="$(basename "$file" .json)"
+  task_id="$(resolve_task_id "$file")"
+  report_id_mismatch "$file" "$task_id"
   printf '[apply-task] applying %s...\n' "$task_id"
 
   result="$(node "${REPO_DIR}/src/apply-task.js" "$file")"

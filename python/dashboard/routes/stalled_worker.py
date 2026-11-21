@@ -210,7 +210,7 @@ def build_stalled_worker(env=None, now=None, read_rows=read_ledger_tail, read_in
         if str(r.get("at", ""))[:10] == today:
             today_counts[r["outcome"]] = today_counts.get(r["outcome"], 0) + 1
     holds = []
-    for r in ds:
+    for r in {r["taskId"]: r for r in ds}.values():   # each task's LATEST decision only (ds is in ledger order, so a later row replaces an earlier one)
         if r.get("outcome") == "HOLD-FOR-OWNER":
             ts = _parse_ts(r.get("at"))
             holds.append({"taskId": r.get("taskId"), "project": r.get("project"), "question": r.get("question"), "dryRun": r.get("mode") != "on",

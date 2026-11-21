@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const { spawnSync } = require('node:child_process');
-const { lendTask, reclaimExpired, findRecordFile, main } = require('./lend-task.js');
+const { lendTask, reclaimExpired, applyNodeBlock, releaseStaleLeasedTo, findRecordFile, main } = require('./lend-task.js');
 const { leaseFor, listLeases } = require('./lease-ledger.js');
 const { createServer } = require('./node-intake-server.js');
 
@@ -38,7 +38,7 @@ test('a successful lend posts task and lease with the bearer token, stamps lease
   assert.equal(seen[0].headers.Authorization, `Bearer ${TOKEN}`);
   assert.equal(seen[0].timeout, 15000);
   assert.deepEqual(seen[0].body.task, { id: 't1', title: 't1', pad: 1 });
-  assert.deepEqual(seen[0].body.lease, { taskId: 't1', nodeId: 'grimm', expiresAt: '2026-11-11T18:00:00.000Z' });
+  assert.deepEqual(seen[0].body.lease, { taskId: 't1', nodeId: 'grimm', expiresAt: '2026-11-11T13:00:00.000Z' });
   assert.equal(read(f).leasedTo, 'grimm');
   assert.equal(read(f).pad, 1);
   assert.equal(leaseFor('t1', w.env).state, 'lent');
@@ -183,4 +183,59 @@ test('the CLI runs as a real process against a real local intake', async () => {
     assert.ok(fs.existsSync(path.join(nodePipeline, 'queue', 'adhoc', 'cli1.json')));
   } finally { server.close(); server.closeAllConnections(); }
   assert.equal(spawnSync(process.execPath, [path.join(__dirname, 'lend-task.js'), 'lend'], { env: { ...process.env, ...w.env }, encoding: 'utf8' }).status, 2);
+});
+
+test('releaseStaleLeasedTo clears leasedTo when the ledger row is expired or returned, and leaves a live lease alone', () => {
+  const w = world();
+  const other = path.join(w.dir, 'other');
+  for (const q of ['pending', 'adhoc']) fs.mkdirSync(path.join(other, 'queue', q), { recursive: true });
+  const { lendLease, expireLeases } = require('./lease-ledger.js');
+  w.put('pending', 'stale', { leasedTo: 'grimm' });
+  w.put('adhoc', 'live', { leasedTo: 'grimm' });
+  fs.writeFileSync(path.join(other, 'queue', 'pending', 'stale2.json'), JSON.stringify({ id: 'stale2', leasedTo: 'grimm' }));
+  lendLease('stale', 'grimm', { ttlMs: 1000, now: T0, env: w.env });
+  lendLease('stale2', 'grimm', { ttlMs: 1000, now: T0, env: w.env });
+  lendLease('live', 'grimm', { ttlMs: 3600000, now: T0, env: w.env });
+  expireLeases({ now: T0 + 5000, env: w.env });
+  const healed = releaseStaleLeasedTo({ pipelineDirs: [w.pipelineDir, other], env: w.env });
+  assert.deepEqual(healed.sort(), ['stale', 'stale2']);
+  assert.equal(read(path.join(w.pipelineDir, 'queue', 'pending', 'stale.json')).leasedTo, undefined);
+  assert.equal(read(path.join(other, 'queue', 'pending', 'stale2.json')).leasedTo, undefined);
+  assert.equal(read(path.join(w.pipelineDir, 'queue', 'adhoc', 'live.json')).leasedTo, 'grimm');
+  assert.deepEqual(releaseStaleLeasedTo({ pipelineDirs: [w.pipelineDir, other], env: w.env }), []);
+});
+
+test('releaseStaleLeasedTo leaves a record leased to a different node than the ledger row names', () => {
+  const w = world();
+  const { lendLease, expireLeases } = require('./lease-ledger.js');
+  w.put('pending', 't9', { leasedTo: 'other-node' });
+  lendLease('t9', 'grimm', { ttlMs: 1000, now: T0, env: w.env });
+  expireLeases({ now: T0 + 5000, env: w.env });
+  assert.deepEqual(releaseStaleLeasedTo({ pipelineDirs: [w.pipelineDir], env: w.env }), []);
+  assert.equal(read(path.join(w.pipelineDir, 'queue', 'pending', 't9.json')).leasedTo, 'other-node');
+});
+
+test('reclaimExpired with pipelineDirs takes the task back in every dir from one expiry', () => {
+  const w = world();
+  const other = path.join(w.dir, 'other');
+  fs.mkdirSync(path.join(other, 'queue', 'adhoc'), { recursive: true });
+  fs.writeFileSync(path.join(other, 'queue', 'adhoc', 'tx.json'), JSON.stringify({ id: 'tx', leasedTo: 'grimm' }));
+  require('./lease-ledger.js').lendLease('tx', 'grimm', { ttlMs: 1000, now: T0, env: w.env });
+  const rows = reclaimExpired({ pipelineDirs: [w.pipelineDir, other], now: T0 + 5000, env: w.env });
+  assert.equal(rows.length, 1);
+  assert.equal(read(path.join(other, 'queue', 'adhoc', 'tx.json')).leasedTo, undefined);
+});
+
+test('applyNodeBlock drops leasedTo and writes a node-blocked history event with the reason, only where the record names that node', () => {
+  const w = world();
+  w.put('pending', 'tb', { leasedTo: 'grimm' });
+  w.put('adhoc', 'tc', { leasedTo: 'elsewhere' });
+  const changed = applyNodeBlock({ pipelineDirs: [w.pipelineDir], taskId: 'tb', nodeId: 'grimm', reason: 'plan limit' });
+  assert.equal(changed.length, 1);
+  const rec = read(path.join(w.pipelineDir, 'queue', 'pending', 'tb.json'));
+  assert.equal(rec.leasedTo, undefined);
+  assert.equal(rec.history.at(-1).stage, 'node-blocked grimm');
+  assert.equal(rec.history.at(-1).detail, 'grimm: plan limit');
+  assert.deepEqual(applyNodeBlock({ pipelineDirs: [w.pipelineDir], taskId: 'tc', nodeId: 'grimm', reason: 'x' }), []);
+  assert.equal(read(path.join(w.pipelineDir, 'queue', 'adhoc', 'tc.json')).leasedTo, 'elsewhere');
 });

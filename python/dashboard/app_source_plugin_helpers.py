@@ -21,7 +21,10 @@ from app_settings_helpers import QUEUE_STATES, logger
 # other's half-finished branch/index state, exactly the failure mode that lockfile
 # already exists to prevent between apply-task.sh's own two callers.
 def _acquire_apply_lock(timeout_seconds=5):
-    lock_dir = Path.home() / ".local" / "state" / "agent-manager" / "locks"
+    # AGENT_MANAGER_LOCK_DIR overrides the directory (tests use it to stay hermetic).
+    # Read at call time; an empty value counts as unset. The default matches apply-task.sh.
+    override = os.environ.get("AGENT_MANAGER_LOCK_DIR", "")
+    lock_dir = Path(override) if override else Path.home() / ".local" / "state" / "agent-manager" / "locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / "apply-task.lock"
     lock_fd = open(lock_path, "w")

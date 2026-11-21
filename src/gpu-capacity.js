@@ -58,12 +58,9 @@ function laneNumBatch(env = process.env) {
   return Number.isInteger(n) && n >= 32 && n <= 8192 ? n : null;
 }
 
-// Kept so existing callers keep working: there is no longer a separate, larger tier.
-const EXTENDED_NUM_CTX = PINNED_NUM_CTX;
-
 // OLLAMA_KV_CACHE_TYPE (e.g. a lower-precision KV cache dtype) is an additional VRAM
 // lever that is not yet enabled in this deployment. Do not raise NUM_CTX (PINNED_NUM_CTX
-// / EXTENDED_NUM_CTX above) until a quality regression check has been run against the
+// above) until a quality regression check has been run against the
 // resulting output on this model -- a larger context or a quantized KV cache that
 // degrades quality would only show up in the actual answers, not in the VRAM math here.
 
@@ -87,10 +84,10 @@ const HARD_TIMEOUT_CEILING_MS = 300_000;
 // connection closed before llama-server finished loading" in Ollama's own log means.
 // Once a lane hangs up early, Ollama frees the partial load and the model never
 // actually becomes resident, so the NEXT call needs another full cold load too -- a
-// livelock that never recovers on its own. Raised well past the worst contended
-// measurement above, with real margin, while staying under this file's existing
-// 240s/300s ceilings so nothing else here needs to change.
-const MIN_TIMEOUT_MS = 150_000; // floor, not a target -- was 45_000 ("even a 20-token ping can sit queued behind real contention on this single-GPU box well past 30s before generation even starts," confirmed live 2026-08-20), too short for a genuine cold model load as this same comment's 2026-08-26 update above found live.
+// livelock that never recovers on its own. Set to 2x the 90 s worst contended
+// measurement above (180 s), so the margin is explicit. It stays under this file's
+// existing 240s/300s ceilings, so nothing else here needs to change.
+const MIN_TIMEOUT_MS = 180_000; // floor, not a target -- was 45_000 ("even a 20-token ping can sit queued behind real contention on this single-GPU box well past 30s before generation even starts," confirmed live 2026-08-20), too short for a genuine cold model load as this same comment's 2026-08-26 update above found live.
 const DEFAULT_TIMEOUT_MS = 240_000; // fallback when throughput hasn't been measured yet -- this system's previous fixed value.
 
 // overheadMiB = VRAM Ollama is using beyond the model weights themselves (KV cache + prompt
@@ -188,7 +185,6 @@ module.exports = {
   DEFAULT_PINNED_NUM_CTX,
   laneNumCtx,
   laneNumBatch,
-  EXTENDED_NUM_CTX,
   HARD_TIMEOUT_CEILING_MS,
   MIN_TIMEOUT_MS,
   DEFAULT_TIMEOUT_MS,

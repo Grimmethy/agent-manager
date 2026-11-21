@@ -24,7 +24,7 @@ function load(extra = {}) {
 }
 const call = (ctx, expr, arg) => { ctx.__arg = arg; return vm.runInContext(`${expr}(__arg)`, ctx); };
 
-const pauseMarker = (over = {}) => ({ scope: 'node', reason: '', source: 'operator', setAt: '2026-11-11T12:00:00.000Z', expiresAt: null, ...over });
+const pauseMarker = (over = {}) => ({ scope: 'node', reason: '', source: 'operator', setAt: new Date(2026, 10, 11, 12, 0).toISOString(), expiresAt: null, ...over });
 const idleStatus = { node: null, global: null, workers: [] };
 
 test('buildMachinePauseHtml: nothing without a usable status', () => {
@@ -46,15 +46,15 @@ test('buildMachinePauseHtml: an active node pause offers Resume this machine and
   const html = call(ctx, 'buildMachinePauseHtml', { ...idleStatus, node: pauseMarker({ source: 'site-traffic', reason: 'site in use', expiresAt: new Date(2026, 10, 11, 9, 5).toISOString() }) });
   assert.match(html, /data-scope="node" data-next-paused="false"[^>]*>▶ Resume this machine<\/button>/);
   assert.match(html, /data-scope="global" data-next-paused="true"[^>]*>⏸ Pause everything<\/button>/);
-  assert.match(html, /This machine paused by site-traffic \(site in use\), until 09:05/);
+  assert.match(html, /This machine paused by site-traffic \(site in use\), since 12:00, until 09:05/);
 });
 
 test('buildMachinePauseHtml: an active global pause offers Resume everything, a pause with no expiry says until resumed, and both notes can show', () => {
   const { ctx } = load();
   const html = call(ctx, 'buildMachinePauseHtml', { ...idleStatus, node: pauseMarker(), global: pauseMarker({ scope: 'global', source: 'dashboard' }) });
   assert.match(html, /data-scope="global" data-next-paused="false"[^>]*>▶ Resume everything<\/button>/);
-  assert.match(html, /This machine paused by operator, until resumed/);
-  assert.match(html, /Everything paused by dashboard, until resumed/);
+  assert.match(html, /This machine paused by operator, since 12:00, until resumed/);
+  assert.match(html, /Everything paused by dashboard, since 12:00, until resumed/);
 });
 
 test('buildMachinePauseHtml: an unparseable expiry reads as until resumed and hostile text in a reason or source is escaped', () => {
@@ -64,6 +64,15 @@ test('buildMachinePauseHtml: an unparseable expiry reads as until resumed and ho
   assert.ok(!html.includes('<img'));
   assert.ok(!html.includes('"><b>'));
   assert.match(html, /&lt;img onerror=x&gt;/);
+});
+
+test('buildMachinePauseHtml: a node pause with no setAt (or an unparseable one) omits the since clause', () => {
+  const { ctx } = load();
+  for (const setAt of [undefined, null, 'bogus']) {
+    const html = call(ctx, 'buildMachinePauseHtml', { ...idleStatus, node: pauseMarker({ setAt, reason: 'site in use' }) });
+    assert.match(html, /This machine paused by operator \(site in use\), until resumed/);
+    assert.ok(!html.includes('since'));
+  }
 });
 
 test('setMachinePause: pausing posts to /api/pause/<scope>, resuming to /api/resume/<scope>, and success re-renders once', async () => {

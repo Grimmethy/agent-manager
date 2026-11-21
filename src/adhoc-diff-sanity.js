@@ -30,6 +30,14 @@
 // time, so the round-trip closes instead of just getting detected after the fact.
 
 const { extractRequestObjectTokens } = require('./request-object-tokens.js');
+const { findOverride, buildOverrideEvent } = require('./gate-override.js');
+
+// Records an applied owner override on the task's history via the existing task-history sink (appendHistoryEvent). Called for EVERY matched override, even when it
+// suppressed nothing (`suppressed` may be []), so a misapplied override can always be found later. task-history.js is required lazily at call time.
+function recordGateOverride(task, gate, entry, suppressed) {
+  const { type, ...payload } = buildOverrideEvent({ gate, reason: entry.reason, by: entry.by, at: entry.at, suppressed });
+  require('./task-history.js').appendHistoryEvent(task, type, JSON.stringify(payload));
+}
 
 // --- diff parsing -----------------------------------------------------------
 
@@ -106,6 +114,18 @@ const DOC_DELIVERABLE_RE = /\b(?:append|prepend|create|write|add|merge|insert|do
 // changed)" was itself read as a code request because of "NEW file" and "write"). Only meaningful together with a stated documentation deliverable, see wantsCodeChange.
 const READ_ONLY_RE = /\bread-only\b|\bnothing else (?:is |was |gets )?(?:touched|changed|modified|edited)\b|\bchange nothing else\b|\bwrite ONLY the one\b/i;
 
+// Markdown emphasis or backticks around a plain word ("Do **not** open", "__never__ edit", "`delete`") hide a negator or code word from the regexes below.
+// Strip the markup from plain words only. A path token (it contains "/" or ".") keeps its backticks or emphasis.
+function normaliseEmphasis(text) {
+  return String(text || '')
+    .replace(/(?<![\w*])\*\*([A-Za-z][A-Za-z' -]*?)\*\*(?![\w*/.])/g, '$1')
+    .replace(/(?<![\w_])__([A-Za-z][A-Za-z' -]*?)__(?![\w_/.])/g, '$1')
+    .replace(/`([A-Za-z][\w-]*)`/g, '$1');
+}
+
+// Prohibition triggers. A code signal AFTER one of these in the same sentence is a negated request, not a request for code.
+const PROHIBITION_TRIGGER_RE = /\b(do\s+not|don['’]t|never|no|without)\b/i;
+
 function stripNonRequests(sen) {
   return sen.replace(NEGATED_VERB_RE, ' ').replace(PIPELINE_BOILERPLATE_RE, ' ');
 }
@@ -117,11 +137,20 @@ function scanForCodeSignals(text) {
   // still part of the SAME citation ("The code anchor is real: src/foo.js defines ..."),
   // and splitting on it would separate the citation marker from the very code-signal
   // token it's meant to cover.
-  const sentences = String(text || '').split(/(?<=[.!?])\s+|\n+/);
+  const sentences = normaliseEmphasis(text).split(/(?<=[.!?])\s+|\n+/);
+  const excluded = [];
   let docDeliverable = false;
   const tripping = [];
-  for (const sen of sentences) {
+  for (let si = 0; si < sentences.length; si++) {
+    const sen = sentences[si];
     if (CITATION_CONTEXT_RE.test(sen)) continue;
+    // A prohibition ("Do not open src/x.js") negates the code signals that come AFTER its trigger in the same sentence. A signal BEFORE the trigger is a real request
+    // ("Change the timeout in src/foo.js but do not touch the tests"), so such a sentence is left to the normal scan.
+    const prohib = PROHIBITION_TRIGGER_RE.exec(sen);
+    if (prohib && CODE_SIGNAL_RE.test(sen.slice(prohib.index + prohib[0].length)) && !CODE_SIGNAL_RE.test(sen.slice(0, prohib.index))) {
+      excluded.push({ event: 'prohibition-excluded-from-signal', sentenceIndex: si, trigger: prohib[1].toLowerCase() });
+      continue;
+    }
     let cleaned = stripNonRequests(sen);
     const doc = DOC_DELIVERABLE_RE.exec(cleaned);
     if (doc) {
@@ -132,7 +161,7 @@ function scanForCodeSignals(text) {
     }
     if (CODE_SIGNAL_RE.test(cleaned)) tripping.push(cleaned);
   }
-  return { docDeliverable, tripping };
+  return { docDeliverable, tripping, excluded };
 }
 
 // A code PATH merely named, cited or described does not make a sentence a request -- but a sentence that OPENS WITH AN IMPERATIVE does, whatever the verb: "Lazy-load the job
@@ -540,6 +569,29 @@ function isCreatedDocDeliverable(task, planText, rawText, files) {
   return !scanForCodeSignals(rawText).tripping.some(opensWithImperative);
 }
 
+// Exact path tokens the task text names in a non-restriction sentence that also carries a create or change verb ("Add a test in src/foo.test.js").
+// Used only to exempt a changed file from the forbidden-path check when its normalized path EXACTLY equals a named path. Never prefix matching.
+const NAMED_PATH_NEGATION_RE = /\b(?:not|no|never|without|avoid|unchanged|don['’]t|do\s+not|must\s+not)\b/i;
+const NAMED_PATH_VERB_RE = /\b(?:create|add|implement|change|update|modify|edit|write|rename|replace|wire|append|prepend|insert|remove|delete|fix|refactor|move)\b/i;
+const NAMED_PATH_TOKEN_RE = /(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]+/g;
+function normalizeDiffPath(p) {
+  return String(p || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^[`'"(\[]+|[`'"),;:\]]+$/g, '');
+}
+function collectNamedDiffPaths(task, planText = '') {
+  const rawText = (task && task.promptContext && task.promptContext.rawText) || (task && task.title) || '';
+  const named = new Set();
+  for (const text of [rawText, planText]) {
+    for (const sen of String(text || '').split(/(?<=[.!?:;])\s+|\n+/)) {
+      if (NAMED_PATH_NEGATION_RE.test(sen) || !NAMED_PATH_VERB_RE.test(sen)) continue;
+      for (const m of sen.match(NAMED_PATH_TOKEN_RE) || []) {
+        const p = normalizeDiffPath(m);
+        if (p) named.add(p);
+      }
+    }
+  }
+  return named;
+}
+
 function taskWantsCodeChange(task) {
   const rawText = (task && task.promptContext && task.promptContext.rawText) || (task && task.title) || '';
   const planText = (task && (task.planResponse || task.lastGoodPlan)) || '';
@@ -562,9 +614,15 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   const targets = extractDeclaredTargets(task, planText);
   const forbidden = extractForbiddenPaths(combined)
     .filter((f) => !targets.some((t) => pathsRefEqual(f, t)));
+  const forbiddenOverride = findOverride(task, 'forbidden-path');
+  const forbiddenSuppressed = [];
   if (forbidden.length) {
-    const violations = files.map((f) => ({ f, hit: pathHitsForbidden(f.path, forbidden) })).filter((v) => v.hit);
-    if (violations.length) {
+    // A file the task itself names exactly (in a create/change sentence, not a restriction) is exempt; directory and basename restrictions still apply to every other file.
+    const namedDiffPaths = collectNamedDiffPaths(task, planText);
+    const violations = files.map((f) => ({ f, hit: pathHitsForbidden(f.path, forbidden) })).filter((v) => v.hit && !namedDiffPaths.has(normalizeDiffPath(v.f.path)));
+    if (violations.length && forbiddenOverride) {
+      for (const v of violations) forbiddenSuppressed.push(v.f.path);
+    } else if (violations.length) {
       const list = violations.map((v) => `${v.f.path} (matches forbidden "${v.hit}")`).join(', ');
       return {
         code: 'forbidden-path',
@@ -573,6 +631,8 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
       };
     }
   }
+
+  if (forbiddenOverride) recordGateOverride(task, 'forbidden-path', forbiddenOverride, forbiddenSuppressed);
 
   // 2. Deletes a file the task never asked to delete.
   const deletes = files.filter((f) => f.kind === 'delete');
@@ -589,6 +649,8 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   // (when present) is authoritative -- see extractDeclaredFiles's own header for why a
   // free-text keyword scan can't distinguish an edit target from a cited-as-evidence
   // path. Only falls back to CODE_SIGNAL_RE's blind scan when no Files: line exists.
+  const docsOverride = findOverride(task, 'docs-only');
+  const docsSuppressed = [];
   const nonDoc = files.filter((f) => !isDocPath(f.path));
   // A task whose own declared edit targets are ALL documentation (its Files: line, a path in its title, or a file it says to create) is a documentation task no matter how many code paths
   // its text cites as evidence (HUB0117 3/4: "Edit `docs/local-delegation.md` ... point to `agent-manager.env.example`").
@@ -623,6 +685,7 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
       // Fall through to the legacy check below
     } else if (mentionsDocs && allFilesAreDocs) {
       // Pure docs task: no code signals, diff matches declared docs -> pass
+      if (docsOverride) recordGateOverride(task, 'docs-only', docsOverride, []);
       return null;
     }
     // Mixed task (code + docs) that only produced docs: provide specific feedback about missing code
@@ -642,13 +705,17 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
       const specificFeedback = missingCode.length > 0
         ? ` The task mentions these code paths that your diff should include: ${missingCode.join(', ')}.`
         : '';
-      return {
+      if (docsOverride) {
+        for (const f of files) docsSuppressed.push(f.path);
+      } else return {
         code: 'docs-only',
         reason: `diff only touches documentation (${files.map((f) => f.path).join(', ')}) -- the task asks for a code change`,
         retryFeedback: `${feedbackBase}${specificFeedback}`,
       };
     }
   }
+
+  if (docsOverride) recordGateOverride(task, 'docs-only', docsOverride, docsSuppressed);
 
   // 4. A checkable "all N tests pass/added" claim contradicted by the diff's own test defs.
   const claimed = extractClaimedTestCount(summary);

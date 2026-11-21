@@ -5,7 +5,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { branchVerdictKey, branchVerdictBorderStyle, branchVerdictBadgeHtml, branchVerdictDetailHtml, filterBranchesByVerdict, branchVerdictFilterBarHtml } = require('./branch-verdicts.js');
+const { branchVerdictAgeText, branchDuplicateText, branchVerdictKey, branchVerdictBorderStyle, branchVerdictBadgeHtml, branchVerdictDetailHtml, filterBranchesByVerdict, branchVerdictFilterBarHtml } = require('./branch-verdicts.js');
 
 const B = (verdict, extra = {}) => ({ branch: 'agent/x', verdict, reasons: ['r1', 'r2'], source: 'manual', stale: false, ...extra });
 
@@ -158,4 +158,64 @@ test('discard all: the bar is a flex container and only the Discard-all button i
   assert.match(html, /<button class="secondary" data-discard-all style="margin-left:auto;margin-right:18px"/);
   assert.equal((html.match(/margin-left:auto/g) || []).length, 1, 'no filter chip is pushed right');
   assert.doesNotMatch(branchVerdictFilterBarHtml(list, 'all'), /margin-left:auto/);
+});
+
+// ---- Needs re-verify (owner 2026-11-18): a 'merge' branch the server flags with b.reverify leaves "Ready to merge".
+const { BRANCH_VERDICT_FILTERS } = require('./branch-verdicts.js');
+const RV = (extra = {}) => B('merge', { reverify: { reasons: ['conflicts with master now'], verdictAgeHours: 5 }, verdictAgeHours: 5, ...extra });
+
+test('re-verify: a merge branch with reverify reasons is its own bucket, after Ready to merge in the filter bar', () => {
+  assert.equal(branchVerdictKey(RV()), 'reverify');
+  assert.equal(branchVerdictKey(B('merge')), 'merge');
+  assert.equal(branchVerdictKey(B('merge', { reverify: { reasons: [] } })), 'merge');
+  assert.equal(branchVerdictKey(B('needs-work', { reverify: { reasons: ['x'] } })), 'needs-work');
+  assert.equal(branchVerdictKey(RV({ stale: true })), 'unverified');
+  const keys = BRANCH_VERDICT_FILTERS.map((f) => f.key);
+  assert.equal(keys.indexOf('reverify'), keys.indexOf('merge') + 1);
+  assert.equal(BRANCH_VERDICT_FILTERS.find((f) => f.key === 'reverify').label, 'Needs re-verify');
+});
+
+test('re-verify: the chip counts exclude flagged branches and the new bucket counts them', () => {
+  const list = [B('merge'), B('merge'), RV(), RV(), RV(), B('needs-work')];
+  const html = branchVerdictFilterBarHtml(list, 'all');
+  assert.match(html, /Ready to merge \(2\)/);
+  assert.match(html, /Needs re-verify \(3\)/);
+  assert.match(html, /All \(6\)/);
+  assert.equal(filterBranchesByVerdict(list, 'merge').length, 2);
+  assert.equal(filterBranchesByVerdict(list, 'reverify').length, 3);
+});
+
+test('re-verify: the card shows every reason, the verdict age and a duplicate notice, escaped', () => {
+  const b = RV({ reverify: { reasons: ['conflicts with master now', 'verified 6 days ago, 787 commits behind master'] }, verdictAgeHours: 150, duplicateOf: ['agent/other<x>'] });
+  const html = branchVerdictBadgeHtml(b);
+  assert.match(html, /class="badge warn" data-verdict="reverify"/);
+  assert.match(html, />re-verify</);
+  assert.match(html, /conflicts with master now/);
+  assert.match(html, /verified 6 days ago, 787 commits behind master/);
+  assert.match(html, /verdict 6 days old/);
+  assert.match(html, /duplicate of agent\/other&lt;x&gt;/);
+  assert.doesNotMatch(html, /<x>/);
+});
+
+test('verdict age text: minutes, hours, days, unknown', () => {
+  assert.equal(branchVerdictAgeText(B('merge', { verdictAgeHours: 0.2 })), 'verdict under an hour old');
+  assert.equal(branchVerdictAgeText(B('merge', { verdictAgeHours: 3.9 })), 'verdict 3 h old');
+  assert.equal(branchVerdictAgeText(B('merge', { verdictAgeHours: 47 })), 'verdict 47 h old');
+  assert.equal(branchVerdictAgeText(B('merge', { verdictAgeHours: 49 })), 'verdict 2 days old');
+  assert.equal(branchVerdictAgeText(B('merge')), '');
+  assert.equal(branchVerdictAgeText(B('merge', { verdictAgeHours: 'x' })), '');
+});
+
+test('duplicate notice: lists the other branches, empty when none', () => {
+  assert.equal(branchDuplicateText(B('merge', { duplicateOf: ['agent/a', 'agent/b'] })), 'duplicate of agent/a, agent/b');
+  assert.equal(branchDuplicateText(B('merge', { duplicateOf: [] })), '');
+  assert.equal(branchDuplicateText(B('merge')), '');
+});
+
+test('a plain merge card still shows the one-line first reason and the age line when known', () => {
+  const html = branchVerdictBadgeHtml(B('merge', { verdictAgeHours: 2 }));
+  assert.match(html, /class="badge ok" data-verdict="merge"/);
+  assert.match(html, /r1/);
+  assert.doesNotMatch(html, /r2/);
+  assert.match(html, /verdict 2 h old/);
 });

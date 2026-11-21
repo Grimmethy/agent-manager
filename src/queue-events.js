@@ -24,7 +24,9 @@ const realFs = require('fs');
 const crypto = require('crypto');
 const path = require('path');
 
-const TYPES = ['verdict_recorded', 'branch_merged'];
+const TYPES = ['verdict_recorded', 'branch_merged', 'branch_pushed', 'task_stalled'];
+const STALL_STAGES = ['blocked', 'needs-clarification', 'awaiting-confirm', 'review-rejected', 'apply-blocked', 'unclaimed', 'checker-left-for-owner', 'checker-not-ready', 'no-checker-row', 'no-merger-row'];
+const activeStalls = new Set();
 const MAX_LINE_BYTES = 3500;
 const DEFAULT_ROTATE_BYTES = 5 * 1024 * 1024;
 
@@ -52,18 +54,32 @@ function readJson(fs, file) {
 
 function append(pipelineDir, event, { fs = realFs, now = () => new Date(), maxBytes = DEFAULT_ROTATE_BYTES } = {}) {
   if (!event || !TYPES.includes(event.type)) throw new RangeError(`unknown event type: ${event && event.type}`);
+  if (process.env.AGENT_MANAGER_QUEUE_EVENTS && process.env.AGENT_MANAGER_QUEUE_EVENTS.trim().toLowerCase() === 'off') return false;
   let project = path.resolve(pipelineDir);
   try { project = fs.realpathSync(pipelineDir); } catch { /* not on disk yet: the given path */ }
-  const rec = {
-    at: event.at || now().toISOString(),
-    type: event.type,
-    branch: event.branch || null,
-    taskId: event.taskId || null,
-    sha: event.sha || null,
-    verdict: event.verdict || null,
-    source: event.source || null,
-    project,
-  };
+  let rec;
+  if (event.type === 'task_stalled') {
+    rec = {
+      at: event.at || now().toISOString(),
+      type: event.type,
+      taskId: event.taskId || null,
+      project: event.project || project,
+      stage: event.stage || null,
+      reason: event.reason || null,
+      since: event.since || null,
+    };
+  } else {
+    rec = {
+      at: event.at || now().toISOString(),
+      type: event.type,
+      branch: event.branch || null,
+      taskId: event.taskId || null,
+      sha: event.sha || null,
+      verdict: event.verdict || null,
+      source: event.source || null,
+      project,
+    };
+  }
   const line = `${JSON.stringify(rec)}\n`;
   if (Buffer.byteLength(line) >= MAX_LINE_BYTES) throw new RangeError(`event line is ${Buffer.byteLength(line)} bytes; the limit is ${MAX_LINE_BYTES - 1}`);
   const dir = dirOf(pipelineDir);
@@ -74,6 +90,44 @@ function append(pipelineDir, event, { fs = realFs, now = () => new Date(), maxBy
   } catch { /* no journal yet, or another writer rotated it first */ }
   fs.appendFileSync(file, line);                                                           // one write on an O_APPEND descriptor
   return line;
+}
+
+function enterStall({ taskId, project, stage, reason, since }) {
+  try {
+    if (process.env.AGENT_MANAGER_QUEUE_EVENTS && process.env.AGENT_MANAGER_QUEUE_EVENTS.trim().toLowerCase() === 'off') return;
+    if (typeof stage !== 'string' || !STALL_STAGES.includes(stage)) return;
+    if (!taskId || !project) return;
+    const key = `${project}|${taskId}|${stage}`;
+    if (activeStalls.has(key)) return;
+    let truncatedReason = reason;
+    if (typeof reason === 'string') {
+      const testLine = `${JSON.stringify({ at: new Date().toISOString(), type: 'task_stalled', taskId, project, stage, reason, since: since || null })}\n`;
+      if (Buffer.byteLength(testLine) >= MAX_LINE_BYTES) {
+        let lo = 0, hi = reason.length;
+        while (lo < hi) {
+          const mid = Math.ceil((lo + hi) / 2);
+          const trial = reason.slice(0, mid);
+          const t = `${JSON.stringify({ at: new Date().toISOString(), type: 'task_stalled', taskId, project, stage, reason: trial, since: since || null })}\n`;
+          if (Buffer.byteLength(t) < MAX_LINE_BYTES) {
+            lo = mid;
+          } else {
+            hi = mid - 1;
+          }
+        }
+        truncatedReason = reason.slice(0, lo);
+      }
+    }
+    const line = append(project, { type: 'task_stalled', taskId, project, stage, reason: truncatedReason, since });
+    if (line) activeStalls.add(key);
+  } catch (e) {
+    console.error(`queue-events enterStall: ${e.message}`);
+  }
+}
+
+function clearStall({ taskId, project, stage }) {
+  if (!taskId || !project || !stage) return;
+  const key = `${project}|${taskId}|${stage}`;
+  activeStalls.delete(key);
 }
 
 // Identity of a journal file independent of its inode number: a hash of its first line ('' while the first line is still being written or the file is empty).
@@ -160,14 +214,14 @@ function readCorrections(pipelineDir, { fs = realFs } = {}) {
   return { total: Number(cur.total) || 0, byConsumer: cur.byConsumer && typeof cur.byConsumer === 'object' ? cur.byConsumer : {}, lastAt: cur.lastAt || null };
 }
 
-module.exports = { append, drain, snapshot, recordCorrection, readCorrections, TYPES, MAX_LINE_BYTES, DEFAULT_ROTATE_BYTES, journalPath, rotatedPath };
+module.exports = { append, drain, snapshot, recordCorrection, readCorrections, enterStall, clearStall, TYPES, STALL_STAGES, MAX_LINE_BYTES, DEFAULT_ROTATE_BYTES, journalPath, rotatedPath };
 
 if (require.main === module) {
   const [cmd, ...rest] = process.argv.slice(2);
   const opt = {};
   for (let i = 0; i < rest.length; i += 2) opt[rest[i].replace(/^--/, '')] = rest[i + 1];
   if (cmd !== 'emit' || !opt.dir || !opt.type) {
-    console.error('usage: queue-events.js emit --dir <pipelineDir> --type <verdict_recorded|branch_merged> [--branch B] [--task-id I] [--sha S] [--verdict V] [--source S]');
+    console.error('usage: queue-events.js emit --dir <pipelineDir> --type <verdict_recorded|branch_merged|branch_pushed|task_stalled> [--branch B] [--task-id I] [--sha S] [--verdict V] [--source S]');
     process.exit(2);
   }
   try {

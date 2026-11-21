@@ -119,37 +119,43 @@ function contextWorkerFindingsHtml(f) {
 
 // The impact worker's own lines (payload.impact from routes/context_worker.py): what its newest decision found, the investigation tasks it has filed, the intervention ledger per kind and the
 // authority gate. Collapsed: two lines; open: the lists behind them. A missing section (its reader failed) draws nothing; fields that are not lists or numbers read as empty or zero.
+// `payload` is the full worker payload (used for unknown-name fallback); `knownName` is the worker name; `impact` defaults to payload.impact when omitted.
 const contextWorkerImpactShown = 3;
 
-function contextWorkerImpactHtml(impact, open) {
-  if (!impact || typeof impact !== 'object') return '';
+function contextWorkerImpactHtml(payload, knownName, impact) {
+  const p = payload && typeof payload === 'object' ? payload : {};
+  const name = typeof knownName === 'string' && knownName ? knownName : (p.impactCard && typeof p.impactCard === 'object' && typeof p.impactCard.title === 'string' ? p.impactCard.title : 'context-impact worker');
+  const trunc = name.length > 48 ? name.slice(0, 47) + '…' : name;
+  const imp = impact !== undefined ? impact : (p.impact && typeof p.impact === 'object' ? p.impact : null);
+  if (!imp || typeof imp !== 'object') return '';
   const list = (v) => (Array.isArray(v) ? v : []);
   const names = (v) => list(v).filter((x) => typeof x === 'string');
-  const latest = impact.latest && typeof impact.latest === 'object' ? impact.latest : null;
+  const latest = imp.latest && typeof imp.latest === 'object' ? imp.latest : null;
   const regressed = names(latest && latest.regressed);
   const improved = names(latest && latest.improved);
   const insufficient = names(latest && latest.insufficient);
   const wouldFile = names(latest && latest.wouldFile);
-  const filedCount = Number(impact.filedCount) > 0 ? Math.floor(Number(impact.filedCount)) : 0;
+  const filedCount = Number(imp.filedCount) > 0 ? Math.floor(Number(imp.filedCount)) : 0;
   const shown = (arr) => arr.slice(0, contextWorkerImpactShown).map((x) => contextWorkerEsc(contextWorkerCut(x, 48))).join(', ') + (arr.length > contextWorkerImpactShown ? ' +' + (arr.length - contextWorkerImpactShown) + ' more' : '');
   const line = (text, tip) => '<div class="meta" style="margin-top:2px"' + (tip ? ' title="' + contextWorkerEsc(tip) + '"' : '') + '>' + text + '</div>';
   const summary = latest
     ? 'impact: ' + contextWorkerInt(regressed.length) + ' regressed, ' + contextWorkerInt(improved.length) + ' improved, ' + contextWorkerInt(insufficient.length) + ' channel' + (insufficient.length === 1 ? '' : 's') + ' short of data'
     : 'impact: no decision yet';
-  const interventions = impact.interventions && typeof impact.interventions === 'object' ? impact.interventions : {};
+  const interventions = imp.interventions && typeof imp.interventions === 'object' ? imp.interventions : {};
   const kindText = (kind) => {
     const c = interventions[kind] && typeof interventions[kind] === 'object' ? interventions[kind] : {};
     return kind + ' ' + contextWorkerInt(c.HELPED) + ' helped / ' + contextWorkerInt(c['NO-EFFECT']) + ' no effect / ' + contextWorkerInt(c.HARMED) + ' harmed / ' + contextWorkerInt(c.open) + ' waiting';
   };
-  const gate = impact.gate && typeof impact.gate === 'object' ? impact.gate : {};
+  const gate = imp.gate && typeof imp.gate === 'object' ? imp.gate : {};
   const gateText = 'authority gate ' + (gate.open === true ? 'OPEN' : 'closed') + ' (' + contextWorkerInt(gate.evaluated) + ' map edit' + (Number(gate.evaluated) === 1 ? '' : 's') + ' evaluated, ' + contextWorkerInt(gate.helped) + ' helped)';
+  const open = contextWorkerExpanded.impact === true;
   let html = line(contextWorkerEsc(summary) + (regressed.length ? ' · ' + shown(regressed) : ''), regressed.join(', '))
     + line(contextWorkerInt(filedCount) + ' investigation task' + (filedCount === 1 ? '' : 's') + ' filed · ' + contextWorkerEsc(gateText), 'The gate opens at 3 evaluated map edits with more than half helped: only then may a change of the default grounding source be proposed.');
   if (!open) return html;
   if (improved.length) html += line('improved: ' + shown(improved));
   if (insufficient.length) html += line('not enough data: ' + shown(insufficient), insufficient.join(', '));
   if (wouldFile.length) html += line('dry run: would file ' + contextWorkerInt(wouldFile.length) + ' investigation task' + (wouldFile.length === 1 ? '' : 's') + ': ' + shown(wouldFile), wouldFile.join(', '));
-  const filed = list(impact.filed).filter((f) => f && typeof f === 'object' && typeof f.taskId === 'string');
+  const filed = list(imp.filed).filter((f) => f && typeof f === 'object' && typeof f.taskId === 'string');
   if (filed.length) html += line('filed: ' + filed.slice(-contextWorkerImpactShown).map((f) => contextWorkerEsc(contextWorkerCut(f.taskId, 40))).join(', ') + (filed.length > contextWorkerImpactShown ? ' (newest ' + contextWorkerImpactShown + ' of ' + contextWorkerInt(filedCount) + ')' : ''), filed.map((f) => f.taskId).join(', '));
   html += line(contextWorkerEsc(kindText('map-edit'))) + line(contextWorkerEsc(kindText('memory-edit')));
   return html;
@@ -213,13 +219,13 @@ function buildContextWorkerHtml(p, nowMs) {
   const detail = open ? '<div class="worker-recent-tasks"><div class="meta" style="margin-top:8px"><strong>Today</strong> ' + contextWorkerTodayText(p) + '</div>'
     + contextWorkerRecentHtml(p.recent) + '</div>' : '';
   return '<div id="context-' + name + '-worker-panel" class="worker-card clickable' + (off ? ' worker-off' : '') + '" data-context-expand="' + name + '" aria-expanded="' + open + '">'
-    + head + meta + contextWorkerLastDecisionHtml(p, now) + contextWorkerFindingsHtml(p.findings) + (name === 'impact' ? contextWorkerImpactHtml(p.impact, open) : '') + contextWorkerErrorHtml(p.errors) + holds + toggle + detail + '</div>';
+    + head + meta + contextWorkerLastDecisionHtml(p, now) + contextWorkerFindingsHtml(p.findings) + (name === 'impact' ? contextWorkerImpactHtml(p, p.name, p.impact) : '') + contextWorkerErrorHtml(p.errors) + holds + toggle + detail + '</div>';
 }
 
 // What renderWorkers() appends: the map card, the memory card, then the impact card, each nothing at all unless that worker has left a trace (ledger, trigger state or a switched-off marker).
-// `nowMs` only dates the last decision; the fourth argument is optional so a caller that knows two workers still works.
+// `nowMs` only dates the last decision; the fourth argument (impact payload) is optional so a caller that knows two workers still works.
 function renderContextWorkerSection(mapPayload, memoryPayload, nowMs, impactPayload) {
-  return buildContextWorkerHtml(mapPayload, nowMs) + buildContextWorkerHtml(memoryPayload, nowMs) + buildContextWorkerHtml(impactPayload, nowMs);
+  return buildContextWorkerHtml(mapPayload, nowMs) + buildContextWorkerHtml(memoryPayload, nowMs) + buildContextWorkerHtml(impactPayload || null, nowMs);
 }
 
 // POST the switch, then redraw the Workers tab. Returns true on success.

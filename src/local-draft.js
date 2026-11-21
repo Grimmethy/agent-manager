@@ -714,8 +714,30 @@ const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) 
 // degenerate planResult never reaches here -- the `!planResult.degenerate` in the re-roll
 // condition below stays as the unit-test contract that a degenerate input simply skips
 // the re-roll.
+// Plan-stage cap for silent-catch-block dismissals (see silent-catch-plan-cap.js). Only an
+// observability_review finding that the review already dismissed counts as an expected
+// dismissal; a bare silent-catch-block rule never does, so a genuine finding's plan is never
+// truncated. Logs 'plan-done-capped' only when the text actually shrinks.
+function derivePlanCapContext(task) {
+  const ruleId = (task.promptContext && (task.promptContext.originalRule || task.promptContext.rule)) || '';
+  const expectedDisposition = (task.source === 'observability_review' && task.reviewDisposition === 'dismissed') ? 'dismiss' : null;
+  return { ruleId, expectedDisposition };
+}
+
+// ruleId / expectedDisposition may be passed in (runPlanPass derives them once); when omitted they are derived from the task.
+function capPlanForTask(task, text, appendHistoryEvent, ruleIdArg, expectedArg) {
+  const derived = derivePlanCapContext(task);
+  const ruleId = ruleIdArg !== undefined ? ruleIdArg : derived.ruleId;
+  const expected = expectedArg !== undefined ? expectedArg : derived.expectedDisposition;
+  const capped = require('./silent-catch-plan-cap').capPlanStageOutput(text, ruleId, expected);
+  if (capped.length < text.length) {
+    appendHistoryEvent(task, 'plan-done-capped', `ruleId=${ruleId} expectedDisposition=${expected} originalLength=${text.length} cappedLength=${capped.length}`);
+  }
+  return capped;
+}
+
 async function attemptSeedReroll({
-  planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task,
+  planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task, ruleId, expectedDisposition,
 }) {
   let totalAttempts = planResult.attempts || 1;
   let reRolled = false;
@@ -738,14 +760,14 @@ async function attemptSeedReroll({
   if (stillThin && seedPlan) {
     // Thin rolls, but a real plan from a prior attempt exists -- reuse it verbatim rather
     // than hand the implement tiers a stub with no map.
-    task.planResponse = seedPlan;
+    task.planResponse = capPlanForTask(task, seedPlan, appendHistoryEvent, ruleId, expectedDisposition);
     task.lastGoodPlan = seedPlan;
     recordPlan(attempt, { text: seedPlan, attempts: totalAttempts, reRolled, seededFromPrior: true });
     appendHistoryEvent(task, 'plan-done', `${totalAttempts} attempt(s), reused a prior attempt's plan (${seedPlan.length} chars) after ${reRolled ? 'two thin rolls' : 'a thin roll'}`);
     return { planResult, totalAttempts, reRolled, stillThin, seededFromPrior: true };
   }
 
-  task.planResponse = planResult.response;
+  task.planResponse = capPlanForTask(task, planResult.response, appendHistoryEvent, ruleId, expectedDisposition);
   // Fix 2b: keep the last good plan outside draftAttempts (so record collapse can't drop
   // it -- it is the seed source for any later retry). Never store a thin one.
   if (!stillThin) task.lastGoodPlan = planResult.response;
@@ -843,7 +865,7 @@ async function executePlanRolls(callPlan, planLen, { substanceGated, recordModel
 // locals. Call order, arguments, and side effects are exactly what the inline code did;
 // returns { blocked: true, blockedReason, blockedStage: 'plan' } on a degenerate roll,
 // else undefined after handing the (possibly re-rolled) plan to attemptSeedReroll.
-async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding }) {
+async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding, ruleId, expectedDisposition }) {
   if (planResult.degenerate) {
     const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
     recordPlan(attempt, { degenerate: planResult.degenerate, attempts: planResult.attempts || 1 });
@@ -865,7 +887,7 @@ async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRo
   // value keeps the bookkeeping locals (totalAttempts, reRolled, stillThin,
   // seededFromPrior) available below.
   const seedReroll = await attemptSeedReroll({
-    planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task,
+    planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task, ruleId, expectedDisposition,
   });
   return { planResult: seedReroll.planResult, totalAttempts: seedReroll.totalAttempts, reRolled: seedReroll.reRolled, stillThin: seedReroll.stillThin, seededFromPrior: seedReroll.seededFromPrior };
 }
@@ -894,7 +916,7 @@ function reusePriorPlanForContinuation(task, attempt) {
   if (resolveSourceName(task) !== 'adhoc' || task.isAgenticContinuation !== true || task._planCritiqueRevised) return false;
   const plan = bestPriorPlan(task);
   if (!plan || parseCriteriaBlock(plan).length === 0) return false;
-  task.planResponse = plan;
+  task.planResponse = capPlanForTask(task, plan, appendHistoryEvent);
   task.lastGoodPlan = plan;
   if (process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE !== 'false') applyPlanAcceptanceCriteria(task);
   recordPlan(attempt, { text: plan, seededFromPrior: true });
@@ -902,11 +924,95 @@ function reusePriorPlanForContinuation(task, attempt) {
   return true;
 }
 
+// Deterministic-checklist plan skip (2026-11-18): an adhoc task whose acceptance criteria
+// already arrive as a fully-specified checklist (>=3 items, each naming a repo path and a
+// checkable literal/command/exit code) does not need a plan model call -- the criteria ARE
+// the plan. Any item that fails the shape test keeps the plan pass running. The plan-critique
+// re-plan (_planCritiqueRevised) is a deliberate second plan and is never skipped.
+// Kill switch: AGENT_MANAGER_ADHOC_CHECKLIST_SKIP=false.
+const DETERMINISTIC_PATH_RE = /(?:^|[\s`(])[\w.-]+\/[\w./-]+|\b[\w-]+\.(?:js|ts|py|md|json|sh|yml|yaml)\b/;
+const DETERMINISTIC_CHECK_RE = /`|\bexits?\s+(?:0|\d+)\b|\bexit code\b|\bequals?\b|\bcontains?\b|\bis\s+\d{3}\b/i;
+
+function isDeterministicChecklist(task) {
+  if (process.env.AGENT_MANAGER_ADHOC_CHECKLIST_SKIP === 'false') return false;
+  if (resolveSourceName(task) !== 'adhoc' || task._planCritiqueRevised) return false;
+  const { criteria } = resolveAcceptanceCriteria(task);
+  if (criteria.length < 3) return false;
+  return criteria.every((c) => DETERMINISTIC_PATH_RE.test(c) && DETERMINISTIC_CHECK_RE.test(c));
+}
+
+// Returns true when the plan pass was skipped (no model call); the criteria become the plan.
+function skipPlanForDeterministicChecklist(task, attempt) {
+  if (!isDeterministicChecklist(task)) return false;
+  const { criteria } = resolveAcceptanceCriteria(task);
+  const text = `CRITERIA:\n${criteria.map((c) => `- ${c}`).join('\n')}`;
+  task.planResponse = capPlanForTask(task, text, appendHistoryEvent);
+  task.lastGoodPlan = text;
+  applyPlanAcceptanceCriteria(task);
+  recordPlan(attempt, { text, seededFromPrior: false });
+  appendHistoryEvent(task, 'plan-done', `skipped plan pass: deterministic checklist (${criteria.length} items) -- ${criteria.map((c) => c.slice(0, 80)).join(' | ')}`);
+  return true;
+}
+
+// Named-change plan skip: a lookup/substring check over the criteria text. A criterion has a
+// verified named target when it contains a repo path token that exists (fileExists lookup, which
+// also covers named test files) or a process.env.NAME expression. The plan is skipped only when
+// EVERY criterion has at least one verified target; any criterion without one (e.g. "update the
+// README usage section") keeps the plan pass running. Pure: fileExists is injected.
+// Kill switch: AGENT_MANAGER_ADHOC_NAMED_SKIP=false.
+const NAMED_PATH_RE = /(?:[\w.-]+\/)+[\w.-]+\.[A-Za-z]{1,5}\b/g;
+const NAMED_TEST_RE = /[\w./-]+\.test\.js/g;
+const NAMED_ENV_RE = /process\.env\.[A-Z][A-Z0-9_]+/g;
+
+function skipPlanForNamedChange(criteria, { fileExists } = {}) {
+  const list = Array.isArray(criteria) ? criteria.filter((c) => typeof c === 'string' && c.trim()) : [];
+  if (list.length === 0) return { skip: false, reason: 'no-criteria', targets: [], unmatched: [] };
+  const exists = typeof fileExists === 'function' ? fileExists : () => false;
+  const targets = [];
+  const unmatched = [];
+  for (const c of list) {
+    const found = [];
+    const pathTokens = new Set([...(c.match(NAMED_PATH_RE) || []), ...(c.match(NAMED_TEST_RE) || [])]);
+    for (const tok of pathTokens) { if (exists(tok)) found.push(tok); }
+    for (const env of (c.match(NAMED_ENV_RE) || [])) found.push(env);
+    if (found.length === 0) unmatched.push(c); else targets.push(...found);
+  }
+  if (unmatched.length) return { skip: false, reason: 'unnamed-criterion', targets, unmatched };
+  return { skip: true, reason: 'all-criteria-named', targets, unmatched };
+}
+
+// Returns true when the plan pass was skipped (no model call); the criteria become the plan.
+// Every decision is recorded as a plan-skip-named-change history event (reason, targets, unmatched).
+function applyNamedChangePlanSkip(task, attempt, fileExistsFn) {
+  if (process.env.AGENT_MANAGER_ADHOC_NAMED_SKIP === 'false') return false;
+  if (resolveSourceName(task) !== 'adhoc' || task._planCritiqueRevised) return false;
+  const { criteria } = resolveAcceptanceCriteria(task);
+  const repoRoot = getConfig().repoRoot;
+  const fileExists = fileExistsFn || ((p) => {
+    try { return fs.existsSync(require('path').join(repoRoot, p)); } catch (_) { return false; }
+  });
+  const d = skipPlanForNamedChange(criteria, { fileExists });
+  const evt = d.skip ? 'plan-skipped-named-change' : 'plan-not-skipped-named-change';
+  appendHistoryEvent(task, 'plan-skip-named-change', `${evt}: reason=${d.reason} targets=${JSON.stringify(d.targets)} unmatched=${JSON.stringify(d.unmatched.map((c) => c.slice(0, 120)))} criteria=${JSON.stringify(criteria.map((c) => c.slice(0, 120)))}`);
+  if (!d.skip) return false;
+  const text = `CRITERIA:\n${criteria.map((c) => `- ${c}`).join('\n')}`;
+  task.planResponse = capPlanForTask(task, text, appendHistoryEvent);
+  task.lastGoodPlan = text;
+  applyPlanAcceptanceCriteria(task);
+  recordPlan(attempt, { text, seededFromPrior: false });
+  appendHistoryEvent(task, 'plan-done', `skipped plan pass: named change (${criteria.length} items) -- ${d.targets.join(', ')}`);
+  return true;
+}
+
 async function runPlanPass(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
-  runOrientPassFn = runOrientPass, recordModelCall,
+  runOrientPassFn = runOrientPass, recordModelCall, fileExistsFn,
 }) {
   if (reusePriorPlanForContinuation(task, attempt)) return { blocked: false };
+  if (skipPlanForDeterministicChecklist(task, attempt)) return { blocked: false };
+  if (applyNamedChangePlanSkip(task, attempt, fileExistsFn)) return { blocked: false };
+  // Plan-cap context derived once per pass and threaded to every plan write site below.
+  const { ruleId, expectedDisposition } = derivePlanCapContext(task);
   // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
   // trial lookup): researchPlanPrompt's own header used to call the research plan pass
   // "intentionally throwaway" and never gave it tool access -- so it could (and did)
@@ -1026,7 +1132,7 @@ async function runPlanPass(task, {
   // into handlePlanResult above -- same behavior, same recordPlan/appendHistoryEvent
   // order, now a single named unit. Returns { blocked: ... } on a degenerate roll.
   const handled = await handlePlanResult(task, attempt, {
-    planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding,
+    planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding, ruleId, expectedDisposition,
   });
   if (handled && handled.blocked) return handled;
   planResult = handled.planResult;
@@ -1054,7 +1160,7 @@ async function runPlanPass(task, {
     }
     // A degenerate re-roll carries no usable plan -- keep the previous one.
     if (!reRoll.degenerate) {
-      task.planResponse = reRoll.response;
+      task.planResponse = capPlanForTask(task, reRoll.response, appendHistoryEvent, ruleId, expectedDisposition);
       // Keep the seed source (lastGoodPlan) consistent with the plan we now accept.
       if (!planIsThin(reRoll.response)) task.lastGoodPlan = reRoll.response;
     }
@@ -1521,6 +1627,25 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
     task.priorRejectionFeedback.push(blockedReason);
     return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
   }
+  // Deterministic decompose structure gate (src/decompose-structure-check.js, no LLM call): a RESOLUTION: decompose draft without a valid
+  // JSON array of {title, rawText} sub-tasks is bounced here, before any review vote is spent on it. Deterministic defect, so like the size
+  // gate it goes through the normal reject-retry loop (no reviewInconclusive). A throwing gate is advisory and never blocks a draft.
+  let decomposeGate = null;
+  try {
+    decomposeGate = require('./decompose-structure-check.js').runDecomposeStructureCheck(task, task.implementResponse);
+  } catch (e) {
+    decomposeGate = null;
+  }
+  if (decomposeGate && decomposeGate.verdict === 'blocked') {
+    const blockedReason = String(decomposeGate.reason || '(no detail)').slice(0, 500);
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: blockedReason });
+    appendHistoryEvent(task, 'blocked', blockedReason);
+    task.blockedStage = 'review';
+    task.blockedReason = blockedReason;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(blockedReason);
+    return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
+  }
   if (postImplementEntry && typeof postImplementEntry.postImplementCheck === 'function') {
     let grounding;
     try {
@@ -1977,7 +2102,19 @@ async function runDraftPasses(task, attempt, {
         // A stacked task builds on its chain branch tip, not the shared checkout's working tree (null for every non-stacked task).
         const guardRef = resolveGroundingRef(task, repoRoot);
         const existsAtRef = guardRef ? (p) => !!resolveAtRef(repoRoot, guardRef, p, grepAllowedDirs) : null;
-        const preImplementGuard = planTargetGuard(task, task.planResponse, repoRoot, grepAllowedDirs, existsAtRef);
+        const revisionCount = typeof task.revisionCount === 'number' ? task.revisionCount : 0;
+        const preImplementGuard = planTargetGuard({ ...task, revisionCount }, task.planResponse, repoRoot, grepAllowedDirs, existsAtRef);
+        if (preImplementGuard.revise) {
+          task.revisionCount = preImplementGuard.revise.revisionCount;
+          appendHistoryEvent(task, 'revise', preImplementGuard.revise.feedback);
+          return {
+            succeeded: true,
+            blocked: false,
+            revise: true,
+            reviseFeedback: preImplementGuard.revise.feedback,
+            blockedStage: 'pre-implement',
+          };
+        }
         if (preImplementGuard.blocked) {
           appendHistoryEvent(task, 'blocked', preImplementGuard.reason);
           return {
@@ -2138,7 +2275,7 @@ async function runDraftPasses(task, attempt, {
 
     return { succeeded: true, blocked: false };
   } catch (e) {
-    console.error('[local-draft] draftTask failed:', e.stack || String(e));
+    console.error('[local-draft] runDraftPasses failed:', e.stack || String(e));
     if (e.cause) console.error('[local-draft] draftTask cause:', e.cause.stack || String(e.cause));
     return { succeeded: false, reason: e.message };
   }
@@ -2382,7 +2519,7 @@ function tryGroundingRefreshFallback(task) {
   }
 }
 
-module.exports = { reusePriorPlanForContinuation, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, SPLIT_TRUNCATION_MAX_RETRIES, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
+module.exports = { skipPlanForNamedChange, applyNamedChangePlanSkip, reusePriorPlanForContinuation, isDeterministicChecklist, runPlanPass, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, SPLIT_TRUNCATION_MAX_RETRIES, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback, attemptSeedReroll };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on

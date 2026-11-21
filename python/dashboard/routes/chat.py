@@ -20,11 +20,12 @@ chat_bp = Blueprint("chat-bp", __name__)
 def api_chat_active():
     """Loads (or creates, if none exists yet) the single ongoing system-wide
     conversation -- called on dashboard load so the panel shows where you left off."""
-    from app import CHAT_STORAGE_DIR, _call_chat, _chat_roots, instances_dir
+    from app import CHAT_STORAGE_DIR, _call_chat, _chat_roots, get_registry_warnings, instances_dir
     from chat_sessions import get_active_session, PROVIDER_LOCAL
     session = _call_chat(get_active_session, CHAT_STORAGE_DIR, _chat_roots(),
                            instances_dir(), provider=PROVIDER_LOCAL)
-    return jsonify(session)
+    # _chat_roots() (called above) refreshes the registry warnings store, so read it after.
+    return jsonify({**session, "registryWarnings": get_registry_warnings()})
 
 
 @chat_bp.route("/api/chat/new", methods=["POST"])

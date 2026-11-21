@@ -210,6 +210,17 @@ _CANDIDATE_METADATA_LINE_RE = re.compile(r"^(?:###.*|Strength:.*|Files?:.*|Sourc
 _DESCRIPTION_MAX_CHARS = 600
 
 
+def _prompt_context_body(value):
+    """The candidate write-up text carried in a task's promptContext. A dict yields its
+    'body' value (None when absent; callers apply their own `or ""`), a str is taken as
+    the body itself, and anything else yields an empty string."""
+    if isinstance(value, dict):
+        return value.get("body")
+    if isinstance(value, str):
+        return value
+    return ""
+
+
 def _describe_change(data: dict) -> str | None:
     """Best-effort plain-English description of what a branch's task actually changed
     (Grimmethy, 2026-08-20: "I'd also like the unmerged branch reports to include a plain
@@ -274,8 +285,7 @@ def _describe_change(data: dict) -> str | None:
         if after:
             return after[:_DESCRIPTION_MAX_CHARS]
 
-    prompt_context = data.get("promptContext") or {}
-    body = (prompt_context.get("body") or "").strip()
+    body = (_prompt_context_body(data.get("promptContext")) or "").strip()
     if body:
         cleaned = strip_candidate_metadata(body)
         if cleaned:
