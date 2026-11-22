@@ -877,6 +877,22 @@ async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRo
     // blocked/ forever with zero automated retry -- confirmed live: 2 of 4 stuck-child
     // hubs in Hub Tasks were gated on exactly this shape. 'plan' is deliberately not
     // 'review'/'apply'/'pre-critique'/'draft' so none of those checks accidentally match it.
+    task.blockedStage = 'plan';
+    // 2026-11 (HUB0822 1/3): clear any BLOCKER-TYPE tag the task may have picked up
+    // from a prior implement pass. Without this, a task re-routed to plan carries its
+    // old infra-error/design-question/budget-exhausted classification and the plan pass
+    // output gets misclassified as infra-error on re-entry. The BLOCKER-TYPE line is
+    // embedded in blockedReason as a line matching /BLOCKER-TYPE:\s*(design-question|budget-exhausted|infra-error)\b/i;
+    // strip that line (and the trailing newline) so the new degenerate-plan reason is
+    // the only content.
+    if (typeof task.blockedReason === 'string') {
+      const BLOCKER_TYPE_RE = /BLOCKER-TYPE:\s*(design-question|budget-exhausted|infra-error)\b/i;
+      task.blockedReason = task.blockedReason
+        .split('\n')
+        .filter(line => !BLOCKER_TYPE_RE.test(line))
+        .join('\n')
+        .replace(/\n+$/, '');
+    }
     return { blocked: true, blockedReason, blockedStage: 'plan' };
   }
 
