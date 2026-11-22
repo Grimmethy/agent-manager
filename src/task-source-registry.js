@@ -26,16 +26,37 @@ function pipelineDirForHistory() {
 /**
  * Record one owner-mismatch suppression for a single source: a history event and a per-source counter.
  * taskId is not known at the gate (the source has not produced a task yet), so it is logged as null.
+ *
+ * Three outcomes:
+ * - recorded: the history event is written to the pipeline directory.
+ * - skipped: pipelineDirForHistory() returned null (no pipelineDir, no AGENT_MANAGER_PIPELINE_DIR, no repoRoot),
+ *   so there is nowhere to write; a warning is written to stderr.
+ * - failed: the directory resolved but the write failed (logPipelineEvent returned false or threw); a warning is
+ *   written to stderr.
+ * In the last two cases the per-source counter still increments, and the error is never rethrown, so the gate
+ * still returns null for the caller.
  */
 function recordOwnerMismatch(sourceName, runningRoot, owners) {
   ownerMismatchCounts[sourceName] = (ownerMismatchCounts[sourceName] || 0) + 1;
-  logPipelineEvent(pipelineDirForHistory(), 'owner-mismatch', {
+  const entry = {
     source: sourceName,
     taskId: null,
     runningRoot,
     owners,
     reason: 'owner-mismatch',
-  });
+  };
+  try {
+    const dir = pipelineDirForHistory();
+    if (!dir) {
+      process.stderr.write(`[owner-mismatch] source "${sourceName}": no pipeline directory resolved (pipelineDir, AGENT_MANAGER_PIPELINE_DIR and repoRoot all unset); owner-mismatch event NOT recorded\n`);
+      return;
+    }
+    if (!logPipelineEvent(dir, 'owner-mismatch', entry)) {
+      process.stderr.write(`[owner-mismatch] source "${sourceName}": failed to write owner-mismatch event to "${dir}"; event NOT recorded\n`);
+    }
+  } catch (err) {
+    process.stderr.write(`[owner-mismatch] source "${sourceName}": error recording owner-mismatch event (${err && err.message}); event NOT recorded\n`);
+  }
 }
 
 /**
