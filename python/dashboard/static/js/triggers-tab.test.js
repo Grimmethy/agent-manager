@@ -95,3 +95,32 @@ test('the summary cards sit in a wrapping flex row; the offender table and episo
   assert.match(html, /<h3>Recent episodes<\/h3>/);
   assert.ok((html.match(/<table>/g) || []).length >= 2, 'the offender and day tables are both rendered');
 });
+
+test('offenders_by_day renders newest-first with escaped labels', () => {
+  const days = [
+    { date: '2026-11-09', episodes: 1, offenders: [{ label: 'llama-server', episodes_in_top: 1, share: 0.5, avg_mb: 2800, max_mb: 2800 }] },
+    { date: '2026-11-10', episodes: 1, offenders: [{ label: '<script>x</script>', episodes_in_top: 1, share: 1, avg_mb: 4150, max_mb: 4200 }] },
+  ];
+  const html = build(body({ summary: { ...body().summary, offenders_by_day: days } }));
+  assert.match(html, /&lt;script&gt;x&lt;\/script&gt; 100% 4150 MB/);
+  assert.doesNotMatch(html, /<script>x/);
+  const section = html.slice(html.indexOf('By day: top offenders'));
+  assert.ok(section.indexOf('2026-11-10</td>') < section.indexOf('2026-11-09</td>'), 'the offender day table is newest first');
+  assert.match(section, /llama-server 50% 2800 MB/);
+});
+
+test('without offenders_by_day the page matches the golden HTML', () => {
+  const GOLDEN = '<h2 style="margin:0 0 8px">Memory pressure</h2><div class="row" style="margin-bottom:12px"><button onclick="setTriggersDays(7)">7 days</button> <button class="active" onclick="setTriggersDays(14)">14 days</button> <button onclick="setTriggersDays(30)">30 days</button> <button onclick="setTriggersDays(90)">90 days</button></div>'
+    + '<div style="display:flex;flex-wrap:wrap;gap:10px"><div style="min-width:120px"><div class="meta">Episodes</div><div style="font-size:1.5rem;font-weight:700">2</div><div class="meta">1 critical, 1 tight</div></div><div style="min-width:120px"><div class="meta">Time paused</div><div style="font-size:1.5rem;font-weight:700">22 min</div><div class="meta">0% of the window</div></div><div style="min-width:120px"><div class="meta">Longest</div><div style="font-size:1.5rem;font-weight:700">20 min</div></div><div style="min-width:120px"><div class="meta">Lowest available</div><div style="font-size:1.5rem;font-weight:700">970 MB</div></div><div style="min-width:120px"><div class="meta">Would-refuse</div><div style="font-size:1.5rem;font-weight:700">3</div><div class="meta">new work held back (dry-run)</div></div></div>'
+    + '<h3>What was biggest when pressure hit</h3><div class="meta" style="margin-bottom:6px">The five largest processes at the moment each episode opened: what to optimise.</div><table><thead><tr><th>Process</th><th>In episodes</th><th>Share</th><th>Avg MB</th><th>Max MB</th></tr></thead><tbody><tr><td>qemu:p40-passthrough</td><td>2</td><td><span style="display:inline-block;height:8px;width:100px;background:var(--accent);vertical-align:middle"></span> 100%</td><td>4150</td><td>4200</td></tr><tr><td>llama-server</td><td>1</td><td><span style="display:inline-block;height:8px;width:50px;background:var(--accent);vertical-align:middle"></span> 50%</td><td>2800</td><td>2800</td></tr></tbody></table>'
+    + '<h3>By day</h3><table><thead><tr><th>Day (UTC)</th><th>Episodes</th><th>Paused</th><th>Peak</th></tr></thead><tbody><tr><td>2026-11-10</td><td>1</td><td><span style="display:inline-block;height:8px;width:8px;background:var(--accent);vertical-align:middle"></span> 2.0 h</td><td><span class="badge bad">critical</span></td></tr><tr><td>2026-11-09</td><td>1</td><td><span style="display:inline-block;height:8px;width:1px;background:var(--accent);vertical-align:middle"></span> 10 min</td><td><span class="badge warn">tight</span></td></tr></tbody></table>'
+    + '<h3>Why it triggered</h3><table><thead><tr><th>Why it triggered</th><th>Count</th></tr></thead><tbody><tr><td>swap low (N MB free)</td><td>2</td></tr></tbody></table>'
+    + '<h3>Recent episodes</h3><table><thead><tr><th>Started</th><th>Length</th><th>Level</th><th>Lowest available</th><th>Reason</th><th>Biggest at the time</th></tr></thead><tbody><tr><td>2026-11-10T20:41:12Z</td><td>20 min</td><td><span class="badge bad">critical</span></td><td>1200 MB</td><td>swap nearly gone (5 MB free)</td><td>qemu:p40-passthrough 4200 MB, llama-server 2800 MB, claude 450 MB</td></tr><tr><td>2026-11-10T18:00:00Z</td><td>2 min</td><td><span class="badge warn">tight</span></td><td>1200 MB</td><td>swap nearly gone (5 MB free)</td><td>qemu:p40-passthrough 4200 MB, llama-server 2800 MB, claude 450 MB</td></tr></tbody></table>';
+  assert.equal(build(body()), GOLDEN);
+});
+
+test('a day with no offenders says no process data', () => {
+  const days = [{ date: '2026-11-10', episodes: 1, offenders: [] }];
+  const html = build(body({ summary: { ...body().summary, offenders_by_day: days } }));
+  assert.match(html, /<td>2026-11-10<\/td><td>1<\/td><td>no process data<\/td>/);
+});
