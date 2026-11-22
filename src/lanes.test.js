@@ -311,12 +311,14 @@ test('cloud: numCtx and numBatch describe a GPU, so they are ignored (even inval
   assert.deepEqual(Object.keys(lane.env).sort(), ['AGENT_MANAGER_GPU_YIELD_APPS', 'LOCAL_MODEL', 'OLLAMA_URL']);
 });
 
-test('cloud: laneAllowsSource honours the allowlist (adhoc yes, hygiene scans and unknown sources no)', () => {
+test('cloud: laneAllowsSource ignores the allowlist -- cloud lanes claim any source', () => {
   const lane = getLanes(withRegistry([CLOUD, RX580]))[1];
-  assert.equal(laneAllowsSource(lane, 'adhoc'), true);
-  assert.equal(laneAllowsSource(lane, 'function_length_review'), false);
-  assert.equal(laneAllowsSource(lane, 'observability_review'), false);
-  assert.equal(laneAllowsSource(lane, undefined), false);
+  // Cloud lane: taskClasses is ignored, so it claims anything including sources not in the allowlist
+  assert.equal(laneAllowsSource(lane, 'adhoc'), true, 'taskClasses entry is allowed');
+  assert.equal(laneAllowsSource(lane, 'function_length_review'), true, 'non-allowlisted source is also allowed (cloud bypasses taskClasses)');
+  assert.equal(laneAllowsSource(lane, 'observability_review'), true, 'another non-allowlisted source is also allowed');
+  assert.equal(laneAllowsSource(lane, undefined), true, 'undefined source is also allowed');
+  // Non-cloud lane (rx580, no allowlist) is unaffected
   assert.equal(laneAllowsSource(getLanes(withRegistry([CLOUD, RX580]))[2], 'function_length_review'), true, 'the rx580 lane (no allowlist) is unaffected');
 });
 
