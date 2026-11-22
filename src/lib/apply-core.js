@@ -5,6 +5,7 @@
 const { getRegisteredSource, resolveSourceName } = require('../task-source-registry.js');
 const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve, closeBrainDumpEntryResolved, applyResearchTask, isEffectivelyEmptyResponse, applyArchDiscoveryCandidates } = require('../apply-group-a.js');
 const { applyGroupB, batchContainsDeleteMode } = require('../apply-group-b.js');
+// Loads the task sources module for its load-time registerTaskSource() calls (the package's built-in sources); usesGroupB reads that registry, so removing this require changes which apply path a task takes.
 require('../task-sources.js');
 
 function coAuthorTrailer(task) {
