@@ -44,3 +44,5 @@ Any index or graph rebuild must be event-triggered: a write to the concept store
 2. Should `docs/agents/codebase-map.md` stay hand-maintained, or become a generated view of the wiki? If generated, the AGENTS.md mandate and the freshness test both change.
 3. Which renderer: hand-written SVG, or a bundled graph library? This is open and has no current code to build on.
 4. Should the two id-keyed special panels (ghost telemetry and the static flow chart) migrate into the wiki as ordinary entries, or stay as hardcoded panels?
+
+Scoped first step of the standalone wiki/knowledge-base repo: see `docs/design/wiki-kb-scope.md`.
