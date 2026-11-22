@@ -1,0 +1,14 @@
+# Agent Manager crash recovery: a one-shot run at boot, ordered after the network is up.
+# Installed by scripts/install-crash-recovery.sh. The owner enables it; nothing here enables anything.
+[Unit]
+Description=Agent Manager crash recovery (runs once at boot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO@
+ExecStart=/usr/bin/env node scripts/crash-recover.js
+
+[Install]
+WantedBy=multi-user.target
