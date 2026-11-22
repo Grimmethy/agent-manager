@@ -212,6 +212,19 @@ cloud_dial_off() {
   CLOUD_DIAL_LAST="on"; return 1
 }
 
+# cloud_plan_limited <gateway_url> -> exit 0 when that cloud-providers gateway is at its plan limit, 1 otherwise. `node src/cloud-plan-limit.js is-limited <url>` asks (it probes
+# <url>/health, and answers not-limited without any HTTP call for a url that is not an enabled cloud lane's endpoint). On exit 0 the CLI's one line (the resetsAt, or 'until unknown')
+# is left in CLOUD_PLAN_LIMIT_NOTE for the caller's log. An empty url, a missing node, a node failure or anything unclear counts as NOT limited (a broken probe must never stall the
+# swarm). No timer or loop: the caller's tick is the trigger.
+cloud_plan_limited() {
+  local url="${1:-}" here out
+  CLOUD_PLAN_LIMIT_NOTE=""
+  [[ -n "$url" ]] || return 1
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if out="$(node "${here}/../src/cloud-plan-limit.js" is-limited "$url" 2>/dev/null)"; then CLOUD_PLAN_LIMIT_NOTE="$out"; return 0; fi
+  return 1
+}
+
 comfyui_lease_held() {
   local endpoint="${1:-}"
   local lease_path="${AGENT_MANAGER_COMFY_LEASE_PATH:-${HOME}/.local/state/agent-manager/comfyui-lease.json}"
