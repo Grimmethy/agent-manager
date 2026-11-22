@@ -58,7 +58,16 @@ const DEBRIEF_MIN_AGREEING = Number(process.env.AGENT_MANAGER_AUTO_CONFIRM_DEBRI
 
 // Same classify helper inline-duplicated in review-task.js:246 and local-client.js's CLI.
 // Kept local here too (extracting the trio into src/classify-vote.js is a follow-up).
+// Marker sets must be pairwise non-substring (case-insensitive).
 function classifyVote(markers, minReasoningChars) {
+  for (let i = 0; i < markers.length; i++) {
+    for (let j = 0; j < markers.length; j++) {
+      if (i === j) continue;
+      if (markers[i].toLowerCase().includes(markers[j].toLowerCase())) {
+        throw new Error(`classifyVote markers must be pairwise non-substring: "${markers[i]}" and "${markers[j]}"`);
+      }
+    }
+  }
   return (text) => {
     const lower = text.toLowerCase();
     const marker = markers.find((m) => lower.includes(m.toLowerCase()));
