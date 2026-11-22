@@ -280,7 +280,7 @@ function policyChangeCheck({ task, factCheckVerdict, recordModelOutcome }) {
       const decision = pc.decidePolicyRouting({ classification, gateReplay: task.gateReplay, task });
       task.policyChange = {
         at: new Date().toISOString(), policy: !!classification.policy, kinds: classification.kinds, pureMove: !!classification.pureMove, hint: !!classification.hint,
-        route: decision.route, reason: decision.reason,
+        route: decision.route, reason: decision.reason, shadow: !pc.policyRoutingEnabled(), escalated: decision.route === 'escalate' && pc.policyRoutingEnabled(),
         signals: classification.signals.slice(0, 4).map((x) => ({ kind: x.kind, file: x.file, line: x.line, text: String(x.text || '').slice(0, 120) })),
       };
       if (classification.policy) {
