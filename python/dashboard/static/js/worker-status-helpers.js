@@ -25,8 +25,8 @@ function statusBadgeClass(status, stale) {
 }
 
 // What the badge says. Most statuses are shown as they are; the two GPU-session states say why in words.
-function statusLabel(status) {
-  if (status === 'paused') return 'paused: GPU session';
+function statusLabel(status, pass) {
+  if (status === 'paused') return pass === 'ram' ? 'paused: memory pressure' : 'paused: GPU session';
   if (status === 'warming') return 'resuming: model warming';
   return status;
 }

@@ -52,7 +52,7 @@ const WF_LAYOUT_OPTS = { nodeW: 272, nodeH: 128, gapX: 64, gapY: 16 };
 
 function wfStatusBadge(runtime) {
   if (!runtime) return '';
-  const label = runtime.stale ? 'STALE' : statusLabel(runtime.status);
+  const label = runtime.stale ? 'STALE' : statusLabel(runtime.status, runtime.currentPass);
   return '<span class="badge ' + wfEsc(statusBadgeClass(runtime.status, runtime.stale)) + '">' + wfEsc(label) + '</span>';
 }
 

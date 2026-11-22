@@ -57,6 +57,13 @@ test('statusLabel: the two GPU-session states are spelled out, the rest pass thr
   assert.equal(h.statusLabel(undefined), undefined);
 });
 
+test('statusLabel: a memory-pressure pause (pass ram) reads differently from a GPU-session pause', () => {
+  assert.equal(h.statusLabel('paused', 'ram'), 'paused: memory pressure');
+  assert.equal(h.statusLabel('paused', 'gpu-session'), 'paused: GPU session');
+  assert.equal(h.statusLabel('paused'), 'paused: GPU session');
+  assert.equal(h.statusBadgeClass('paused', false), 'warn');
+});
+
 test('the guarded export gives require() the same three functions', () => {
   const mod = require(SOURCE);
   assert.deepEqual(Object.keys(mod).sort(), ['fmtAge', 'statusBadgeClass', 'statusLabel']);

@@ -331,7 +331,7 @@ async function renderWorkers(isPoll) {
         ${buildWorkerModelSelectHtml(inst, workerModels, overrides)}
         ${canAssignTask(inst) ? buildTaskPickerHtml(inst, assignableByInstance[inst.instanceId] || [], selectedWorkerTaskType[inst.instanceId] || '') : ''}
         <div class="badge-col">
-          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : statusLabel(inst.status)}</span>
+          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : statusLabel(inst.status, inst.currentPass)}</span>
           ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
           <span class="state-timer" id="state-timer-${inst.instanceId}">${inst.stateAgeSeconds != null ? 'in this state ' + fmtDuration(inst.stateAgeSeconds) : ''}</span>
           ${typeof buildWorkerSwitchHtml === 'function' ? buildWorkerSwitchHtml(inst) : ''}
