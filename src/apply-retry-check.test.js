@@ -123,7 +123,7 @@ test('isDivergedHistoryFailure recognizes the exact resetToMain/prepareStackedBr
   assert.equal(isDivergedHistoryFailure({ blockedStage: 'review', blockedReason: DIVERGED_REASON }), false, 'must still be a real apply failure, not just matching text on any stage');
 });
 
-test('applyRetryCheck escalates a diverged-history apply failure straight to needs-clarification, never blind-retrying it', () => {
+test('applyRetryCheck keeps a diverged-history apply failure in blocked/ with diverged-state metadata, never blind-retrying it', () => {
   const { blockedDir, pendingDir } = setupDirs();
   writeBlockedTask(blockedDir, 'task-1', { blockedReason: DIVERGED_REASON, applyRetryCount: 0 });
   const needsClarificationDir = path.join(pendingDir, '..', 'needs-clarification');
@@ -131,41 +131,51 @@ test('applyRetryCheck escalates a diverged-history apply failure straight to nee
 
   const summary = applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
 
-  assert.equal(summary.exhausted, 1);
+  assert.equal(summary.held, 1);
   assert.equal(summary.requeued, 0);
-  assert.ok(!fs.existsSync(path.join(blockedDir, 'task-1.json')), 'must not sit in blocked/ burning retries');
-  assert.ok(fs.existsSync(path.join(needsClarificationDir, 'task-1.json')));
-  const escalated = JSON.parse(fs.readFileSync(path.join(needsClarificationDir, 'task-1.json'), 'utf8'));
-  assert.equal(escalated.needsClarification.reason, 'git-state-diverged');
-  assert.equal(escalated.applyRetryCount, 0, 'never spent a retry -- this was never eligible for a blind redraft in the first place');
-  assert.ok(escalated.history.some((h) => h.stage === 'needs-clarification' && /diverged git history/.test(h.detail || '')));
+  assert.ok(fs.existsSync(path.join(blockedDir, 'task-1.json')), 'must stay in blocked/ with metadata');
+  assert.ok(!fs.existsSync(path.join(needsClarificationDir, 'task-1.json')), 'must not go to needs-clarification');
+  const kept = JSON.parse(fs.readFileSync(path.join(blockedDir, 'task-1.json'), 'utf8'));
+  assert.equal(kept.applyRetryCount, 0, 'never spent a retry -- this was never eligible for a blind redraft in the first place');
+  assert.ok(kept.divergedMainError, 'must carry the diverged-state metadata');
+  assert.equal(kept.divergedMainError.reason, DIVERGED_REASON, 'reason must be the original blockedReason');
+  assert.ok(Array.isArray(kept.divergedMainError.localOnly), 'localOnly must be an array');
+  assert.ok(Array.isArray(kept.divergedMainError.remoteOnly), 'remoteOnly must be an array');
+  assert.ok(kept.history.some((h) => h.stage === 'blocked' && /diverged main detected/.test(h.detail || '')), 'history event must be blocked, not needs-clarification');
 });
 
-test('applyRetryCheck does NOT escalate a diverged-history failure a second time once already escalated', () => {
+test('applyRetryCheck keeps a diverged-history failure in blocked/ even if already escalated once', () => {
   const { blockedDir, pendingDir } = setupDirs();
   writeBlockedTask(blockedDir, 'task-1', {
     blockedReason: DIVERGED_REASON,
     applyRetryCount: 0,
-    history: [{ stage: 'needs-clarification', detail: 'escalated immediately -- diverged git history, a blind retry cannot differ' }],
+    history: [{ stage: 'blocked', detail: 'diverged main detected -- keeping in blocked with diverged-state metadata, not needs-clarification' }],
   });
   const needsClarificationDir = path.join(pendingDir, '..', 'needs-clarification');
   fs.mkdirSync(needsClarificationDir, { recursive: true });
 
   const summary = applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
 
-  // Falls through to the ordinary retry-cap path instead (still bounded, no infinite loop).
-  assert.equal(summary.requeued, 1);
-  assert.ok(fs.existsSync(path.join(pendingDir, 'task-1.json')));
+  // Stays in blocked/ (held), never moves to needs-clarification or pending/.
+  assert.equal(summary.held, 1);
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(blockedDir, 'task-1.json')), 'must stay in blocked/');
+  assert.ok(!fs.existsSync(path.join(needsClarificationDir, 'task-1.json')), 'must not go to needs-clarification');
+  assert.ok(!fs.existsSync(path.join(pendingDir, 'task-1.json')), 'must not go to pending/');
 });
 
-test('applyRetryCheck falls back to the ordinary bounded retry when no needsClarificationDir is given (back-compat)', () => {
+test('applyRetryCheck keeps a diverged-history failure in blocked/ even without needsClarificationDir (back-compat)', () => {
   const { blockedDir, pendingDir } = setupDirs();
   writeBlockedTask(blockedDir, 'task-1', { blockedReason: DIVERGED_REASON, applyRetryCount: 0 });
 
   const summary = applyRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
 
-  assert.equal(summary.requeued, 1);
-  assert.ok(fs.existsSync(path.join(pendingDir, 'task-1.json')));
+  // Stays in blocked/ (held) with metadata -- never requeued, never goes to pending/.
+  assert.equal(summary.held, 1);
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(blockedDir, 'task-1.json')), 'must stay in blocked/');
+  const kept = JSON.parse(fs.readFileSync(path.join(blockedDir, 'task-1.json'), 'utf8'));
+  assert.ok(kept.divergedMainError, 'must carry the diverged-state metadata');
 });
 
 // --- apply-stage "find string not found" on a candidate whose own site is already fixed -----
