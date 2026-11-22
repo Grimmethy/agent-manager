@@ -104,6 +104,24 @@ test('a worker that was never switched off claims normally (the guard is inert),
   }
 });
 
+test('a daemon switched off mid-flight claims nothing and exits 0', async () => {
+  const sb = sandbox();
+  const logPath = path.join(sb.root, 'worker.log');
+  const child = startDaemon(sb, logPath);
+  try {
+    assert.ok(await waitFor(() => sb.heartbeat() && sb.heartbeat().status !== 'disabled'), 'it reports active initially');
+    assert.equal(sb.cli('disable', 'worker-x').status, 0);
+    await new Promise((r) => setTimeout(r, 2000));
+    const log = fs.readFileSync(logPath, 'utf8');
+    assert.ok(/switched off by the operator/.test(log), 'it reports the switch-off');
+    assert.ok(fs.existsSync(sb.taskFile), 'the waiting task was not claimed');
+    assert.deepEqual(fs.readdirSync(path.join(sb.A, 'queue', 'drafting')), []);
+    assert.equal(sb.heartbeat().status, 'disabled', 'it reports disabled after the flip');
+  } finally {
+    killGroup(child);
+  }
+});
+
 test('a broken switch never stalls a worker: with node unable to run the switch the worker is treated as on', () => {
   const sb = sandbox();
   const r = spawnSync('/bin/bash', ['-c', 'source "$1"; worker_switched_off worker-x; echo "exit=$?"', 'bash', path.join(__dirname, 'agent-manager-common.sh')], {
