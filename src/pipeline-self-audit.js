@@ -51,6 +51,7 @@ const MAX_DEBRIEF_ACTIONS = 3; // 2026-09-07: Easy Agile / Coveros retrospective
 const {
   REASON_CATEGORIES, categorizeBlockedReason, hasZeroHitHarnessSearch, signatureForTask, classifyBlockedTask,
 } = require('./blocked-task-classifiers.js');
+const { parseSignature } = require('./signature-parse.js');
 
 // coverage: { [signature]: { reportedAt, taskId } } -- signatures already turned into an
 // audit task are skipped forever (this module reports a pattern once; whether the
@@ -86,9 +87,7 @@ function findAuditClusters(blockedTasks, coverage = {}) {
 // never to queue/ task-state files.
 function buildAuditRawText(cluster) {
   const { signature, tasks } = cluster;
-  const sepIdx = signature.lastIndexOf('::');
-  const source = signature.slice(0, sepIdx);
-  const category = signature.slice(sepIdx + 2);
+  const { source, category } = parseSignature(signature);
   const examples = tasks.slice(0, MAX_EXAMPLES).map((t) => {
     const reason = (t.blockedReason || '(no blockedReason recorded)').slice(0, MAX_REASON_CHARS);
     return `- ${t.id}: ${reason}`;
@@ -100,6 +99,8 @@ function buildAuditRawText(cluster) {
   // own drafting pass) about WHERE to look before they start reading code.
   const { faultSide } = classifyBlockedTask(tasks[0]);
   const hasInconclusive = tasks.some(t => t.reviewInconclusive === true);
+  // Only a cluster where EVERY task is an inconclusive gate verdict drops the "OWN code" conclusion. A mixed cluster may still hide a real harness bug in its genuine rejections, so it keeps the original paragraph.
+  const allInconclusive = tasks.length > 0 && tasks.every(t => t.reviewInconclusive === true);
   const faultSideNote = hasInconclusive
     ? 'gate-inconclusive (stochastic re-roll, not a genuine reviewer rejection)'
     : ({
@@ -116,7 +117,7 @@ function buildAuditRawText(cluster) {
     ...examples,
     remainder > 0 ? `...and ${remainder} more with the same signature.` : '',
     '',
-    'This many tasks failing identically usually means the root cause is in this ' +
+    ...(allInconclusive ? [`All ${tasks.length} tasks ended with inconclusive gate verdicts, so no reviewer rejected a draft. Check the gate's own run output before attributing these failures to the drafts or to the pipeline.`] : [ 'This many tasks failing identically usually means the root cause is in this ' +
       'pipeline\'s OWN code (a harness/fetch bug, a prompt gap, a broken tool) rather ' +
       'than every one of these tasks independently being a bad idea -- the precedent for ' +
       'this exact shape of bug is grep-codebase-tool.js, found 2026-08-19: it silently ' +
@@ -126,6 +127,7 @@ function buildAuditRawText(cluster) {
       'grounding available" -- the individual drafts were not wrong, the tool feeding ' +
       'them was.',
     '',
+  ]),
   ].filter(Boolean).join('\n');
 }
 
@@ -136,9 +138,7 @@ function buildAuditRawText(cluster) {
 // pure functions.
 function buildAuditTask(cluster, domain) {
   const { signature } = cluster;
-  const sepIdx = signature.lastIndexOf('::');
-  const source = signature.slice(0, sepIdx);
-  const category = signature.slice(sepIdx + 2);
+  const { source, category } = parseSignature(signature);
   const id = `pipeline-self-audit-${source}-${category}-${Date.now()}`;
   return {
     id,
@@ -160,6 +160,7 @@ module.exports = {
   hasZeroHitHarnessSearch,
   categorizeBlockedReason,
   signatureForTask,
+  classifyBlockedTask,
   findAuditClusters,
   buildAuditRawText,
   buildAuditTask,

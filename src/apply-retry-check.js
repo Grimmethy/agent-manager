@@ -33,12 +33,14 @@
 
 const fs = require('fs');
 const path = require('path');
+const { healGeneratedDirt } = require('./lib/apply-clone-dirt.js');
 const { getConfig } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { decideFindingResolved } = require('./premise-recheck-decision.js');
 const { alreadyEscalatedSinceLastReadmission } = require('./reject-retry-check.js');
+const { classifyPatchFailure } = require('./patch-failure-classifier.js');
 
 const MAX_APPLY_RETRIES = 2;
 
@@ -74,6 +76,19 @@ function isFindStringMiss(task) {
   return isApplyFailure(task) && FIND_NOT_FOUND_RE.test(String(task.blockedReason || ''));
 }
 
+// A record that already carries an approved review: localVerdict 'approved' with two real votes (localVotes shape assumed, see the
+// review writer before relying on it further). Such a record's draft is good; only the apply step failed.
+function isApprovedRecord(task) {
+  return task.localVerdict === 'approved' && Array.isArray(task.localVotes) && task.localVotes.length >= 2;
+}
+
+// Transient network failure during apply (e.g. a DNS blip). Redrafting cannot fix this, so an approved record is re-applied, not redrafted.
+const NETWORK_APPLY_RE = /could not resolve host|temporary failure in name resolution|connection (timed out|refused|reset)|network is unreachable|cannot lock ref|unable to create '[^']*\.lock'/i;
+function isNetworkApplyFailure(task) {
+  return isApplyFailure(task) && NETWORK_APPLY_RE.test(String(task.blockedReason || ''));
+}
+const APPLY_NETWORK_MAX_RELEASES = 4;
+
 // 2026-09-23 (change_review backlog incident): a dirty apply clone aborts `git checkout -B` / `git rebase`
 // ("Your local changes to the following files would be overwritten", "cannot rebase: You have unstaged
 // changes", or git-runner.js's own assertCleanTree "apply clone is dirty"). That is INFRASTRUCTURE -- the
@@ -96,12 +111,21 @@ const INFRA_APPLY_RE = /apply clone is dirty|local changes to the following file
 // after <n>ms") is also infrastructure -- the apply clone sits on the same rotational disk as the model files (IO pressure avg300 ~13%),
 // and 23 such timeouts across 3 days hit already-approved drafts (arch_discovery community-12 burned all 2 apply retries on it and was
 // escalated as a 'design-decision'). Same treatment as a dirty clone: re-apply the approved result, no redraft. Unlike a dirty clone this
-// can recur every time, so it is bounded: after APPLY_TIMEOUT_MAX_RELEASES releases it falls through to the normal retry/escalation path.
+// can recur every time, so it is bounded: after APPLY_TIMEOUT_MAX_RELEASES releases it is left in a retryable state (NOT needs-clarification)
+// with the fetch timeout recorded as its reason, so the watchdog picks it up again automatically once git connectivity returns. The redraft
+// counter is never touched for this failure class -- redrafting cannot fix a network timeout, and burning retries on it masks the real cause.
 const GIT_TIMEOUT_RE = /spawnSync git ETIMEDOUT|\bgit [\w-]+[^\n]{0,80} timed out after \d+ms/i;
 const APPLY_TIMEOUT_MAX_RELEASES = 4;
 function isGitTimeoutApplyFailure(task) {
   return isApplyFailure(task) && GIT_TIMEOUT_RE.test(String(task.blockedReason || ''))
     && (Number(task.applyTimeoutReleases) || 0) < APPLY_TIMEOUT_MAX_RELEASES;
+}
+// Same classification but WITHOUT the release-count gate -- used after the infra short-circuit to
+// catch timeouts that have exceeded max releases and must be left in a retryable state (not
+// escalated to needs-clarification, not redrafted). A timeout is a timeout regardless of how many
+// times we've tried to re-apply; the underlying cause (network/git) is unchanged.
+function isGitTimeoutFailure(task) {
+  return isApplyFailure(task) && GIT_TIMEOUT_RE.test(String(task.blockedReason || ''));
 }
 function isInfraApplyFailure(task) {
   return isApplyFailure(task) && (INFRA_APPLY_RE.test(String(task.blockedReason || '')) || isGitTimeoutApplyFailure(task));
@@ -112,24 +136,33 @@ function isInfraApplyFailure(task) {
 function defaultIsApplyCloneClean() {
   try {
     const { applyRepoRoot } = getConfig();
-    const out = require('child_process').execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: applyRepoRoot, encoding: 'utf8', stdio: 'pipe', timeout: 30_000 });
-    return out.trim() === '';
+    const run = (args) => require('child_process').execFileSync('git', args, { cwd: applyRepoRoot, encoding: 'utf8', stdio: 'pipe', timeout: 30_000 });
+    // Restore compiled-cache dirt first (lib/apply-clone-dirt.js); with the heal switch at dry-run/off this changes nothing and the count below is as before.
+    healGeneratedDirt(run);
+    return run(['status', '--porcelain', '--untracked-files=no']).trim() === '';
   } catch {
     return false;
   }
 }
 
 function buildExhaustedApplyQuestion(task) {
+  const classification = task.applyRetryClassification;
+  const classificationNote = classification
+    ? `Classification: ${classification.classification} -- ${classification.detail}`
+    : '';
+
   return [
     `An apply failure survived ${MAX_APPLY_RETRIES} automatic redraft attempts: ${String(task.blockedReason || '(no reason recorded)')}`,
-    '',
+    classificationNote,
     isFindStringMiss(task)
       ? 'The draft\'s edit could not be matched against the real file. Common cause: the '
         + 'candidate\'s citation is stale -- something else may have already changed or fixed '
         + 'that code, and a deterministic re-scan could not confirm it either way. Check the '
         + 'real file: if the issue is already fixed, Archive this task; if the citation is '
         + 'merely stale, correct it and requeue.'
-      : 'A fresh draft against current code kept failing to apply. Check whether another task '
+      : classification?.classification === 'conflicting_edit'
+        ? `Another task changed the lines this patch was editing. Check which task made the conflicting change (look at recent commits to ${classification.detail.split(' ')[3] || 'the file'}), then either requeue after reconciling or Archive if the conflict is already resolved.`
+        : 'A fresh draft against current code kept failing to apply. Check whether another task '
         + 'changed the same lines, and either requeue after reconciling or Archive it.',
   ].join('\n');
 }
@@ -210,6 +243,30 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approv
         continue;
       }
 
+      // Exhausted git-timeout short-circuit -- see isGitTimeoutFailure's own header.
+      // After APPLY_TIMEOUT_MAX_RELEASES releases back to approved/, the fetch is still
+      // failing. This is a TRANSIENT INFRASTRUCTURE ERROR, not a draft/content problem:
+      // redrafting cannot fix a network timeout, and escalating to a human for "clarification"
+      // on a fetch timeout is exactly what the stalled-task worker was complaining about
+      // (4 deadcode tasks parked in needs-clarification for a cause they cannot usefully
+      // resolve). Leave the task in blocked/ (the watchdog picks it up again on the next
+      // tick) with a recorded reason that names the fetch timeout, so it resumes
+      // automatically once git connectivity returns. The redraft counter is untouched.
+      if (isGitTimeoutFailure(task)) {
+        const alreadyMarked = Array.isArray(task.history) && task.history.some((h) => h && h.stage === 'git-timeout-exhausted');
+        if (!alreadyMarked) {
+          step = 'record';
+          appendHistoryEvent(task, 'git-timeout-exhausted',
+            `Git fetch timed out after ${APPLY_TIMEOUT_MAX_RELEASES} automatic re-apply attempts (no redraft burned -- a timeout cannot be fixed by redrafting): ${String(task.blockedReason || '')}`);
+          step = 'write';
+          fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
+        }
+        // Do NOT escalate to needs-clarification, do NOT burn a redraft, do NOT move
+        // the task -- the watchdog will re-pick it up and the next tick may succeed.
+        summary.held++;
+        continue;
+      }
+
       // Diverged-history short-circuit -- see isDivergedHistoryFailure's own header.
       // Regardless of retryCount: retrying reproduces the identical git-state failure,
       // structurally, not stochastically, so there is no reason to wait for the cap.
@@ -250,6 +307,77 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approv
         }
       }
 
+      // Patch-failure classification: distinguish stale context (redraft will fix) from
+      // conflicting edit (escalate with the conflict named) from malformed hunk (regenerate).
+      // This prevents the "same kind of failure every retry" loop the stalled-task worker
+      // was complaining about. The classifier reads current file state, so it can tell
+      // "the code moved" (stale) from "the code was replaced" (conflict) -- git apply's
+      // own error messages are ambiguous between the two.
+      if (!isInfraApplyFailure(task) && !isGitTimeoutFailure(task) && !isDivergedHistoryFailure(task)) {
+        try {
+          const classification = classifyPatchFailure({
+            rawDiff: task.rawDiff || '',
+            blockedReason: task.blockedReason || '',
+            repoRoot: repoRoot || getConfig().repoRoot,
+          });
+
+          // Conflicting edit: escalate immediately, don't burn a retry on something
+          // that structurally cannot apply (another task changed the same lines).
+          if (classification.classification === 'conflicting_edit') {
+            if (needsClarificationDir && !alreadyEscalatedSinceLastReadmission(task)) {
+              step = 'record';
+              task.needsClarification = {
+                reason: 'conflicting-edit',
+                openQuestions: [
+                  `Apply failed because another task changed the lines this patch was editing: ${classification.detail}`,
+                  `The patch's context lines no longer exist at the expected location. Check which task made the conflicting change (look at recent commits to ${classification.detail.split(' ')[3] || 'the file'}), then either requeue after reconciling or Archive if the conflict is already resolved.`,
+                ],
+              };
+              appendHistoryEvent(task, 'needs-clarification', `escalated: conflicting edit (${classification.detail})`);
+              if (pipelineDir) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'apply-retry-check:conflicting-edit', pipelineDir });
+              step = 'write';
+              fs.mkdirSync(needsClarificationDir, { recursive: true });
+              fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
+              step = 'unlink';
+              fs.unlinkSync(filePath);
+              summary.exhausted++;
+              continue;
+            }
+          }
+
+          // Stale context or malformed hunk: add a note to the task so the redraft
+          // knows what to look for. The retry mechanism will pick this up.
+          if (classification.classification === 'stale_context') {
+            task.applyRetryNote = `stale context: ${classification.detail} -- redraft against current code`;
+          } else if (classification.classification === 'malformed_hunk') {
+            task.applyRetryNote = `malformed hunk: ${classification.detail} -- regenerate the edit`;
+          }
+        } catch (classifyErr) {
+          // Classification is best-effort; a failure here should not block the retry.
+          console.warn('[apply-retry-check] patch classification failed:', classifyErr.message);
+        }
+      }
+
+      // Approved record hit a transient network error at apply: re-apply the approved result (never redraft it). Bounded by its own counter,
+      // which never touches applyRetryCount, so a long outage cannot burn the redraft budget.
+      if (isApprovedRecord(task) && isNetworkApplyFailure(task) && approvedDirResolved) {
+        if ((Number(task.applyNetworkReleases) || 0) < APPLY_NETWORK_MAX_RELEASES) {
+          const reason = String(task.blockedReason || '').slice(0, 200);
+          task.applyNetworkReleases = (Number(task.applyNetworkReleases) || 0) + 1;
+          delete task.blockedReason;
+          delete task.blockedStage;
+          task.status = 'approved';
+          appendHistoryEvent(task, 'approved', `apply retried after ${reason}`);
+          fs.mkdirSync(approvedDirResolved, { recursive: true });
+          fs.writeFileSync(path.join(approvedDirResolved, name), JSON.stringify(task, null, 2));
+          fs.unlinkSync(filePath);
+          summary.released++;
+        } else {
+          summary.held++;
+        }
+        continue;
+      }
+
       const retryCount = Number(task.applyRetryCount) || 0;
       if (retryCount >= MAX_APPLY_RETRIES) {
         const alreadyStamped = Array.isArray(task.history) && task.history.some((h) => h.stage === 'exhausted');
@@ -285,6 +413,28 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approv
       }
 
       task.applyRetryCount = retryCount + 1;
+
+      // Redraft after a real content/conflict failure: clear the approved draft's fields together so the redraft never mixes two authors' work.
+      if (isApprovedRecord(task)) {
+        const cleared = ['rawDiff', 'localVotes', 'acceptanceResults', 'planResponse', 'implementResponse'].filter((k) => task[k] !== undefined);
+        for (const k of cleared) delete task[k];
+        if (cleared.length) appendHistoryEvent(task, 'draft-fields-cleared', `redraft after apply failure: cleared ${cleared.join(', ')}`);
+      }
+
+      // A find-string miss redrafts with the REAL nearby lines (lib/find-recheck.js), not just "find string not found": the redraft that failed this way
+      // (TaxHarvest AC-271) invented its `find`, and the bare reason gave it nothing to copy. Best-effort; a task with no parseable edit set is unchanged.
+      if (isFindStringMiss(task)) {
+        try {
+          const fr = require('./lib/find-recheck.js');
+          const parsed = require('./json-fence.js').parseJsonMaybeFenced(String(task.implementResponse || ''));
+          const flags = parsed ? fr.simulateEdits(Array.isArray(parsed) ? parsed : [parsed], repoRoot) : [];
+          if (flags.length) {
+            const note = `Last attempt's edit set could not apply: ${fr.feedbackFor(flags)}`.slice(0, 900);
+            const prior = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+            if (!prior.includes(note)) task.priorRejectionFeedback = [...prior, note];
+          }
+        } catch { /* best-effort: the bare blockedReason is still in history */ }
+      }
 
       step = 'record';
       recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'apply-watchdog', outcomeReason: task.blockedReason || null });
@@ -326,7 +476,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { applyRetryCheck, isDivergedHistoryFailure, isInfraApplyFailure };
+module.exports = { applyRetryCheck, isDivergedHistoryFailure, isInfraApplyFailure, isGitTimeoutFailure, defaultIsApplyCloneClean };
 
 if (require.main === module) {
   main();

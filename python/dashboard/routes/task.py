@@ -4,7 +4,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 import os
+import re
 import subprocess
+import tempfile
 
 # The app.py helpers these views call (ENV_FILE_PATH, PACKAGE_ROOT, QUEUE_STATES, SRC_DIR, _archive_task_file, _call_discuss, _discuss_provider_args, _files_touched_for, _incoming_task_links, _outgoing_task_links, _record_manual_requeue, _repeated_blocker_match, _task_cost_summary, _task_input_summary, _work_log_for, get_active_grep_dirs, get_active_repo_root, get_pipeline_dir, instances_dir, logger, queue_dir, read_env_file, read_json_safe) are
 # imported lazily inside each view: app.py imports THIS module to register the
@@ -14,6 +16,30 @@ import subprocess
 # pattern as routes/concepts.py, routes/second_brain.py, routes/reports.py.)
 
 task_bp = Blueprint("task-bp", __name__)
+
+
+def _qdir_for_request(body=None, queue_only=False):
+    """(queue dir, scope) for the project a request names (2026-10-30). `?project=<repoRoot>` (or "project" in a JSON body) selects another registered
+    project's queue exactly like the branch and premium routes do (branch_projects.resolve_scope); absent or equal to the active project = the active
+    project's queue as before, scope None. An unregistered project is a 404 and never falls back to the active one. `queue_only=True` (the archive route) also accepts a registered project that is not its own git repo, via
+    queue_projects.resolve_queue_dir; every other caller keeps the git-repo requirement."""
+    from app import get_active_repo_root, queue_dir
+    project = request.args.get("project") or (body.get("project") if isinstance(body, dict) else None)
+    if not project:
+        return queue_dir(), None
+    import branch_projects
+    import queue_projects
+    try:
+        scope = branch_projects.resolve_scope(project, get_active_repo_root())
+    except LookupError as e:
+        if not queue_only:
+            abort(404, description=str(e))
+        try:
+            qdir = queue_projects.resolve_queue_dir(project, get_active_repo_root())
+        except LookupError as e2:
+            abort(404, description=str(e2))
+        return (qdir, None) if qdir else (queue_dir(), None)
+    return (scope["qdir"], scope) if scope else (queue_dir(), None)
 
 # 2026-09-17, root-caused live: /resolve and /answer below both move a held task from
 # queue/needs-clarification/ into queue/adhoc/ for "a fresh draft pass", but neither ever
@@ -59,10 +85,25 @@ def _clean_slate_for_fresh_adhoc_attempt(data):
     if data.get("status") == "blocked":
         data["status"] = "pending"
 
+
+_PREMIUM_FIELDS = ("premiumPriority", "premiumSetBy", "premiumSetAt")
+
+
+def _carry_premium_fields(src_path, data):
+    """Re-reads the source file (no lock helper exists in this module, so this is a fresh read
+    immediately before the write) and copies the premium fields into `data` in place, after any
+    clean-slate stripping, so a needs-clarification -> adhoc move never loses them."""
+    from app import read_json_safe
+    current_src = read_json_safe(src_path) or {}
+    for field in _PREMIUM_FIELDS:
+        if field in current_src:
+            data[field] = current_src[field]
+
+
 @task_bp.route("/api/task/<state>/<task_id>")
 def api_task_detail(state, task_id):
     from app import QUEUE_STATES, _files_touched_for, _incoming_task_links, _outgoing_task_links, _task_cost_summary, _task_input_summary, _work_log_for, queue_dir, read_json_safe
-    qdir = queue_dir()
+    qdir, _scope = _qdir_for_request()   # ?project=<repoRoot> reads that registered project's queue; absent = the active project (same as before)
     if not qdir:
         abort(404)
 
@@ -99,10 +140,11 @@ def api_task_archive(state, task_id):
     down an anchor for. 'awaiting-confirm' included the same day, same reasoning -- DENYING
     a delete-containing batch (the awaiting-confirm gate's own opposite of /confirm below)
     is exactly this action too: give up on it rather than let it apply."""
-    from app import _archive_task_file, _stamp_manual_archive, queue_dir
-    if state not in ("blocked", "done", "needs-clarification", "awaiting-confirm"):
-        abort(400, description="only a blocked, done, needs-clarification, or awaiting-confirm task can be archived")
-    qdir = queue_dir()
+    from app import _archive_task_file, _stamp_manual_archive
+    if state not in ("blocked", "done", "needs-clarification", "awaiting-confirm", "adhoc", "pending"):
+        abort(400, description="only a blocked, done, needs-clarification, awaiting-confirm, adhoc or pending task can be archived")
+    body = request.get_json(silent=True) or {}
+    qdir, _scope = _qdir_for_request(body, queue_only=True)   # ?project=<repoRoot> archives in that registered project's queue (2026-11-02, cross-project workers; a non-git project too, 2026-11-13)
     if not qdir:
         abort(404)
     src = qdir / state / f"{task_id}.json"
@@ -111,7 +153,6 @@ def api_task_archive(state, task_id):
     dest = qdir / "done" / "_archived_no_action" / src.name
     if dest.exists():
         abort(409, description=f"an archived copy of '{src.stem}' already exists")
-    body = request.get_json(silent=True) or {}
     # Record what this archive MEANS before moving it (see _stamp_manual_archive): without a disposition the task is
     # "unclassified" forever and silently blocks anything that dependsOn it.
     stamped = _stamp_manual_archive(src, state, body.get("reason"))
@@ -168,15 +209,16 @@ def api_hub_retire(hub_id):
     or reviewer corrupts it), is itself a coordinating hub (retire that one first), or already has an archived copy. Children that already
     finished (done/archived/superseded) or whose record is gone are left as they are. Body: {"reason": "<why>"} (optional).
     Returns {"hub", "archived": [child ids], "left": {child id: why}}."""
-    from app import _archive_task_file, queue_dir, read_json_safe, logger
-    qdir = queue_dir()
+    from app import _archive_task_file, read_json_safe, logger
+    body = request.get_json(silent=True) or {}
+    qdir, _scope = _qdir_for_request(body)
     if not qdir:
         abort(404)
     hub_file = qdir / "coordinating" / f"{hub_id}.json"
     hub = read_json_safe(hub_file)
     if not isinstance(hub, dict):
         abort(404, description=f"no coordinating hub '{hub_id}'")
-    reason = ((request.get_json(silent=True) or {}).get("reason") or "").strip() or None
+    reason = (body.get("reason") or "").strip() or None
     archive_dir = qdir / "done" / "_archived_no_action"
 
     to_retire, left, blockers = [], {}, []
@@ -226,6 +268,109 @@ def api_hub_retire(hub_id):
     return jsonify({"hub": hub_id, "archived": archived, "left": left})
 
 
+@task_bp.route("/api/hub/<hub_id>/waive-abandoned", methods=["POST"])
+def api_hub_waive_abandoned(hub_id):
+    """Set `abandonedPiecesWaived: true` on a coordinating hub (2026-11-05): the owner's explicit "merge it anyway" that _summarize_hub reads
+    (app_branch_helpers.py). An ABANDONED piece counts as finished for hub auto-completion but is not code that shipped, so a hub with one is never
+    readyToMerge; before this route nothing could set the flag. The hub worker uses it after it has either replaced the abandoned piece (the
+    replacement is a piece of the same hub and must still be built) or found the piece's work already on the base.
+
+    Body: {"reason": "<why>"} (required, recorded on the hub record and in its history); `?project=<repoRoot>` selects another registered project.
+    404 no such coordinating hub; 400 no reason; 409 the hub has no abandoned piece (nothing to waive). Idempotent: waiving twice answers 200 with
+    `alreadyWaived: true`. Returns {"hub", "waived": true, "abandoned": [piece ids], "alreadyWaived"?}."""
+    from app import read_json_safe, logger
+    body = request.get_json(silent=True) or {}
+    qdir, _scope = _qdir_for_request(body)
+    if not qdir:
+        abort(404)
+    hub_file = qdir / "coordinating" / f"{hub_id}.json"
+    hub = read_json_safe(hub_file)
+    if not isinstance(hub, dict):
+        abort(404, description=f"no coordinating hub '{hub_id}'")
+    reason = (body.get("reason") or "").strip()
+    if not reason:
+        abort(400, description="a reason is required")
+    abandoned = [st.get("id") for st in hub.get("subTasks") or [] if isinstance(st, dict) and st.get("status") == "abandoned"]
+    if not abandoned:
+        abort(409, description="the hub has no abandoned piece; nothing to waive")
+    if hub.get("abandonedPiecesWaived") is True:
+        return jsonify({"hub": hub_id, "waived": True, "abandoned": abandoned, "alreadyWaived": True})
+    now_iso = datetime.now(timezone.utc).isoformat()
+    hub["abandonedPiecesWaived"] = True
+    hub.setdefault("history", []).append({"stage": "abandoned-pieces-waived", "at": now_iso, "detail": f"abandoned piece(s) {', '.join(abandoned)} waived: {reason}"})
+    try:
+        hub_file.write_text(json.dumps(hub, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.error("Could not write the waiver on %s: %s", hub_file, exc)
+        abort(500, description=f"could not write the hub record: {exc}")
+    return jsonify({"hub": hub_id, "waived": True, "abandoned": abandoned})
+
+
+@task_bp.route("/api/hub/<hub_id>/pieces", methods=["POST"])
+def api_hub_add_piece(hub_id):
+    """Add a follow-up piece to a hub that is already coordinating (2026-10-31, HUB0295-05).
+
+    A hub's piece list is fixed when it is decomposed, and `_summarize_hub` computes readyToMerge from it, so a corrective piece filed by hand
+    never held the hub back: the hub read "ready to merge" without it. This appends the piece to the hub's `subTasks` (and writes its child
+    record on the hub's stacked chain); the coordinator sweep then renumbers the not-yet-started pieces. Single implementation: src/hub-add-piece.js,
+    run here as a subprocess exactly like /rereview, so the route and the CLI can never diverge.
+
+    `hub_id` is the hub RECORD id (the file name in queue/coordinating/, like /retire), not the HUBnnnn label. Body, a NEW piece:
+    {"title": "...", "rawText": "<self-contained piece text>", "files": ["path", ...]?, "dependsOn": ["id"]?, "reason": "why"?};
+    or ADOPT a child that already exists: {"adopt": "<child id>", "reason": "why"?}. `?project=<repoRoot>` selects another registered project.
+    Returns the CLI's JSON {ok, id, total, seq?, adopted?, ownerGate?}: 404 no such coordinating hub, 400 bad body, 409 refused (duplicate id, child in
+    another hub, file-decompose hub, several chains, switched off)."""
+    from app import ENV_FILE_PATH, PACKAGE_ROOT, read_env_file
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        abort(400, description="body must be a JSON object")
+    qdir, _scope = _qdir_for_request(body)
+    if not qdir:
+        abort(404)
+    adopt = body.get("adopt")
+    title = body.get("title")
+    raw_text = body.get("rawText")
+    if adopt is not None and not (isinstance(adopt, str) and adopt.strip()):
+        abort(400, description="adopt must be a non-empty child task id")
+    if not adopt and not (isinstance(title, str) and title.strip() and isinstance(raw_text, str) and raw_text.strip()):
+        abort(400, description="give a title and a rawText for a new piece, or adopt: <child id>")
+    script = PACKAGE_ROOT / "src" / "hub-add-piece.js"
+    args = ["node", str(script), hub_id, "--pipeline-dir", str(qdir.parent), "--who", "dashboard"]
+    reason = body.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        args += ["--reason", reason.strip()]
+    tmp_path = None
+    try:
+        if adopt:
+            args += ["--adopt", adopt.strip()]
+        else:
+            payload = {"rawText": raw_text}
+            if isinstance(body.get("files"), list):
+                payload["files"] = body["files"]
+            if isinstance(body.get("prerequisiteHubs"), list):
+                payload["prerequisiteHubs"] = body["prerequisiteHubs"]
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
+                json.dump(payload, fh)
+                tmp_path = fh.name
+            args += ["--title", title.strip(), "--prompt-context-file", tmp_path]
+            if isinstance(body.get("dependsOn"), list) and body["dependsOn"]:
+                args += ["--depends-on", ",".join(str(d) for d in body["dependsOn"])]
+        cp = subprocess.run(args, capture_output=True, text=True, timeout=60, env={**os.environ, **read_env_file(ENV_FILE_PATH)})
+        result = json.loads((cp.stdout or "{}").strip().splitlines()[-1])
+    except Exception as e:  # noqa: BLE001 -- surface a clean error, never a stack trace
+        abort(500, description=f"add-piece failed: {e}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    if not result.get("ok"):
+        status = 404 if str(result.get("error", "")).startswith("no coordinating hub") else 409
+        return jsonify(result), status
+    return jsonify(result)
+
+
 @task_bp.route("/api/task/<state>/<task_id>/rereview", methods=["POST"])
 def api_task_rereview(state, task_id):
     """Re-review: send a review-stage-blocked task BACK TO REVIEW with its draft intact -- no redraft.
@@ -239,10 +384,17 @@ def api_task_rereview(state, task_id):
         abort(400, description="only a blocked or needs-clarification task can be re-reviewed")
     body = request.get_json(silent=True) or {}
     reason = (body.get("reason") or "").strip() or "re-review requested from the dashboard"
+    qdir, scope = _qdir_for_request(body)
+    if not qdir:
+        abort(404)
+    project = (scope or {}).get("label") or request.args.get("project") or body.get("project")
     script = PACKAGE_ROOT / "src" / "rereview-task.js"
+    cmd = ["node", str(script), task_id, "--state", state, "--reason", reason]
+    if project:
+        cmd += ["--pipeline-dir", str(qdir.parent), "--project", str(project)]
     try:
         cp = subprocess.run(
-            ["node", str(script), task_id, "--state", state, "--reason", reason],
+            cmd,
             capture_output=True, text=True, timeout=30,
             env={**os.environ, **read_env_file(ENV_FILE_PATH)},
         )
@@ -260,10 +412,11 @@ def api_task_staleness_keep(state, task_id):
     task is still valid. Clears the flag and writes a `stalenessKeep` cooldown so the sweep
     does not re-flag it for AGENT_MANAGER_STALENESS_COOLDOWN_DAYS (default 21). The task
     stays exactly where it is -- this only affects the flag."""
-    from app import queue_dir
+    body = request.get_json(silent=True) or {}
     if state not in ("blocked", "needs-clarification"):
         abort(400, description="staleness flags only exist on blocked / needs-clarification tasks")
-    qdir = queue_dir()
+    qdir, scope = _qdir_for_request(body)
+    project = (scope or {}).get("label") or request.args.get("project") or body.get("project")
     if not qdir:
         abort(404)
     src = qdir / state / f"{task_id}.json"
@@ -279,7 +432,7 @@ def api_task_staleness_keep(state, task_id):
     data["stalenessKeep"] = {"until": until.isoformat(), "by": "human", "at": datetime.now(timezone.utc).isoformat()}
     data.setdefault("history", []).append({
         "stage": "advisory", "at": datetime.now(timezone.utc).isoformat(),
-        "detail": f"staleness flag dismissed by a human -- keep until {until.date().isoformat()}",
+        "detail": f"staleness flag dismissed by a human -- keep until {until.date().isoformat()}" + (f" (project {project})" if project else ""),
     })
     src.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return jsonify({"id": task_id, "kept": True, "until": until.isoformat()})
@@ -292,10 +445,11 @@ def api_task_context_trim_keep(state, task_id):
     flag and writes a `contextTrimKeep` cooldown so the sweep does not re-flag it for
     AGENT_MANAGER_CONTEXT_TRIM_SWEEP_KEEP_COOLDOWN_DAYS (default 21). The task stays exactly
     where it is -- this only affects the flag, same as staleness-keep above."""
-    from app import queue_dir
+    body = request.get_json(silent=True) or {}
     if state != "blocked":
         abort(400, description="context-trim flags only exist on blocked tasks")
-    qdir = queue_dir()
+    qdir, scope = _qdir_for_request(body)
+    project = (scope or {}).get("label") or request.args.get("project") or body.get("project")
     if not qdir:
         abort(404)
     src = qdir / state / f"{task_id}.json"
@@ -311,7 +465,7 @@ def api_task_context_trim_keep(state, task_id):
     data["contextTrimKeep"] = {"until": until.isoformat(), "by": "human", "at": datetime.now(timezone.utc).isoformat()}
     data.setdefault("history", []).append({
         "stage": "advisory", "at": datetime.now(timezone.utc).isoformat(),
-        "detail": f"context-trim flag dismissed by a human -- keep until {until.date().isoformat()}",
+        "detail": f"context-trim flag dismissed by a human -- keep until {until.date().isoformat()}" + (f" (project {project})" if project else ""),
     })
     src.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return jsonify({"id": task_id, "kept": True, "until": until.isoformat()})
@@ -356,7 +510,7 @@ def api_task_confirm_delete(task_id):
     # report here for a human read. Confirming it stamps debriefReportConfirmedAt so the
     # re-run's second pass archives the window's own done/ tasks (see applyDebriefReport in
     # src/apply-group-a.js).
-    if data.get("source") == "pipeline_debrief":
+    if data.get("source") in ("pipeline_debrief", "capability_debrief"):  # capability_debrief reuses the same second-pass gate
         data["debriefReportConfirmedAt"] = now_iso
     if data.get("source") == "decompose_design_question":
         data["decomposeQuestionConfirmedAt"] = now_iso
@@ -369,6 +523,24 @@ def api_task_confirm_delete(task_id):
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
     return jsonify({"id": task_id, "confirmed": True})
+
+
+def _shared_branch_siblings(qdir, branch, task_id):
+    """Live tasks (other than task_id) with work applied to `branch` -- see src/lib/shared-branch.js, the single implementation, run through its CLI.
+
+    Returns {"siblings": [...]} or {"siblings": [], "error": "..."}; the caller keeps the branch on any error (fail safe)."""
+    try:
+        cli = Path(__file__).resolve().parents[3] / "src" / "shared-branch-siblings.js"
+        out = subprocess.run(
+            ["node", str(cli), "--pipeline", str(Path(qdir).parent), "--branch", str(branch), "--task", str(task_id)],
+            capture_output=True, text=True, timeout=20,
+        )
+        data = json.loads(out.stdout or "{}")
+        if out.returncode != 0 or not isinstance(data, dict):
+            return {"siblings": [], "error": data.get("error") if isinstance(data, dict) and data.get("error") else f"exit {out.returncode}"}
+        return data
+    except Exception as e:  # noqa: BLE001 -- anything unexpected means "unknown", which keeps the branch
+        return {"siblings": [], "error": str(e)[:120]}
 
 
 @task_bp.route("/api/task/<state>/<task_id>/requeue", methods=["POST"])
@@ -417,10 +589,10 @@ def api_task_requeue(state, task_id):
     archive pass moved there is just as "archived" and must be just as requeueable as one a
     human moved to _archived_no_action/ by hand; see done-archive.js's own header on the
     same "always reversible" promise this endpoint already exists to uphold."""
-    from app import _record_manual_requeue, _repeated_blocker_match, get_active_repo_root, logger, queue_dir, read_json_safe
+    from app import _record_manual_requeue, _repeated_blocker_match, get_active_repo_root, logger, read_json_safe
     if state not in ("blocked", "needs-clarification", "done", "archived"):
         abort(400, description="only a blocked, needs-clarification, done, or archived task can be requeued")
-    qdir = queue_dir()
+    qdir, scope = _qdir_for_request(request.get_json(silent=True) or {})   # ?project=<repoRoot>: that registered project's queue, repo and pipeline
     if not qdir:
         abort(404)
     if state == "archived":
@@ -464,6 +636,12 @@ def api_task_requeue(state, task_id):
                 "again to proceed anyway."
             ))
 
+    # circuitBreaker (set by src/review-task.js when the fact-check rejection counter trips): a manual requeue would redo
+    # the same failing work, so refuse here. This runs before any branch handling or write to queue/pending/, so the task
+    # file stays in queue/blocked/. A missing or non-True field is a no-op.
+    if data.get("circuitBreaker") is True:
+        return jsonify({"error": "circuit_breaker"}), 409
+
     # If this task was already applied to a branch that never merged (task-disposition.js's
     # 'pending-merge' -- an agent/<id> branch exists, ahead of main, unmerged), a requeue is
     # about to redo the same work from scratch on a FRESH branch, so the old one is now
@@ -480,9 +658,20 @@ def api_task_requeue(state, task_id):
             if isinstance(ev, dict) and ev.get("stage") == "applied" and ev.get("detail"):
                 applied_branch = ev["detail"]
                 break
-        if applied_branch:
+        # A branch other live work sits on (a hub's shared branch) is KEPT: deleting it destroyed the siblings' approved, unmerged commits (HUB0018-01,
+        # 2026-10-07; src/lib/shared-branch.js is the single implementation, reached through its CLI). A failing check also keeps the branch -- a stale
+        # pushed branch is the cheap mistake, a deleted shared one the expensive one. The redraft stacks on top of the kept branch.
+        shared = _shared_branch_siblings(qdir, applied_branch, task_id) if applied_branch else {"siblings": []}
+        if applied_branch and (shared.get("error") or shared.get("siblings")):
+            why = (f"sibling check failed ({shared['error']})" if shared.get("error")
+                   else "shared with " + ", ".join(s["id"] for s in shared["siblings"]))
+            data.setdefault("history", []).append({
+                "stage": "branch-kept", "at": datetime.now(timezone.utc).isoformat(),
+                "detail": f"requeue kept {applied_branch}: {why}; the redraft stacks on it",
+            })
+        elif applied_branch:
             from app import _invalidate_branch_cache, _run_git
-            repo_root = get_active_repo_root()
+            repo_root = scope["repoPath"] if scope else get_active_repo_root()
             repo_root = Path(repo_root) if repo_root else None
             if repo_root:
                 try:
@@ -498,7 +687,11 @@ def api_task_requeue(state, task_id):
                         "Non-fatal: could not delete superseded branch %r for requeued task %r: %s",
                         applied_branch, task_id, e,
                     )
-                _invalidate_branch_cache()
+                if scope:
+                    import branch_projects
+                    branch_projects.after_action(scope)
+                else:
+                    _invalidate_branch_cache()
             abandon_iso = datetime.now(timezone.utc).isoformat()
             abandon_detail = f"superseded by a manual requeue from {state}/; prior branch {applied_branch} deleted"
             data.setdefault("history", []).append({
@@ -558,13 +751,40 @@ def api_task_requeue(state, task_id):
         fresh["stacked"] = data["stacked"]
     if "dependsOn" in data:
         fresh["dependsOn"] = data["dependsOn"]
+    if "prerequisiteHubs" in data:
+        fresh["prerequisiteHubs"] = data["prerequisiteHubs"]
     if "atomic" in data:
         fresh["atomic"] = data["atomic"]
     if "noDecompose" in data:
         fresh["noDecompose"] = data["noDecompose"]
+    # Premium / human-queue fields (2026-11-15, mirrors chat-task-requeue.js:134-141):
+    # these are set by Chat / CLI / execute.js and must survive the reset. Losing them
+    # on requeue was silently downgrading priority for tasks that a human or a
+    # premium-priority path had explicitly marked -- the same bug the JS path already
+    # fixed.
+    if "humanQueued" in data:
+        fresh["humanQueued"] = data["humanQueued"]
+    if "premiumPriority" in data:
+        fresh["premiumPriority"] = data["premiumPriority"]
+    if "premiumSetBy" in data:
+        fresh["premiumSetBy"] = data["premiumSetBy"]
+    if "premiumSetAt" in data:
+        fresh["premiumSetAt"] = data["premiumSetAt"]
+    # Fresh read of the source file to ensure premium fields are preserved even if
+    # something between the initial read and this write modified the in-memory copy.
+    # This is the defensive pattern: re-read the file to get the canonical current
+    # values, then copy the premium fields from that fresh read.
+    current_src = read_json_safe(src) or {}
+    if "premiumPriority" in current_src:
+        fresh["premiumPriority"] = current_src["premiumPriority"]
+    if "premiumSetBy" in current_src:
+        fresh["premiumSetBy"] = current_src["premiumSetBy"]
+    if "premiumSetAt" in current_src:
+        fresh["premiumSetAt"] = current_src["premiumSetAt"]
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
-    _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual")
+    _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual",
+                           pipeline_dir=scope["pipelineDir"] if scope else None)
     return jsonify({"id": task_id, "requeued": True})
 
 
@@ -578,8 +798,9 @@ def api_task_resolve_clarification(task_id):
     candidates, or hand-typed for a 'no-match' case) become promptContext.prefetchedPaths;
     an empty/omitted paths list means "proceed with no prefetch at all," a deliberate
     choice, not an error."""
-    from app import _record_manual_requeue, queue_dir, read_json_safe
-    qdir = queue_dir()
+    from app import _record_manual_requeue, read_json_safe
+    body = request.get_json(silent=True) or {}
+    qdir, scope = _qdir_for_request(body)
     if not qdir:
         abort(404)
     src = qdir / "needs-clarification" / f"{task_id}.json"
@@ -587,7 +808,6 @@ def api_task_resolve_clarification(task_id):
     if not data:
         abort(404)
 
-    body = request.get_json(silent=True) or {}
     paths = body.get("paths")
     if paths and isinstance(paths, list):
         data.setdefault("promptContext", {})["prefetchedPaths"] = [str(p) for p in paths]
@@ -598,10 +818,33 @@ def api_task_resolve_clarification(task_id):
     dest = adhoc_dir / f"{task_id}.json"
     if dest.exists():
         abort(409, description=f"'{task_id}' already has a task in adhoc/")
+    _carry_premium_fields(src, data)
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
-    _record_manual_requeue(data, reason_hint="needs-clarification resolved via the file-path picker", requeue_writer="operator-manual")
+    _record_manual_requeue(data, reason_hint="needs-clarification resolved via the file-path picker", requeue_writer="operator-manual", pipeline_dir=scope["pipelineDir"] if scope else None)
     return jsonify({"id": task_id, "resolved": True, "prefetchedPaths": data.get("promptContext", {}).get("prefetchedPaths")})
+
+
+_FILES_LINE_RE = re.compile(r"^Files:[ \t]*(\S[^\r\n]*)$", re.IGNORECASE | re.MULTILINE)
+
+
+def replace_files_line(raw_text, answer):
+    """(new_raw_text, replaced) -- mirrors replaceFilesLine in src/chat-task-requeue.js (2026-10-30). The LAST `Files:` line of the answer
+    replaces the FIRST `Files:` line of the task text, because src/adhoc-diff-sanity.js extractDeclaredFiles reads only the first one and every
+    guard trusts it. replaced is None or {"old": str, "new": str}. Nothing changes when the answer has no such line, when the task text has no
+    earlier one, or when the value is unchanged."""
+    text = raw_text or ""
+    found = _FILES_LINE_RE.findall(answer or "")
+    if not found:
+        return text, None
+    new = found[-1].strip()
+    earlier = _FILES_LINE_RE.search(text)
+    if not earlier:
+        return text, None
+    old = earlier.group(1).strip()
+    if old == new:
+        return text, None
+    return text[:earlier.start()] + f"Files: {new}" + text[earlier.end():], {"old": old, "new": new}
 
 
 @task_bp.route("/api/task/needs-clarification/<task_id>/answer", methods=["POST"])
@@ -616,8 +859,9 @@ def api_task_answer_clarification(task_id):
     session's transcript already gets folded in as (see api_discuss_end's needs-
     clarification branch), just without ever opening a session.
     Body: {"answer": "<free text, or the clicked option's label+description>"}."""
-    from app import _record_manual_requeue, queue_dir, read_json_safe
-    qdir = queue_dir()
+    from app import _record_manual_requeue, read_json_safe
+    body = request.get_json(silent=True) or {}
+    qdir, scope = _qdir_for_request(body)
     if not qdir:
         abort(404)
     src = qdir / "needs-clarification" / f"{task_id}.json"
@@ -625,13 +869,13 @@ def api_task_answer_clarification(task_id):
     if not data:
         abort(404)
 
-    body = request.get_json(silent=True) or {}
     answer = (body.get("answer") or "").strip()
     if not answer:
         abort(400, description="answer is required")
 
     data.setdefault("promptContext", {})
-    prior = data["promptContext"].get("rawText", "")
+    # A `Files:` line in the answer REPLACES the task's stale first one (same rule as the chat answer), so the guards read the corrected paths.
+    prior, files_replaced = replace_files_line(data["promptContext"].get("rawText", ""), answer)
     data["promptContext"]["rawText"] = prior + (
         f"\n\nHUMAN DESIGN DECISION (answered directly from the Needs Clarification "
         f"picker, {datetime.now(timezone.utc).isoformat()}):\n{answer}\n"
@@ -639,6 +883,11 @@ def api_task_answer_clarification(task_id):
         f"directly rather than re-asking for clarification."
     )
     _clean_slate_for_fresh_adhoc_attempt(data)
+    if files_replaced:
+        data.setdefault("history", []).append({
+            "stage": "files-line-replaced", "at": datetime.now(timezone.utc).isoformat(),
+            "detail": f'Files line replaced by the answer: "{files_replaced["old"]}" -> "{files_replaced["new"]}"',
+        })
     data.setdefault("history", []).append({
         "stage": "needs-clarification-resolved", "at": datetime.now(timezone.utc).isoformat(),
         "detail": "Answered directly from the dashboard's multiple-choice/Other picker -- requeued to adhoc/ for a fresh draft pass.",
@@ -649,9 +898,10 @@ def api_task_answer_clarification(task_id):
     dest = adhoc_dir / f"{task_id}.json"
     if dest.exists():
         abort(409, description=f"'{task_id}' already has a task in adhoc/")
+    _carry_premium_fields(src, data)
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
-    _record_manual_requeue(data, reason_hint=f"needs-clarification answered from the picker: {answer[:200]}", requeue_writer="operator-manual")
+    _record_manual_requeue(data, reason_hint=f"needs-clarification answered from the picker: {answer[:200]}", requeue_writer="operator-manual", pipeline_dir=scope["pipelineDir"] if scope else None)
     return jsonify({"id": task_id, "answered": True})
 
 
@@ -684,8 +934,8 @@ def api_task_mark_done_clarification(task_id):
     from this specific record, but the need is considered met" -- exactly what
     isDependencySatisfied's own new no-code-coming check now looks for (see its comment).
     """
-    from app import queue_dir, read_json_safe
-    qdir = queue_dir()
+    from app import read_json_safe
+    qdir, _scope = _qdir_for_request(request.get_json(silent=True) or {})
     if not qdir:
         abort(404)
     src = qdir / "needs-clarification" / f"{task_id}.json"
@@ -714,51 +964,16 @@ def api_task_mark_done_clarification(task_id):
 
 @task_bp.route("/api/task/approved/<task_id>/apply", methods=["POST"])
 def api_task_apply(task_id):
-    """Manual per-task apply (three-tier approval mode, 2026-07-26): the missing piece that
-    makes 'prompt'/'approve'-tier tasks actually usable one at a time, instead of only via
-    the all-or-nothing AGENT_MANAGER_INCLUDE_APPLY global toggle. Shells out to
-    apply-runner.ps1 -TaskId <id> (a one-shot invocation mode that bypasses the automatic
-    loop's approval-mode filtering entirely, since a human explicitly clicked Apply) and
-    waits for it to finish -- a real git branch/commit/push can take a while, hence the
-    generous timeout, and this is deliberately synchronous (no async job tracking) since
-    the dashboard button needs a direct success/failure answer to show the user."""
-    from app import ENV_FILE_PATH, PACKAGE_ROOT, SRC_DIR, get_active_repo_root, logger, queue_dir, read_env_file
+    """Manual per-task apply. It used to shell out to src/apply-runner.ps1 -TaskId <id> (a Windows one-shot mode); that script is retired and
+    scripts/apply-task.sh has no single-task mode (it applies every approved task), so this answers 501 and the apply loop (scripts/apply-loop.sh)
+    applies the task on its next tick. The task must still be in approved/."""
+    from app import queue_dir
     qdir = queue_dir()
     if not qdir:
         abort(404)
-    approved_path = qdir / "approved" / f"{task_id}.json"
-    if not approved_path.is_file():
+    if not (qdir / "approved" / f"{task_id}.json").is_file():
         abort(404, description=f"'{task_id}' not found in approved/")
-
-    repo_root = get_active_repo_root()
-    if not repo_root:
-        abort(400, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
-
-    env_overrides = read_env_file(ENV_FILE_PATH)
-    env_overrides["AGENT_MANAGER_REPO_ROOT"] = repo_root
-    child_env = {**os.environ, **env_overrides}
-
-    script_path = SRC_DIR / "apply-runner.ps1"
-    try:
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path), "-TaskId", task_id],
-            capture_output=True, text=True, timeout=300, env=child_env, cwd=str(PACKAGE_ROOT),
-        )
-    except subprocess.TimeoutExpired as e:
-        logger.error(
-            "apply-runner.ps1 -TaskId %s timed out (script: %s): %s: %s",
-            task_id, str(script_path), type(e).__name__, str(e),
-            exc_info=True,
-        )
-        raise
-
-    output_tail = (result.stdout or "")[-4000:]
-    if result.returncode == 2:
-        return jsonify({"id": task_id, "applied": False, "reason": f"'{task_id}' was not found in approved/ by apply-runner.ps1 (raced with the automatic loop?)"}), 404
-    if result.returncode != 0:
-        return jsonify({"id": task_id, "applied": False, "reason": "apply-runner.ps1 exited non-zero", "output": output_tail}), 500
-
-    return jsonify({"id": task_id, "applied": True, "output": output_tail})
+    return jsonify({"id": task_id, "applied": False, "reason": "manual per-task apply is retired with the Windows runner; the apply loop applies approved tasks on its next tick"}), 501
 
 
 @task_bp.route("/api/task/needs-clarification/<task_id>/discuss/latest", methods=["GET"])

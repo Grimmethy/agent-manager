@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # loc
 readonly INSTANCE_ID="${1:-worker-0}"                                              # allow override via argv; default to 'worker-0' matching PowerShell's $env:INSTANCE_ID if undefined (same convention across all 4 daemons so operator can grep logs for specific loop instance).
 export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so local-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
 
-# --once (2026-09-20, docs/idle-pool-borrowing.md): ONE tick, then exit with 10 (did work), 11 (did work, infra-shaped failure) or 0 (found
+# --once (2026-09-20, docs/design-notes/idle-pool-borrowing.md): ONE tick, then exit with 10 (did work), 11 (did work, infra-shaped failure) or 0 (found
 # nothing). It is how an idle lane BORROWS a tick from another suite project: the lane's daemon runs this same script again as a child under
 # that project's env (scripts/../src/pool-projects.js --env-args), heartbeating into the lane's HOME instances dir. The child must not look like a
 # second daemon, so it skips the duplicate-instance check, the "starting" heartbeat and the startup reclaim, and it never sleeps or borrows.
@@ -15,6 +15,15 @@ ONCE=false
 # Every heartbeat this lane writes carries the DAEMON's pid (write_heartbeat_file), not a borrowed child's, so dead-process-check never sees a
 # dead pid between borrowed ticks.
 if ! "$ONCE"; then export AGENT_MANAGER_DAEMON_PID="$$"; fi
+# Premium-only borrowed tick (2026-10-18, premium reach -- src/pool-projects.js header): the daemon runs a --once child with
+# AGENT_MANAGER_PREMIUM_ONLY_TICK=true when ANOTHER registered project holds premium work and the home project holds none. Such a child
+# resumes, seeds and claims premium tasks only, so it can never take (or generate) that project's regular work. Ignored without --once.
+PREMIUM_ONLY=false
+if "$ONCE" && [[ "${AGENT_MANAGER_PREMIUM_ONLY_TICK:-}" == "true" ]]; then PREMIUM_ONLY=true; fi
+# Exit 0 when the task file's top-level premiumPriority is true (same test as pool-projects.js hasPremium).
+is_premium_file() {
+  node -e 'try{process.exit(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).premiumPriority===true?0:1)}catch(e){process.exit(1)}' "$1" 2>/dev/null
+}
 
 # Worker lanes are one per GPU, named for the GPU (src/lanes.js: worker-3090, worker-p40). Every
 # lane claims ANY pending task by priority -- there is no reasoning/worker split (2026-09-19).
@@ -25,17 +34,13 @@ source "${SCRIPT_DIR}/orc-common.sh"                                            
 
 # Re-run once per tick (Workers tab per-instance model dropdown): exports LOCAL_MODEL for this
 # tick from dashboard-settings.json's workerModelOverrides when the dashboard has set one for THIS
-# instanceId (a bare model name; a legacy "ollama:" prefix is tolerated), else leaves whatever
-# agent-manager.env / the lane's own env set at launch untouched. Every node call downstream this
-# tick (local-draft.js, ...) inherits the exported value.
+# instanceId (a bare model name; a legacy "ollama:" prefix is tolerated), else the model this
+# process was launched with (effective_local_model / capture_base_local_model in
+# agent-manager-common.sh), so removing an override puts the lane back. Every node call downstream
+# this tick (local-draft.js, ...) inherits the exported value.
+capture_base_local_model
 refresh_active_model() {
-  local override
-  override="$(get_model_override "$INSTANCE_ID")"
-  case "$override" in
-    claude:*) : ;;
-    ollama:*) LOCAL_MODEL="${override#ollama:}" ;;
-    ?*) LOCAL_MODEL="$override" ;;
-  esac
+  LOCAL_MODEL="$(effective_local_model "$INSTANCE_ID")"
   export LOCAL_MODEL
   HEARTBEAT_MODEL="${LOCAL_MODEL:-}"
 }
@@ -199,15 +204,49 @@ process_drafting_file() {
   # queue/needs-clarification/ instead of review/, same "nothing here for an automatic
   # reviewer to verify" reasoning local-draft.js's own comment documents.
   draft_needs_clarification="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.needsClarification?"true":"false")}catch(e){console.log("false")}')"
+  # recorded (2026-11-02): a script-handled source (src/script-handler-registry.js) finished its work and left the result on the task; nothing for a reviewer to verify.
+  draft_recorded="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.recorded?"true":"false")}catch(e){console.log("false")}')"
 
   if [[ "$draft_succeeded" == "true" && "$draft_blocked" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/blocked" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/blocked/${name}"
     printf '[worker-%s] blocked %s: %s\n' "$INSTANCE_ID" "$task_id" "$draft_result" >&2
   elif [[ "$draft_succeeded" == "true" && "$draft_needs_clarification" == "true" ]]; then
-    mkdir -p "${QUEUE_DIR}/needs-clarification" >/dev/null 2>&1
-    mv -n "$wpath" "${QUEUE_DIR}/needs-clarification/${name}"
-    printf '[worker-%s] %s needs a human decision -- moved to needs-clarification/\n' "$INSTANCE_ID" "$task_id" >&2
+    # A stop record (a question for a human, no diff) from a NODE worker goes to queue/node-outbox/ so src/node-package-send.js ships it to wok, which files it in its own
+    # queue/needs-clarification/ and ends the lease. A wok worker files it here, as before. The is-node check runs once, in this branch.
+    if node "${PACKAGE_SRC_DIR}/node-outbox.js" is-node; then
+      mkdir -p "${QUEUE_DIR}/node-outbox" >/dev/null 2>&1
+      mv -n "$wpath" "${QUEUE_DIR}/node-outbox/${name}"
+      printf '[worker-%s] %s stopped on a node with a question, ready to send to wok: %s\n' "$INSTANCE_ID" "$task_id" "$task_id" >&2
+    else
+      mkdir -p "${QUEUE_DIR}/needs-clarification" >/dev/null 2>&1
+      mv -n "$wpath" "${QUEUE_DIR}/needs-clarification/${name}"
+      printf '[worker-%s] %s needs a human decision -- moved to needs-clarification/\n' "$INSTANCE_ID" "$task_id" >&2
+    fi
+  elif [[ "$draft_succeeded" == "true" && "$draft_recorded" == "true" ]]; then
+    mkdir -p "${QUEUE_DIR}/done" >/dev/null 2>&1
+    mv -n "$wpath" "${QUEUE_DIR}/done/${name}"
+    printf '[worker-%s] recorded %s -- script handler finished, no review needed: moved to done/\n' "$INSTANCE_ID" "$task_id" >&2
+  elif [[ "$draft_succeeded" == "true" ]] && node "${PACKAGE_SRC_DIR}/node-outbox.js" is-node; then
+    # Multi-node (piece 7b): a worker on a NODE (AGENT_MANAGER_NODE_ID set and not wok) stops after the draft. The drafted record waits in queue/node-outbox/ for
+    # src/node-package-send.js to ship it to wok, whose own queue/review/ runs the ordinary review, apply, verifier and merge. A wok worker never takes this branch.
+    # Draft-present gate (HUB0574): only move a drafted record into node-outbox/ when it actually carries draft content. Otherwise leave it in the node's queue and log the reason.
+    draft_content_gap="$(node -e '
+      try {
+        const o = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+        const nonEmpty = (v) => (typeof v === "string" ? v.trim() !== "" : !!v);
+        const nc = o.needsClarification;
+        const ncReason = nc && typeof nc === "object" ? nc.reason : nc;
+        if (!(nonEmpty(o.implementResponse) || nonEmpty(o.rawDiff) || nonEmpty(o.adhocResolution) || nonEmpty(ncReason))) console.log("no implementResponse, rawDiff, adhocResolution or needsClarification reason on the record");
+      } catch (e) { console.log("record unreadable: " + e.message); }
+    ' "$wpath" 2>/dev/null)"
+    if [[ -n "$draft_content_gap" ]]; then
+      printf '[worker-%s] draft succeeded for %s but it is not ready to send to wok (%s) -- left in the node queue\n' "$INSTANCE_ID" "$task_id" "$draft_content_gap" >&2
+    else
+      mkdir -p "${QUEUE_DIR}/node-outbox" >/dev/null 2>&1
+      mv -n "$wpath" "${QUEUE_DIR}/node-outbox/${name}"
+      printf '[worker-%s] draft complete on a node, ready to send to wok: %s\n' "$INSTANCE_ID" "$task_id" >&2
+    fi
   elif [[ "$draft_succeeded" == "true" ]]; then
     mkdir -p "${QUEUE_DIR}/review" >/dev/null 2>&1
     mv -n "$wpath" "${QUEUE_DIR}/review/${name}"
@@ -216,6 +255,23 @@ process_drafting_file() {
     # apply-task.sh's "applying X..." lines. The task JSON already carries a 'draft-done'
     # history event (src/local-draft.js concludeDraft()).
     printf '[worker-%s] draft complete, ready for review: %s\n' "$INSTANCE_ID" "$task_id" >&2
+  elif grep -qE "the Forge family holds the GPU" <<< "$draft_result"; then
+    # Forge GPU session (2026-10-14): local-client.js refused to START a model call because PromptForge holds the GPU (comfyui-lease)
+    # -- src/gpu-guard.js ForgePauseError / FORGE_PAUSE_MESSAGE. This is NOT a failure of the task and NOT an outage: it is a deliberate,
+    # open-ended pause (a Forge session lasts 20 min idle to 4 h), the same class as the 'manually paused' case below. So: no
+    # draftFailureCount increment, no infra-requeue round, no block. The item stays in drafting/ and resumes through the normal
+    # leftover-drafting pass once the lease clears; this tick stops claiming (TICK_HAD_INFRA_FAILURE) and the next ticks yield at the
+    # top while the lease holds. Without this branch the failure counting below could permanently block a good task.
+    # The pattern is the FORGE_PAUSE_MESSAGE text (pinned by src/local-client-forge-pause.test.js so the copies cannot drift).
+    printf '[worker-%s] draft paused for a Forge GPU session -- not counted as a failure; %s stays in drafting/ and resumes when the lease clears\n' "$INSTANCE_ID" "$task_id" >&2
+    TICK_HAD_INFRA_FAILURE=true
+  elif quota_resume="$(printf '%s' "$draft_result" | node "${PACKAGE_SRC_DIR}/draft-quota.js" classify-and-defer "$wpath" 2>>"$LOG_FILE")"; [[ -n "$quota_resume" ]]; then
+    # Rate-limit / quota (HTTP 429: hourly token budget, five-hour plan limit) -- a TEMPORARY capacity condition, not a draft failure
+    # (src/draft-quota.js). classify-and-defer already wrote task.deferUntil; the item stays in drafting/ and the existing per-tick
+    # leftover-drafting pass skips it until then (no new timer or poll, ADR-0024). Deliberately NO draftFailureCount increment, NO
+    # infra-requeue round and NO block, so a quota window can never send the task to needs-clarification. This tick stops claiming.
+    printf '[worker-%s] draft deferred on a rate limit until %s -- not counted as a failure; %s stays in drafting/\n' "$INSTANCE_ID" "$quota_resume" "$task_id" >&2
+    TICK_HAD_INFRA_FAILURE=true
   else
     # Draft call itself failed (e.g. Ollama unreachable, or a real generation call timing
     # out under GPU contention) -- retry via the leftover-drafting resume pass at the top
@@ -389,6 +445,15 @@ process_drafting_file() {
         // process producing truly zero output is itself strong evidence of an external
         // kill/crash, not a content failure the model produced -- treated as infra-shaped
         // here for exactly that reason.
+        // Lane attribution (HUB0164 3/4): a failure is lane-attributable only when the module says so.
+        // Any load or parse error leaves laneAttributable false, so the bounded path behaves as before.
+        let laneAttributable = false;
+        let laneRecorder = null;
+        try {
+          const attrMod = require(process.argv[5]);
+          laneRecorder = attrMod.recordLaneFailure;
+          laneAttributable = attrMod.classifyInfraFailure({ failureText: draftResult, laneId: process.argv[6], primaryLaneId: process.argv[7] }).laneAttributable === true;
+        } catch (e) { laneAttributable = false; }
         const isInfra = INFRA_FAILURE_PATTERN.test(draftResult || "") || !(draftResult || "").trim();
         const infraRequeueCount = o.infraRequeueCount || 0;
         o.history = o.history || [];
@@ -401,7 +466,19 @@ process_drafting_file() {
           });
           fs.writeFileSync(p, JSON.stringify(o, null, 2));
           console.log("requeue");
-        } else if (isInfra && infraRequeueCount < infraRequeueLimit) {
+        } else if (laneAttributable === true) {
+          // Lane-attributable infra failure: record it against the failing lane and requeue
+          // without charging the task infraRequeueCount.
+          try { if (laneRecorder) laneRecorder(process.argv[6], { reason: draftResult, instancesDir: process.argv[8] }); } catch (e) { /* best-effort */ }
+          o.draftFailureCount = 0;
+          o.history.push({
+            stage: "requeued",
+            at: new Date().toISOString(),
+            detail: `draft call failed ${failureCount} times in a row on an infra failure attributable to lane ${process.argv[6]} (most recent: ${draftResult}) -- requeued without counting against this task`,
+          });
+          fs.writeFileSync(p, JSON.stringify(o, null, 2));
+          console.log("requeue");
+        } else if (isInfra && laneAttributable === false && infraRequeueCount < infraRequeueLimit) {
           o.infraRequeueCount = infraRequeueCount + 1;
           o.draftFailureCount = 0;
           o.history.push({
@@ -421,7 +498,7 @@ process_drafting_file() {
           fs.writeFileSync(p, JSON.stringify(o, null, 2));
           console.log("block");
         }
-      ' "$wpath" "$draft_result" "$failure_count" "${DRAFT_INFRA_REQUEUE_LIMIT:-3}")"
+      ' "$wpath" "$draft_result" "$failure_count" "${DRAFT_INFRA_REQUEUE_LIMIT:-3}" "${PACKAGE_SRC_DIR}/infra-attribution.js" "$INSTANCE_ID" "${AGENT_MANAGER_PRIMARY_LANE:-worker-0}" "$INSTANCES_DIR")"
 
       if [[ "$action" == "requeue" ]]; then
         mkdir -p "${QUEUE_DIR}/pending" >/dev/null 2>&1
@@ -471,8 +548,16 @@ fi
 # ticks for the backoff to actually lengthen; reset to 0 the moment any tick's work is
 # NOT an infra failure (a real success, a non-infra block, or a genuinely idle tick).
 CONSECUTIVE_INFRA_FAILURES=0
+SWITCHED_OFF_TICKS=0                                                     # consecutive ticks this worker has been switched off by the operator (worker_switched_off); only used to print one line on each transition
+DIAL_OFF_TICKS=0                                                         # consecutive ticks this cloud lane has been turned off by the cloud-agent dial (cloud_dial_off); only used to print one line on each transition
+LANE_RULES_STAMP="${TEMP_DIR:-${TMPDIR:-/tmp}}/lane-rules-${INSTANCE_ID}.stamp"   # reload_lane_rules (agent-manager-common.sh) re-reads this lane's taskClasses and reviews only when lanes.json is newer than this per-instance stamp; the tick is the trigger, no timer
+ENDPOINT_DOWN_TICKS=0                                                    # consecutive ticks the lane's Ollama endpoint did not answer (see the circuit breaker in the main loop)
+LAST_WAKE=""                                                            # how the last idle wait ended: event | timeout | sleep (see wait_for_queue_change)
+WAKE_RECONCILE_HITS=0                                                    # timeout wakes that then found work: a producer changed state without announcing it in a queue directory (ADR-0024 rule 6)
+LAST_TICK_START=0                                                        # epoch seconds when the current tick began (the minimum gap between idle ticks is measured from it)
+LAST_TICK_START_MS=0                                                     # the same moment in ms: the waiter reports any queue entry that arrived after it (catch-up)
 
-# Borrow a tick from another suite project (docs/idle-pool-borrowing.md). Called only when this lane's OWN project had nothing to do this tick.
+# Borrow a tick from another suite project (docs/design-notes/idle-pool-borrowing.md). Called only when this lane's OWN project had nothing to do this tick.
 # Walks the pool in least-recently-borrowed order; the first project that yields work ends the walk. A borrowed tick does exactly ONE item (its
 # task runs to the end of the pass, so active-project work arriving meanwhile waits for that one task -- the other lane can take it), then the
 # lane re-checks its home project immediately -- no sleep beyond the loop's usual 1s after work -- before borrowing again. A project that had nothing is skipped for a few minutes
@@ -501,9 +586,122 @@ borrow_from_pool() {
   return 0
 }
 
+source "${SCRIPT_DIR}/wake-common.sh"                                        # wait_for_queue_change (the idle wait; ADR-0024 S3), shared with review-runner.sh and apply-loop.sh
+
+# The pause at the end of a tick, shared by the normal tick and a tick that ended on a premium borrow (it reads did_work and
+# TICK_HAD_INFRA_FAILURE and maintains CONSECUTIVE_INFRA_FAILURES, exactly as when it was inline at the bottom of the loop).
+end_of_tick_pause() {
+  # Idle-only backoff: only pay the full poll interval when this tick genuinely found
+  # nothing to do. Previously slept the full ORC_TICK_SECS (30s) unconditionally at the
+  # end of EVERY tick regardless of whether more work was sitting right there waiting --
+  # confirmed live 2026-08-15: a real backlog with tasks completing in well under 30s each
+  # still spent the majority of wall-clock time asleep between them, under 50% utilization.
+  # A brief sleep even when work was done avoids a true zero-delay busy-loop hammering the
+  # filesystem tick after tick when a large backlog is draining.
+  if "$did_work" && "$TICK_HAD_INFRA_FAILURE"; then
+    # Jittered exponential backoff (2026-08-25, Grimmethy: "boost throughput" -- shape
+    # borrowed from nullboiler's retry_base_delay_ms=1000/retry_max_delay_ms=30000/
+    # retry_jitter_ms=250, see single-flight-lock.js's per-model-lock change from the same
+    # request for the sibling half of this fix). Confirmed live 2026-08-24: with the flat
+    # `sleep 1` this replaces, a struggling Ollama instance got re-hammered by this same
+    # worker's very next claim every ~150s (the timeout duration) for 90 minutes straight,
+    # zero backoff, zero recovery room. Doubles (1s, 2s, 4s, ... capped at 30s) with each
+    # consecutive infra-failure tick, plus up to 250ms of jitter so multiple lanes backing
+    # off at once don't re-hammer in lockstep; resets to 0 (flat 1s again) the instant a
+    # tick's work is NOT an infra failure. This only paces THIS worker's own next claim --
+    # it does not change DRAFT_FAILURE_RETRY_LIMIT/DRAFT_INFRA_REQUEUE_LIMIT's existing,
+    # separate give-up bounds at all.
+    CONSECUTIVE_INFRA_FAILURES=$((CONSECUTIVE_INFRA_FAILURES + 1))
+    backoff_secs=$((1 << (CONSECUTIVE_INFRA_FAILURES - 1)))                        # 1,2,4,8,16,32,... (bit-shift doubling)
+    if (( backoff_secs > 30 )); then backoff_secs=30; fi
+    jitter_ms=$((RANDOM % 250))
+    sleep "${backoff_secs}.$(printf '%03d' "$jitter_ms")"
+  elif "$did_work"; then
+    CONSECUTIVE_INFRA_FAILURES=0
+    if [[ "$LAST_WAKE" == "timeout" ]]; then
+      WAKE_RECONCILE_HITS=$((WAKE_RECONCILE_HITS + 1))
+      printf '[worker-%s] wake reconcile: found work after a TIMEOUT wake (hit %s) -- a queue change was not announced in a watched directory.\n' "$INSTANCE_ID" "$WAKE_RECONCILE_HITS" >&2
+    fi
+    LAST_WAKE=""
+    sleep 1
+  else
+    CONSECUTIVE_INFRA_FAILURES=0
+    wait_for_queue_change
+  fi
+}
+
+# Premium reach (2026-10-18, Grimmethy: "premium priority tasks happen regardless of what project repo is currently selected (currently
+# selected repo still wins the tie)"). Called by the daemon BEFORE its home tick: when the home project has no premium work for this lane
+# and another registered project (pooled or not) does, run ONE premium-only --once tick there (least-recently-premium-borrowed first) and
+# return 0; the caller then ends this tick. A project whose tick took nothing (e.g. the task is restricted to another lane) is backed off for
+# this lane. Every premium borrow is a 'premium-borrow' event in the HOME pipeline history. Kill switch AGENT_MANAGER_PREMIUM_REACH=false.
+borrow_premium_from_projects() {
+  [[ "${AGENT_MANAGER_PREMIUM_REACH:-true}" != "false" ]] || return 1
+  local pipes=() env_args=() pipe rc
+  if node "${PACKAGE_SRC_DIR}/pool-projects.js" --has-premium "$PIPELINE_DIR" worker "$INSTANCE_ID" 2>>"$LOG_FILE"; then
+    return 1   # the home project has premium work for this lane: it wins the tie, the home tick takes it
+  fi
+  mapfile -t pipes < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --premium-projects worker "$INSTANCE_ID" 2>>"$LOG_FILE")
+  for pipe in "${pipes[@]}"; do
+    [[ -n "$pipe" ]] || continue
+    env_args=()
+    mapfile -t env_args < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --env-args "$pipe" "$INSTANCES_DIR" 2>>"$LOG_FILE")
+    (( ${#env_args[@]} > 0 )) || continue
+    printf '[worker-%s] home has no premium work -- borrowing a PREMIUM tick from %s\n' "$INSTANCE_ID" "$pipe"
+    rc=0
+    env "${env_args[@]}" AGENT_MANAGER_PREMIUM_ONLY_TICK=true bash "${SCRIPT_DIR}/local-worker.sh" "$INSTANCE_ID" --once || rc=$?
+    if (( rc == 10 || rc == 11 )); then
+      node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark-premium "$pipe" worker "$PIPELINE_DIR" "$INSTANCE_ID" >>"$LOG_FILE" 2>&1 || true
+      did_work=true
+      if (( rc == 11 )); then TICK_HAD_INFRA_FAILURE=true; fi
+      return 0
+    fi
+    if (( rc != 0 )); then printf '[worker-%s] premium tick from %s exited %s (treated as empty)\n' "$INSTANCE_ID" "$pipe" "$rc" >&2; fi
+    node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark-premium-empty "$pipe" worker "$INSTANCE_ID" >>"$LOG_FILE" 2>&1 || true
+  done
+  return 1
+}
+
 while :; do                                                                     # `while :; do` is bash idiom for 'true/forever' loop — equivalent of PowerShell's `while ($true)` syntax we're matching here. Bash doesn't have boolean literals natively so ':' (the POSIX-no-op command that always returns 0=success) serves as the true condition in loops like this one; identical semantic meaning in practice to while-true block we use elsewhere.
+  LAST_TICK_START="$(date +%s)"; LAST_TICK_START_MS="$(date +%s%3N)"
   did_work=false                                                                 # tracks whether this tick actually processed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment). Reset fresh every tick.
   TICK_HAD_INFRA_FAILURE=false                                                   # set by process_drafting_file (a global, not a subshell -- it's called directly) when this tick's draft call failed on an apparent infra outage. Drives the backoff decision below, separate from did_work.
+
+  # Operator switch (Workers tab toggle, src/worker-switch.js). A worker switched off claims, resumes and borrows NOTHING, but stays alive and heartbeats status
+  # "disabled", so the watchdog leaves it alone and the claim loop treats the lane as not alive (capability-routing.js laneAliveFromHeartbeat), never as a place
+  # a task can be steered to. Checked FIRST each tick: a task already in drafting/ waits there until the worker is switched back on, and a task that is mid-flight
+  # when the switch flips finishes first (the check is once per tick).
+  if worker_switched_off "$INSTANCE_ID"; then
+    if (( SWITCHED_OFF_TICKS == 0 )); then
+      printf '[worker-%s] %s\n' "$INSTANCE_ID" "$(worker_switch_message "$INSTANCE_ID")" >&2
+    fi
+    SWITCHED_OFF_TICKS=$((SWITCHED_OFF_TICKS + 1))
+    write_heartbeat_file "$INSTANCE_ID" "disabled" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
+    if "$ONCE"; then exit 0; fi
+    sleep "${AGENT_MANAGER_SWITCHED_OFF_PAUSE_S:-${ORC_TICK_SECS:-30}}"     # orc-common.sh pins ORC_TICK_SECS to 30; this knob exists so a test can poll fast
+    continue
+  fi
+  if (( SWITCHED_OFF_TICKS > 0 )); then
+    printf '[worker-%s] switched back on after %s tick(s) off; resuming.\n' "$INSTANCE_ID" "$SWITCHED_OFF_TICKS" >&2
+    SWITCHED_OFF_TICKS=0
+  fi
+  # Cloud-agent dial (src/cloud-dial.js): a cloud lane ranked past the dial count claims nothing this tick, like a switched-off worker; a task already in drafting/ finishes first. Heartbeat
+  # status disabled with pass "dial" (so the Workers tab can tell it from the operator switch). No dial file (today) = this block never fires and spawns nothing.
+  if cloud_dial_off "$INSTANCE_ID"; then
+    if (( DIAL_OFF_TICKS == 0 )); then
+      printf '[worker-%s] turned off by the cloud-agent dial -- claiming nothing until the dial is raised.\n' "$INSTANCE_ID" >&2
+    fi
+    DIAL_OFF_TICKS=$((DIAL_OFF_TICKS + 1))
+    write_heartbeat_file "$INSTANCE_ID" "disabled" "$HEARTBEAT_MODEL" "" "dial" "$STARTED_AT"
+    if "$ONCE"; then exit 0; fi
+    sleep "${AGENT_MANAGER_SWITCHED_OFF_PAUSE_S:-${ORC_TICK_SECS:-30}}"
+    continue
+  fi
+  if (( DIAL_OFF_TICKS > 0 )); then
+    printf '[worker-%s] the cloud-agent dial now includes this lane after %s tick(s) off; resuming.\n' "$INSTANCE_ID" "$DIAL_OFF_TICKS" >&2
+    DIAL_OFF_TICKS=0
+  fi
+  reload_lane_rules "$INSTANCE_ID" || true                                      # a lanes.json edit (taskClasses, reviews) reaches this running worker without a restart; no node spawn while lanes.json is unchanged, and a failure never stops the tick. Sets LANE_RULES_TASK_CLASSES / LANE_RULES_REVIEWS for later pieces; nothing reads them yet.
   refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work -- see the function's own comment above the loop.
   printf '[worker-%s] tick at %s — searching for new drafts...\n' "$INSTANCE_ID" "$(date -u '+%FT%T.%NZ' 2>/dev/null)"    # status message at top of each iteration — same information PowerShell's Write-Verbose emits but using printf for format-safety (avoids issues if variable contents include '%' characters which would be interpreted as string-formatting directives by `echo -e` on some systems, breaking log output).
   write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"   # so the dashboard's Workers tab sees this instance exists even on a tick that claims nothing -- previously never called anywhere in this script, which is why no workers ever showed up regardless of whether the process was alive.
@@ -512,10 +710,50 @@ while :; do                                                                     
   [[ -r "$HOME_LOGS" ]]                                                          || mkdir -p "$HOME_LOGS"                  # ensure log dir exists (might not have been created yet between launch.sh running and this script actually reaching this step). Same pattern as PowerShell's `$logFolder = if (-not (Test-Path $dir)) { New-Item ... } else { $dir }` conditional creation block which is what we're replacing with simpler shell here.
 
   # Yield this tick while PromptForge holds the GPU (comfyui-lease).
-  if comfyui_lease_held; then
+  if comfyui_lease_held "${OLLAMA_URL:-http://localhost:11434}"; then
     printf '[worker-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+    lane_note_gpu_pause "$INSTANCE_ID" "$HEARTBEAT_MODEL" "$STARTED_AT"   # heartbeat says "paused" (Workers tab) and remembers to warm the model up afterwards
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
+    continue
+  fi
+  lane_warm_after_pause "$INSTANCE_ID" "$HEARTBEAT_MODEL" "$STARTED_AT"   # no-op unless the lease was just released: reload the model before claiming
+
+  # Endpoint circuit breaker (2026-10-23, Grimmethy: the rx580 lane sat idle for 12 h after grimm hard-reset and its Ollama never came back; "this is a recurring
+  # event"). While this lane's Ollama endpoint does not answer, claim and resume NOTHING: every draft would fail identically, burn the task's infra requeue
+  # rounds and park it in blocked/ (540 failed ticks and six parked tasks that night). Wait and re-probe instead; the heartbeat says why (pass
+  # 'endpoint-unreachable'), the log says it on the first down tick and every 20th. AGENT_MANAGER_ENDPOINT_PROBE=off disables it (the sandbox tests point the
+  # endpoint at a closed port on purpose). A borrowed --once child just exits: its daemon already probed this same endpoint at the top of its own tick.
+  if [[ "${AGENT_MANAGER_ENDPOINT_PROBE:-on}" != "off" ]] && ! ollama_endpoint_reachable "${OLLAMA_URL:-http://localhost:11434}"; then
+    ENDPOINT_DOWN_TICKS=$((ENDPOINT_DOWN_TICKS + 1))
+    if (( ENDPOINT_DOWN_TICKS == 1 || ENDPOINT_DOWN_TICKS % 20 == 0 )); then
+      printf '[worker-%s] Ollama endpoint %s is not answering (tick %s of the outage) -- claiming nothing until it does.\n' "$INSTANCE_ID" "${OLLAMA_URL:-http://localhost:11434}" "$ENDPOINT_DOWN_TICKS" >&2
+    fi
+    write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "endpoint-unreachable" "$STARTED_AT"
+    if "$ONCE"; then exit 0; fi
+    sleep "${AGENT_MANAGER_ENDPOINT_DOWN_PAUSE_S:-${ORC_TICK_SECS:-30}}"          # orc-common.sh pins ORC_TICK_SECS to 30; this knob exists so the test can poll fast
+    continue
+  fi
+  if (( ENDPOINT_DOWN_TICKS > 0 )); then
+    printf '[worker-%s] Ollama endpoint %s answers again after %s tick(s); resuming.\n' "$INSTANCE_ID" "${OLLAMA_URL:-http://localhost:11434}" "$ENDPOINT_DOWN_TICKS" >&2
+    ENDPOINT_DOWN_TICKS=0
+  fi
+
+  # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
+  if mem_pressure_high; then
+    printf '[worker-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
+    write_heartbeat_file "$INSTANCE_ID" "paused" "$HEARTBEAT_MODEL" "" "ram" "$STARTED_AT"   # status paused, pass ram: the Workers tab and the cloud-dial counts can tell a RAM hold from a GPU-session pause (pass gpu-session) and from idle
+    if "$ONCE"; then exit 0; fi
+    sleep "${ORC_TICK_SECS:-30}"
+    continue
+  fi
+
+  # Cloud agents review before they draft (cloud_take_review, scripts/agent-manager-common.sh): when queue/review/ holds an item no live reviewer has claimed, this cloud lane
+  # reviews ONE item and ends the tick; when every waiting review is already claimed (or there is none) it goes on to draft. A premium-only borrowed tick never reviews.
+  if ! "$PREMIUM_ONLY" && cloud_take_review "$INSTANCE_ID"; then
+    did_work=true
+    if "$ONCE"; then exit 10; fi
+    end_of_tick_pause
     continue
   fi
 
@@ -527,6 +765,9 @@ while :; do                                                                     
   # Confirmed live 2026-08-16: ComfyUI, not run in hours, left 23013/24576MB VRAM used --
   # every ornithCall this tick would have timed out at 240s with no indication why.
   node "${PACKAGE_SRC_DIR}/gpu-guard.js" >>"$LOG_FILE" 2>&1 || true
+
+  # Premium reach: another project's premium task goes before this lane's home REGULAR work (home premium still wins -- see the function).
+  if ! "$ONCE" && borrow_premium_from_projects; then end_of_tick_pause; continue; fi
 
   # Seed pending/ with a new task if the queue has room to generate one -- local-worker.ps1
   # calls this every tick (task-sources.js's own CLI header: "Safe to call on every worker
@@ -542,7 +783,25 @@ while :; do                                                                     
   # ever been attempted or why Scouted Repos stayed empty despite tasks completing.
   # Every lane runs generation, unfiltered: getNextTask() walks the ONE priority ladder and returns the
   # best eligible task; the in-flight throttle is bounded by the number of live lanes (generation-throttle.js).
-  node "${PACKAGE_SRC_DIR}/task-sources.js" >>"$LOG_FILE" 2>&1 || true
+  # A premium-only borrowed tick seeds only when this project's adhoc/ or derived/ holds premium work (task-selection.js then generates it
+  # first), so borrowing a premium tick never generates regular work in another project.
+  if ! "$PREMIUM_ONLY" || node "${PACKAGE_SRC_DIR}/pool-projects.js" --has-premium "$PIPELINE_DIR" worker-seed 2>>"$LOG_FILE"; then
+    # Several lanes tick on one project and each one walked the whole generation ladder (a node start with its module load, about 0.14 CPU-s, plus three git probes of the
+    # candidate docs) a few seconds after the last: 13 runs in 75 s for ONE idle lane, ~100 child processes a minute (CPU analysis 2026-11-07). A run that another lane (or this one)
+    # finished for the same pipeline within AGENT_MANAGER_TASK_SOURCES_DEDUPE_SECS (default 5, 0 = off) has nothing new to find, so this tick skips it. The stamp is a file holding the
+    # epoch of the last run, read with builtins only (no fork); a missing or unreadable stamp runs it, so the worst case is today's behaviour.
+    ts_window="${AGENT_MANAGER_TASK_SOURCES_DEDUPE_SECS:-5}"
+    ts_stamp="${AGENT_MANAGER_STATE_DIR:-$HOME/.local/state/agent-manager}/task-sources-stamps/${PIPELINE_DIR//\//_}"
+    ts_now=0 ts_last=0
+    printf -v ts_now '%(%s)T' -1
+    [[ "$ts_window" =~ ^[0-9]+$ ]] || ts_window=5
+    if (( ts_window > 0 )) && [[ -r "$ts_stamp" ]]; then read -r ts_last < "$ts_stamp" 2>/dev/null || ts_last=0; fi
+    [[ "$ts_last" =~ ^[0-9]+$ ]] || ts_last=0
+    if (( ts_window == 0 || ts_now - ts_last >= ts_window )); then
+      if (( ts_window > 0 )); then mkdir -p "${ts_stamp%/*}" 2>/dev/null && printf '%s\n' "$ts_now" > "$ts_stamp" 2>/dev/null; fi
+      node "${PACKAGE_SRC_DIR}/task-sources.js" >>"$LOG_FILE" 2>&1 || true
+    fi
+  fi
 
   # Resume any task already sitting in THIS instance's own drafting/ folder before claiming
   # anything new -- a claim only ever gets processed by whichever worker process happened
@@ -577,6 +836,9 @@ while :; do                                                                     
       [[ "$name" == *.json ]]                                                  || continue
       wpath="${drafting_instance_dir}/${name}"
       [[ -f "$wpath" && -s "$wpath" ]]                                        || continue
+      if "$PREMIUM_ONLY" && ! is_premium_file "$wpath"; then continue; fi       # a premium-only borrowed tick leaves regular leftovers for later
+      # Rate-limit deferral (src/draft-quota.js): leave the item alone until its stated reset has passed. No failure was counted.
+      if node "${PACKAGE_SRC_DIR}/draft-quota.js" deferred "$wpath" 2>/dev/null; then continue; fi
       printf '[worker-%s] resuming leftover drafting item: %s\n' "$INSTANCE_ID" "$name"
       # A resumed item that predates the claimedAt stamp (or a chat-preempt requeue that
       # skipped drafting/) gets one now, set-once -- see the claim site's comment.
@@ -641,9 +903,13 @@ while :; do                                                                     
   # failure was already seen, means this tick backs off from Ollama entirely rather than
   # only half-backing-off -- the backlog can no longer outgrow its own drain rate.
   if [[ -r "$pdir" ]] && ! "$TICK_HAD_INFRA_FAILURE" && ! { "$ONCE" && "$did_work"; }; then   # a borrowed tick that already resumed its one leftover item claims nothing more. check readability before attempting readdir (same safety pattern as PowerShell's Test-Path before foreach — user might have permissions-restricted dir that should be skipped not crash-the-loop).
-    while IFS= read -r name; do
-      [[ -n "$name" ]] && items+=("$name")
-    done < <(node "${PACKAGE_SRC_DIR}/next-claimable-task.js" "$pdir" "$INSTANCE_ID" 2>/dev/null)
+    # ONE read of the pending queue per tick: the ranking call also says which tasks are premium (name<TAB>1 or 0), so a premium-only tick no longer
+    # re-reads and re-parses every ranked file to pick them out.
+    while IFS=$'\t' read -r name premium_flag; do
+      [[ -n "$name" ]] || continue
+      if "$PREMIUM_ONLY" && [[ "$premium_flag" != 1 ]]; then continue; fi
+      items+=("$name")
+    done < <(node "${PACKAGE_SRC_DIR}/next-claimable-task.js" "$pdir" "$INSTANCE_ID" --with-premium 2>/dev/null)
 
     # Iterate each pending draft, process if ready:
     for name in "${items[@]}"; do                                             # loop over collected filenames one at a time — bash array iteration via `${array[@]}` syntax (each element becomes separate word when quoted). Equivalent of PowerShell's `foreach ($item in $drafts)` which we're mirroring here since both languages use the same conceptual model for "do this to every X in collection".
@@ -735,6 +1001,13 @@ while :; do                                                                     
           printf '[worker-%s] infra-shaped failure -- stopping this tick early instead of claiming more pending items\n' "$INSTANCE_ID" >&2
           break
         fi
+        # Re-rank after every processed item (2026-10-15, premium head-of-line starvation): `items` above is a snapshot taken ONCE at the top of the
+        # tick, and generation (task-sources.js) + ranking (next-claimable-task.js) only run at the top of a tick, so draining the whole snapshot
+        # meant a premium task generated or released meanwhile waited for every remaining item (worker-3090: 59 claims in one tick, ~6h; HUB0148-02..07
+        # and 17 other premium tasks sat unclaimed). End the tick here instead: did_work is already true, so the end-of-tick pause is the 1s
+        # busy-loop guard, not the idle poll, and the next tick regenerates and re-ranks before the next claim. Skips (`continue` above) did no work
+        # and correctly do not end the tick.
+        break
       fi
 
     done                                                                         # end per-filename loop within current tick — bash doesn't auto-close the `for name in "${items[@]}"` scope; 'done' keyword terminates it same way PowerShell closes each block with } or closing brace pattern (we use bash's explicit 'done' syntax which is required).
@@ -746,39 +1019,8 @@ while :; do                                                                     
     if "$did_work"; then exit 10; fi
     exit 0
   fi
-  # Nothing to do in the home project this tick -> work another suite project NOW rather than idle (docs/idle-pool-borrowing.md).
+  # Nothing to do in the home project this tick -> work another suite project NOW rather than idle (docs/design-notes/idle-pool-borrowing.md).
   if ! "$did_work" && ! "$TICK_HAD_INFRA_FAILURE"; then borrow_from_pool; fi
 
-  # Idle-only backoff: only pay the full poll interval when this tick genuinely found
-  # nothing to do. Previously slept the full ORC_TICK_SECS (30s) unconditionally at the
-  # end of EVERY tick regardless of whether more work was sitting right there waiting --
-  # confirmed live 2026-08-15: a real backlog with tasks completing in well under 30s each
-  # still spent the majority of wall-clock time asleep between them, under 50% utilization.
-  # A brief sleep even when work was done avoids a true zero-delay busy-loop hammering the
-  # filesystem tick after tick when a large backlog is draining.
-  if "$did_work" && "$TICK_HAD_INFRA_FAILURE"; then
-    # Jittered exponential backoff (2026-08-25, Grimmethy: "boost throughput" -- shape
-    # borrowed from nullboiler's retry_base_delay_ms=1000/retry_max_delay_ms=30000/
-    # retry_jitter_ms=250, see single-flight-lock.js's per-model-lock change from the same
-    # request for the sibling half of this fix). Confirmed live 2026-08-24: with the flat
-    # `sleep 1` this replaces, a struggling Ollama instance got re-hammered by this same
-    # worker's very next claim every ~150s (the timeout duration) for 90 minutes straight,
-    # zero backoff, zero recovery room. Doubles (1s, 2s, 4s, ... capped at 30s) with each
-    # consecutive infra-failure tick, plus up to 250ms of jitter so multiple lanes backing
-    # off at once don't re-hammer in lockstep; resets to 0 (flat 1s again) the instant a
-    # tick's work is NOT an infra failure. This only paces THIS worker's own next claim --
-    # it does not change DRAFT_FAILURE_RETRY_LIMIT/DRAFT_INFRA_REQUEUE_LIMIT's existing,
-    # separate give-up bounds at all.
-    CONSECUTIVE_INFRA_FAILURES=$((CONSECUTIVE_INFRA_FAILURES + 1))
-    backoff_secs=$((1 << (CONSECUTIVE_INFRA_FAILURES - 1)))                        # 1,2,4,8,16,32,... (bit-shift doubling)
-    if (( backoff_secs > 30 )); then backoff_secs=30; fi
-    jitter_ms=$((RANDOM % 250))
-    sleep "${backoff_secs}.$(printf '%03d' "$jitter_ms")"
-  elif "$did_work"; then
-    CONSECUTIVE_INFRA_FAILURES=0
-    sleep 1
-  else
-    CONSECUTIVE_INFRA_FAILURES=0
-    sleep "${ORC_TICK_SECS:-60}"                                                   # wait between polls (default: 60s) — same delay PowerShell uses via its `Start-Sleep -Seconds $env:TICK_INTERVAL` inside main daemon loop body (we read from ORC_TICK_SECS env var so user can customize per-instance without editing the script; bash ${VAR:-default} form is exactly that kind of fallback assignment which matches what PowerShell's `$interval = if ($null -ne $env:INTERVAL) { $env:INTERVAL } else { 60}` does for same purpose.
-  fi
+  end_of_tick_pause
 done                                                                             # end top-level 'while' loop here — bash `do...done` syntax pair; mirror of PowerShell's `while (...){ ... }` curly-brace structure we're replacing (bash has no native boolean true so ':' used as the always-true condition).

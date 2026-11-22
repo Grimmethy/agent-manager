@@ -22,9 +22,15 @@ const { allocateHubSerial, formatHubLabel, memberId, memberTitle } = require('./
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
+const { ownerGateFor } = require('./owner-gates.js');
+const { validProposalFiles } = require('./proposal-files.js');
+const { targetHintForFailure } = require('./apply-target-hint.js');
+const { inferTestDependsOn, validateTestDependencies } = require('./lib/test-dependencies.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
-const GIT_TIMEOUT_MS = 60_000;
+const { gitTimeoutMs } = require('./lib/git-timeout.js');
+const GIT_TIMEOUT_MS = gitTimeoutMs();   // AGENT_MANAGER_GIT_TIMEOUT_MS overrides the 60 s default
 
 function slugify(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -123,6 +129,24 @@ function inferMissingAfterLinks(subTasks) {
 const CODE_CHANGE_VERB_RE = /\b(add|modify|change|fix|implement|create|write|remove|refactor|update|replace|wire|extract|rename|delete|insert|adjust|tighten|expand|introduce|migrate|split|merge|patch|restructure|drop|disable|enable)\b/i;
 const VERIFICATION_LEAD_RE = /^(run|confirm|verify|check|validate|ensure|audit|test)\b/i;
 
+// 2026-09-27 (HUB0119 2/4): a sub-task proposal whose title/description DISPOSES a
+// brain-dump entry (file/route/classify/archive/reject/approve/triage it) is a
+// brain_dump_disposition task, not adhoc work -- apply-task.js's brain_dump_disposition
+// branch (HUB0119 3/4) owns it. Same high-precision discipline as CREATED_FILE_RE and
+// VERIFICATION_LEAD_RE above: a disposition verb must stand close before the entry ID
+// (bounded `[^.\n]` window -- never crosses a sentence boundary, so a passing mention of
+// "bd-..." elsewhere in the text never fires), and the ID must carry the brain-dump
+// entry format ("bd-" + 13-digit ms epoch, cf. `adhoc-brain-dump-<id>-<ts>` in
+// apply-group-a-brain-dump.js -- 6+ digits would also accept unrelated hex strings).
+// Capture group 1 is the entryId.
+// 2026-10-26 follow-up (verified by executing the old pattern): the first version (a disposition verb followed by ANY text within 60 characters
+// of the id) missed the very wording the hub was filed for ('Mark brain-dump entry bd-... resolved with this evidence', 'Record verification on
+// brain dump bd-...', 'Close bd-... as actioned') and matched real code work ('File the fix for the bug reported in bd-... in src/x.js',
+// 'Route the GPU lease through arbiter; see bd-...'), which then reached closeBrainDumpEntryResolved with no code change. Now the proposal must
+// START a line with the disposition verb and reach the id through nothing but filler words (the, this, entry, brain-dump, on, for, of, as,
+// verification, evidence, note), so any other noun between the verb and the id means it is work, not a disposition.
+const BRAIN_DUMP_DISPOSITION_RE = /^\s*(?:please\s+)?(?:file|route|classify|archive|reject|approve|triage|mark|record|close|resolve|dismiss)\b(?:\s+(?:the|this|a|an|on|for|of|as|brain-dump|brain\s+dump|entry|note|verification|evidence))*\s+bd-(\d{13})\b/im;
+
 function isVerificationOnlySubTask(sub) {
   const title = String((sub && sub.title) || '').trim();
   if (!title) return false;
@@ -196,10 +220,46 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
     if (k > 0) prevOf.set(i, survivingIndices[k - 1]);
   });
 
+  // Test-dependency edges (src/lib/test-dependencies.js): a "tests" child is linked to the
+  // sibling whose behavior it exercises. Runs on id-bearing proposals before any record is written.
+  const withIds = subTasks.map((sub, i) => ({ ...sub, id: ids[i] }));
+  const inferred = inferTestDependsOn(withIds);
+  const validation = validateTestDependencies(inferred.proposals);
+  if (!validation.ok) throw new Error(`test-dependency validation failed: ${validation.errors.join('; ')}`);
+  const testDependsOn = new Map(); // surviving child index -> sibling id it must wait on
+  inferred.proposals.forEach((p, i) => {
+    if (!p.dependsOn || foldTargets.has(i)) return;
+    const targetIndex = ids.indexOf(p.dependsOn);
+    if (targetIndex < 0 || foldTargets.has(targetIndex)) return;
+    testDependsOn.set(i, p.dependsOn);
+  });
+  const testDependencyUnresolved = inferred.unresolved.slice(); // ambiguous tests children left with no edge
+
   const carriedDiff = parentTask && typeof parentTask.carriedPartialDiff === 'string' && parentTask.carriedPartialDiff.trim() ? parentTask.carriedPartialDiff : null;
   const queued = [];
+  const ownerGates = []; // pieces that wait on the owner (owner-gates.js)
   subTasks.forEach((sub, i) => {
     if (foldTargets.has(i)) return; // folded into a sibling's acceptanceCriteria instead of becoming its own no-diff-possible task
+    // HUB0119 2/4: a brain-dump DISPOSITION proposal (BRAIN_DUMP_DISPOSITION_RE above) is
+    // routed to domain 'brain_dump_disposition' (apply-task.js owns that branch) INSTEAD
+    // of becoming an adhoc/decompose sub-task -- it disposes an entry, it has no code diff
+    // of its own. Checked BEFORE any adhoc record is built, so a matching proposal never
+    // lands on the adhoc/decompose queue as domain 'adhoc'.
+    const brainDumpDisposal = BRAIN_DUMP_DISPOSITION_RE.exec(`${sub.title || ''}\n${sub.rawText || ''}`);
+    if (brainDumpDisposal) {
+      const routed = {
+        id: ids[i],
+        domain: 'brain_dump_disposition',
+        source: 'manual',
+        title: sub.title,
+        payload: { entryId: brainDumpDisposal[1], evidenceText: String(sub.rawText || sub.title || '').trim() },
+        promptContext: { rawText: sub.rawText, decomposedFrom: parentTaskId },
+      };
+      if (parentTask && parentTask.premiumPriority) routed.premiumPriority = true;
+      fs.writeFileSync(path.join(adhocDir, `${ids[i]}.json`), JSON.stringify(routed, null, 2) + '\n');
+      queued.push({ id: ids[i], title: sub.title });
+      return;
+    }
     const record = {
       id: ids[i],
       domain: 'adhoc',
@@ -213,18 +273,32 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
     }
     // Work an earlier pass of the parent already landed (agentic-draft-common.js carriedPartialDiff): the pieces describe what REMAINS on top
     // of it, so the FIRST piece's worktree starts from it (applied as uncommitted changes) and every later piece stacks on the result.
+    const testDep = testDependsOn.get(i);
+    if (testDep) {
+      const existingDeps = Array.isArray(record.dependsOn) ? record.dependsOn : [];
+      if (!existingDeps.includes(testDep)) record.dependsOn = [...existingDeps, testDep];
+    }
     if (carriedDiff && i === survivingIndices[0]) {
       record.priorPartialDiff = carriedDiff;
       record.promptContext.rawText = `PRIOR WORK ALREADY APPLIED: an earlier pass of the parent task made some of this change. Those edits are applied to your worktree as uncommitted changes -- run git diff to see them, and do NOT redo them. Your job is the part below, on top of them.\n\n${sub.rawText}`;
     }
+    // The piece's declared scope as the gate-readable `Files:` line (proposal-files.js); never added when the text already has one.
+    const declared = validProposalFiles(sub.files);
+    if (declared && !/^Files:/im.test(record.promptContext.rawText)) record.promptContext.rawText += `\nFiles: ${declared.join(', ')}`;
     const extra = extraCriteria.get(i);
     if (extra && extra.length) record.acceptanceCriteria = extra;
     if (parentTask && parentTask.premiumPriority) record.premiumPriority = true;
+    const prereq = validPrerequisiteHubs(sub.prerequisiteHubs); // hubs whose MERGE this piece waits for (hub-prerequisites.js)
+    if (prereq) record.prerequisiteHubs = prereq;
     fs.writeFileSync(path.join(adhocDir, `${ids[i]}.json`), JSON.stringify(record, null, 2) + '\n');
     queued.push({ id: ids[i], title: record.title });
+    const gate = ownerGateFor({ id: ids[i], title: record.title, rawText: record.promptContext.rawText });
+    if (gate) ownerGates.push(gate);
   });
+  queued.ownerGates = ownerGates;
   queued.hubSerial = hubSerial;
   queued.hubLabel = hubLabel;
+  queued.testDependencyUnresolved = testDependencyUnresolved;
   return queued;
 }
 
@@ -254,7 +328,81 @@ function buildDecomposedPlan(task, pipelineDir) {
     subTasks: queued.map((t) => ({ id: t.id, title: t.title, status: 'pending' })),
     hubSerial: queued.hubSerial,
     hubLabel: queued.hubLabel,
+    ownerGates: queued.ownerGates,
+    testDependencyUnresolved: queued.testDependencyUnresolved || [],
   };
+}
+
+// A git path as written in a patch header: plain, or C-style quoted ("w\303\251ird.txt") when it holds a quote, a backslash, a control character or a non-ASCII byte.
+function unquoteGitPath(raw) {
+  const text = String(raw || '').replace(/\r$/, '');
+  if (!(text.startsWith('"') && text.endsWith('"') && text.length >= 2)) return text;
+  const bytes = [];
+  const body = text.slice(1, -1);
+  const escapes = { a: 7, b: 8, f: 12, n: 10, r: 13, t: 9, v: 11, '\\': 92, '"': 34 };
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i];
+    if (ch !== '\\') { for (const b of Buffer.from(ch, 'utf8')) bytes.push(b); continue; }
+    const octal = /^[0-3][0-7]{2}/.exec(body.slice(i + 1, i + 4));
+    if (octal) { bytes.push(parseInt(octal[0], 8)); i += 3; continue; }
+    const next = body[i + 1];
+    if (next in escapes) { bytes.push(escapes[next]); i += 1; continue; }
+    bytes.push(92);
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+// The OLD path of every rename in a unified diff (its `rename from <path>` header lines), in patch order, each once. `git apply --numstat` lists a rename under its NEW
+// name only, and plain `git apply` really deletes the old file, so staging only the numstat names left the deletion out of the commit (2026-11-04, HUB0321: a moved test
+// file stayed behind on the branch). `copy from` is not a source: the old path survives a copy.
+function renameSources(rawDiff) {
+  const out = [];
+  for (const line of String(rawDiff || '').split('\n')) {
+    if (!line.startsWith('rename from ')) continue;
+    const p = unquoteGitPath(line.slice('rename from '.length));
+    if (p && !out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
+// Restores the files a failed apply touched. A file with a HEAD entry is checked out from HEAD and never unlinked.
+// A file with no HEAD entry (one the patch created) is unlinked, ENOENT tolerated. A file whose HEAD probe fails for
+// a non-exit reason (spawn error) is recorded as unrestored and left alone.
+function restoreFilesAfterFailedApply(files, repoRoot) {
+  const restored = [];
+  const removed = [];
+  const unrestored = [];
+  for (const file of files) {
+    let inHead;
+    try {
+      // `git cat-file -e` exits non-zero when the entry is missing; that is a normal answer, not a failure.
+      execFileSync('git', ['cat-file', '-e', `HEAD:${file}`], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'] });
+      inHead = true;
+    } catch (probeErr) {
+      if (typeof probeErr.status !== 'number') {
+        unrestored.push({ file, error: String(probeErr.message || probeErr) });
+        continue;
+      }
+      inHead = false;
+    }
+    if (inHead) {
+      try {
+        // `HEAD --` (not bare `--`): a failed --3way leaves the index unmerged, and only a real commit-ish resets it.
+        execFileSync('git', ['checkout', 'HEAD', '--', file], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+        restored.push(file);
+      } catch (checkoutErr) {
+        unrestored.push({ file, error: String(checkoutErr.stderr || checkoutErr.message || checkoutErr).trim() });
+      }
+      continue;
+    }
+    try {
+      fs.unlinkSync(path.join(repoRoot, file));
+      removed.push(file);
+    } catch (unlinkErr) {
+      if (unlinkErr.code !== 'ENOENT') unrestored.push({ file, error: unlinkErr.message || String(unlinkErr) });
+    }
+  }
+  return { restored, removed, unrestored };
 }
 
 function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
@@ -267,7 +415,15 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
     const reason = task && task.adhocResolution === 'no-changes-needed'
       ? `no code change needed: ${(task.implementResponse || '').slice(0, 300)}`
       : 'adhoc agentic draft produced no diff';
-    return { skipped: true, reason };
+    // HUB0306 1/2: flag the caller (applyTask) so a stacked hub child with no diff
+    // can be blocked from succeeding instead of silently marked done. NOT set for
+    // `no-changes-needed` (that is an explicit model call, not a no-diff artifact) and
+    // NOT set for decompose parents (handled earlier, returns a coordinator plan).
+    const artifact = { skipped: true, reason };
+    if (task && task.adhocResolution !== 'no-changes-needed') {
+      artifact.emptyDiff = true;
+    }
+    return artifact;
   }
 
   const patchPath = path.join(os.tmpdir(), `adhoc-apply-${task.id}-${process.pid}.patch`);
@@ -286,6 +442,14 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
     const files = numstat.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => line.split('\t').pop());
     if (files.length === 0) {
       throw new Error('git apply --numstat reported no files touched by this diff');
+    }
+    // A rename also touches its old path (the apply deletes it): stage it too, and restore it if the apply fails.
+    files.push(...renameSources(rawDiff));
+    // Rename destinations too (`rename to <path>`): a failed apply can leave the new name behind, so it must be restored or removed as well.
+    for (const line of String(rawDiff).split('\n')) {
+      if (!line.startsWith('rename to ')) continue;
+      const dest = unquoteGitPath(line.slice('rename to '.length));
+      if (dest && !files.includes(dest)) files.push(dest);
     }
 
     // --recount: confirmed live 2026-08-18 -- a real, otherwise-valid diff from
@@ -327,28 +491,9 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
         // failed" report that reads as "nothing changed." Restore every file this
         // patch touches to its real HEAD content before rethrowing, so a failed
         // attempt -- 3-way or plain -- has the exact same "untouched" guarantee.
-        for (const file of files) {
-          try {
-            // `HEAD --` (not bare `--`, which means "from the index") -- confirmed live
-            // writing this fix: a failed --3way conflict leaves the INDEX itself marked
-            // unmerged (stage U), and plain `git checkout -- <file>` refuses to touch an
-            // unmerged path ("error: path is unmerged") entirely. Checking out an actual
-            // commit-ish resets both the index and working tree regardless of merge state.
-            execFileSync('git', ['checkout', 'HEAD', '--', file], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
-          } catch (restoreErr) {
-            // Fails for a file this patch CREATES (mode:"create" has no HEAD entry to
-            // restore from) -- the failed --3way attempt may have still written a stray
-            // file there. Best-effort remove it rather than leave a leftover conflict-
-            // marker file sitting in the repo untracked; per-file (not a blanket git
-            // clean) so an unrelated pre-existing untracked file elsewhere is never
-            // touched.
-            try { fs.unlinkSync(path.join(repoRoot, file)); } catch (unlinkErr) {
-              if (unlinkErr.code !== 'ENOENT') {
-                console.warn(`[apply-adhoc-diff] failed to remove stray file after failed apply: ${file} -- ${unlinkErr.message || String(unlinkErr)}`);
-              }
-            }
-          }
-        }
+        // Files with a HEAD entry are checked out from HEAD; files the patch created are unlinked (see restoreFilesAfterFailedApply).
+        const restoreResult = restoreFilesAfterFailedApply(files, repoRoot);
+        if (restoreResult.unrestored.length) plainApplyErr.unrestored = restoreResult.unrestored;
         // Surface the PLAIN apply's error (what a human/redraft decision should
         // actually see), not the 3-way attempt's, since 3-way's own failure mode
         // ("Failed to merge in the changes") is less informative about the real
@@ -375,11 +520,14 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
     return { files };
   } catch (e) {
     if (/^acceptance command failed/.test(e.message || '')) throw e;
-    const detail = (e.stdout || e.stderr || e.message || '').toString().slice(0, 2000);
-    throw new Error(`git apply failed: ${detail}`);
+    const restoreNote = Array.isArray(e.unrestored) && e.unrestored.length ? `\n[restore incomplete -- left in place: ${e.unrestored.map((u) => `${u.file} (${u.error})`).join('; ')}]` : '';
+    const detail = (e.stdout || e.stderr || e.message || '').toString().slice(0, 2000) + restoreNote;
+    // Only on this failure path: if the diff was written for another registered project, name it and where the record belongs (apply-target-hint.js).
+    const hint = targetHintForFailure(rawDiff, repoRoot);
+    throw new Error(`git apply failed: ${detail}${hint ? `\n${hint}` : ''}`);
   } finally {
     try { fs.unlinkSync(patchPath); } catch (_) { /* best-effort cleanup */ }
   }
 }
 
-module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask };
+module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask, slugify, BRAIN_DUMP_DISPOSITION_RE, renameSources, unquoteGitPath, restoreFilesAfterFailedApply };

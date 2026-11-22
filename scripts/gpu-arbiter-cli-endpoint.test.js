@@ -14,7 +14,7 @@ const { spawn, execFileSync } = require('child_process');
 const ARB = require.resolve('../src/gpu-arbiter.js');
 const CLI = path.join(__dirname, 'gpu-arbiter-cli.js');
 const { sharedInstancesDir } = require('../src/instances-dir.js');
-const { ollamaLockKey, localOllamaLockKey, p40OllamaLockKey } = require('../src/lib/ollama-lock-key.js');
+const { ollamaLockKey, localOllamaLockKey, p40OllamaLockKey, remoteLaneLockKeys } = require('../src/lib/ollama-lock-key.js');
 
 const LOCAL_URL = 'http://localhost:11434';
 const P40_URL = 'http://192.168.122.29:11434';
@@ -43,6 +43,18 @@ test('key helper: local and P40 endpoints get different keys; the shared definit
   assert.equal(p40OllamaLockKey({}), null);
   assert.equal(p40OllamaLockKey({ AGENT_MANAGER_P40_OLLAMA_URL: P40_URL }), 'ollama-192.168.122.29-11434');
   assert.equal(require('../src/lib/draft-lifecycle.js').localOllamaLockKey(), localOllamaLockKey(), 'draft lanes and the chat share ONE definition');
+});
+
+test('remoteLaneLockKeys: every non-host lane (P40 and lanes-registry lanes) and never the host; --local refuses any of them', () => {
+  const regDir = fs.mkdtempSync(path.join(os.tmpdir(), 'arb-lanes-'));
+  const reg = path.join(regDir, 'lanes.json');
+  fs.writeFileSync(reg, JSON.stringify([{ gpu: 'rx580', ollamaUrl: 'http://100.96.112.78:11434', model: 'm' }]));
+  const env = { AGENT_MANAGER_LANES_PATH: reg, AGENT_MANAGER_LOCAL_GPU: '3090', AGENT_MANAGER_P40_OLLAMA_URL: P40_URL, AGENT_MANAGER_P40_MODEL: 'm' };
+  assert.deepEqual(remoteLaneLockKeys(env), ['ollama-192.168.122.29-11434', 'ollama-100.96.112.78-11434']);
+  assert.deepEqual(remoteLaneLockKeys({ AGENT_MANAGER_LANES_PATH: path.join(regDir, 'absent.json'), AGENT_MANAGER_LOCAL_GPU: '3090' }), [], 'host only: nothing remote');
+  const pipe = pipeline();
+  const refused = runCli(pipe, ['status', '--local'], { ...env, OLLAMA_URL: 'http://100.96.112.78:11434' });
+  assert.deepEqual(refused, { holder: null, waiting: [] }, 'the chat never resolves to a registry lane endpoint');
 });
 
 test('cancel-below --local: kills the local-GPU draft and leaves the P40 draft running', async () => {

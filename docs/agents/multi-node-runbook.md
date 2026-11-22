@@ -1,0 +1,137 @@
+# Multi-node runbook: unattended rules, trial, ramp and addresses
+
+How to run the two-machine Agent Manager (wok and grimm) without watching it. The parts are described in `multi-node.md`; this page is what the owner does and what the system promises while nobody is looking. **Nothing here starts by itself**: every command below is run by the owner.
+
+## 1. The unattended rules
+
+1. **Nothing starts by itself on wok or grimm.** No server, timer, worker, lend or relay is started by code. The owner starts them. `multi-node.md` lists the commands.
+2. **Pauses stop new claims at once.** `node src/worker-switch.js pause node` pauses one machine, `pause global` pauses the whole system (`resume <node|global>` ends it, `pause-status` shows it); see "Pausing a machine" in `lanes.md`. A pause with an expiry ends by itself and a broken marker counts as not paused, so a dead tool can never leave a machine stuck.
+3. **grimm gives way to the website.** `node src/site-traffic-monitor.js` pauses grimm's node while the site is in use and clears only its own pause after the idle time (`site-traffic-monitor.md`). It also pauses on load or low RAM (`AGENT_MANAGER_SITE_MAX_LOAD`, `AGENT_MANAGER_SITE_MIN_FREE_GB`).
+4. **The cloud lane stays off until the owner turns it on**, and while it is on it claims nothing once the gateway's hourly token budget is spent (`src/gateway-budget.js`; `cloud-lane.md`, "What went wrong on the lane, and the budget check").
+5. **Work is only claimed on its own node.** A task leased to grimm is never claimed on wok and the other way round (`src/node-affinity.js`).
+6. **Leases end.** A lease lasts 6 hours (`AGENT_MANAGER_LEASE_TTL_MS`). `node src/lend-task.js reclaim` expires due leases and takes the tasks back; it is run by the owner (nothing runs it on a schedule yet).
+7. **Packages never contain live client data.** A record package drops votes, history, the lease stamp and any token, secret or password key (`src/review-package.js`); the work itself is the record's `rawDiff`.
+8. **Merges and deploys stay with the verified flow, and a node never merges, pushes or deploys.** A node's record lands in wok's `queue/review/` and is reviewed, applied, verified and merged as any other task; GitHub credentials never go on a node. Nothing deploys to grimm by code.
+9. **The owner hears about exceptions, plus one summary a day.** Urgent messages for a machine that went quiet or a pause that is stuck; one daily summary (`notifier.md`; the hourly timer in its "Daily summary timer" section is an example, not installed).
+10. **Tokens live in files** (mode 600), never in the environment, a repository or a log.
+
+## 2. Setting up a node
+
+The owner's steps, in order. Nothing here starts by itself.
+
+1. **On the node:** `scripts/provision-node.sh <node-id> <pipeline-dir> <node-repo-dir>`. It refuses the id `wok`, an id that is not lowercase letters, digits and dashes (up to 31 characters, not starting with a dash) and a directory that is not an absolute path of plain characters. It creates `queue/{pending,adhoc,drafting,review,blocked,needs-clarification,done,node-outbox,node-sent}`, `task-domains.json`, a `lanes.json` holding only the cloud lane, **disabled**, and `node.env` (`AGENT_MANAGER_NODE_ID`, `AGENT_MANAGER_PIPELINE_DIR`, `AGENT_MANAGER_REPO_ROOT`, `AGENT_MANAGER_DOMAINS_PATH`, `AGENT_MANAGER_LANES_PATH`). It never writes a token and starts nothing; running it again keeps what exists.
+2. **Register the node on wok and put the token files in place** (section 5 and `nodes.md`): `node src/node-registry.js register <node-id> --address <LAN address> ...`, then copy the printed token into a mode 600 file on the node.
+3. **Start the node's workers** with `node.env` in their environment (`set -a; source <pipeline-dir>/node.env; set +a`, then the ordinary `scripts/local-worker.sh <instance-id>`). A worker whose `AGENT_MANAGER_NODE_ID` is not `wok` claims only work leased to its node and files a finished draft in `queue/node-outbox/`. The cloud lane stays off until you set `enabled` to `true` in `lanes.json` (`cloud-lane.md`).
+4. **Send the outbox** by hand or from a timer you create: `node src/node-package-send.js --url <wok package intake url> --token-file <file> --node-id <node-id> --outbox <pipeline-dir>/queue/node-outbox`. It prints `{sent, failed, remaining}`; exit 3 means a record stayed in the outbox. Nothing runs it on a schedule.
+5. **On wok, start the package intake** with `AGENT_MANAGER_PIPELINE_DIR` set and `AGENT_MANAGER_PACKAGE_BIND` set to wok's LAN address (port 7473 unless `AGENT_MANAGER_PACKAGE_PORT` says otherwise): `node src/package-intake-server.js`. This opens a port on wok to the LAN, so it needs your OK, like the registry service.
+
+A node never merges, pushes or deploys: its output is a record that wok reviews.
+
+### 2b. Node claim filter (the dirs, sources and domains a node may take)
+
+Three env vars shape which tasks a node may claim from a pipeline dir listed in `AGENT_MANAGER_NODE_FILTERED_DIRS` (comma-separated, absolute paths; unset gives `[]`). The three vars and their defaults:
+
+- `AGENT_MANAGER_NODE_FILTERED_DIRS` — comma-separated absolute paths of pipeline dirs this node **filters**. A dir not listed here is unfiltered and every task there is eligible (subject only to the global premium gate). Unset or empty gives `[]`.
+- `AGENT_MANAGER_NODE_FILTER_SOURCES` — which `source` values are eligible inside a filtered dir (default `['manual']`). Unset or empty gives `['manual']`.
+- `AGENT_MANAGER_NODE_FILTER_DOMAINS` — which `domain` values are eligible inside a filtered dir (default `['adhoc', 'default']`). Unset or empty gives `['adhoc', 'default']`.
+
+The same-repo rule always applies: a task in a filtered dir is claimed only when `generatedForRepoRoot` resolves to that dir or is unset. `AGENT_MANAGER_NODE_ALLOW_STACKED` (default off) and `AGENT_MANAGER_NODE_SKIP_PREMIUM` (default off) also apply.
+
+The live registry unit sets `AGENT_MANAGER_NODE_FILTER_DOMAINS=adhoc,default` (owner order 2026-11-16) so the swarm can take Feature Forge tasks (source `manual`, domain `default`) in addition to adhoc. To restrict a node further, set `AGENT_MANAGER_NODE_FILTER_DOMAINS` to a subset (for example `AGENT_MANAGER_NODE_FILTER_DOMAINS=adhoc` excludes `default`); the explicit value always wins over the default.
+
+### Code routes (the node pulls wok's code)
+
+The package intake also answers two read-only routes for a node that pulls wok's published code instead of being sent it: `GET /code/latest` (the list in `latest.json` of the code publish directory, `AGENT_MANAGER_CODE_PUBLISH_DIR`, default `<pipeline dir>/code-publish`) and `GET /code/<name>.bundle` (a bundle file named by an entry of that list, and nothing else). Both need the node's bearer token in `Authorization` and the node id in `X-Node-Id`, and both only answer the address the node was registered with. They are LAN only, with no TLS, so they never write and never serve a path outside the list. The manual way stays: `scp` a bundle, or a shared directory, and `scripts/import-repo-bundle.sh`.
+
+### Review of a node's draft under swap-only critical memory pressure
+The reviewer lanes normally yield their tick while the memory marker is critical. The marker can be critical through the swap backstop alone (swap free under 128 MB with under 4096 MB of RAM and any I/O stall). When that is the only cause, a draft that a node sent (a record in `queue/review` with `fromNode`) is reviewed anyway, one per tick: swap free under 128 MB, at least 1024 MB available, memory full stall under 5, I/O full stall under 10. Anything else critical still yields. Kill switch: `AGENT_MANAGER_NODE_DRAFT_REVIEW_UNDER_SWAP_CRITICAL=false`. Code: `nodeDraftMayRunUnderPressure` in `src/node-draft-pressure.js`, used by `scripts/review-runner.sh`.
+
+## 2a. Giving a node the gateway and a repo copy
+
+A node has no GitHub access, so a repo reaches it as a bundle file, and the cloud-model gateway (the `cloud-providers` repo, see `cloud-lane.md`) is installed the same way. The three scripts only read or write plain files: none runs `systemctl`, `claude`, `ssh` or `scp`, none contacts a network, none writes a key or token. Every step below is yours.
+
+1. **On wok, export the repo:** `scripts/export-repo-bundle.sh /media/model-cache/github/agent-manager <out-dir>`. It checks the bundle with `git bundle verify` and prints one line, `bundle=<path> sha=<40 hex> branch=master`. A third argument names another branch; the `cloud-providers` repo's branch is `main`, so for the gateway run `scripts/export-repo-bundle.sh /media/model-cache/github/cloud-providers <out-dir> main`. It reads the repo only.
+2. **Copy the bundle files to the node** with `scp` (or any copy you trust).
+3. **On the node, import the repo:** `scripts/import-repo-bundle.sh <bundle-file> <node-repo-dir>` (add the branch name for `main`). A missing or empty directory is cloned and the clone has **no remote** (nothing to push to, no credential to hold) and the identity `agent-manager-node`. Running it again with a newer bundle fast-forwards the clone; exit 3 means the clone has uncommitted changes, is on another branch, or has history the bundle does not (nothing is changed). It prints `head=<sha> dest=<path>`. Use `<node-repo-dir>` as the repo directory you gave `scripts/provision-node.sh`.
+4. **Import the gateway the same way**, for example into `~/cloud-providers` on the node.
+5. **Write the gateway unit:** `scripts/provision-node-gateway.sh <cloud-providers-dir> ~/.config/systemd/user` (an optional third argument is the port, default 7450). It refuses anything that is not an absolute path or a port from 1024 to 65535. It writes `am-cloud-gateway.service`, which runs the gateway on the logged-in Claude account **without** the confirmation, and `am-cloud-gateway.confirm-subscription.conf.example`, a template that systemd does not read. The gateway refuses to start without the confirmation.
+6. **Your decisions and commands** (the scripts do none of them): run `claude auth login` on the node; copy the template to `~/.config/systemd/user/am-cloud-gateway.service.d/confirm-subscription.conf` **only if you accept** that Anthropic's consumer terms may not permit automated use of a Pro login (`cloud-lane.md`, "Billing"); then `systemctl --user daemon-reload` and `systemctl --user enable --now am-cloud-gateway.service`; check `curl http://127.0.0.1:7450/health`; and last set `enabled` to `true` on the cloud lane in `<pipeline-dir>/lanes.json` and restart the node's workers.
+
+### One-time conversion of a plain-copy node checkout (owner step)
+
+Use this when a node's checkout is a plain directory of files, not a git clone: `git -C <node-repo-dir> rev-parse HEAD` says not a git repository, and `ls -a` shows no `.git` (grimm, 2026-11-17). Until it is done, `applyCode` in `src/node-code-apply.js` refuses with reason `not-a-git-work-tree`, writes one audit line per refusal and one NOTICE per process, and changes nothing. Every step is yours; the agent does not run them.
+
+1. **Inventory:** `cd <node-repo-dir> && ls -a`. List the node-local files that are not in the published repo, such as `agent-manager.env` and any queue or pipeline state. Those are the only files copied back in step 5.
+2. **Drain the node units:** stop the workers through the drain before touching the directory. Check the usage line of `src/node-code-drain.js` first.
+3. **Back up:** `mv <node-repo-dir> <node-repo-dir>.bak-$(date +%Y%m%d)`. Nothing is deleted.
+4. **Import the current master bundle into an empty directory:** `mkdir <node-repo-dir> && scripts/import-repo-bundle.sh <bundle-file> <node-repo-dir>`. The bundle comes from wok (`scripts/export-repo-bundle.sh`). It prints `head=<sha> dest=<path>`; the clone has no remote.
+5. **Copy back only the inventoried node-local files** from the backup with `cp -p`. Do not copy back the backup's `src/`, `scripts/` or `.git`.
+6. **Check the entry files:** `node --check` on each entry file the units run (the ExecStart targets of the node units).
+7. **Restart the units through the drain**, then check that `git -C <node-repo-dir> rev-parse HEAD` equals the `head=` value from step 4 and that the registry codeSha is the same.
+
+**Rollback:** stop the units through the drain, `mv <node-repo-dir> <node-repo-dir>.failed-$(date +%Y%m%d)`, `mv <node-repo-dir>.bak-YYYYMMDD <node-repo-dir>` (the dated name from step 3), then restart the units.
+
+## 3. The trial (the 80 percent bar)
+
+Before the farm is scaled up, run a small batch of real tasks through one node and score it.
+
+1. Lend each task (`node src/lend-task.js lend <taskId> grimm --url <node intake /lend url> --token-file <file>`), let the node draft it, send its outbox (`node src/node-package-send.js`, section 2), and when the record arrives in wok's `queue/review/` review and merge it as usual.
+2. Write one outcome per task into a JSON file: `[{"taskId": "...", "node": "grimm", "result": "merged"}]`, where `result` is `merged` (merged with no repair), `repaired` (merged after a repair), `failed` or `abandoned`.
+3. Score it: `node src/farm-trial.js <outcomes.json>`. It prints the counts per node and exits 0 when at least 80 percent were `merged`, 3 when not.
+
+## 4. The ramp (how many workers a node can take)
+
+Raise the number of workers on a node one at a time and measure after each step. `node src/farm-ramp.js` only prints a decision; the owner starts or stops the workers.
+
+1. Baseline, with no farm running: `node src/farm-ramp.js baseline --site-url <the site's address>` (the median of three timed requests, plus the load average and free RAM). Keep the `siteMs` value.
+2. After each change in workers: `node src/farm-ramp.js step --workers <n> [--cap <n>] --baseline-ms <siteMs> --site-url <address> [--rate-limited]`.
+3. The decision: `raise` (no limit hit, go one worker higher), `hold` (at the cap), or `stop`. The limits are the site more than 20 percent slower than baseline, load average above 3.0, free RAM below 3 GB, or a rate limit from the cloud gateway (pass `--rate-limited`). On `stop` the cap is one below the worker count that broke a limit; record it as the node's concurrency cap (`--cap` in `node src/node-registry.js register`). The registry stores the cap but does not enforce it; the limit on claimed tasks is `AGENT_MANAGER_NODE_MAX_TASKS` (see the operating notes at the end).
+4. A value that cannot be measured (the site not answering, no `/proc/meminfo`) counts as a limit.
+
+## 5. LAN addresses
+
+Machine-to-machine traffic uses the wired LAN address, with the tailnet address as the fallback.
+
+1. **Owner step: reserve a fixed LAN address for each machine** in the router, so the address in the registry does not change.
+2. Register the node with that address: `node src/node-registry.js register grimm --address <LAN address> ...` (see `nodes.md`).
+3. To see which address answers a service right now: `node src/node-address.js <LAN address> <tailnet address> <port>`. It prints `{address, via}` with `via` `lan`, `tailnet` or `null`, and exits 3 when neither answers (use `""` for an address you do not have).
+
+## 6. Morning checklist (two minutes)
+
+1. Was there an urgent message, or is the daily summary missing? A missing summary means the summary timer or the notifier is not running.
+2. `node src/worker-switch.js pause-status` on each machine: is a pause still set that you did not expect?
+3. `node src/lease-ledger.js list`: any lease still `lent` past its expiry? Run `node src/lend-task.js reclaim`.
+4. `ls <pipeline dir>/queue/node-packages` and `ls <pipeline dir>/queue/review`: a record package that arrived is already filed in `queue/review/` by the intake and needs no relay; only an old version 1 branch package would still need `node src/branch-relay-cli.js`.
+5. On the Workers tab: are the cloud lane and grimm's workers in the state you left them?
+6. On the node: `ls <node pipeline dir>/queue/node-outbox`. Records still there were drafted and not sent; run `node src/node-package-send.js`.
+
+## 6a. Node systemd units
+
+`scripts/provision-node.sh` writes three systemd user units into the target directory it is given. They are written only and never enabled or started: nothing enables or starts them. Enabling and starting them is an operator step. Until the unit-writing step of `provision-node.sh` is merged, these units are documented ahead of implementation.
+
+- **Unit files are written to run as they are, and never overwritten.** `provision-node.sh` resolves the absolute `node` path (`command -v node`, exit 1 if there is none) and writes `ExecStart=<node> <node-repo-dir>/src/...` with `WorkingDirectory=<node-repo-dir>` and `EnvironmentFile=<pipeline-dir>/node.env` in both services. A unit file that already exists (for example a working hand-written `am-node-send.service`) is kept and the script prints `kept <path>`; delete it first if you want the generated one. The send service reads `--url` and `--token-file` from `AGENT_MANAGER_PACKAGE_URL` and `AGENT_MANAGER_NODE_TOKEN_FILE` in `node.env`: uncomment and fill both (and `AGENT_MANAGER_CLAIM_URL`) before starting a unit.
+- **`am-node-retry.path`** and **`am-node-retry.service`** are the reject-retry sweep. The path unit watches `<pipeline>/queue/blocked` (`PathChanged`) and starts the oneshot service, which runs `src/reject-retry-check.js` from the node repo with `node.env`. That script moves blocked records that review rejected (`blockedStage` `review`, or a degenerate critique) back to `queue/pending` for a fresh redraft, at most twice per task (`localRejectCount`); a task that has used its retries goes to `queue/needs-clarification`, and other blocked records are left alone. It is not a blanket requeue of `queue/blocked`. `provision-node.sh` writes the pair but never enables it: run `systemctl --user enable --now am-node-retry.path` when you want it, and look at `<pipeline>/queue/blocked` first, because the first run processes the records already there.
+- **`am-node-pull.service`** runs `node src/node-pull.js --daemon` (from `<node-repo-dir>`). It is the pull daemon that claims work for a free worker. It has no periodic timer: it reacts to changes in `queue/adhoc/` (an `fs.watch` with a 2000 ms debounce). A failed claim backs off from 30 s, doubling, up to a 600 s cap.
+- **`am-node-send.path`** watches `<pipeline>/queue/node-outbox` with `PathChanged` and activates `am-node-send.service`.
+- **`am-node-send.service`** runs `src/node-package-send.js`, which packages and sends the outbox records. It is started by the path unit, not by a schedule. `docs/agents/node-send-timer.md` is the older poll-based example (a 2-minute timer); the path unit is the event-driven replacement, and that file is left unchanged.
+
+**Scheduling priority.** All node units set `Nice=19`, `IOSchedulingClass=idle` and `CPUSchedulingPolicy=idle`, so node work yields to interactive use of the machine.
+
+**Environment.** `node.env` holds commented examples of `AGENT_MANAGER_CLAIM_URL`, `AGENT_MANAGER_NODE_TOKEN_FILE` and `AGENT_MANAGER_NODE_REPOS_DIR`. They are commented out by default; uncomment and set them on the node. The token is read from the token file by path and is not placed in the environment.
+
+## 7. Not built yet
+
+- A loop that applies a ramp decision to the workers: today the owner reads the decision and changes the workers.
+- A timer that runs `node src/lend-task.js reclaim`, a timer that runs `node src/node-package-send.js`, and a command that lends the next waiting task automatically.
+- Anything that moves a repo or the gateway for you: the export, copy, import and unit-writing steps of section 2a are run by hand, and the gateway's confirmation, its login and its start are yours.
+- Automatic scale-up after a passing trial; the trial score is read by the owner.
+- The cloud lane's Sonnet escalation, concurrency back-off and the unexplained liveness-probe 401s (see `cloud-lane.md`).
+
+## Operating notes from the first live runs (2026-11-14 to 2026-11-16)
+
+1. **One checkout for the units.** `am-node-send`, `am-node-heartbeat` and `am-node-pull` must all run from the same agent-manager checkout, the one the code-sync scripts update (on grimm, the checkout those scripts keep current). An older hand-copied directory that is not a checkout kept running old send and heartbeat code, and no codeSha was reported until the units were repointed.
+2. **Workers and slots.** Each extra cloud worker is one lane in the node's `lanes.json` (for example `gpu cloud2`, `cloud3`), one cloud-providers gateway on its own port (7451, 7452, and so on) and one transient unit started with `systemd-run`. `AGENT_MANAGER_NODE_MAX_TASKS` in `node-pull.env` (a whole number from 1 to 8, default 1) is how many claimed tasks the node may hold at once; set it equal to the number of workers. The registry's `concurrencyCap` is only recorded, not enforced.
+3. **Stop reporting.** A node worker that stops on an open question moves its record to `queue/node-outbox`. wok's package intake files it in `queue/needs-clarification` and ends the lease with the event `blocked`. A package wok can never accept (HTTP 400, for example a draft with no diff) moves to `queue/node-refused` with a `.reason` file.
+4. **Duplicate copies hold a slot.** A duplicate copy of an already stopped or sent task in the node's `queue/adhoc` holds a slot and can stall all claims. Look for the same file name in `queue/adhoc`, `queue/needs-clarification`, `queue/blocked` and `queue/node-sent`.
+5. **Site pauses are expected.** The site-traffic monitor pauses the node for 10 minutes when a visitor is on the Property Forager site ("site in use"); the registry then shows `paused` true. That is expected (section 1, rule 3).
+6. **Measured 2026-11-16, three workers.** grimm load was about 0.2 to 0.7 and 94 percent idle. A task takes about 2 minutes from claim to arrival on wok, and about 17 minutes from the first branch verdict to merged (wok's merge step is the slow leg).

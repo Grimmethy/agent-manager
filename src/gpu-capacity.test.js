@@ -78,6 +78,10 @@ test('resolveTimeoutMs scales down for a cheap short call instead of always retu
   assert.ok(cheap >= MIN_TIMEOUT_MS);
 });
 
+test('MIN_TIMEOUT_MS is 180 s, 2x the 90 s worst contended cold-load measurement', () => {
+  assert.equal(MIN_TIMEOUT_MS, 180_000);
+});
+
 test('resolveTimeoutMs never exceeds the caller-supplied ceiling even for a huge workload', () => {
   const ms = resolveTimeoutMs({ promptTokens: 100000, numPredict: 100000, tokensPerSecond: 5, ceilingMs: 240_000 });
   assert.equal(ms, 240_000);
@@ -113,7 +117,30 @@ test('resolveTimeoutMs falls back to a conservative floor tokens/sec when none i
 });
 
 test('one context for every call: the extended tier is folded into PINNED_NUM_CTX, and it is the raised (2026-09-20) 49152', () => {
-  const { EXTENDED_NUM_CTX } = require('./gpu-capacity.js');
   assert.equal(PINNED_NUM_CTX, 49152);
-  assert.equal(EXTENDED_NUM_CTX, PINNED_NUM_CTX);
+});
+
+// Per-lane pinned context (2026-10-17): a lane's registry numCtx reaches the lane process as AGENT_MANAGER_LANE_NUM_CTX.
+test('laneNumCtx: a whole number >= MIN_NUM_CTX wins; unset, junk, fractions and too-small values are ignored (default pin kept)', () => {
+  const { laneNumCtx, MIN_NUM_CTX, DEFAULT_PINNED_NUM_CTX } = require('./gpu-capacity.js');
+  assert.equal(laneNumCtx({ AGENT_MANAGER_LANE_NUM_CTX: '16384' }), 16384);
+  assert.equal(laneNumCtx({ AGENT_MANAGER_LANE_NUM_CTX: String(MIN_NUM_CTX) }), MIN_NUM_CTX);
+  for (const bad of [undefined, '', 'abc', '16384.5', '1024', '-5', '0']) {
+    assert.equal(laneNumCtx({ AGENT_MANAGER_LANE_NUM_CTX: bad }), null, `ignored: ${bad}`);
+  }
+  assert.equal(DEFAULT_PINNED_NUM_CTX, 49152, 'the 24 GB cards keep their pin');
+});
+
+test('PINNED_NUM_CTX is the lane override in a lane process and 49152 everywhere else; resolveNumCtx honors it', () => {
+  const { execFileSync } = require('node:child_process');
+  const probe = "const g=require('./src/gpu-capacity.js'); console.log(JSON.stringify({pin:g.PINNED_NUM_CTX, resolved:g.resolveNumCtx({estimatedTokens:100,numPredict:100,maxSafeNumCtx:0}), clamped:g.resolveNumCtx({estimatedTokens:1,numPredict:1,maxSafeNumCtx:4096})}))";
+  const run = (extra) => JSON.parse(execFileSync(process.execPath, ['-e', probe], { cwd: require('node:path').join(__dirname, '..'), encoding: 'utf8', env: { ...process.env, AGENT_MANAGER_LANE_NUM_CTX: '', ...extra } }));
+  assert.deepEqual(run({}), { pin: 49152, resolved: 49152, clamped: 4096 });
+  assert.deepEqual(run({ AGENT_MANAGER_LANE_NUM_CTX: '16384' }), { pin: 16384, resolved: 16384, clamped: 4096 });
+});
+
+test('laneNumBatch reads AGENT_MANAGER_LANE_NUM_BATCH, whole numbers 32..8192 only', () => {
+  const { laneNumBatch } = require('./gpu-capacity.js');
+  assert.equal(laneNumBatch({ AGENT_MANAGER_LANE_NUM_BATCH: '1024' }), 1024);
+  for (const bad of [undefined, '', 'x', '16', '9000', '1.5']) assert.equal(laneNumBatch({ AGENT_MANAGER_LANE_NUM_BATCH: bad }), null);
 });

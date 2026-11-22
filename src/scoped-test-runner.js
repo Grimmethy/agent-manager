@@ -79,13 +79,45 @@ function reverseDependents(repoRoot, file, alreadyIncluded) {
   // quote char on both ends, base immediately followed by either the closing quote or a
   // JS/TS extension then the closing quote, never a longer name that merely starts with
   // base (e.g. "./utility" must NOT match a search for "util").
-  const re = new RegExp(`(['"])\\.\\.?/${escapeRegExp(base)}(?:\\.[jt]sx?)?\\1`);
+  // 2026-11-01: directory segments between the leading ./ or ../ and the base are allowed (require('./sdk/candidate-fulfillment.js') from a test one
+  // directory above src/sdk). The old pattern needed the base right after ./, so a test that reached the module through a sub-directory was never
+  // found: src/context-trim-sweep.test.js broke on a branch changing src/sdk/candidate-fulfillment.js and nothing ran it.
+  const re = new RegExp(`(['"])\\.\\.?/(?:[^'"/\\n]+/)*${escapeRegExp(base)}(?:\\.[jt]sx?)?\\1`);
   const hits = [];
   for (const d of searchDirs) {
     let entries;
     try { entries = fs.readdirSync(path.join(repoRoot, d)); } catch { continue; }
     for (const name of entries) {
       if (!/\.test\.[jt]sx?$/i.test(name)) continue;
+      const rel = path.join(d, name).replace(/\\/g, '/');
+      if (alreadyIncluded.has(rel)) continue;
+      let content;
+      try { content = fs.readFileSync(path.join(repoRoot, rel), 'utf8'); } catch { continue; }
+      if (re.test(content)) {
+        hits.push(rel);
+        if (hits.length >= MAX_REVERSE_DEP_FILES) return hits;
+      }
+    }
+  }
+  return hits;
+}
+
+// Python twin of reverseDependents: test files in the changed module's directory or its parent that `import <module>` or `from <module> import ...`
+// (also a dotted prefix such as `from dashboard.chat_sessions import`). Same two-directory bound and cap as the JS finder; 2026-11-01: before this a changed
+// .py file only ever got its test_<name>.py, so test_chat_turn_timings.py (it imports chat_sessions) broke on a chat_sessions.py change and was never run.
+function reverseDependentsPy(repoRoot, file, alreadyIncluded) {
+  if (!/\.py$/i.test(file) || isTestFile(file)) return [];
+  const dir = path.dirname(file);
+  const base = path.basename(file, '.py');
+  if (!/^[A-Za-z_][\w]*$/.test(base)) return [];
+  const searchDirs = [...new Set([dir, path.dirname(dir)])];
+  const re = new RegExp(`^\\s*(?:from\\s+(?:[\\w.]+\\.)?${escapeRegExp(base)}\\s+import\\b|import\\s+(?:[\\w.]+\\.)?${escapeRegExp(base)}\\b)`, 'm');
+  const hits = [];
+  for (const d of searchDirs) {
+    let entries;
+    try { entries = fs.readdirSync(path.join(repoRoot, d)); } catch { continue; }
+    for (const name of entries) {
+      if (!/^test_[^/]+\.py$/i.test(name)) continue;
       const rel = path.join(d, name).replace(/\\/g, '/');
       if (alreadyIncluded.has(rel)) continue;
       let content;
@@ -119,6 +151,12 @@ function findAffectedTestFiles(repoRoot, changedFiles) {
     for (const dep of reverseDependents(repoRoot, file, js)) {
       js.add(dep);
       if (js.size >= MAX_TEST_FILES) break;
+    }
+  }
+  for (const file of changedFiles || []) {
+    for (const dep of reverseDependentsPy(repoRoot, file, py)) {
+      py.add(dep);
+      if (py.size >= MAX_TEST_FILES) break;
     }
   }
   return { js: [...js].slice(0, MAX_TEST_FILES), py: [...py].slice(0, MAX_TEST_FILES) };
@@ -195,7 +233,7 @@ function withSandbox(fn) {
 // regression" on every commit touching a lock-contending file. `passed: null` marks this
 // inconclusive -- same "stay silent, let the LLM decide" treatment as no-coverage-exists,
 // never folded into a hard pass or fail.
-function runJsTests(repoRoot, files) {
+function runNodeTests(repoRoot, files) {
   if (!files.length) return null;
   try {
     withSandbox((sandbox) => execFileSync('node', ['--test', ...files], {
@@ -205,8 +243,50 @@ function runJsTests(repoRoot, files) {
   } catch (e) {
     const timedOut = e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT';
     const out = `${e.stdout || ''}${e.stderr || ''}`;
-    return { ran: files, passed: timedOut ? null : false, failures: parseNodeTestFailures(out), raw: out.slice(0, 4000), timedOut };
+    return { ran: files, passed: timedOut || e.code === 'ENOENT' ? null : false, failures: parseNodeTestFailures(out), raw: out.slice(0, 4000), timedOut };
   }
+}
+
+// vitest, for a package that declares it (lib/js-test-runner.js): started through node on its own entry point from the package dir. A package whose node_modules is
+// not installed is INCONCLUSIVE (passed: null), never a regression.
+function runVitestTests(repoRoot, pkgRel, files) {
+  const pkgDir = path.join(repoRoot, pkgRel || '.');
+  const { vitestArgs } = require('./lib/js-test-runner.js');
+  const args = vitestArgs(pkgRel, files);
+  if (!fs.existsSync(path.join(pkgDir, args[0]))) {
+    return { ran: files, passed: null, failures: [], raw: `vitest is not installed for ${pkgRel || 'the repo root'} (run npm ci there)`, timedOut: false };
+  }
+  try {
+    withSandbox((sandbox) => execFileSync('node', args, { cwd: pkgDir, timeout: RUN_TIMEOUT_MS, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: childEnv(sandbox) }));
+    return { ran: files, passed: true, failures: [] };
+  } catch (e) {
+    const timedOut = e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT';
+    const out = `${e.stdout || ''}${e.stderr || ''}`;
+    return { ran: files, passed: timedOut || e.code === 'ENOENT' ? null : false, failures: require('./lib/js-test-runner.js').parseVitestFailures(out), raw: out.slice(0, 4000), timedOut };
+  }
+}
+
+// JS test files run through the runner their own package uses: node:test, or vitest for a package that declares it. 2026-10-08: every file used to go to `node --test`,
+// which cannot execute a .tsx, so a commit touching a component with a vitest test would have auto-filed a false "confirmed regression" (change_review). Files with no
+// usable runner are simply not run: they are no evidence either way. Verdicts combine like runScopedTests does: any false wins, else any null, else true.
+function runJsTests(repoRoot, files) {
+  if (!files.length) return null;
+  const { partitionJsTests } = require('./lib/js-test-runner.js');
+  const plan = partitionJsTests(repoRoot, files);
+  const parts = [];
+  if (plan.nodeTest.length) parts.push(runNodeTests(repoRoot, plan.nodeTest));
+  for (const [pkgRel, group] of plan.vitest) parts.push(runVitestTests(repoRoot, pkgRel, group));
+  const real = parts.filter(Boolean);
+  if (!real.length) return null;
+  if (real.length === 1) return real[0];
+  const verdicts = real.map((x) => x.passed);
+  return {
+    ran: real.flatMap((x) => x.ran),
+    passed: verdicts.includes(false) ? false : verdicts.includes(null) ? null : true,
+    failures: real.flatMap((x) => x.failures || []),
+    raw: real.map((x) => x.raw).filter(Boolean).join('\n').slice(0, 4000),
+    timedOut: real.some((x) => x.timedOut),
+  };
 }
 
 // Defaults to the repo's own .venv when the caller doesn't name an interpreter -- plain
@@ -231,7 +311,7 @@ function runPyTests(repoRoot, files, pythonBin) {
   } catch (e) {
     const timedOut = e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT';
     const out = `${e.stdout || ''}${e.stderr || ''}`;
-    return { ran: files, passed: timedOut ? null : false, failures: parsePyTestFailures(out), raw: out.slice(0, 4000), timedOut };
+    return { ran: files, passed: timedOut || e.code === 'ENOENT' ? null : false, failures: parsePyTestFailures(out), raw: out.slice(0, 4000), timedOut };
   }
 }
 
@@ -278,6 +358,7 @@ function runScopedTests(repoRoot, changedFiles, opts = {}) {
 module.exports = {
   childEnv,
   findAffectedTestFiles,
+  reverseDependentsPy,
   runScopedTests,
   runJsTests,
   runPyTests,

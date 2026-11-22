@@ -125,14 +125,22 @@ def _chat_preempt_max_age_s() -> int:
         return 180
 
 
-# lanes.js's P40 lane id (a literal there): the one lane whose endpoint is NOT the chat's.
+# Legacy fallback only (node/lanes.js unreadable): the one lane whose endpoint is NOT the chat's. Normal operation reads each lane's `preempt` setting.
 _P40_LANE_ID = "worker-p40"
 
 
 def _preempt_lane_sets():
-    """(always_kill, age_gated) lane tuples for this chat turn. Always-kill = the LOCAL GPU lane(s) only (worker-3090): the chat runs on the host GPU and takes it over.
-    The P40 lane is a different endpoint and is never preempted (2026-09-21, Grimmethy: "only take over the 3090. P40 should remain in action"). The reviewer is age-gated."""
-    from app import worker_lane_ids
+    """(always_kill, age_gated) lane tuples for this chat turn, read from each lane's `preempt` setting in src/lanes.js (lanes are data now:
+    the host lane is 'always', the P40 and every lanes-registry lane default to 'never'; a registry entry may opt into 'age-gated').
+    The chat runs on the host GPU and takes it over; every other lane is a different endpoint and is left running (2026-09-21, Grimmethy:
+    "only take over the 3090. P40 should remain in action"). The reviewer is always age-gated.
+    If the lane definitions cannot be read at all, fall back to the old rule: every lane but worker-p40 is always-kill."""
+    from app import worker_lane_defs, worker_lane_ids
+    defs = worker_lane_defs()
+    if defs:
+        always = tuple(l["id"] for l in defs if l.get("preempt") == "always")
+        gated = tuple(l["id"] for l in defs if l.get("preempt") == "age-gated" and l["id"] not in _PREEMPT_LANES_AGE_GATED)
+        return always, (*_PREEMPT_LANES_AGE_GATED, *gated)
     return tuple(l for l in worker_lane_ids() if l != _P40_LANE_ID), _PREEMPT_LANES_AGE_GATED
 
 
@@ -273,7 +281,7 @@ def _kill_and_requeue_instance(instance_id: str, note: str) -> dict:
     return {"killed": True, "taskId": task_id}
 
 
-def _arbiter_cancel_below(cls: str = "interactive") -> list:
+def _arbiter_cancel_below(cls: str = "interactive", key: str = None) -> list:
     """Ask the GPU arbiter (src/gpu-arbiter.js, via its CLI) to cancel every ticket below
     `cls` on the CHAT'S OWN GPU (`--local`: the endpoint the chat talks to, i.e. the host
     GPU / worker-3090) -- never the P40 lane, which is a different endpoint and stays in
@@ -281,7 +289,10 @@ def _arbiter_cancel_below(cls: str = "interactive") -> list:
     should remain in action"). The arbiter marks each cancelRequested and SIGKILLs any
     active holder; the worker daemon requeues its task. Before this it keyed by MODEL NAME
     while worker tickets are keyed by endpoint, so it found nothing and the chat never took
-    over any lane. Best-effort."""
+    over any lane. Best-effort.
+
+    `key` (2026-10-23, Grimmethy: chat may run on a card other than the 3090): cancel on that endpoint key (ollama-<host>-<port>) instead of
+    --local. Only the chat-card picker (chat_card.py) supplies it, and only for the card the reply actually runs on."""
     from app import ENV_FILE_PATH, PACKAGE_ROOT, read_env_file
     import json
     cli = PACKAGE_ROOT / "scripts" / "gpu-arbiter-cli.js"
@@ -289,7 +300,7 @@ def _arbiter_cancel_below(cls: str = "interactive") -> list:
         return []
     try:
         cp = subprocess.run(
-            ["node", str(cli), "cancel-below", "--local", "--cls", cls],
+            ["node", str(cli), "cancel-below", *(["--key", key] if key else ["--local"]), "--cls", cls],
             capture_output=True, text=True, timeout=15,
             env={**os.environ, **read_env_file(ENV_FILE_PATH)},
         )
@@ -301,8 +312,38 @@ def _arbiter_cancel_below(cls: str = "interactive") -> list:
         return []
 
 
-def _preempt_pipeline_for_chat() -> list:
-    """Free the local model for a chat turn. Worker draft lanes go through the GPU arbiter
+def _arbiter_busy_rows(summary: list) -> list:
+    """Rows for a holder that is STILL on the chat's own GPU after the preempt: the arbiter's `status --local` names a holder that the cancel did not
+    kill (2026-10-25: a chat turn waited ~12 minutes behind worker-3090 while the event said only 'freed reviewer', so nothing told the operator the
+    GPU was not free). Row shape {lane: <holder class>, action: 'busy', taskId, phase, ageSeconds: None}. Best-effort like the cancel: any failure -> []."""
+    from app import ENV_FILE_PATH, PACKAGE_ROOT, read_env_file
+    import json
+    cli = PACKAGE_ROOT / "scripts" / "gpu-arbiter-cli.js"
+    if not cli.is_file():
+        return []
+    try:
+        cp = subprocess.run(
+            ["node", str(cli), "status", "--local"],
+            capture_output=True, text=True, timeout=15,
+            env={**os.environ, **read_env_file(ENV_FILE_PATH)},
+        )
+        holder = (json.loads((cp.stdout or "{}").strip() or "{}") or {}).get("holder")
+        if not holder:
+            return []
+        killed = {r.get("taskId") for r in (summary or []) if r.get("action") == "killed" and r.get("taskId")}
+        if holder.get("taskId") and holder.get("taskId") in killed:
+            return []
+        return [{"lane": holder.get("cls"), "action": "busy", "taskId": holder.get("taskId"),
+                 "phase": holder.get("phase"), "ageSeconds": None}]
+    except Exception as e:  # noqa: BLE001 -- best-effort, never block a chat turn
+        print(f"[chat-preempt] arbiter status failed (non-fatal): {e}", file=sys.stderr, flush=True)
+        return []
+
+
+def _preempt_pipeline_for_chat(card: dict = None) -> list:
+    """Free the local model for a chat turn. `card` is chat_card.resolve_chat_card's choice for this turn: a blocked choice preempts nothing, a
+    choice on another card cancels only that card's lane draft (by its arbiter key) and leaves the host lane running, and the host card (or no
+    card) takes the path below unchanged. The reviewer of another card's lane is not touched. Worker draft lanes go through the GPU arbiter
     now -- one cancel-below call. The reviewer is not on the arbiter yet, so it keeps the
     age-gated legacy kill below. Best-effort throughout. Returns [{lane, action, taskId,
     ageSeconds}]."""
@@ -313,6 +354,12 @@ def _preempt_pipeline_for_chat() -> list:
     qdir = queue_dir()
     if not inst_dir or not inst_dir.is_dir():
         return []
+
+    if card is not None:
+        if card.get("blocked") or not card.get("lane"):
+            return []
+        if not card.get("local"):
+            return _arbiter_cancel_below("interactive", key=card.get("lockKey")) if card.get("lockKey") else []
 
     summary = _arbiter_cancel_below("interactive")
 
@@ -408,4 +455,5 @@ def _preempt_pipeline_for_chat() -> list:
                       file=sys.stderr, flush=True)
         except Exception as e:  # noqa: BLE001 -- best-effort, never block the chat turn
             print(f"[chat-preempt] {lane}: skipped ({e})", file=sys.stderr, flush=True)
+    summary.extend(_arbiter_busy_rows(summary))
     return summary

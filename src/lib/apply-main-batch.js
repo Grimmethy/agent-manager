@@ -4,15 +4,23 @@
 
 const fs = require('fs');
 const path = require('path');
-const { getConfig, ensureRegistered } = require('../config.js');
+const { ensureRegistered } = require('../config.js');
 const { getRegisteredSource, resolveSourceName } = require('../task-source-registry.js');
 const { createRealGitRunner } = require('../git-runner.js');
-const { writeTaskLogFile, taskLogRelPath } = require('../task-log-store.js');
+const { writeTaskLogFile, taskLogRelPath, taskComputeForLog } = require('../task-log-store.js');
 require('../task-sources.js');
 const { TRIAGE_BRANCH, ungatedMainPushAllowed } = require('./main-push-policy.js');
 const { coAuthorTrailer, usesGroupB, applyCandidateSplit, writeArtifact, closeOriginatingBrainDumpEntry, assertStageableFiles } = require('./apply-core.js');
+const { checkRemoteExists } = require('./git-remote-check.js');
 
-// The shared checkout must never be left on the triage branch. That branch is based on whatever main was when it was first created and is never rebased, so a
+// Single source of truth for the direct-to-main eligibility check. Both the batch loop and
+// mainPartition() route through here so the lookup and predicate cannot drift apart.
+function isDirectToMainEligible(task) {
+  const reg = getRegisteredSource(resolveSourceName(task));
+  return { eligible: !!(reg && reg.directToMain === true) };
+}
+
+// The shared checkout must never be left on the triage branch. That branch is based on whatever main was when it was first created and is only brought up to date by merging main in on the next apply tick (never rebased: a rewritten branch was never pushed and looped, see git-runner.js prepareStackedBranch), so a
 // checkout parked on it (2026-09-20, PF: 4 h, 40 commits behind main) makes every read of "the repo" (plan grounding, review's live content, the staleness
 // sweep) see ancient code: false "file absent" flags, stale rejections. Only the single fully-successful path used to return to main; a batch that staged
 // nothing, a failed commit, or a failed push stayed on the branch. This wrapper returns to main on EVERY exit once the triage branch has been entered.
@@ -32,8 +40,7 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
   const results = {};
   const eligible = [];
   for (const task of tasks) {
-    const reg = getRegisteredSource(resolveSourceName(task));
-    if (reg && reg.directToMain === true) {
+    if (isDirectToMainEligible(task).eligible) {
       eligible.push(task);
     } else {
       results[task.id] = { succeeded: false, reason: 'source is not directToMain -- must be applied individually, not in the triage batch' };
@@ -45,7 +52,11 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
   // prepareStackedBranch syncs it from origin if it exists (earlier unmerged batches stay on it),
   // or starts it fresh off current main (also after a human merged + deleted it).
   const gated = !ungatedMainPushAllowed();
-  gitRunner.fetchMain();
+  // 2026-09-25: local-only clones have no origin remote; fetching would fail. Probe once
+  // and skip the fetch (and downstream push) when origin is missing, marking the commit
+  // as local-only so downstream task-disposition does not treat it as shipped.
+  const hasOrigin = checkRemoteExists('origin', { cwd: repoRoot });
+  if (hasOrigin) gitRunner.fetchMain();
   if (gated) {
     // Pre-flight BEFORE entering the branch: a dirty apply clone aborts prepareStackedBranch's `checkout -B` / `rebase`
     // (2026-09-23: ~266 change_review tasks blocked one-by-one on it). Self-heal a dedicated clone, else fail once, loudly.
@@ -53,6 +64,14 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
     if (typeof gitRunner.assertCleanTree === 'function') gitRunner.assertCleanTree();
     state.enteredTriageBranch = true;
     gitRunner.prepareStackedBranch(TRIAGE_BRANCH);
+    // Drop candidate blocks main already retracted that this branch still carries (the merge driver used to keep them; see
+    // src/lib/prune-retracted-candidates.js). Best-effort and never fatal: a failure here must not block the batch.
+    if (typeof gitRunner.pruneRetractedCandidates === 'function') {
+      try {
+        const pruned = gitRunner.pruneRetractedCandidates();
+        if (pruned && pruned.committed) console.error(`[apply-main-batch] pruned retracted candidate(s) from ${TRIAGE_BRANCH}: ${pruned.pruned.map((p) => `${p.doc} ${p.ids.map((i) => `AC-${i}`).join(',')}`).join('; ')}`);
+      } catch (e) { console.error(`[apply-main-batch] pruneRetractedCandidates failed (ignored): ${String(e && e.message).split('\n')[0].slice(0, 200)}`); }
+    }
   } else gitRunner.resetToMain();
 
   const staged = [];
@@ -97,7 +116,7 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
       // the failure is deterministic. writeTaskLogFile still writes the file to disk
       // (for the user's own local reference, and so the commit message's `Task-Log:`
       // line below still points somewhere real); it just never joins `files` here.
-      const taskLogRel = writeTaskLogFile(repoRoot, task);
+      const taskLogRel = writeTaskLogFile(repoRoot, task, { compute: taskComputeForLog(pipelineDir, task.id) }); // HUB0280-04: stamp the recorded model compute
       gitRunner.add(files);
       staged.push({ task, files, taskLogRel });
     } catch (e) {
@@ -125,6 +144,22 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
     gitRunner.commit(msgPath);
   } finally {
     fs.unlinkSync(msgPath);
+  }
+
+  // 2026-09-25: unified commit outcome. When origin is missing (local-only clone), skip
+  // push entirely and mark as local. Otherwise, push according to gated/ungated policy.
+  const projectName = path.basename(repoRoot);
+  if (!hasOrigin) {
+    // Local-only path: commit exists, but no remote to push to. Mark as local so
+    // downstream task-disposition does not treat it as shipped.
+    for (const s of staged) {
+      results[s.task.id] = {
+        succeeded: true,
+        doneMarker: `applied to local main (no remote) in ${projectName} -- origin not configured`,
+      };
+      closeOriginatingBrainDumpEntry(s.task, brainDumpPath, `Applied locally in ${projectName} (no origin remote) -- Task: ${s.task.id}`);
+    }
+    return { results, committed: true, pushed: false, branch: gitRunner.mainBranch, localOnly: true };
   }
 
   if (gated) {
@@ -179,16 +214,14 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
 }
 
 function mainPartition() {
-  const { repoRoot } = getConfig();
-  void repoRoot;
   const direct = [];
   const other = [];
   for (const p of process.argv.slice(3)) {
     try {
       const t = JSON.parse(fs.readFileSync(p, 'utf8'));
-      const reg = getRegisteredSource(resolveSourceName(t));
-      if (reg && reg.directToMain === true) direct.push(p); else other.push(p);
-    } catch {
+      if (isDirectToMainEligible(t).eligible) direct.push(p); else other.push(p);
+    } catch (err) {
+      process.stderr.write(`mainPartition: "${p}" defaulting to other: ${err.message}\n`);
       other.push(p);
     }
   }

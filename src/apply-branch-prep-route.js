@@ -37,11 +37,17 @@ function prepareApplyBranch(task, { gitRunner, commitsDirectlyToMain }) {
       if (typeof gitRunner.assertCleanTree === 'function') gitRunner.assertCleanTree();
       gitRunner.prepareStackedBranch(b);
     } else {
+      // seq === 1: fresh branch, but still must not carry stray content from a prior interrupted apply.
+      if (typeof gitRunner.quarantineDirtyTree === 'function') gitRunner.quarantineDirtyTree();
+      if (typeof gitRunner.assertCleanTree === 'function') gitRunner.assertCleanTree();
       gitRunner.resetToMain();
       try { gitRunner.deleteBranch(b); } catch (_) { /* no stale branch */ }
       gitRunner.createBranch(b);
     }
   } else {
+    // Normal (non-stacked) apply: self-heal a dedicated apply clone (quarantine to a patch under .git/), else fail once with a clear message.
+    if (typeof gitRunner.quarantineDirtyTree === 'function') gitRunner.quarantineDirtyTree();
+    if (typeof gitRunner.assertCleanTree === 'function') gitRunner.assertCleanTree();
     gitRunner.resetToMain();
   }
 

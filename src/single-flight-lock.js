@@ -134,7 +134,10 @@ const DISCUSS_PRIORITY_DIR_NAME = '.discuss-waiting';
 // a crashed waiter's abandoned marker stops mattering after DISCUSS_MARKER_FRESH_MS.
 // (Was a flat 8s wall -- far too short for a multi-turn chat turn, so a worker reclaimed
 // the GPU between the chat's tool-loop iterations and the chat starved: 2026-09-02.)
-const DISCUSS_PRIORITY_MAX_WAIT_MS = 120000;
+// The ceiling itself is now discussPriorityMaxWaitMs() (defined below next to
+// lockTimeoutSecs()): a 900000ms (15-minute) safety valve, overridable via
+// DISCUSS_PRIORITY_MAX_WAIT_SEC -- the same env var the bash twin
+// (agent-manager-common.sh) already reads.
 // A marker whose mtime is older than this is treated as abandoned -- a live waiter
 // re-touches its marker on every model call (see refreshPriorityMarker / the Chat loop).
 const DISCUSS_MARKER_FRESH_MS = 15000;
@@ -222,6 +225,20 @@ function removePriorityMarker(markerPath) {
 // process.env without needing a fresh require of this module each time).
 function lockTimeoutSecs() {
   return Number(process.env.SINGLE_FLIGHT_LOCK_TIMEOUT_SECS) || 600;
+}
+
+// Discuss-priority backoff ceiling (ms) -- an OVERALL BACKSTOP only, never the real gate
+// (that's marker freshness, see the DISCUSS_MARKER_FRESH_MS comment above). Default is a
+// 900000ms (15-minute) safety valve: long enough that a live multi-turn chat/Discuss turn
+// keeps the other lanes yielded even if its refresher stalls between model calls, short
+// enough that a crashed waiter's stale marker can never wedge a lane beyond its own lock
+// timeout. Read at call time, exactly like lockTimeoutSecs() (a test overrides it via
+// process.env without a fresh require); DISCUSS_PRIORITY_MAX_WAIT_SEC is the same env var
+// (seconds) agent-manager-common.sh's bash twin already reads, so both sides of the lock
+// share one override.
+function discussPriorityMaxWaitMs() {
+  const secs = Number(process.env.DISCUSS_PRIORITY_MAX_WAIT_SEC);
+  return (Number.isFinite(secs) && secs > 0 ? Math.floor(secs) : 900) * 1000;
 }
 
 // ---- per-process reentrancy ----------------------------------------------------------
@@ -324,7 +341,7 @@ function acquire(instancesDir, key, opts = {}) {
   //   - AGENT_MANAGER_PRIORITY_HOLDER -- legacy: the chat turn's own node child, the
   //     priority holder, must not back off against its own marker between tool-loop turns.
   if (!opts.skipPriorityBackoff && !process.env.AGENT_MANAGER_PRIORITY_HOLDER) {
-    const discussDeadline = Date.now() + DISCUSS_PRIORITY_MAX_WAIT_MS;
+    const discussDeadline = Date.now() + discussPriorityMaxWaitMs();
     while (someoneIsWaiting(instancesDir) && Date.now() < discussDeadline) {
       sleepMs(1000);
     }
@@ -469,5 +486,5 @@ function withTaskMoveLock(instancesDir, taskId, fn) {
 module.exports = {
   acquire, release, withLock, lockFilePath, queueDirPath,
   dropPriorityMarker, refreshPriorityMarker, removePriorityMarker, someoneIsWaiting,
-  DISCUSS_MARKER_FRESH_MS, withTaskMoveLock, taskMoveLockKey,
+  DISCUSS_MARKER_FRESH_MS, discussPriorityMaxWaitMs, withTaskMoveLock, taskMoveLockKey,
 };

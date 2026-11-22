@@ -347,14 +347,17 @@ async function withGpu(instancesDir, opts, fn) {
 // (earlierPeer only counts a LOWER seq, and this outer ticket has a lower seq, so...) --
 // handled explicitly: an acquire() whose pid already owns an equal-or-higher-priority
 // ticket skips the earlier-peer check for that ticket.
-function holdPlace(instancesDir, { cls = 'interactive', model, lockKey, taskId = null, phase = 'session' } = {}) {
+// ownerPid (2026-10-18, brain-dump 1902): the process a reservation is held FOR, when the
+// holder is a stand-in -- scripts/gpu-arbiter-cli.js `hold` keeps the ticket alive on behalf
+// of a non-Node runner. Metadata only: liveness still follows the ticket's own pid.
+function holdPlace(instancesDir, { cls = 'interactive', model, lockKey, taskId = null, phase = 'session', ownerPid = null } = {}) {
   const key = lockKey || model;
   const dir = ticketsDir(instancesDir, key);
   fs.mkdirSync(dir, { recursive: true });
   const seq = String(Date.now()).padStart(16, '0');
   const name = `${seq}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.hold.json`;
   const fp = path.join(dir, name);
-  writeTicketAtomic(fp, { pid: process.pid, cls, taskId, phase, model, startedAt: nowIso(), holding: false, cancelRequested: false, place: true });
+  writeTicketAtomic(fp, { pid: process.pid, cls, taskId, phase, model, startedAt: nowIso(), holding: false, cancelRequested: false, place: true, ...(ownerPid ? { ownerPid } : {}) });
   const compat = interactiveCompatMarker(instancesDir, cls);
   const iv = setInterval(() => { touch(fp); compat.refresh(); }, REFRESH_MS);
   if (typeof iv.unref === 'function') iv.unref();
@@ -392,22 +395,29 @@ function cancelBelow(instancesDir, model, cls) {
   return affected;
 }
 
-// { holder: {...}|null, waiting: [{cls, pid, taskId, phase, seq}] } for the dashboard.
+// { holder: {...}|null, waiting: [{cls, pid, taskId, phase, seq}], reserved: [...] } for the
+// dashboard. reserved (2026-10-18, brain-dump 1902) lists live place tickets (holdPlace /
+// gpu-arbiter-cli.js hold): before it, a reservation was invisible here -- never `holding`,
+// and filtered out of waiting -- although it blocks every lower class on the key.
 function status(instancesDir, model) {
   const tickets = liveTickets(instancesDir, model);
   const holder = tickets.find((t) => t.holding) || null;
   const waiting = tickets
     .filter((t) => !t.holding && !t.place)
     .map((t) => ({ cls: t.cls, pid: t.pid, taskId: t.taskId, phase: t.phase, model: t.model, seq: t._seq }));
+  const reserved = tickets
+    .filter((t) => t.place)
+    .map((t) => ({ cls: t.cls, pid: t.pid, ownerPid: t.ownerPid || null, taskId: t.taskId, phase: t.phase, model: t.model, startedAt: t.startedAt, seq: t._seq }));
   return {
     holder: holder ? { cls: holder.cls, pid: holder.pid, taskId: holder.taskId, phase: holder.phase, model: holder.model, startedAt: holder.startedAt } : null,
     waiting,
+    reserved,
   };
 }
 
 module.exports = {
   acquire, withGpu, holdPlace, cancelBelow, status,
   waitForSlot,
-  liveTickets, ticketsDir,
+  liveTickets, ticketsDir, pidAlive,
   CLASS_RANK, classRank,
 };

@@ -139,7 +139,7 @@ function reAnchorFile(repoRoot, fetched, body, task) {
 function describeImprovement(oldEntry, windowed) {
   const oldUsedFuzzy = !!oldEntry.usedSnippetFuzzyMatch;
   const newUsedFuzzy = windowed.usedSnippetFuzzyMatch;
-  if (oldUsedFuzzy !== newUsedFuzzy) {
+  if (oldUsedFuzzy !== newUsedFuzzy && newUsedFuzzy) {
     return `Snippet fuzzy-match ${oldUsedFuzzy}->${newUsedFuzzy} for ${oldEntry.path}`;
   }
 

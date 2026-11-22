@@ -11,8 +11,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Load shared env + require AGENT_MANAGER_REPO_ROOT, MODEL_URL (same check
 # applied to every daemon; logs [common] ERROR and exits if missing).
 source "${SCRIPT_DIR}/orc-common.sh"
+source "${SCRIPT_DIR}/lib/start-singleton-bg.sh"
 
 readonly INSTANCE_ID="${1:-watchdog}"    # same naming as PowerShell's $env:InstanceID per-daemon.
+
+# Snapshot file path: parsed from --snapshot-file CLI flag or QUEUE_SNAPSHOT_FILE env var.
+# Default pattern: /dev/shm/agent-manager-queue-tick-<instanceId>.json where <instanceId>
+# comes from AGENT_MANAGER_INSTANCE_ID. Each script independently parses the flag/env and
+# forwards the path to its Node.js entry point.
+SNAPSHOT_FILE="${QUEUE_SNAPSHOT_FILE:-}"
 
 # Refuse to start if a live process already holds this instanceId -- see local-worker.sh's
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
@@ -30,6 +37,8 @@ trap 'printf "[watchdog] SIGTERM/SIGINT received -- exiting after current tick.\
 # this daemon restarts something.
 PID_DIR="${HOME}/.local/state/agent-manager/pids"
 mkdir -p "$PID_DIR" 2>/dev/null
+# Shared with python/dashboard/app.py (proactive_sweep_lock_path): whoever starts the proactive decompose sweep takes this lock first.
+PROACTIVE_LOCK="${PID_DIR}/proactive-file-decompose.lock"
 
 # HOME_LOGS: temp dir for watchdog status logs (same shape PS pipeline-doctor.ps1 uses).
 HOME_LOGS="$(mktemp -d)"
@@ -153,6 +162,10 @@ while :; do
       printf '[watchdog] restarted %s (was pid %s, %s) -- new pid %s via %s\n' "$action_instance" "$action_pid" "$action_reason" "$new_pid" "$action_script" >&2
     done < <(node "${PACKAGE_SRC_DIR}/dead-process-check.js" 2>>"${HOME_LOGS}/dead-process-check.log")
 
+    # Lane health probe (src/lane-health.js): one tiny generation per idle lane every ~10 min, so a lane that is up but crawling (2026-10-17: RX 580 memory
+    # clock stuck at 300 MHz, 0.6 tok/s) is flagged as degraded instead of looking like a task that is too big. Self-throttled and run in the background (a probe of a crawling lane can take its full timeout); kill switch AGENT_MANAGER_LANE_HEALTH=off.
+    ( node "${PACKAGE_SRC_DIR}/lane-health.js" >/dev/null 2>>"${HOME_LOGS}/lane-health.log" || true ) &
+
     # Reject-retry-requeue: a task genuinely rejected by review (blockedStage:'review') gets
     # one more redraft attempt, up to reject-retry-check.js's own retry cap -- port of
     # queue-watchdog.ps1's Invoke-RejectRetryCheck (that script's OTHER job, dead-process
@@ -176,6 +189,19 @@ while :; do
     # class automatically; this is the safety net for when even that can't reconcile.
     apply_retry_result="$(node "${PACKAGE_SRC_DIR}/apply-retry-check.js" 2>>"${HOME_LOGS}/apply-retry-check.log")"
     printf '[watchdog] apply-retry-check: %s\n' "$apply_retry_result" >&2
+
+    # Plugin drains (the drain registry helper in src/): while stop.sh's pipeline-stopped marker exists, SIGTERM any drain still running; otherwise drop the pidfile of a dead one. Its own
+    # [watchdog] lines go to this log; it never fails the tick.
+    node "${PACKAGE_SRC_DIR}/drain-registry.js" sweep >/dev/null || true
+
+    # Forge mode (src/forge-mode.js): ends by itself after 6 hours or when the GPU session is gone; a no-op when not in forge mode. Never fails the tick.
+    bash "${SCRIPT_DIR}/forge-mode.sh" expire >/dev/null || true
+
+    # --- required plugins (begin) ---
+    # Every tick, each unmet entry of config/required-plugins.json (src/required-plugins.js) is a loud, readable error in this log, never a silent skip: the failure text
+    # (stderr of the check) is kept and the status lines are dropped. The hub-tasks check below stays: it also decides whether the hub sweeps run this tick.
+    _required_plugins_err="$(node "${PACKAGE_SRC_DIR}/required-plugins.js" 2>&1 >/dev/null)" || printf '[watchdog] %s\n' "$_required_plugins_err" >&2
+    # --- required plugins (end) ---
 
     # Coordinator sweep + rejected-hub-disposition-backfill moved to
     # agent-manager-hub-tasks (S5e of the hub-tasks extraction, 2026-09-25) -- resolved by
@@ -235,6 +261,38 @@ while :; do
     # AGENT_MANAGER_GROUNDING_RECHECK=false. See grounding-recheck-sweep.js.
     grounding_recheck_result="$(node "${PACKAGE_SRC_DIR}/grounding-recheck-sweep.js" 2>>"${HOME_LOGS}/grounding-recheck-sweep.log")"
     printf '[watchdog] grounding-recheck-sweep: %s\n' "$grounding_recheck_result" >&2
+
+    # Branch-conflict re-admission (2026-10-09, TaxHarvest): a single-task agent/* branch that conflicts with main (seen on two runs >= 10 min apart) gets
+    # one redraft against current main, with a main-moved priorVerdict naming the conflicting files and telling the drafter to check first whether the change
+    # already landed. Never touches hub children, stacked tasks, shared branches, human-prioritised tasks, or rivals that conflict only with each other.
+    # AGENT_MANAGER_CONFLICT_READMIT=off|dry-run|on (default dry-run). See branch-conflict-readmit-sweep.js.
+    # Gated (2026-11-03, ADR-0024): runs only when the project's done/, verdict file or remote refs changed, a sweep is waiting for its second sighting, or the 30 minute safety net is due.
+    if sweep_gate_skips project "$PIPELINE_DIR"; then conflict_readmit_result="skipped: nothing changed"
+    else conflict_readmit_result="$(node "${PACKAGE_SRC_DIR}/branch-conflict-readmit-sweep.js" 2>>"${HOME_LOGS}/branch-conflict-readmit-sweep.log")"; fi
+    printf '[watchdog] branch-conflict-readmit-sweep: %s\n' "$conflict_readmit_result" >&2
+
+    # Branch-defect re-admission (2026-10-24): the paired sweep for a defect verdict. A single-task agent/* branch whose task carries a CURRENT chat/manual
+    # needs-work verdict (priorVerdict.sha == the branch head, seen on two runs >= 10 min apart) gets ONE redraft with the reviewer's reasons; a second
+    # needs-work after that is left for a human. Same exclusions as the conflict sweep (hub children, stacked, shared branches, human-prioritised tasks).
+    # AGENT_MANAGER_DEFECT_READMIT=off|dry-run|on (default dry-run). See branch-defect-readmit-sweep.js (chat, manual and worker needs-work verdicts count).
+    if sweep_gate_skips project "$PIPELINE_DIR"; then defect_readmit_result="skipped: nothing changed"
+    else defect_readmit_result="$(node "${PACKAGE_SRC_DIR}/branch-defect-readmit-sweep.js" 2>>"${HOME_LOGS}/branch-defect-readmit-sweep.log")"; fi
+    printf '[watchdog] branch-defect-readmit-sweep: %s\n' "$defect_readmit_result" >&2
+
+    # Redo supersession (2026-10-30): when a redo task (promptContext.redoOf) has merged, record a discard verdict on the Unmerged Branches card of the task it replaced,
+    # so the old needs-work branch does not sit in the pool until a human notices. Records only; the owner's Discard click deletes the branch.
+    # AGENT_MANAGER_REDO_SUPERSEDE=off|dry-run|on (default on). See redo-supersede-sweep.js.
+    # Global (it reads every registered project's done/), so it runs ONCE per tick here, behind its own gate, and not again for each pool project below.
+    if sweep_gate_skips global-redo; then redo_supersede_result="skipped: nothing changed"
+    else redo_supersede_result="$(node "${PACKAGE_SRC_DIR}/redo-supersede-sweep.js" 2>>"${HOME_LOGS}/redo-supersede-sweep.log")"; fi
+    printf '[watchdog] redo-supersede-sweep: %s\n' "$redo_supersede_result" >&2
+
+    # Brain-dump reconcile (HUB0226): closes a brain-dump entry when a task that names it has merged or been superseded. Why a poll and not an event: tasks reach
+    # done/ from the dashboard merge route (python), apply-task (node) and sweeps, so there is no single writer to announce; the one signal all of them leave is the
+    # mtime of queue/done (plus the brain dump file's own mtime). Idle cost: two stat calls and this node start; reconcile only runs when one moved, and a 6 hour
+    # full run counts what the mtimes missed. AGENT_MANAGER_BRAIN_DUMP_RECONCILE=off|dry-run|on (default dry-run). See brain-dump-reconcile-sweep.js.
+    brain_dump_reconcile_result="$(node "${PACKAGE_SRC_DIR}/brain-dump-reconcile-sweep.js" 2>>"${HOME_LOGS}/brain-dump-reconcile-sweep.log")"
+    printf '[watchdog] brain-dump-reconcile-sweep: %s\n' "$brain_dump_reconcile_result" >&2
 
     # Expiry sweep (2026-09-24, change_review flood): retires a QUEUED task whose subject went stale while it waited, for any source that
     # declares an `expiry` hook on its registration (change_review: a review of a commit older than its recency window). Source-agnostic --
@@ -371,7 +429,7 @@ while :; do
     printf '[watchdog] product-spec-to-hub: %s\n' "$spec_hub_result" >&2
 
     # The file-decompose family (S4a of the hub-tasks extraction, 2026-09-24) moved to
-    # agent-manager-hygiene -- Docs/hub-tasks-extraction-plan.md. Resolved by NAME via
+    # agent-manager-hygiene -- docs/design-notes/hub-tasks-extraction-plan.md. Resolved by NAME via
     # resolve_plugin_root (S5a, 2026-09-25) so this keeps working regardless of how many
     # other plugins are also loaded or in what order; every invocation in this family is
     # skipped (not fatal) if the hygiene plugin isn't installed, same discipline as the
@@ -448,10 +506,17 @@ while :; do
     # gated to once per 24h internally (isDue/markChecked); runs the file-length-scan
     # result from THIS same tick, so it always sees fresh flags. Disable with
     # AGENT_MANAGER_PROACTIVE_FILE_DECOMPOSE=false.
+    # Run DETACHED and single-instance (2026-10-17): one run is 15+ minutes of model calls, and running it inline held every other sweep in this tick behind it (the coordinator
+    # sweep went ~16 minutes without a pass). The dashboard's --force start takes the same lock (python/dashboard/app.py proactive_sweep_argv), so the two can no longer overlap.
+    # The sweep's own summary line now goes to its log instead of this tick's output.
     if [[ -n "$_hygiene_src" ]] && [[ -f "${_hygiene_src}/proactive-file-decompose-sweep.js" ]]; then
-      proactive_decompose_result="$(node "${_hygiene_src}/proactive-file-decompose-sweep.js" 2>>"${HOME_LOGS}/proactive-file-decompose-sweep.log")"
-      printf '[watchdog] proactive-file-decompose-sweep: %s\n' "$proactive_decompose_result" >&2
+      start_singleton_bg "$PROACTIVE_LOCK" "${HOME_LOGS}/proactive-file-decompose-sweep.log" node "${_hygiene_src}/proactive-file-decompose-sweep.js"
     fi
+
+    # Plugin watchdog scripts (2026-11-02, ADR-0024 interim clock hook): every enabled plugins.json entry that declares "watchdogScripts" gets those scripts run
+    # once per tick, with a timeout and failure isolation, so a new plugin trigger needs no hardcoded block here. See scripts/run-plugin-watchdog-scripts.sh.
+    # AGENT_MANAGER_PLUGIN_WATCHDOG_SCRIPTS=off disables.
+    HOME_LOGS="$HOME_LOGS" PACKAGE_SRC_DIR="$PACKAGE_SRC_DIR" bash "${SCRIPT_DIR}/run-plugin-watchdog-scripts.sh"
 
     # merged-work-sweep (2026-09-18): wires verify-merged-work.js -- built 2026-09-16,
     # never previously called from anywhere -- into a periodic pass. Cheaply pre-filters
@@ -463,6 +528,15 @@ while :; do
     # ever, not every tick) -- cheap to run on every watchdog tick like the sweep above.
     merged_work_result="$(node "${PACKAGE_SRC_DIR}/merged-work-sweep.js" 2>>"${HOME_LOGS}/merged-work-sweep.log")"
     printf '[watchdog] merged-work-sweep: %s\n' "$merged_work_result" >&2
+
+    # Queue snapshot tick: rebuild the shared /dev/shm snapshot so other daemons can read
+    # it via readQueueSnapshot() (which honors QUEUE_SNAPSHOT_FILE). Skipped when no
+    # snapshot file path was configured (--snapshot-file CLI flag or QUEUE_SNAPSHOT_FILE
+    # env var), since the default tmpfs path is only useful when a consumer expects it.
+    if [[ -n "$SNAPSHOT_FILE" ]]; then
+      snapshot_result="$(QUEUE_SNAPSHOT_FILE="$SNAPSHOT_FILE" node "${PACKAGE_SRC_DIR}/queue-cache.js" buildQueueSnapshot "${AGENT_MANAGER_REPO_ROOT}" 2>>"${HOME_LOGS}/queue-snapshot.log")"
+      printf '[watchdog] queue-snapshot: %s\n' "$snapshot_result" >&2
+    fi
 
     # Drift-scan (Brain Dump #83: "Reasoning tasks aren't represented in the job list...
     # make sure task visibility is a consistent part of the pipeline"). drift-scan.js
@@ -528,7 +602,28 @@ while :; do
       echo $! > "$GRAPH_BUILD_LOCK"
     fi
 
-    # Idle-pool borrowing (docs/idle-pool-borrowing.md, step 4): housekeeping for the pool projects lanes borrow work from -- retries, hub
+    # Pool sweep (2026-10-30, HUB0295): runs branch-defect-readmit-sweep.js and branch-conflict-readmit-sweep.js for each pool project, but only for a project whose inputs changed
+    # (src/sweep-gate.js; fails open; AGENT_MANAGER_SWEEP_GATE=off restores every-tick runs). redo-supersede-sweep.js is global and runs once per tick above. Kill switch AGENT_MANAGER_SWEEP_POOL=false.
+    AGENT_MANAGER_SWEEP_POOL=${AGENT_MANAGER_SWEEP_POOL:=true}
+    if [[ "${AGENT_MANAGER_SWEEP_POOL}" == "true" ]]; then
+      while IFS= read -r _pipe; do
+        [[ -n "$_pipe" ]] || continue
+        if sweep_gate_skips project "$_pipe"; then continue; fi
+        _env_args="$(node "${PACKAGE_SRC_DIR}/pool-projects.js" --env-args "$_pipe" apply 2>/dev/null)" || true
+        if [[ -z "$_env_args" ]]; then
+          printf '[watchdog] skipping pool project %s -- no env args returned\n' "$_pipe" >&2
+          continue
+        fi
+        for _sweep in branch-defect-readmit-sweep.js branch-conflict-readmit-sweep.js; do
+          _sweep_output="$(env $_env_args node "${PACKAGE_SRC_DIR}/${_sweep}" 2>/dev/null)" || true
+          echo "$_sweep_output" | grep -E '^(checked|observed|requeued|superseded)' | while IFS= read -r _line; do
+            printf '[watchdog] %s %s %s\n' "$_pipe" "$_sweep" "$_line" >&2
+          done
+        done
+      done < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --all 2>/dev/null)
+    fi
+
+    # Idle-pool borrowing (docs/design-notes/idle-pool-borrowing.md, step 4): housekeeping for the pool projects lanes borrow work from -- retries, hub
     # reconciliation, triage -- which the sweeps above only do for the ACTIVE project. Runs in the BACKGROUND (a pool project's sweeps take
     # tens of seconds and must never delay this tick's daemon supervision), one run at a time (flock), and each project is due at most every
     # AGENT_MANAGER_POOL_SWEEP_INTERVAL_SECS (pool-sweeps.sh). Kill switch AGENT_MANAGER_POOL_BORROW=false.

@@ -22,6 +22,10 @@ an existing sweep). Hand-editing `queue/` or committing a fix straight to a stuc
 branch is the exception that needs a stated reason, not the default move. If no mechanism
 fits, the deliverable is a proposal for one — surface it, don't paper over it.
 
+## Filing friction tasks: premium at filing
+
+Friction tasks that block work are filed premium at filing, by the filing agent, without being asked. Blocking = a stage cannot complete (claim, lease, dependsOn, draft, review, apply, merge), a UI step cannot be done, or a task waits on the fix. Cosmetic/product-feedback friction stays non-premium and the report says which. A hub's premium does not reach its pieces yet (premium route per unfinished piece). Report lists each friction task with premium yes/no and a reason.
+
 ## Second principle: build for after-the-fact audit, not just correctness
 
 Grimmethy has said this directly, more than once: *"you know how much I love being able
@@ -150,6 +154,43 @@ each requeue was a pipeline mechanism or an operator/agent hand-fix, and
 escalation with no re-admission mechanism matching. The concept card's telemetry line and
 its timeline are the live scoreboard — a debt entry stops recurring once you build the
 missing deterministic recovery.
+
+## Fourth principle: triggers, not polls — announce the change, don't re-check on a timer
+
+Grimmethy's standing design rule, learned developing games (Grimmethy/Elementals: `GameEvents`,
+`TileSignalComponent`, `GameClockComponent`) and now written down as ADR-0024 with its language-neutral
+home in the private repo `Grimmethy/triggers` (`docs/PRINCIPLE.md`, `docs/PRIMITIVES.md`, `spec/`).
+Polling re-asks "did anything change?" on a timer, once per consumer per tick. Measured here on
+2026-10-31: 31 distinct `node` scripts per watchdog tick, a shared spinning disk at 100% busy on ~7 MB/s
+of tiny reads, and `liveSiblingsOnBranch` parsing every queue file once per candidate. The rules:
+
+- **The writer announces.** Whatever changes state emits a named, past-tense event (a verdict recorded,
+  a branch merged, a task blocked). Consumers do not scan for it.
+- **One authority per concern, and everyone routes through it.** Queue transitions and time are not
+  re-implemented per sweep.
+- **Register, catch up once, then react.** A new consumer evaluates current state once, then acts on events.
+- **Edge by default.** Fire on transitions; repeating while a condition holds is opt-in.
+- **One clock.** Periodic work registers an interval; do not add a new sleep loop or per-script timer.
+- **Keep a slow reconcile and count what it finds.** A correction means a producer forgot to emit — fix
+  the producer. Zero corrections for weeks is the evidence the events are complete.
+- **Handles and teardown.** Every registration can be released.
+
+Existing precedents to extend, not duplicate: `queue/side-findings-inbox` + `src/side-finding-sweep.js`,
+`queue/context-log-inbox` + `src/context-log-sweep.js`, and `src/queue-cache.js`.
+
+```
+# WRONG: every pool project, every tick, 1 + 3 node launches each (32 projects ~ 128 launches)
+for pipe in $(node src/pool-projects.js --all); do run the three sweeps; done
+
+# RIGHT (src/pool-sweep-gate.js arrives with HUB0295 piece 5): ask once which projects changed, sweep only those
+for pipe in $(node src/pool-sweep-gate.js --due); do run the three sweeps; done
+```
+
+**Before adding any sweep, tick, poll or timer** answer in the change description: which event would
+make it unnecessary and why it cannot be emitted; what one pass costs when nothing changed (measure it);
+whether it registers with the shared clock instead of owning a timer; what its reconcile is and what the
+reconcile counter says; and whether it is edge-triggered on purpose. An unmeasured idle cost is not an
+answer. Stage plan and open questions: `docs/adr/0024-triggers-not-polls.md`.
 
 ## Hub tasks: every sub-task must merge to `main` independently
 
@@ -370,7 +411,7 @@ The `observability_*`, `performance_*`, `function_length_*`, `arch_*` and `unuse
 task sources moved (2026-08-27) into the out-of-tree **agent-manager-hygiene** plugin,
 loaded via `AGENT_MANAGER_REGISTER_PATH` (comma-separated for more than one plugin;
 `src/config.js` `ensureRegistered()` `require()`s each once). The live `agent-manager.env`
-points it at `/media/wok/model-cache/agent-manager-hygiene/register.js`.
+points it at `/media/model-cache/github/agent-manager-hygiene/register.js`.
 
 - **`docs/PLUGIN_API.md` is the contract** for what a plugin may `require` from
   `agent-manager/src/*`. `src/plugin-api.test.js` fails in THIS repo's CI if one of those

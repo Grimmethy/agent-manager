@@ -29,12 +29,16 @@ _acquire_apply_lock()/_release_apply_lock() pair already used by the merge-branc
 endpoint, so this module never needs its own git-mutex logic.
 """
 import json
+import os
+import re
 import time
 import uuid
 from pathlib import Path
 
+import chat_card
 import claude_client
 import codebase_map_digest
+import context_log_retrieval
 import local_tool_client
 import model_stats_client
 import ollama_client
@@ -100,6 +104,10 @@ def _new_session(roots: list, instances_dir, provider: str, model: str, effort: 
         # plugin/project repos, all read/write. See app.py:_chat_roots().
         "roots": roots,
         "repoRoot": roots[0],
+        # mtimes (st_mtime_ns, one per registry file) of projects.json / plugins.json at the
+        # moment `roots` was last computed -- get_active_session() compares against these
+        # to decide whether to refresh session["roots"]. None = never stamped.
+        "rootsMtime": None,
         "instancesDir": str(instances_dir) if instances_dir else None,
         # Only meaningful for the Claude provider (claude_client.generate()'s own
         # `resume` param) -- the CLI's real session id, captured from the first reply and
@@ -116,23 +124,70 @@ def _new_session(roots: list, instances_dir, provider: str, model: str, effort: 
         # registry (app.py), NOT here -- an open file object isn't JSON-serializable and
         # wouldn't survive a process restart meaningfully anyway.
         "reserved": False,
+        # The GPU card (a lane id such as worker-3090) the owner picked for this session's local replies; None = the host lane. Each message
+        # re-resolves it (chat_card.py): if the Forge holds the picked card the reply moves to a free one.
+        "card": None,
     }
 
 
+def _roots_mtime(paths) -> list:
+    """One st_mtime_ns per path, None for a missing file -- never raises. A plain stat per
+    file, no directory scan."""
+    mtimes = []
+    for p in paths:
+        try:
+            mtimes.append(os.stat(p).st_mtime_ns)
+        except OSError:
+            mtimes.append(None)
+    return mtimes
+
+
+def _refresh_roots(session: dict, roots: list, registry_paths) -> bool:
+    """Overwrite session['roots'] with the caller's freshly computed `roots` (app.py's
+    _chat_roots()) when the registry files changed since the last stamp. repoRoot is never
+    touched -- it stays stable for the session. With registry_paths=None there is no mtime
+    to compare, so the roots list itself is compared instead. Returns True if changed."""
+    fresh = [r for r in (roots or []) if r]
+    if not fresh:
+        return False
+    if registry_paths is None:
+        if session.get("roots") == fresh:
+            return False
+        session["roots"] = fresh
+        return True
+    mtime = _roots_mtime(registry_paths)
+    if session.get("rootsMtime") is not None and session.get("rootsMtime") == mtime:
+        return False
+    session["roots"] = fresh
+    session["rootsMtime"] = mtime
+    return True
+
+
 def get_active_session(storage_dir: Path, roots: list, instances_dir=None,
-                        provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None) -> dict:
+                        provider: str = PROVIDER_LOCAL, model: str = None, effort: str = None,
+                        registry_paths=None) -> dict:
     """The single ongoing conversation for this project (Brain Dump #153: "hideable panel
     on the right side of the app" -- global, not per-subject like Discuss). Creates one if
     none is currently active. Does NOT re-resolve provider/model/effort for an existing
     active session -- same "fixed for the session's lifetime" reasoning discuss_sessions.py
     already documents (a mid-conversation provider switch would hand the new
-    provider/model a transcript or --resume history it didn't generate)."""
+    provider/model a transcript or --resume history it didn't generate).
+
+    Roots are refreshed on EVERY call, not on a timer: when `registry_paths` (the caller's
+    projects.json / plugins.json paths) is given, their mtimes are stat'd and session['roots']
+    is overwritten from the caller's fresh `roots` only if one of them changed (tracked in
+    session['rootsMtime']). session['repoRoot'] stays stable across refreshes."""
     sessions = _read_sessions(storage_dir)
     active = [s for s in sessions.values() if s.get("status") == "active"]
     if active:
         active.sort(key=lambda s: s.get("startedAt") or "", reverse=True)
-        return active[0]
+        session = active[0]
+        if _refresh_roots(session, roots, registry_paths):
+            _write_sessions(storage_dir, sessions)
+        return session
     session = _new_session(roots, instances_dir, provider, model, effort)
+    if registry_paths is not None:
+        session["rootsMtime"] = _roots_mtime(registry_paths)
     sessions[session["id"]] = session
     _write_sessions(storage_dir, sessions)
     return session
@@ -178,7 +233,7 @@ def _read_agents_md(session: dict) -> str:
     roots = session.get("roots") or [session["repoRoot"]]
     try:
         content = (Path(roots[0]) / "AGENTS.md").read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return ""
     if not content:
         return ""
@@ -294,6 +349,35 @@ _LOCAL_SYSTEM_PROMPT = (
 )
 
 
+# TASK-REF as written by Chat (see src/context-log-marker.js TASK_REF_LINE_RE). The line
+# must start with TASK-REF: (optionally indented); the value is the rest of that line.
+_TASK_REF_RE = re.compile(r"(?:^|\n)[ \t]*TASK-REF:[ \t]*(.+)$", re.M)
+_PLACEHOLDER_TASK_REF = "<task id>"
+
+
+def _latest_task_ref(session: dict):
+    """The most recent TASK-REF stated in the session transcript, or None."""
+    for turn in reversed(session.get("transcript") or []):
+        for raw in reversed(_TASK_REF_RE.findall(turn.get("text") or "")):
+            ref = raw.strip()
+            if ref and ref != _PLACEHOLDER_TASK_REF:
+                return ref
+    return None
+
+
+def _context_log_block(session: dict) -> str:
+    """Context-log block for the session's latest task ref, or "" (no ref, no logs, or no
+    SECOND_BRAIN_DIR configured). The block already ends with its audit line."""
+    task_ref = _latest_task_ref(session)
+    if not task_ref:
+        return ""
+    second_brain = os.environ.get("SECOND_BRAIN_DIR", "")
+    project = Path(session["repoRoot"]).name
+    block_text, _injected = context_log_retrieval.retrieve_context_logs(
+        second_brain, project=project, task_ref=task_ref)
+    return block_text
+
+
 def _local_system_prompt(session: dict) -> str:
     prompt = _LOCAL_SYSTEM_PROMPT + "\n\nAccessible repos:\n" + _roots_blurb(session)
     agents_md = _read_agents_md(session)
@@ -302,6 +386,9 @@ def _local_system_prompt(session: dict) -> str:
     map_digest = _codebase_map_digest(session)
     if map_digest:
         prompt += "\n\n---\n\n" + map_digest
+    context_block = _context_log_block(session)
+    if context_block:
+        prompt += "\n\n---\n\n" + context_block
     return prompt
 
 
@@ -329,17 +416,23 @@ def _stream_local(session: dict, message: str):
     started = time.time()
     messages = _build_local_messages(session, message)
     roots = session.get("roots") or [session["repoRoot"]]
+    card = chat_card.resolve_chat_card(session.get("card"))
+    if card.get("blocked"):
+        yield card.get("note") or "No GPU card is free for chat right now."
+        return
+    if card.get("note"):
+        yield f"*({card['note']})*\n\n"
     result = None
     for event in local_tool_client.stream_plan_with_tools(
         messages=messages, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
         primary_root=roots[0], extra_roots=roots[1:], force_summary_on_cap=True,
-        allow_amplification=True,
+        allow_amplification=True, card_env=card.get("env"),
     ):
         if event.get("type") == "chunk":
             yield event["text"]
         elif event.get("type") == "final":
             result = event
-    model_stats_client.record_call("chat-session", ollama_client.MODEL, int((time.time() - started) * 1000),
+    model_stats_client.record_call("chat-session", (card.get("env") or {}).get("LOCAL_MODEL") or ollama_client.MODEL, int((time.time() - started) * 1000),
                                     stage="chat", result=result or {}, source="chat")
     # 2026-09-05, Grimmethy: force_summary_on_cap=True is now passed above, so both a
     # turn-cap hit AND a context-budget hit (see local-tool-client.js's own
@@ -448,6 +541,19 @@ def set_reserved(storage_dir: Path, session_id: str, reserved: bool):
     if not session:
         return None
     session["reserved"] = reserved
+    sessions[session_id] = session
+    _write_sessions(storage_dir, sessions)
+    return session
+
+
+def set_card(storage_dir: Path, session_id: str, card):
+    """Persist the owner's card pick for this session (a lane id, or None/'' for the host lane). Validation is the resolver's job at send time:
+    an unknown id is reported to the user on the next message instead of being silently dropped here."""
+    sessions = _read_sessions(storage_dir)
+    session = sessions.get(session_id)
+    if not session:
+        return None
+    session["card"] = (str(card).strip() or None) if card else None
     sessions[session_id] = session
     _write_sessions(storage_dir, sessions)
     return session

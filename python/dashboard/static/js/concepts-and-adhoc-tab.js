@@ -33,23 +33,30 @@ async function renderAdhocTasksTab() {
       <td>${escapeHtml(when)}</td>
     </tr>`;
   }).join('');
-  const footer = `<div class="meta" style="padding:10px 4px">Showing ${tasks.length} adhoc task${tasks.length === 1 ? '' : 's'}.</div>`;
+  const footer = `<div class="meta" style="padding:12px 4px">Showing ${tasks.length} adhoc task${tasks.length === 1 ? '' : 's'}.</div>`;
   main.innerHTML = `<table><thead><tr><th>Title</th><th>State</th><th>Created</th></tr></thead><tbody>${rows}</tbody></table>${footer}`;
   main.querySelectorAll('tr.clickable').forEach(row => {
     row.onclick = () => openTaskAnywhere(row.dataset.id);
   });
 }
 
+// Per-concept special panels, keyed by concept ID. Concepts not listed here get no special panel.
+const CONCEPT_CARD_CONFIG = {
+  'concept-ghost-in-the-machine-0dbeea': { ghostTelemetry: true },
+  'concept-adhoc-task-lifecycle-64935e': { lifecycleFlow: true },
+};
+
 function renderConceptCard(concept) {
+  const cardConfig = CONCEPT_CARD_CONFIG[concept.id] || {};
   const isStable = CONCEPT_STABLE_STATUSES.has(concept.status);
   const statusBadge = `<span class="badge ${isStable ? 'ok' : 'idle'}">${escapeHtml(concept.status || 'open')}</span>`;
   const researchChip = concept.researchForkCount > 0
-    ? `<span title="Last researched ${concept.lastResearchedAt ? escapeAttr(new Date(concept.lastResearchedAt).toLocaleString()) : 'unknown'}" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--muted);border-radius:3px;color:var(--muted);font-size:11px">🔬 researched ${concept.researchForkCount}×</span>`
+    ? `<span title="Last researched ${concept.lastResearchedAt ? escapeAttr(new Date(concept.lastResearchedAt).toLocaleString()) : 'unknown'}" class="chip">🔬 researched ${concept.researchForkCount}×</span>`
     : '';
   const scratch = concept.builtFromScratchCount || 0;
   const adapted = concept.adaptedFromResourceCount || 0;
   const buildChip = (scratch + adapted) > 0
-    ? `<span title="Self-reported by the implementing model when it finishes concept-tagged work -- NOT verified against real diffs, treat as a rough signal only" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--warn);border-radius:3px;color:var(--warn);font-size:11px">🔨 ${scratch} scratch / 🔗 ${adapted} adapted (unverified)</span>`
+    ? `<span title="Self-reported by the implementing model when it finishes concept-tagged work -- NOT verified against real diffs, treat as a rough signal only" class="chip chip-warn">🔨 ${scratch} scratch / 🔗 ${adapted} adapted (unverified)</span>`
     : '';
   // linkedTaskCount (2026-09-06): a deterministic backfill match (a done task's own
   // title/rawText literally named this concept) -- see src/concept-tally-backfill.js.
@@ -57,7 +64,7 @@ function renderConceptCard(concept) {
   // exact phrase match), not a self-report, so it earns a plain accent tone instead of
   // the warn-colored "unverified" styling.
   const linkedChip = concept.linkedTaskCount > 0
-    ? `<span title="Done tasks whose own title or text named this concept by name -- a deterministic match, not self-reported" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--accent);border-radius:3px;color:var(--accent);font-size:11px">📎 ${concept.linkedTaskCount} linked task${concept.linkedTaskCount === 1 ? '' : 's'}</span>`
+    ? `<span title="Done tasks whose own title or text named this concept by name -- a deterministic match, not self-reported" class="chip chip-accent">📎 ${concept.linkedTaskCount} linked task${concept.linkedTaskCount === 1 ? '' : 's'}</span>`
     : '';
   const shelveNote = concept.status === 'shelved'
     ? `<div class="row meta" style="margin-top:4px"><span>⏸ Shelved: ${escapeHtml(concept.shelvedReason || '')}${concept.revisitCondition ? ` — revisit when: ${escapeHtml(concept.revisitCondition)}` : ''}</span></div>`
@@ -78,7 +85,7 @@ function renderConceptCard(concept) {
   // clicked Requeue) vs. mechanism recoveries (a watchdog sweep, no one in the loop),
   // plus the count of failure classes that currently have NO deterministic recovery
   // (Part B's ghost-debt register). Lazily hydrated in renderConceptsTab.
-  const ghostPanel = concept.id === 'concept-ghost-in-the-machine-0dbeea'
+  const ghostPanel = cardConfig.ghostTelemetry
     ? `<div class="ghost-telemetry meta" data-ghost-telemetry-for="${escapeAttr(concept.id)}" style="margin-top:6px">Loading requeue telemetry…</div>`
     : '';
   // Adhoc Task Lifecycle (2026-09-27, brain-dump bd-1790466365924): same hardcoded-id
@@ -99,10 +106,10 @@ function renderConceptCard(concept) {
     { label: 'applying', detail: 'apply-task.js: applyTask() → real branch/commit' },
     { label: 'done / blocked', detail: 'status: done (mergedAt set) or blocked (blockedReason set)' },
   ];
-  const lifecyclePanel = concept.id === 'concept-adhoc-task-lifecycle-64935e'
-    ? `<div class="meta" style="margin-top:6px;display:flex;flex-wrap:wrap;align-items:center;gap:4px">
+  const lifecyclePanel = cardConfig.lifecycleFlow
+    ? `<div class="meta" style="margin-top:8px;display:flex;flex-wrap:wrap;align-items:center;gap:4px">
         ${LIFECYCLE_STAGES.map((s, i) => `
-          <span style="display:inline-block;border:1px solid var(--muted);border-radius:4px;padding:4px 8px;font-size:11px;line-height:1.3">
+          <span style="display:inline-block;border:1px solid var(--muted);border-radius:4px;padding:4px 8px;font-size:12px;line-height:1.3">
             <strong>${escapeHtml(s.label)}</strong><br>${escapeHtml(s.detail)}
           </span>
           ${i < LIFECYCLE_STAGES.length - 1 ? '<span style="color:var(--muted)">→</span>' : ''}

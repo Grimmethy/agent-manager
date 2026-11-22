@@ -25,4 +25,19 @@ function p40OllamaLockKey(env = process.env) {
   return env.AGENT_MANAGER_P40_OLLAMA_URL ? ollamaLockKey(env.AGENT_MANAGER_P40_OLLAMA_URL) : null;
 }
 
-module.exports = { ollamaLockKey, localOllamaLockKey, p40OllamaLockKey };
+// Endpoint keys of every lane that is NOT the host GPU's -- the P40 and any lanes-registry lane (src/lanes.js). The interactive chat takes over
+// the HOST GPU only (2026-09-21, "only take over the 3090. P40 should remain in action"), so its `--local` key must never resolve to one of
+// these. Replaces the P40-only check now that lanes are data (2026-10-17); falls back to the P40 key if lanes.js cannot be loaded.
+function remoteLaneLockKeys(env = process.env) {
+  const keys = [];
+  try {
+    for (const l of require('../lanes.js').getLanes(env)) if (!l.local && l.env && l.env.OLLAMA_URL) keys.push(ollamaLockKey(l.env.OLLAMA_URL));
+  } catch { /* lanes.js unreadable: the P40 key below is still enforced */ }
+  // Always also the P40 URL on its own: the old guard refused it whenever AGENT_MANAGER_P40_OLLAMA_URL was set, even if the P40 lane
+  // itself was incomplete (no model) and so absent from getLanes(). A safety check must not get weaker because a lane is half-configured.
+  const p40 = p40OllamaLockKey(env);
+  if (p40 && !keys.includes(p40)) keys.unshift(p40);
+  return keys;
+}
+
+module.exports = { ollamaLockKey, localOllamaLockKey, p40OllamaLockKey, remoteLaneLockKeys };

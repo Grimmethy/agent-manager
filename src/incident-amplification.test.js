@@ -1,5 +1,10 @@
 'use strict';
 
+// getConfig() throws without AGENT_MANAGER_REPO_ROOT (it comes from agent-manager.env on a live host), and
+// grepCodebase swallows that into zero matches -- so these tests only passed in a shell that happened to export
+// it. Default it here (never overriding a real value) so they are hermetic.
+process.env.AGENT_MANAGER_REPO_ROOT = process.env.AGENT_MANAGER_REPO_ROOT || require('path').join(__dirname, '..');
+
 // Exercises the real grepCodebase() and writeSideFindingInbox() -- no mocking the search
 // primitive or the filer itself, matching this session's own "exercise the real
 // db-backed module" convention.

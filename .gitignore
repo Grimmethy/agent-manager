@@ -2,7 +2,9 @@ node_modules/
 *.log
 agent-manager.env
 plugins.json
+lanes.json
 *.bak
+*.bak-*
 .venv
 .venv-broken-*/
 python/dashboard/project_cache/
@@ -14,6 +16,8 @@ __pycache__/
 # project it's pointed at, not source.
 instances/
 queue/
+# The ADR-0024 queue-events journal (runtime state: journal, read positions, reconcile counter), never committed.
+queue-events/
 graphify-out/
 model-stats.db
 hardware-stats.db
@@ -83,3 +87,6 @@ reclaim-log.jsonl
 # still written locally (apply-task.js/task-log-store.js unchanged otherwise) for the
 # user's own reference, just never staged/committed/pushed.
 task-logs/
+
+# replay lab output (src/replay-lab.js)
+replay-reports/

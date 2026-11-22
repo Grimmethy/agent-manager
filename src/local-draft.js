@@ -40,7 +40,7 @@ const path = require('path');
 const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt } = require('./prompts.js');
 const { buildPlanGrounding } = require('./plan-grounding.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
-const { resolveAcceptanceCriteria } = require('./acceptance-criteria.js');
+const { resolveAcceptanceCriteria, parseCriteriaBlock } = require('./acceptance-criteria.js');
 const { filterCriteriaForSandbox } = require('./lib/draft-sandbox.js');
 const { runOrientPass } = require('./orient-pass.js');
 const { runPlanCritique } = require('./plan-critique.js');
@@ -55,8 +55,10 @@ const {
 } = require('./draft-attempt-record.js');
 const { appendTierWorkLog, pruneWorkLogs } = require('./work-log.js');
 const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
+const { isForgePause } = require('./gpu-guard.js');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { missingFileCheck } = require('./draft-file-guard.js');
+const { planImportBindingProblem } = require('./adhoc-diff-sanity.js');
 const { planTargetGuard } = require('./plan-target-guard.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
@@ -64,9 +66,12 @@ const { parseClarificationOptions } = require('./agentic-draft-common.js');
 const { resolveGroundingRef, readFileAtRef, resolveAtRef } = require('./stacked-grounding.js');
 const { checkDraft, checkCitationsAgainstHarnessFiles } = require('./fact-checker.js');
 const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.js');
+const { checkConflict } = require('./conflict-check.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
+const { getScriptHandler } = require('./script-handler-registry.js');
 const { getPreDispatchGate } = require('./deterministic-recheck-registry.js');
+const { buildGateFalsePositiveDraft } = require('./lib/gate-verdict.js');
 const { selectAbModel } = require('./ab-model-select.js');
 const { resolveStrategy } = require('./model-strategies.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
@@ -76,6 +81,8 @@ const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
 const { postJson } = require('./ollama-http.js');
 const { checkOllamaReachable } = require('./ollama-health.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { recordAttempt: recordLedgerAttempt } = require('./capability-ledger.js');
+const { recordAvoidedLane } = require('./premium-rotation.js');
 const { PER_CALL_TIMEOUT_CEILING_MS } = require('./local-client.js');
 const { getModelProfile } = require('./model-profile-registry.js');
 const { localOllamaLockKey, writeTaskJson, researchClaudeStatus, isResearchDomainTask, draftDoneDetail, concludeDraft } = require('./lib/draft-lifecycle.js');
@@ -87,6 +94,69 @@ const { canonicalizeEdits } = require('./lib/find-canonicalize.js');
 const { resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResearchBranch, runUiVisibilityFastpath } = require('./lib/draft-context.js');
 const { computePlanNumPredict, tryDeterministicScriptExtractEdit, tryDeterministicOnePassDecompose, tryDeterministicNodeModuleDecompose, tryDeterministicBlueprintDecompose, tryDeterministicLiteralEdit } = require('./lib/deterministic-extract.js');
 const { runCritiqueAndRevision, computeImplementBudget, callImplementModel } = require('./lib/implement-critique.js');
+
+// 2026-11-04, this task: conflict check runs before implement to catch file overlap with
+// other open branches EARLY (the dashboard's _check_conflicts only runs during review, too
+// late). If a conflict is detected, the draft is blocked with a needs-human-decision verdict
+// so a human can decide which branch to keep. This prevents the class of 13 branches that all
+// failed with "it conflicts with # other open branch(#)" because the check ran after work was
+// already done.
+async function preFlightConflictCheck(task, { pipelineDir, repoRoot }) {
+  if (!pipelineDir || !repoRoot) return null;
+  try {
+    const proposedFiles = task.promptContext?.proposeFiles || task.promptContext?.files || [];
+    if (!proposedFiles.length) return null;
+    
+    const openBranches = [];
+    const pendingDir = path.join(pipelineDir, 'queue', 'pending');
+    if (fs.existsSync(pendingDir)) {
+      const files = fs.readdirSync(pendingDir).filter(f => f.endsWith('.json'));
+      for (const file of files) {
+        if (file === `${task.id}.json`) continue; // Skip self
+        try {
+          const otherTask = JSON.parse(fs.readFileSync(path.join(pendingDir, file), 'utf8'));
+          if (otherTask.id?.startsWith('adhoc/triage-queue')) continue;
+          const match = otherTask.id?.match(/^agent\/(.+)$/);
+          if (match) {
+            const branch = match[1];
+            const r = await new Promise((resolve) => {
+              const { execFileSync } = require('child_process');
+              try {
+                const out = execFileSync('git', ['diff', '--name-only', 'origin/main', `origin/${branch}`], { cwd: repoRoot, encoding: 'utf8', env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, timeout: 30_000 });
+                resolve({ files: out.split('\n').map(l => l.trim()).filter(Boolean) });
+              } catch (e) {
+                resolve({ files: [] });
+              }
+            });
+            openBranches.push({ branch, files: r.files });
+          }
+        } catch (e) {
+          // Skip unreadable
+        }
+      }
+    }
+    
+    const conflicts = [];
+    for (const open of openBranches) {
+      const overlap = proposedFiles.filter(pf => open.files.includes(pf));
+      if (overlap.length) {
+        conflicts.push({ branch: open.branch, files: overlap });
+      }
+    }
+    
+    if (conflicts.length) {
+      return {
+        verdict: 'needs-human-decision',
+        reason: `it conflicts with ${conflicts.length} other open branch(es) that touch the same files (${conflicts.map(c => c.branch).join(', ')}); keep one`,
+        conflicts,
+      };
+    }
+  } catch (e) {
+    // Best-effort: a conflict check failure must never break the draft
+    console.error(`Conflict check failed: ${e.message}`);
+  }
+  return null;
+}
 
 // 2026-09-08, Grimmethy: "fix worker-1" -- see gpu-arbiter.js's own header for the
 // incident (worker-1's qwen2.5:3b starved into repeated hard OLLAMA_TIMEOUTs by
@@ -106,6 +176,10 @@ const { runCritiqueAndRevision, computeImplementBudget, callImplementModel } = r
 // currently-succeeding first try never regresses; more sampling diversity on a call that
 // already failed can only help, never hurt.
 const RETRY_TEMPERATURE = 1.0;
+
+// 2026-11-04: max retries for a truncated split-mode implement response before blocking the task.
+// Configurable for tuning; default 3 matches the task's acceptance criterion.
+const SPLIT_TRUNCATION_MAX_RETRIES = 3;
 
 // Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
 // plugin sources (agent-manager-hygiene). local-draft.js's draft path calls
@@ -353,6 +427,50 @@ function findUnverifiedEdit(implementResponse, fetchedFiles, { anchorSnippet = '
 // `invalid: true` path below) instead of silently masquerading as plain prose.
 const SPLIT_MODE_MARKER_RE = /"mode"\s*:\s*"split"/;
 
+// 2026-11-04: recover complete sub-candidates from a truncated split response (arch-review-ac-70, arch-review-ac-395).
+// When the model's output is cut off mid-JSON, scan for complete `{...}` blocks in the candidates array and return them
+// as `{ truncated: true, candidates: [...], reason: '...' }`. The caller uses recovered candidates directly (no retry)
+// and drops the incomplete trailing one. Returns `{ invalid: true, reason: '...' }` only when no complete sub-candidate
+// can be recovered -- that triggers a retry with reduced split size.
+function extractCompleteSubCandidatesFromTruncated(trimmed) {
+  const candidatesMatch = trimmed.match(/"candidates"\s*:\s*\[/);
+  if (!candidatesMatch) return null;
+  const arrStart = candidatesMatch.index + candidatesMatch[0].length;
+  let depth = 0;
+  let inString = false;
+  let stringEscape = false;
+  let candidateStart = -1;
+  const complete = [];
+  for (let i = arrStart; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (stringEscape) { stringEscape = false; continue; }
+    if (ch === '\\' && inString) { stringEscape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') {
+      if (depth === 0) candidateStart = i;
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && candidateStart !== -1) {
+        const candidateText = trimmed.slice(candidateStart, i + 1);
+        try {
+          const parsed = JSON.parse(candidateText);
+          if (parsed && typeof parsed === 'object' && typeof parsed.title === 'string' && parsed.title.trim()
+            && typeof parsed.problem === 'string' && parsed.problem.trim()
+            && typeof parsed.solution === 'string' && parsed.solution.trim()) {
+            complete.push(parsed);
+          }
+        } catch {
+          // Not valid JSON, skip
+        }
+        candidateStart = -1;
+      }
+    }
+  }
+  return complete.length > 0 ? complete : null;
+}
+
 function parseCandidateSplit(implementResponse) {
   const trimmed = (implementResponse || '').trim();
   if (!trimmed || trimmed === '""' || trimmed === "''") return null;
@@ -362,6 +480,11 @@ function parseCandidateSplit(implementResponse) {
     parsed = parseJsonMaybeFenced(trimmed);
   } catch {
     if (looksLikeSplitAttempt) {
+      // Try to recover complete sub-candidates from the truncated JSON
+      const recovered = extractCompleteSubCandidatesFromTruncated(trimmed);
+      if (recovered && recovered.length >= 1) {
+        return { truncated: true, candidates: recovered, reason: `Implement pass response was truncated mid-JSON (mode "split" detected) but ${recovered.length} complete sub-candidate(s) were recovered before the cut point. Using recovered candidates and dropping incomplete trailing ones.` };
+      }
       return { invalid: true, reason: 'Implement pass appears to have attempted mode "split" (the response contains "mode":"split") but the JSON is truncated or malformed and could not be parsed -- likely ran out of output budget mid-response. Retry with fewer/shorter sub-candidates, or increase the implement budget.' };
     }
     return null; // malformed JSON with no split marker is a separate, pre-existing failure mode -- not this check's job
@@ -390,7 +513,7 @@ function parseCandidateSplit(implementResponse) {
   });
 
   if (valid.length < 2) {
-    return { invalid: true, reason: `Implement pass said mode "split" but only ${valid.length} of ${raw.length} proposed sub-candidate(s) had a real title/problem/solution -- at least 2 well-formed sub-candidates are required` };
+    return { invalid: true, tooFew: true, usable: valid.length, proposed: raw.length, reason: `Implement pass said mode "split" but only ${valid.length} of ${raw.length} proposed sub-candidate(s) had a real title/problem/solution -- at least 2 well-formed sub-candidates are required` };
   }
 
   valid.forEach((c, finalIndex) => {
@@ -591,8 +714,30 @@ const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) 
 // degenerate planResult never reaches here -- the `!planResult.degenerate` in the re-roll
 // condition below stays as the unit-test contract that a degenerate input simply skips
 // the re-roll.
+// Plan-stage cap for silent-catch-block dismissals (see silent-catch-plan-cap.js). Only an
+// observability_review finding that the review already dismissed counts as an expected
+// dismissal; a bare silent-catch-block rule never does, so a genuine finding's plan is never
+// truncated. Logs 'plan-done-capped' only when the text actually shrinks.
+function derivePlanCapContext(task) {
+  const ruleId = (task.promptContext && (task.promptContext.originalRule || task.promptContext.rule)) || '';
+  const expectedDisposition = (task.source === 'observability_review' && task.reviewDisposition === 'dismissed') ? 'dismiss' : null;
+  return { ruleId, expectedDisposition };
+}
+
+// ruleId / expectedDisposition may be passed in (runPlanPass derives them once); when omitted they are derived from the task.
+function capPlanForTask(task, text, appendHistoryEvent, ruleIdArg, expectedArg) {
+  const derived = derivePlanCapContext(task);
+  const ruleId = ruleIdArg !== undefined ? ruleIdArg : derived.ruleId;
+  const expected = expectedArg !== undefined ? expectedArg : derived.expectedDisposition;
+  const capped = require('./silent-catch-plan-cap').capPlanStageOutput(text, ruleId, expected);
+  if (capped.length < text.length) {
+    appendHistoryEvent(task, 'plan-done-capped', `ruleId=${ruleId} expectedDisposition=${expected} originalLength=${text.length} cappedLength=${capped.length}`);
+  }
+  return capped;
+}
+
 async function attemptSeedReroll({
-  planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task,
+  planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task, ruleId, expectedDisposition,
 }) {
   let totalAttempts = planResult.attempts || 1;
   let reRolled = false;
@@ -615,14 +760,14 @@ async function attemptSeedReroll({
   if (stillThin && seedPlan) {
     // Thin rolls, but a real plan from a prior attempt exists -- reuse it verbatim rather
     // than hand the implement tiers a stub with no map.
-    task.planResponse = seedPlan;
+    task.planResponse = capPlanForTask(task, seedPlan, appendHistoryEvent, ruleId, expectedDisposition);
     task.lastGoodPlan = seedPlan;
     recordPlan(attempt, { text: seedPlan, attempts: totalAttempts, reRolled, seededFromPrior: true });
     appendHistoryEvent(task, 'plan-done', `${totalAttempts} attempt(s), reused a prior attempt's plan (${seedPlan.length} chars) after ${reRolled ? 'two thin rolls' : 'a thin roll'}`);
     return { planResult, totalAttempts, reRolled, stillThin, seededFromPrior: true };
   }
 
-  task.planResponse = planResult.response;
+  task.planResponse = capPlanForTask(task, planResult.response, appendHistoryEvent, ruleId, expectedDisposition);
   // Fix 2b: keep the last good plan outside draftAttempts (so record collapse can't drop
   // it -- it is the seed source for any later retry). Never store a thin one.
   if (!stillThin) task.lastGoodPlan = planResult.response;
@@ -720,7 +865,7 @@ async function executePlanRolls(callPlan, planLen, { substanceGated, recordModel
 // locals. Call order, arguments, and side effects are exactly what the inline code did;
 // returns { blocked: true, blockedReason, blockedStage: 'plan' } on a degenerate roll,
 // else undefined after handing the (possibly re-rolled) plan to attemptSeedReroll.
-async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding }) {
+async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding, ruleId, expectedDisposition }) {
   if (planResult.degenerate) {
     const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
     recordPlan(attempt, { degenerate: planResult.degenerate, attempts: planResult.attempts || 1 });
@@ -742,15 +887,132 @@ async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRo
   // value keeps the bookkeeping locals (totalAttempts, reRolled, stillThin,
   // seededFromPrior) available below.
   const seedReroll = await attemptSeedReroll({
-    planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task,
+    planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task, ruleId, expectedDisposition,
   });
   return { planResult: seedReroll.planResult, totalAttempts: seedReroll.totalAttempts, reRolled: seedReroll.reRolled, stillThin: seedReroll.stillThin, seededFromPrior: seedReroll.seededFromPrior };
 }
 
+// The acceptance-criteria step of runPlanPass, unchanged, as its own function so the plan-reuse path below applies exactly the same rules.
+function applyPlanAcceptanceCriteria(task) {
+  const ac = resolveAcceptanceCriteria(task);
+  // A plan-derived criterion that needs a JS toolchain (tsc, build, tests) is dropped when the draft sandbox will have none (lib/draft-sandbox.js):
+  // the draft cannot run it, and review rejects an unverified criterion (PF HUB0005-01).
+  const sandboxFiltered = filterCriteriaForSandbox({ criteria: ac.criteria, source: ac.source, repoRoot: getConfig().repoRoot });
+  if (sandboxFiltered.dropped.length) {
+    appendHistoryEvent(task, 'advisory', `dropped ${sandboxFiltered.dropped.length} plan-derived acceptance criterion(s) that need a JS toolchain the draft sandbox does not have: ${sandboxFiltered.dropped.map((c) => c.slice(0, 90)).join(' | ')}`);
+  }
+  task.acceptanceCriteria = sandboxFiltered.criteria;
+  task.acceptanceCriteriaSource = ac.source;
+}
+
+// Agentic-continuation plan reuse (2026-10-16): an adhoc task that already ran an agentic implement pass and was requeued as a continuation
+// (isAgenticContinuation, priorPartialDiff) keeps its plan (lastGoodPlan survives the requeue) and its orientNotes, yet the plan pass ran again
+// on every attempt -- and kept ending in 'Plan pass degenerate: truncated' (the extend-the-merged-doc task: six blocked attempts, ~33k-char prompt,
+// reasoning ate the whole numPredict). The plan already exists, so no orient pass and no plan call are made. Only a plan this task's own earlier
+// attempt wrote counts (bestPriorPlan), and only one that carries a CRITERIA: block, so the acceptance criteria the review holds the diff to
+// are still derivable. The plan-critique re-plan (_planCritiqueRevised) is a deliberate second plan and is never short-circuited. Returns true
+// when the plan was reused.
+function reusePriorPlanForContinuation(task, attempt) {
+  if (resolveSourceName(task) !== 'adhoc' || task.isAgenticContinuation !== true || task._planCritiqueRevised) return false;
+  const plan = bestPriorPlan(task);
+  if (!plan || parseCriteriaBlock(plan).length === 0) return false;
+  task.planResponse = capPlanForTask(task, plan, appendHistoryEvent);
+  task.lastGoodPlan = plan;
+  if (process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE !== 'false') applyPlanAcceptanceCriteria(task);
+  recordPlan(attempt, { text: plan, seededFromPrior: true });
+  appendHistoryEvent(task, 'plan-done', 'reused the prior plan for an agentic continuation -- no model call');
+  return true;
+}
+
+// Deterministic-checklist plan skip (2026-11-18): an adhoc task whose acceptance criteria
+// already arrive as a fully-specified checklist (>=3 items, each naming a repo path and a
+// checkable literal/command/exit code) does not need a plan model call -- the criteria ARE
+// the plan. Any item that fails the shape test keeps the plan pass running. The plan-critique
+// re-plan (_planCritiqueRevised) is a deliberate second plan and is never skipped.
+// Kill switch: AGENT_MANAGER_ADHOC_CHECKLIST_SKIP=false.
+const DETERMINISTIC_PATH_RE = /(?:^|[\s`(])[\w.-]+\/[\w./-]+|\b[\w-]+\.(?:js|ts|py|md|json|sh|yml|yaml)\b/;
+const DETERMINISTIC_CHECK_RE = /`|\bexits?\s+(?:0|\d+)\b|\bexit code\b|\bequals?\b|\bcontains?\b|\bis\s+\d{3}\b/i;
+
+function isDeterministicChecklist(task) {
+  if (process.env.AGENT_MANAGER_ADHOC_CHECKLIST_SKIP === 'false') return false;
+  if (resolveSourceName(task) !== 'adhoc' || task._planCritiqueRevised) return false;
+  const { criteria } = resolveAcceptanceCriteria(task);
+  if (criteria.length < 3) return false;
+  return criteria.every((c) => DETERMINISTIC_PATH_RE.test(c) && DETERMINISTIC_CHECK_RE.test(c));
+}
+
+// Returns true when the plan pass was skipped (no model call); the criteria become the plan.
+function skipPlanForDeterministicChecklist(task, attempt) {
+  if (!isDeterministicChecklist(task)) return false;
+  const { criteria } = resolveAcceptanceCriteria(task);
+  const text = `CRITERIA:\n${criteria.map((c) => `- ${c}`).join('\n')}`;
+  task.planResponse = capPlanForTask(task, text, appendHistoryEvent);
+  task.lastGoodPlan = text;
+  applyPlanAcceptanceCriteria(task);
+  recordPlan(attempt, { text, seededFromPrior: false });
+  appendHistoryEvent(task, 'plan-done', `skipped plan pass: deterministic checklist (${criteria.length} items) -- ${criteria.map((c) => c.slice(0, 80)).join(' | ')}`);
+  return true;
+}
+
+// Named-change plan skip: a lookup/substring check over the criteria text. A criterion has a
+// verified named target when it contains a repo path token that exists (fileExists lookup, which
+// also covers named test files) or a process.env.NAME expression. The plan is skipped only when
+// EVERY criterion has at least one verified target; any criterion without one (e.g. "update the
+// README usage section") keeps the plan pass running. Pure: fileExists is injected.
+// Kill switch: AGENT_MANAGER_ADHOC_NAMED_SKIP=false.
+const NAMED_PATH_RE = /(?:[\w.-]+\/)+[\w.-]+\.[A-Za-z]{1,5}\b/g;
+const NAMED_TEST_RE = /[\w./-]+\.test\.js/g;
+const NAMED_ENV_RE = /process\.env\.[A-Z][A-Z0-9_]+/g;
+
+function skipPlanForNamedChange(criteria, { fileExists } = {}) {
+  const list = Array.isArray(criteria) ? criteria.filter((c) => typeof c === 'string' && c.trim()) : [];
+  if (list.length === 0) return { skip: false, reason: 'no-criteria', targets: [], unmatched: [] };
+  const exists = typeof fileExists === 'function' ? fileExists : () => false;
+  const targets = [];
+  const unmatched = [];
+  for (const c of list) {
+    const found = [];
+    const pathTokens = new Set([...(c.match(NAMED_PATH_RE) || []), ...(c.match(NAMED_TEST_RE) || [])]);
+    for (const tok of pathTokens) { if (exists(tok)) found.push(tok); }
+    for (const env of (c.match(NAMED_ENV_RE) || [])) found.push(env);
+    if (found.length === 0) unmatched.push(c); else targets.push(...found);
+  }
+  if (unmatched.length) return { skip: false, reason: 'unnamed-criterion', targets, unmatched };
+  return { skip: true, reason: 'all-criteria-named', targets, unmatched };
+}
+
+// Returns true when the plan pass was skipped (no model call); the criteria become the plan.
+// Every decision is recorded as a plan-skip-named-change history event (reason, targets, unmatched).
+function applyNamedChangePlanSkip(task, attempt, fileExistsFn) {
+  if (process.env.AGENT_MANAGER_ADHOC_NAMED_SKIP === 'false') return false;
+  if (resolveSourceName(task) !== 'adhoc' || task._planCritiqueRevised) return false;
+  const { criteria } = resolveAcceptanceCriteria(task);
+  const repoRoot = getConfig().repoRoot;
+  const fileExists = fileExistsFn || ((p) => {
+    try { return fs.existsSync(require('path').join(repoRoot, p)); } catch (_) { return false; }
+  });
+  const d = skipPlanForNamedChange(criteria, { fileExists });
+  const evt = d.skip ? 'plan-skipped-named-change' : 'plan-not-skipped-named-change';
+  appendHistoryEvent(task, 'plan-skip-named-change', `${evt}: reason=${d.reason} targets=${JSON.stringify(d.targets)} unmatched=${JSON.stringify(d.unmatched.map((c) => c.slice(0, 120)))} criteria=${JSON.stringify(criteria.map((c) => c.slice(0, 120)))}`);
+  if (!d.skip) return false;
+  const text = `CRITERIA:\n${criteria.map((c) => `- ${c}`).join('\n')}`;
+  task.planResponse = capPlanForTask(task, text, appendHistoryEvent);
+  task.lastGoodPlan = text;
+  applyPlanAcceptanceCriteria(task);
+  recordPlan(attempt, { text, seededFromPrior: false });
+  appendHistoryEvent(task, 'plan-done', `skipped plan pass: named change (${criteria.length} items) -- ${d.targets.join(', ')}`);
+  return true;
+}
+
 async function runPlanPass(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
-  runOrientPassFn = runOrientPass, recordModelCall,
+  runOrientPassFn = runOrientPass, recordModelCall, fileExistsFn,
 }) {
+  if (reusePriorPlanForContinuation(task, attempt)) return { blocked: false };
+  if (skipPlanForDeterministicChecklist(task, attempt)) return { blocked: false };
+  if (applyNamedChangePlanSkip(task, attempt, fileExistsFn)) return { blocked: false };
+  // Plan-cap context derived once per pass and threaded to every plan write site below.
+  const { ruleId, expectedDisposition } = derivePlanCapContext(task);
   // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
   // trial lookup): researchPlanPrompt's own header used to call the research plan pass
   // "intentionally throwaway" and never gave it tool access -- so it could (and did)
@@ -812,9 +1074,11 @@ async function runPlanPass(task, {
   // read-only tools before planning. runOrientPass skips itself (0 GPU) when grounding
   // already covers the task or when there's nothing concrete to orient on. Kill switch
   // AGENT_MANAGER_ADHOC_ORIENT=false.
+  let orientResult = null;
   if (substanceGated && grounding && process.env.AGENT_MANAGER_ADHOC_ORIENT !== 'false') {
     try {
       const orient = await runOrientPassFn(task, { grounding, maybeLocked });
+      orientResult = orient;
       recordOrient(attempt, { turnsUsed: orient.turnsUsed, skipped: orient.skipped });
       appendHistoryEvent(task, 'orient-done', orient.skipped ? 'skipped (grep-covered)' : `${orient.turnsUsed} turn(s)`);
       if (!orient.skipped && orient.notes) {
@@ -823,7 +1087,21 @@ async function runPlanPass(task, {
         task.oriented = true;
       }
     } catch (e) {
+      if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
       appendHistoryEvent(task, 'advisory', `orient pass errored (non-fatal): ${String(e && e.message || e).slice(0, 160)}`);
+    }
+  }
+
+  // Context provenance stamp (2026-11-03): which grounding sources fed this draft.
+  // Pure module, deterministic, serialized size under 2048 bytes. Kill switch:
+  // AGENT_MANAGER_CONTEXT_PROVENANCE=false (default on). Failure is swallowed.
+  if (process.env.AGENT_MANAGER_CONTEXT_PROVENANCE !== 'false') {
+    try {
+      const { buildContextProvenance } = require('./lib/context-provenance.js');
+      // `grounding` is the OBJECT from buildPlanGrounding ({ text, anchorPaths, grepHits }); task._planGrounding is only its text (a string) and is deleted below.
+      task.contextProvenance = buildContextProvenance({ grounding, orient: orientResult, task });
+    } catch (e) {
+      console.warn(`[local-draft] context-provenance failed for ${task.id}: ${e.message}`);
     }
   }
 
@@ -854,28 +1132,48 @@ async function runPlanPass(task, {
   // into handlePlanResult above -- same behavior, same recordPlan/appendHistoryEvent
   // order, now a single named unit. Returns { blocked: ... } on a degenerate roll.
   const handled = await handlePlanResult(task, attempt, {
-    planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding,
+    planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding, ruleId, expectedDisposition,
   });
   if (handled && handled.blocked) return handled;
   planResult = handled.planResult;
   const stillThin = handled.stillThin;
   const seededFromPrior = handled.seededFromPrior;
 
+  // Import-binding cap (HUB0159 · 2/3): a plan whose wiring step shows no verbatim
+  // require/import line -- or that spreads bindings across multiple steps -- is a
+  // wiring plan, not a feature plan. Exactly ONE re-plan: re-roll at RETRY_TEMPERATURE
+  // and take that roll; if the second roll ALSO trips the cap, accept it. The guard on
+  // task._importBindingReplanned (set BEFORE the re-roll) means a legitimate plan is
+  // accepted on the second attempt and never dropped forever, and no second re-plan can
+  // ever happen even if runPlanPass re-enters for the same task. When the check finds
+  // no problem (null -- including every non-adhoc source), control falls through to the
+  // acceptance-criteria step below with no side effects.
+  const bindingProblem = planImportBindingProblem(task);
+  if (bindingProblem && !task._importBindingReplanned) {
+    task._importBindingReplanned = true;
+    appendHistoryEvent(task, 'plan-rejected', `import-binding cap: ${bindingProblem.code}`);
+    const startedAt = new Date().toISOString();
+    const startMs = Date.now();
+    const reRoll = await callPlan(RETRY_TEMPERATURE);
+    if (recordModelCall) {
+      recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: reRoll, source: task.source, stage: 'plan' });
+    }
+    // A degenerate re-roll carries no usable plan -- keep the previous one.
+    if (!reRoll.degenerate) {
+      task.planResponse = capPlanForTask(task, reRoll.response, appendHistoryEvent, ruleId, expectedDisposition);
+      // Keep the seed source (lastGoodPlan) consistent with the plan we now accept.
+      if (!planIsThin(reRoll.response)) task.lastGoodPlan = reRoll.response;
+    }
+    if (planImportBindingProblem(task)) {
+      appendHistoryEvent(task, 'plan-accepted-after-rejection', `import-binding cap: ${bindingProblem.code}`);
+    }
+  }
+
   // Acceptance criteria (2026-09-04): a "definition of done" the implement + review are
   // held to. From promptContext.acceptanceCriteria if the caller gave one, else the
   // trailing CRITERIA: block the plan pass was asked to write. Kill switch
   // AGENT_MANAGER_ADHOC_ACCEPTANCE=false.
-  if (substanceGated && process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE !== 'false') {
-    const ac = resolveAcceptanceCriteria(task);
-    // A plan-derived criterion that needs a JS toolchain (tsc, build, tests) is dropped when the draft sandbox will have none (lib/draft-sandbox.js):
-    // the draft cannot run it, and review rejects an unverified criterion (PF HUB0005-01).
-    const sandboxFiltered = filterCriteriaForSandbox({ criteria: ac.criteria, source: ac.source, repoRoot: getConfig().repoRoot });
-    if (sandboxFiltered.dropped.length) {
-      appendHistoryEvent(task, 'advisory', `dropped ${sandboxFiltered.dropped.length} plan-derived acceptance criterion(s) that need a JS toolchain the draft sandbox does not have: ${sandboxFiltered.dropped.map((c) => c.slice(0, 90)).join(' | ')}`);
-    }
-    task.acceptanceCriteria = sandboxFiltered.criteria;
-    task.acceptanceCriteriaSource = ac.source;
-  }
+  if (substanceGated && process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE !== 'false') applyPlanAcceptanceCriteria(task);
 
   // Harness-search grounding step (HUB0079 2/3): extracted from this function into
   // runHarnessSearchStep above -- same behavior, now unit-testable in isolation (which
@@ -1001,7 +1299,57 @@ function canonicalizeImplementFinds(task) {
 async function finalizeCandidateFulfillment(task, {
   maybeLocked, maybeLockedOn, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
 }, { implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt }) {
-  const split = parseCandidateSplit(task.implementResponse);
+  let split = parseCandidateSplit(task.implementResponse);
+  // Too-few-sub-candidates retry (class C, arch-review-ac-180): the model said mode "split" but gave ONE child that restated the whole
+  // single-file candidate (and itself spanned two files, against the prompt's own one-file-per-piece rule). That is a fixable answer, not
+  // a dead end -- ask once, naming the rule, before blocking for a human. Any later failure blocks exactly as before. The flag is not a
+  // clean-slate field, so a re-admitted task is not retried forever.
+  if (split && split.invalid && split.tooFew && !task.splitTooFewRetried) {
+    task.splitTooFewRetried = true;
+    const correction = `Your previous answer was mode "split" but only ${split.usable} of ${split.proposed} sub-candidate(s) were usable. A split needs AT LEAST 2 sub-candidates, each with a title, problem and solution, each touching exactly ONE file, listed in the order they must be applied (use dependsOn when a later piece needs an earlier one). For example: (1) create the new module, then (2) rewire the original file to use it. Do not put the whole job in a single sub-candidate.`;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(correction);
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: `${implPrompt}\n\n${correction}`, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
+    if (!retryResult.degenerate) {
+      task.implementResponse = retryResult.response;
+      split = parseCandidateSplit(task.implementResponse);
+    }
+    appendHistoryEvent(task, 'implement-retry', `split had ${split && split.tooFew ? split.usable : 'too few'} usable sub-candidate(s) -- retried once asking for at least 2, one file each${retryResult.degenerate ? ' (retry degenerate, original answer kept)' : ''}`);
+  }
+  // 2026-11-04: truncated split retry (arch-review-ac-70, arch-review-ac-395). When parseCandidateSplit returns
+  // { truncated: true, candidates } we use the recovered candidates directly (no retry needed). When it returns
+  // { invalid: true, reason } with a split marker but no recoverable candidates, retry with reduced split size
+  // (ask for fewer sub-candidates, each shorter) up to MAX_SPLIT_TRUNCATION_RETRIES times before blocking.
+  if (split && split.invalid && split.reason && split.reason.includes('truncated or malformed') && !task.splitTruncationRetried) {
+    const maxRetries = SPLIT_TRUNCATION_MAX_RETRIES;
+    let retryCount = 0;
+    while (retryCount < maxRetries) {
+      retryCount += 1;
+      task.splitTruncationRetried = retryCount;
+      const correction = `Your previous implement response was truncated mid-JSON (ran out of output budget) while attempting mode "split". This retry asks for FEWER sub-candidates (max 2, down from whatever you tried before) and SHORTER descriptions -- each sub-candidate must fit in under 200 words total (title + problem + solution + benefits combined). Do not list more than 2 sub-candidates. Keep each one concise. Example shape: {\"mode\":\"split\",\"candidates\":[{\"title\":\"Short title\",\"problem\":\"One sentence.\",\"solution\":\"One sentence.\",\"benefits\":\"One sentence.\"},{\"title\":\"Another short title\",\"problem\":\"One sentence.\",\"solution\":\"One sentence.\",\"benefits\":\"One sentence.\"}]}`;
+      task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+      task.priorRejectionFeedback.push(correction);
+      const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: `${implPrompt}\\n\\n${correction}`, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
+      if (!retryResult.degenerate) {
+        task.implementResponse = retryResult.response;
+        const retrySplit = parseCandidateSplit(task.implementResponse);
+        if (retrySplit && !retrySplit.invalid && !retrySplit.truncated) {
+          split = retrySplit;
+          break; // Success -- valid split recovered
+        }
+        if (retrySplit && retrySplit.truncated && retrySplit.candidates && retrySplit.candidates.length >= 1) {
+          split = retrySplit;
+          break; // Success -- recovered candidates
+        }
+        // Still truncated or invalid -- continue retrying
+      }
+    }
+    if (split && split.invalid) {
+      appendHistoryEvent(task, 'implement-retry', `split response truncated on all ${retryCount} retry attempt(s) -- no complete sub-candidates recoverable, giving up`);
+    } else if (split && (split.truncated || split.candidates)) {
+      appendHistoryEvent(task, 'implement-retry', `split response truncated but recovered ${split.candidates ? split.candidates.length : '?'} candidate(s) after ${retryCount} retry attempt(s)`);
+    }
+  }
   if (split) {
     const pc = task.promptContext || {};
     const atSplitCap = (pc.splitDepth || 0) >= 1;
@@ -1023,6 +1371,7 @@ async function finalizeCandidateFulfillment(task, {
       try {
         premise = await entry.premiseCheck(task, { call: resolvedLocalCall, maybeLockedOn });
       } catch (e) {
+        if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
         // AC-170: log the swallowed premiseCheck exception so operators can see it.
         // entry.name / entry.sourceName are not confirmed present; fall back to constructor name.
         console.error(`[premiseCheck] task=${task.id || task.name || 'unknown'} source=${entry.name || entry.sourceName || entry.constructor?.name || 'unknown-source'} error=${e?.message ?? String(e)}`, e?.stack);
@@ -1140,6 +1489,8 @@ async function finalizeCandidateFulfillment(task, {
 // draftModel, ...) and emits its own history events. Returns { done: true, result } when
 // a terminal outcome was reached (deterministic empty, degenerate block, or a candidate
 // split), else { done: false } so draftTask continues to critique + revision.
+const NO_REAL_FILE_STUB_RE = /^\s*no real file to adapt\.?\s*$/i;
+
 async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
 
@@ -1221,6 +1572,19 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
     }
   }
 
+  // Terminal no-op stub: archImportImplementPrompt tells the model to answer exactly "no real file to adapt" when no file in the
+  // harness Real matches list fits (the old "output the empty string" instruction was routinely ignored in favour of an invented
+  // file). Resolve it like the zero-hit skip above -- implementResponse '' so the emptyApproval source auto-approves -- before
+  // post-implement checks, critique or requeue can treat a compliant answer as a fabrication. Only sources that opt in via
+  // skipImplementWhenNoHarnessHits (arch_import) get this; any other response text is left untouched.
+  if (skipImplementOnNoHits && NO_REAL_FILE_STUB_RE.test(String(task.implementResponse || ''))) {
+    task.implementResponse = '';
+    recordImplement(attempt, { note: 'model answered the "no real file to adapt" stub' });
+    appendHistoryEvent(task, 'implement-done', 'model answered "no real file to adapt" -- terminal no-op, empty implementResponse, no critique or requeue');
+    concludeDraft(task);
+    return { done: true, result: { succeeded: true, blocked: false } };
+  }
+
   // A source can register a `postImplementCheck(task, implementResponse, {call,
   // maybeLockedOn})` -- generic, source-agnostic hook, same convention as premiseCheck
   // above but for the implement pass's OWN output rather than a candidate-fulfillment
@@ -1243,11 +1607,51 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   // "the CANDIDATE itself rests on a false premise" (retrying redrafts against the exact
   // same false premise every time -- structurally futile, not stochastically unlucky).
   const postImplementEntry = getRegisteredSource(resolveSourceName(task));
+  // Write-time size gate (ADR-0023 S1): a directToMain candidate write-up over the fulfillment limit would be appended and then skipped
+  // forever, so it is bounced here with its measured size. Unlike the grounding gate below, this does NOT set reviewInconclusive: the
+  // violation is deterministic, so it goes through the normal reject-retry loop (feedback injected, MAX_LOCAL_REJECT_RETRIES, then
+  // needs-clarification). A throwing gate is advisory and never blocks a draft.
+  let sizeGate = null;
+  try {
+    sizeGate = require('./candidate-size-gate.js').checkCandidateSize(task, task.implementResponse, { entry: postImplementEntry });
+  } catch (e) {
+    sizeGate = null;
+  }
+  if (sizeGate && sizeGate.verdict === 'oversized') {
+    const blockedReason = `Oversized candidate: ${String(sizeGate.reason || '(no detail)')}`.slice(0, 500);
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: blockedReason });
+    appendHistoryEvent(task, 'blocked', blockedReason);
+    task.blockedStage = 'review';
+    task.blockedReason = blockedReason;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(blockedReason);
+    return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
+  }
+  // Deterministic decompose structure gate (src/decompose-structure-check.js, no LLM call): a RESOLUTION: decompose draft without a valid
+  // JSON array of {title, rawText} sub-tasks is bounced here, before any review vote is spent on it. Deterministic defect, so like the size
+  // gate it goes through the normal reject-retry loop (no reviewInconclusive). A throwing gate is advisory and never blocks a draft.
+  let decomposeGate = null;
+  try {
+    decomposeGate = require('./decompose-structure-check.js').runDecomposeStructureCheck(task, task.implementResponse);
+  } catch (e) {
+    decomposeGate = null;
+  }
+  if (decomposeGate && decomposeGate.verdict === 'blocked') {
+    const blockedReason = String(decomposeGate.reason || '(no detail)').slice(0, 500);
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: blockedReason });
+    appendHistoryEvent(task, 'blocked', blockedReason);
+    task.blockedStage = 'review';
+    task.blockedReason = blockedReason;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(blockedReason);
+    return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
+  }
   if (postImplementEntry && typeof postImplementEntry.postImplementCheck === 'function') {
     let grounding;
     try {
       grounding = await postImplementEntry.postImplementCheck(task, task.implementResponse, { call: resolvedLocalCall, maybeLockedOn: ctx.maybeLockedOn });
     } catch (e) {
+      if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
       grounding = null; // advisory -- a throwing check must never block a real draft
     }
     if (grounding && (grounding.verdict === 'ungrounded' || grounding.verdict === 'invalid-premise')) {
@@ -1468,14 +1872,47 @@ function selectDraftStrategy(task, injectedFns = {}) {
 }
 
 async function draftTask(task, deps = {}) {
-  // Pre-dispatch gate: a deterministic 'archive' verdict ends the task here, before
-  // beginDraftAttempt/resolveDraftContext ever touch the task-source registry.
+  // Pre-dispatch gate: a deterministic 'archive' verdict ends the drafting here, before
+  // beginDraftAttempt/resolveDraftContext ever touch the task-source registry. It is expressed as a model-free
+  // FALSE POSITIVE draft (lib/gate-verdict.js) and concluded like any other draft, so the task goes to review and
+  // the source's own apply() records the scanner suppression and the dismissed disposition. It used to return
+  // {status:'archived'}, which nothing routed: the task reached review with an empty draft (39 stranded tasks).
   const gateHit = tryPreDispatchGate(task);
   if (gateHit) {
-    task.status = 'archived';
+    delete task.blockedStage;
+    delete task.blockedReason;
     task.preDispatchGate = { ruleId: gateHit.ruleId, verdict: 'archive', reason: gateHit.reason };
     appendHistoryEvent(task, 'pre-dispatch-gate', `rule "${gateHit.ruleId}" verdict 'archive' -- ${gateHit.reason}`);
-    return { status: 'archived', reason: gateHit.reason, succeeded: true, ruleId: gateHit.ruleId };
+    const draft = buildGateFalsePositiveDraft(gateHit, task);
+    task.planResponse = draft.plan;
+    task.lastGoodPlan = draft.plan;
+    task.implementResponse = draft.implementResponse;
+    task.critiqueOutcome = 'no-issues';
+    appendHistoryEvent(task, 'plan-done', 'pre-dispatch gate verdict, no model call');
+    appendHistoryEvent(task, 'implement-done', 'FALSE POSITIVE from the deterministic gate, no model call');
+    appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic verdict, nothing for a critique pass to add)');
+    concludeDraft(task);
+    return { succeeded: true, blocked: false, gateVerdict: 'false-positive', ruleId: gateHit.ruleId, reason: gateHit.reason };
+  }
+  // Script-handled source (src/script-handler-registry.js): the work is a script, not a diff. Run it, record its result on the task and finish as
+  // 'recorded' (no model call, no draft attempt). A throw falls into the worker's normal draft-failure accounting.
+  const scriptHandler = getScriptHandler(resolveSourceName(task));
+  if (scriptHandler) {
+    try {
+      const res = (await scriptHandler(task, {})) || {};
+      const outcome = String(res.outcome || 'done');
+      const summary = String(res.summary || '');
+      task.scriptResult = { outcome, summary, detail: res.detail === undefined ? null : res.detail, at: new Date().toISOString() };
+      task.terminalDisposition = 'recorded';
+      task.status = 'recorded';
+      appendHistoryEvent(task, 'script-handler-done', `${outcome}: ${summary}`.slice(0, 200));
+      appendHistoryEvent(task, 'recorded', 'script handler finished; no review needed');
+      return { succeeded: true, recorded: true };
+    } catch (err) {
+      const message = err && err.message ? err.message : String(err);
+      appendHistoryEvent(task, 'script-handler-failed', message.slice(0, 200));
+      return { succeeded: false, reason: `script handler failed: ${message}` };
+    }
   }
   // One append-only record per draftTask() run (draft-attempt-record.js). runDraftPasses
   // threads `attempt` through every pass and records into it as output is produced;
@@ -1491,6 +1928,21 @@ async function draftTask(task, deps = {}) {
   // (a blocked network_unavailable task must not consume a draft-attempt slot).
   if (!(result && result.blocked && result.blockedReason === 'network_unavailable')) {
     finalizeDraftAttempt(task, attempt, result, { emitHistory: appendHistoryEvent });
+    // Escalation: a timeout / degenerate / error on a lane with a bigger tier above it sends the retry up a tier (avoidLanes).
+    try {
+      const lanes = require('./lanes.js').getLanes();
+      if (require('./capability-routing.js').escalationLane(attempt, lanes)) {
+        const avoided = recordAvoidedLane(task, lanes.length, process.env, lanes);
+        if (avoided) appendHistoryEvent(task, 'lane-escalated', `${attempt.reason || attempt.blockedReason || attempt.outcome} on ${avoided}; a larger lane gets the retry`);
+      }
+    } catch (_) { /* escalation is best-effort */ }
+    // Capability ledger (docs/design-notes/capability-routing-and-benchmarking.md): one line per attempt, recording only.
+    const repoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+    if (repoRoot) {
+      let sourceName = null;
+      try { sourceName = resolveSourceName(task); } catch (_) { sourceName = task && task.source || null; }
+      recordLedgerAttempt(process.env.AGENT_MANAGER_PIPELINE_DIR || repoRoot, attempt, { source: sourceName, taskId: task && task.id, throughput: require('./local-throughput.js').takeAttemptThroughput() });
+    }
   }
   return result;
 }
@@ -1650,7 +2102,19 @@ async function runDraftPasses(task, attempt, {
         // A stacked task builds on its chain branch tip, not the shared checkout's working tree (null for every non-stacked task).
         const guardRef = resolveGroundingRef(task, repoRoot);
         const existsAtRef = guardRef ? (p) => !!resolveAtRef(repoRoot, guardRef, p, grepAllowedDirs) : null;
-        const preImplementGuard = planTargetGuard(task, task.planResponse, repoRoot, grepAllowedDirs, existsAtRef);
+        const revisionCount = typeof task.revisionCount === 'number' ? task.revisionCount : 0;
+        const preImplementGuard = planTargetGuard({ ...task, revisionCount }, task.planResponse, repoRoot, grepAllowedDirs, existsAtRef);
+        if (preImplementGuard.revise) {
+          task.revisionCount = preImplementGuard.revise.revisionCount;
+          appendHistoryEvent(task, 'revise', preImplementGuard.revise.feedback);
+          return {
+            succeeded: true,
+            blocked: false,
+            revise: true,
+            reviseFeedback: preImplementGuard.revise.feedback,
+            blockedStage: 'pre-implement',
+          };
+        }
         if (preImplementGuard.blocked) {
           appendHistoryEvent(task, 'blocked', preImplementGuard.reason);
           return {
@@ -1689,6 +2153,7 @@ async function runDraftPasses(task, attempt, {
             if (rePlan.blocked) return { succeeded: true, blocked: true, blockedReason: rePlan.blockedReason, blockedStage: rePlan.blockedStage };
           }
         } catch (e) {
+          if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
           appendHistoryEvent(task, 'advisory', `plan-critique errored (non-fatal): ${String(e && e.message || e).slice(0, 160)}`);
         }
       }
@@ -1830,7 +2295,7 @@ async function runDraftPasses(task, attempt, {
 
     return { succeeded: true, blocked: false };
   } catch (e) {
-    console.error('[local-draft] draftTask failed:', e.stack || String(e));
+    console.error('[local-draft] runDraftPasses failed:', e.stack || String(e));
     if (e.cause) console.error('[local-draft] draftTask cause:', e.cause.stack || String(e.cause));
     return { succeeded: false, reason: e.message };
   }
@@ -1849,6 +2314,63 @@ async function main() {
   } catch (e) {
     process.stdout.write(JSON.stringify({ succeeded: false, reason: `Could not read/parse task JSON: ${e.message}` }));
     return;
+  }
+
+  // 2026-11-04, this task: pre-flight conflict check. Run BEFORE draftTask to catch file
+  // overlap with other open branches EARLY. If a conflict is detected, block the draft with a
+  // needs-human-decision verdict so a human can decide which branch to keep. This prevents the
+  // class of 13 branches that all failed with "it conflicts with # other open branch(#)" because
+  // the check ran after work was already done.
+  const pipelineDir = path.dirname(path.dirname(taskPath)); // taskPath is <pipelineDir>/queue/<state>/<id>.json
+  const repoRoot = path.dirname(pipelineDir);
+  try {
+    const proposedFiles = task.promptContext?.proposeFiles || task.promptContext?.files || [];
+    if (proposedFiles.length) {
+      const openBranches = [];
+      const pendingDir = path.join(pipelineDir, 'queue', 'pending');
+      if (fs.existsSync(pendingDir)) {
+        const files = fs.readdirSync(pendingDir).filter(f => f.endsWith('.json'));
+        for (const file of files) {
+          if (file === `${task.id}.json`) continue; // Skip self
+          try {
+            const otherTask = JSON.parse(fs.readFileSync(path.join(pendingDir, file), 'utf8'));
+            if (otherTask.id?.startsWith('adhoc/triage-queue')) continue;
+            const match = otherTask.id?.match(/^agent\/(.+)$/);
+            if (match) {
+              const branch = match[1];
+              const { execFileSync } = require('child_process');
+              try {
+                const out = execFileSync('git', ['diff', '--name-only', 'origin/main', `origin/${branch}`], { cwd: repoRoot, encoding: 'utf8', env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, timeout: 30_000 });
+                openBranches.push({ branch, files: out.split('\n').map(l => l.trim()).filter(Boolean) });
+              } catch (e) {
+                // Skip branches that can't be checked
+              }
+            }
+          } catch (e) {
+            // Skip unreadable
+          }
+        }
+      }
+      
+      const conflicts = [];
+      for (const open of openBranches) {
+        const overlap = proposedFiles.filter(pf => open.files.includes(pf));
+        if (overlap.length) {
+          conflicts.push({ branch: open.branch, files: overlap });
+        }
+      }
+      
+      if (conflicts.length) {
+        const reason = `it conflicts with ${conflicts.length} other open branch(es) that touch the same files (${conflicts.map(c => c.branch).join(', ')}); keep one`;
+        task.needsHumanDecision = { verdict: 'needs-human-decision', reason, conflicts };
+        task.status = 'needs-clarification';
+        process.stdout.write(JSON.stringify({ succeeded: true, blocked: true, blockedReason: reason, blockedStage: 'pre-implement' }));
+        return;
+      }
+    }
+  } catch (e) {
+    // Best-effort: a conflict check failure must never break the draft
+    console.error(`Conflict check failed: ${e.message}`);
   }
 
   // Defense-in-depth (2026-09-07): scripts/local-worker.sh's own claim step already
@@ -2017,7 +2539,7 @@ function tryGroundingRefreshFallback(task) {
   }
 }
 
-module.exports = { draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
+module.exports = { skipPlanForNamedChange, applyNamedChangePlanSkip, reusePriorPlanForContinuation, isDeterministicChecklist, runPlanPass, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, SPLIT_TRUNCATION_MAX_RETRIES, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback, attemptSeedReroll };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on

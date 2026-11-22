@@ -94,6 +94,59 @@ def api_internal_chat_roots():
     return jsonify({"roots": _chat_roots()})
 
 
+@internal_chat_bp.route("/api/internal/chat/register-repo", methods=["POST"])
+def api_internal_chat_register_repo():
+    # Operator route: registers an EXISTING local checkout as a project. Body: {path, cloneUrl?}.
+    # cloneUrl is accepted but informational only -- this route NEVER runs git clone; a missing
+    # directory is refused so the operator clones it manually and retries.
+    # pipelineDir is a sibling <repoRoot>-pipeline directory, never inside the tracked repo.
+    _require_internal_token()
+    from app import _chat_roots, get_registry_warnings, record_project_registry_entry, validate_project_entry
+
+    body = request.get_json(silent=True) or {}
+    raw_path = (body.get("path") or "").strip()
+    if not raw_path:
+        abort(400, description="path is required")
+    repo_root = os.path.normpath(os.path.abspath(raw_path))
+    if not os.path.isdir(repo_root):
+        abort(400, description=f"repo directory does not exist: {repo_root} -- clone it manually, then retry (this route never runs git clone)")
+
+    pipeline_dir = repo_root + "-pipeline"
+    domains_path = os.path.join(pipeline_dir, "task-domains.json")
+    roots_before = _chat_roots()
+    os.makedirs(pipeline_dir, exist_ok=True)
+    if not os.path.exists(domains_path):
+        with open(domains_path, "w", encoding="utf-8"):
+            pass
+
+    entry = {"repoRoot": repo_root, "pipelineDir": pipeline_dir, "domainsPath": domains_path}
+    problems = validate_project_entry(entry)
+    registered = False
+    if not problems:
+        registered = record_project_registry_entry(repo_root, pipeline_dir, domains_path) is not False
+    roots_after = _chat_roots()
+    warnings = get_registry_warnings() + [{"entry": entry, "reason": p} for p in problems]
+    return jsonify({"rootsBefore": roots_before, "rootsAfter": roots_after, "registered": registered, "warnings": warnings})
+
+
+@internal_chat_bp.route("/api/internal/chat/run-command", methods=["POST"])
+def api_internal_chat_run_command():
+    """Runs ONE owner-confirmed, allowlisted command for the chat plugin (owner decision A, 2026-10-25: the restricted host-side runner; design in the
+    agent-manager-chat-plugin repo's docs/write-command-allowlist-design.md). Body: {argv, repo, proposalId, confirmedAt, sessionId?}. The plugin holds the
+    persisted confirmation; chat_command_runner re-validates the allowlist, the kill switch and the confirmation's age itself and returns
+    { ok, exitCode, stdout, stderr, durationMs } for a command that ran or { ok: false, refused: reason } for one that did not (HTTP 200 either way)."""
+    _require_internal_token()
+    import chat_command_runner
+    from app import get_pipeline_dir
+
+    body = request.get_json(silent=True) or {}
+    result = chat_command_runner.run_approved(
+        body.get("argv"), body.get("repo"), body.get("proposalId"), body.get("confirmedAt"), body.get("sessionId"),
+        pipeline_dir=get_pipeline_dir(),
+    )
+    return jsonify(result)
+
+
 @internal_chat_bp.route("/api/internal/chat/preempt", methods=["POST"])
 def api_internal_chat_preempt():
     """Wraps _preempt_pipeline_for_chat() -- kills the worker lanes' in-flight draft
@@ -102,6 +155,7 @@ def api_internal_chat_preempt():
     {preempted: [...]} -- an empty list if preemption is disabled
     (AGENT_MANAGER_CHAT_PREEMPT=false) or nothing was in flight."""
     _require_internal_token()
+    import chat_card
     from app import _chat_preempt_enabled, _chat_preempt_gate_state, _preempt_pipeline_for_chat, log_preempt_gate_off
     if not _chat_preempt_enabled():
         # HUB0033 2/4 -- gate OFF (see chat_preempt.py's _chat_preempt_gate_state):
@@ -112,7 +166,7 @@ def api_internal_chat_preempt():
         log_preempt_gate_off(_chat_preempt_gate_state())
         return jsonify({"preempted": []})
     try:
-        preempted = _preempt_pipeline_for_chat()
+        preempted = _preempt_pipeline_for_chat(chat_card.resolve_chat_card((request.get_json(silent=True) or {}).get("card")))
     except Exception as e:  # noqa: BLE001 -- best-effort, never fail the caller's turn on this
         return jsonify({"preempted": [], "error": str(e)})
     return jsonify({"preempted": preempted})
@@ -199,14 +253,23 @@ def api_internal_chat_local_turn():
     _require_internal_token()
     import contextlib
 
+    import chat_card
     import single_flight_lock
     from app import instances_dir
     from local_tool_client import LocalToolClientError, stream_plan_with_tools
 
     body = request.get_json(silent=True) or {}
     inst_dir = instances_dir()
+    # Optional body.card (a lane id): the GPU card for this turn. Resolved here exactly as the in-tree chat does (chat_card.py): a card the
+    # Forge holds moves to a free one with a note chunk; every card held -> an error event, no model call.
+    card = chat_card.resolve_chat_card(body.get("card"))
 
     def generate():
+        if card.get("blocked"):
+            yield f"data: {json.dumps({'type': 'error', 'error': card.get('note') or 'no GPU card is free for chat'})}\n\n"
+            return
+        if card.get("note"):
+            yield f"data: {json.dumps({'type': 'chunk', 'text': '*(' + card['note'] + ')*' + chr(10) + chr(10)})}\n\n"
         marker_cm = single_flight_lock.priority_marker(inst_dir) if inst_dir else contextlib.nullcontext()
         with marker_cm:
             try:
@@ -221,6 +284,7 @@ def api_internal_chat_local_turn():
                     force_summary_on_cap=bool(body.get("forceSummaryOnCap")),
                     allow_amplification=bool(body.get("allowAmplification")),
                     context_log_session_id=body.get("contextLogSessionId"),
+                    card_env=card.get("env"),
                 ):
                     yield f"data: {json.dumps(event)}\n\n"
             except LocalToolClientError as e:

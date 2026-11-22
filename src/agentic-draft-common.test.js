@@ -177,6 +177,135 @@ test('resolveAgenticDraft(implemented): a lockfile rewritten by a sandbox npm in
   });
 });
 
+// 2026-10-07 (leftover-references.js): a draft that removes a name but leaves a use behind is blocked at draft time with the file
+// and line named; the SAME names blocked twice in a row downgrade to an advisory so a false positive can never strand the task.
+function leftoverDraft(wt) {
+  const g = (args) => execFileSync('git', args, { cwd: wt, encoding: 'utf8' });
+  fs.mkdirSync(path.join(wt, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(wt, 'src', 'db.js'), 'const [STATUS_PENDING] = LIST;\nfunction claim(p) { return p !== STATUS_PENDING; }\n');
+  g(['add', '-A']); g(['commit', '-qm', 'files']);
+  fs.writeFileSync(path.join(wt, 'src', 'db.js'), 'const [STATUS] = LIST;\nfunction claim(p) { return p !== STATUS_PENDING; }\n');
+  return { id: 'tleft', source: 'manual', domain: 'adhoc', promptContext: { rawText: 'Rename the STATUS constants in src/db.js.' } };
+}
+const leftoverResult = { response: 'Renamed the constants in src/db.js.\n\nRESOLUTION: implemented\n\ndone' };
+
+test('resolveAgenticDraft(implemented): a removed name still referenced -> retryable block naming the file and line', () => {
+  withRealRepo((wt) => {
+    const task = leftoverDraft(wt);
+    const out = resolveAgenticDraft(task, { result: leftoverResult, worktreeDir: wt });
+    assert.equal(out.blocked, true);
+    assert.match(out.blockedReason, /still referenced.*STATUS_PENDING/);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.deepEqual(task.leftoverRefBlocked, ['STATUS_PENDING']);
+    assert.match(task.adhocDiffSubstanceFeedback, /src\/db\.js:2/);
+    assert.ok(!task.adhocResolution, 'not stamped as implemented');
+  });
+});
+
+test('resolveAgenticDraft(implemented): the same leftover names blocked twice -> advisory, the draft goes through', () => {
+  withRealRepo((wt) => {
+    const task = leftoverDraft(wt);
+    task.leftoverRefBlocked = ['STATUS_PENDING'];
+    const out = resolveAgenticDraft(task, { result: leftoverResult, worktreeDir: wt });
+    assert.notEqual(out.blocked, true, JSON.stringify(out).slice(0, 300));
+    assert.equal(task.adhocResolution, 'implemented');
+    assert.equal(task.leftoverRefBlocked, undefined, 'the marker is cleared once it has been waved through');
+    assert.ok(task.history.some((e) => e.stage === 'advisory' && /leftover-reference gate.*not blocking again/.test(e.detail || '')));
+  });
+});
+
+test('resolveAgenticDraft(implemented): AGENT_MANAGER_LEFTOVER_REF_MODE=off disables the gate', () => {
+  const prev = process.env.AGENT_MANAGER_LEFTOVER_REF_MODE;
+  process.env.AGENT_MANAGER_LEFTOVER_REF_MODE = 'off';
+  try {
+    withRealRepo((wt) => {
+      const task = leftoverDraft(wt);
+      const out = resolveAgenticDraft(task, { result: leftoverResult, worktreeDir: wt });
+      assert.notEqual(out.blocked, true);
+    });
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_LEFTOVER_REF_MODE; else process.env.AGENT_MANAGER_LEFTOVER_REF_MODE = prev; }
+});
+
+// 2026-10-08 (lib/test-framework.js): a diff that adds a test file for a framework its package cannot run is a retryable block with the fix in the feedback;
+// the same files blocked twice are waved through as an advisory.
+function tfAgenticSeed(wt) {
+  const g = (args) => execFileSync('git', args, { cwd: wt, encoding: 'utf8' });
+  fs.mkdirSync(path.join(wt, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(wt, 'package.json'), JSON.stringify({ name: 'pkg' }));
+  fs.writeFileSync(path.join(wt, 'src', 'sibling.test.js'), "const test = require('node:test');\ntest('s', () => {});\n");
+  fs.writeFileSync(path.join(wt, 'src', 'x.js'), 'let a = 1;\n');
+  g(['add', '-A']); g(['commit', '-qm', 'seed']);
+}
+const tfResult = { response: 'Added a test.\n\nRESOLUTION: implemented\n\ndone' };
+const tfTaskFor = (id, over = {}) => ({ id, source: 'manual', domain: 'adhoc', promptContext: { rawText: 'Add a test for src/x.js.' }, ...over });
+
+test('resolveAgenticDraft(implemented): a NEW jest test in a node:test package -> retryable block naming the sibling test; the same files twice -> advisory', () => {
+  withRealRepo((wt) => {
+    tfAgenticSeed(wt);
+    fs.writeFileSync(path.join(wt, 'src', 'new.test.js'), "describe('x', () => { it('y', () => { const f = jest.fn(); expect(f).toBeDefined(); }); });\n");
+    const task = tfTaskFor('tf-agentic-1');
+    const out = resolveAgenticDraft(task, { result: tfResult, worktreeDir: wt });
+    assert.equal(out.blocked, true);
+    assert.match(out.blockedReason, /test framework not usable/);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.deepEqual(task.testFrameworkBlocked, ['src/new.test.js']);
+    assert.match(task.adhocDiffSubstanceFeedback, /sibling\.test\.js/);
+    assert.ok(!task.adhocResolution);
+    // the retry produces the same files: not blocked again
+    const again = tfTaskFor('tf-agentic-2', { testFrameworkBlocked: ['src/new.test.js'] });
+    const out2 = resolveAgenticDraft(again, { result: tfResult, worktreeDir: wt });
+    assert.notEqual(out2.blocked, true, JSON.stringify(out2).slice(0, 200));
+    assert.equal(again.adhocResolution, 'implemented');
+    assert.ok(again.history.some((h) => h.stage === 'advisory' && /not blocking again/.test(h.detail || '')));
+  });
+});
+
+test('resolveAgenticDraft(implemented): a node:test file passes; a modified (not new) test file and a change that adds the dependency are not checked', () => {
+  withRealRepo((wt) => {
+    tfAgenticSeed(wt);
+    fs.writeFileSync(path.join(wt, 'src', 'new.test.js'), "const test = require('node:test');\ntest('n', () => {});\n");
+    const ok = tfTaskFor('tf-agentic-ok');
+    assert.notEqual(resolveAgenticDraft(ok, { result: tfResult, worktreeDir: wt }).blocked, true);
+  });
+  withRealRepo((wt) => {
+    tfAgenticSeed(wt);
+    fs.appendFileSync(path.join(wt, 'src', 'sibling.test.js'), "describe('x', () => { jest.fn(); });\n"); // an EDIT to an existing test: not a new file
+    assert.notEqual(resolveAgenticDraft(tfTaskFor('tf-agentic-edit'), { result: tfResult, worktreeDir: wt }).blocked, true);
+  });
+  withRealRepo((wt) => {
+    tfAgenticSeed(wt);
+    fs.writeFileSync(path.join(wt, 'package.json'), JSON.stringify({ name: 'pkg', devDependencies: { jest: '^29' } }));
+    fs.writeFileSync(path.join(wt, 'src', 'new.test.js'), "describe('x', () => { jest.fn(); });\n");
+    assert.notEqual(resolveAgenticDraft(tfTaskFor('tf-agentic-dep'), { result: tfResult, worktreeDir: wt }).blocked, true, 'jest arrives with the same change');
+  });
+});
+
+test('resolveAgenticDraft(implemented): AGENT_MANAGER_TEST_FRAMEWORK_GATE=off disables the gate', () => {
+  const prev = process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE;
+  process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE = 'off';
+  try {
+    withRealRepo((wt) => {
+      tfAgenticSeed(wt);
+      fs.writeFileSync(path.join(wt, 'src', 'new.test.js'), "describe('x', () => { jest.fn(); });\n");
+      assert.notEqual(resolveAgenticDraft(tfTaskFor('tf-agentic-off'), { result: tfResult, worktreeDir: wt }).blocked, true);
+    });
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE; else process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE = prev; }
+});
+
+test('resolveAgenticDraft(implemented): AGENT_MANAGER_TEST_FRAMEWORK_GATE=advisory records the finding but does not block', () => {
+  const prev = process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE;
+  process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE = 'advisory';
+  try {
+    withRealRepo((wt) => {
+      tfAgenticSeed(wt);
+      fs.writeFileSync(path.join(wt, 'src', 'new.test.js'), "describe('x', () => { jest.fn(); });\n");
+      const task = tfTaskFor('tf-agentic-adv');
+      assert.notEqual(resolveAgenticDraft(task, { result: tfResult, worktreeDir: wt }).blocked, true);
+      assert.ok(task.history.some((h) => h.stage === 'advisory' && /advisory mode/.test(h.detail || '')));
+    });
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE; else process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE = prev; }
+});
+
 // --- resolveAgenticDraft(no-changes-needed) -- adhocNoChangesClaimProblem (2026-09-04) ---
 
 test('resolveAgenticDraft(no-changes-needed): no "Already covered:" block -> retryable block with pointed feedback', () => {
@@ -735,6 +864,106 @@ test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error, zero
   });
 });
 
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error but report shows missing target -> reclassified to needs-clarification, NOT requeued', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'misdirected-target-1' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nThe requested branch "feature-x" does not exist in this repository. The task appears to be misdirected to the wrong repository -- the target code is absent from this checkout.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'read_file' }, { tool: 'grep_codebase' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.retryableDraftBlock, false, 'must NOT be requeued as infra retry');
+    assert.equal(task.infraErrorRetry, undefined, 'must NOT set infraErrorRetry');
+    assert.match(out.blockedReason, /target is missing or misdirected/);
+    assert.match(out.blockedReason, /feature-x/);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error with missing target signal "does not exist in any repo" -> reclassified', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'misdirected-target-2' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nI searched every repo I can access and the target code does not exist in any repo I can access. This task is misdirected to the wrong repository.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'read_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, true);
+    assert.match(out.blockedReason, /target is missing or misdirected/);
+    assert.match(out.blockedReason, /does not exist/);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error with genuine tool failure -> still requeued (existing behavior preserved)', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'infra-real-failure-1' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nThe worktree git index is locked -- every edit_file call fails with "unable to create .git/index.lock". Not a design question.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'read_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, undefined, 'must NOT be routed to needs-clarification');
+    assert.equal(task.retryableDraftBlock, true);
+    assert.equal(task.infraErrorBefore, true);
+    assert.equal(task.infraErrorRetry, true);
+    assert.match(out.blockedReason, /BLOCKER-TYPE: infra-error/);
+  });
+});
+
+test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error with missing target AND partial work -> still reclassified (missing target takes priority)', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'partial work landed\n');
+    const task = { id: 'misdirected-target-3' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nGot the first file done, then realized the requested branch does not exist in this repository. The task is misdirected to the wrong repository.',
+        forcedSummary: false,
+        toolCallLog: [{ tool: 'read_file' }, { tool: 'edit_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.isAgenticContinuation, undefined, 'must NOT be treated as continuation');
+    assert.match(out.blockedReason, /target is missing or misdirected/);
+  });
+});
+
+test('detectMissingTargetReport: detects missing target signals', () => {
+  const { detectMissingTargetReport } = require('./agentic-draft-common.js');
+  assert.ok(detectMissingTargetReport('The requested branch "feature-x" does not exist in this repository'));
+  assert.ok(detectMissingTargetReport('The target code does not exist in any repo I can access'));
+  assert.ok(detectMissingTargetReport('This task is misdirected to the wrong repository'));
+  assert.ok(detectMissingTargetReport('The file absent from checkout was not found'));
+  assert.ok(detectMissingTargetReport('The repository does not contain the requested path'));
+  assert.ok(detectMissingTargetReport('No matching file in this repo for the target'));
+  assert.equal(detectMissingTargetReport('The worktree git index is locked'), null);
+  assert.equal(detectMissingTargetReport('Got ETIMEDOUT on every call'), null);
+  assert.equal(detectMissingTargetReport(''), null);
+  assert.equal(detectMissingTargetReport(null), null);
+});
+
+test('detectMissingTargetReport: detects the accessible-root misdirection phrases from real reports, but not genuine infra failures', () => {
+  const { detectMissingTargetReport } = require('./agentic-draft-common.js');
+  assert.ok(detectMissingTargetReport('the feature-forge repo is not registered as an accessible root in this session'));
+  assert.ok(detectMissingTargetReport('the feature-forge repo is not accessible from this session'));
+  assert.ok(detectMissingTargetReport('list_roots returned only the primary root'));
+  assert.equal(detectMissingTargetReport('npm install failed with ECONNRESET'), null);
+  assert.equal(detectMissingTargetReport('edit_file failed: ETIMEDOUT while writing the file'), null);
+});
+
 test('resolveAgenticDraft(needs-human-decision): BLOCKER-TYPE: infra-error WITH partial work landed -> continuation', () => {
   withRealRepo((wt) => {
     fs.writeFileSync(path.join(wt, 'a.txt'), 'partial work landed\n');
@@ -1155,5 +1384,66 @@ test('runAgenticDraftInWorktree with no prior diff behaves as before (partialDif
       runInWorktree: async (wtDir, i) => { info = i; return { response: 'RESOLUTION: no-changes-needed\nAlready covered: none' }; },
     });
     assert.equal(info.partialDiff, null);
+  });
+});
+
+test('parseSubTaskProposals keeps a valid prerequisiteHubs array and drops an invalid one', () => {
+  const out = parseSubTaskProposals('[{"title":"a","rawText":"x","prerequisiteHubs":["HUB0006","oops"]},{"title":"b","rawText":"y","prerequisiteHubs":"HUB0006"}]');
+  assert.deepEqual(out[0].prerequisiteHubs, ['HUB0006']);
+  assert.equal(out[1].prerequisiteHubs, undefined);
+});
+
+test('parseSubTaskProposals keeps a valid files array and drops an unusable one; the review rendering shows it', () => {
+  const out = parseSubTaskProposals('[{"title":"a","rawText":"x","files":["README.md"," src/a.js "]},{"title":"b","rawText":"y","files":["two words"]}]');
+  assert.deepEqual(out[0].files, ['README.md', 'src/a.js']);
+  assert.equal(out[1].files, undefined);
+  assert.match(formatSubTaskProposalsForReview(out), /1\. a\n   x\n   Files: README\.md, src\/a\.js\n2\. b\n   y$/);
+});
+
+// 2026-11-02 stalled-task loop: the forced final turn produced NO text after edits landed (40 parked 'design-decision' tasks whose only question was the placeholder) ------
+test('resolveAgenticDraft: forcedSummary with EMPTY text + edits but no captured diff -> budget exhaustion block (decompose-eligible), not a human hold', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'oot-1' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: '', forcedSummary: true, turnsUsed: 35, toolCallLog: [{ tool: 'read_file' }, { tool: 'edit_file' }, { tool: 'edit_file' }] },
+      worktreeDir: wt,
+    });
+    assert.equal(out.blocked, true);
+    assert.equal(out.needsClarification, undefined);
+    assert.equal(task.turnBudgetExhausted, true);
+    assert.equal(task.turnBudgetExhaustedBefore, true);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.notEqual(task.adhocResolution, 'needs-human-decision');
+    assert.match(out.blockedReason, /ran out of turns/);
+  });
+});
+
+test('resolveAgenticDraft: forcedSummary with EMPTY text + a partial diff -> continuation, then exhaustion once the cap is hit', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'partial work landed\n');
+    const res = { response: '', forcedSummary: true, turnsUsed: 35, toolCallLog: [{ tool: 'edit_file' }] };
+    const first = { id: 'oot-2' };
+    const out = resolveAgenticDraft(first, { result: res, worktreeDir: wt });
+    assert.match(out.blockedReason, /continuation 1\/2/);
+    assert.equal(first.isAgenticContinuation, true);
+    assert.match(first.priorPartialDiff, /a\.txt/);
+    const capped = { id: 'oot-3', agenticContinuationCount: 2 };
+    const out2 = resolveAgenticDraft(capped, { result: res, worktreeDir: wt });
+    assert.equal(out2.blocked, true);
+    assert.equal(capped.turnBudgetExhaustedBefore, true);
+    assert.equal(out2.needsClarification, undefined);
+  });
+});
+
+test('resolveAgenticDraft: forcedSummary with REAL text but no RESOLUTION line still goes to a human (only the empty-text case changed)', () => {
+  withRealRepo((wt) => {
+    const task = { id: 'oot-4' };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'I found two incompatible readings of the spec and cannot pick one.', forcedSummary: true, turnsUsed: 35, toolCallLog: [{ tool: 'edit_file' }] },
+      worktreeDir: wt,
+    });
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.adhocResolution, 'needs-human-decision');
+    assert.ok(!task.turnBudgetExhausted);
   });
 });

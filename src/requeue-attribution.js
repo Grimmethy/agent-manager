@@ -51,6 +51,41 @@ function _resetFallbackRateLimitForTests() {
   fallbackCallTimestamps = [];
 }
 
+// recordSuppression: writes a durable attribution record for a suppressed (zero-hit)
+// requeue event. Idempotency is keyed on taskId -- first write wins; a later distinct
+// event for the same task is intentionally NOT re-recorded (documented trade-off: the
+// dedup key is taskId, the stable identity of the suppressed case). Never throws.
+function recordSuppression({ taskId, signature, category, zeroHitGroupSize, reasonText, blockedStage, actor, repoRoot, now }) {
+  if (!taskId || !repoRoot) return null;
+
+  const dir = path.join(repoRoot, 'queue', 'suppression-attribution');
+  const file = path.join(dir, `suppressed-${taskId}.json`);
+
+  try {
+    if (fs.existsSync(file)) return { filed: false, deduped: true, file };
+  } catch (_) { /* existsSync can throw on bad paths; let the write attempt decide */ }
+
+  const record = {
+    status: 'suppressed',
+    taskId,
+    signature,
+    category,
+    zeroHitGroupSize,
+    reasonText,
+    blockedStage,
+    actor,
+    now,
+  };
+
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(record, null, 2) + '\n', 'utf8');
+    return { filed: true, deduped: false, file };
+  } catch (_) {
+    return { filed: false, deduped: false, file, error: true };
+  }
+}
+
 function normalizeReasonText(reasonHint) {
   if (Array.isArray(reasonHint)) return reasonHint.filter(Boolean).join('; ');
   return String(reasonHint || '');
@@ -251,14 +286,17 @@ module.exports = {
   normalizeReasonText,
   CAUSE_CATEGORIES,
   _resetFallbackRateLimitForTests,
+  recordSuppression,
 };
 
 // CLI: `node src/requeue-attribution.js classify <payloadPath>` -- so the Flask dashboard
 // (python/dashboard/requeue_attribution_client.py) can record a MANUAL requeue, which
 // otherwise never reaches this classifier at all (api_task_requeue is pure Python).
 // payload: { task?, taskFile?, reasonHint, requeueWriter, actor, blockedStage? }.
-// Prints the { signature, category } result as JSON. Best-effort: any failure exits 0
-// with an empty object so a telemetry problem never breaks a requeue on the caller side.
+// Prints the { signature, category } result as JSON. Failures are NOT swallowed: any error
+// writes a message to stderr, leaves stdout empty, and exits 1. The Flask caller
+// (python/dashboard/requeue_attribution_client.py) already treats a nonzero exit as None, so
+// a telemetry failure still never breaks a requeue on the caller side.
 if (require.main === module) {
   (async () => {
     try {
@@ -269,7 +307,10 @@ if (require.main === module) {
       }
       const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf8'));
       let task = payload.task;
-      if (!task && payload.taskFile && fs.existsSync(payload.taskFile)) {
+      if (!task && payload.taskFile) {
+        if (!fs.existsSync(payload.taskFile)) {
+          throw new Error(`taskFile not found: ${payload.taskFile}`);
+        }
         task = JSON.parse(fs.readFileSync(payload.taskFile, 'utf8'));
       }
       const repoRoot = process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT;
@@ -283,7 +324,8 @@ if (require.main === module) {
       });
       process.stdout.write(JSON.stringify(result || {}));
     } catch (e) {
-      process.stdout.write('{}');
+      process.stderr.write(`requeue-attribution classify failed: ${e && e.message ? e.message : String(e)}\n`);
+      process.exitCode = 1;
     }
   })();
 }

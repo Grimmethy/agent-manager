@@ -1,6 +1,6 @@
 'use strict';
 
-// Piece 5 of the manifest-driven dashboard tab (Docs/hub-tasks-extraction-plan.md section
+// Piece 5 of the manifest-driven dashboard tab (docs/design-notes/hub-tasks-extraction-plan.md section
 // 5): the enable/disable lifecycle's active-tab redirect in python/dashboard/static/js/
 // core-ui.js. switchToTab() is the shared transition renderTabButton's onclick handlers
 // use (extracted here so the redirect can reuse the real leave/enter semantics instead of
@@ -129,9 +129,9 @@ test('refresh() (branches-joblist-hardware-tabs.js) syncs plugin tabs and checks
     path.join(__dirname, '..', 'python', 'dashboard', 'static', 'js', 'branches-joblist-hardware-tabs.js'),
     'utf8',
   );
-  const start = source.indexOf('async function refresh()');
+  const start = source.indexOf('async function refreshCycle()'); // refresh() itself is a one-line runRefreshGuarded(refreshCycle) wrapper
   const end = source.indexOf('function escapeAttr', start);
-  assert.ok(start !== -1 && end !== -1, 'refresh()/escapeAttr boundary not found');
+  assert.ok(start !== -1 && end !== -1, 'refreshCycle()/escapeAttr boundary not found');
   const body = source.slice(start, end);
   // Search each needle starting after the previous match, not from 0 -- the surrounding
   // comment prose mentions "redirectFromGoneActiveTab()" too, so a bare indexOf(needle)

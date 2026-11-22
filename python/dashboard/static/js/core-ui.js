@@ -18,31 +18,11 @@ async function loadProjectHistory() {
     const data = await fetchJson('/api/projects/history');
     projectHistory = data.projects || [];
   } catch (e) {
+    console.error('loadProjectHistory failed to fetch project history', e);
     projectHistory = [];
   }
   const list = document.getElementById('project-history-list');
   if (list) list.innerHTML = projectHistory.map((p) => `<option value="${escapeAttr(p)}">`).join('');
-}
-
-async function loadProjectDropdown() {
-  const select = document.getElementById('project-select');
-  if (!select) return;
-  let projects = [];
-  try {
-    const data = await fetchJson('/api/second-brain/projects');
-    projects = data.projects || [];
-  } catch (e) { /* Second Brain not configured -- leave the dropdown at just the placeholder */ }
-  let matched = !projectPath;
-  let html = '<option value="">Select a project...</option>';
-  for (const p of projects) {
-    const selected = p.path === projectPath;
-    if (selected) matched = true;
-    html += `<option value="${escapeAttr(p.path)}"${selected ? ' selected' : ''}>${escapeHtml(p.name)}</option>`;
-  }
-  // Current path isn't a known Second Brain project (e.g. picked via Browse) -- keep it
-  // visible and selected rather than silently falling back to the placeholder.
-  if (!matched) html += `<option value="${escapeAttr(projectPath)}" selected>${escapeHtml(projectPath)}</option>`;
-  select.innerHTML = html;
 }
 
 function renderHistoryPanel() {
@@ -69,20 +49,51 @@ function renderHistoryPanel() {
   });
 }
 
-async function fetchJson(url, { timeoutMs = 8000 } = {}) {
+// Failure memory (HUB0531 1/4): a timeout, AbortError, or non-OK response for a URL is
+// remembered with Date.now() and identical requests get that stored error back for
+// FETCH_FAILURE_MEMORY_MS. Expiry is checked only when a new call arrives -- no timer.
+const FETCH_FAILURE_MEMORY_MS = 15000;
+// In-flight GET dedupe: concurrent calls for the same URL share one promise, cleared on
+// settle. Note: the key is the URL alone, so sharers get the first caller's timeoutMs and
+// the same parsed JSON object reference -- a caller that mutates the result affects the others.
+const fetchInFlight = new Map();
+const fetchFailures = new Map();
+
+async function fetchJsonUncached(url, timeoutMs) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   let r;
   try {
     r = await fetch(url, { signal: controller.signal });
   } catch (e) {
-    if (e.name === 'AbortError') throw new Error(url + ' -> timed out after ' + (timeoutMs / 1000) + 's');
+    if (e.name === 'AbortError') {
+      const message = url + ' -> timed out after ' + (timeoutMs / 1000) + 's';
+      fetchFailures.set(url, { message, at: Date.now() });
+      throw new Error(message);
+    }
     throw e;
   } finally {
     clearTimeout(timeoutId);
   }
-  if (!r.ok) throw new Error(url + ' -> ' + r.status);
+  if (!r.ok) {
+    const message = url + ' -> ' + r.status;
+    fetchFailures.set(url, { message, at: Date.now() });
+    throw new Error(message);
+  }
   return r.json();
+}
+
+async function fetchJson(url, { timeoutMs = 8000 } = {}) {
+  const failure = fetchFailures.get(url);
+  if (failure) {
+    if (Date.now() - failure.at < FETCH_FAILURE_MEMORY_MS) throw new Error(failure.message);
+    fetchFailures.delete(url);
+  }
+  const pending = fetchInFlight.get(url);
+  if (pending) return pending;
+  const promise = fetchJsonUncached(url, timeoutMs).finally(() => fetchInFlight.delete(url));
+  fetchInFlight.set(url, promise);
+  return promise;
 }
 
 // Stale-render guard (2026-09-29, "display stutters and switches to the wrong tab"): every
@@ -117,6 +128,30 @@ async function runRefreshGuarded(fn, { now = Date.now, maxMs = 30000 } = {}) {
 }
 function _resetRenderStateForTest() { renderGeneration = 0; refreshRunningSince = 0; }
 
+// Per-browser-tab persistence of the active tab (sessionStorage: survives a reload or a tab
+// discard, and is not shared across windows). Storage can throw (private windows, quota), so
+// every access is guarded and a failure just means the tab is not remembered.
+const ACTIVE_TAB_STORAGE_KEY = 'dashboard.activeTab';
+function persistActiveTab(key) {
+  try { sessionStorage.setItem(ACTIVE_TAB_STORAGE_KEY, key); } catch (e) { /* no persistence */ }
+}
+function readStoredActiveTab() {
+  try { return sessionStorage.getItem(ACTIVE_TAB_STORAGE_KEY); } catch (e) { return null; }
+}
+
+// Restores the stored tab once, after the first successful plugin-tab merge (TABS starts
+// empty, so an earlier restore would fail findTabByKey and trip redirectFromGoneActiveTab).
+// An unknown or gone key leaves the current tab ('project' at startup) active.
+let activeTabRestoreDone = false;
+function restoreStoredActiveTabOnce() {
+  if (activeTabRestoreDone) return;
+  activeTabRestoreDone = true;
+  const stored = readStoredActiveTab();
+  if (!stored || stored === activeTab) return;
+  if (!findTabByKey(stored)) return;
+  switchToTab(stored);
+}
+
 function severityForTab(tabKey, count) {
   const thresholds = TAB_COUNT_SEVERITY_THRESHOLDS[tabKey];
   if (!thresholds || typeof count !== 'number') return null;
@@ -129,21 +164,28 @@ function severityForTab(tabKey, count) {
 // leave*Tab hook, updates activeTab, re-renders the nav, then runs the destination's own
 // enter*Tab hook (or the generic renderMain() for everything else). Both onclick handlers
 // in renderTabButton below use this, and so does redirectFromGoneActiveTab() (piece 5;
-// Docs/hub-tasks-extraction-plan.md section 5) -- the redirect needs the real leave/enter
+// docs/design-notes/hub-tasks-extraction-plan.md section 5) -- the redirect needs the real leave/enter
 // semantics, not just an activeTab assignment, so it reuses this instead of duplicating it.
 function switchToTab(key) {
-  if (activeTab === 'project' && key !== 'project') leaveProjectTab();
-  if (activeTab === 'brain-dump' && key !== 'brain-dump') leaveBrainDumpTab();
-  if (activeTab === 'branches' && key !== 'branches') leaveBranchesTab();
-  if (activeTab === 'hygiene' && key !== 'hygiene') leaveHygieneTab();
   bumpRenderGeneration(); // any in-flight render for the tab being left is now stale
   activeTab = key;
+  persistActiveTab(key);
   renderNav();
+  if (typeof showTabSkeleton === 'function') showTabSkeleton();   // clear the previous tab's content at once; the tab's own render replaces this
   if (key === 'project') enterProjectTab();
   else if (key === 'brain-dump') enterBrainDumpTab();
   else if (key === 'branches') enterBranchesTab();
   else if (key === 'hygiene') enterHygieneTab();
   else renderMain();
+}
+
+// The tab's label as drawn in the nav: its line icon (nav-icons.js) followed by the label without its old leading emoji. A tab without a known icon
+// (a plugin tab, say) keeps its label exactly as it was.
+function navTabLabelHtml(tab) {
+  const icon = typeof navTabIcon === 'function' ? navTabIcon(tab) : '';
+  if (!icon) return `<span>${tab.label}</span>`;
+  const plain = typeof navTabPlainLabel === 'function' ? navTabPlainLabel(tab) : tab.label;
+  return `<span class="nav-tab-label">${icon}<span>${plain}</span></span>`;
 }
 
 function renderTabButton(tab, indent) {
@@ -159,7 +201,7 @@ function renderTabButton(tab, indent) {
     // 'awaiting-confirm' already get elsewhere in this nav).
     const inProgress = counts.adhocInProgress ?? 0;
     const blocked = counts.adhocBlocked ?? 0;
-    btn.innerHTML = `<span>${tab.label}</span><span class="count">`
+    btn.innerHTML = `${navTabLabelHtml(tab)}<span class="count">`
       + `<span style="color:var(--muted)">${inProgress}</span>`
       + ` <span style="color:var(--bad); font-weight:600">${blocked}</span>`
       + `</span>`;
@@ -169,7 +211,7 @@ function renderTabButton(tab, indent) {
   const count = (tab.key === 'workers' || tab.key === 'models' || tab.key === 'joblist' || tab.key === 'plugins' || tab.key === 'deepdive') ? '' : (counts[tab.key] ?? '');
   const severity = severityForTab(tab.key, count);
   const dot = severity ? `<span class="status-dot ${severity}"></span>` : '';
-  btn.innerHTML = `<span>${tab.label}</span><span class="count">${dot}${count}</span>`;
+  btn.innerHTML = `${navTabLabelHtml(tab)}<span class="count">${dot}${count}</span>`;
   btn.onclick = () => switchToTab(tab.key);
   return btn;
 }
@@ -237,6 +279,12 @@ function mergePluginTabs(plugins, manifestTabsEnabled) {
       if (!isValidPluginTab(p.tab)) continue;
       const tab = p.tab;
       const row = { key: tab.key, label: tab.label, description: tab.description, pluginName: p.name, pluginScript: tab.script };
+      // A plugin whose entry has a `process` block owns a server core can start; renderPluginTab()
+      // ensures it is running before the tab's own renderer runs (see ensurePluginTabStarted).
+      if (p.process && typeof p.process === 'object' && p.process.command) {
+        row.startCommand = [p.process.command, ...(Array.isArray(p.process.args) ? p.process.args : [])].join(' ');
+        row.processLog = `~/.local/state/agent-manager/logs/plugin-${p.name}.log`;
+      }
       const replaces = tab.replaces;
       let replaced = false;
       if (replaces) {
@@ -269,6 +317,7 @@ async function syncPluginTabs() {
   try {
     const data = await fetchJson('/api/plugins');
     mergePluginTabs(data.plugins, data.manifestTabsEnabled);
+    restoreStoredActiveTabOnce(); // first successful merge only; a no-op on every later call
   } catch (e) {
     // Fail-safe: leave TABS as whatever it already was (CORE_TABS on the very first
     // failure) rather than let a plugin-listing error block the rest of the dashboard.
@@ -276,7 +325,7 @@ async function syncPluginTabs() {
 }
 
 // --- Manifest-driven dashboard tab: renderer registry, loader and dispatch (piece 4 of 6;
-// Docs/hub-tasks-extraction-plan.md section 5). This is the riskiest piece -- it sits on
+// docs/design-notes/hub-tasks-extraction-plan.md section 5). This is the riskiest piece -- it sits on
 // the path every tab click already runs -- so the contract is narrow and the failure mode
 // is contained: a plugin's ui/<script>.js is loaded as a plain classic <script> (same-origin,
 // piece 2's route) and is expected to call registerPluginTabRenderer(key, fn) at load time;
@@ -317,8 +366,19 @@ function findTabByKey(key) {
 // disable just took its replaced CORE_TABS row down with it. Either way the handling is the
 // same: switchToTab() runs the real leave/enter transition rather than just reassigning
 // activeTab, so the tab we're leaving still gets its own cleanup hook.
+// Two-strike rule: a single miss is not enough to redirect, because the tab list can be
+// briefly incomplete mid-update. goneActiveTabStrikes counts consecutive misses; a hit resets
+// it, and the redirect fires on the 2nd consecutive miss (then the counter resets). No timer
+// is involved -- the caller's own poll is what re-invokes this.
+let goneActiveTabStrikes = 0;
 function redirectFromGoneActiveTab(fallbackKey = 'project') {
-  if (findTabByKey(activeTab)) return false;
+  if (findTabByKey(activeTab)) {
+    goneActiveTabStrikes = 0;
+    return false;
+  }
+  goneActiveTabStrikes += 1;
+  if (goneActiveTabStrikes < 2) return false;
+  goneActiveTabStrikes = 0;
   switchToTab(fallbackKey);
   return true;
 }
@@ -350,11 +410,45 @@ function loadPluginTabScript(tab) {
   return promise;
 }
 
+// Core-owned lazy start (2026-10-12, found when the CharacterForge tab showed a blank
+// "refused to connect" iframe because its script never asked for its server to be started):
+// before a tab whose plugin has a `process` block renders, POST the idempotent
+// /api/plugins/<name>/ensure-started route. Per plugin: success is remembered for the page's
+// life (so the 5s re-render makes no further request), one request is in flight at a time, and
+// a failure or healthy:false (the route only waits ~5s, a cold venv can take longer) writes an
+// error panel and is retried by the next render. -> 'ready' | 'pending' | 'failed'.
+const pluginTabStarted = {};
+const pluginTabStarting = {};
+
+async function ensurePluginTabStarted(tab, main) {
+  if (!tab.startCommand || pluginTabStarted[tab.pluginName]) return 'ready';
+  if (pluginTabStarting[tab.pluginName]) return 'pending';
+  const hasContent = main.querySelector && (main.querySelector('iframe') || main.querySelector('[data-plugin-start-error]'));
+  if (!hasContent) main.innerHTML = typeof skeletonHtml === 'function' ? skeletonHtml({ caption: `Starting ${tab.label}...` }) : `<div class="empty">Starting ${escapeHtml(tab.label)}...</div>`;
+  pluginTabStarting[tab.pluginName] = true;
+  let why = '';
+  try {
+    const r = await fetch(`/api/plugins/${encodeURIComponent(tab.pluginName)}/ensure-started`, { method: 'POST' });
+    const body = await r.json().catch(() => ({}));
+    if (r.ok && body.healthy) { pluginTabStarted[tab.pluginName] = true; return 'ready'; }
+    why = body.description || (r.ok ? 'it did not report healthy within its start window (it may still be starting; this retries on the next refresh)' : `HTTP ${r.status}`);
+  } catch (e) {
+    why = e.message;
+  } finally {
+    delete pluginTabStarting[tab.pluginName];
+  }
+  main.innerHTML = `<div class="empty" data-plugin-start-error>Could not start the "${escapeHtml(tab.label)}" server (plugin ${escapeHtml(tab.pluginName)}): ${escapeHtml(why)}<br>Start command: <code>${escapeHtml(tab.startCommand)}</code><br>Log: <code>${escapeHtml(tab.processLog)}</code></div>`;
+  return 'failed';
+}
+
 async function renderPluginTab(tab) {
   const main = document.getElementById('main');
   try {
+    if (tab.startCommand) {   // no await for a plugin without a process block: the script load below must stay synchronous
+      if ((await ensurePluginTabStarted(tab, main)) !== 'ready') return;
+    }
     if (!pluginTabRenderers[tab.key]) {
-      main.innerHTML = `<div class="empty">Loading ${escapeHtml(tab.label)}...</div>`;
+      main.innerHTML = typeof skeletonHtml === 'function' ? skeletonHtml({ caption: `Loading ${tab.label}...` }) : `<div class="empty">Loading ${escapeHtml(tab.label)}...</div>`;
       await loadPluginTabScript(tab);
     }
     const renderFn = pluginTabRenderers[tab.key];
@@ -367,26 +461,184 @@ async function renderPluginTab(tab) {
   }
 }
 
-function renderNav() {
-  const nav = document.getElementById('nav');
-  nav.innerHTML = '';
-  for (const tab of TABS) {
-    if (tab.group) {
-      const expanded = isGroupExpanded(tab.group);
-      const header = document.createElement('button');
-      header.innerHTML = `<span>${expanded ? '▾' : '▸'} ${tab.group}</span><span class="count"></span>`;
-      header.onclick = () => {
-        localStorage.setItem('agentManagerNavGroup_' + tab.group, expanded ? 'collapsed' : 'expanded');
+// The tab list in display order. On a phone-sized screen the Forges group goes FIRST (the owner uses it most from the phone and should not have
+// to scroll the strip for it, 2026-10-14); everything else keeps its order, and a wide screen is untouched. Returns a new array.
+function navOrder(tabs, narrow) {
+  if (!narrow) return tabs.slice();
+  const forges = tabs.filter((t) => t.group === 'Forges');
+  return forges.length ? [...forges, ...tabs.filter((t) => t.group !== 'Forges')] : tabs.slice();
+}
+
+const NARROW_QUERY = '(max-width: 860px)';   // the same breakpoint the stylesheet's phone layout uses
+function isNarrowScreen() {
+  return typeof window !== 'undefined' && !!window.matchMedia && window.matchMedia(NARROW_QUERY).matches;
+}
+// Rotating a phone (or resizing a window) across the breakpoint changes the order, so the strip is rebuilt.
+if (typeof window !== 'undefined' && window.matchMedia) {
+  const mq = window.matchMedia(NARROW_QUERY);
+  if (mq.addEventListener) mq.addEventListener('change', () => { if (typeof renderNav === 'function' && document.getElementById('nav')) renderNav(); });
+}
+
+const NAV_CHEVRON_SVG = '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 6l3 3 3-3"/></svg>';
+
+function navFoldKey(path) { return 'agentManagerNavSection_' + path; }
+
+// One fold header: a chevron, the label, a dot when something inside needs attention (shown even while folded), a count, and a marker when the
+// folded section holds the tab on screen. sub is true for the Forges sub-groups.
+function renderNavFoldHeader(label, { open, sub, severity, badge, here, path }) {
+  const header = document.createElement('button');
+  header.className = sub ? 'nav-sh nav-sub-sh' : 'nav-sh';
+  if (typeof header.setAttribute === 'function') header.setAttribute('aria-expanded', open ? 'true' : 'false');
+  header.innerHTML = `<span class="nav-chev${open ? '' : ' closed'}">${NAV_CHEVRON_SVG}</span><span class="nav-sh-label">${escapeHtml(label)}</span>`
+    + (here && !open ? '<span class="nav-here" title="The tab you are on is in here"></span>' : '')
+    + (severity ? `<span class="status-dot ${severity}"></span>` : '')
+    + (badge ? `<em>${badge}</em>` : '');
+  header.onclick = () => {
+    localStorage.setItem(navFoldKey(path), open ? 'collapsed' : 'expanded');
+    renderNav();
+  };
+  return header;
+}
+
+// The wide layout: sections (nav-sections.js) with a hairline divider between them. Fold choices persist per section / sub-group in localStorage.
+function renderNavSections(nav) {
+  const countOf = (key) => counts[key];
+  const severityOf = (key) => severityForTab(key, counts[key]);
+  buildNavSections(TABS).forEach((section, i) => {
+    if (i > 0) {
+      const divider = document.createElement('div');
+      divider.className = 'nav-div';
+      nav.appendChild(divider);
+    }
+    const containsActive = navSectionContains(section, activeTab);
+    const open = navSectionOpen({ stored: localStorage.getItem(navFoldKey(section.key)), defaultOpen: section.defaultOpen, containsActive });
+    const { badge, severity } = navSectionSummary(section, { countOf, severityOf });
+    nav.appendChild(renderNavFoldHeader(section.label, { open, sub: false, severity, badge, here: containsActive, path: section.key }));
+    if (!open) return;
+    for (const tab of section.items) nav.appendChild(renderTabButton(tab, false));
+    for (const sub of section.subgroups || []) {
+      const path = `${section.key}.${sub.key}`;
+      const subActive = sub.items.some((t) => t.key === activeTab);
+      const subOpen = navSectionOpen({ stored: localStorage.getItem(navFoldKey(path)), defaultOpen: false, containsActive: subActive });
+      const subSeverity = sub.items.map((t) => severityOf(t.key)).includes('bad') ? 'bad' : (sub.items.map((t) => severityOf(t.key)).includes('warn') ? 'warn' : null);
+      nav.appendChild(renderNavFoldHeader(sub.label, { open: subOpen, sub: true, severity: subSeverity, badge: null, here: subActive, path }));
+      if (subOpen) for (const tab of sub.items) nav.appendChild(renderTabButton(tab, true));
+    }
+  });
+}
+
+const NAV_COLLAPSE_SVG = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3L5 8l5 5"/></svg>';
+const NAV_EXPAND_SVG = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3l5 5-5 5"/></svg>';
+
+function navRailCollapsed() {
+  return localStorage.getItem(NAV_RAIL_KEY) === 'collapsed';
+}
+
+// The row at the top of the wide sidebar: a round chevron button (the "Sidebar UI" reel) plus a "Collapse" pill; in the rail just the button, pointing the other way.
+function renderNavTop(collapsed) {
+  const top = document.createElement('div');
+  top.className = 'nav-top';
+  const btn = document.createElement('button');
+  btn.className = 'nav-collapse-btn';
+  btn.title = collapsed ? 'Expand the sidebar' : 'Collapse the sidebar to icons';
+  if (typeof btn.setAttribute === 'function') {
+    btn.setAttribute('aria-label', collapsed ? 'Expand sidebar' : 'Collapse sidebar');
+    btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  }
+  btn.innerHTML = collapsed ? NAV_EXPAND_SVG : NAV_COLLAPSE_SVG;
+  btn.onclick = () => {
+    if (collapsed) localStorage.removeItem(NAV_RAIL_KEY); else localStorage.setItem(NAV_RAIL_KEY, 'collapsed');
+    renderNav();
+  };
+  top.appendChild(btn);
+  if (!collapsed) {
+    const pill = document.createElement('span');
+    pill.className = 'nav-collapse-pill';
+    pill.innerHTML = 'Collapse';
+    top.appendChild(pill);
+  }
+  return top;
+}
+
+// An icon-only tab button: the glyph, a dot when the tab needs attention, the full name as the tooltip and accessible name.
+function renderNavRailButton(tab) {
+  const btn = document.createElement('button');
+  btn.className = 'rail-btn' + (tab.key === activeTab ? ' active' : '');
+  const name = navTabPlainLabel(tab);
+  btn.title = name;
+  if (typeof btn.setAttribute === 'function') btn.setAttribute('aria-label', name);
+  const severity = severityForTab(tab.key, counts[tab.key]);
+  const icon = typeof navTabIcon === 'function' ? navTabIcon(tab, 20) : '';
+  btn.innerHTML = (icon ? `<span class="rail-glyph">${icon}</span>` : `<span class="rail-glyph">${escapeHtml(navTabGlyph(tab))}</span>`) + (severity ? `<span class="status-dot ${severity}"></span>` : '');
+  btn.onclick = () => switchToTab(tab.key);
+  return btn;
+}
+
+// The collapsed sidebar: an icon per tab for the sections that are open, one letter button per folded section (clicking it opens the section and widens
+// the sidebar again), and the same hairline dividers.
+function renderNavRail(nav) {
+  const sections = buildNavSections(TABS);
+  const openOf = (section) => navSectionOpen({ stored: localStorage.getItem(navFoldKey(section.key)), defaultOpen: section.defaultOpen, containsActive: navSectionContains(section, activeTab) });
+  for (const entry of navRailEntries(sections, openOf)) {
+    if (entry.type === 'divider') {
+      const divider = document.createElement('div');
+      divider.className = 'nav-div';
+      nav.appendChild(divider);
+    } else if (entry.type === 'tab') {
+      nav.appendChild(renderNavRailButton(entry.tab));
+    } else {
+      const section = entry.section;
+      const btn = document.createElement('button');
+      btn.className = 'rail-btn rail-section';
+      btn.title = `${section.label} (click to open)`;
+      if (typeof btn.setAttribute === 'function') btn.setAttribute('aria-label', `Open ${section.label}`);
+      const { severity } = navSectionSummary(section, { countOf: (k) => counts[k], severityOf: (k) => severityForTab(k, counts[k]) });
+      const sectionIcon = typeof navSectionIcon === 'function' ? navSectionIcon(section, 20) : '';
+      btn.innerHTML = (sectionIcon ? `<span class="rail-glyph">${sectionIcon}</span>` : `<span class="rail-glyph">${escapeHtml(section.label.charAt(0))}</span>`) + (severity ? `<span class="status-dot ${severity}"></span>` : '');
+      btn.onclick = () => {
+        localStorage.setItem(navFoldKey(section.key), 'expanded');
+        localStorage.removeItem(NAV_RAIL_KEY);
         renderNav();
       };
-      nav.appendChild(header);
-      if (expanded) {
-        for (const child of tab.children) nav.appendChild(renderTabButton(child, true));
-      }
-    } else {
-      nav.appendChild(renderTabButton(tab, false));
+      nav.appendChild(btn);
     }
   }
+}
+
+function renderNav() {
+  const nav = document.getElementById('nav');
+  const scrollLeft = nav.scrollLeft || 0;   // the phone nav is one sideways-scrolling row: folding a section must not jump it back to the start
+  nav.innerHTML = '';
+  const sectioned = typeof buildNavSections === 'function';
+  const wide = !isNarrowScreen() && sectioned;
+  const rail = wide && navRailCollapsed();
+  nav.className = rail ? 'nav-rail' : '';
+  if (sectioned) {
+    // Same sections, fold chevrons and icons on a phone as on a desktop (owner 2026-11-07); only the collapse button and the icon rail stay wide-only.
+    if (wide) nav.appendChild(renderNavTop(rail));
+    if (rail) renderNavRail(nav); else renderNavSections(nav);
+  } else {
+    // nav-sections.js missing: the flat strip with the old Forges / Job Status groups.
+    for (const tab of navOrder(TABS, isNarrowScreen())) {
+      if (tab.group) {
+        const expanded = isGroupExpanded(tab.group);
+        const header = document.createElement('button');
+        header.innerHTML = `<span>${expanded ? '▾' : '▸'} ${tab.group}</span><span class="count"></span>`;
+        header.onclick = () => {
+          localStorage.setItem('agentManagerNavGroup_' + tab.group, expanded ? 'collapsed' : 'expanded');
+          renderNav();
+        };
+        nav.appendChild(header);
+        if (expanded) {
+          for (const child of tab.children) nav.appendChild(renderTabButton(child, true));
+        }
+      } else {
+        nav.appendChild(renderTabButton(tab, false));
+      }
+    }
+  }
+  if (scrollLeft && isNarrowScreen()) nav.scrollLeft = scrollLeft;
+  if (typeof navNotchUpdate === 'function') navNotchUpdate(nav);
 }
 
 function fmtPct(x) { return x == null ? '-' : Math.round(x * 100) + '%'; }
@@ -466,6 +718,33 @@ async function safeSourceNames(sourceNamesFn = allSourceNames) {
   }
 }
 
+// ---- Host-memory chip (2026-11-02, phase 5 of the memory-pressure plan) -------------------------------------------------------------------------------------
+// /api/summary carries `memory` (python/dashboard/memory_status.py): {state:'ok'|'unknown'} or, under pressure, {state:'tight'|'critical', reason, numbers, paused,
+// wouldPause, pauseS, canUnload}. The header chip shows only under pressure; it never adds a request of its own (it rides the existing summary refresh).
+function formatPauseLength(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '';
+  const s = Math.floor(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+function memoryChipModel(memory) {
+  if (!memory || (memory.state !== 'tight' && memory.state !== 'critical')) return { visible: false };
+  let text = `Memory ${memory.state}`;
+  if (memory.paused) text += ` \u00b7 new work paused${Number.isFinite(memory.pauseS) ? ` ${formatPauseLength(memory.pauseS)}` : ''}`;
+  else if (memory.wouldPause) text += ' \u00b7 would pause (dry-run)';
+  const n = memory.numbers || {};
+  const bits = [];
+  if (Number.isFinite(n.available_mb)) bits.push(`${n.available_mb} MB available`);
+  if (Number.isFinite(n.swap_free_mb)) bits.push(`swap ${n.swap_free_mb} MB free`);
+  if (Number.isFinite(n.io_full)) bits.push(`io stall ${n.io_full}%`);
+  if (Number.isFinite(n.mem_full)) bits.push(`memory stall ${n.mem_full}%`);
+  const title = [memory.reason, bits.join(', ')].filter(Boolean).join(' \u2014 ');
+  return { visible: true, text, title, className: memory.state === 'critical' ? 'chip chip-solo chip-bad' : 'chip chip-solo chip-warn', canUnload: !!memory.canUnload };
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -515,4 +794,4 @@ function adhocStateLabel(state) {
 // (`module` is undefined there, so this is a no-op in production) -- the guard exists
 // solely so safeSourceNames is requireable from a Node test, the first test coverage
 // this file has ever had.
-if (typeof module !== 'undefined') module.exports = { safeSourceNames, bumpRenderGeneration, renderStaleCheck, runRefreshGuarded, _resetRenderStateForTest };
+if (typeof module !== 'undefined') module.exports = { formatPauseLength, memoryChipModel, navOrder, safeSourceNames, bumpRenderGeneration, renderStaleCheck, runRefreshGuarded, _resetRenderStateForTest };

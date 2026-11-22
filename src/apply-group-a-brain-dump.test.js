@@ -76,6 +76,81 @@ test('applyBrainDumpSort stale no-op: edited rawText since drafting -> non-succe
   assert.equal(fs.existsSync(secondBrainDir), false);
 });
 
+test('applyBrainDumpSort stale no-op: non-captured terminal status possibly-resolved (sortAttempt 2) -> non-success shape, nothing classified or queued', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-stale-pr-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  const pipelineDir = path.join(dir, 'pipeline');
+  const brainDumpPath = writeBrainDump(dir, [
+    { id: 'bd-pr', capturedAt: '2026-07-22T00:00:00.000Z', rawText: 'original', status: 'possibly-resolved', sortAttempt: 2 },
+  ]);
+  const before = fs.readFileSync(brainDumpPath, 'utf8');
+
+  const task = { promptContext: { brainDumpEntryId: 'bd-pr', rawText: 'original' } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: 'fixture-project' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.stale, true);
+  assert.equal(result.success, false);
+  assert.equal(result.file, undefined);
+  assert.equal(result.recoverable, undefined);
+
+  // Entry left byte-for-byte as-is: status and sortAttempt unchanged.
+  assert.equal(fs.readFileSync(brainDumpPath, 'utf8'), before);
+  const entry = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0];
+  assert.equal(entry.status, 'possibly-resolved');
+  assert.equal(entry.sortAttempt, 2);
+
+  // No classification filed and no adhoc task queued.
+  assert.equal(fs.existsSync(secondBrainDir), false);
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'adhoc')), false);
+});
+
+test('applyBrainDumpSort stale no-op: captured with rawText differing from the drafted text -> non-success shape, no sortAttempt bump', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-stale-raw-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  const pipelineDir = path.join(dir, 'pipeline');
+  const brainDumpPath = writeBrainDump(dir, [
+    { id: 'bd-raw', capturedAt: '2026-07-22T00:00:00.000Z', rawText: 'edited text', status: 'captured' },
+  ]);
+  const before = fs.readFileSync(brainDumpPath, 'utf8');
+
+  // Drafted against different text than the entry now holds.
+  const task = { promptContext: { brainDumpEntryId: 'bd-raw', rawText: 'original text' } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: 'fixture-project' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.stale, true);
+  assert.equal(result.success, false);
+  assert.equal(result.file, undefined);
+  assert.equal(result.recoverable, undefined);
+
+  const entry = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0];
+  assert.equal(fs.readFileSync(brainDumpPath, 'utf8'), before);
+  assert.equal(entry.status, 'captured');
+  assert.equal(entry.sortAttempt, undefined);
+  assert.equal(fs.existsSync(secondBrainDir), false);
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'adhoc')), false);
+});
+
+test('applyBrainDumpSort stale guard control: unchanged captured entry (rawText matches draft) is NOT treated as stale', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-stale-ctl-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(secondBrainDir, { recursive: true });
+  const brainDumpPath = writeBrainDump(dir, [
+    { id: 'bd-ok', capturedAt: '2026-07-22T00:00:00.000Z', rawText: 'same text', status: 'captured' },
+  ]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-ok', rawText: 'same text' } };
+  const implementResponse = JSON.stringify({ category: 'idea', secondBrainPath: 'Ideas/x.md' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir: path.join(dir, 'pipeline') });
+
+  // Unchanged captured entry must reach classification, not the stale shape.
+  assert.notEqual(result.stale, true);
+  assert.notEqual(result.success, false);
+  assert.equal(typeof result.file, 'string');
+});
+
 test('applyBrainDumpSort stale no-op: status moved off captured since drafting -> same non-success shape', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-stale-'));
   const secondBrainDir = path.join(dir, 'secondbrain');
@@ -97,6 +172,41 @@ test('applyBrainDumpSort stale no-op: status moved off captured since drafting -
   const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
   assert.equal(entries[0].status, 'sorted'); // untouched -- the guard writes nothing
   assert.equal(entries[0].sortAttempt, undefined);
+});
+
+test('applyBrainDumpSort stale no-op: actioned entry with sortAttempt 0 -> no research or adhoc queueing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-stale-actioned-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  const pipelineDir = path.join(dir, 'pipeline');
+  fs.mkdirSync(pipelineDir, { recursive: true });
+  const brainDumpEntryId = 'bd-act';
+  const brainDumpPath = writeBrainDump(dir, [
+    { id: brainDumpEntryId, capturedAt: '2026-07-22T00:00:00.000Z', rawText: 'original', status: 'actioned', sortAttempt: 0 },
+  ]);
+
+  // Drafted against 'original' while the entry was still 'captured'; the entry has since been actioned.
+  const task = { promptContext: { brainDumpEntryId, rawText: 'original' } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.stale, true);
+  assert.equal(result.success, false);
+  assert.equal(result.researchQueued, undefined);
+  assert.equal(result.queuedTaskId, undefined);
+
+  // Neither the research write path (queueResearchTask) nor any adhoc/derived/needs-clarification path may write.
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue')), false, 'no queue directory written under pipelineDir');
+  for (const sub of ['research', 'adhoc', 'derived', 'needs-clarification']) {
+    assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', sub)), false, `no queue/${sub} written`);
+  }
+  assert.equal(fs.existsSync(secondBrainDir), false, 'no note filed');
+
+  // Entry left exactly as-is: still actioned, sortAttempt unchanged, no queuedTaskId written.
+  const saved = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0];
+  assert.equal(saved.status, 'actioned');
+  assert.equal(saved.sortAttempt, 0);
+  assert.equal(saved.queuedTaskId, undefined);
 });
 
 // 2026-09-16, pipeline hardening (brain_dump_sort possibleDuplicateOf false matches):
@@ -144,4 +254,239 @@ test('possibleDuplicateOf guard: a claimed title that IS in the real candidate l
     'a genuine exact match must NOT be discarded -- a real duplicate flag still reaches the duplicate gate');
   assert.equal(isValidDuplicateMatch('Add authentication to the Agent Manager dashboard session persistence', realTitles), true,
     'a truncated/extended form of a real title still matches, so a real duplicate is not lost to the guard');
+});
+
+// 2026-10-18: work for the entry appeared AFTER its sort was drafted -> link, do not queue (brain-dump-existing-work.js).
+test('applyBrainDumpSort: existing work for the entry -> skipped existingWork result, entry linked, nothing queued or filed', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-existing-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(secondBrainDir, { recursive: true });
+  const entry = brainDumpEntry({ id: 'bd-7', serial: 1905, capturedAt: '2026-10-18T03:00:00.000Z' });
+  const brainDumpPath = writeBrainDump(dir, [entry]);
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'adhoc-by-hand.json'), JSON.stringify({ id: 'adhoc-by-hand', promptContext: { raisedFrom: 'brain-dump-1905' } }));
+  const task = { promptContext: { brainDumpEntryId: 'bd-7', rawText: 'original' } };
+  const implementResponse = JSON.stringify({ category: 'idea', secondBrainPath: 'Ideas/x.md' });
+
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir: dir });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.existingWork, true);
+  assert.equal(result.linkedTo, 'adhoc-by-hand');
+  assert.match(result.reason, /already exists: adhoc-by-hand \(done, matched by raisedFrom\)/);
+  const saved = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0];
+  assert.equal(saved.status, 'actioned');
+  assert.equal(saved.queuedTaskId, 'adhoc-by-hand');
+  assert.equal(saved.linkedExistingWork.by, 'apply');
+  assert.deepEqual(fs.readdirSync(secondBrainDir), [], 'no note filed');
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')), false, 'no adhoc task queued');
+  const hist = fs.readFileSync(path.join(dir, 'instances', 'pipeline-history.log'), 'utf8');
+  assert.match(hist, /"type":"brain-dump-existing-work".*"by":"apply"/);
+});
+
+// 2026-10-24: brain-dump target check (brain-dump-target-check.js) wired into applyBrainDumpSort before the adhoc task is queued.
+function targetCheckFixture(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const repoRoot = path.join(dir, 'repo'); const pipelineDir = path.join(dir, 'pipeline');
+  fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'src', 'real.js'), '// stub\n');
+  // A real (sandbox) git repo: the check lists tracked files, and fails OPEN when it cannot.
+  const git = (...args) => require('child_process').execFileSync('git', ['-C', repoRoot, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', ...args], { stdio: 'ignore' });
+  git('init', '-q'); git('add', '-A'); git('commit', '-q', '-m', 'init');
+  fs.mkdirSync(path.join(pipelineDir, 'queue'), { recursive: true });
+  const domainsPath = path.join(pipelineDir, 'task-domains.json');
+  fs.writeFileSync(domainsPath, JSON.stringify({ adhoc: {}, default: {} }));
+  const registryPath = path.join(dir, 'projects.json');
+  fs.writeFileSync(registryPath, JSON.stringify([{ repoRoot, pipelineDir, domainsPath, label: 'fixture-project' }]));
+  const prev = process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH;
+  process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = registryPath;
+  const restore = () => { if (prev === undefined) delete process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH; else process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = prev; };
+  return { dir, repoRoot, pipelineDir, restore };
+}
+
+function sortWith(fx, entryOverrides) {
+  const rawText = entryOverrides.rawText;
+  const brainDumpPath = writeBrainDump(fx.dir, [brainDumpEntry({ id: 'bd-tc', ...entryOverrides })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-tc', rawText } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: 'fixture-project' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(fx.dir, 'sb'), pipelineDir: fx.pipelineDir });
+  return { result, entry: JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0] };
+}
+
+test('applyBrainDumpSort target check: an entry citing only missing paths queues no task, is parked and stamped', () => {
+  const fx = targetCheckFixture('apply-bd-targetcheck-');
+  try {
+    const { result, entry } = sortWith(fx, { rawText: 'The `drive_links.py` and `turn_cancel.py` modules do not exist' });
+    assert.equal(result.skipped, true);
+    assert.equal(result.targetCheck, true);
+    assert.match(result.reason, /every cited path is missing/);
+    assert.equal(fs.existsSync(path.join(fx.pipelineDir, 'queue', 'adhoc')), false, 'no adhoc task queued');
+    assert.equal(entry.status, 'captured');
+    assert.ok(!entry.suppressed);
+    assert.equal(entry.targetCheck.verdict, 'suspect');
+    assert.ok(entry.sortAttempt >= 3, 'parked so brain_dump_sort does not pick it again');
+    const hist = fs.readFileSync(path.join(fx.pipelineDir, 'instances', 'pipeline-history.log'), 'utf8');
+    assert.match(hist, /"type":"brain-dump-target-check"/);
+  } finally { fx.restore(); }
+});
+
+test('applyBrainDumpSort target check: an entry citing a real path still queues an adhoc task', () => {
+  const fx = targetCheckFixture('apply-bd-targetcheck-ok-');
+  try {
+    const { result, entry } = sortWith(fx, { rawText: 'Fix a defect in `src/real.js` and `src/new-helper.js`' });
+    assert.equal(result.targetCheck, undefined);
+    assert.equal(fs.readdirSync(path.join(fx.pipelineDir, 'queue', 'adhoc')).length, 1);
+    assert.equal(entry.targetCheck, undefined);
+  } finally { fx.restore(); }
+});
+
+test('applyBrainDumpSort target check: targetCheckOverride and the kill switch both let a suspect entry through', () => {
+  const text = 'The `gone-one.py` and `gone-two.py` modules do not exist';
+  let fx = targetCheckFixture('apply-bd-targetcheck-ovr-');
+  try {
+    sortWith(fx, { rawText: text, targetCheckOverride: true });
+    assert.equal(fs.readdirSync(path.join(fx.pipelineDir, 'queue', 'adhoc')).length, 1, 'override queues the task');
+  } finally { fx.restore(); }
+  fx = targetCheckFixture('apply-bd-targetcheck-off-');
+  process.env.AGENT_MANAGER_BRAIN_DUMP_TARGET_CHECK = 'false';
+  try {
+    sortWith(fx, { rawText: text });
+    assert.equal(fs.readdirSync(path.join(fx.pipelineDir, 'queue', 'adhoc')).length, 1, 'kill switch queues the task');
+  } finally { delete process.env.AGENT_MANAGER_BRAIN_DUMP_TARGET_CHECK; fx.restore(); }
+});
+
+// 2026-10-31: duplicate pre-queue check (brain-dump-duplicate-check.js) wired into applyBrainDumpSort.
+function sortEntryOf(fx, entries, id) {
+  const brainDumpPath = writeBrainDump(fx.dir, entries);
+  const rawText = entries.find((e) => e.id === id).rawText;
+  const task = { promptContext: { brainDumpEntryId: id, rawText } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: 'fixture-project' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(fx.dir, 'sb'), pipelineDir: fx.pipelineDir });
+  return { result, data: JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')) };
+}
+
+test('applyBrainDumpSort duplicate check: two filings of one defect queue exactly ONE task (the first), the second is parked with duplicateOf', () => {
+  const fx = targetCheckFixture('apply-bd-dup-pair-');
+  try {
+    const text = 'Fix a defect in `src/real.js` function `doThing` that returns the wrong value';
+    const entries = [brainDumpEntry({ id: 'bd-a', rawText: text }), brainDumpEntry({ id: 'bd-b', rawText: text })];
+    const first = sortEntryOf(fx, entries, 'bd-a');
+    assert.equal(first.result.duplicateCheck, undefined, 'the first filing is queued');
+    assert.equal(fs.readdirSync(path.join(fx.pipelineDir, 'queue', 'adhoc')).length, 1);
+    const second = sortEntryOf(fx, entries, 'bd-b');
+    assert.equal(second.result.skipped, true);
+    assert.equal(second.result.duplicateCheck, true);
+    assert.equal(second.result.linkedTo, 'bd-a');
+    assert.equal(fs.readdirSync(path.join(fx.pipelineDir, 'queue', 'adhoc')).length, 1, 'no second task');
+    assert.equal(second.data.entries.find((e) => e.id === 'bd-b').duplicateOf, 'bd-a');
+    assert.ok(second.data.entries.find((e) => e.id === 'bd-b').sortAttempt >= 3, 'parked so it is not picked again');
+  } finally { fx.restore(); }
+});
+
+test('applyBrainDumpSort duplicate check: a pushed branch for the same file and symbol parks the entry (the repo root reaches the check)', () => {
+  const fx = targetCheckFixture('apply-bd-dup-branch-');
+  try {
+    const run = (cwd, ...a) => require('child_process').execFileSync('git', ['-C', cwd, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', ...a], { stdio: 'ignore' });
+    const origin = path.join(fx.dir, 'origin.git'); fs.mkdirSync(origin); run(origin, 'init', '-q', '--bare', '-b', 'main');
+    run(fx.repoRoot, 'branch', '-M', 'main'); run(fx.repoRoot, 'remote', 'add', 'origin', origin);
+    fs.writeFileSync(path.join(fx.repoRoot, 'src', 'real.js'), 'function doThing() { return 1 }\n'); run(fx.repoRoot, 'commit', '-q', '-am', 'real'); run(fx.repoRoot, 'push', '-q', 'origin', 'main');
+    run(fx.repoRoot, 'checkout', '-q', '-b', 'agent/earlier'); fs.writeFileSync(path.join(fx.repoRoot, 'src', 'real.js'), 'function doThing() { return 2 }\n');
+    run(fx.repoRoot, 'commit', '-q', '-am', 'fix'); run(fx.repoRoot, 'push', '-q', 'origin', 'agent/earlier'); run(fx.repoRoot, 'checkout', '-q', 'main'); run(fx.repoRoot, 'fetch', '-q', 'origin');
+    const text = 'Fix a defect in `src/real.js` function `doThing` that returns the wrong value';
+    const { result, data } = sortEntryOf(fx, [brainDumpEntry({ id: 'bd-x', rawText: text })], 'bd-x');
+    assert.equal(result.duplicateCheck, true);
+    assert.equal(result.linkedTo, 'agent/earlier');
+    assert.equal(data.entries[0].duplicateOf, 'agent/earlier');
+    assert.equal(fs.existsSync(path.join(fx.pipelineDir, 'queue', 'adhoc')), false, 'no task queued');
+  } finally { fx.restore(); }
+});
+
+// HUB0195 3/4: infra attribution gate on recoverableSortSkip.
+// When the skip reason is infrastructure-attributed (detected via blockedReason or
+// reason-string markers like "timeout", "ECONNRESET", "502"), the entry's sortAttempt
+// budget must NOT be burned -- it goes to infraSortAttempts / infraSortAttemptCount
+// instead, with a sortBudgetEvents log and a sortExhausted stamp at the cap.
+// Content skips must still increment sortAttempt exactly as before.
+test('recoverableSortSkip: infra skip does NOT burn sortAttempt, uses infra counters instead', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-infra-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(secondBrainDir, { recursive: true });
+  const brainDumpPath = writeBrainDump(dir, [
+    { id: 'bd-infra', capturedAt: '2026-07-22T00:00:00.000Z', rawText: 'infra test', status: 'captured' },
+  ]);
+
+  // Task with a blockedReason that signals infra failure.
+  const task = {
+    blockedReason: 'upstream service returned 502 Bad Gateway -- network timeout',
+    promptContext: { brainDumpEntryId: 'bd-infra', rawText: 'infra test', existingQueuedTitles: [] },
+  };
+  // A classification that will fail the secondBrainPath validation (no tracked labels
+  // in a fresh sandbox), which routes through recoverableSortSkip with the reason
+  // string carrying the infra marker.
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'NonTracked/x.md', actionable: true, belongsToProject: 'nonexistent' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir: path.join(dir, 'pipeline') });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.recoverable, true);
+  const entry = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0];
+  // Infra skip: sortAttempt must NOT be burned.
+  assert.equal(entry.sortAttempt, undefined, 'sortAttempt must not be incremented on infra skip');
+  // Infra counters advance.
+  assert.equal(entry.infraSortAttempts, 1);
+  assert.equal(entry.infraSortAttemptCount, 1);
+  // Event logged.
+  assert.ok(Array.isArray(entry.sortBudgetEvents));
+  assert.equal(entry.sortBudgetEvents.length, 1);
+  assert.equal(entry.sortBudgetEvents[0].type, 'infraSortSkip');
+  // Not exhausted yet (cap is 3).
+  assert.equal(entry.sortExhausted, undefined);
+});
+
+test('recoverableSortSkip: content skip still burns sortAttempt as before', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-content-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(secondBrainDir, { recursive: true });
+  const brainDumpPath = writeBrainDump(dir, [
+    { id: 'bd-content', capturedAt: '2026-07-22T00:00:00.000Z', rawText: 'content test', status: 'captured' },
+  ]);
+
+  // Task with NO blockedReason -- a normal content skip.
+  const task = {
+    promptContext: { brainDumpEntryId: 'bd-content', rawText: 'content test', existingQueuedTitles: [] },
+  };
+  // Same path that will fail validation, but this time the reason string has no infra
+  // marker, so it falls through to the content-skip branch.
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'NonTracked/x.md', actionable: true, belongsToProject: 'nonexistent' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir: path.join(dir, 'pipeline') });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.recoverable, true);
+  const entry = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0];
+  // Content skip: sortAttempt must increment exactly as before.
+  assert.equal(entry.sortAttempt, 1, 'sortAttempt must be incremented on content skip');
+  // No infra counters touched.
+  assert.equal(entry.infraSortAttempts, undefined);
+  assert.equal(entry.infraSortAttemptCount, undefined);
+});
+
+test('recoverableSortSkip: infra exhaustion stamps sortExhausted at the cap', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-infra-exhaust-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(secondBrainDir, { recursive: true });
+  const entry = { id: 'bd-exhaust', capturedAt: '2026-07-22T00:00:00.000Z', rawText: 'exhaust test', status: 'captured', infraSortAttempts: 2 };
+  const brainDumpPath = writeBrainDump(dir, [entry]);
+
+  const task = {
+    blockedReason: 'connection refused -- ECONNRESET on upstream',
+    promptContext: { brainDumpEntryId: 'bd-exhaust', rawText: 'exhaust test', existingQueuedTitles: [] },
+  };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'NonTracked/x.md', actionable: true, belongsToProject: 'nonexistent' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir: path.join(dir, 'pipeline') });
+
+  assert.equal(result.skipped, true);
+  const updated = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0];
+  assert.equal(updated.infraSortAttempts, 3);
+  assert.equal(updated.sortExhausted, true, 'sortExhausted must be stamped when infra counter hits the cap');
+  assert.equal(updated.sortBudgetEvents.length, 2, 'infraSortSkip + infraSortExhausted events');
+  assert.equal(updated.sortBudgetEvents[1].type, 'infraSortExhausted');
 });

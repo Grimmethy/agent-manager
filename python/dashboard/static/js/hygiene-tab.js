@@ -4,17 +4,15 @@
 // Backend: GET /api/hygiene/inventory (routes/hygiene.py, src/hygiene-inventory.js). Nothing here writes.
 //
 // Like Brain Dump / Filed Findings / Branches, this tab opts out of the generic 5s full re-render (branches-joblist-
-// hardware-tabs.js's refresh()): expanding a family and reading its list must not be wiped mid-click. It runs its own
-// 30s poll instead (enterHygieneTab / leaveHygieneTab, wired in core-ui.js).
+// hardware-tabs.js's refresh()): expanding a family and reading its list must not be wiped mid-click. It has no timer: its inventory reloads
+// when hygiene-changed, counts-changed or branches-changed arrive (live-updates.js, applied through refreshActiveTabPanels in the page glue).
 
 let hygieneData = null;
 let hygieneError = null;
 let hygieneExpanded = null;          // family key currently expanded
 let hygieneFlagFilter = 'waiting';
 let hygieneCandFilter = 'all';
-let hygienePollTimer = null;
 let hygieneLoading = false;
-const HYGIENE_POLL_MS = 30000;
 const HYGIENE_LIST_CAP = 100;
 
 const HYGIENE_STATUS_BADGE = {
@@ -47,16 +45,9 @@ function hygieneDate(iso) {
 async function enterHygieneTab() {
   renderHygieneShell();
   await loadHygiene();
-  if (hygienePollTimer) clearInterval(hygienePollTimer);
-  hygienePollTimer = setInterval(() => { if (activeTab === 'hygiene') loadHygiene({ quiet: true }); }, HYGIENE_POLL_MS);
 }
 
-function leaveHygieneTab() {
-  if (hygienePollTimer) clearInterval(hygienePollTimer);
-  hygienePollTimer = null;
-}
-
-// renderMain() dispatches here; identical to entering the tab minus the timer (enterHygieneTab owns that).
+// renderMain() dispatches here; identical to entering the tab.
 async function renderHygieneTab() {
   renderHygieneShell();
   if (hygieneData) renderHygiene();
@@ -157,7 +148,7 @@ function hygieneFamilyDetail(f) {
     const statuses = ['waiting', 'blocked', 'queued', 'done', 'digest', 'suppressed', 'stale'];
     const shown = fl.items.filter((i) => hygieneFlagFilter === 'all' || i.status === hygieneFlagFilter);
     parts.push(`<div class="field-label" style="display:flex; justify-content:space-between">
-      <span title="${escapeAttr(statuses.map((s) => `${s}: ${HYGIENE_STATUS_HELP[s]}`).join('\n'))}">Scanner flags -- ${escapeHtml(statuses.map((s) => `${s} ${fl.counts[s] || 0}`).join(' · '))}</span>
+      <span title="${escapeAttr(statuses.map((s) => `${s}: ${HYGIENE_STATUS_HELP[s]}`).join('&#10;'))}">Scanner flags -- ${escapeHtml(statuses.map((s) => `${s} ${fl.counts[s] || 0}`).join(' · '))}</span>
       <select id="hyg-flag-filter" style="text-transform:none; letter-spacing:normal; font-size:12px">
         ${['waiting', 'all', ...statuses.filter((s) => s !== 'waiting')].map((s) => `<option value="${s}" ${hygieneFlagFilter === s ? 'selected' : ''}>${s}</option>`).join('')}
       </select></div>

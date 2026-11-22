@@ -16,6 +16,10 @@ hub.** A hub's sub-tasks are frequently designed as a matched set, not independe
   substance — e.g. the sub-tasks cover only one of several deliverables the original ask
   named. That context changes what "done" or "mergeable" even means for the pieces you're
   looking at, and is easy to miss if you only look at the individual branch's own commit.
+  Each vote in `localVotes` carries `verdict` and `response` plus, since 2026-11-16, `provider` (`cloud` when the vote ran on a cloud-lane gateway, otherwise `ollama`) and `model` (the model that cast it), so a verdict can be read as a cloud agent's or a local model's. Older records without the two keys still read.
+
+**Verdicts (2026-10-31):** merge (green), needs-work (yellow: a defect to fix), hold (blue: the piece is sound but cannot merge yet, because its hub is
+unfinished or a sibling must merge first; it is never redrafted and never counted as a defect), discard (red). `discard_stats.py` reports hold in its own column.
 
 **Before analyzing a branch for value/completeness:**
 
@@ -33,3 +37,11 @@ hub.** A hub's sub-tasks are frequently designed as a matched set, not independe
 See also: "Hub tasks: every sub-task must merge to `main` independently" in `AGENTS.md` for
 the separate mergeability rule this applies alongside (each sub-task still needs its own
 clean merge to `main` — this doc is about how to *review* them, not how they should land).
+
+## Which hub branches the tab lists (2026-10-31)
+
+The tab does not list a built piece of an unfinished hub: its branch is pushed, but held (`GET /api/git/held-hub-branches`, `?projects=all` for every project)
+until the hub is `readyToMerge`. Held: hubs whose source is `manual`, `derived_task` or `change_review_fix`, in any domain. Listed as before: function-length,
+performance and arch-review hubs (their pieces merge alone) and any hub that owns a branch. A hub with an **abandoned** piece is not ready (the piece is not
+shipped code, e.g. a wiring step): call `POST /api/hub/<hub_id>/waive-abandoned` with body `{"reason": "..."}` (optional `?project=<repoRoot>`) to say "merge it anyway"; the route sets `abandonedPiecesWaived: true` and records the reason in the hub's history, or use merge-early on a held branch.
+Verify a held piece only when its hub is ready; before that it can only be a "hold".

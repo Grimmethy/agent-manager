@@ -12,14 +12,22 @@
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
+const { ungatedMainPushAllowed, assertMainWriteAllowed } = require('./lib/main-push-policy.js');
+const { healGeneratedDirt } = require('./lib/apply-clone-dirt.js');
 
 const GIT_ENV = {
   ...process.env,
   GIT_TERMINAL_PROMPT: '0',
   GCM_INTERACTIVE: 'never',
 };
-const GIT_TIMEOUT_MS = 60_000;
+const { gitTimeoutMs } = require('./lib/git-timeout.js');   // AGENT_MANAGER_GIT_TIMEOUT_MS (default 60000), read on each call
+const FETCH_RETRY_PAUSE_MS = 2000;
+const FETCH_RETRY_TIMEOUT_FACTOR = 3;
+const { clearStaleRefLocks } = require('./lib/git-lock-utils.js');
+const FETCH_MAX_ATTEMPTS = 3;          // total attempts for one fetch, however timeouts and lock errors mix
+const LOCK_RETRY_BASE_MS = 1_000;      // pause after the nth failed attempt on a lock error: 1 s, then 2 s
+const LOCK_ERROR_RE = /cannot lock ref.*File exists|Unable to create.*\.lock.*File exists|Another git process seems to be running/i;
+function isLockError(err) { return Boolean(err) && LOCK_ERROR_RE.test(String(err.message || '')); }
 
 // Stable prefix of the error assertCleanTree() throws. apply-retry-check.js matches on it to treat the
 // failure as INFRASTRUCTURE (a git-state problem, not a draft-quality one): no retry burned, no redraft.
@@ -43,7 +51,7 @@ function detectDefaultBranch(repoRoot) {
   const candidates = [process.env.AGENT_MANAGER_MAIN_BRANCH, 'main', 'master'].filter(Boolean);
   for (const branch of candidates) {
     try {
-      execFileSync('git', ['rev-parse', '--verify', `origin/${branch}`], { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+      execFileSync('git', ['rev-parse', '--verify', `origin/${branch}`], { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: gitTimeoutMs() });
       return branch;
     } catch {
       continue;
@@ -66,17 +74,103 @@ function annotateGitTimeout(err, args, timeoutMs) {
  * Production adapter: real git via child_process, against a real repoRoot on disk.
  * @param {string} repoRoot - Absolute path to the git repo to operate on.
  */
-function createRealGitRunner(repoRoot) {
+// `exec` and `sleepMs` are injectable so the retry can be tested without real git or real waiting.
+function syncSleep(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSleep, lockOpts = {} } = {}) {
   const mainBranch = detectDefaultBranch(repoRoot);
-  function run(args) {
-    try {
-      return execFileSync('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
-    } catch (e) {
-      throw annotateGitTimeout(e, args, GIT_TIMEOUT_MS);
+  function run(args, extra = {}) {
+    const attempt = (timeout) => exec('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout, ...extra });
+    const limit = gitTimeoutMs();
+    // Only a FETCH is ever repeated: it is network- and disk-bound and safe to run again. A push, checkout, reset or merge that failed may have half-happened, so those run once.
+    if (args[0] !== 'fetch') {
+      try { return attempt(limit); } catch (e) { throw annotateGitTimeout(e, args, limit); }
+    }
+    // A fetch gets at most FETCH_MAX_ATTEMPTS attempts in total: a timeout is retried ONCE with a longer limit, a ref-lock error is retried with backoff. Before every attempt,
+    // ref locks that are old and have no git process behind them are removed (src/lib/git-lock-utils.js; a lock that might be live is never touched). The runner stays synchronous.
+    let timeout = limit;
+    let timedOutOnce = false;
+    for (let n = 1; ; n++) {
+      clearStaleRefLocks(repoRoot, lockOpts);
+      try {
+        return attempt(timeout);
+      } catch (e) {
+        if (n >= FETCH_MAX_ATTEMPTS) throw annotateGitTimeout(e, args, timeout);
+        if (e && e.code === 'ETIMEDOUT' && !timedOutOnce) {
+          timedOutOnce = true;
+          sleepMs(FETCH_RETRY_PAUSE_MS);
+          timeout = limit * FETCH_RETRY_TIMEOUT_FACTOR;
+        } else if (isLockError(e)) {
+          sleepMs(LOCK_RETRY_BASE_MS * Math.pow(2, n - 1));
+        } else {
+          throw annotateGitTimeout(e, args, timeout);
+        }
+      }
     }
   }
   function isAncestor(a, b) {
     try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
+  }
+  // Pre-flight (2026-09-23/24 incident): .gitattributes names a merge driver but its COMMAND lives only in each clone's local .git/config.
+  // A clone without it silently falls back to a plain text merge and the candidate-doc rebase conflicts. Log a clear warning; never throws.
+  function warnIfMergeDriverMissing(probePath = 'Docs/CHANGE_REVIEW_CANDIDATES.md') {
+    try {
+      const out = String(run(['check-attr', 'merge', '--', probePath])).trim();
+      const m = /:\s*merge:\s*(\S+)\s*$/.exec(out);
+      const driver = m && m[1];
+      if (!driver || ['unspecified', 'unset', 'set'].includes(driver)) return null;
+      let cmd = '';
+      try { cmd = String(run(['config', '--get', `merge.${driver}.driver`])).trim(); } catch { cmd = ''; }
+      if (cmd) return null;
+      const msg = `[git-runner] WARNING: .gitattributes names merge driver '${driver}' for ${probePath} but merge.${driver}.driver is unset in ${repoRoot}; rebases will fall back to a plain text merge. Run scripts/setup-merge-drivers.sh ${repoRoot}`;
+      console.error(msg);
+      return msg;
+    } catch { return null; }
+  }
+  // A push that hits the time cap may still have landed (2026-11-04: apply's `git push` of agent/<id> timed out after 60 s while the branch was arriving on GitHub; apply recorded
+  // a failure for work that was already on origin, and the sanctioned retry then collided with its own first push as a non-fast-forward: 33 minutes of a 38 minute build).
+  // After a TIMED-OUT push only, ask the remote what it holds: the push succeeded exactly when the remote tip of `name` is the local tip. Any doubt (no such branch there, a
+  // different tip, ls-remote or rev-parse failing) leaves the original error to be thrown. A rejection or any other push failure never gets here.
+  function pushLanded(name) {
+    try {
+      const remoteTip = String(run(['ls-remote', '--heads', 'origin', `refs/heads/${name}`])).trim().split(/\s+/)[0];
+      const localTip = String(run(['rev-parse', `refs/heads/${name}`])).trim();
+      return Boolean(remoteTip) && remoteTip === localTip;
+    } catch { return false; }
+  }
+  function pushBranch(name) {
+    try {
+      return run(['push', '-u', 'origin', name]);
+    } catch (e) {
+      if (e && e.code === 'ETIMEDOUT' && pushLanded(name)) return '';
+      throw e;
+    }
+  }
+  const pushMainGated = () => { assertMainWriteAllowed(run, mainBranch, 'git-runner:pushMain'); return pushBranch(mainBranch); };
+  // True only when a diverged local branch adds NOTHING its remote counterpart lacks -- it is a duplicate of origin's content (typically the same commits under
+  // different SHAs after the stale-main rebase rewrote one side), so a rescue branch would only be a stale snapshot of the rolling branch. Seen 2026-10-04/05 on
+  // TaxHarvest: 12 rescue branches in ~6 h, every one a near-copy of agent/triage-queue. Two signals, either suffices: (a) `git cherry <remote> <name>` lists no '+'
+  // line AND lists every local-unique commit (each has a patch-equivalent upstream; merges are invisible to cherry, so a count mismatch falls through to (b)), or (b) measured from the two branches' FORK POINT (merge-base, so shared history is not
+  // counted), the lines local ADDS are a NON-EMPTY subset of the lines the remote branch adds (the rule python/dashboard/branch_verdicts.py
+  // _check_redundant_snapshot applies to these branches, there measured from main). Any doubt -- a git failure, no common ancestor -- returns false and the caller
+  // rescues exactly as before: a wrong 'redundant' drops work, a wrong 'not redundant' costs one extra branch. Known limit: the line-set test looks only at added
+  // lines, so a local commit that duplicates added lines AND deletes lines origin kept would be judged redundant; the rolling candidate-doc branches this exists
+  // for only append.
+  function localAddsNothingOver(remote, name) {
+    try {
+      // `git cherry` skips merge commits, so "no '+' line" only proves a duplicate when it accounts for EVERY local-unique commit (a merge with its own edits would otherwise pass).
+      const cherry = run(['cherry', remote, name]).split('\n').filter(Boolean);
+      const uniqueCommits = Number(run(['rev-list', '--count', `${remote}..${name}`]).trim());
+      if (cherry.length === uniqueCommits && !cherry.some((l) => l.startsWith('+'))) return true;
+      const fork = run(['merge-base', name, remote]).trim();
+      if (!fork) return false;
+      const added = (ref) => new Set(run(['diff', '--unified=0', fork, ref]).split('\n')
+        .filter((l) => l.startsWith('+') && !l.startsWith('+++') && l.slice(1).trim()).map((l) => l.slice(1)));
+      const mine = added(name);
+      if (mine.size === 0) return false;                                  // nothing added since the fork: a deletions-only change is never "a duplicate"
+      const theirs = added(remote);
+      for (const line of mine) if (!theirs.has(line)) return false;
+      return true;
+    } catch { return false; }
   }
   // A DEDICATED apply clone is the one AGENT_MANAGER_APPLY_REPO_ROOT names (never the shared
   // interactive checkout, never any other repo). Nothing legitimate is ever left uncommitted in it, so
@@ -101,7 +195,7 @@ function createRealGitRunner(repoRoot) {
       const dir = path.join(gitDir, 'agent-manager-quarantine');
       fs.mkdirSync(dir, { recursive: true });
       const patch = execFileSync('git', ['stash', 'show', '-p', '--include-untracked', 'stash@{0}'], {
-        cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, maxBuffer: 256 * 1024 * 1024,
+        cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: gitTimeoutMs(), maxBuffer: 256 * 1024 * 1024,
       });
       if (!patch.trim()) return null;
       const file = path.join(dir, `stray-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}.patch`);
@@ -116,20 +210,69 @@ function createRealGitRunner(repoRoot) {
   }
   function doResetToMain() {
     const stashBefore = stashTip();
+    let stashOk = false;
+    let stashFallback = null;
     try {
       run(['stash', 'push', '-u', '-m', `agent-manager auto-stash before reset ${new Date().toISOString()}`]);
+      stashOk = true;
     } catch (e) {
-      throw new Error(`auto-stash before resetToMain failed, reset aborted to avoid destroying work: ${e.message}`);
+      // 2026-11-05 (stalled-task fix): a timed-out stash used to abort the whole reset,
+      // leaving the task permanently blocked because the worktree could never be cleaned.
+      // Fallback: capture tracked changes as a patch, list untracked files, then force-clean
+      // the worktree so the reset can proceed. The patch + untracked list live in
+      // AGENT_MANAGER_STASH_BACKUP_DIR (or /tmp/agent-manager-stash-backup if unset) under a
+      // timestamped subdirectory, so they survive the reset and can be recovered manually.
+      const isTimeout = e && (e.code === 'ETIMEDOUT' || /timed out after \d+ms/i.test(e.message));
+      if (isTimeout) {
+        const recoveryDir = path.join(
+          process.env.AGENT_MANAGER_STASH_BACKUP_DIR || '/tmp/agent-manager-stash-backup',
+          `fallback-${Date.now()}`
+        );
+        fs.mkdirSync(recoveryDir, { recursive: true });
+        stashFallback = { recoveryDir, savedTracked: false, savedUntracked: [] };
+        try {
+          const tracked = run(['diff']);
+          const patchFile = path.join(recoveryDir, 'tracked-changes.patch');
+          fs.writeFileSync(patchFile, tracked);
+          stashFallback.savedTracked = true;
+        } catch (patchErr) {
+          console.error(`[git-runner] resetToMain fallback: could not capture tracked changes: ${patchErr.message}`);
+        }
+        try {
+          const untracked = run(['ls-files', '--others', '--exclude-standard']);
+          const untrackedFiles = untracked.trim() ? untracked.trim().split(/\n/) : [];
+          if (untrackedFiles.length) {
+            fs.writeFileSync(path.join(recoveryDir, 'untracked-files.txt'), untrackedFiles.join('\n') + '\n');
+            stashFallback.savedUntracked = untrackedFiles;
+          }
+        } catch (untrackedErr) {
+          console.error(`[git-runner] resetToMain fallback: could not list untracked files: ${untrackedErr.message}`);
+        }
+        // Force-clean the worktree so the reset can proceed. git reset --hard HEAD clears
+        // tracked changes without touching untracked; git clean -fd clears the rest. Both
+        // are worktree-only operations -- no history is rewritten.
+        try { run(['reset', '--hard', 'HEAD']); } catch { /* best-effort */ }
+        try { run(['clean', '-fd']); } catch { /* best-effort */ }
+        console.error(
+          `[git-runner] auto-stash timed out (${e.message}); fell back to patch+clean. ` +
+          `Tracked changes saved: ${stashFallback.savedTracked ? 'yes' : 'no'}. ` +
+          `Untracked files listed: ${stashFallback.savedUntracked.length}. ` +
+          `Recover with: git apply ${path.join(recoveryDir, 'tracked-changes.patch')} && cat ${path.join(recoveryDir, 'untracked-files.txt')}`
+        );
+      } else {
+        throw new Error(`auto-stash before resetToMain failed, reset aborted to avoid destroying work: ${e.message}`);
+      }
     }
     run(['checkout', mainBranch]);
     run(['fetch', 'origin', mainBranch]);
     const remote = `origin/${mainBranch}`;
+    let divergedRescue = null; // set only when the diverged branch preserved local-only commits
     const originInLocal = isAncestor(remote, mainBranch);
     const localInOrigin = isAncestor(mainBranch, remote);
     if (originInLocal && !localInOrigin) {
       if (ungatedMainPushAllowed()) {
         try {
-          run(['push', 'origin', `${mainBranch}:${mainBranch}`]);
+          assertMainWriteAllowed(run, mainBranch, 'git-runner:resetToMain:fast-forward'); run(['push', 'origin', `${mainBranch}:${mainBranch}`]);
         } catch (e) {
           throw new Error(`resetToMain: local ${mainBranch} is ahead of origin but fast-forwarding it to origin failed (push rejected -- e.g. a protected branch or a race): ${e.message}`);
         }
@@ -148,9 +291,44 @@ function createRealGitRunner(repoRoot) {
         console.error(`[git-runner] local ${mainBranch} had commit(s) origin lacks; NOT pushed to ${mainBranch} (no ungated main pushes) -- kept on ${rescue} for a human to review/merge`);
       }
     } else if (!originInLocal && !localInOrigin) {
-      throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic reset`);
+      // Diverged: preserve local-only commits on a rescue branch, then align main to origin
+      // (the reset below). Main is never pushed. Throw only if the rescue itself fails.
+      const stamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+      let rescue = `agent/rescued-${mainBranch}-${stamp}`;
+      let preserved = null;
+      try {
+        let exists = true;
+        try { run(['rev-parse', '--verify', '--quiet', `refs/heads/${rescue}`]); } catch { exists = false; }
+        if (exists) rescue = `${rescue}-${Math.random().toString(36).slice(2, 8)}`;
+        run(['branch', rescue, mainBranch]);
+        const a = String(run(['rev-parse', rescue])).trim();
+        const b = String(run(['rev-parse', mainBranch])).trim();
+        if (!a || a !== b) throw new Error(`rescue ref ${rescue} does not match local ${mainBranch}`);
+        preserved = rescue;
+      } catch (e) {
+        throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- automatic recovery failed, needs a human to reconcile, not an automatic reset. Nothing was preserved; local ${mainBranch} is not reconciled with ${remote}: ${e.message}`);
+      }
+      divergedRescue = preserved;
+      try { run(['push', '-u', 'origin', preserved]); } catch { /* best-effort: the local rescue branch still exists */ }
+      console.error(`[git-runner] local ${mainBranch} and ${remote} were out of sync (local-only commit(s) on both sides); preserved local-only commit(s) on ${preserved} and aligning ${mainBranch} to ${remote}`);
     }
-    run(['reset', '--hard', remote]);
+    try {
+      run(['reset', '--hard', remote]);
+    } catch (e) {
+      if (divergedRescue) {
+        throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged -- automatic recovery failed: local-only commit(s) were preserved on ${divergedRescue}, but the reset to ${remote} failed, so local ${mainBranch} is not reconciled: ${e.message}`);
+      }
+      throw e;
+    }
+    // 2026-11-05 (stalled-task fix): if we fell back from a timed-out stash, log where the
+    // work was saved so the task owner (or the next retry) knows how to recover it.
+    if (stashFallback) {
+      console.error(
+        `[git-runner] resetToMain completed with stash fallback. ` +
+        `Recover saved work: git apply ${path.join(stashFallback.recoveryDir, 'tracked-changes.patch')} 2>/dev/null; ` +
+        `cat ${path.join(stashFallback.recoveryDir, 'untracked-files.txt')}`
+      );
+    }
     // Pop the stash created above right back onto the now-reset tree (2026-09-14, fixing
     // the "never popped" hazard this function used to carry -- see the header comment on
     // the returned object below for the full incident history). Confirmed live: the
@@ -210,6 +388,10 @@ function createRealGitRunner(repoRoot) {
       return quarantineStash();
     },
     assertCleanTree: () => {
+      // Compiled-cache dirt (tracked __pycache__/*.pyc rewritten by any Python run) is restored first; see lib/apply-clone-dirt.js.
+      const healed = healGeneratedDirt(run);
+      if (healed.restored.length) console.error(`[git-runner] restored ${healed.restored.length} generated file(s) in ${repoRoot}: ${healed.restored.slice(0, 5).join(', ')}`);
+      else if (healed.wouldRestore.length) console.error(`[git-runner] (dry-run) would restore ${healed.wouldRestore.length} generated file(s) in ${repoRoot}: ${healed.wouldRestore.slice(0, 5).join(', ')}`);
       const lines = run(['status', '--porcelain', '--untracked-files=no']).split('\n').filter(Boolean);
       if (!lines.length) return;
       const files = lines.map((l) => l.slice(3)).slice(0, 8).join(', ');
@@ -267,7 +449,9 @@ function createRealGitRunner(repoRoot) {
     //     "the whole prior chain already merged" fallback the seq===1 path already uses
     //     (2026-09-07 reasoning) -- now reached by an actual staleness check instead of
     //     by trusting whatever name happens to exist locally.
+    warnIfMergeDriverMissing,
     prepareStackedBranch: (name) => {
+      warnIfMergeDriverMissing();
       try {
         run(['fetch', 'origin', name]);
       } catch {
@@ -311,6 +495,11 @@ function createRealGitRunner(repoRoot) {
             // tip and let the pipeline continue. A human can still recover the rescue
             // branch's content later; nothing downstream has to wait on them noticing
             // first.
+            if (localAddsNothingOver(remote, name)) {
+              console.error(`[git-runner] prepareStackedBranch: local ${name} had diverged from ${remote} but adds nothing origin lacks (a duplicate of origin's content) -- resetting without a rescue branch`);
+              run(['checkout', '-B', name, remote]);
+              return;
+            }
             const rescue = `${name}-rescued-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}`;
             try { run(['branch', rescue, name]); } catch { /* best-effort: proceed even if the rescue branch itself couldn't be created */ }
             try { run(['push', '-u', 'origin', rescue]); } catch { /* best-effort: the local rescue branch still exists even if the push fails */ }
@@ -319,7 +508,7 @@ function createRealGitRunner(repoRoot) {
             return;
           }
         }
-        // A ROLLING branch (e.g. TRIAGE_BRANCH) is never explicitly rebased on its own --
+        // A ROLLING branch (e.g. TRIAGE_BRANCH) is never explicitly rebased on its own (it is brought up to main by the MERGE below) --
         // apply-main-batch.js's own header says so plainly ("based on whatever main was
         // when it was first created and is never rebased"). Every branch of the logic
         // above only ever compares LOCAL to REMOTE; none of it ever asks whether the
@@ -333,16 +522,33 @@ function createRealGitRunner(repoRoot) {
         // explicitly retracted as a false positive after the fact.
         try { run(['fetch', 'origin', mainBranch]); } catch { /* best-effort, matches fetchMain elsewhere */ }
         if (!isAncestor(`origin/${mainBranch}`, remote)) {
+          // MERGE main in first; the rebase is only the fallback (brain dump bd-1791228522460, 2026-10-05). The rebase this used to do EVERY time rewrote only the LOCAL branch and nothing pushed the
+          // rewrite, so origin never contained main and this block re-fired on EVERY tick: a tick with a batch had its plain push rejected (non-fast-forward) and
+          // retryPushAfterRebase rebased the commits back onto the old origin tip; a tick with nothing to commit left the rewrite unpushed and the next tick saw
+          // two-sided divergence (the `-rescued-` branches, 18 in ~11 h on TaxHarvest; the reflog of the local branch shows the pattern). A merge only ADVANCES the
+          // branch: the push is a fast-forward, no SHA is rewritten, and main is an ancestor of origin after the first tick. Local ends strictly ahead of origin by one
+          // merge commit, which the 'trust local' path above already handles on the next call.
           run(['checkout', '-B', name, remote]);
           try {
-            run(['rebase', `origin/${mainBranch}`]);
-          } catch (e) {
-            try { run(['rebase', '--abort']); } catch { /* best-effort */ }
-            throw new Error(
-              `prepareStackedBranch: ${remote} is based on a stale point of ${mainBranch} (main has moved on since this rolling branch was last built) and rebasing its still-unmerged commits onto the current tip failed -- needs a human to reconcile, not an automatic sync: ${e.message}`,
-            );
+            run(['merge', '--no-edit', `origin/${mainBranch}`]);
+            return;
+          } catch (mergeErr) {
+            try { run(['merge', '--abort']); } catch { /* best-effort */ }
+            // A single three-way merge can conflict where the commit-by-commit rebase would not: the rolling branch may already carry changes that main later received
+            // under other SHAs (the rebase drops those as already applied; replayed on real TaxHarvest refs the merge conflicted on adjacent removals in
+            // frontend/src/api/properties.ts where the rebase succeeded). Falling back to the rebase keeps that case working exactly as it did before; only a conflict
+            // BOTH ways needs a human. (The rebase path still rewrites only the local branch -- the old loop -- but is now the rare path, not every tick.)
+            try {
+              run(['rebase', `origin/${mainBranch}`]);
+              console.error(`[git-runner] prepareStackedBranch: merging ${mainBranch} into ${name} conflicted; rebased onto ${mainBranch} instead (the rebase drops commits main already carries): ${String(mergeErr && mergeErr.message).split('\n')[0].slice(0, 160)}`);
+              return;
+            } catch (e) {
+              try { run(['rebase', '--abort']); } catch { /* best-effort */ }
+              throw new Error(
+                `prepareStackedBranch: ${remote} is based on a stale point of ${mainBranch} (main has moved on since this rolling branch was last built) and neither merging the current ${mainBranch} into it nor rebasing its still-unmerged commits onto it worked -- needs a human to reconcile, not an automatic sync: ${e.message}`,
+              );
+            }
           }
-          return;
         }
         run(['checkout', '-B', name, remote]); // local missing, or ⊆ origin (stale/behind/identical); remote itself is current
         return;
@@ -367,9 +573,12 @@ function createRealGitRunner(repoRoot) {
       try { run(['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}`]); } catch { return false; }
       return !isAncestor(remote, `origin/${mainBranch}`);
     },
+    // Drops candidate blocks main already retracted from the CURRENT branch's Docs/*_CANDIDATES.md and commits the removal (its own commit, pushed
+    // with the next batch). Paired repair for the merge driver's old ignore-deletions bug -- see src/lib/prune-retracted-candidates.js. Never throws.
+    pruneRetractedCandidates: () => require('./lib/prune-retracted-candidates.js').pruneRetractedCandidates({ repoRoot, git: run, mainRef: `origin/${mainBranch}` }),
     add: (files) => run(['add', ...files]),
     commit: (messageFilePath) => run(['commit', '-F', messageFilePath]),
-    push: (branchName) => run(['push', '-u', 'origin', branchName]),
+    push: (branchName) => (branchName === mainBranch ? pushMainGated() : pushBranch(branchName)),
     // 2026-09-24: closes the specific gap that produced two real incidents (a human
     // manually rescuing agent/triage-queue by hand on 2026-09-23, then four more identical
     // blocks on 2026-09-24) -- an ordinary non-fast-forward push rejection (origin moved
@@ -404,12 +613,7 @@ function createRealGitRunner(repoRoot) {
     // per-task branch isolation, and resetToMain()'s hard reset to origin/<mainBranch>
     // would otherwise silently destroy an un-pushed local commit on the very next apply
     // -- confirmed live 2026-08-16, see apply-task.js's own comment on this path.
-    pushMain: () => {
-      if (!ungatedMainPushAllowed()) {
-        throw new Error(`pushMain refused: pushing ${mainBranch} to origin without a human gate is disabled (set AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH=true to override). Push a branch and merge it via the dashboard/PR instead.`);
-      }
-      return run(['push', '-u', 'origin', mainBranch]);
-    },
+    pushMain: pushMainGated,
   };
 }
 
@@ -500,6 +704,7 @@ function createFakeGitRunner(opts = {}) {
       const isAncestor = opts.isAncestorFn || (() => false);
       return !isAncestor(`origin/${name}`, `origin/${opts.mainBranch || 'main'}`);
     },
+    pruneRetractedCandidates: () => { record('pruneRetractedCandidates'); return { pruned: [], committed: false }; },
     add: (files) => record('add', files),
     commit: (messageFilePath) => record('commit', messageFilePath),
     push: (branchName) => record('push', branchName),

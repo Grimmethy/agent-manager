@@ -9,6 +9,7 @@ const { findTaskAnywhere, QUEUE_STATES } = require('./task-anywhere.js');
 const { lineMatches } = require('./text-match.js');
 const { getConfig } = require('./config.js');
 const { queueAdhocTask } = require('./queue-adhoc-task.js');
+const { listProjects, resolveProject, projectForText } = require('./chat-projects.js');
 const { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, withApplyLock, runBashTool, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS } = require('./local-tool-fs-tools.js');
 
 const READ_TASK_SECTIONS = { plan: 'planResponse', implement: 'implementResponse', blockedReason: 'blockedReason', history: 'history' };
@@ -141,7 +142,7 @@ function archivedTaskFiles(pipelineDir) {
   return out;
 }
 
-function searchTasksTool(pipelineDir, { query, state, includeArchived } = {}) {
+function searchTasksTool(pipelineDir, { query, state, includeArchived, similar = false } = {}) {
   if (typeof query !== 'string' || !query.trim()) {
     return { error: 'search_tasks requires a non-empty "query" argument' };
   }
@@ -165,6 +166,27 @@ function searchTasksTool(pipelineDir, { query, state, includeArchived } = {}) {
   }
   if (includeArchived) candidates = [...candidates, ...archivedTaskFiles(pipelineDir)];
 
+  // similar mode: rank ALL candidates first, then cap, so a late/archived/body-only match is not dropped by file order.
+  if (similar === true) {
+    const { rankTasks, DUPLICATE_SCORE } = require('./task-similarity.js');
+    const docs = [];
+    const byKey = new Map();
+    for (const { fullPath, foundState } of candidates) {
+      let data;
+      try { data = JSON.parse(fs.readFileSync(fullPath, 'utf8')); } catch { continue; }
+      const fallbackId = path.basename(fullPath, '.json');
+      const id = data.id || fallbackId;
+      if (byKey.has(id)) continue;
+      const summary = { ...taskSummary(data, fallbackId), foundState };
+      byKey.set(id, summary);
+      docs.push({ id, title: data.title || '', promptContext: data.promptContext, state: foundState });
+    }
+    const ranked = rankTasks(query, docs, { limit: MAX_SEARCH_TASK_RESULTS });
+    const results = ranked.map((r) => ({ ...byKey.get(r.id), score: r.score, matchedOn: r.matchedOn }));
+    if (results.length > 0 && results[0].score < DUPLICATE_SCORE) results[0].note = 'no close match';
+    return { results };
+  }
+
   const results = [];
   for (const { fullPath, foundState } of candidates) {
     if (results.length >= MAX_SEARCH_TASK_RESULTS) break;
@@ -178,11 +200,139 @@ function searchTasksTool(pipelineDir, { query, state, includeArchived } = {}) {
   return { results };
 }
 
-function queueReviewedTaskTool(pipelineDir, { title, description }) {
+function realDir(p) {
+  try { return fs.realpathSync(p); } catch { return path.resolve(String(p)); }
+}
+
+// `project` (label or repo root, from list_projects) files the task into THAT project's queue with its task-domains.json. Omitted: today's target (the
+// pipelineDir argument), but a text whose absolute paths all belong to ONE other registered project is refused instead of landing in the wrong queue
+// (2026-10-25: two tasks about the chat plugin repo went into agent-manager's own queue). `opts` is for tests: { projects, defaultDomainsPath }.
+// search_tasks with project "all": every registered project's queue (one search per distinct pipeline dir), each hit tagged with its project label,
+// at most MAX_SEARCH_TASK_RESULTS in total. `opts.projects` is for tests.
+function searchTasksAllProjects(args, opts = {}) {
+  const projects = opts.projects || listProjects();
+  const seen = new Set();
+  const results = [];
+  for (const project of projects) {
+    if (results.length >= MAX_SEARCH_TASK_RESULTS) break;
+    const dir = realDir(project.pipelineDir);
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    const found = searchTasksTool(project.pipelineDir, args);
+    if (found.error) return found;
+    for (const hit of found.results) {
+      if (results.length >= MAX_SEARCH_TASK_RESULTS) break;
+      results.push({ ...hit, project: project.label });
+    }
+  }
+  return { results };
+}
+
+// Records a duplicate-gate history event on the candidate task's own file (a dismissed task has no record of its own).
+// Best-effort: a failing write never changes the dismiss-or-queue decision.
+function recordGateEvent(entry, stage, detail, opts) {
+  try {
+    const { appendHistoryEvent } = require('./task-history.js');
+    const writer = opts.appendHistoryEvent || appendHistoryEvent;
+    const data = JSON.parse(fs.readFileSync(entry.fullPath, 'utf8'));
+    writer(data, stage, JSON.stringify(detail));
+    fs.writeFileSync(entry.fullPath, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.warn(`[queue_reviewed_task] could not record ${stage} for ${detail.candidateId}:`, e && e.message ? e.message : String(e));
+  }
+}
+
+// Returns a dismissal result when a same-source duplicate exists, else null. Throws only on unexpected errors (caller falls through).
+function duplicateGate(pipelineDir, title, description, opts = {}) {
+  // What queueAdhocTask stamps on every record it writes; opts.source overrides (tests / other callers).
+  const newSource = opts.source !== undefined ? opts.source : 'manual';
+  if (!newSource) return null;
+  const sim = require('./task-similarity.js');
+  const rank = opts.rankTasks || sim.rankTasks;
+  const threshold = opts.duplicateScore !== undefined ? opts.duplicateScore : sim.DUPLICATE_SCORE;
+  const { sharesDistinctivePhrase: phraseFn } = require('./text-similarity.js');
+  const query = `${title} ${description.slice(0, 600)}`;
+
+  const docs = [];
+  const byId = new Map();
+  const files = [
+    ...candidateTaskFiles(pipelineDir, 'drafting'),
+    ...QUEUE_STATES.flatMap((s) => candidateTaskFiles(pipelineDir, s)),
+    ...candidateTaskFiles(pipelineDir, 'adhoc'),
+  ];
+  for (const { fullPath, foundState } of files) {
+    let data;
+    try { data = JSON.parse(fs.readFileSync(fullPath, 'utf8')); } catch { continue; }
+    const id = data.id || path.basename(fullPath, '.json');
+    if (byId.has(id)) continue;
+    byId.set(id, { fullPath, source: data.source, title: data.title || '' });
+    docs.push({ id, title: data.title || '', promptContext: data.promptContext, state: foundState });
+  }
+  if (docs.length === 0) return null;
+
+  const ranked = rank(query, docs, { limit: 5 }) || [];
+  let dismissal = null;
+  for (const r of ranked) {
+    if (!(r.score >= threshold)) continue;
+    const entry = byId.get(r.id);
+    if (!entry) continue;
+    const candidateSource = r.source !== undefined ? r.source : entry.source;
+    const phrase = r.sharesDistinctivePhrase !== undefined ? r.sharesDistinctivePhrase : Boolean(phraseFn(query, entry.title));
+    const detail = { newTitle: title, candidateId: r.id, score: r.score, matchedOn: r.matchedOn, sharesDistinctivePhrase: phrase, source: candidateSource };
+    const dismiss = !dismissal && candidateSource === newSource && phrase === true && r.matchedOn !== 'id';
+    if (dismiss) dismissal = detail;
+    recordGateEvent(entry, dismiss ? 'duplicate-dismissed' : 'near-miss', detail, opts);
+  }
+  if (!dismissal) return null;
+  return {
+    dismissedAsDuplicateOf: dismissal.candidateId,
+    score: dismissal.score,
+    matchedOn: dismissal.matchedOn,
+    message: `Not queued: this looks like a duplicate of ${dismissal.candidateId} (score ${dismissal.score}). If it is genuinely different, reword the title/description and call again.`,
+  };
+}
+
+function queueReviewedTaskTool(pipelineDir, { title, description, project, dependsOn }, opts = {}) {
   if (typeof title !== 'string' || !title.trim()) return { error: 'queue_reviewed_task requires a non-empty "title" argument' };
   if (typeof description !== 'string' || !description.trim()) return { error: 'queue_reviewed_task requires a non-empty "description" argument' };
+  // dependsOn validation: must be an array of strings if provided, each referencing a real task
+  if (dependsOn !== undefined && !Array.isArray(dependsOn)) return { error: 'queue_reviewed_task dependsOn must be an array of task ids (or omitted)' };
+  if (Array.isArray(dependsOn) && dependsOn.length > 0) {
+    if (!dependsOn.every((id) => typeof id === 'string' && id.trim())) {
+      return { error: 'queue_reviewed_task dependsOn entries must be non-empty strings (task ids)' };
+    }
+  }
   if (isGitWriteRequest({ title, description })) return { error: GIT_WRITE_REQUEST_REFUSAL };
-  const { domainsPath } = getConfig();
+  const projects = opts.projects || listProjects();
+  let target = { pipelineDir, domainsPath: null, label: null }; // domainsPath null = the process default, looked up only when a task is really queued
+  if (typeof project === 'string' && project.trim()) {
+    const resolved = resolveProject(project, projects);
+    if (resolved.error) return { error: resolved.error };
+    target = { pipelineDir: resolved.project.pipelineDir, domainsPath: resolved.project.domainsPath, label: resolved.project.label };
+  } else {
+    const owner = projectForText(`${title}\n${description}`, projects);
+    if (owner && realDir(owner.pipelineDir) !== realDir(pipelineDir)) {
+      return { error: `this task is about the project "${owner.label}" (paths under ${owner.repoRoot}) but would be queued to a different project's queue; call again with project: "${owner.label}"` };
+    }
+  }
+  // Validate dependsOn ids exist in the target project's queue/done/
+  if (Array.isArray(dependsOn) && dependsOn.length > 0) {
+    const unresolved = dependsOn.filter((depId) => {
+      const found = findTaskAnywhere(target.pipelineDir, depId);
+      return !found;
+    });
+    if (unresolved.length > 0) {
+      return { error: `queue_reviewed_task: dependsOn references unknown task id(s): ${unresolved.join(', ')} -- none of these exist in the target project's queue or done/` };
+    }
+  }
+  // Duplicate gate: dismiss only a near-certain duplicate from the SAME source; everything else queues as before.
+  // Best-effort -- any failure inside it falls through to queueing so a broken gate never drops a task.
+  try {
+    const dismissed = duplicateGate(target.pipelineDir, title, description, opts);
+    if (dismissed) return dismissed;
+  } catch (e) {
+    console.warn('[queue_reviewed_task] duplicate gate failed, queueing anyway:', e && e.message ? e.message : String(e));
+  }
   try {
     // premiumPriority: true (2026-09-16, Grimmethy: "any tasks that chat is working on
     // directly should be labelled premium priority") -- every task Chat itself queues
@@ -190,13 +340,14 @@ function queueReviewedTaskTool(pipelineDir, { title, description }) {
     // now, not a background-priority idea to triage eventually. See
     // queueAdhocTask()'s own header for what this field does.
     const { record } = queueAdhocTask(
-      { title, promptContext: { rawText: description, raisedFrom: 'chat' }, premiumPriority: true },
-      { pipelineDir, domainsPath },
+      { title, promptContext: { rawText: description, raisedFrom: 'chat' }, premiumPriority: true, premiumSetBy: 'chat-queue', dependsOn: Array.isArray(dependsOn) && dependsOn.length > 0 ? dependsOn : undefined, ...(target.label ? { project: target.label } : {}) },
+      { pipelineDir: target.pipelineDir, domainsPath: target.domainsPath || opts.defaultDomainsPath || getConfig().domainsPath },
     );
-    return { queuedTaskId: record.id, message: `Queued as ${record.id} (premium priority) -- it will go through the normal review pipeline (see the Adhoc Tasks tab).` };
+    const where = target.label ? ` in project "${target.label}"` : '';
+    return { queuedTaskId: record.id, ...(target.label ? { project: target.label } : {}), message: `Queued as ${record.id}${where} (premium priority) -- it will go through the normal review pipeline (see the Adhoc Tasks tab).` };
   } catch (e) {
     return { error: `failed to queue task: ${e.message}` };
   }
 }
 
-module.exports = { taskSummary, formatTaskHistory, windowSectionText, readTaskTool, candidateTaskFiles, archivedTaskFiles, searchTasksTool, queueReviewedTaskTool, READ_TASK_SECTIONS, MAX_SEARCH_TASK_RESULTS };
+module.exports = { searchTasksAllProjects, taskSummary, formatTaskHistory, windowSectionText, readTaskTool, candidateTaskFiles, archivedTaskFiles, searchTasksTool, queueReviewedTaskTool, READ_TASK_SECTIONS, MAX_SEARCH_TASK_RESULTS };

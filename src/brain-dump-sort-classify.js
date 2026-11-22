@@ -44,6 +44,25 @@ const GENERIC_FILENAME_BLOCKLIST = new Set([
   'untitled', 'temp', 'draft', 'journal', 'log',
 ]);
 
+// Tags (2026-10-17): the implement prompt's schema example used to be `["short", "lowercase", "keywords"]`, and the 8B on the RX 580 copied it verbatim
+// in 6 of 20 notes (the 27B: 1 of 143), leaving those notes with no usable tags -- and the tags also feed the related-note derivation in
+// apply-group-a-brain-dump.js. Placeholder / template tags are dropped, and a note left with none gets keywords taken from its own file name.
+const PLACEHOLDER_TAG_WORDS = new Set(['short', 'lowercase', 'keywords', 'keyword', 'tag', 'tags', 'tag1', 'tag2', 'tag3']);
+const TAG_STOPWORDS = new Set(['the', 'and', 'for', 'with', 'from', 'into', 'that', 'this', 'when', 'not', 'are', 'its', 'md', 'fix', 'note', 'notes']);
+
+function isPlaceholderTag(tag) {
+  const t = String(tag).trim().toLowerCase();
+  return !t || PLACEHOLDER_TAG_WORDS.has(t) || /^<.*>$/.test(t);
+}
+
+function sanitizeTags(tags, secondBrainPath) {
+  const real = (Array.isArray(tags) ? tags : []).map(String).filter((t) => !isPlaceholderTag(t));
+  if (real.length) return real;
+  const stem = String(secondBrainPath || '').split('/').pop().replace(/\.md$/i, '');
+  const words = stem.split(/[-_.\s]+/).map((w) => w.toLowerCase()).filter((w) => w.length >= 3 && !TAG_STOPWORDS.has(w));
+  return [...new Set(words)].slice(0, 5);
+}
+
 // Parses brain_dump_sort's implement-pass output -- a single JSON object, not markdown
 // (see prompts.js's brainDumpSortImplementPrompt for the exact schema). Returns null on
 // anything unparseable or missing secondBrainPath, rather than throwing -- callers treat
@@ -69,7 +88,7 @@ function parseBrainDumpSortResult(implementResponse) {
     // relative on POSIX but an absolute-looking second segment can behave surprisingly on
     // some platforms; normalize here rather than rely on path.join's platform handling.
     secondBrainPath: String(parsed.secondBrainPath).replace(/^[/\\]+/, '').trim(),
-    tags: Array.isArray(parsed.tags) ? parsed.tags.map(String) : [],
+    tags: sanitizeTags(parsed.tags, parsed.secondBrainPath),
     actionable: !!parsed.actionable,
     rationale: parsed.rationale ? String(parsed.rationale).trim() : '',
     belongsToProject: nullishString(parsed.belongsToProject),
@@ -137,6 +156,13 @@ function validateSecondBrainPath(relPath, secondBrainDir, trackedProjectLabels =
   const stem = baseName.replace(/\.[^./]+$/, '').toLowerCase().trim();
   if (GENERIC_FILENAME_BLOCKLIST.has(stem)) {
     return `filename "${baseName}" is too generic to find again later -- name it after the actual subject of the note (e.g. "ebay-cross-post-automation.md", not "ideas.md")`;
+  }
+
+  // A file named after nothing but a tracked project ("Projects/agent-manager.md") is as unfindable as "ideas.md": every note about that project would
+  // want the same name. Seen twice in 24 notes from the RX 580 8B (2026-10-18); the 27B never did it.
+  const normName = (s) => String(s).toLowerCase().replace(/[_\s]+/g, '-');
+  if ((Array.isArray(trackedProjectLabels) ? trackedProjectLabels : []).some((l) => normName(l) === normName(stem))) {
+    return `filename "${baseName}" is just the project name -- name the file after the actual subject of the note (e.g. "apply-task-path-validation.md", not "${baseName}")`;
   }
 
   const topLevel = segments[0];
@@ -217,6 +243,15 @@ function isInvestigationFinding(rawText) {
   return INVESTIGATION_RE.test(String(rawText || ''));
 }
 
+// Name tokens that identify a tracked project without being generic words every project label shares ("agent", "manager", "plugin", ...).
+const GENERIC_LABEL_TOKENS = new Set(['agent', 'manager', 'plugin', 'plugins', 'project', 'client', 'portal', 'research', 'forge', 'app', 'the']);
+function distinctiveLabelTokens(label) {
+  return String(label).split(/[^A-Za-z0-9]+/).filter(Boolean)
+    .flatMap((w) => w.split(/(?<=[a-z])(?=[A-Z])/))
+    .map((w) => w.toLowerCase())
+    .filter((w) => w.length >= 3 && !GENERIC_LABEL_TOKENS.has(w));
+}
+
 function deriveBelongsToProject(parsed, promptContext = {}) {
   const trackedLabels = Array.isArray(promptContext.projectLabels) ? promptContext.projectLabels : [];
   const rawLabel = nullishString(parsed.belongsToProject);
@@ -258,6 +293,16 @@ function deriveBelongsToProject(parsed, promptContext = {}) {
     l !== selfLabel && new RegExp(`\\b${l.replace(/-/g, '[- ]?')}\\b`, 'i').test(head)))];
   if (named.length === 1) {
     return { belongsToProject: named[0], actionable: true };
+  }
+
+  // The model named a project that is NOT tracked (its own invention) and the head check above found nothing: before falling back to the
+  // self-project recovery below, look for exactly one OTHER tracked project whose distinctive name token appears anywhere in the note.
+  // Live 2026-10-17: a note about automating a credit / private-debt Google Sheet dashboard got the invented label
+  // "agent-manager-plugin-research", then self-recovered to agent-manager on the word "dashboard"; the 27B routed it to credit-manager-plugin.
+  if (rawLabel && !trackedLabels.includes(rawLabel)) {
+    const evidenced = trackedLabels.filter((l) => l !== selfLabel && distinctiveLabelTokens(l).some((tok) => new RegExp(`\\b${tok}\\b`, 'i').test(rawText)));
+    const unique = [...new Set(evidenced)];
+    if (unique.length === 1) return { belongsToProject: unique[0], actionable: true };
   }
 
   // Self-project recovery for a concrete change to this pipeline itself.
@@ -315,6 +360,7 @@ module.exports = {
   CANONICAL_TOP_LEVEL,
   GENERIC_FILENAME_BLOCKLIST,
   parseBrainDumpSortResult,
+  sanitizeTags,
   validateSecondBrainPath,
   normalizeSecondBrainPathCase,
   deriveBelongsToProject,

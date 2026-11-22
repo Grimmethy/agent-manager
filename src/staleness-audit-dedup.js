@@ -3,6 +3,13 @@
 // staleness-audit-dedup.js -- extracted from src/staleness-audit.js ([[hub-task-integration]] node-module decompose).
 
 const { normalizeTokens, jaccardSimilarity: jaccard, STOPWORDS: DUP_STOPWORDS, distinctivePhrases: sharedDistinctivePhrases } = require('./text-similarity.js');
+// Reuse the path-extraction helper staleness-audit's own named-file checks use
+// (candidateFilePaths -> fact-checker.js's extractFilePaths) rather than a second,
+// possibly-inconsistent regex.
+const { candidateFilePaths } = require('./staleness-audit-signals.js');
+// Reuse the existing hub-membership resolver: parentHub (stamped by apply-task.js)
+// wins, promptContext.decomposedFrom (written by every decompose producer) as fallback.
+const { hubIdForTask } = require('./hub-priority.js');
 
 function normalizeTaskTokens(task) {
   const ctx = task.promptContext || {};
@@ -19,17 +26,133 @@ function bdLineage(id) {
   return m ? m[1] : null;
 }
 
-function findDuplicateTask(task, corpus) {
+// Two tasks related as hub and child in EITHER direction -- the child record's resolved
+// hub id (parentHub or promptContext.decomposedFrom, via hubIdForTask) is the other
+// record's id, or the hub's subTasks list contains the child's id. subTasks may carry
+// the full record id or a shorter hub-token, so compare exact-match or '-'-bounded
+// prefix in either direction. A hub and its own child legitimately share almost all
+// their text (the child IS the decomposed restatement of the hub) -- that is
+// coordination, not duplication, and must never be flagged as 'duplicate-of (retire)':
+// retiring one of the pair would drop the only live record of work that is not done.
+function relatedAsHubAndChild(a, b) {
+  if (!a || !b) return false;
+  const hubA = hubIdForTask(a);
+  const hubB = hubIdForTask(b);
+  if (hubA && String(b.id) && hubA === b.id) return true;
+  if (hubB && String(a.id) && hubB === a.id) return true;
+  const subTaskMatches = (entry, otherId) => {
+    const e = String(entry || '').trim();
+    if (!e) return false;
+    return e === otherId || otherId.startsWith(e + '-') || e.startsWith(otherId + '-');
+  };
+  if (Array.isArray(a.subTasks) && a.subTasks.some((s) => subTaskMatches(s, b.id))) return true;
+  if (Array.isArray(b.subTasks) && b.subTasks.some((s) => subTaskMatches(s, a.id))) return true;
+  return false;
+}
+
+// 2026-11-01 (questforge hub HUB0029): two pieces of ONE stacked hub chain are siblings by construction. A contract-first hub repeats the same
+// large shared CONTRACT paragraph at the top of every piece (inside the first 600 characters normalizeTaskTokens reads), so any two siblings
+// overlapped by ~90% and HUB0029-07 got 'duplicate-of (high, retire) -- overlaps HUB0029-04' although the two were different deliverables. Same
+// stacked.branch, or the same promptContext.decomposedFrom, means siblings: never a duplicate of each other (only of something OUTSIDE the chain).
+function relatedAsSiblings(a, b) {
+  if (!a || !b) return false;
+  const branchA = a.stacked && typeof a.stacked === 'object' ? a.stacked.branch : null;
+  const branchB = b.stacked && typeof b.stacked === 'object' ? b.stacked.branch : null;
+  if (branchA && branchB && branchA === branchB) return true;
+  const fromA = a.promptContext && a.promptContext.decomposedFrom;
+  const fromB = b.promptContext && b.promptContext.decomposedFrom;
+  return Boolean(fromA && fromB && fromA === fromB);
+}
+
+// Both tasks name at least one real source file, and the two named sets share NONE:
+// the token overlap is shared boilerplate (a decompose hub's "Decompose
+// <path> (N module(s))" title and prompt scaffolding), not shared subject matter --
+// two hubs that split DIFFERENT files are different work. Only fires when BOTH sides
+// name >= 1 file: a task that names no file at all is never dropped by this guard and
+// still goes through the normal Jaccard/threshold decision, so a real twin whose
+// rewording happens to name fewer (or zero) paths can't be silently skipped here.
+function namesDisjointFiles(a, b) {
+  let fa = [];
+  let fb = [];
+  try { fa = candidateFilePaths(a) || []; } catch { fa = []; }
+  try { fb = candidateFilePaths(b) || []; } catch { fb = []; }
+  if (fa.length === 0 || fb.length === 0) return false;
+  const setA = new Set(fa);
+  return !fb.some((p) => setA.has(p));
+}
+
+// Blocking index for the Jaccard duplicate decision. It is exact for the threshold:
+// Jaccard >= t implies the two token sets share a token within their prefixes under any
+// fixed global token order (prefix length n - ceil(t*n) + 1). Each record's token set is
+// computed once. A probe only compares against records that share a prefix token; the
+// existing jaccard check still decides every candidate, so blocking never changes which
+// pairs are flagged. Build it once per dedup pass and pass it as opts.index.
+function sortByGlobalOrder(tokens, df) {
+  return [...tokens].sort((x, y) => {
+    const dx = df.get(x) || 0;
+    const dy = df.get(y) || 0;
+    if (dx !== dy) return dx - dy;
+    if (x === y) return 0;
+    return x < y ? -1 : 1;
+  });
+}
+
+// The epsilon makes ceil() err toward a longer prefix, which can only add candidates.
+function prefixLength(n, threshold) {
+  return Math.max(1, n - Math.ceil(threshold * n - 1e-9) + 1);
+}
+
+function buildDupIndex(corpus, threshold = dupSimilarityThreshold()) {
+  const entries = [];
+  for (const other of corpus || []) {
+    if (!other || !other.id) continue;
+    entries.push({ other, tokens: normalizeTaskTokens(other) });
+  }
+  const df = new Map();
+  for (const e of entries) for (const tok of e.tokens) df.set(tok, (df.get(tok) || 0) + 1);
+  const postings = new Map();
+  entries.forEach((e, idx) => {
+    const sorted = sortByGlobalOrder(e.tokens, df);
+    const p = prefixLength(sorted.length, threshold);
+    for (let i = 0; i < p && i < sorted.length; i += 1) {
+      const list = postings.get(sorted[i]);
+      if (list) list.push(idx); else postings.set(sorted[i], [idx]);
+    }
+  });
+  return { threshold, entries, df, postings };
+}
+
+// Candidate entries for a probe token set, in ascending corpus order so ties resolve as
+// the brute-force scan would.
+function dupCandidates(mine, index) {
+  const sorted = sortByGlobalOrder(mine, index.df);
+  const p = prefixLength(sorted.length, index.threshold);
+  const hit = new Set();
+  for (let i = 0; i < p && i < sorted.length; i += 1) {
+    for (const idx of index.postings.get(sorted[i]) || []) hit.add(idx);
+  }
+  return [...hit].sort((a, b) => a - b).map((i) => index.entries[i]);
+}
+
+// `opts.relationCheck` / `opts.siblingCheck` / `opts.fileDisjointCheck` are test-only switches (default on):
+// a mutation test flips them off to prove the new guards are what suppress the pair.
+// `opts.index` is an optional prebuilt buildDupIndex(corpus) for the same corpus.
+function findDuplicateTask(task, corpus, { relationCheck = true, siblingCheck = true, fileDisjointCheck = true, index = null } = {}) {
   const mine = normalizeTaskTokens(task);
   if (mine.size < 4) return null;
   const myLineage = bdLineage(task.id);
   const threshold = dupSimilarityThreshold();
+  const idx = index && index.entries && index.threshold === threshold ? index : buildDupIndex(corpus, threshold);
   let best = null;
-  for (const other of corpus || []) {
+  for (const cand of dupCandidates(mine, idx)) {
+    const other = cand.other;
     if (!other || !other.id || other.id === task.id) continue;
     if (/(^|-)(brain-dump-sort|product-spec-outline)-/.test(other.id)) continue;
     if (myLineage && bdLineage(other.id) === myLineage) continue; // same lineage, not a dup
-    const sim = jaccard(mine, normalizeTaskTokens(other));
+    if (relationCheck && relatedAsHubAndChild(task, other)) continue; // hub/child, not a dup
+    if (siblingCheck && relatedAsSiblings(task, other)) continue; // pieces of one hub chain share the contract text, not the work
+    if (fileDisjointCheck && namesDisjointFiles(task, other)) continue; // different files, boilerplate overlap
+    const sim = jaccard(mine, cand.tokens);
     if (sim >= threshold && (!best || sim > best.sim)) {
       best = { id: other.id, state: other.state || other.status || null, sim: Number(sim.toFixed(2)) };
     }
@@ -37,4 +160,4 @@ function findDuplicateTask(task, corpus) {
   return best;
 }
 
-module.exports = { normalizeTaskTokens, dupSimilarityThreshold, bdLineage, findDuplicateTask };
+module.exports = { normalizeTaskTokens, dupSimilarityThreshold, bdLineage, buildDupIndex, findDuplicateTask, relatedAsHubAndChild, relatedAsSiblings, namesDisjointFiles };

@@ -18,6 +18,8 @@
 const { runPlanWithTools } = require('./local-tool-client.js');
 const { summariseInvestigation } = require('./agentic-draft-common.js');
 const { buildPlanGrounding, groundingCovers } = require('./plan-grounding.js');
+const { labelFor } = require('./model-provider.js');
+const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 
 const ORIENT_TURNS = Number(process.env.AGENT_MANAGER_ADHOC_ORIENT_TURNS) || 8;
 const ORIENT_NOTES_CAP = 4000;
@@ -45,7 +47,7 @@ function buildOrientPrompt(task, groundingText) {
 }
 
 // task, { grounding?, runPlan?, maybeLocked } -> { notes: string, turnsUsed: number, skipped: bool }
-async function runOrientPass(task, { grounding, runPlan = runPlanWithTools, maybeLocked } = {}) {
+async function runOrientPass(task, { grounding, runPlan = runPlanWithTools, maybeLocked, recordModelCall = defaultRecordModelCall } = {}) {
   const g = grounding || buildPlanGrounding(task);
   const groundingText = g ? g.text : '';
 
@@ -56,12 +58,23 @@ async function runOrientPass(task, { grounding, runPlan = runPlanWithTools, mayb
 
   const call = () => runPlan({ prompt: buildOrientPrompt(task, groundingText), maxTurns: ORIENT_TURNS, source: task.source, taskId: task.id, stage: 'orient' });
   let result;
+  const startedAt = new Date().toISOString();
+  const startMs = Date.now();
   try {
     result = maybeLocked ? await maybeLocked(true, call, 'orient') : await call();
   } catch (e) {
     // Orient is best-effort -- a failed run just means the plan falls back to the
     // deterministic grounding.
     return { notes: groundingText, turnsUsed: 0, skipped: true, error: String(e && e.message || e).slice(0, 200) };
+  }
+
+  // HUB0280-03: this pass runs through runPlanWithTools, not local-client.js call(), so nothing else writes its model_calls row (tokens are summed over the turns).
+  if (recordModelCall && typeof task.id === 'string' && task.id) {
+    try {
+      recordModelCall({ taskId: task.id, stage: 'orient', model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result, source: task.source });
+    } catch (e) {
+      console.warn(`[orient-pass] model_calls record failed for ${task.id} (non-fatal): ${e && e.message}`);
+    }
   }
 
   const responseText = (result && result.response) || '';

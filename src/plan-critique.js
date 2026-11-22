@@ -15,6 +15,7 @@
 
 const { taskIdentifiers } = require('./task-anchor-files.js');
 const { call: localCall } = require('./local-client.js');
+const { isForgePause } = require('./gpu-guard.js');
 
 const GAP_TAGS = ['MISSING_REQUIREMENT', 'UNVERIFIED_PATH', 'SCOPE_TOO_BIG', 'NO_VERIFICATION'];
 const MAX_GAPS = 5;
@@ -27,7 +28,6 @@ const MAX_GAPS = 5;
 // model name, so this call already correctly took turns with the main draft lane before
 // this change; this fix only removes the swap cost, not a locking gap.)
 const CRITIQUE_MODEL = process.env.AGENT_MANAGER_PLAN_CRITIQUE_MODEL;
-const CRITIQUE_NUM_CTX = 8192;
 
 function clip(s, n) {
   const str = String(s || '');
@@ -109,21 +109,29 @@ function parseCritique(text) {
 }
 
 // task, { call?, maybeLockedOn } -> { verdict: 'ok'|'gaps', gaps: string[], viaModel: bool }
-async function runPlanCritique(task, { call = localCall, maybeLockedOn } = {}) {
+async function decidePlanCritique(task, { call = localCall, maybeLockedOn } = {}) {
   const det = deterministicGaps(task);
   if (det.length) return { verdict: 'gaps', gaps: det.slice(0, MAX_GAPS), viaModel: false };
 
   const prompt = buildPlanCritiquePrompt(task);
-  const fn = () => call({ prompt, model: CRITIQUE_MODEL, numCtx: CRITIQUE_NUM_CTX, think: false, temperature: 0.2, numPredict: 500, source: task.source });
+  const fn = () => call({ prompt, model: CRITIQUE_MODEL, think: false, temperature: 0.2, numPredict: 500, source: task.source });
   let result;
   try {
     result = maybeLockedOn ? await maybeLockedOn(CRITIQUE_MODEL, fn, 'plan-critique') : await fn();
   } catch (e) {
+    if (isForgePause(e)) throw e;   // the Forge family holds the GPU: do not turn the pause into "no gaps" (the draft would skip its critique)
     // Critique is advisory -- a failed run just means no re-plan.
     return { verdict: 'ok', gaps: [], viaModel: true, error: String(e && e.message || e).slice(0, 160) };
   }
   if (result && result.degenerate) return { verdict: 'ok', gaps: [], viaModel: true };
   return { ...parseCritique(result && result.response), viaModel: true };
+}
+
+// task, opts -> { verdict, gaps, viaModel, error? }; logs exactly one line per critique.
+async function runPlanCritique(task, opts = {}) {
+  const out = await decidePlanCritique(task, opts);
+  console.warn('[plan-critique] verdict=%s gaps=%d viaModel=%s', out.verdict, out.gaps.length, out.viaModel);
+  return out;
 }
 
 module.exports = { runPlanCritique, buildPlanCritiquePrompt, parseCritique, deterministicGaps, GAP_TAGS, MAX_GAPS };

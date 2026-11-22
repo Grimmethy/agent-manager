@@ -84,6 +84,15 @@ function monthBucket(d) {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
+// Single source of truth for the queue/done/_archived/<YYYY-MM>/ destination both passes use.
+function archiveDestDir(doneDir, now) {
+  return path.join(doneDir, ARCHIVE_DIRNAME, monthBucket(new Date(now)));
+}
+
+function ensureArchiveDir(destDir) {
+  fs.mkdirSync(destDir, { recursive: true });
+}
+
 /**
  * Scans queue/done/ TOP LEVEL ONLY (fs.readdirSync is non-recursive by nature -- never
  * descends into _archived_no_action/ or the dated _archived/<YYYY-MM>/ folders this itself
@@ -105,7 +114,7 @@ function archiveDoneTasks({ pipelineDir, now = Date.now() }) {
     return result;
   }
 
-  const destDir = path.join(doneDir, ARCHIVE_DIRNAME, monthBucket(new Date(now)));
+  const destDir = archiveDestDir(doneDir, now);
   let destDirEnsured = false;
 
   for (const entry of entries) {
@@ -127,7 +136,7 @@ function archiveDoneTasks({ pipelineDir, now = Date.now() }) {
     }
 
     if (!destDirEnsured) {
-      fs.mkdirSync(destDir, { recursive: true });
+      ensureArchiveDir(destDir);
       destDirEnsured = true;
     }
     try {
@@ -156,7 +165,7 @@ function archiveDoneTasks({ pipelineDir, now = Date.now() }) {
  */
 function archiveSpecificDoneTasks({ pipelineDir, taskIds, now = Date.now() }) {
   const doneDir = path.join(pipelineDir, 'queue', 'done');
-  const destDir = path.join(doneDir, ARCHIVE_DIRNAME, monthBucket(new Date(now)));
+  const destDir = archiveDestDir(doneDir, now);
   const result = { moved: 0, missing: 0, errors: [] };
   let destDirEnsured = false;
 
@@ -164,7 +173,7 @@ function archiveSpecificDoneTasks({ pipelineDir, taskIds, now = Date.now() }) {
     const src = path.join(doneDir, `${id}.json`);
     if (!fs.existsSync(src)) { result.missing++; continue; }
     if (!destDirEnsured) {
-      fs.mkdirSync(destDir, { recursive: true });
+      ensureArchiveDir(destDir);
       destDirEnsured = true;
     }
     try {
@@ -215,7 +224,7 @@ function listArchivedMonthDirs(pipelineDir) {
 }
 
 module.exports = {
-  archiveDoneTasks, archiveSpecificDoneTasks, checkDue, listArchivedMonthDirs, retentionMs, statePath, monthBucket, ARCHIVE_DIRNAME,
+  archiveDoneTasks, archiveSpecificDoneTasks, checkDue, listArchivedMonthDirs, retentionMs, statePath, monthBucket, archiveDestDir, ensureArchiveDir, ARCHIVE_DIRNAME,
 };
 
 if (require.main === module) {

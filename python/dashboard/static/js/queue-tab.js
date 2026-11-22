@@ -1,6 +1,12 @@
 // Queue tab: task actions, hub sort and priority, the source filter wiring and renderQueueTab. Moved verbatim out of core-ui.js (2026-10-01); allSourceNames and safeSourceNames stayed behind because core-ui.test.js requires safeSourceNames from core-ui.js. A plain global <script>, loaded by index.html right after core-ui.js.
 // No require()/module.exports: the browser loads this with a plain <script src> tag, so every name below is a shared global.
 
+// Project filter state, keyed by queue state (active, pending, done, all). Mirrors
+// queueSourceFilter's shape -- per-state so each tab can keep its own project filter
+// independent of the others. Default 'active' matches the contract's precedence:
+// URL ?project=, then selected, then 'active'.
+var queueProjectFilter = { active: 'active', pending: 'active', done: 'active', all: 'all' };
+
 async function postTaskAction(state, id, action, confirmMessage, body) {
   if (confirmMessage && !confirm(confirmMessage)) return;
   try {
@@ -39,6 +45,21 @@ function wireQueueSourceFilter(state) {
     queueLoadedCount[state] = QUEUE_PAGE_SIZE;
     renderQueueTab(state);
   };
+}
+
+function wireQueueProjectFilter(state) {
+  const container = document.getElementById('queue-project-filter');
+  if (!container) return;
+  if (typeof renderQueueProjectFilter !== 'function') return;
+  renderQueueProjectFilter(container, {
+    projects: [], // populated by sibling task; empty for now
+    selected: queueProjectFilter[state] || 'active',
+    onChange: (value) => {
+      queueProjectFilter[state] = value;
+      queueLoadedCount[state] = QUEUE_PAGE_SIZE;
+      renderQueueTab(state);
+    },
+  });
 }
 
 // Hub Tasks tab sort control. Choice persists in localStorage so it survives a reload and
@@ -112,7 +133,9 @@ async function renderQueueTab(state) {
   if (!queueLoadedCount[state]) queueLoadedCount[state] = QUEUE_PAGE_SIZE;
   queueLoadInFlight = true;
   const sourceFilter = queueSourceFilter[state] || '';
-  const filterQS = sourceFilter ? `&source=${encodeURIComponent(sourceFilter)}` : '';
+  const projectValue = queueProjectFilter[state] || 'active';
+  const filterQS = sourceFilter ? `&source=${encodeURIComponent(sourceFilter)}` : '' +
+    (projectValue && projectValue !== 'all' ? `&project=${encodeURIComponent(projectValue)}` : '');
   // Hub Tasks tab sort (2026-09-09, Grimmethy: "I'd like the hubs to be sortable either
   // alphabetically by name or by priority"). Only the coordinating state honours it;
   // 'priority' (the default) = explicit hubPriority asc, then unranked hubs oldest-first.
@@ -136,17 +159,18 @@ async function renderQueueTab(state) {
     .concat(sourceNames.map((n) => `<option value="${escapeAttr(n)}" ${n === sourceFilter ? 'selected' : ''}>${escapeHtml(n)}</option>`))
     .join('');
   const hubSortHtml = state === 'coordinating'
-    ? `<label class="meta" style="margin-left:14px">Sort hubs: <select id="hub-sort-select">
+    ? `<label class="meta" style="margin-left:16px">Sort hubs: <select id="hub-sort-select">
          <option value="priority" ${hubSort === 'priority' ? 'selected' : ''}>Priority (then oldest first)</option>
          <option value="name" ${hubSort === 'name' ? 'selected' : ''}>Name (A–Z)</option>
        </select></label>`
     : '';
-  const filterHtml = `<div class="row" style="margin-bottom:10px"><label class="meta">Task type: <select id="queue-source-filter">${filterOptionsHtml}</select></label>${hubSortHtml}</div>`;
+  const filterHtml = `<div class="row" style="margin-bottom:8px"><label class="meta">Task type: <select id="queue-source-filter">${filterOptionsHtml}</select></label>${hubSortHtml}<div id="queue-project-filter"></div></div>`;
 
   if (isStale()) return;
   if (tasks.length === 0) {
     main.innerHTML = filterHtml + `<div class="empty">${sourceFilter ? `No "${escapeHtml(sourceFilter)}" tasks here.` : 'Nothing here.'}</div>`;
     wireQueueSourceFilter(state);
+    wireQueueProjectFilter(state);
     wireHubSort(state);
     return;
   }
@@ -183,6 +207,8 @@ async function renderQueueTab(state) {
   // first time a new family appears in the (already hierarchy-ordered) list -- works even
   // when a page starts mid-family, since every row carries its family's label, not just roots.
   let lastHubFamily = null;
+  // hub-labels.js resolveHubLabels, guarded so the tab still renders if the script is not loaded. Used only for the family header's parent line.
+  const hubLabels = (typeof resolveHubLabels === 'function') ? (resolveHubLabels(tasks) || {}) : {};
   const rows = tasks.map(t => {
     const isPrompt = showApply && approvalModeBySource[t.source] === 'prompt';
     // Orange left-border + ⚠ prefix on every row here -- the actual ask (Discuss session
@@ -233,8 +259,8 @@ async function renderQueueTab(state) {
         'retries-exhausted': '🧗 capability ceiling', 'fabrication-repeat': '🧗 capability ceiling',
         'recheck-verdict-archive': '🪦 recheck: retire' }[sf.reason] || `⚑ ${sf.reason}`;
       const tip = escapeAttr(((sf.evidence || []).join(' • ')).slice(0, 400) + `  [${sf.confidence}${sf.voteResult ? ', ' + sf.voteResult : ''}]`);
-      const col = sf.confidence === 'high' ? 'var(--bad)' : 'var(--warn)';
-      return `<span title="${tip}" style="display:inline-block;margin-bottom:3px;padding:1px 5px;border:1px solid ${col};border-radius:3px;color:${col};font-size:11px">${label}</span><br>`;
+      const col = sf.confidence === 'high' ? 'chip-bad' : 'chip-warn';
+      return `<span title="${tip}" class="chip chip-block ${col}">${label}</span><br>`;
     })() : '';
     const rereviewBtn = t.rereviewable ? `<button type="button" class="secondary task-rereview-btn" data-id="${escapeAttr(t.id)}" title="Send this SAME draft back to review (no redraft) -- for when the draft was fine and the review side was wrong">Re-review</button>` : '';
     const keepBtn = sf ? `<button type="button" class="secondary task-staleness-keep-btn" data-id="${escapeAttr(t.id)}" title="Dismiss this flag -- the task stays and is not re-flagged for a while">Keep</button>` : '';
@@ -245,8 +271,8 @@ async function renderQueueTab(state) {
     const ctf = t.contextTrimFlag;
     const trimChip = ctf ? (() => {
       const tip = escapeAttr(((ctf.evidence || []).join(' • ')).slice(0, 400) + `  [${ctf.confidence}]`);
-      const col = ctf.confidence === 'strong' ? 'var(--bad)' : 'var(--warn)';
-      return `<span title="${tip}" style="display:inline-block;margin-bottom:3px;padding:1px 5px;border:1px solid ${col};border-radius:3px;color:${col};font-size:11px">🔍 stale grounding — needs re-anchoring</span><br>`;
+      const col = ctf.confidence === 'strong' ? 'chip-bad' : 'chip-warn';
+      return `<span title="${tip}" class="chip chip-block ${col}">🔍 stale grounding — needs re-anchoring</span><br>`;
     })() : '';
     const trimKeepBtn = ctf ? `<button type="button" class="secondary task-context-trim-keep-btn" data-id="${escapeAttr(t.id)}" title="Dismiss this flag -- the task stays as-is and won't be re-anchored for a while">Keep grounding as-is</button>` : '';
     // Hub Tasks family indent (2026-09-08): hubDepth comes pre-computed from api_queue_state's
@@ -256,11 +282,11 @@ async function renderQueueTab(state) {
     // children. Shown on every coordinating row; the button prompts and POSTs to
     // /api/task-anywhere/<id>/hub-priority.
     const hubPriorityControl = state === 'coordinating'
-      ? `<div style="margin-top:3px">`
+      ? `<div style="margin-top:4px">`
         + (t.hubPriority !== null && t.hubPriority !== undefined
-          ? `<span title="Hub priority — lower is worked first" style="display:inline-block;padding:1px 5px;border:1px solid var(--link);border-radius:3px;color:var(--link);font-size:11px">P${escapeHtml(String(t.hubPriority))}</span> `
-          : `<span class="meta" style="font-size:11px">unranked</span> `)
-        + `<button type="button" class="secondary hub-priority-btn" data-id="${escapeAttr(t.id)}" data-priority="${t.hubPriority === null || t.hubPriority === undefined ? '' : escapeAttr(String(t.hubPriority))}" style="padding:0 6px;font-size:11px" title="Set or clear this hub's priority">Set priority</button>`
+          ? `<span title="Hub priority — lower is worked first" class="chip chip-link chip-solo">P${escapeHtml(String(t.hubPriority))}</span> `
+          : `<span class="meta" style="font-size:12px">unranked</span> `)
+        + `<button type="button" class="secondary hub-priority-btn" data-id="${escapeAttr(t.id)}" data-priority="${t.hubPriority === null || t.hubPriority === undefined ? '' : escapeAttr(String(t.hubPriority))}" style="padding:0 8px;font-size:12px" title="Set or clear this hub's priority">Set priority</button>`
         + `</div>`
       : '';
     const hubIdCell = state === 'coordinating'
@@ -268,7 +294,11 @@ async function renderQueueTab(state) {
       : `<td>${t.id}</td>`;
     let familyHeaderRow = '';
     if (state === 'coordinating' && t.hubFamily && t.hubFamily !== lastHubFamily) {
-      familyHeaderRow = `<tr><td colspan="4" style="background:rgba(91,157,255,0.14);color:var(--link);font-weight:600;padding:6px 8px;border-top:1px solid var(--border)">🗂 ${escapeHtml(t.hubFamily)}</td></tr>`;
+      const famRootId = t.hubDepth ? ((tasks.find(x => x && !x.hubDepth && x.hubFamily === t.hubFamily) || {}).id || null) : t.id;
+      const famInfo = famRootId && hubLabels[famRootId];
+      const famParentLine = famInfo && famInfo.parentLabel ? `<div class="meta" style="font-size:12px;font-weight:400">part of ${escapeHtml(famInfo.parentLabel)} / ${escapeHtml(famInfo.parentRecordId)}</div>` : '';
+      const famOpenAttrs = famRootId ? ` class="clickable" data-state="coordinating" data-id="${escapeAttr(famRootId)}" title="${escapeAttr(famRootId)}" tabindex="0" role="button" style="cursor:pointer" onkeydown="if(event.key==='Enter'){openDetail(this.dataset.state,this.dataset.id)}"` : '';
+      familyHeaderRow = `<tr${famOpenAttrs}><td colspan="4" style="background:rgba(91,157,255,0.14);color:var(--link);font-weight:600;padding:6px 8px;border-top:1px solid var(--border)">🗂 ${escapeHtml(t.hubFamily)}${famParentLine}</td></tr>`;
       lastHubFamily = t.hubFamily;
     }
     return `${familyHeaderRow}
@@ -301,11 +331,12 @@ async function renderQueueTab(state) {
   `;
   }).join('');
   const actionHeader = (showArchiveRequeue || showArchiveOnly || showConfirmDeny || showApply) ? '<th>Actions</th>' : '';
-  const footer = `<div class="meta" style="padding:10px 4px">Showing ${tasks.length} of ${total}${queueHasMore[state] ? ' -- scroll for more' : ''}</div>`
+  const footer = `<div class="meta" style="padding:12px 4px">Showing ${tasks.length} of ${total}${queueHasMore[state] ? ' -- scroll for more' : ''}</div>`
     + (state === 'needs-clarification' ? '<div class="meta" style="padding:0 4px">Click a row to pick a file path, answer an open design question, or Discuss -- then send it back to drafting.</div>' : '');
   if (isStale()) return;
   main.innerHTML = filterHtml + `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th>${actionHeader}</tr></thead><tbody>${rows}</tbody></table>${footer}`;
   wireQueueSourceFilter(state);
+  wireQueueProjectFilter(state);
   wireHubSort(state);
   main.querySelectorAll('tr.clickable').forEach(row => {
     row.onclick = () => openDetail(row.dataset.state, row.dataset.id);

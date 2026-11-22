@@ -110,7 +110,7 @@ test('reclaim-log.jsonl (reclaim-orphaned-drafts.js) is git-ignored', () => {
 // user's own free-typed personal/business note content -- confirmed live, 13 of 48
 // already-committed entries originated from brain-dump entries.
 test('task-logs/ (task-log-store.js) is git-ignored -- it can retain a brain-dump note verbatim, and this repo is public', () => {
-  assert.ok(gitIgnored('task-logs'), 'task-logs/ must be git-ignored -- it retains promptContext.rawText/implementResponse/planResponse verbatim, which for a brain_dump-derived task is free-typed personal/business content, on a repo that is public on GitHub');
+  assert.ok(gitIgnored('task-logs/probe.json'), 'task-logs/ must be git-ignored -- it retains promptContext.rawText/implementResponse/planResponse verbatim, which for a brain_dump-derived task is free-typed personal/business content, on a repo that is public on GitHub');
 });
 
 test('.gitignore also covers SQLite side-car files (*.db-journal / -wal / -shm)', () => {

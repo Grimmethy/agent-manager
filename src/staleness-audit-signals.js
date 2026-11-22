@@ -158,9 +158,29 @@ function alreadyImplementedSignal(repoRoot, task, existsAtRef = null) {
   return { strong: strongEvidence.length > 0, strongEvidence, phraseHits };
 }
 
+// 2026-11-01 (pf-backend hub HUB0001 piece 1, retired by mistake): a decomposed piece names its OWN scope on a `Files:` line, but the paths the
+// signal below sees come from fact-checker.js PATH_EXT_RE, which does not know .prisma/.sql/.mjs/.css/.html. A piece whose real file was
+// prisma/schema.prisma and whose contract paragraph mentioned a file a LATER piece creates (src/services/callLog.js) therefore had one named path,
+// absent, and read as 'every file this task names is absent'. The Files line is the authoritative scope, so when there is one the verdict is made on
+// it alone. Returns the repo-relative paths on the task's `Files:` line (comma separated), [] when there is none.
+function ownFilesLine(task) {
+  const ctx = (task && task.promptContext) || {};
+  const m = /^Files:\s*(.+)$/m.exec(String(ctx.rawText || ''));
+  if (!m) return [];
+  return m[1].split(',').map((x) => x.trim())
+    .filter((x) => x && !/\s/.test(x) && !x.startsWith('/') && !x.includes('..'))
+    .slice(0, 20);
+}
+
 function invalidPremiseSignal(repoRoot, task, existsAtRef = null) {
   if (!repoRoot) return { hit: false, evidence: [] };
   const ownCreateTarget = task.promptContext && task.promptContext.newFile;
+  const own = ownFilesLine(task).filter((p) => p !== ownCreateTarget);
+  if (own.length > 0) {
+    const missingOwn = own.filter((p) => !existsAnywhere(repoRoot, p, existsAtRef));
+    if (missingOwn.length !== own.length) return { hit: false, evidence: [] };
+    return { hit: true, evidence: [`every file this task's Files line names is absent from the repo: ${missingOwn.join(', ')}`] };
+  }
   const named = candidateFilePaths(task).filter((p) => p !== ownCreateTarget);
   if (named.length === 0) return { hit: false, evidence: [] };
   const missing = named.filter((p) => !existsAnywhere(repoRoot, p, existsAtRef));
@@ -178,4 +198,4 @@ function isDecomposeLoop(task) {
   return allDecompose && hasExhaustedRetries(task);
 }
 
-module.exports = { isStaleByAge, isFabricationRepeat, hasExhaustedRetries, alreadyImplementedSignal, invalidPremiseSignal, isDecomposeLoop, candidateFilePaths, distinctivePhrases, extractCreatedSymbols, lastActivityTs, stalenessThresholdMs, symbolDefinedInRepo, envDays, FABRICATION_KEYWORDS, GIT_LOG_TIMEOUT_MS, CREATE_VERB_RE, DEFAULT_STALENESS_THRESHOLD_DAYS, GENERATED_DOC_RE, MS_PER_DAY, NON_PROGRESS_STAGES, TITLE_PREFIX_RE };
+module.exports = { ownFilesLine, isStaleByAge, isFabricationRepeat, hasExhaustedRetries, alreadyImplementedSignal, invalidPremiseSignal, isDecomposeLoop, candidateFilePaths, distinctivePhrases, extractCreatedSymbols, lastActivityTs, stalenessThresholdMs, symbolDefinedInRepo, envDays, FABRICATION_KEYWORDS, GIT_LOG_TIMEOUT_MS, CREATE_VERB_RE, DEFAULT_STALENESS_THRESHOLD_DAYS, GENERATED_DOC_RE, MS_PER_DAY, NON_PROGRESS_STAGES, TITLE_PREFIX_RE };

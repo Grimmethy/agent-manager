@@ -16,9 +16,11 @@ Run: .venv/bin/python -m unittest python.dashboard.test_brain_dump_routes -v
 import json
 import os
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -179,6 +181,65 @@ class BrainDumpWriteRoutesTest(unittest.TestCase):
         self._seed([])
         self.assertEqual(self.client.post("/api/brain-dump/nope/suppress").status_code, 404)
 
+    # HUB0148 (2026-10-15): string serials in brain-dump.json ('1752', ...) used to make
+    # capture's max() raise TypeError -> HTTP 500, and read left the str on disk. These two
+    # tests pin both halves: capture survives mixed int/string/junk serials and numbers
+    # one above the max int-coercible serial, and read_brain_dump_entries heals a string
+    # serial to an int PERSISTED on disk.
+    def test_capture_survives_mixed_int_string_and_junk_serials_and_numbers_above_max_int(self):
+        # Max int-coercible serial here is 1753 (the string '1752' is int-coercible but
+        # lower; the slug junk is not coercible at all), so the next serial must be 1754
+        # -- and capture must not 500 on the mixed types.
+        self._seed([
+            {"id": "bd-int-a", "serial": 1752, "rawText": "one", "status": "captured"},
+            {"id": "bd-int-b", "serial": 1753, "rawText": "two", "status": "captured"},
+            {"id": "bd-str", "serial": "1752", "rawText": "string serial", "status": "captured"},
+            {"id": "bd-junk", "serial": "bd-1791055597086-file-level-dead-code-scan",
+             "rawText": "junk serial", "status": "captured"},
+        ])
+        resp = self.client.post("/api/brain-dump/capture", json={"text": "capture must not 500"})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        entry = resp.get_json()
+        self.assertEqual(entry["serial"], 1754)
+        self.assertIsInstance(entry["serial"], int)
+        appended = [e for e in self._entries() if e.get("id") == entry["id"]]
+        self.assertEqual(len(appended), 1)
+        self.assertEqual(appended[0]["serial"], 1754)
+        self.assertIsInstance(appended[0]["serial"], int)
+
+    # Pins the merged fix's real semantics: a string serial HIGHER than every int serial
+    # IS int-coerced and counts toward max (so '1754' as a string -> next is 1755, not
+    # 1754). The 2026-10-15 bug was that such strings crashed max() with TypeError; this
+    # confirms they are tolerated AND coerced.
+    def test_capture_int_coerces_a_higher_string_serial_and_increments_above_it(self):
+        self._seed([
+            {"id": "bd-int-a", "serial": 1752, "rawText": "one", "status": "captured"},
+            {"id": "bd-int-b", "serial": 1753, "rawText": "two", "status": "captured"},
+            {"id": "bd-str-high", "serial": "1754", "rawText": "string serial", "status": "captured"},
+            {"id": "bd-junk", "serial": "bd-1791055597086-file-level-dead-code-scan",
+             "rawText": "junk serial", "status": "captured"},
+        ])
+        resp = self.client.post("/api/brain-dump/capture", json={"text": "string serials tolerated"})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        entry = resp.get_json()
+        self.assertEqual(entry["serial"], 1755)
+        self.assertIsInstance(entry["serial"], int)
+
+    def test_read_brain_dump_entries_heals_string_serial_to_int_on_disk(self):
+        self._seed([
+            {"id": "bd-str-heal", "serial": "1752", "rawText": "string serial", "status": "captured"},
+            {"id": "bd-int-keep", "serial": 1753, "rawText": "int serial", "status": "captured"},
+        ])
+        entries = app.read_brain_dump_entries()
+        by_id = {e.get("id"): e for e in entries if isinstance(e, dict)}
+        self.assertIsInstance(by_id["bd-str-heal"]["serial"], int)
+        self.assertEqual(by_id["bd-str-heal"]["serial"], 1752)
+        self.assertEqual(by_id["bd-int-keep"]["serial"], 1753)
+        # Independent re-read straight from disk: the heal must be persisted, not just in-memory.
+        on_disk = {e.get("id"): e for e in json.loads(self.brain_dump.read_text(encoding="utf-8"))["entries"]}
+        self.assertIsInstance(on_disk["bd-str-heal"]["serial"], int)
+        self.assertEqual(on_disk["bd-str-heal"]["serial"], 1752)
+
     def test_prioritize_queues_an_adhoc_task_and_actions_the_entry(self):
         self._seed([{"id": "bd-p", "serial": 1, "rawText": "do this now", "status": "captured"}])
         resp = self.client.post("/api/brain-dump/bd-p/prioritize")
@@ -191,6 +252,127 @@ class BrainDumpWriteRoutesTest(unittest.TestCase):
         self.assertEqual(len(queued), 1)
         rec = json.loads(queued[0].read_text(encoding="utf-8"))
         self.assertEqual(rec["promptContext"]["brainDumpEntryId"], "bd-p")
+
+    # 2026-10-17: _coerce_serial's float branch did int(val) unguarded, so NaN raised
+    # ValueError and Infinity raised OverflowError despite the "never raises" contract.
+    # json.loads accepts the NaN/Infinity literals, so a hand-edited brain-dump.json with
+    # one of them would 500 /api/brain-dump/capture.
+    def test_coerce_serial_nan_returns_zero(self):
+        self.assertEqual(app._coerce_serial(float('nan')), 0)
+
+    def test_coerce_serial_inf_returns_zero(self):
+        self.assertEqual(app._coerce_serial(float('inf')), 0)
+
+    def test_capture_with_nan_serial_in_seed_returns_200_and_next_serial(self):
+        # json.dumps emits NaN as a bare JSON literal; json.loads reads it back as
+        # float('nan'), exercising the full _assign_brain_dump_serials -> _coerce_serial
+        # path. Next serial must come from the finite entry (7) only: 8.
+        entries = [
+            {"id": "bd-nan", "serial": float('nan'), "rawText": "junk", "status": "sorted"},
+            {"id": "bd-ok", "serial": 7, "rawText": "real", "status": "sorted"},
+        ]
+        self.brain_dump.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+        resp = self.client.post("/api/brain-dump/capture", json={"text": "after nan"})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        self.assertEqual(resp.get_json()["serial"], 8)
+
+
+class PrioritizeTargetCheckTest(unittest.TestCase):
+    """'Process now' warns before queueing an entry the pre-queue target check calls suspect (HUB0274-08). The node check is stubbed:
+    subprocess.run is patched, so nothing here starts a process. The route fails open on any problem with the check."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_env_path = app.ENV_FILE_PATH
+        app.ENV_FILE_PATH = Path(self._tmp.name) / "agent-manager.env"
+        self._saved = {k: os.environ.get(k) for k in ("AGENT_MANAGER_REPO_ROOT", "AGENT_MANAGER_PIPELINE_DIR", "AGENT_MANAGER_BRAIN_DUMP_PATH")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+        self.pipeline_dir = Path(self._tmp.name) / "pipeline"
+        self.pipeline_dir.mkdir(parents=True, exist_ok=True)
+        app.ENV_FILE_PATH.write_text(f"AGENT_MANAGER_PIPELINE_DIR={self.pipeline_dir}\n", encoding="utf-8")
+        self.brain_dump = self.pipeline_dir / "brain-dump.json"
+        self.client = app.app.test_client()
+
+    def tearDown(self):
+        app.ENV_FILE_PATH = self._orig_env_path
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._tmp.cleanup()
+
+    def _seed(self, **extra):
+        self.brain_dump.write_text(json.dumps({"entries": [{"id": "bd-s", "serial": 1, "rawText": "see `src/gone.js`", "status": "sorted", **extra}]}), encoding="utf-8")
+
+    def _queued(self):
+        adhoc = self.pipeline_dir / "queue" / "adhoc"
+        return list(adhoc.glob("*.json")) if adhoc.exists() else []
+
+    def _verdict(self, stdout):
+        return mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr=""))
+
+    def test_a_suspect_verdict_is_a_409_with_the_reasons_and_queues_nothing(self):
+        self._seed()
+        with self._verdict('{"verdict": "suspect", "reasons": ["every cited path is missing from the target repo (src/gone.js)"]}\n') as run:
+            resp = self.client.post("/api/brain-dump/bd-s/prioritize")
+        self.assertEqual(resp.status_code, 409, resp.get_data(as_text=True))
+        text = resp.get_json()["description"]
+        self.assertIn("every cited path is missing", text)
+        self.assertIn('{"force": true}', text)
+        self.assertEqual(self._queued(), [])
+        entry = json.loads(self.brain_dump.read_text(encoding="utf-8"))["entries"][0]
+        self.assertEqual(entry["status"], "sorted")
+        sent = json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(sent["rawText"], "see `src/gone.js`")
+        self.assertEqual(run.call_args.kwargs["timeout"], 5)
+
+    def test_force_queues_the_same_entry_without_running_the_check(self):
+        self._seed()
+        with self._verdict('{"verdict": "suspect", "reasons": ["x"]}') as run:
+            resp = self.client.post("/api/brain-dump/bd-s/prioritize", json={"force": True})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        self.assertEqual(len(self._queued()), 1)
+        run.assert_not_called()
+        self.assertEqual(resp.get_json()["status"], "actioned")
+
+    def test_an_ok_verdict_queues(self):
+        self._seed()
+        with self._verdict('{"verdict": "ok", "reasons": []}'):
+            resp = self.client.post("/api/brain-dump/bd-s/prioritize")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(self._queued()), 1)
+
+    def test_the_check_failing_open_still_queues(self):
+        for failure in (
+            mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired(cmd="node", timeout=5)),
+            mock.patch.object(subprocess, "run", side_effect=FileNotFoundError("node")),
+            self._verdict("not json at all"),
+            self._verdict(""),
+        ):
+            for old in self._queued():
+                old.unlink()
+            self._seed()
+            with failure:
+                resp = self.client.post("/api/brain-dump/bd-s/prioritize")
+            self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+            self.assertEqual(len(self._queued()), 1)
+
+    def test_an_entry_with_targetcheckoverride_queues_without_running_the_check(self):
+        self._seed(targetCheckOverride=True)
+        with self._verdict('{"verdict": "suspect", "reasons": ["x"]}') as run:
+            resp = self.client.post("/api/brain-dump/bd-s/prioritize")
+        self.assertEqual(resp.status_code, 200)
+        run.assert_not_called()
+
+    def test_the_success_response_shape_is_unchanged(self):
+        self._seed()
+        with self._verdict('{"verdict": "ok", "reasons": []}'):
+            body = self.client.post("/api/brain-dump/bd-s/prioritize").get_json()
+        self.assertEqual(body["status"], "actioned")
+        self.assertTrue(body["queuedTaskId"].startswith("adhoc-brain-dump-"))
+        self.assertIn("queuedAt", body)
 
 
 if __name__ == "__main__":

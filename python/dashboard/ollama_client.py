@@ -14,6 +14,23 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 # found" error instead of a guessed name.
 MODEL = os.environ.get("LOCAL_MODEL")
 
+# 2026-11-07 (owner: never unload, never swap a model). Ollama restarts its runner -- a full reload of the 21 GB model -- whenever a request's num_ctx differs from
+# the loaded one, and a per-request keep_alive overrides the server's OLLAMA_KEEP_ALIVE. This client used to send a small fixed num_ctx and no keep_alive while every
+# pipeline caller pins 49152, so each Grill / Discuss call could evict and reload the model. Mirror the pipeline exactly like the chat plugin's ollama_client.py:
+# AGENT_MANAGER_LANE_NUM_CTX, else 49152 (src/gpu-capacity.js), and "8760h" (src/keep-alive.js; the string "-1" is rejected by Ollama with HTTP 400).
+# io-ok: this is the pipeline's pinned context (src/gpu-capacity.js PINNED_NUM_CTX) mirrored for python, not a caller choosing its own
+DEFAULT_PINNED_NUM_CTX = 49152
+KEEP_ALIVE = "8760h"
+
+
+def pinned_num_ctx() -> int:
+    """The num_ctx every request must carry, read per call from the same env the pipeline lanes use."""
+    try:
+        n = int(os.environ.get("AGENT_MANAGER_LANE_NUM_CTX", ""))
+    except ValueError:
+        return DEFAULT_PINNED_NUM_CTX
+    return n if n > 0 else DEFAULT_PINNED_NUM_CTX
+
 
 def generate(prompt: str, think: bool = False, temperature: float = 0.4, num_predict: int = 900) -> dict:
     """POSTs to Ollama's /api/generate. Returns {"response": str, "thinking": str}."""
@@ -22,7 +39,8 @@ def generate(prompt: str, think: bool = False, temperature: float = 0.4, num_pre
         "prompt": prompt,
         "think": think,
         "stream": False,
-        "options": {"temperature": temperature, "num_predict": num_predict, "num_ctx": 8192},
+        "keep_alive": KEEP_ALIVE,
+        "options": {"temperature": temperature, "num_predict": num_predict, "num_ctx": pinned_num_ctx()},
     }
     req = urllib.request.Request(
         f"{OLLAMA_URL}/api/generate",

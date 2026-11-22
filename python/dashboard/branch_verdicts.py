@@ -2,7 +2,7 @@
 
 Why this exists: in the 2026-09-25 review, of 37 unmerged branches 4 were already on master under a
 different SHA, 30+ were redundant agent/triage-queue-rescued-* snapshots, and only ~7 needed a real
-decision -- and none of that was visible in the app. A verdict (merge / needs-work / discard) is recorded
+decision -- and none of that was visible in the app. A verdict (merge / needs-work / hold / discard) is recorded
 per branch AND head SHA, so a verdict for an older commit reads back as stale instead of vouching for code
 nobody looked at.
 
@@ -23,8 +23,13 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-VERDICTS = ("merge", "needs-work", "discard")
-SOURCES = ("deterministic", "chat", "manual")
+# "hold" (2026-10-31): a sound piece that cannot merge yet (its hub is unfinished, or a sibling must merge first). It is NOT needs-work: nothing in it is
+# defective, so it is never fed to a redraft (apply_prior_verdict) and never counted as a defect. It is also never merge-ready.
+VERDICTS = ("merge", "needs-work", "hold", "discard")
+# "worker" (2026-11-02): the branch-verifier worker (agent-manager-pipeline-ops). Automated like "deterministic", but it ran the touched tests, so it ranks between the two:
+# it replaces a deterministic verdict, never a chat/manual one (a human verdict wins), and a deterministic check never replaces it.
+SOURCES = ("deterministic", "chat", "manual", "worker")
+HUMAN_SOURCES = ("chat", "manual")
 STORE_NAME = "branch-verdicts.json"
 ROLLING_BRANCH = "agent/triage-queue"
 STALE_NOTE = "verdict is for an older commit"
@@ -35,6 +40,14 @@ _TASK_DIRS = ("pending", "review", "approved", "blocked", "done", "needs-clarifi
 # Same trailer app.py's _TASK_TRAILER_RE reads: apply-task.js stamps "Task: <id> (...)" on every commit it makes.
 _TASK_TRAILER_RE = re.compile(r"^Task:\s*(\S+)", re.MULTILINE)
 _CONFLICT_RE = re.compile(r"^CONFLICT \([^)]+\):.*\bin (.+)$", re.MULTILINE)
+
+
+class VerdictReadbackError(RuntimeError):
+    """Raised when a verdict just written by record_owner_merge_verdict does not read back from the store."""
+    code = "verdict_readback_failed"
+
+
+OWNER_MERGE_REASON = "owner clicked Merge in the dashboard"
 
 
 def _now_iso():
@@ -87,6 +100,17 @@ def validate_verdict_body(verdict, reasons, source):
     return None
 
 
+def _emit_verdict_event(queue_dir, branch, sha, verdict, source):
+    """Announce a recorded verdict in the queue-events journal (ADR-0024: the writer announces, the sweeps react). Best-effort: a journal problem must never break
+    recording a verdict, so everything is caught and logged. AGENT_MANAGER_QUEUE_EVENTS=off makes the writer skip it."""
+    try:
+        from queue_events import append_event
+        pipeline_dir = os.path.dirname(os.path.abspath(str(queue_dir)))
+        append_event(pipeline_dir, {"type": "verdict_recorded", "branch": branch, "sha": sha, "verdict": verdict, "source": source, "taskId": None})
+    except Exception as exc:  # noqa: BLE001 -- never let the journal break a verdict
+        logger.warning("queue-events: verdict_recorded not journaled for %s: %s", branch, exc)
+
+
 def record_verdict(queue_dir, branch, sha, verdict, reasons, source):
     """Persist a verdict for (branch, sha). Returns (record, written).
 
@@ -103,13 +127,31 @@ def record_verdict(queue_dir, branch, sha, verdict, reasons, source):
     existing = per_branch.get(sha)
     if existing and source == "deterministic" and existing.get("source") != "deterministic":
         return existing, False
+    if existing and source == "worker" and existing.get("source") in HUMAN_SOURCES:
+        return existing, False
     record = {"verdict": verdict, "reasons": list(reasons), "source": source, "verifiedAt": _now_iso()}
     per_branch[sha] = record
     if len(per_branch) > _KEEP_SHAS:
         for old in sorted(per_branch, key=lambda s: per_branch[s].get("verifiedAt", ""))[:-_KEEP_SHAS]:
             del per_branch[old]
     save_verdicts(queue_dir, verdicts)
+    _emit_verdict_event(queue_dir, branch, sha, verdict, source)
     return record, True
+
+
+def record_owner_merge_verdict(queue_dir, branch, sha):
+    """Record the owner's Merge click as a manual merge verdict for (branch, sha), then read it back.
+
+    Goes through record_verdict (the single store writer). Returns the row as read back from the store.
+    Raises VerdictReadbackError when the row is missing or does not match what was written.
+    """
+    record_verdict(queue_dir, branch, sha, "merge", [OWNER_MERGE_REASON], "manual")
+    stored = (load_verdicts(queue_dir).get(branch) or {}).get(sha)
+    if (not isinstance(stored, dict) or stored.get("verdict") != "merge"
+            or stored.get("source") != "manual" or stored.get("reasons") != [OWNER_MERGE_REASON]):
+        raise VerdictReadbackError(f"owner merge verdict for {branch} @ {sha} did not read back from {STORE_NAME}")
+    return {"branch": branch, "sha": sha, "verdict": stored["verdict"], "source": stored["source"],
+            "reason": OWNER_MERGE_REASON, "reasons": list(stored["reasons"]), "verifiedAt": stored.get("verifiedAt")}
 
 
 def clear_verdict(queue_dir, branch, sha):
@@ -217,9 +259,9 @@ def _check_conflicts(run_git, repo_root, main_branch, branch):
     if ok:
         return None
     files = sorted(set(_CONFLICT_RE.findall(out)))
-    if not files and "CONFLICT" not in out:
-        return None  # the check itself failed (not a real conflict) -- never report that as one
-    return ("needs-work", ["conflicts with " + main_branch + " on: " + (", ".join(files) if files else "unknown files")])
+    if not files:
+        return None  # no actual conflict markers found -- the check itself failed (not a real conflict) -- never report that as one
+    return ("needs-work", ["conflicts with " + main_branch + " on: " + (", ".join(files))])
 
 
 def run_deterministic_checks(repo_root, main_branch, branch, run_git, extra_reasons=()):
@@ -282,10 +324,49 @@ def resolve_owner(repo_root, main_branch, branch, run_git, queue_dir=None, hub_l
     return task_ids, hub_id
 
 
-def write_task_log(queue_dir, task_ids, hub_id, branch, verdict, reasons, source):
+# A chat/manual needs-work verdict is the one thing a redraft should be told about, so it is also stamped onto
+# the owning TASK's promptContext (which both requeue paths carry over verbatim). Caps keep a long verdict from
+# swamping the prompt; src/lib/prompt-blocks.js priorVerdictBlock applies its own total cap on top.
+_PRIOR_VERDICT_MAX_REASONS = 8
+# 1500 = priorVerdictBlock's own total cap: the actionable part of a reason is usually at its END (the real
+# arch-review-ac-50 verdict was 887 chars and named the fix last), so a tighter per-entry cut would drop it.
+_PRIOR_VERDICT_REASON_CHARS = 1500
+
+
+def apply_prior_verdict(rec, branch, verdict, reasons, source, sha=None):
+    """Mutates a TASK record's promptContext.priorVerdict from a recorded verdict; returns True if it changed.
+
+    chat/manual/worker + needs-work sets it (latest wins); chat/manual/worker + merge clears it (the redraft was accepted);
+    every other combination -- deterministic checks, discard (its reasons are about redundancy, not a defect in
+    the change), hold (nothing to redraft: the piece is waiting, not defective) -- leaves it alone. Never called for a hub record. A record whose promptContext is not a dict
+    is skipped rather than overwritten."""
+    if source not in HUMAN_SOURCES + ("worker",):
+        return False
+    ctx = rec.get("promptContext")
+    if not isinstance(ctx, dict):
+        return False
+    if verdict == "needs-work":
+        ctx["priorVerdict"] = {
+            "verdict": verdict,
+            "reasons": [str(r)[:_PRIOR_VERDICT_REASON_CHARS] for r in list(reasons or [])[:_PRIOR_VERDICT_MAX_REASONS]],
+            "sha": sha,
+            "at": _now_iso(),
+            "source": source,
+            "branch": branch,
+        }
+        return True
+    if verdict == "merge" and "priorVerdict" in ctx:
+        del ctx["priorVerdict"]
+        return True
+    return False
+
+
+def write_task_log(queue_dir, task_ids, hub_id, branch, verdict, reasons, source, sha=None):
     """Append a history event to each owning task and to its hub, shaped like src/task-history.js's
     appendHistoryEvent ({stage, at, detail}). `task_ids` is one id or a list (see resolve_owner). Silent
-    no-op for an id with no task file. Returns the count of records written."""
+    no-op for an id with no task file. Returns the count of records written.
+
+    Also stamps promptContext.priorVerdict on each owning TASK (never the hub) -- see apply_prior_verdict."""
     if not queue_dir:
         return 0
     if isinstance(task_ids, str):
@@ -307,6 +388,8 @@ def write_task_log(queue_dir, task_ids, hub_id, branch, verdict, reasons, source
             history = rec.get("history") if isinstance(rec.get("history"), list) else []
             history.append({"stage": "branch-verdict", "at": _now_iso(), "detail": detail})
             rec["history"] = history
+            if tid != hub_id:
+                apply_prior_verdict(rec, branch, verdict, reasons, source, sha)
             _atomic_write_json(path, rec)
             written += 1
         except (OSError, ValueError) as exc:
@@ -315,17 +398,14 @@ def write_task_log(queue_dir, task_ids, hub_id, branch, verdict, reasons, source
 
 
 def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, hub_lookup=None):
-    """Mutates `branches` in place: adds verdict/reasons/source/verifiedAt/stale/headSha to each.
-
-    Runs the deterministic checks only when this head SHA has no verdict yet (a chat/manual one is never
-    replaced, and an existing deterministic one is reused, not recomputed on every list build). Best-effort:
-    a failure on one branch leaves it grey and never breaks the list.
-    """
+    """Mutates `branches` in place: adds verdict/reasons/source/verifiedAt/stale/headSha, then reverify/verdictAgeHours/duplicateOf (branch_reverify.py).
+    Deterministic checks run only when this head SHA has no verdict (a chat/manual one is never replaced; a conflicting 'merge' is demoted, branch_reverify.py).
+    Best-effort: a failure on one branch leaves it grey and never breaks the list."""
     if not queue_dir:
         return branches
     verdicts = load_verdicts(queue_dir)
     # Cross-branch pass (needs the whole list): open rivals from different hubs that cannot both merge.
-    import branch_redundancy
+    import branch_redundancy, branch_reverify
     try:
         alternatives = branch_redundancy.find_alternatives(branches, repo_root, (branches[0].get("mainBranch") if branches else None) or "master", run_git)
     except Exception as exc:  # noqa: BLE001 -- best-effort; a failure here must never break the branch list
@@ -338,9 +418,10 @@ def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, hub_l
         b["headSha"] = sha
         try:
             existing = (verdicts.get(branch) or {}).get(sha)
-            # A chat/manual verdict for this exact SHA is final. A deterministic one is recomputed each build
-            # (master may have moved: a conflict can clear, a branch can become already-on-master) but only
-            # rewritten/logged when it actually changed.
+            if sha and existing and branch_reverify.demote_or_restore(queue_dir, repo_root, branch, sha, existing, b, run_git, hub_lookup):
+                b.update(get_verdict(queue_dir, branch, sha, load_verdicts(queue_dir)))
+                continue
+            # A chat/manual verdict for this exact SHA is final. A deterministic one is recomputed each build (a conflict can clear, a branch can land) and only rewritten/logged when it changed.
             if sha and (existing is None or existing.get("source") == "deterministic"):
                 extra = []
                 if b.get("hubSiblingConflicts"):
@@ -356,7 +437,7 @@ def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, hub_l
                         if written:
                             task_ids, hub_id = resolve_owner(repo_root, b.get("mainBranch") or "master", branch, run_git,
                                                              queue_dir, hub_lookup, b.get("taskId"))
-                            write_task_log(queue_dir, task_ids, hub_id or (b.get("hub") or {}).get("id"), branch, verdict, reasons, "deterministic")
+                            write_task_log(queue_dir, task_ids, hub_id or (b.get("hub") or {}).get("id"), branch, verdict, reasons, "deterministic", sha)
                         verdicts = load_verdicts(queue_dir)
                 elif existing is not None:
                     clear_verdict(queue_dir, branch, sha)
@@ -364,4 +445,5 @@ def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, hub_l
         except (ValueError, OSError, RuntimeError) as exc:
             logger.warning("Deterministic verdict check failed for %s (non-fatal): %s", branch, exc)
         b.update(get_verdict(queue_dir, branch, sha, verdicts))
+    branch_reverify.annotate_reverify(branches)
     return branches

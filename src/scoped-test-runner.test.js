@@ -14,7 +14,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const {
-  findAffectedTestFiles, runScopedTests, parseNodeTestFailures, parsePyTestFailures,
+  findAffectedTestFiles, reverseDependentsPy, runScopedTests, parseNodeTestFailures, parsePyTestFailures,
   MAX_REVERSE_DEP_FILES, MAX_TEST_FILES, RUN_TIMEOUT_MS,
 } = require('./scoped-test-runner.js');
 
@@ -295,4 +295,133 @@ test('runScopedTests: a real covering test run under a live-looking env sees a t
     const result = runScopedTests(repo, ['src/thing.js']);
     assert.equal(result.passed, true, result.raw || JSON.stringify(result));
   });
+});
+
+// --- vitest packages (2026-10-08) ------------------------------------------------------------------------------------------------------------------------------
+// change_review runs runScopedTests over merged commits. `node --test` cannot execute a .tsx, so a commit touching a component with a vitest test would have
+// auto-filed a false "confirmed regression". The runner now comes from the package that owns the test file.
+{
+  const fs2 = require('node:fs');
+  const os2 = require('node:os');
+  const path2 = require('node:path');
+  const test2 = require('node:test');
+  const assert2 = require('node:assert/strict');
+  const { runJsTests } = require('./scoped-test-runner.js');
+
+  // A repo with a vitest package whose "vitest.mjs" is a stub: it exits with the code in STUB_EXIT.mjs's text and prints a FAIL line when it fails.
+  const mk = ({ installed = true, fail = false } = {}) => {
+    const dir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'sc-vitest-'));
+    const put = (rel, text) => { fs2.mkdirSync(path2.dirname(path2.join(dir, rel)), { recursive: true }); fs2.writeFileSync(path2.join(dir, rel), text); };
+    put('web/package.json', JSON.stringify({ devDependencies: { vitest: '^3.2.7' } }));
+    put('web/src/A.test.tsx', 'x');
+    put('plain.test.js', "const test = require('node:test'); test('ok', () => {});\n");
+    put('package.json', '{}');
+    if (installed) put('web/node_modules/vitest/vitest.mjs', fail
+      ? "console.log(' FAIL  ' + process.argv.slice(2).filter((a) => a.endsWith('.tsx'))[0] + ' > A > breaks'); process.exit(1);"
+      : 'process.exit(0);');
+    return dir;
+  };
+
+  test2('runJsTests: a .tsx test goes to vitest from its package (pass), and a plain .js test still goes to node --test', () => {
+    const dir = mk();
+    const r = runJsTests(dir, ['web/src/A.test.tsx', 'plain.test.js']);
+    assert2.equal(r.passed, true);
+    assert2.deepEqual([...r.ran].sort(), ['plain.test.js', 'web/src/A.test.tsx']);
+  });
+
+  test2('runJsTests: a failing vitest test is a real failure with its name; a package without installed node_modules is INCONCLUSIVE, never a regression', () => {
+    const failing = runJsTests(mk({ fail: true }), ['web/src/A.test.tsx']);
+    assert2.equal(failing.passed, false);
+    assert2.deepEqual(failing.failures, ['src/A.test.tsx > A > breaks']);
+    const missing = runJsTests(mk({ installed: false }), ['web/src/A.test.tsx']);
+    assert2.equal(missing.passed, null);
+    assert2.match(missing.raw, /vitest is not installed for web \(run npm ci there\)/);
+  });
+
+  test2('runJsTests: when one package fails and another is inconclusive the combined verdict is false (a real failure always wins), and inconclusive + pass is null', () => {
+    const dir = mk({ fail: true });
+    const put = (rel, text) => { fs2.mkdirSync(path2.dirname(path2.join(dir, rel)), { recursive: true }); fs2.writeFileSync(path2.join(dir, rel), text); };
+    put('web2/package.json', JSON.stringify({ devDependencies: { vitest: '^3.2.7' } }));      // declares vitest but has no node_modules: inconclusive
+    put('web2/src/B.test.tsx', 'x');
+    assert2.equal(runJsTests(dir, ['web/src/A.test.tsx', 'web2/src/B.test.tsx']).passed, false);
+    const ok = mk();
+    fs2.mkdirSync(path2.join(ok, 'web2', 'src'), { recursive: true });
+    fs2.writeFileSync(path2.join(ok, 'web2', 'package.json'), JSON.stringify({ devDependencies: { vitest: '^3.2.7' } }));
+    fs2.writeFileSync(path2.join(ok, 'web2', 'src', 'B.test.tsx'), 'x');
+    assert2.equal(runJsTests(ok, ['web/src/A.test.tsx', 'web2/src/B.test.tsx']).passed, null);
+  });
+
+  test2('runJsTests: a .tsx test in a package with no runner is not run at all (no evidence either way), and mixed results combine false > null > true', () => {
+    const dir = mk();
+    fs2.writeFileSync(path2.join(dir, 'web', 'package.json'), '{}');
+    assert2.equal(runJsTests(dir, ['web/src/A.test.tsx']), null, 'nothing runnable -> no verdict');
+    const both = runJsTests(mk({ fail: true }), ['web/src/A.test.tsx', 'plain.test.js']);
+    assert2.equal(both.passed, false, 'a failing suite wins over a passing one');
+    assert2.deepEqual(both.failures, ['src/A.test.tsx > A > breaks']);
+  });
+}
+
+// --- reverse dependents reach through sub-directories, and Python gets them too (2026-11-01) ---------------------------
+
+test('findAffectedTestFiles: a test one directory up that requires the module through a sub-directory path is found (context-trim-sweep.test.js vs src/sdk/candidate-fulfillment.js)', () => {
+  const repo = tmpRepo();
+  write(repo, 'src/sdk/thing.js', 'module.exports = {};\n');
+  write(repo, 'src/sdk/thing.test.js', '');
+  write(repo, 'src/other.test.js', "const t = require('./sdk/thing.js');\n");
+  write(repo, 'src/bare.test.js', "const t = require('./sdk/thing');\n");
+  write(repo, 'src/esm.test.js', "import { x } from '../src/sdk/thing.js';\n");
+  write(repo, 'src/longer.test.js', "const t = require('./sdk/thingy.js');\n");     // a longer name that merely starts with the base must not match
+  write(repo, 'src/unrelated.test.js', "const t = require('./sdk/other.js');\n");
+  const affected = findAffectedTestFiles(repo, ['src/sdk/thing.js']);
+  assert.deepEqual(affected.js.sort(), ['src/bare.test.js', 'src/esm.test.js', 'src/other.test.js', 'src/sdk/thing.test.js']);
+});
+
+test('findAffectedTestFiles: a plain ./base require is still found and a base in another directory is still not (bounded to the dir and its parent)', () => {
+  const repo = tmpRepo();
+  write(repo, 'src/sdk/thing.js', '');
+  write(repo, 'src/sdk/uses.test.js', "require('./thing');\n");
+  write(repo, 'elsewhere/far.test.js', "require('../src/sdk/thing.js');\n");
+  assert.deepEqual(findAffectedTestFiles(repo, ['src/sdk/thing.js']).js, ['src/sdk/uses.test.js']);
+});
+
+test('findAffectedTestFiles: Python tests that import the changed module are found (test_chat_turn_timings.py vs chat_sessions.py)', () => {
+  const repo = tmpRepo();
+  write(repo, 'chat_sessions.py', 'def f():\n    pass\n');
+  write(repo, 'test_chat_sessions.py', '');
+  write(repo, 'test_chat_turn_timings.py', 'import chat_sessions\n');
+  write(repo, 'test_from_form.py', 'from chat_sessions import f\n');
+  write(repo, 'test_dotted.py', 'from plugin.chat_sessions import f\n');
+  write(repo, 'test_longer.py', 'import chat_sessions_extra\n');          // a longer module name must not match
+  write(repo, 'test_comment.py', '# import chat_sessions\nx = 1\n');       // not at the start of a statement
+  write(repo, 'test_unrelated.py', 'import os\n');
+  const affected = findAffectedTestFiles(repo, ['chat_sessions.py']);
+  assert.deepEqual(affected.py.sort(), ['test_chat_sessions.py', 'test_chat_turn_timings.py', 'test_dotted.py', 'test_from_form.py']);
+  assert.deepEqual(affected.js, []);
+});
+
+test('reverseDependentsPy: only for a non-test .py file, bounded to its directory and parent, capped, never repeats an included file', () => {
+  const repo = tmpRepo();
+  write(repo, 'pkg/sub/mod.py', '');
+  write(repo, 'pkg/test_up.py', 'import mod\n');
+  write(repo, 'far/test_far.py', 'import mod\n');
+  assert.deepEqual(reverseDependentsPy(repo, 'pkg/sub/mod.py', new Set()), ['pkg/test_up.py']);
+  assert.deepEqual(reverseDependentsPy(repo, 'pkg/sub/mod.py', new Set(['pkg/test_up.py'])), []);
+  assert.deepEqual(reverseDependentsPy(repo, 'pkg/test_up.py', new Set()), [], 'a test file has no dependents');
+  assert.deepEqual(reverseDependentsPy(repo, 'pkg/sub/mod.js', new Set()), []);
+  for (let i = 0; i < MAX_REVERSE_DEP_FILES + 4; i++) write(repo, `pkg/sub/test_many_${i}.py`, 'import mod\n');
+  assert.equal(reverseDependentsPy(repo, 'pkg/sub/mod.py', new Set()).length, MAX_REVERSE_DEP_FILES);
+});
+
+test('runJsTests: a test runner that cannot start (ENOENT) is inconclusive (passed:null), not a test failure', () => {
+  const repo = tmpRepo();
+  write(repo, 'pkg/x.test.js', "const { test } = require('node:test');\ntest('ok', () => {});\n");
+  const savedPath = process.env.PATH;
+  process.env.PATH = '/nonexistent-scoped-test-path';
+  try {
+    const r = require('./scoped-test-runner.js').runJsTests(repo, ['pkg/x.test.js']);
+    assert.equal(r.passed, null);
+    assert.deepEqual(r.failures, []);
+  } finally {
+    process.env.PATH = savedPath;
+  }
 });

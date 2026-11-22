@@ -30,8 +30,7 @@ function nextProductSpecSectionTask() {
 // generation -- the same override every other premium-priority mechanism in this codebase
 // already provides. Deliberately before the loop and independent of the allowlist
 // restriction below: a mode-scoped allowlist must not be able to swallow an explicitly
-// operator-pinned task any more than it can a plain adhoc one. Lazy require: task-sources.js
-// requires THIS module (line 47), so a top-level require back would be circular.
+// operator-pinned task any more than it can a plain adhoc one. The generators are registered by task-sources.js (setPreemptLoaders below).
 function hasPremiumPriorityInQueue(queueDir) {
   let entries;
   try {
@@ -77,11 +76,26 @@ function hasHubTierInQueue(queueDir, pipelineDir) {
   return false;
 }
 
+// The adhoc and derived generators live in task-sources.js, which requires THIS module, so they are registered here by task-sources.js when it loads
+// (setPreemptLoaders) instead of being required back (roadmap step 1, piece P3: that lazy require was an edge of the import cycle).
+let preemptLoaders = null;
+function setPreemptLoaders(loaders) {
+  for (const name of ['nextAdhocTask', 'nextDerivedTask']) {
+    if (!loaders || typeof loaders[name] !== 'function') throw new Error(`task-selection: setPreemptLoaders needs a ${name} function`);
+  }
+  preemptLoaders = { nextAdhocTask: loaders.nextAdhocTask, nextDerivedTask: loaders.nextDerivedTask };
+}
+
+function preemptLoader(name) {
+  if (!preemptLoaders) throw new Error(`task-selection: the ${name} loader is not registered (task-sources.js registers it when it loads)`);
+  return preemptLoaders[name];
+}
+
 function hubTierPreemptedTask(queueDir, pipelineDir) {
   const { isHubTierTask } = require('../hub-priority.js');
   for (const [dir, load] of [['adhoc', 'nextAdhocTask'], ['derived', 'nextDerivedTask']]) {
     if (!hasHubTierInQueue(path.join(queueDir, dir), pipelineDir)) continue;
-    const task = require('../task-sources.js')[load]();
+    const task = preemptLoader(load)();
     if (task && (task.premiumPriority === true || isHubTierTask(pipelineDir, task))) return task;
   }
   return null;
@@ -91,11 +105,11 @@ function premiumPreemptedTask() {
   const { pipelineDir } = getConfig();
   const queueDir = path.join(pipelineDir, 'queue');
   if (hasPremiumPriorityInQueue(path.join(queueDir, 'adhoc'))) {
-    const task = require('../task-sources.js').nextAdhocTask();
+    const task = preemptLoader('nextAdhocTask')();
     if (task) return task; // if the generator declined it (e.g. dependsOn unmet) fall through below
   }
   if (hasPremiumPriorityInQueue(path.join(queueDir, 'derived'))) {
-    const task = require('../task-sources.js').nextDerivedTask();
+    const task = preemptLoader('nextDerivedTask')();
     if (task) return task;
   }
   return hubTierPreemptedTask(queueDir, pipelineDir);
@@ -132,4 +146,4 @@ function getNextTask({ blocked } = {}) {
   return null;
 }
 
-module.exports = { nextProductSpecSectionTask, getNextTask };
+module.exports = { nextProductSpecSectionTask, getNextTask, setPreemptLoaders };

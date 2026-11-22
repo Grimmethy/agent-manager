@@ -79,6 +79,7 @@ function parseArchDiscoveryCandidates(implementResponse) {
       const anchorIdx = block.indexOf(bodyAnchor);
       const body = block.slice(anchorIdx + bodyAnchor.length).trim();
       return {
+        headingId: ((headingLine.match(/AC-(\d+)/) || [])[1]) || null,
         title: titleMatch[1].trim(),
         strength: strengthMatch ? strengthMatch[1].trim() : 'Strong',
         source: sourceMatch ? sourceMatch[1].trim() : '',
@@ -89,6 +90,22 @@ function parseArchDiscoveryCandidates(implementResponse) {
       };
     })
     .filter((c) => c && c.title && c.body);
+}
+
+// Retraction-note gate (2026-11-16, AC-60..62 incident): a block that merely RETRACTS an earlier
+// candidate (title struck through or marked RETRACTED/Withdrawn, or a body whose first non-metadata
+// line is a 'Status:' saying it is not a defect) is a model's own critique text leaking into the
+// implement response, never a real finding. Returns the rule name that fires, or null. Prose that
+// merely mentions 'retracted' later in the body is NOT a rule.
+const RETRACTION_STATUS_RE = /^Status:\s*(withdrawn|retracted|no defect|not a defect|no action required)\b/i;
+const CANDIDATE_METADATA_LINE_RE = /^(Strength|Depends-On-Index|Files|Source|Split-Depth|Symbol|Snippet):/i;
+function retractionGateReason(c) {
+  const title = String((c && c.title) || '').trim();
+  if (title.startsWith('~~') || /\b(RETRACTED|Withdrawn)\b/.test(title)) return 'R1';
+  const lines = String((c && c.body) || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const first = lines.find((l) => !CANDIDATE_METADATA_LINE_RE.test(l));
+  if (first && RETRACTION_STATUS_RE.test(first)) return 'R2';
+  return null;
 }
 
 function nextAvailableCandidateId(existingText) {
@@ -159,39 +176,98 @@ function dedupeDocViews(candidatesPath, workingTreeText) {
   return views;
 }
 
-// `dedupe` (opt-in, default off): drop a candidate whose file + function (lib/candidate-dedupe.js) is already in
+// The text one candidate occupies in a Docs/*_CANDIDATES.md doc, minus the leading blank-line separator. Pure: the
+// caller allocates `id` and resolves `dependsOnId` (the id of an EARLIER candidate in the same batch, or null).
+// Shared by applyArchDiscoveryCandidates and candidate-size-gate.js so the gate measures exactly what gets written.
+function renderCandidateSection(c, id, { snippet = null, dependsOnId = null } = {}) {
+  const lines = [`### ${id} · ${c.title}`, `Strength: ${c.strength}`];
+  // Split-Depth: N -- a one-level pre-split marker; nextCandidateFulfillmentTask (SDK)
+  // refuses to pre-split a candidate at depth >= 1 (hard recursion stop).
+  if (c.splitDepth) lines.push(`Split-Depth: ${c.splitDepth}`);
+  if (c.source) lines.push(`Source: ${c.source}`);
+  if (c.files) lines.push(`Files: ${normalizeCandidateFiles(c.files)}`);
+  if (c.symbol) lines.push(`Symbol: ${c.symbol}`);
+  // dependsOnIndex -> a real Depends-On: AC-NNN line (2026-09-05, see
+  // prompts.js's candidateSplitInstructions for the incident): only resolvable once ids are
+  // actually being assigned in the same pass, so the caller passes the resolved id in. Only valid
+  // within a single split batch -- parseCandidateSplit's own remapping guarantees the index
+  // refers to an EARLIER candidate in THIS SAME call.
+  if (dependsOnId) lines.push(`Depends-On: ${dependsOnId}`);
+  // Fenced, not backtick-inline -- the real snippet is often multi-line and may itself
+  // contain backticks (template literals are common in this codebase), so a fence is
+  // the only delimiter that can't collide with the content it's wrapping.
+  if (snippet) lines.push('Snippet:', '```', snippet, '```');
+  lines.push('', c.body);
+  return lines.join('\n') + '\n';
+}
+
+// `symbol` (optional): see the comment at the top of the function body. `dedupe` (opt-in, default off): drop a candidate whose file + function (lib/candidate-dedupe.js) is already in
 // the doc on any view above, or earlier in this same call. Left off for candidate splits (sibling
 // candidates legitimately share Files:) and hand-authored docs. Kill switch: AGENT_MANAGER_CANDIDATE_DEDUPE=false.
 // All candidates dropped -> nothing is written and { skipped, duplicateOf, reason } comes back; the reason contains
 // "skipped" so task-disposition.js's NOOP_RE closes the task as a noop.
-function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates', snippet = null, dedupe = false }) {
+// `requireStrength` (2026-10-04): opt-in, default null = every candidate is accepted as before. A verdict-style source whose prompt
+// only ever asks for a Strong block (dead-code triage: a FALSE POSITIVE / UNCERTAIN verdict must write NO block) passes 'Strong'
+// so a block the model wrote anyway ("Strength: Not actionable (false positive)", deadcode-getparser) is not filed as a candidate.
+// Exact trimmed match, because fulfillment (sdk/lib/candidate-lifecycle.js) acts only on exactly 'Strong'. Not enforced in
+// parseArchDiscoveryCandidates: arch_import/arch_review legitimately file 'Worth exploring' and 'Speculative'.
+function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates', snippet = null, dedupe = false, symbol = null, requireStrength = null }) {
   let candidates = parseArchDiscoveryCandidates(implementResponse);
   if (candidates.length === 0) {
     return { skipped: true, reason: 'no candidates in implement response -- nothing to apply' };
   }
+  // Retraction-note gate (see retractionGateReason): drop blocks that retract an earlier candidate before anything else sees them.
+  const skippedByGate = [];
+  candidates = candidates.filter((c) => {
+    const rule = retractionGateReason(c);
+    if (!rule) return true;
+    skippedByGate.push({ id: c.headingId ? `AC-${c.headingId}` : null, title: String(c.title).slice(0, 80), rule, reason: `retraction-gate:${rule}` });
+    return false;
+  });
+  if (candidates.length === 0) {
+    return { skipped: true, reason: `skipped: ${skippedByGate.length} retraction note(s) rejected by retraction-gate -- nothing appended`, skippedByGate };
+  }
+  let droppedNonStrong = 0;
+  if (typeof requireStrength === 'string' && requireStrength.trim()) {
+    const required = requireStrength.trim();
+    const kept = candidates.filter((c) => String(c.strength).trim() === required);
+    droppedNonStrong = candidates.length - kept.length;
+    if (kept.length === 0) {
+      const found = [...new Set(candidates.map((c) => String(c.strength).trim()))].join(', ');
+      return { skipped: true, reason: `skipped: ${droppedNonStrong} candidate(s) not Strength: ${required} (${found}) -- nothing appended` };
+    }
+    candidates = kept;
+  }
+  // `symbol` (2026-10-03): the function/identifier the SOURCE knows the candidate is about (e.g. function_length_review
+  // reads it off its scanner finding), written as a deterministic `Symbol:` line and used as the dedupe key ahead of any
+  // title parsing -- the model's title formatting (backticks or not) no longer decides whether a duplicate is caught.
+  // Only applied to a single-candidate batch: with several candidates one symbol cannot be attributed to any one of them.
+  if (symbol && candidates.length === 1) candidates[0].symbol = String(symbol).trim();
 
   let text = fs.existsSync(candidatesPath) ? fs.readFileSync(candidatesPath, 'utf8') : `${docTitle}\n`;
 
   let duplicatesSkipped = [];
   if (dedupe && process.env.AGENT_MANAGER_CANDIDATE_DEDUPE !== 'false') {
     try {
-      const { findDuplicateCandidate, candidateKey } = require('./lib/candidate-dedupe.js');
+      const { findDuplicateCandidate, dedupeKey } = require('./lib/candidate-dedupe.js');
       const views = dedupeDocViews(candidatesPath, text);
       const seenKeys = new Set();
       candidates = candidates.filter((c) => {
-        const key = candidateKey(c);
-        const dup = findDuplicateCandidate(c, views) || (key && seenKeys.has(key) ? { duplicateOf: 'an earlier candidate in this batch', ref: 'this batch' } : null);
+        const dk = dedupeKey(c);
+        const seenId = dk ? `${dk.kind}:${dk.key}` : null;
+        const dup = findDuplicateCandidate(c, views) || (seenId && seenKeys.has(seenId) ? { duplicateOf: 'an earlier candidate in this batch', ref: 'this batch', matchedBy: dk.kind } : null);
         if (dup) { duplicatesSkipped.push(dup); return false; }
-        if (key) seenKeys.add(key);
+        if (seenId) seenKeys.add(seenId);
         return true;
       });
     } catch { duplicatesSkipped = []; /* fail-open: append as before */ }
     if (candidates.length === 0 && duplicatesSkipped.length > 0) {
       const first = duplicatesSkipped[0];
+      const via = first.matchedBy === 'snippet' ? 'file+snippet line' : 'identifier';
       return {
         skipped: true,
         duplicateOf: first.duplicateOf,
-        reason: `skipped: candidate already exists as ${first.duplicateOf} (${first.ref}) -- not appended again`,
+        reason: `skipped: candidate already exists as ${first.duplicateOf} (${first.ref}) (matched by ${via}) -- not appended again`,
       };
     }
   }
@@ -205,40 +281,39 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   const candidateIds = [];
   candidates.forEach((c) => {
     const id = `AC-${Math.max(nextAvailableCandidateId(text), idFloor + 1)}`;
-    const lines = [`### ${id} · ${c.title}`, `Strength: ${c.strength}`];
-    // Split-Depth: N -- a one-level pre-split marker; nextCandidateFulfillmentTask (SDK)
-    // refuses to pre-split a candidate at depth >= 1 (hard recursion stop).
-    if (c.splitDepth) lines.push(`Split-Depth: ${c.splitDepth}`);
-    if (c.source) lines.push(`Source: ${c.source}`);
-    if (c.files) lines.push(`Files: ${normalizeCandidateFiles(c.files)}`);
-    // dependsOnIndex -> a real Depends-On: AC-NNN line (2026-09-05, see
-    // prompts.js's candidateSplitInstructions for the incident): only resolvable NOW,
-    // once ids are actually being assigned in this same pass. Only valid within a single
-    // split batch (candidates all arrive together, in original order, from
-    // apply-task.js's applyCandidateSplit) -- candidateIds[c.dependsOnIndex] is only
-    // populated when that index refers to an EARLIER candidate in THIS SAME call, which
-    // parseCandidateSplit's own remapping already guarantees.
-    if (Number.isInteger(c.dependsOnIndex) && candidateIds[c.dependsOnIndex]) {
-      lines.push(`Depends-On: ${candidateIds[c.dependsOnIndex]}`);
-    }
-    // Fenced, not backtick-inline -- the real snippet is often multi-line and may itself
-    // contain backticks (template literals are common in this codebase), so a fence is
-    // the only delimiter that can't collide with the content it's wrapping.
-    if (snippet) lines.push('Snippet:', '```', snippet, '```');
-    lines.push('', c.body);
-    text += '\n' + lines.join('\n') + '\n';
+    const dependsOnId = Number.isInteger(c.dependsOnIndex) ? candidateIds[c.dependsOnIndex] : null;
+    const section = renderCandidateSection(c, id, { snippet, dependsOnId });
+    text += '\n' + section;
     candidateIds.push(id);
   });
 
   fs.mkdirSync(path.dirname(candidatesPath), { recursive: true });
   writeAtomicSync(candidatesPath, text);
 
-  return { file: candidatesPath, candidateCount: candidates.length, candidateIds, ...(duplicatesSkipped.length ? { duplicatesSkipped: duplicatesSkipped.length } : {}) };
+  return { file: candidatesPath, candidateCount: candidates.length, candidateIds, ...(duplicatesSkipped.length ? { duplicatesSkipped: duplicatesSkipped.length } : {}), ...(droppedNonStrong ? { droppedNonStrong } : {}), ...(skippedByGate.length ? { skippedByGate } : {}) };
+}
+
+// Model-free grounding check: the `Snippet:` fence a candidate carries is the real code text the scanner read. A draft
+// that claims to describe that code must contain it (whitespace-insensitive). Returns null when there is nothing to
+// enforce or the snippet is present; otherwise { expected } so a caller can quote the missing text back (-612 class:
+// the draft said `except Exception` / `FALLBACK` where the code had `except OSError` / `_fallback_cache_paths(...)`).
+function snippetMismatch(candidate, draftText) {
+  let snippet = candidate && typeof candidate.snippet === 'string' ? candidate.snippet : '';
+  if (!snippet.trim() && candidate && typeof candidate.body === 'string') {
+    const m = candidate.body.match(/^Snippet:\s*\n```[^\n]*\n([\s\S]*?)\n```/m);
+    if (m) snippet = m[1];
+  }
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const want = norm(snippet);
+  if (!want) return null;
+  return norm(draftText).includes(want) ? null : { expected: snippet.trim() };
 }
 
 module.exports = {
+  snippetMismatch,
   isEffectivelyEmptyResponse,
   parseArchDiscoveryCandidates,
   nextAvailableCandidateId,
   applyArchDiscoveryCandidates,
+  renderCandidateSection,
 };

@@ -21,7 +21,7 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # of agent-manager.env itself (same file launch.bat / the dashboard read), since it should
 # also work as a one-off invocation with no daemon already running to have set them.
 ENV_FILE="${REPO_DIR}/agent-manager.env"
-# A BORROWED pass (docs/idle-pool-borrowing.md, scripts/apply-loop.sh) runs under another suite project's env. The env file below describes the
+# A BORROWED pass (docs/design-notes/idle-pool-borrowing.md, scripts/apply-loop.sh) runs under another suite project's env. The env file below describes the
 # ACTIVE project, so sourcing it would silently point this pass back at the active project's queue and repo. Remember the project-scoped values
 # (including "unset": a project without an applyRepoRoot / grepDirs must not inherit the active project's) and restore them after the source.
 declare -A _pool_saved=()
@@ -72,12 +72,39 @@ source "${SCRIPT_DIR}/agent-manager-common.sh"
 # against not being caught on that one tick.
 move_task_file_locked() {
   local tid="$1" src="$2" dst="$3"
-  if acquire_single_flight_lock "move.${tid}"; then
+  if acquire_single_flight_lock "move.${tid}" "skip"; then
     mv "$src" "$dst"
     release_single_flight_lock
   else
     printf '[apply-task] %s: task-move lock timed out -- moving %s -> %s WITHOUT the lock\n' "$tid" "$src" "$dst" >&2
     mv "$src" "$dst"
+  fi
+}
+
+# The task id is the record's own `id` field, never its file name: a record can sit in
+# approved/ under any name (e.g. zz.task.json), and done/blocked/awaiting-confirm/coordinating
+# must file it as <id>.json or the coordinator sweep (findTaskRecordById) never finds it.
+# Falls back to the basename only when `id` is missing, not a string, or not a safe path segment.
+resolve_task_id() {
+  local f="$1" base id
+  base="$(basename "$f" .json)"
+  id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(typeof o.id==="string"&&o.id.trim()!=="")process.stdout.write(o.id.trim())}catch(e){}' "$f" 2>/dev/null)"
+  if [[ -z "$id" ]]; then
+    printf '%s' "$base"
+  elif [[ ! "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf '[apply-task] record file name '\''%s'\'' has unsafe task id '\''%s'\'': filing under the file name\n' "$base" "$id" >&2
+    printf '%s' "$base"
+  else
+    printf '%s' "$id"
+  fi
+}
+
+# Prints the one-line notice when a record's file name and its task id disagree.
+report_id_mismatch() {
+  local base
+  base="$(basename "$1" .json)"
+  if [[ "$base" != "$2" ]]; then
+    printf '[apply-task] record file name '\''%s'\'' differs from task id '\''%s'\'': filed as %s.json\n' "$base" "$2" "$2" >&2
   fi
 }
 
@@ -121,6 +148,15 @@ fi
 shopt -s nullglob
 files=("$APPROVED_DIR"/*.json)
 shopt -u nullglob
+
+# Premium-only borrowed pass (2026-10-18, premium reach -- src/pool-projects.js header): apply-loop.sh runs this under a registered project
+# that is NOT in the pool only for its premium approved tasks, so that project's regular approved work is never applied while another project
+# is selected. Keeps the order; the empty check below then reports "nothing to do".
+if [[ "${AGENT_MANAGER_APPLY_PREMIUM_ONLY:-}" == "true" && -n "${AGENT_MANAGER_BORROWING_FROM:-}" && ${#files[@]} -gt 0 ]]; then
+  _all_count=${#files[@]}
+  mapfile -t files < <(printf '%s\n' "${files[@]}" | node -e 'const fs=require("fs");for(const p of fs.readFileSync(0,"utf8").split("\n")){if(!p)continue;try{if(JSON.parse(fs.readFileSync(p,"utf8")).premiumPriority===true)console.log(p)}catch(e){}}' 2>/dev/null)
+  printf '[apply-task] premium-only pass: %s of %s approved task(s) are premium\n' "${#files[@]}" "$_all_count"
+fi
 
 if [[ ${#files[@]} -eq 0 ]]; then
   printf '[apply-task] nothing to do: no approved tasks in %s.\n' "$APPROVED_DIR"
@@ -195,7 +231,8 @@ if [[ ${#direct_files[@]} -gt 0 ]]; then
     } catch (e) { /* handled below: any direct_file not printed stays in approved/ for next tick */ }
   ' | while IFS=$'\t' read -r bpath bok bneedsconfirm bcoordinating bnote; do
       [[ -z "$bpath" ]] && continue
-      btid="$(basename "$bpath" .json)"
+      btid="$(resolve_task_id "$bpath")"
+      report_id_mismatch "$bpath" "$btid"
       if [[ "$bcoordinating" == "1" ]]; then
         move_task_file_locked "$btid" "$bpath" "${COORDINATING_DIR}/${btid}.json"
         printf '[apply-task] %s: coordinating sub-tasks (triage batch) -- %s\n' "$btid" "$bnote"
@@ -214,7 +251,8 @@ if [[ ${#direct_files[@]} -gt 0 ]]; then
 fi
 
 for file in "${other_files[@]}"; do
-  task_id="$(basename "$file" .json)"
+  task_id="$(resolve_task_id "$file")"
+  report_id_mismatch "$file" "$task_id"
   printf '[apply-task] applying %s...\n' "$task_id"
 
   result="$(node "${REPO_DIR}/src/apply-task.js" "$file")"

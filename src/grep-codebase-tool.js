@@ -9,6 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
 const { lineMatches } = require('./text-match.js');
+const { isArchivedDirName } = require('./lib/archived-dirs.js');
 
 // Was JS/TS-only, silently excluding every file in whichever of AGENT_MANAGER_GREP_DIRS
 // happened to hold Python/shell/docs content -- for this project's own real config
@@ -37,14 +38,29 @@ const MAX_CONTEXT_LINES = 5;
 // allowed dir that is itself under the requested dir, or "."/"" meaning "all of them".
 // Returns { roots: [absolute paths] } or { error }.
 function resolvePrimaryDirs(repoRoot, allowedDirs, dir) {
-  const norm = String(dir == null ? '' : dir).trim().replace(/^\.\//, '').replace(/\/+$/, '');
+  const raw = String(dir == null ? '' : dir).trim();
+  if (path.isAbsolute(raw) || /^[\\/]/.test(raw) || /^[A-Za-z]:/.test(raw)) {
+    return { error: `dir '${dir}' must be a relative path inside the repo, not an absolute path.` };
+  }
+  if (raw.split(/[\\/]/).includes('..')) {
+    return { error: `dir '${dir}' may not contain '..' segments -- use a path inside the repo.` };
+  }
+  const norm = raw.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
   if (norm === '' || norm === '.') {
     return { roots: allowedDirs.map((d) => path.join(repoRoot, d)) };
   }
   if (allowedDirs.includes(norm)) return { roots: [path.join(repoRoot, norm)] };
   // requested dir is inside an allowed dir, e.g. "python/dashboard" under "python"
-  const underAllowed = allowedDirs.some((d) => norm === d || norm.startsWith(`${d}/`));
-  if (underAllowed) return { roots: [path.join(repoRoot, norm)] };
+  const matchDir = allowedDirs.find((d) => norm === d || norm.startsWith(`${d}/`));
+  if (matchDir !== undefined) {
+    const candidate = path.resolve(repoRoot, norm);
+    const allowedRoot = path.resolve(repoRoot, matchDir);
+    const rel = path.relative(allowedRoot, candidate);
+    if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) {
+      return { error: `dir '${dir}' resolves outside the allowed dir '${matchDir}'.` };
+    }
+    return { roots: [candidate] };
+  }
   // an allowed dir is inside the requested dir, e.g. dir="." handled above, or a parent
   const containedAllowed = allowedDirs.filter((d) => d.startsWith(`${norm}/`));
   if (containedAllowed.length) return { roots: containedAllowed.map((d) => path.join(repoRoot, d)) };
@@ -141,7 +157,7 @@ function grepCodebase({ query, dir, root, contextLines }) {
       if (hits.length >= maxMatches) return;
       const fullPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
-        if (GREP_SKIP_DIRS.has(entry.name)) continue;
+        if (GREP_SKIP_DIRS.has(entry.name) || isArchivedDirName(entry.name)) continue;
         walk(fullPath);
       } else if (entry.isFile()) {
         grepOneFile(fullPath, false);
@@ -167,4 +183,4 @@ function grepCodebase({ query, dir, root, contextLines }) {
   return hits;
 }
 
-module.exports = { grepCodebase };
+module.exports = { grepCodebase, resolvePrimaryDirs };

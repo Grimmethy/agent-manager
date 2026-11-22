@@ -30,6 +30,14 @@
 // time, so the round-trip closes instead of just getting detected after the fact.
 
 const { extractRequestObjectTokens } = require('./request-object-tokens.js');
+const { findOverride, buildOverrideEvent } = require('./gate-override.js');
+
+// Records an applied owner override on the task's history via the existing task-history sink (appendHistoryEvent). Called for EVERY matched override, even when it
+// suppressed nothing (`suppressed` may be []), so a misapplied override can always be found later. task-history.js is required lazily at call time.
+function recordGateOverride(task, gate, entry, suppressed) {
+  const { type, ...payload } = buildOverrideEvent({ gate, reason: entry.reason, by: entry.by, at: entry.at, suppressed });
+  require('./task-history.js').appendHistoryEvent(task, type, JSON.stringify(payload));
+}
 
 // --- diff parsing -----------------------------------------------------------
 
@@ -76,7 +84,7 @@ const CODE_SIGNAL_RE = /\b(src|python|scripts|lib|app|dashboard|templates)\/|\.(
 // containing one of these is excluded from the code-signal scan, same "citation vs.
 // target" distinction extractDeclaredFiles/extractDeclaredTargets already draw elsewhere
 // in this file, just applied to the blind-scan fallback path instead of a structured one.
-const CITATION_CONTEXT_RE = /\b(?:enforced by|already (?:exist|implement|cover|handle|contain)s?|documented in|as (?:shown|described|documented|seen|specified) in|mentioned in|cited in|referenced in|defined in|lives? in|found in|per\b|see\b|(?:anchor|grounding) is real|confirmed (?:real|in)|the (?:real|grounding) (?:source|evidence))\b/i;
+const CITATION_CONTEXT_RE = /\b(?:enforced by|already (?:exist|implement|cover|handle|contain)s?|documented in|as (?:shown|described|documented|seen|specified) in|mentioned in|cited in|referenced in|defined in|lives? in|found in|(?:anchor|grounding) is real|confirmed (?:real|in)|the (?:real|grounding) (?:source|evidence))\b/i;
 
 // 2026-09-21 (needs-clarification clearing, in-app chat design review): the citation markers above cannot keep up with prose. Two genuine documentation tasks
 // (an AGENTS.md invariant note; a research note under docs/research/) were still blocked 3/3 by sentences that mention a code path only to say it is NOT to be touched
@@ -92,7 +100,9 @@ const CITATION_CONTEXT_RE = /\b(?:enforced by|already (?:exist|implement|cover|h
 //      verb, or one that opens with an imperative ("Lazy-load the rows in index.html") on a code path still wants code.
 const CODE_PATH_SIGNAL_RE = /\b(?:src|python|scripts|lib|app|dashboard|templates)\/|\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css)\b/i;
 const CODE_PHRASE_SIGNAL_RE = /\b(?:implement|endpoint|route|task source|new (?:module|file|source|helper)|render\w*\(|def \w+\(|function \w+|wire (?:it|this|the|in)|add .{0,25}(?:to|in|into) \w[\w./-]*\.(?:py|js|html|sh)|api route|backend|cursor module|sweep logic)\b/i;
-const AFFIRMATIVE_EDIT_VERB_RE = /\b(?:change|edit|update|modify|replace|rewrite|append|prepend|insert|remove|delete|add|fix|create|write|refactor|extract|move|rename)\b/i;
+// A verb glued to identifier characters is part of a NAME, not a request: "lease-delete+yield", "file.delete", "get_move_set" (2026-10-15, GPU broker verification tasks: a documentation task that cites
+// `lease-delete+yield` as evidence was blocked as asking for a code change). The lookbehind/lookahead keep a sentence-final "delete." and "delete the lease" as verbs.
+const AFFIRMATIVE_EDIT_VERB_RE = /(?<![-_+/.:])\b(?:change|edit|update|modify|replace|rewrite|append|prepend|insert|remove|delete|add|fix|create|write|refactor|extract|move|rename)\b(?![-_+/:]|\.\w)/i;
 // A negator, up to three filler words, then an edit-ish verb: "do NOT modify", "not files to edit", "does not implement", "must not be edited".
 const NEGATED_VERB_RE = /\b(?:do\s*n[o']?t|don['’]t|does\s*n[o']?t|doesn['’]t|must\s+not|should\s+not|never|not|no)\b(?:\s+[\w'’-]+){0,3}?\s+(?:edit\w*|modif\w*|chang\w*|touch\w*|implement\w*|updat\w*|writ\w*|add\w*|alter\w*|delet\w*|creat\w*|replac\w*|rewrit\w*|insert\w*|remov\w*|fix\w*)\b/gi;
 // The sentence the needs-clarification picker appends to a human's answer ("This answer resolves the open question(s) above -- implement against it directly rather than
@@ -100,6 +110,21 @@ const NEGATED_VERB_RE = /\b(?:do\s*n[o']?t|don['’]t|does\s*n[o']?t|doesn['’]
 const PIPELINE_BOILERPLATE_RE = /\bimplement against (?:it|this|that|the answer)\b[^.!?\n]*/gi;
 // An affirmative sentence whose object is a documentation file: "Append X to AGENTS.md", "Create a single NEW Markdown file at docs/research/x.md".
 const DOC_DELIVERABLE_RE = /\b(?:append|prepend|create|write|add|merge|insert|document|record|draft)\b[^.!?\n]{0,160}?(?:\.md\b|\.txt\b|\bdocs?\/|\bMarkdown\b|\bADR\b|\bREADME\b|\bAGENTS\b)/i;
+// A task that says outright its code is read-only / nothing else is touched (2026-10-15: "RULES: read-only on the code; write ONLY the one findings file named below (a NEW file, nothing else
+// changed)" was itself read as a code request because of "NEW file" and "write"). Only meaningful together with a stated documentation deliverable, see wantsCodeChange.
+const READ_ONLY_RE = /\bread-only\b|\bnothing else (?:is |was |gets )?(?:touched|changed|modified|edited)\b|\bchange nothing else\b|\bwrite ONLY the one\b/i;
+
+// Markdown emphasis or backticks around a plain word ("Do **not** open", "__never__ edit", "`delete`") hide a negator or code word from the regexes below.
+// Strip the markup from plain words only. A path token (it contains "/" or ".") keeps its backticks or emphasis.
+function normaliseEmphasis(text) {
+  return String(text || '')
+    .replace(/(?<![\w*])\*\*([A-Za-z][A-Za-z' -]*?)\*\*(?![\w*/.])/g, '$1')
+    .replace(/(?<![\w_])__([A-Za-z][A-Za-z' -]*?)__(?![\w_/.])/g, '$1')
+    .replace(/`([A-Za-z][\w-]*)`/g, '$1');
+}
+
+// Prohibition triggers. A code signal AFTER one of these in the same sentence is a negated request, not a request for code.
+const PROHIBITION_TRIGGER_RE = /\b(do\s+not|don['’]t|never|no|without)\b/i;
 
 function stripNonRequests(sen) {
   return sen.replace(NEGATED_VERB_RE, ' ').replace(PIPELINE_BOILERPLATE_RE, ' ');
@@ -112,11 +137,20 @@ function scanForCodeSignals(text) {
   // still part of the SAME citation ("The code anchor is real: src/foo.js defines ..."),
   // and splitting on it would separate the citation marker from the very code-signal
   // token it's meant to cover.
-  const sentences = String(text || '').split(/(?<=[.!?])\s+|\n+/);
+  const sentences = normaliseEmphasis(text).split(/(?<=[.!?])\s+|\n+/);
+  const excluded = [];
   let docDeliverable = false;
   const tripping = [];
-  for (const sen of sentences) {
+  for (let si = 0; si < sentences.length; si++) {
+    const sen = sentences[si];
     if (CITATION_CONTEXT_RE.test(sen)) continue;
+    // A prohibition ("Do not open src/x.js") negates the code signals that come AFTER its trigger in the same sentence. A signal BEFORE the trigger is a real request
+    // ("Change the timeout in src/foo.js but do not touch the tests"), so such a sentence is left to the normal scan.
+    const prohib = PROHIBITION_TRIGGER_RE.exec(sen);
+    if (prohib && CODE_SIGNAL_RE.test(sen.slice(prohib.index + prohib[0].length)) && !CODE_SIGNAL_RE.test(sen.slice(0, prohib.index))) {
+      excluded.push({ event: 'prohibition-excluded-from-signal', sentenceIndex: si, trigger: prohib[1].toLowerCase() });
+      continue;
+    }
     let cleaned = stripNonRequests(sen);
     const doc = DOC_DELIVERABLE_RE.exec(cleaned);
     if (doc) {
@@ -127,7 +161,7 @@ function scanForCodeSignals(text) {
     }
     if (CODE_SIGNAL_RE.test(cleaned)) tripping.push(cleaned);
   }
-  return { docDeliverable, tripping };
+  return { docDeliverable, tripping, excluded };
 }
 
 // A code PATH merely named, cited or described does not make a sentence a request -- but a sentence that OPENS WITH AN IMPERATIVE does, whatever the verb: "Lazy-load the job
@@ -141,9 +175,16 @@ const NON_IMPERATIVE_LEAD_RE = /^(?:(?:and|then|also|but|so|next|finally|plus)\s
 // "Populate it with at least three rows: routes/chat.py:140-148 (...)" and "Decision 1: ... touching scripts/local-worker.sh" are documentation, and a first version of this
 // rule, dry-run over the real queue, flipped both). A "Label:" / "Decision 1:" lead is not a verb either.
 const TARGET_PATH_RE = /\b(?:in|into|to|inside|within)\s+(?:the\s+|its\s+|a\s+)?(?:[\w.-]+\/)*[\w.-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css)\b/i;
+// Verbs that ask the author to LOOK at a file, never to change it (2026-10-16: two read-only design/findings tasks, "Ground it in the current code with path:line ... in src/task-sources.js" and
+// "Read the real history ... the existing task sources in src/task-sources.js", were blocked because "Ground" / "Read" are not on the non-verb list above and the file is named after "in"). None of
+// these is a mutating verb; a sentence that ALSO contains a real edit verb ("Read the helper and rename it in src/a.js") still counts, see opensWithImperative.
+const READING_LEAD_RE = /^(?:read|ground|check|confirm|verify|compare|survey|inspect|review|examine|trace|count|group|audit|map|identify|investigate|analy[sz]e|look|study|scan|grep|search|find|classify|tabulate|quantify|cross-check|cross-reference)$/i;
 function opensWithImperative(c) {
   const m = /^[\s>*\-\d.)]*([A-Za-z][A-Za-z-]*)(?=\s)/.exec(c);
-  return !!m && !NON_IMPERATIVE_LEAD_RE.test(m[1]) && TARGET_PATH_RE.test(c);
+  if (!m || NON_IMPERATIVE_LEAD_RE.test(m[1]) || !TARGET_PATH_RE.test(c)) return false;
+  // A first word followed by a colon is a label/heading (e.g. "Questions: which functions..."), not an imperative verb
+  if (/^[\s>*\-\d.)]*[A-Za-z][A-Za-z-]*\s*:/.test(c)) return false;
+  return !(READING_LEAD_RE.test(m[1]) && !AFFIRMATIVE_EDIT_VERB_RE.test(c));
 }
 // A sentence still counts as asking for code when it has a phrase signal, an affirmative edit verb, or opens with an imperative.
 const requestsCode = (c) => CODE_PHRASE_SIGNAL_RE.test(c) || AFFIRMATIVE_EDIT_VERB_RE.test(c) || opensWithImperative(c);
@@ -154,6 +195,9 @@ const requestsCode = (c) => CODE_PHRASE_SIGNAL_RE.test(c) || AFFIRMATIVE_EDIT_VE
 function wantsCodeChange(combined, rawText = null) {
   if (rawText) {
     const raw = scanForCodeSignals(rawText);
+    // A stated documentation deliverable AND an explicit read-only statement: the verbs and phrases in code-citing sentences describe what the document will verify, so only a sentence
+    // that opens with an imperative aimed at a code path ("Rename the helper in src/a.js") still asks for code.
+    if (raw.docDeliverable && READ_ONLY_RE.test(rawText)) return raw.tripping.some(opensWithImperative);
     if (raw.docDeliverable) return raw.tripping.some(requestsCode);
   }
   const all = scanForCodeSignals(combined);
@@ -219,6 +263,8 @@ function isVerificationReport(sentence) {
   return VERIFICATION_MARKER_RE.test(sentence) && !IMPERATIVE_PROHIBITION_RE.test(sentence);
 }
 
+const EXCEPTION_MARKER_RE = /\b(?:other than|except(?: for)?|apart from|aside from|besides)\b/i;
+
 function extractForbiddenPaths(text) {
   const out = new Set();
   const add = (raw) => {
@@ -228,9 +274,13 @@ function extractForbiddenPaths(text) {
     out.add(s);
   };
   const sentences = String(text || '').split(/(?<=[.!?:])\s+|\n+/);
-  for (const sen of sentences) {
+  for (let sen of sentences) {
     if (!RESTRICTION_SENTENCE_RE.test(sen)) continue;
     if (isVerificationReport(sen)) continue;
+    // "Does not touch any file other than `x`" / "nothing except x" names the ONE file that may change: what follows the exception marker is the exemption, never a prohibition
+    // (HUB0040 2/3 was blocked on `matches forbidden "src/decompose-premise-check.js"`, the file it was told to edit).
+    const exemption = EXCEPTION_MARKER_RE.exec(sen);
+    if (exemption) sen = sen.slice(0, exemption.index);
     for (const p of sen.matchAll(/\b(?:src|python|scripts|lib|tests?|docs|node_modules)\/[\w./@-]*[\w]/gi)) add(p[0]);
     for (const p of sen.matchAll(/[\w./@-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css|json|ya?ml)\b/gi)) add(p[0]);
     // (?!\/[A-Za-z0-9_-]) after the capture group (2026-09-15, root-caused live): without
@@ -262,7 +312,8 @@ function pathHitsForbidden(changedPath, forbidden) {
     if (f.endsWith('/')) return cp === f.slice(0, -1) || cp.startsWith(f);
     if (cp === f) return true;
     // path with no extension ("src/apply-adhoc-diff") -> match "src/apply-adhoc-diff.js"
-    if (f.includes('/') && !/\.\w+$/.test(f)) return cp === f || cp.startsWith(`${f}.`);
+    // ... or, when the restriction names a directory without the trailing slash ("Do not touch `docs/audit/`" is extracted as "docs/audit"), anything under it
+    if (f.includes('/') && !/\.\w+$/.test(f)) return cp === f || cp.startsWith(`${f}.`) || cp.startsWith(`${f}/`);
     // a bare filename restriction matches by basename
     if (!f.includes('/')) return base === f || base.startsWith(`${f}.`);
     return false;
@@ -279,7 +330,7 @@ function pathHitsForbidden(changedPath, forbidden) {
 // target carefully, not a prohibition on touching it at all. extractForbiddenPaths'
 // output is filtered against this set so the forbidden-path gate only ever fires for a
 // path that is NOT one of the task's declared targets.
-function extractDeclaredTargets(task, planText = '') {
+function extractDeclaredTargets(task, planText = '', { includeCreated = true } = {}) {
   const out = new Set();
   const add = (raw) => {
     const s = String(raw || '').trim().replace(/^[`'"(]+|[`'".,;)]+$/g, '').replace(/^\.\//, '');
@@ -294,7 +345,9 @@ function extractDeclaredTargets(task, planText = '') {
   for (const frag of String((task && task.title) || '').split(/(?<=[.!?:;])\s+|\s+[—-]\s+/)) {
     if (RESTRICTION_SENTENCE_RE.test(frag)) continue;
     for (const m of frag.matchAll(/\b(?:src|python|scripts|lib|tests?|docs|node_modules)\/[\w./@-]*[\w]/gi)) add(m[0]);
-    for (const m of frag.matchAll(/[\w./@-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css|json|ya?ml)\b/gi)) add(m[0]);
+    // `(?!\()`: a CALL such as `res.json()` / `fs.readFile()` in a title is code, not a file path (2026-10-08: two TaxHarvest tasks whose title is the whole
+    // brain-dump text, "`res.json()` on a non-JSON 200 ...", were blocked by the plan-target guard as "cites missing-file target(s): res.json"; same shape as #514).
+    for (const m of frag.matchAll(/[\w./@-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css|json|ya?ml)\b(?!\()/gi)) add(m[0]);
   }
   // 3. Explicit edit-target mentions in the plan body.
   const plan = String(planText || '');
@@ -337,7 +390,46 @@ function extractDeclaredTargets(task, planText = '') {
   // SAME plan broadly forbade all of src/ -- including the one file the plan had just
   // named as its edit target two paragraphs earlier.
   for (const p of leadingInClauseTargets(plan)) add(p);
+  // 6. An imperative edit verb whose OBJECT is a backticked concrete file path, in a non-restriction sentence of the rawText body
+  // (2026-10-25, adhoc-clear-pidfile-...-1792936771585, blocked on `diff touches server/core/comfy_proc.py (matches forbidden "comfy_proc.py")`):
+  // "In the gpu-broker repo, modify `server/core/comfy_proc.py`'s `_clear_pidfile()` ..." names its target, but it is not the "In `<path>`," leading
+  // shape rules 4/5 accept, so the same task's own scope sentence ("Do not change anything else in comfy_proc.py ...") forbade the file it had just been
+  // told to edit. Kept narrow like rule 4: the path must be the verb's direct object (optionally after "the file"), so a path that is merely cited in
+  // a sentence that happens to contain a verb is still not a target.
+  for (const p of verbObjectTargets(rawText)) add(p);
+  // 7. A file the task or its own plan says to CREATE / WRITE, or calls its deliverable ("Create docs/audit-x.md.", "Create the deliverable as a single plain-text file at `notes/x.txt`",
+  // "The deliverable is the note file `notes/x.txt`"): a new file is a declared target exactly like an edited one. Without this a documentation task whose scope sentences mention that
+  // same file ("the diff must be exactly one new file ...", "do not also modify it") had it forbidden (HUB0125 1/2) and was judged docs-only (HUB0002 2/2).
+  if (includeCreated) {
+    for (const p of createTargets(rawText)) add(p);
+    for (const p of createTargets(plan)) add(p);
+  }
   return [...out];
+}
+
+// Rule 7 of extractDeclaredTargets: "create|write|generate [the|a ... file] [at] <path>" or "deliverable is ... <path>" in a sentence that is not itself a restriction.
+function createTargets(text) {
+  const out = [];
+  const PATH = '`?([\w./@-]+\.\w+)`?(?!\\()';
+  for (const frag of String(text || '').split(/(?<=[.!?;])\s+|\n+/)) {
+    if (RESTRICTION_SENTENCE_RE.test(frag) || IMPERATIVE_PROHIBITION_RE.test(frag)) continue;
+    const a = new RegExp(`^[\s\\d.)*>#-]*(?:create|write|generate|author)\s+(?:the\s+|a\s+|an\s+|new\s+|single\s+|plain-text\s+|deliverable\s+|as\s+)*(?:file\s+)?(?:at\s+|named\s+)?${PATH}`, 'i').exec(frag);
+    if (a) out.push(a[1]);
+    const b = new RegExp(`\bdeliverable\s+is\s+(?:exactly\s+)?(?:the\s+|one\s+)?(?:\w+\s+){0,3}?(?:file\s+)?${PATH}`, 'i').exec(frag);
+    if (b) out.push(b[1]);
+  }
+  return out;
+}
+
+// Rule 6 of extractDeclaredTargets: "<modify|edit|change|update|rewrite|replace|fix> [the file] `<path>`" in a sentence that is not itself a restriction.
+function verbObjectTargets(text) {
+  const out = [];
+  for (const frag of String(text || '').split(/(?<=[.!?:;])\s+|\n+/)) {
+    // IMPERATIVE_PROHIBITION_RE too: RESTRICTION_SENTENCE_RE needs `edit\w+`, so "Never edit `x`" is not caught by it, and a prohibited file must not become a target.
+    if (RESTRICTION_SENTENCE_RE.test(frag) || IMPERATIVE_PROHIBITION_RE.test(frag)) continue;
+    for (const m of frag.matchAll(/\b(?:modify|edit|change|update|rewrite|replace|fix)\s+(?:the\s+file\s+)?`([\w./@-]+\.\w+)`(?!\()/gi)) out.push(m[1]);
+  }
+  return out;
 }
 
 // Shared by extractDeclaredTargets' rules 4 and 5 -- a leading "In `<path>` (aside)?,
@@ -349,7 +441,7 @@ function leadingInClauseTargets(text) {
   for (const frag of String(text || '').split(/(?<=[.!?:;])\s+|\n+/)) {
     const sentence = frag.trim();
     if (RESTRICTION_SENTENCE_RE.test(sentence)) continue;
-    const leading = /^(?:In|At)\s+[`'"]?([\w./@-]+\.\w+)[`'"]?\s*(?:\([^)]*\)\s*)?,/i.exec(sentence);
+    const leading = /^(?:In|At)\s+[`'"]?([\w./@-]+\.\w+)(?!\()[`'"]?\s*(?:\([^)]*\)\s*)?,/i.exec(sentence);
     if (leading && EDIT_VERB_RE.test(sentence)) out.push(leading[1]);
   }
   return out;
@@ -403,6 +495,12 @@ const PLAN_TARGETS_HINT = 'Implement the actual change in the file(s) the plan/t
 const ALL_N_TESTS_RE = /\ball\s+(\d+)\s+tests?\b/i;
 const N_TESTS_CLAIM_RE = /\b(\d+)\s+tests?\s+(?:pass(?:es|ed|ing)?|added)\b/i;
 
+// Whole-suite run phrases: when the summary or task text mentions one of these, a STATUS
+// claim like "All 14 tests pass" is about the ENTIRE test suite (not just the diff's
+// added tests), so the check must skip -- comparing the status count to the diff's added
+// test defs would always fail spuriously.
+const WHOLE_SUITE_RUN_RE = /\b(?:test\/\*\.test\.js|npm test|full suite|whole suite|all tests|node --test|unittest discover|pytest)\b/i;
+
 // `kind` separates a QUANTITY claim about the diff ("12 tests added") from a STATUS report
 // ("All 14 tests pass" -- the N tests in the file, which can far exceed what this diff adds
 // when it extends an existing test file; change_review AC-72 caught the 1054f01 regression
@@ -455,9 +553,49 @@ function taskWantsCodeFromText(rawText, combined) {
 }
 
 // Task-level form of the same decision (for the known-fixed-failures registry): the gate's verdict on `task` with a docs-only diff, without needing a diff.
+function declaredEditTargetsAllDocs(task, planText = '') {
+  const editTargets = extractDeclaredTargets(task, planText, { includeCreated: false });
+  return editTargets.length > 0 && editTargets.every((t) => isDocPath(t));
+}
+
+// 2026-11-02 (stalled-task loop: HUB0125 1/2 "Create docs/audit-....md", HUB0002 2/2 "Write the research note", both parked 'diff only touches documentation -- the task asks for a code
+// change'): a task whose every declared target (edit OR create) is a document, whose diff creates exactly those documents, and in which no sentence OPENS WITH AN IMPERATIVE aimed at a code
+// path, is asking for the document. The keyword scan trips on the descriptive sentences ("mapping ... to getConceptTimeline at src/concepts.js:185", "a row for src/x.js / fileHub()") that a
+// document-writing task is full of. A sentence like "Also rename foo in src/a.js" still opens with an imperative, so a task that really wants code stays blocked.
+function isCreatedDocDeliverable(task, planText, rawText, files) {
+  const targets = extractDeclaredTargets(task, planText, { includeCreated: true });
+  if (!targets.length || !targets.every((t) => isDocPath(t))) return false;
+  if (!files.length || !files.every((f) => targets.some((t) => pathsRefEqual(f.path, t)))) return false;
+  return !scanForCodeSignals(rawText).tripping.some(opensWithImperative);
+}
+
+// Exact path tokens the task text names in a non-restriction sentence that also carries a create or change verb ("Add a test in src/foo.test.js").
+// Used only to exempt a changed file from the forbidden-path check when its normalized path EXACTLY equals a named path. Never prefix matching.
+const NAMED_PATH_NEGATION_RE = /\b(?:not|no|never|without|avoid|unchanged|don['’]t|do\s+not|must\s+not)\b/i;
+const NAMED_PATH_VERB_RE = /\b(?:create|add|implement|change|update|modify|edit|write|rename|replace|wire|append|prepend|insert|remove|delete|fix|refactor|move)\b/i;
+const NAMED_PATH_TOKEN_RE = /(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]+/g;
+function normalizeDiffPath(p) {
+  return String(p || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^[`'"(\[]+|[`'"),;:\]]+$/g, '');
+}
+function collectNamedDiffPaths(task, planText = '') {
+  const rawText = (task && task.promptContext && task.promptContext.rawText) || (task && task.title) || '';
+  const named = new Set();
+  for (const text of [rawText, planText]) {
+    for (const sen of String(text || '').split(/(?<=[.!?:;])\s+|\n+/)) {
+      if (NAMED_PATH_NEGATION_RE.test(sen) || !NAMED_PATH_VERB_RE.test(sen)) continue;
+      for (const m of sen.match(NAMED_PATH_TOKEN_RE) || []) {
+        const p = normalizeDiffPath(m);
+        if (p) named.add(p);
+      }
+    }
+  }
+  return named;
+}
+
 function taskWantsCodeChange(task) {
   const rawText = (task && task.promptContext && task.promptContext.rawText) || (task && task.title) || '';
   const planText = (task && (task.planResponse || task.lastGoodPlan)) || '';
+  if (declaredEditTargetsAllDocs(task, planText)) return false;
   return taskWantsCodeFromText(rawText, `${rawText}\n${planText}`);
 }
 
@@ -476,9 +614,15 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   const targets = extractDeclaredTargets(task, planText);
   const forbidden = extractForbiddenPaths(combined)
     .filter((f) => !targets.some((t) => pathsRefEqual(f, t)));
+  const forbiddenOverride = findOverride(task, 'forbidden-path');
+  const forbiddenSuppressed = [];
   if (forbidden.length) {
-    const violations = files.map((f) => ({ f, hit: pathHitsForbidden(f.path, forbidden) })).filter((v) => v.hit);
-    if (violations.length) {
+    // A file the task itself names exactly (in a create/change sentence, not a restriction) is exempt; directory and basename restrictions still apply to every other file.
+    const namedDiffPaths = collectNamedDiffPaths(task, planText);
+    const violations = files.map((f) => ({ f, hit: pathHitsForbidden(f.path, forbidden) })).filter((v) => v.hit && !namedDiffPaths.has(normalizeDiffPath(v.f.path)));
+    if (violations.length && forbiddenOverride) {
+      for (const v of violations) forbiddenSuppressed.push(v.f.path);
+    } else if (violations.length) {
       const list = violations.map((v) => `${v.f.path} (matches forbidden "${v.hit}")`).join(', ');
       return {
         code: 'forbidden-path',
@@ -487,6 +631,8 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
       };
     }
   }
+
+  if (forbiddenOverride) recordGateOverride(task, 'forbidden-path', forbiddenOverride, forbiddenSuppressed);
 
   // 2. Deletes a file the task never asked to delete.
   const deletes = files.filter((f) => f.kind === 'delete');
@@ -503,23 +649,89 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   // (when present) is authoritative -- see extractDeclaredFiles's own header for why a
   // free-text keyword scan can't distinguish an edit target from a cited-as-evidence
   // path. Only falls back to CODE_SIGNAL_RE's blind scan when no Files: line exists.
+  const docsOverride = findOverride(task, 'docs-only');
+  const docsSuppressed = [];
   const nonDoc = files.filter((f) => !isDocPath(f.path));
-  if (nonDoc.length === 0) {
-    if (taskWantsCodeFromText(rawText, combined)) {
-      return {
+  // A task whose own declared edit targets are ALL documentation (its Files: line, a path in its title, or a file it says to create) is a documentation task no matter how many code paths
+  // its text cites as evidence (HUB0117 3/4: "Edit `docs/local-delegation.md` ... point to `agent-manager.env.example`").
+  // (Files this task says to CREATE are left out here: "Create docs/x.md ... Then update src/y.js" must still read as asking for code.)
+  const docOnlyTargets = declaredEditTargetsAllDocs(task, planText);
+  if (nonDoc.length === 0 && !docOnlyTargets) {
+    // 2026-11-04 (TaxHarvest stall clearing): when the diff is docs-only, also check whether the task itself is plausibly a documentation task -- title/description mentions
+    // README / runbook / docs / documentation and the diff only touches those named docs, with NO imperative verb aimed at a code path AND no code file in any declared target.
+    // A task whose text is about updating documentation should not be rejected for producing exactly that. This sits BEFORE the legacy `taskWantsCodeFromText` check so a genuine
+    // docs task passes even when its description cites code paths as evidence (the very shape that stalls adhoc tasks).
+    const taskTitle = task.title || '';
+    const taskDesc = (task.promptContext && task.promptContext.rawText) || '';
+    const combinedTitleDesc = `${taskTitle}\n${taskDesc}`;
+    const mentionsDocs = /README|runbook|documentation|\bdocs?\b/i.test(combinedTitleDesc);
+    // Check if the diff only touches documentation files
+    const allFilesAreDocs = files.length > 0 && files.every((f) => isDocPath(f.path));
+    // Check for any code-related signal that would indicate this is a mixed task (code + docs)
+    // rather than a pure docs task:
+    // 1. A Files: line that includes a code path
+    // 2. An imperative verb aimed at a code path
+    // 3. A declared target that is a code file
+    // 4. A declared target that doesn't match the diff (task says create X, diff creates Y)
+    const hasCodeInFilesLine = extractDeclaredFiles(rawText) && extractDeclaredFiles(rawText).some((p) => !isDocPath(p));
+    const hasCodeImperative = scanForCodeSignals(rawText).tripping.some(opensWithImperative);
+    const allTargets = extractDeclaredTargets(task, planText, { includeCreated: true });
+    const hasCodeTarget = allTargets.length > 0 && allTargets.some((t) => !isDocPath(t));
+    // Check if the diff creates a different doc than declared
+    const declaredDocs = allTargets.filter((t) => isDocPath(t));
+    const hasMismatchedDoc = declaredDocs.length > 0 && !declaredDocs.some((d) => files.some((f) => pathsRefEqual(f.path, d)));
+    // If any code signal is present OR the diff doesn't match the declared docs, this is not a pure docs task
+    if (mentionsDocs && allFilesAreDocs && (hasCodeInFilesLine || hasCodeImperative || hasCodeTarget || hasMismatchedDoc)) {
+      // Fall through to the legacy check below
+    } else if (mentionsDocs && allFilesAreDocs) {
+      // Pure docs task: no code signals, diff matches declared docs -> pass
+      if (docsOverride) recordGateOverride(task, 'docs-only', docsOverride, []);
+      return null;
+    }
+    // Mixed task (code + docs) that only produced docs: provide specific feedback about missing code
+    if (taskWantsCodeFromText(rawText, combined) && !isCreatedDocDeliverable(task, planText, rawText, files)) {
+      // Identify what code the task asked for but the diff didn't include
+      const declaredFiles = extractDeclaredFiles(rawText);
+      const declaredCodePaths = declaredFiles ? declaredFiles.filter((p) => !isDocPath(p)) : [];
+      const codeImperativeTargets = scanForCodeSignals(rawText).tripping
+        .filter((sen) => opensWithImperative(sen))
+        .map((sen) => {
+          const m = /\b(?:in|into|to|inside|within)\s+(?:the\s+|its\s+|a\s+)?([\w.-]+\/[\w.-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css))\b/i.exec(sen);
+          return m ? m[1] : null;
+        })
+        .filter(Boolean);
+      const missingCode = [...new Set([...declaredCodePaths, ...codeImperativeTargets])];
+      const feedbackBase = `Your diff only created/edited documentation (${files.map((f) => f.path).join(', ')}). That is not the deliverable -- the task asks for a real code change. ${PLAN_TARGETS_HINT}. A doc/ADR, if the task asks for one at all, comes LAST, after the code is written and checked.`;
+      const specificFeedback = missingCode.length > 0
+        ? ` The task mentions these code paths that your diff should include: ${missingCode.join(', ')}.`
+        : '';
+      if (docsOverride) {
+        for (const f of files) docsSuppressed.push(f.path);
+      } else return {
         code: 'docs-only',
         reason: `diff only touches documentation (${files.map((f) => f.path).join(', ')}) -- the task asks for a code change`,
-        retryFeedback: `Your diff only created/edited documentation (${files.map((f) => f.path).join(', ')}). That is not the deliverable -- the task asks for a real code change. ${PLAN_TARGETS_HINT}. A doc/ADR, if the task asks for one at all, comes LAST, after the code is written and checked.`,
+        retryFeedback: `${feedbackBase}${specificFeedback}`,
       };
     }
   }
+
+  if (docsOverride) recordGateOverride(task, 'docs-only', docsOverride, docsSuppressed);
 
   // 4. A checkable "all N tests pass/added" claim contradicted by the diff's own test defs.
   const claimed = extractClaimedTestCount(summary);
   // A status claim ("All N tests pass") equals the diff's added tests only when the diff
   // CREATES every file it touches (a brand-new test file); against an edited existing file the
   // two are different numbers, so only an explicit "N tests added" claim is comparable there.
-  const comparable = claimed !== null && (claimed.kind === 'added' || files.every((f) => f.kind === 'create'));
+  // For a STATUS claim, also skip when the summary or task text mentions a whole-suite run
+  // phrase (e.g. "npm test", "full suite", "test/*.test.js", "node --test", "pytest") --
+  // that signals the count is about the WHOLE suite, not just the diff's added tests, so
+  // comparing it to the diff's added test defs would always fail spuriously.
+  const statusIsWholeSuite = claimed && claimed.kind === 'status' && (
+    WHOLE_SUITE_RUN_RE.test(summary) || WHOLE_SUITE_RUN_RE.test(rawText)
+  );
+  const comparable = claimed !== null && !statusIsWholeSuite && (
+    claimed.kind === 'added' || files.every((f) => f.kind === 'create')
+  );
   if (comparable) {
     const claimedTests = claimed.count;
     const actualTests = countAddedTestDefs(rawDiff);
@@ -527,7 +739,7 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
       return {
         code: 'false-test-count-claim',
         reason: `summary claims ${claimedTests} tests but the diff only adds ${actualTests} test definition(s)`,
-        retryFeedback: `Your summary claims ${claimedTests} tests, but the diff you produced only adds ${actualTests} test definition(s). Either write the tests you claimed, or correct the summary to match what the diff actually contains -- do not report a count you didn't verify against your own diff.`,
+        retryFeedback: `Your summary claims ${claimedTests} tests, but the diff you produced only adds ${actualTests} test definition(s). If you added tests to the diff, state the count as "N tests added" to match what the diff actually contains. If you are reporting the whole-suite total, phrase it as "suite total N" (e.g. "suite total 42 after this change") rather than implying the diff itself contains that many tests.`,
       };
     }
   }
@@ -604,7 +816,83 @@ function adhocNoChangesClaimProblem(task, summary) {
   };
 }
 
+// --- import-binding steps in a plan (HUB0159 · 1/3) ---------------------------
+//
+// A plan step that tells the implementer to add a require/import binding is exactly where
+// a token-gesture plan tends to show itself. Two deterministic shapes are worth a retry
+// round-trip:
+//   - >= 2 separate import-binding steps: spreading one binding across several steps
+//     almost always means the plan is doing the wiring instead of the feature;
+//   - exactly 1 import-binding step that never shows the binding verbatim (no complete
+//     require('...') / import ... from '...' statement inside its fenced snippet): the
+//     implementer has to guess the exact line and where it goes.
+//
+// Tightened heuristic (this is the point of this check, and why it was never a blind
+// keyword scan): a binding token ONLY counts when it appears INSIDE a fenced code block
+// (```...```). A `require(` or `import ... from` mentioned in plain prose -- a citation,
+// an explanation, a quoted example -- is NOT an import-binding step, so a plan that merely
+// talks about a binding is never flagged.
+
+const PLAN_IMPORT_BINDING_TOKEN_RE = /\brequire\s*\(|\bimport\b[^\n;]*\bfrom\b/;
+// A VERBATIM anchor: the complete statement with a quoted module specifier, which is what
+// the implementer can actually `find` and place an edit against.
+const PLAN_IMPORT_VERBATIM_ANCHOR_RE = /\brequire\s*\(\s*['"][^'"\n]+['"]\s*\)|\bimport\s+(?:\{[^}\n]*\}|[A-Za-z_$][\w$]*)\s+from\s+['"][^'"\n]+['"]/;
+
+// Per-branch tally: every pass/flag branch in planImportBindingProblem increments exactly
+// one counter before returning, so a wrongly-dismissed case can be located by inspecting
+// which branch fired (sibling gates in this file have no equivalent; this is local to the
+// new heuristic).
+const planImportBindingStats = {
+  skippedNotAdhoc: 0,
+  passNoImportStep: 0,
+  passVerbatimAnchor: 0,
+  flagMissingVerbatimAnchor: 0,
+  flagTooManySteps: 0,
+};
+
+// Returns null if the plan's import-binding steps look sane, else
+// { code, reason, retryFeedback }.
+function planImportBindingProblem(task, summary) {
+  if (!isAdhoc(task)) {
+    planImportBindingStats.skippedNotAdhoc++;
+    return null;
+  }
+  // The plan text (planResponse / lastGoodPlan) plus the caller-supplied summary.
+  const text = `${String(task.planResponse || task.lastGoodPlan || '')}\n${String(summary || '')}`;
+
+  // Fenced blocks only: an unclosed trailing fence still captures to end-of-text.
+  const blocks = [];
+  const fenceRe = /```[\s\S]*?(?:```|$)/g;
+  let m;
+  while ((m = fenceRe.exec(text)) !== null) blocks.push(m[0]);
+
+  const steps = blocks.filter((b) => PLAN_IMPORT_BINDING_TOKEN_RE.test(b));
+  if (steps.length === 0) {
+    planImportBindingStats.passNoImportStep++;
+    return null; // no fenced import-binding step -- prose mentions never count
+  }
+  if (steps.length >= 2) {
+    planImportBindingStats.flagTooManySteps++;
+    return {
+      code: 'too-many-import-binding-steps',
+      reason: `the plan spreads import bindings across ${steps.length} separate fenced steps`,
+      retryFeedback: 'Your plan has more than one step adding a require/import binding. That is almost always the wiring being done instead of the feature. Collapse it to ONE step that adds the single binding the feature needs, then spend the rest of the plan on the feature itself.',
+    };
+  }
+  if (steps.some((b) => PLAN_IMPORT_VERBATIM_ANCHOR_RE.test(b))) {
+    planImportBindingStats.passVerbatimAnchor++;
+    return null; // exactly one step and it shows the verbatim binding statement to find/add
+  }
+  planImportBindingStats.flagMissingVerbatimAnchor++;
+  return {
+    code: 'missing-verbatim-find-anchor',
+    reason: "the plan's single import-binding step shows the binding only in shorthand -- no verbatim require('...') / import ... from '...' statement inside its fenced snippet",
+    retryFeedback: "Your single import-binding step never shows the exact line to add. Put the verbatim statement (e.g. const { x } = require('./module.js'); or import x from './module.js'); inside a fenced code block in that step, together with the existing line it goes after, so the edit has a findable anchor.",
+  };
+}
+
 module.exports = {
   adhocDiffSubstanceProblem, adhocNoChangesClaimProblem, parseChangedFiles, extractForbiddenPaths,
   extractDeclaredTargets, pathsRefEqual, taskWantsCodeChange,
+  planImportBindingProblem, planImportBindingStats,
 };

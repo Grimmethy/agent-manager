@@ -1,8 +1,9 @@
 # CLAUDE.md
 
 Repo-specific guidance for Claude Code working in `agent-manager`. This complements
-(does not replace) the `F:\GitHub\CLAUDE.md` architect-role instructions that apply
-across every project in `F:\GitHub`.
+(does not replace) the cross-project architect-role instructions that applied across every
+project under `/media/model-cache/github` (written as `F:\GitHub\CLAUDE.md` in the Windows era;
+that file is not present on this Linux host, so this file is the only repo-level guidance here).
 
 ## First principle: build the mechanism, don't hand-fix the instance
 
@@ -18,6 +19,10 @@ Act on a single item directly only when the user **explicitly asks** for that it
 even then prefer a dashboard `/api/task/...` endpoint or an existing sweep over
 hand-editing `queue/`. If no mechanism fits, the deliverable is a proposal for one.
 
+## Filing friction tasks: premium at filing
+
+Friction tasks that block work are filed premium at filing. The full rule is in AGENTS.md, section "Filing friction tasks: premium at filing".
+
 ## Agent skills
 
 ### Issue tracker
@@ -30,7 +35,18 @@ Default label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `read
 
 ### Domain docs
 
-Single-context — one `CONTEXT.md` (to be created) and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+Single-context — one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Skills
+
+`act-as-local-agent` and `verify-unmerged-branches` ship in `docs/agents/skills/` (`.claude/` is
+gitignored). Run `scripts/install-skills.sh` once to link them into `~/.claude/skills`.
+
+### Triggers, not polls
+
+Before adding a sweep, tick, poll or timer, read the Fourth principle in `AGENTS.md` and
+`docs/adr/0024-triggers-not-polls.md`: announce the change at the writer, register interest once, keep a
+counted slow reconcile, and measure the idle cost. Language-neutral spec: the private repo `Grimmethy/triggers`.
 
 ### Codebase map
 
@@ -50,7 +66,7 @@ gitignored here, so it can't ship in-repo):
 
 ```json
 "hooks": {"SessionStart": [{"matcher": "startup|clear|compact", "hooks": [{
-  "type": "command", "command": "python3 /media/model-cache/github/agent-manager/python/dashboard/codebase_map_digest.py"}]}]}
+  "type": "command", "command": "python3 <your agent-manager checkout>/python/dashboard/codebase_map_digest.py"}]}]}
 ```
 
 It no-ops silently when the cwd isn't inside a repo that has the map.

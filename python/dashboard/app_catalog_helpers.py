@@ -157,11 +157,31 @@ def _assign_brain_dump_serials(entries: list) -> bool:
     capturedAt order (oldest first) so backfilled numbers land in a sensible reading
     order rather than dict/file order, continuing from whatever the current max already
     is so a re-run never reassigns or collides with a number already handed out.
+    String serials (e.g. '1792047142094') are coerced to int in place so the
+    dashboard's max() bookkeeping and any downstream JSON consumers never see a str.
+    Non-numeric junk ('abc', None, ...) is left untouched here -- _coerce_serial
+    maps those to 0 downstream when a serial is actually consumed.
     Returns True if anything changed, so the caller knows to persist it."""
+    changed = False
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        val = e.get("serial")
+        if isinstance(val, str):
+            try:
+                iv = int(val.strip())
+            except (ValueError, TypeError):
+                continue
+            if iv >= 0:
+                e["serial"] = iv
+                changed = True
     missing = [e for e in entries if isinstance(e, dict) and not e.get("serial")]
     if not missing:
-        return False
-    next_serial = max((e.get("serial") or 0) for e in entries if isinstance(e, dict)) + 1 if entries else 1
+        return changed
+    # Lazy import: app.py re-exports this module, so a top-level `from app import ...`
+    # here would be circular.
+    from app import _coerce_serial
+    next_serial = max((_coerce_serial(e.get("serial")) for e in entries if isinstance(e, dict)), default=0) + 1
     for e in sorted(missing, key=lambda e: e.get("capturedAt") or ""):
         e["serial"] = next_serial
         next_serial += 1
@@ -362,3 +382,37 @@ _branch_cache = {"at": 0.0, "branches": []}
 
 
 _branch_cache_lock = threading.Lock()
+
+
+def _branch_fetch_ttl_seconds(environ=None):
+    """Seconds between timed `git fetch origin` runs for the ACTIVE project's branch list (env AGENT_MANAGER_BRANCH_FETCH_TTL_SECONDS, default 300, floor 30). A merge or a
+    discard still forces the next list to fetch at once (_invalidate_branch_cache(refetch=True)): the writer announces, the timer is only the safety net (ADR-0024)."""
+    import os
+    try:
+        return max(30.0, float((environ if environ is not None else os.environ).get("AGENT_MANAGER_BRANCH_FETCH_TTL_SECONDS", "300")))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _action_fetch_timeout_seconds(environ=None):
+    """Seconds a `git fetch origin` may take when a person is waiting on a merge, discard or verdict (env AGENT_MANAGER_ACTION_FETCH_TIMEOUT_SECONDS, default 180, floor 30).
+    The list's own background fetch keeps 30 s; an action must not fail on a host so loaded that one fetch takes 47 s (2026-11-03: four 500s on the Merge button)."""
+    import os
+    try:
+        return max(30.0, float((environ if environ is not None else os.environ).get("AGENT_MANAGER_ACTION_FETCH_TIMEOUT_SECONDS", "180")))
+    except (TypeError, ValueError):
+        return 180.0
+
+
+_ACTION_FETCH_TIMEOUT_SECONDS = _action_fetch_timeout_seconds()
+# A merge fetches once to check the branch and once under the apply lock; the second is skipped when the first finished this recently.
+_ACTION_FETCH_REUSE_SECONDS = 120.0
+
+
+# 2026-10-15: `git fetch origin --prune` (14-16 s at load) used to run on EVERY list; it now runs at most once per this many seconds unless forced or invalidated. `refreshing` is the
+# single-flight flag for the background refresh list_unmerged_branches starts when it serves a stale cache. Both guarded by _branch_cache_lock.
+# 2026-11-03: default 60 -> 300. Measured with scripts/idle-cost-audit.py, the dashboard's `git fetch origin` ran ~7 times a minute on a disk already at 100% busy.
+_BRANCH_FETCH_TTL_SECONDS = _branch_fetch_ttl_seconds()
+
+
+_branch_fetch_state = {"at": 0.0, "refreshing": False}

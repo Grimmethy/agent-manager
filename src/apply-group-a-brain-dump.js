@@ -6,7 +6,19 @@ const fs = require('fs');
 const path = require('path');
 const { resolveAnchors, extractKeywords } = require('./path-prefetch.js');
 const { resolveGraphPath, getSecondBrainDir } = require('./config.js');
+// isResearchDomainTask (draft-lifecycle.js) owns the "Research:" title-prefix convention
+// -- the one part of a research task's identity that survives existingQueuedTaskTitles()'s
+// 140-char title truncation, and the structured tag this file's duplicate gate now matches
+// on when free-text can't (see isValidDuplicateMatch's header). draft-lifecycle.js itself
+// requires only task-history.js / task-source-registry.js / ollama-lock-key.js (all
+// dependency-free), so pulling it in here adds no cycle.
+const { isResearchDomainTask } = require('./lib/draft-lifecycle.js');
 const { writeAtomicSync, writeJsonAtomicSync } = require('./atomic-write.js');
+const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-dump-existing-work.js');
+const { checkEntryTargets, isEnabled: targetCheckEnabled } = require('./brain-dump-target-check.js');
+const { checkBrainDumpDuplicate, isEnabled: duplicateCheckEnabled } = require('./lib/brain-dump-duplicate-check.js');
+const { logPipelineEvent } = require('./pipeline-history.js');
+const { handOffJournalEntry } = require('./journalforge-handoff.js');
 const { normalizeTokens, jaccardSimilarity } = require('./text-similarity.js');
 const {
   CANONICAL_TOP_LEVEL,
@@ -17,6 +29,7 @@ const {
   deriveBelongsToProject,
   isInvestigationFinding,
 } = require('./brain-dump-sort-classify.js');
+const { processAmbiguousBrainDump } = require('./scoped-clarification.js');
 
 function readProjectRegistry() {
   const registryPath = process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH || path.join(__dirname, '..', 'projects.json');
@@ -60,9 +73,15 @@ function originProjectFor(entry, registry) {
 // title still passes; anything below that bar is almost certainly a hallucination, not a
 // real duplicate the classifier actually found.
 const DUPLICATE_MATCH_JACCARD_THRESHOLD = 0.5;
-function isValidDuplicateMatch(candidate, existingTitles) {
+function isValidDuplicateMatch(candidate, existingTitles, candidateTask) {
   const c = String(candidate || '').trim();
   if (!c || !Array.isArray(existingTitles) || existingTitles.length === 0) return false;
+  // Research-domain branch (2026-09-16): existingQueuedTaskTitles() cuts every title to 140
+  // chars, so a "Research: ..." title can lose the words a free-text check needs. The
+  // "Research:" prefix (isResearchDomainTask) survives that truncation, so when the candidate
+  // is research-domain and some queued title is too, that structured signal decides.
+  const candidateIsResearch = !!candidateTask && (candidateTask.domain === 'research' || isResearchDomainTask({ title: c }));
+  if (candidateIsResearch && existingTitles.some((t) => isResearchDomainTask({ title: String(t || '') }))) return true;
   const cLower = c.toLowerCase();
   const cTokens = normalizeTokens(c);
   return existingTitles.some((title) => {
@@ -144,8 +163,52 @@ function findEntry(data, entryId) {
   return data.entries.find((e) => e && e.id === entryId) || null;
 }
 
-function recoverableSortSkip(data, entry, brainDumpPath, reason) {
-  entry.sortAttempt = (entry.sortAttempt || 0) + 1;
+const MAX_INFRA_SORT_ATTEMPTS = 3;
+
+// Detect infrastructure-attributed failures by inspecting the task's blockedReason and
+// the skip reason string. Infrastructure errors (network timeouts, connection refused,
+// rate limits, ECONNRESET, DNS failures, upstream 5xx) should not burn the entry's
+// MAX_SORT_ATTEMPTS budget because a fresh retry of the same classifier will hit the
+// same infra wall -- the 3-attempt sort budget is meant for content that might change
+// on re-read, not for a flaky dependency.
+function isInfraAttributed(task, reason) {
+  const blocked = String(task && task.blockedReason || '').toLowerCase();
+  const r = String(reason || '').toLowerCase();
+  const markers = [
+    'network timeout', 'connection refused', 'rate limit exceeded',
+    'econnreset', 'econnrefused', 'dns', 'timeout', '502', '503', '504',
+    'upstream', 'service unavailable', 'connection reset', 'socket hang up',
+    'enotfound', 'etimedout', 'eai-again',
+  ];
+  return markers.some((m) => blocked.includes(m) || r.includes(m));
+}
+
+function recoverableSortSkip(data, entry, brainDumpPath, reason, task) {
+  if (isInfraAttributed(task, reason)) {
+    // Infra skip: do NOT burn the entry's MAX_SORT_ATTEMPTS. Record on a separate
+    // infra-attributed counter so the 3-attempt sort budget is reserved for content
+    // that might actually change on re-read.
+    entry.infraSortAttempts = (entry.infraSortAttempts || 0) + 1;
+    entry.infraSortAttemptCount = (entry.infraSortAttemptCount || 0) + 1;
+    entry.sortBudgetEvents = entry.sortBudgetEvents || [];
+    entry.sortBudgetEvents.push({
+      type: 'infraSortSkip',
+      reason: reason,
+      infraSortAttempts: entry.infraSortAttempts,
+      timestamp: Date.now(),
+    });
+    if (entry.infraSortAttempts >= MAX_INFRA_SORT_ATTEMPTS) {
+      entry.sortExhausted = true;
+      entry.sortBudgetEvents.push({
+        type: 'infraSortExhausted',
+        reason: reason,
+        infraSortAttempts: entry.infraSortAttempts,
+        timestamp: Date.now(),
+      });
+    }
+  } else {
+    entry.sortAttempt = (entry.sortAttempt || 0) + 1;
+  }
   try {
     fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
     writeJsonAtomicSync(brainDumpPath, data);
@@ -204,11 +267,11 @@ function loadAndValidateEntry({ implementResponse, task, brainDumpPath, secondBr
   const result = parseBrainDumpSortResult(implementResponse);
   if (!result) {
     return { done: recoverableSortSkip(data, entry, brainDumpPath,
-      'implement pass did not return a valid classification JSON') };
+      'implement pass did not return a valid classification JSON', task) };
   }
 
 
-  return { ctx: { data, entry, result, secondBrainDir, pipelineDir, brainDumpEntryId, rawText, existingQueuedTitles, brainDumpPath, promptContext: task.promptContext } };
+  return { ctx: { data, entry, result, secondBrainDir, pipelineDir, brainDumpEntryId, rawText, existingQueuedTitles, brainDumpPath, promptContext: task.promptContext, task } };
 }
 
 // Stage 2: normalise and validate the vault path, then recover the owning project (derive, origin routing, investigation-shaped findings).
@@ -248,7 +311,7 @@ function classifySortResult(ctx) {
   const namingError = validateSecondBrainPath(result.secondBrainPath, secondBrainDir, trackedLabels);
   if (namingError) {
     return { done: recoverableSortSkip(data, entry, brainDumpPath,
-      `rejected secondBrainPath "${result.secondBrainPath}": ${namingError}`) };
+      `rejected secondBrainPath "${result.secondBrainPath}": ${namingError}`, ctx.task) };
   }
 
   // Deterministic belongsToProject recovery -- the classifier routinely leaves this null
@@ -400,9 +463,41 @@ function buildAdhocTaskForEntry(ctx, matchedProject) {
     adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
     adhocTask.needsClarification = { reason: 'no-match' };
   } else if (anchorResult.status === 'ambiguous') {
-    adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
-    adhocTask.needsClarification = { reason: 'ambiguous', candidates: anchorResult.candidates };
-    if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+    // 2026-11-04 (brain-dump tasks stalling as 'ambiguous'): attempt to scope the task
+    // or generate specific questions instead of leaving it stuck with a generic signature.
+    // The task file may not exist yet (first time through), so we pass null for taskFile.
+    const clarificationResult = processAmbiguousBrainDump(
+      rawText,
+      adhocTask.title,
+      brainDumpEntryId,
+      path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification'),
+      null
+    );
+
+    if (clarificationResult.action === 'scope') {
+      // Successfully scoped: write the scoped body and queue to adhoc/
+      adhocTask.title = clarificationResult.scopedTask.title;
+      adhocTask.promptContext.scopedBody = clarificationResult.scopedTask.body;
+      adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'adhoc');
+      if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+    } else if (clarificationResult.action === 'escalate') {
+      // Escalate: task is stale or was previously marked ambiguous
+      adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'blocked');
+      adhocTask.needsClarification = {
+        reason: 'stale-clarification',
+        escalationReason: clarificationResult.reason,
+        candidates: anchorResult.candidates
+      };
+    } else {
+      // Generate specific questions
+      adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
+      adhocTask.needsClarification = {
+        reason: 'clarification-required',
+        questions: clarificationResult.questions,
+        candidates: anchorResult.candidates
+      };
+      if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+    }
   }
   // 'greenfield': adhocTask left exactly as constructed above, queues normally with
   // no prefetchedPaths field at all -- there is nothing to prefetch from yet.
@@ -429,7 +524,7 @@ function applyDuplicateGate(ctx, matchedProject, built) {
   // Validate BEFORE trusting it -- see isValidDuplicateMatch's own header for the
   // incident this closes. A classifier answer that matches nothing in the real
   // candidate list it was shown is treated as no match at all, not a duplicate flag.
-  if (result.possibleDuplicateOf && !isValidDuplicateMatch(result.possibleDuplicateOf, existingQueuedTitles)) {
+  if (result.possibleDuplicateOf && !isValidDuplicateMatch(result.possibleDuplicateOf, existingQueuedTitles, result.requiresResearch ? { domain: 'research' } : null)) {
     console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that does not match any real candidate title shown to the classifier -- discarding as a hallucinated match, not routing to needs-clarification`);
     result.possibleDuplicateOf = null;
   }
@@ -456,7 +551,7 @@ function applyDuplicateGate(ctx, matchedProject, built) {
       entry.duplicateGateAttempts = duplicateGateAttempts + 1;
       console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} matched against "${result.possibleDuplicateOf}" (duplicateGateAttempts=${entry.duplicateGateAttempts}) -- retrying with a fresh classification pass instead of routing to needs-clarification`);
       return { skip: recoverableSortSkip(data, entry, brainDumpPath,
-        `possible duplicate of "${result.possibleDuplicateOf}" on the first flag -- retrying with a fresh classification pass`) };
+        `possible duplicate of "${result.possibleDuplicateOf}" on the first flag -- retrying with a fresh classification pass`, ctx.task) };
     }
     console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} matched against "${result.possibleDuplicateOf}" again (duplicateGateAttempts=${duplicateGateAttempts}) -- routing to needs-clarification`);
     adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
@@ -507,7 +602,7 @@ function queueProjectTask(ctx, matchedProject) {
   // Matched a real project but it has no 'adhoc' domain -- a config gap that needs a
   // human, not a silent downgrade to a passive note.
   return recoverableSortSkip(data, entry, brainDumpPath,
-    `matched project "${matchedProject.label}" has no 'adhoc' domain registered -- cannot queue work there`);
+    `matched project "${matchedProject.label}" has no 'adhoc' domain registered -- cannot queue work there`, ctx.task);
 }
 
 // Stage: the passive vault-note fallback for an entry not tied to any tracked project.
@@ -537,11 +632,81 @@ function filePassiveNote(ctx) {
   return { file: fullPath };
 }
 
+// The pipeline dirs to search for an entry's existing work: this pipeline, plus the project the classifier named (its own
+// queue is where a new task would go).
+function existingWorkDirs(pipelineDir, result) {
+  const dirs = [];
+  try { dirs.push(pipelineDir || require('./config.js').getConfig().pipelineDir); } catch { if (pipelineDir) dirs.push(pipelineDir); }
+  const label = result && result.belongsToProject;
+  if (label) {
+    const p = readProjectRegistry().find((x) => x.label === label);
+    if (p && p.pipelineDir) dirs.push(p.pipelineDir);
+  }
+  return dirs.filter(Boolean);
+}
+
+// Pre-queue target check (brain-dump-target-check.js): an entry whose cited paths are all missing from the matched project's repo, that cites archive/ code, or
+// that is only a hub sequencing note is NOT turned into an adhoc task. It stays in Brain Dump (status unchanged, not suppressed, not actioned) with
+// entry.targetCheck = { verdict, reasons, at }; sortAttempt is parked at the budget so brain_dump_sort does not pick it again, and an owner can force it through by
+// setting entry.targetCheckOverride = true (and clearing sortAttempt). AGENT_MANAGER_BRAIN_DUMP_TARGET_CHECK=false skips the check.
+const TARGET_CHECK_PARKED_ATTEMPTS = 3; // = MAX_SORT_ATTEMPTS in apply-group-a.js / task-sources.js
+function targetCheckSkip({ data, entry, brainDumpPath }, matchedProject, pipelineDir) {
+  if (!targetCheckEnabled() || entry.targetCheckOverride === true) return null;
+  const check = checkEntryTargets(entry.rawText, { repoRoot: matchedProject.repoRoot });
+  if (check.verdict !== 'suspect') return null;
+  entry.targetCheck = { verdict: check.verdict, reasons: check.reasons, at: new Date().toISOString() };
+  entry.sortAttempt = Math.max(entry.sortAttempt || 0, TARGET_CHECK_PARKED_ATTEMPTS);
+  fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+  writeJsonAtomicSync(brainDumpPath, data);
+  try { logPipelineEvent(pipelineDir, 'brain-dump-target-check', { entryId: entry.id, serial: entry.serial ?? null, project: matchedProject.label, reasons: check.reasons }); } catch { /* best-effort log */ }
+  return { skipped: true, targetCheck: true, reason: `brain-dump entry not queued: ${check.reasons.join('; ')} (entry.targetCheck stamped; set targetCheckOverride to force it)` };
+}
+
 function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
   const loaded = loadAndClassifyEntry({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
   if (loaded.done) return loaded.done;
   const { ctx } = loaded;
   const { result, data, entry } = ctx;
+
+  // Existing-work re-check (2026-10-18, brain-dump-existing-work.js): work for this entry can appear between drafting
+  // this sort and applying it (an operator carrying the entry by hand, the dashboard's prioritize). Link instead of queueing.
+  const existing = findExistingWorkForEntry(existingWorkDirs(pipelineDir, result), entry);
+  if (existing) {
+    linkEntryToExistingWork(entry, existing, 'apply');
+    fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+    writeJsonAtomicSync(brainDumpPath, data);
+    logPipelineEvent(existing.pipelineDir, 'brain-dump-existing-work', { entryId: entry.id, serial: entry.serial ?? null, taskId: existing.taskId, state: existing.state, how: existing.how, by: 'apply' });
+    return {
+      skipped: true,
+      existingWork: true,
+      linkedTo: existing.taskId,
+      reason: `work for this brain-dump entry already exists: ${existing.taskId} (${existing.state}, matched by ${existing.how}) -- not queueing another task`,
+    };
+  }
+
+  // Duplicate pre-queue check (2026-10-31, brain-dump-duplicate-check.js): an entry that duplicates another brain-dump entry
+  // (same cited file paths + first identifier) or an unmerged agent/* branch in the target repo is NOT turned into an adhoc
+  // task. It stays in Brain Dump with entry.duplicateOf set to the id/branch of the duplicate; sortAttempt is parked at the
+  // budget so brain_dump_sort does not pick it again. Kill switch: AGENT_MANAGER_BRAIN_DUMP_DUPLICATE_CHECK=false. Escape
+  // hatch: entry.duplicateOverride === true.
+  if (duplicateCheckEnabled()) {
+    // The target repo is known only when the sort named a registered project; without it the branch half is skipped (fails open), the entry half still runs.
+    const dupProject = result.belongsToProject ? readProjectRegistry().find((p) => p.label === result.belongsToProject) : null;
+    const dupCheck = checkBrainDumpDuplicate(entry, { brainDumpPath, repoRoot: dupProject ? dupProject.repoRoot : null });
+    if (dupCheck) {
+      entry.duplicateOf = dupCheck.duplicateOf;
+      entry.sortAttempt = Math.max(entry.sortAttempt || 0, 3);
+      fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+      writeJsonAtomicSync(brainDumpPath, data);
+      try { logPipelineEvent(pipelineDir, 'brain-dump-duplicate-check', { entryId: entry.id, serial: entry.serial ?? null, duplicateOf: dupCheck.duplicateOf, source: dupCheck.source, key: dupCheck.key }); } catch { /* best-effort log */ }
+      return {
+        skipped: true,
+        duplicateCheck: true,
+        linkedTo: dupCheck.duplicateOf,
+        reason: `brain-dump entry not queued: duplicates ${dupCheck.source} "${dupCheck.duplicateOf}" (entry.duplicateOf stamped; set duplicateOverride to force it)`,
+      };
+    }
+  }
 
   // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code
   // change -- "investigate X, document findings" needs real web research, not a diff
@@ -564,12 +729,26 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
     // reviewBrainDumpSort should have blocked a non-tracked label; if one slipped through,
     // don't silently downgrade it to a passive note -- that masks the misclassification.
     return recoverableSortSkip(data, entry, brainDumpPath,
-      `belongsToProject "${result.belongsToProject}" does not match any registered project -- a corrected pass should name a tracked label or null`);
+      `belongsToProject "${result.belongsToProject}" does not match any registered project -- a corrected pass should name a tracked label or null`, task);
   }
 
-  if (matchedProject) return queueProjectTask(ctx, matchedProject);
+  if (matchedProject) {
+    const blocked = targetCheckSkip(ctx, matchedProject, pipelineDir);
+    if (blocked) return blocked;
+    return queueProjectTask(ctx, matchedProject);
+  }
 
-  return filePassiveNote(ctx);
+  const filed = filePassiveNote(ctx);
+  // JournalForge keep-and-resurface handoff (journal loop). Runs only AFTER the vault note is
+  // filed, and can never change the filing or the sort result: any failure is caught here.
+  try {
+    const handoff = handOffJournalEntry({ entry, result, capturedAt: entry.capturedAt, pipelineDir });
+    if (handoff.handed) {
+      fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+      writeJsonAtomicSync(brainDumpPath, data);
+    }
+  } catch { /* handoff is best-effort; the note is already filed */ }
+  return filed;
 }
 
 function closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId, note }) {

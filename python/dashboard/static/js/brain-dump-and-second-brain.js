@@ -1,3 +1,24 @@
+// POST /api/brain-dump/<id>/prioritize. The server answers 409 (JSON {description}) for an entry the target check holds back unless the body carries
+// {force: true}; on a 409 the owner is asked and a yes re-POSTs once with force. prioritizeRefusal comes from brain-dump-chips.js, which index.html
+// loads as a plain script before this one (a global function, not a require: this file runs in the browser).
+// -> { queued, declined, status }
+async function prioritizeEntry(id, force = false) {
+  const url = '/api/brain-dump/' + encodeURIComponent(id) + '/prioritize';
+  const res = await fetch(url, force
+    ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force: true }) }
+    : { method: 'POST' });
+  if (res.status === 409 && !force) {
+    let text = '';
+    try { const body = await res.json(); text = (body && body.description) || ''; } catch (e) { /* not JSON: ask without the reason */ }
+    const refusal = prioritizeRefusal(res.status, text);
+    if (refusal.refused) {
+      if (!window.confirm(refusal.message + '\n\nQueue it anyway?')) return { queued: false, declined: true, status: 409 };
+      return prioritizeEntry(id, true);
+    }
+  }
+  return { queued: res.ok, declined: false, status: res.status };
+}
+
 function renderBrainDumpShell() {
   document.getElementById('main').innerHTML = `
     <div class="capture-row">
@@ -19,7 +40,7 @@ function renderBrainDumpShell() {
       <div>
         <div class="field-label" style="display:flex; justify-content:space-between; align-items:center;">
           <span>Second Brain</span>
-          <button class="secondary" id="bd-sync-github-btn" style="text-transform:none; letter-spacing:normal; font-size:12px; padding:4px 10px;" title="Scan GitHub for your repos and create Second Brain notes for any that aren't linked yet">Sync GitHub Projects</button>
+          <button class="secondary" id="bd-sync-github-btn" style="text-transform:none; letter-spacing:normal; font-size:12px; padding:4px 12px;" title="Scan GitHub for your repos and create Second Brain notes for any that aren't linked yet">Sync GitHub Projects</button>
         </div>
         <div class="browser-panel" id="bd-browser" style="max-height:220px"><div class="empty">Loading...</div></div>
         <div id="bd-file-panel"></div>
@@ -121,7 +142,8 @@ function wireBrainDumpCardHandlers(el) {
       btn.disabled = true;
       btn.textContent = 'Queuing...';
       try {
-        await fetch('/api/brain-dump/' + encodeURIComponent(btn.dataset.prioritize) + '/prioritize', { method: 'POST' });
+        const result = await prioritizeEntry(btn.dataset.prioritize);
+        if (result.declined) { btn.disabled = false; btn.textContent = 'Process now'; return; }
         await refreshBrainDumpEntries(true);
       } catch (e) {
         alert('Could not queue: ' + e.message);
@@ -151,7 +173,7 @@ function wireBrainDumpCardHandlers(el) {
         await fetch('/api/brain-dump/' + encodeURIComponent(btn.dataset.delete), { method: 'DELETE' });
         await refreshBrainDumpEntries(true);
       } catch (e) {
-        alert('Could not delete: ' + e.message);
+        alert('Could not delete: ' + e.message); btn.disabled = false;
       }
     };
   });
@@ -443,7 +465,7 @@ function renderBrainDumpCard(entry) {
   // common case and needs no extra UI); raisedByBadge marks a machine-raised entry so it
   // reads differently from a human-typed note at a glance.
   const countChip = entry.count > 1
-    ? `<span title="${escapeAttr(`Seen ${entry.count} times${(entry.seenIn || []).length ? ' -- tasks: ' + entry.seenIn.join(', ') : ''}`)}" style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--warn);border-radius:3px;color:var(--warn);font-size:11px">🔁 seen ${entry.count}&times;</span>`
+    ? `<span title="${escapeAttr(`Seen ${entry.count} times${(entry.seenIn || []).length ? ' -- tasks: ' + entry.seenIn.join(', ') : ''}`)}" class="chip chip-warn">🔁 seen ${entry.count}&times;</span>`
     : '';
   // 2026-09-05, Grimmethy (reading the first real finding, #208, which had no taskId at
   // all): "Make sure the brain dumps provide enough context. A link to the task that
@@ -454,8 +476,8 @@ function renderBrainDumpCard(entry) {
   // that predates this or genuinely has no task to link (taskId stays null for Chat).
   const raisedByBadge = entry.raisedBy
     ? (entry.raisedBy.taskId
-      ? `<span class="clickable" data-open-task="${escapeAttr(entry.raisedBy.taskId)}" style="cursor:pointer;display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--muted);border-radius:3px;color:var(--muted);font-size:11px" title="Flagged automatically while working on ${escapeAttr(entry.raisedBy.taskId)} -- click to open that task">🤖 ${escapeHtml(entry.raisedBy.source || 'pipeline')}</span>`
-      : `<span style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--muted);border-radius:3px;color:var(--muted);font-size:11px" title="Flagged automatically while working on a ${escapeAttr(entry.raisedBy.source || 'pipeline')} task (no task link available)">🤖 ${escapeHtml(entry.raisedBy.source || 'pipeline')}</span>`)
+      ? `<span class="chip clickable" data-open-task="${escapeAttr(entry.raisedBy.taskId)}" title="Flagged automatically while working on ${escapeAttr(entry.raisedBy.taskId)} -- click to open that task">🤖 ${escapeHtml(entry.raisedBy.source || 'pipeline')}</span>`
+      : `<span class="chip" title="Flagged automatically while working on a ${escapeAttr(entry.raisedBy.source || 'pipeline')} task (no task link available)">🤖 ${escapeHtml(entry.raisedBy.source || 'pipeline')}</span>`)
     : '';
   // Suppress only makes sense for a machine-raised entry (retire a stale/obsolete
   // finding a sweep keeps re-flagging) -- a human's own Brain Dump note is deleted, not
@@ -467,7 +489,7 @@ function renderBrainDumpCard(entry) {
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
       <div class="row">
         <span class="text">${serialBadge}${escapeHtmlBright(entry.rawText)}${countChip}${raisedByBadge}</span>
-        ${statusBadge}
+        ${statusBadge}${brainDumpChipsHtml(entry, escapeHtml)}
       </div>
       <div class="row meta">
         <span>${meta}</span>
@@ -520,13 +542,9 @@ function renderBrainDumpDiscussCard(entry, session) {
   `;
 }
 
-async function loadSecondBrainBrowser() {
-  const panel = document.getElementById('bd-browser');
-  if (!panel) return;
-  panel.innerHTML = '<div class="empty">Loading...</div>';
-  let data;
+async function fetchBrowseData(path) {
   try {
-    data = await fetchJson('/api/second-brain/browse?path=' + encodeURIComponent(brainDumpBrowsePath));
+    return await fetchJson('/api/second-brain/browse?path=' + encodeURIComponent(path));
   } catch (e) {
     // brainDumpBrowsePath is persisted in localStorage across sessions -- a folder it
     // points at can legitimately stop existing between visits (renamed, merged, deleted
@@ -536,26 +554,16 @@ async function loadSecondBrainBrowser() {
     // case-duplicate folders got merged, and a browser that had "projects" saved from
     // before the merge 404'd here forever after. Fall back to root once rather than
     // leaving a stale path permanently wedged.
-    if (brainDumpBrowsePath !== '') {
+    if (path !== '') {
       brainDumpBrowsePath = '';
       localStorage.setItem('agentManagerBrainDumpBrowsePath', '');
-      try {
-        data = await fetchJson('/api/second-brain/browse?path=');
-      } catch (e2) {
-        panel.innerHTML = `<div class="empty">Could not browse: ${e2.message}</div>`;
-        return;
-      }
-    } else {
-      panel.innerHTML = `<div class="empty">Could not browse: ${e.message}</div>`;
-      return;
+      return await fetchJson('/api/second-brain/browse?path=');
     }
+    throw e;
   }
+}
 
-  if (!data.configured) {
-    panel.innerHTML = '<div class="empty">SECOND_BRAIN_DIR is not configured for the active project.</div>';
-    return;
-  }
-
+function buildBrowserHtml(data, selectedFile) {
   // A plain path-as-text crumb here previously gave no way back to the root except
   // clicking "up" once per level -- easy to end up parked deep in a small folder (e.g.
   // Decisions/, 2 files) after a "jump to file" link, with no obvious cue you're not
@@ -580,7 +588,7 @@ async function loadSecondBrainBrowser() {
       const countLabel = entry.count === null ? '?' : entry.count;
       html += `<div class="browser-entry" data-nav="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}/</span><span class="entry-count">${countLabel}</span></div>`;
     } else {
-      const active = entry.path === brainDumpSelectedFile ? ' active' : '';
+      const active = entry.path === selectedFile ? ' active' : '';
       // Notes linked to a real GitHub repo (via /api/second-brain/sync-github-projects)
       // get a one-click way to make that repo the pipeline's active project, or a badge
       // if it already is -- the actual ask: buttons in Second Brain that set a project
@@ -599,6 +607,75 @@ async function loadSecondBrainBrowser() {
       html += `<div class="browser-entry${active}" data-file="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}</span>${projectControl}</div>`;
     }
   }
+  return html;
+}
+
+// "Set Active Project" action for a Second Brain entry: confirm, then stop the
+// current pipeline and start it against the entry's repo path (safe defaults).
+async function handleSetActiveProject(btn, repoPath) {
+  if (!confirm(`Stop the current pipeline (if running) and start it against:\n${repoPath}\n\nStarts in the safe default (no apply/no push) -- switch that on later from the Project tab if you want it to write changes.`)) return;
+  btn.disabled = true;
+  btn.textContent = 'Switching...';
+  try {
+    await fetch('/api/pipeline/stop', { method: 'POST' });
+    const resp = await fetch('/api/pipeline/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: repoPath, includeApply: false, skipPush: true }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.description || ('HTTP ' + resp.status));
+    }
+    await loadSecondBrainBrowser();
+  } catch (err) {
+    alert('Could not switch active project: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = 'Set Active';
+  }
+}
+
+// "Create GitHub Project" action for a Second Brain note: confirm, then create a
+// new git repo seeded from the note and refresh to show the newly linked project.
+async function handleCreateGithubProject(btn, notePath) {
+  if (!confirm(`Create a new GitHub project seeded from this note?\n\nThis creates a new folder + git repo under your GitHub projects directory, with this note's content as README.md, and links the note to it here.`)) return;
+  btn.disabled = true;
+  btn.textContent = 'Creating...';
+  try {
+    const resp = await fetch('/api/second-brain/create-github-project', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notePath }),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(result.description || ('HTTP ' + resp.status));
+    await loadSecondBrainBrowser();
+    alert(`Created ${result.projectName} at ${result.repoPath}`);
+  } catch (err) {
+    alert('Could not create GitHub project: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = 'Create GitHub Project';
+  }
+}
+
+async function loadSecondBrainBrowser() {
+  const panel = document.getElementById('bd-browser');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty">Loading...</div>';
+  let data;
+  try {
+    data = await fetchBrowseData(brainDumpBrowsePath);
+  } catch (e) {
+    panel.innerHTML = `<div class="empty">Could not browse: ${e.message}</div>`;
+    return;
+  }
+
+  if (!data.configured) {
+    panel.innerHTML = '<div class="empty">SECOND_BRAIN_DIR is not configured for the active project.</div>';
+    return;
+  }
+
+  const html = buildBrowserHtml(data, brainDumpSelectedFile);
   panel.innerHTML = html;
 
   panel.querySelectorAll('[data-nav]').forEach((el) => {
@@ -609,53 +686,15 @@ async function loadSecondBrainBrowser() {
     };
   });
   panel.querySelectorAll('.set-active-project').forEach((btn) => {
-    btn.onclick = async (e) => {
+    btn.onclick = (e) => {
       e.stopPropagation(); // don't also trigger the row's data-file "open note" handler
-      const repoPath = btn.dataset.repoPath;
-      if (!confirm(`Stop the current pipeline (if running) and start it against:\n${repoPath}\n\nStarts in the safe default (no apply/no push) -- switch that on later from the Project tab if you want it to write changes.`)) return;
-      btn.disabled = true;
-      btn.textContent = 'Switching...';
-      try {
-        await fetch('/api/pipeline/stop', { method: 'POST' });
-        const resp = await fetch('/api/pipeline/start', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: repoPath, includeApply: false, skipPush: true }),
-        });
-        if (!resp.ok) {
-          const err = await resp.json().catch(() => ({}));
-          throw new Error(err.description || ('HTTP ' + resp.status));
-        }
-        await loadSecondBrainBrowser();
-      } catch (err) {
-        alert('Could not switch active project: ' + err.message);
-        btn.disabled = false;
-        btn.textContent = 'Set Active';
-      }
+      handleSetActiveProject(btn, btn.dataset.repoPath);
     };
   });
   panel.querySelectorAll('.create-github-project').forEach((btn) => {
-    btn.onclick = async (e) => {
+    btn.onclick = (e) => {
       e.stopPropagation(); // don't also trigger the row's data-file "open note" handler
-      const notePath = btn.dataset.notePath;
-      if (!confirm(`Create a new GitHub project seeded from this note?\n\nThis creates a new folder + git repo under your GitHub projects directory, with this note's content as README.md, and links the note to it here.`)) return;
-      btn.disabled = true;
-      btn.textContent = 'Creating...';
-      try {
-        const resp = await fetch('/api/second-brain/create-github-project', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ notePath }),
-        });
-        const result = await resp.json().catch(() => ({}));
-        if (!resp.ok) throw new Error(result.description || ('HTTP ' + resp.status));
-        await loadSecondBrainBrowser();
-        alert(`Created ${result.projectName} at ${result.repoPath}`);
-      } catch (err) {
-        alert('Could not create GitHub project: ' + err.message);
-        btn.disabled = false;
-        btn.textContent = 'Create GitHub Project';
-      }
+      handleCreateGithubProject(btn, btn.dataset.notePath);
     };
   });
   panel.querySelectorAll('[data-file]').forEach((el) => {
@@ -966,18 +1005,13 @@ async function sbDiscussEnd(sessionId, btn) {
 async function enterBrainDumpTab() {
   renderBrainDumpShell();
   // force=true -- brainDumpEditingId/brainDumpDiscussingId are module-level and outlive
-  // leaveBrainDumpTab() (by design, so an in-progress discussion survives a tab switch).
+  // a tab switch (by design, so an in-progress discussion survives it).
   // An unforced call here would hit refreshBrainDumpEntries' own guard against those same
   // flags and skip the list entirely on every return to this tab, appearing to hang
   // indefinitely with no spinner (confirmed live 2026-08-17, see the brain-dump entry
-  // this fix closes out). The periodic poll below stays unforced on purpose -- that guard
-  // is still correct there, to keep a 5s tick from clobbering an open discussion/edit.
+  // this fix closes out). The refresh a brain-dump-changed event triggers stays unforced on purpose -- that guard
+  // is still correct there, to keep an announcement from clobbering an open discussion/edit (finishing one refreshes at once).
   await refreshBrainDumpEntries(true);
-  brainDumpEntriesInterval = setInterval(refreshBrainDumpEntries, 5000);
-}
-
-function leaveBrainDumpTab() {
-  if (brainDumpEntriesInterval) { clearInterval(brainDumpEntriesInterval); brainDumpEntriesInterval = null; }
 }
 
 // Filed Findings tab (2026-09-14, Grimmethy: "Brain dump needs to go back to human input
@@ -1047,7 +1081,8 @@ function wireFiledFindingsHandlers(el) {
       btn.disabled = true;
       btn.textContent = 'Queuing...';
       try {
-        await fetch('/api/brain-dump/' + encodeURIComponent(btn.dataset.prioritize) + '/prioritize', { method: 'POST' });
+        const result = await prioritizeEntry(btn.dataset.prioritize);
+        if (result.declined) { btn.disabled = false; btn.textContent = 'Process now'; return; }
         await refreshFiledFindingsEntries();
       } catch (e) {
         alert('Could not queue: ' + e.message);

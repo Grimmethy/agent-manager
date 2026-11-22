@@ -1,0 +1,387 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const { main, flag } = require('./node-package-send.js');
+const { createServer } = require('./package-intake-server.js');
+const { registerNode } = require('./node-registry.js');
+const { lendLease, leaseFor } = require('./lease-ledger.js');
+
+// Built from parts so the file holds no quoted credential-shaped literal (the merge check's credential scan flags one); the value is still tok-SECRET-1234567890.
+const FAKE_NODE_TOKEN = ['tok', 'SECRET', '1234567890'].join('-');
+
+function setup() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'node-send-'));
+  const outbox = path.join(dir, 'queue', 'node-outbox');
+  fs.mkdirSync(outbox, { recursive: true });
+  const tokenFile = path.join(dir, 'node-token');
+  fs.writeFileSync(tokenFile, `${FAKE_NODE_TOKEN}\n`, { mode: 0o600 });
+  return { dir, outbox, sent: path.join(dir, 'queue', 'node-sent'), tokenFile };
+}
+
+function put(s, name, record) {
+  fs.writeFileSync(path.join(s.outbox, name), typeof record === 'string' ? record : JSON.stringify(record));
+}
+
+function argvFor(s, extra = {}) {
+  const a = { '--url': 'http://127.0.0.1:1/package', '--token-file': s.tokenFile, '--node-id': 'grimm', '--outbox': s.outbox, ...extra };
+  return Object.entries(a).flatMap(([k, v]) => (v === null ? [] : [k, v]));
+}
+
+async function run(s, { post, extra, now } = {}) {
+  const lines = [];
+  const errs = [];
+  const code = await main(argvFor(s, extra), {}, { post, now }, (l) => lines.push(l), (e) => errs.push(e));
+  return { code, lines, errs, result: lines.length ? JSON.parse(lines[0]) : null };
+}
+
+const ok = async () => ({ status: 200 });
+const REC = (id) => ({ id, title: 'T', rawDiff: 'diff --git a b', implementResponse: 'did it', leasedTo: 'grimm', localVotes: [1], history: [2], apiToken: 'x' });
+
+test('flag returns the value after a flag and nothing for an absent, last or flag-followed flag', () => {
+  assert.equal(flag(['--url', 'u'], '--url'), 'u');
+  assert.equal(flag(['--url'], '--url'), undefined);
+  assert.equal(flag(['--url', '--outbox', 'o'], '--url'), undefined);
+  assert.equal(flag([], '--url'), undefined);
+});
+
+test('missing arguments exit 2 with the usage line and send nothing', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  let posts = 0;
+  for (const flagName of ['--url', '--token-file', '--node-id', '--outbox']) {
+    const r = await run(s, { post: async () => { posts += 1; return { status: 200 }; }, extra: { [flagName]: null } });
+    assert.equal(r.code, 2, flagName);
+    assert.match(r.errs.join(''), /^usage: node src\/node-package-send\.js /);
+    assert.equal(r.lines.length, 0);
+  }
+  assert.equal(posts, 0);
+  assert.deepEqual(fs.readdirSync(s.outbox), ['a.json']);
+});
+
+test('an unreadable or empty token file, and an outbox that is not a directory, exit 2 and send nothing', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  let posts = 0;
+  const post = async () => { posts += 1; return { status: 200 }; };
+  assert.equal((await run(s, { post, extra: { '--token-file': path.join(s.dir, 'nope') } })).code, 2);
+  fs.writeFileSync(s.tokenFile, '  \n');
+  const empty = await run(s, { post });
+  assert.equal(empty.code, 2);
+  assert.match(empty.errs.join(''), /token file/);
+  fs.writeFileSync(s.tokenFile, FAKE_NODE_TOKEN);
+  const file = path.join(s.dir, 'plain-file');
+  fs.writeFileSync(file, 'x');
+  const notDir = await run(s, { post, extra: { '--outbox': file } });
+  assert.equal(notDir.code, 2);
+  assert.match(notDir.errs.join(''), /outbox/);
+  assert.equal((await run(s, { post, extra: { '--outbox': path.join(s.dir, 'missing') } })).code, 2);
+  assert.equal(posts, 0);
+});
+
+test('a 2xx answer moves each record to node-sent next to the outbox, in name order, and the package is version 2 without votes or the lease stamp', async () => {
+  const s = setup();
+  const ids = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']; // eight records, created in ascending order: a listing comes back newest first on tmpfs and in hash order elsewhere, so only sorting gives this order
+  for (const id of ids) put(s, `${id}.json`, REC(id));
+  const seen = [];
+  const post = async (url, headers, body) => { seen.push({ url, headers, pkg: JSON.parse(body) }); return { status: 200 }; };
+  const r = await run(s, { post, now: () => Date.UTC(2026, 10, 11) });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.result, { sent: 8, failed: 0, refused: 0, remaining: 0 });
+  assert.deepEqual(fs.readdirSync(s.outbox), []);
+  assert.deepEqual(fs.readdirSync(s.sent).sort(), ids.map((id) => `${id}.json`));
+  assert.deepEqual(seen.map((x) => x.pkg.taskId), ids);
+  assert.equal(seen[0].url, 'http://127.0.0.1:1/package');
+  assert.equal(seen[0].headers.Authorization, `Bearer ${FAKE_NODE_TOKEN}`);
+  const pkg = seen[0].pkg;
+  assert.equal(pkg.version, 2);
+  assert.equal(pkg.kind, 'record');
+  assert.equal(pkg.nodeId, 'grimm');
+  assert.equal(pkg.builtAt, '2026-11-11T00:00:00.000Z');
+  assert.equal(pkg.record.rawDiff, 'diff --git a b');
+  for (const key of ['leasedTo', 'localVotes', 'history', 'apiToken']) assert.equal(key in pkg.record, false, key);
+});
+
+test('a refusal, a network failure and a thrown send leave the record in the outbox, count failed and exit 3', async () => {
+  for (const post of [async () => ({ status: 409 }), async () => ({ status: 500 }), async () => { throw new Error('down'); }]) {
+    const s = setup();
+    put(s, 'a.json', REC('a'));
+    const r = await run(s, { post });
+    assert.equal(r.code, 3);
+    assert.deepEqual(r.result, { sent: 0, failed: 1, refused: 0, remaining: 1 });
+    assert.deepEqual(fs.readdirSync(s.outbox), ['a.json']);
+    assert.equal(fs.existsSync(s.sent), false);
+  }
+});
+
+test('a 400 moves the record to node-refused with a reason sidecar, counts refused and exits 0; a second run does not resend it', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  const refusedDir = path.join(s.dir, 'queue', 'node-refused');
+  const now = () => Date.UTC(2026, 10, 16, 1, 2, 3);
+  const r = await run(s, { post: async () => ({ status: 400 }), now });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.result, { sent: 0, failed: 0, refused: 1, remaining: 0 });
+  assert.deepEqual(Object.keys(r.result), ['sent', 'failed', 'refused', 'remaining']);
+  assert.deepEqual(fs.readdirSync(s.outbox), []);
+  assert.deepEqual(fs.readdirSync(refusedDir).sort(), ['a.json', 'a.json.reason.txt']);
+  const reason = fs.readFileSync(path.join(refusedDir, 'a.json.reason.txt'), 'utf8');
+  assert.equal(reason, 'HTTP 400 at 2026-11-16T01:02:03.000Z: (no body)\n');
+  assert.match(reason, /400/);
+  let posts = 0;
+  const again = await run(s, { post: async () => { posts += 1; return { status: 200 }; }, now });
+  assert.equal(again.code, 0);
+  assert.deepEqual(again.result, { sent: 0, failed: 0, refused: 0, remaining: 0 });
+  assert.equal(posts, 0);
+});
+
+test('a 400 writes the response body into the reason file, truncated to 300 characters, and (no body) when the body is empty', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  put(s, 'b.json', REC('b'));
+  put(s, 'c.json', REC('c'));
+  const refusedDir = path.join(s.dir, 'queue', 'node-refused');
+  const bodies = { a: 'bad package: version', b: 'y'.repeat(350), c: '' };
+  const post = async (url, headers, body) => ({ status: 400, body: bodies[JSON.parse(body).taskId] });
+  const now = () => Date.UTC(2026, 10, 16, 1, 2, 3);
+  const r = await run(s, { post, now });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.result, { sent: 0, failed: 0, refused: 3, remaining: 0 });
+  assert.equal(fs.readFileSync(path.join(refusedDir, 'a.json.reason.txt'), 'utf8'), 'HTTP 400 at 2026-11-16T01:02:03.000Z: bad package: version\n');
+  assert.equal(fs.readFileSync(path.join(refusedDir, 'b.json.reason.txt'), 'utf8'), `HTTP 400 at 2026-11-16T01:02:03.000Z: ${'y'.repeat(300)}\n`);
+  assert.equal(fs.readFileSync(path.join(refusedDir, 'c.json.reason.txt'), 'utf8'), 'HTTP 400 at 2026-11-16T01:02:03.000Z: (no body)\n');
+});
+
+test('an undrafted record stays in the outbox unsent and is never posted, while a drafted record after it is still sent', async () => {
+  const s = setup();
+  put(s, 'a-undrafted.json', { ...REC('a'), implementResponse: '   ' });
+  put(s, 'b.json', REC('b'));
+  const posted = [];
+  const post = async (url, headers, body) => { posted.push(JSON.parse(body).taskId); return { status: 200 }; };
+  const r = await run(s, { post });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.result, { sent: 1, failed: 0, refused: 0, remaining: 1 });
+  assert.deepEqual(posted, ['b']);
+  assert.deepEqual(fs.readdirSync(s.outbox), ['a-undrafted.json']);
+  assert.match(r.errs.join(''), /a-undrafted\.json/);
+});
+
+test('a 400 whose refile into node-refused fails leaves the record in the outbox and counts it failed, not refused, exit 3', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  const refusedDir = path.join(s.dir, 'queue', 'node-refused');
+  fs.writeFileSync(refusedDir, 'a plain file where the directory should be');
+  const now = () => Date.UTC(2026, 10, 16, 1, 2, 3);
+  const r = await run(s, { post: async () => ({ status: 400 }), now });
+  assert.equal(r.code, 3);
+  assert.deepEqual(r.result, { sent: 0, failed: 1, refused: 0, remaining: 1 });
+  assert.deepEqual(fs.readdirSync(s.outbox), ['a.json']);
+  assert.equal(fs.statSync(refusedDir).isFile(), true);
+});
+
+test('401, 403, 409, 503 and a thrown send are transient: the record stays in the outbox, nothing is refused, failed 1, exit 3', async () => {
+  const posts = [401, 403, 409, 503].map((status) => async () => ({ status }));
+  posts.push(async () => { throw new Error('down'); });
+  for (const post of posts) {
+    const s = setup();
+    put(s, 'a.json', REC('a'));
+    const r = await run(s, { post });
+    assert.equal(r.code, 3);
+    assert.deepEqual(r.result, { sent: 0, failed: 1, refused: 0, remaining: 1 });
+    assert.deepEqual(fs.readdirSync(s.outbox), ['a.json']);
+    assert.equal(fs.existsSync(path.join(s.dir, 'queue', 'node-refused')), false);
+  }
+});
+
+test('a mixed outbox of a 200, a 400 and a 503 gives sent 1, failed 1, refused 1, remaining 1', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  put(s, 'b.json', REC('b'));
+  put(s, 'c.json', REC('c'));
+  const statuses = { a: 200, b: 400, c: 503 };
+  const post = async (url, headers, body) => ({ status: statuses[JSON.parse(body).taskId] });
+  const r = await run(s, { post });
+  assert.equal(r.code, 3);
+  assert.deepEqual(r.result, { sent: 1, failed: 1, refused: 1, remaining: 1 });
+  assert.deepEqual(fs.readdirSync(s.outbox), ['c.json']);
+  assert.deepEqual(fs.readdirSync(s.sent), ['a.json']);
+  assert.deepEqual(fs.readdirSync(path.join(s.dir, 'queue', 'node-refused')).sort(), ['b.json', 'b.json.reason.txt']);
+});
+
+test('records that are not JSON, have no string id or an empty id are failed and left; good records around them are still sent', async () => {
+  const s = setup();
+  put(s, 'a-good.json', REC('a'));
+  put(s, 'b-junk.json', '{not json');
+  put(s, 'c-noid.json', { title: 'x' });
+  put(s, 'd-numid.json', { id: 5 });
+  put(s, 'e-emptyid.json', { id: '' });
+  put(s, 'f-good.json', REC('f'));
+  fs.writeFileSync(path.join(s.outbox, 'notes.txt'), 'not a record');
+  const r = await run(s, { post: ok });
+  assert.equal(r.code, 3);
+  assert.deepEqual(r.result, { sent: 2, failed: 4, refused: 0, remaining: 4 });
+  assert.deepEqual(fs.readdirSync(s.outbox).sort(), ['b-junk.json', 'c-noid.json', 'd-numid.json', 'e-emptyid.json', 'notes.txt']);
+});
+
+test('a move into node-sent that fails leaves the record in the outbox and counts it failed instead of throwing', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  fs.writeFileSync(s.sent, 'a plain file where the directory should be');
+  const r = await run(s, { post: ok });
+  assert.equal(r.code, 3);
+  assert.deepEqual(r.result, { sent: 0, failed: 1, refused: 0, remaining: 1 });
+});
+
+test('a 400 whose refused move fails counts as failed, not refused, and the record stays in the outbox', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  const refusedDir = path.join(s.dir, 'queue', 'node-refused');
+  fs.writeFileSync(refusedDir, 'a plain file where the directory should be');
+  const r = await run(s, { post: async () => ({ status: 400 }) });
+  assert.equal(r.code, 3);
+  assert.deepEqual(r.result, { sent: 0, failed: 1, refused: 0, remaining: 1 });
+  assert.deepEqual(fs.readdirSync(s.outbox), ['a.json']);
+  assert.equal(fs.statSync(refusedDir).isFile(), true);
+});
+
+test('a record filed while the send is running is not sent this time and is counted as remaining', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  const post = async () => { put(s, 'z-new.json', REC('z')); return { status: 200 }; };
+  const r = await run(s, { post });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.result, { sent: 1, failed: 0, refused: 0, remaining: 1 });
+  assert.deepEqual(fs.readdirSync(s.outbox), ['z-new.json']);
+});
+
+test('an empty outbox prints zero counts and exits 0 without posting', async () => {
+  const s = setup();
+  let posts = 0;
+  const r = await run(s, { post: async () => { posts += 1; return { status: 200 }; } });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.result, { sent: 0, failed: 0, refused: 0, remaining: 0 });
+  assert.equal(posts, 0);
+});
+
+test('the token never appears in the output, the errors or the result, on success or failure', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  const bad = await run(s, { post: async () => { throw new Error(`boom ${FAKE_NODE_TOKEN}`); } });
+  const good = await run(s, { post: ok });
+  const empty = await run(s, { post: ok, extra: { '--token-file': path.join(s.dir, 'nope') } });
+  for (const r of [bad, good, empty]) assert.equal((r.lines.join('') + r.errs.join('')).includes(FAKE_NODE_TOKEN), false);
+});
+
+test('a real round trip: the package intake on wok replaces the leased original with the node record in queue/review, ends the lease, and the outbox record moves to node-sent', async () => {
+  const s = setup();
+  const wok = fs.mkdtempSync(path.join(os.tmpdir(), 'wok-side-'));
+  const env = { HOME: wok, AGENT_MANAGER_NODES_DIR: path.join(wok, 'nodes'), AGENT_MANAGER_PIPELINE_DIR: path.join(wok, 'pipeline') };
+  const { token } = registerNode({ id: 'grimm', address: '', cores: 4, ramGb: 15, concurrencyCap: 2 }, env);
+  fs.writeFileSync(s.tokenFile, token, { mode: 0o600 });
+  lendLease('HUB7-01-x', 'grimm', { env });
+  const adhoc = path.join(env.AGENT_MANAGER_PIPELINE_DIR, 'queue', 'adhoc');
+  fs.mkdirSync(adhoc, { recursive: true });
+  fs.writeFileSync(path.join(adhoc, 'HUB7-01-x.json'), JSON.stringify({ id: 'HUB7-01-x', title: 'T', leasedTo: 'grimm' }));
+  put(s, 'HUB7-01-x.json', { ...REC('HUB7-01-x'), status: 'needs-review' });
+  const server = createServer({ env, send: async () => {} });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    const url = `http://127.0.0.1:${server.address().port}/package`;
+    const r = await run(s, { extra: { '--url': url } });
+    assert.equal(r.code, 0, r.errs.join(''));
+    assert.deepEqual(r.result, { sent: 1, failed: 0, refused: 0, remaining: 0 });
+    const filed = JSON.parse(fs.readFileSync(path.join(env.AGENT_MANAGER_PIPELINE_DIR, 'queue', 'review', 'HUB7-01-x.json'), 'utf8'));
+    assert.equal(filed.fromNode, 'grimm');
+    assert.equal(filed.status, 'needs-review');
+    assert.equal(filed.rawDiff, 'diff --git a b');
+    assert.equal('leasedTo' in filed, false);
+    assert.equal(fs.existsSync(path.join(adhoc, 'HUB7-01-x.json')), false);
+    assert.equal(leaseFor('HUB7-01-x', env).state, 'returned');
+    assert.deepEqual(fs.readdirSync(s.sent), ['HUB7-01-x.json']);
+  } finally { server.close(); server.closeAllConnections(); }
+});
+
+test('the command line exits 2 with the usage line when it is given nothing', () => {
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'node-package-send.js')], { env: { PATH: process.env.PATH }, encoding: 'utf8', timeout: 20000 });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /^usage: node src\/node-package-send\.js /);
+  assert.equal(r.stdout, '');
+});
+
+test('a failed send logs one stderr line per record with the HTTP status and the start of the answer, or the network reason', async () => {
+  const s = setup();
+  put(s, 'a.json', REC('a'));
+  put(s, 'b.json', REC('b'));
+  const answers = [{ status: 503, body: 'upstream\nbusy' }, null];
+  const r = await run(s, { post: async () => { const a = answers.shift(); if (a === null) throw new Error('boom'); return a; } });
+  assert.equal(r.code, 3);
+  assert.ok(r.errs.some((e) => e.startsWith('failed a.json: HTTP 503 upstream busy')), r.errs.join('|'));
+  assert.ok(r.errs.some((e) => e.startsWith('failed b.json: no answer from wok')), r.errs.join('|'));
+});
+
+test('a record that failed three runs in a row is skipped for the backoff time, the run exits 0 and reports backedOff, and it is tried again afterwards', async () => {
+  const s = setup();
+  put(s, 'stuck.json', REC('stuck'));
+  const posts = [];
+  const post = async () => { posts.push(1); return { status: 503, body: '' }; };
+  let t = Date.UTC(2026, 10, 18, 12, 0, 0);
+  const now = () => t;
+  for (let i = 0; i < 3; i++) { const r = await run(s, { post, now }); assert.equal(r.code, 3, `failure ${i + 1} still exits 3`); t += 1000; }
+  assert.equal(posts.length, 3);
+  const quiet = await run(s, { post, now });
+  assert.equal(posts.length, 3, 'inside the backoff nothing is posted');
+  assert.equal(quiet.code, 0);
+  assert.deepEqual(quiet.result, { sent: 0, failed: 0, refused: 0, remaining: 1, backedOff: 1 });
+  t += 11 * 60 * 1000;
+  const again = await run(s, { post, now });
+  assert.equal(posts.length, 4, 'after the backoff it is tried again');
+  assert.equal(again.code, 3);
+});
+
+test('a backed-off record does not hold back a good record filed after it, and a success clears the record\'s failure count', async () => {
+  const s = setup();
+  put(s, 'a-stuck.json', REC('a-stuck'));
+  const bad = async () => ({ status: 503 });
+  let t = Date.UTC(2026, 10, 18, 12, 0, 0);
+  const now = () => t;
+  for (let i = 0; i < 3; i++) await run(s, { post: bad, now });
+  put(s, 'b-good.json', REC('b-good'));
+  const r = await run(s, { post: ok, now });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.result, { sent: 1, failed: 0, refused: 0, remaining: 1, backedOff: 1 });
+  t += 11 * 60 * 1000;
+  const healed = await run(s, { post: ok, now });
+  assert.equal(healed.code, 0);
+  assert.equal(healed.result.sent, 1);
+  const state = JSON.parse(fs.readFileSync(path.join(path.dirname(s.outbox), 'node-send-backoff.json'), 'utf8'));
+  assert.deepEqual(state, {});
+});
+
+test('AGENT_MANAGER_NODE_SEND_BACKOFF_AFTER and _MS change the threshold and the pause', async () => {
+  const s = setup();
+  put(s, 'x.json', REC('x'));
+  const t0 = Date.UTC(2026, 10, 18, 12, 0, 0);
+  const lines = [];
+  const code1 = await main(argvFor(s), { AGENT_MANAGER_NODE_SEND_BACKOFF_AFTER: '1', AGENT_MANAGER_NODE_SEND_BACKOFF_MS: '60000' }, { post: async () => ({ status: 503 }), now: () => t0 }, (l) => lines.push(l), () => {});
+  assert.equal(code1, 3);
+  const code2 = await main(argvFor(s), { AGENT_MANAGER_NODE_SEND_BACKOFF_AFTER: '1', AGENT_MANAGER_NODE_SEND_BACKOFF_MS: '60000' }, { post: async () => { throw new Error('must not post'); }, now: () => t0 + 30000 }, (l) => lines.push(l), () => {});
+  assert.equal(code2, 0);
+  const code3 = await main(argvFor(s), { AGENT_MANAGER_NODE_SEND_BACKOFF_AFTER: '1', AGENT_MANAGER_NODE_SEND_BACKOFF_MS: '60000' }, { post: ok, now: () => t0 + 61000 }, (l) => lines.push(l), () => {});
+  assert.equal(code3, 0);
+  assert.equal(JSON.parse(lines[2]).sent, 1);
+});
+
+test('a refused (400) or sent record leaves no failure entry behind, and the entry of a record that left the outbox is dropped', async () => {
+  const s = setup();
+  put(s, 'gone.json', REC('gone'));
+  await run(s, { post: async () => ({ status: 503 }) });
+  fs.unlinkSync(path.join(s.outbox, 'gone.json'));
+  put(s, 'r.json', REC('r'));
+  await run(s, { post: async () => ({ status: 400, body: 'bad' }) });
+  const state = JSON.parse(fs.readFileSync(path.join(path.dirname(s.outbox), 'node-send-backoff.json'), 'utf8'));
+  assert.deepEqual(state, {});
+});

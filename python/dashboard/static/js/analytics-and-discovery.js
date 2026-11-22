@@ -38,28 +38,49 @@ function wireDeepDiveAddBar() {
   input.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
 }
 
+// "Show leads scouted for other projects" -- off by default: the tab lists exactly what THIS project's pipeline works on.
+let ddShowAll = false;
+
+function ddStatusLabel(p) {
+  if (p.status === 'queued') return '<span class="pill" title="Tagged for this project: the next worker tick clones and graphs it">queued to clone</span>';
+  if (p.status === 'other-project') return '<span class="pill" title="Scouted for a different project: this pipeline will not work on it">other project</span>';
+  return '';
+}
+
 async function renderDeepDiveTab() {
-  const projects = await fetchJson('/api/deep-dive/projects');
+  const projects = await fetchJson('/api/deep-dive/projects' + (ddShowAll ? '?scope=all' : ''));
   const main = document.getElementById('main');
+  const showAllToggle = `<label class="muted" style="margin-left:12px"><input type="checkbox" id="dd-show-all" ${ddShowAll ? 'checked' : ''}> also show leads scouted for other projects</label>`;
+  const bar = DEEP_DIVE_ADD_BAR.replace('</div>', showAllToggle + '</div>');
+  const wireToggle = () => {
+    const cb = document.getElementById('dd-show-all');
+    if (cb) cb.onchange = () => { ddShowAll = cb.checked; renderDeepDiveTab(); };
+  };
   if (projects.length === 0) {
-    main.innerHTML = DEEP_DIVE_ADD_BAR + '<div class="empty">No repos scouted yet -- project_search hasn\'t landed a Strong lead for deep_dive to pick up, or add one above.</div>';
+    main.innerHTML = bar + '<div class="empty">No repos scouted for this project yet -- project_search hasn\'t landed a Strong lead tagged for it, or add one above.</div>';
     wireDeepDiveAddBar();
+    wireToggle();
     return;
   }
   const rows = projects.map(p => `
-    <tr class="clickable ${p.hotlist ? 'top-row' : ''}" data-slug="${escapeAttr(p.slug)}">
-      <td onclick="event.stopPropagation()"><input type="checkbox" class="hotlist-toggle" data-slug="${escapeAttr(p.slug)}" ${p.hotlist ? 'checked' : ''} title="Move this repo to the top of the research priority list"></td>
-      <td>${escapeHtml(p.slug)}</td>
+    <tr class="clickable ${p.hotlist ? 'top-row' : ''} ${p.status === 'other-project' ? 'muted' : ''}" data-slug="${escapeAttr(p.slug)}" data-status="${escapeAttr(p.status || 'cloned')}">
+      <td onclick="event.stopPropagation()"><input type="checkbox" class="hotlist-toggle" data-slug="${escapeAttr(p.slug)}" ${p.hotlist ? 'checked' : ''} ${p.status === 'cloned' ? '' : 'disabled'} title="Move this repo to the top of the research priority list (available once it has been cloned)"></td>
+      <td>${escapeHtml(p.slug)} ${ddStatusLabel(p)}</td>
+      <td>${p.relevantTo ? escapeHtml(p.relevantTo) : ''}</td>
+      <td title="${escapeAttr(p.description || '')}">${escapeHtml(p.reason || '')}</td>
       <td>${p.sourceUrl ? `<a href="${escapeAttr(p.sourceUrl)}" target="_blank" onclick="event.stopPropagation()">${escapeHtml(p.sourceUrl)}</a>` : ''}</td>
       <td>${p.reviewedCount} / ${p.communityCount}</td>
       <td>${p.totalActionItems}</td>
       <td>${p.clonedAt ? new Date(p.clonedAt).toLocaleString() : ''}</td>
     </tr>
   `).join('');
-  main.innerHTML = DEEP_DIVE_ADD_BAR + `<table><thead><tr><th>Hot</th><th>Project</th><th>Source</th><th>Communities Reviewed</th><th>Action Items</th><th>Cloned</th></tr></thead><tbody>${rows}</tbody></table>`;
+  main.innerHTML = bar + `<div class="table-scroll"><table><thead><tr><th>Hot</th><th>Project</th><th>Scouted for</th><th>Why it matters there</th><th>Source</th><th>Communities Reviewed</th><th>Action Items</th><th>Cloned</th></tr></thead><tbody>${rows}</tbody></table></div>`;
   wireDeepDiveAddBar();
+  wireToggle();
   main.querySelectorAll('tr.clickable').forEach(row => {
-    row.onclick = () => openDeepDiveDetail(row.dataset.slug);
+    // only a cloned lead has communities/analysis to open
+    if (row.dataset.status === 'cloned') row.onclick = () => openDeepDiveDetail(row.dataset.slug);
+    else row.style.cursor = 'default';
   });
   main.querySelectorAll('.hotlist-toggle').forEach(cb => {
     cb.onclick = (e) => e.stopPropagation();
@@ -416,21 +437,36 @@ async function openReportDetail(period, filename) {
   backdrop.classList.add('open');
 }
 
+// Reports tab paging state: reportsListTotal is the server's count of the filtered set
+// (before slicing); reportsListOffset is the offset of the last page loaded.
+let reportsListTotal = 0;
+let reportsListOffset = 0;
+
 async function renderReportsTab() {
-  const main = document.getElementById('main');
+  const periodParam = reportsPeriodFilter === 'all' ? '' : reportsPeriodFilter;
   try {
-    reportsListCache = await fetchJson('/api/reports');
+    const page = await fetchJson(buildListUrl(24, 0, periodParam));
+    reportsListCache = appendPage([], page.reports);
+    reportsListTotal = page.total;
+    reportsListOffset = 0;
   } catch (e) {
-    main.innerHTML = `<div class="empty">Error loading reports: ${escapeHtml(e.message)}</div>`;
+    document.getElementById('main').innerHTML = `<div class="empty">Error loading reports: ${escapeHtml(e.message)}</div>`;
     return;
   }
+  renderReportsView();
+}
+
+// Renders the Reports tab from reportsListCache without refetching.
+function renderReportsView() {
+  const main = document.getElementById('main');
 
   const filterBar = `
     <div class="row" style="margin-bottom:12px">
       ${['all', 'hourly', 'daily', 'weekly'].map(p => `<button class="${reportsPeriodFilter === p ? 'active' : ''}" data-report-filter="${p}">${p[0].toUpperCase()}${p.slice(1)}</button>`).join('')}
     </div>`;
 
-  const visible = reportsPeriodFilter === 'all' ? reportsListCache : reportsListCache.filter(r => r.period === reportsPeriodFilter);
+  // The period filter is applied server-side (buildListUrl's period param), so the cache is already filtered.
+  const visible = reportsListCache;
 
   if (visible.length === 0) {
     main.innerHTML = filterBar + '<div class="empty">No reports generated yet -- the pipeline files an hourly report as soon as the first hour elapses since it started tracking.</div>';
@@ -441,7 +477,10 @@ async function renderReportsTab() {
         <td>${escapeHtml(r.filename)}</td>
         <td>${fmtAge((Date.now() - new Date(r.generatedAt).getTime()) / 1000)} ago</td>
       </tr>`).join('');
-    main.innerHTML = filterBar + `<table><thead><tr><th>Period</th><th>Report</th><th>Generated</th></tr></thead><tbody>${rows}</tbody></table>`;
+    const more = hasMore(reportsListCache.length, reportsListTotal)
+      ? '<div style="margin:12px 0"><button class="secondary" id="reports-load-more">Load more</button></div>'
+      : '';
+    main.innerHTML = filterBar + `<table><thead><tr><th>Period</th><th>Report</th><th>Generated</th></tr></thead><tbody>${rows}</tbody></table>` + more;
   }
 
   main.querySelectorAll('[data-report-filter]').forEach((btn) => {
@@ -450,6 +489,21 @@ async function renderReportsTab() {
   main.querySelectorAll('[data-open-report-period]').forEach((row) => {
     row.onclick = () => openReportDetail(row.dataset.openReportPeriod, row.dataset.openReportFilename);
   });
+  const loadMoreBtn = document.getElementById('reports-load-more');
+  if (loadMoreBtn) loadMoreBtn.onclick = async () => {
+    loadMoreBtn.disabled = true;
+    try {
+      const next = nextOffset(reportsListOffset, 24);
+      const page = await fetchJson(buildListUrl(24, next, reportsPeriodFilter === 'all' ? '' : reportsPeriodFilter));
+      reportsListCache = appendPage(reportsListCache, page.reports);
+      reportsListTotal = page.total;
+      reportsListOffset = next;
+      renderReportsView();
+    } catch (e) {
+      loadMoreBtn.disabled = false;
+      showToast('Could not load more reports: ' + e.message);
+    }
+  };
 }
 
 async function renderTokenfoldTab() {

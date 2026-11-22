@@ -16,6 +16,8 @@ const path = require('path');
 const { postJson } = require('./ollama-http.js');
 const inflightLock = require('./model-inflight-lock.js');
 const gpuCapacity = require('./gpu-capacity.js');
+const gpuGuard = require('./gpu-guard.js');
+const { isSlowEndpoint, isCloudEndpoint } = require('./lanes.js');
 const localThroughput = require('./local-throughput.js');
 const { currentDateLine } = require('./current-date-line.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
@@ -24,6 +26,8 @@ const { injectAmplificationInstruction, extractAmplificationRequests } = require
 const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { EventEmitter } = require('events');
+const emitter = new EventEmitter();
 
 // Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
 // unset, which would turn every caller of this module (including test files that require
@@ -147,6 +151,9 @@ const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 // the P40 lane, confirmed by comparing the two resolved env vars directly rather than
 // guessing from a hostname pattern.
 const IS_P40_ENDPOINT = !!process.env.AGENT_MANAGER_P40_OLLAMA_URL && OLLAMA_URL === process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+// 2026-10-17: lanes are data now (src/lanes.js). ANY lane marked `slow` -- the P40 and any registry lane with "slow": true -- gets the same
+// longer per-call ceiling; IS_P40_ENDPOINT stays for the legacy match, IS_SLOW_ENDPOINT is what the ceiling below keys on.
+const IS_SLOW_ENDPOINT = IS_P40_ENDPOINT || isSlowEndpoint(OLLAMA_URL);
 // No hardcoded fallback tag here on purpose (2026-08-22, Grimmethy: "The models are or
 // should be fully interchangeable and their names should not be hardcoded anywhere") --
 // this used to fall back to the bare literal string 'ornith', which isn't a real Ollama
@@ -169,7 +176,25 @@ const MODEL = process.env.LOCAL_MODEL;
 // path sent none at all and inherited Ollama's 5-minute default, so a single agentic turn
 // that outran 5 min (model reasoning + a 240s run_bash + the GPU lock held elsewhere in
 // between) paid a full cold reload (~114s observed) on the next turn.
-const KEEP_ALIVE = process.env.LOCAL_KEEP_ALIVE || process.env.ORNITH_KEEP_ALIVE || '30m';
+// 2026-11-06 (owner: never unload, never swap): the default is no longer '30m' and a shorter override is ignored; see src/keep-alive.js.
+const { resolveKeepAlive, NEVER_EXPIRE } = require('./keep-alive.js');
+const { ensureResident } = require('./model-resident.js');
+const KEEP_ALIVE = resolveKeepAlive(process.env.LOCAL_KEEP_ALIVE, process.env.ORNITH_KEEP_ALIVE);
+
+// 2026-11-07 (owner: never unload, never swap a model). Ollama restarts its runner -- a full reload of the 21 GB model -- whenever a request's num_ctx
+// differs from the loaded one. Three checks sent a small hardcoded 8192 (candidate-premise-check, deep-dive-grounding-check, plan-critique) and
+// each use cost two reloads. A caller-supplied numCtx that is not the pipeline's pinned value is therefore ignored here, once-per-(source, value)
+// warning; AGENT_MANAGER_ALLOW_CALLER_NUM_CTX=1 restores caller control (A/B eval work that really wants another context).
+const warnedNumCtx = new Set();
+function pinNumCtx(callerNumCtx, pinned, source) {
+  if (!callerNumCtx || callerNumCtx === pinned || process.env.AGENT_MANAGER_ALLOW_CALLER_NUM_CTX === '1') return callerNumCtx || pinned;
+  const key = `${source || 'none'}|${callerNumCtx}`;
+  if (!warnedNumCtx.has(key)) {
+    warnedNumCtx.add(key);
+    console.warn(`[local-client] ignoring numCtx=${callerNumCtx} from source=${source || 'none'}: a different context restarts the model runner; using ${pinned}`);
+  }
+  return pinned;
+}
 
 function detectDegenerate(text, { allowEmpty = false, doneReason, isDraft = false } = {}) {
   // 2026-09-05, Grimmethy: root-caused a whole cluster of blocked pipeline_forensics_fix
@@ -259,7 +284,41 @@ function estimateTokens(text) {
   return Math.ceil((text || '').length / 4); // rough chars-per-token estimate -- only used to bucket a context window and a timeout budget, not to enforce a hard limit.
 }
 
-async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
+// 2026-10-17 (first call on grimm's 8 GB lane): a model WITHOUT the thinking capability (qwen3-vl:8b-instruct) rejects any request carrying
+// think:true with HTTP 400 `"<model>" does not support thinking`, and callOnce's default is think:true, so every plan/implement pass on such a
+// lane hard-failed in ~2 ms. Learn it once per (endpoint, model): on that exact 400, retry the same request WITHOUT the think field (omitted rather
+// than false, so it is accepted whichever way a given Ollama treats think:false on a non-thinking model), and send later requests for that model
+// without it up front. Any other error, or a request that did not ask for thinking, is untouched.
+const THINK_UNSUPPORTED = new Set(); // `${url}|${model}`
+const THINK_UNSUPPORTED_RE = /does not support thinking/i;
+function isThinkUnsupportedError(e) {
+  return !!e && e.statusCode === 400 && THINK_UNSUPPORTED_RE.test(String(e.message || ''));
+}
+function withoutThink(body) {
+  const { think, ...rest } = body;
+  void think;
+  return rest;
+}
+async function postGenerate({ url, body, timeoutMs, headers, post = postJson, unsupported = THINK_UNSUPPORTED }) {
+  const key = `${url}|${body.model}`;
+  const target = `${url}/api/generate`;
+  const sent = (body.think && unsupported.has(key)) ? withoutThink(body) : body;
+  try {
+    return await post(target, sent, timeoutMs, headers);
+  } catch (e) {
+    if (sent.think && isThinkUnsupportedError(e)) {
+      unsupported.add(key);
+      return post(target, withoutThink(sent), timeoutMs, headers);
+    }
+    throw e;
+  }
+}
+
+async function callOnce({ prompt, images, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, allowAmplification = false, conceptId = null, post } = {}) {
+  // Forge exclusion (2026-10-14): never START a model call while PromptForge's comfyui-lease is held -- it would reload the model
+  // PromptForge just evicted. Checked here, before any prompt building, in-flight lock or network I/O. See gpu-guard.js ForgePauseError.
+  // A lease may be scoped to certain endpoints (gpu-guard.js leaseHeldFor): only a call to a leased card is refused, the other cards' lanes carry on.
+  if (gpuGuard.forgePauseEnabled() && gpuGuard.leaseHeldFor(OLLAMA_URL)) throw new gpuGuard.ForgePauseError();
   // Pipeline-wide side-finding capture (2026-09-05, see side-finding.js's own header):
   // tell the model the SIDE-FINDING: convention exists, unless this specific call needs
   // clean/parseable-only output (allowSideFindings: false -- set by known strict-schema
@@ -282,10 +341,27 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   const datedPrompt = `${currentDateLine()}\n\n${effectivePrompt}`;
   const promptTokens = estimateTokens(datedPrompt);
 
-  const resolvedNumCtx = numCtx || gpuCapacity.resolveNumCtx({ estimatedTokens: promptTokens, numPredict });
+  // 2026-10-24 (rx580, change_review): the plan budget for a >10000-char diff is 6000-8000 tokens from the FIRST call; at ~16 tok/s that is
+  // ~375 s against the 300 s ceiling, so it timed out every time the model used it (one task ran 8 cycles, ~2 h). The retry clamp below only
+  // limits ESCALATED budgets, so cap the one actually sent. Skipped when the caller or operator chose the timeout on purpose, and when no
+  // rate has been recorded for this endpoint+model (DEFAULT_TPS is a guess for a cold machine).
+  if (!timeoutMs && !ENV_TIMEOUT_MS_OVERRIDE) {
+    const recordedTps = localThroughput.getTokensPerSecond(resolveInstancesDir(), OLLAMA_URL, model || MODEL);
+    if (recordedTps !== localThroughput.DEFAULT_TPS) {
+      const capped = capNumPredictToFit({ numPredict, promptTokens, tokensPerSecond: recordedTps, ceilingMs: perCallCeilingMs() });
+      if (capped !== numPredict) {
+        console.warn(`[local-client] num_predict capped to fit the per-call ceiling | requested=${numPredict} sent=${capped} rate=${Math.round(recordedTps * 10) / 10}tok/s promptTokens=${promptTokens} source=${source || 'none'}`);
+        numPredict = capped;
+      }
+    }
+  }
+
+  const resolvedNumCtx = pinNumCtx(numCtx, gpuCapacity.resolveNumCtx({ estimatedTokens: promptTokens, numPredict }), source);
 
   const options = { num_ctx: resolvedNumCtx, num_predict: numPredict, temperature };
   if (repeatPenalty) options.repeat_penalty = repeatPenalty;
+  const laneBatch = gpuCapacity.laneNumBatch();
+  if (laneBatch) options.num_batch = laneBatch; // this lane's own prompt-processing batch (lanes registry numBatch)
 
   const body = { model: model || MODEL, prompt: datedPrompt, think, stream: false, keep_alive: KEEP_ALIVE, options };
   // Grammar-constrained decoding. When `format` is set ("json", or a full JSON-schema object),
@@ -296,6 +372,8 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   // implement draft came back ```json-fenced despite that exact instruction). The constraint
   // applies only to `response`; the `thinking` trace is left unconstrained.
   if (format) body.format = format;
+  // Vision call (lib/task-images.js): base64 pictures the model should look at. Ollama's /api/generate `images` field.
+  if (Array.isArray(images) && images.length) body.images = images;
 
   // In-flight lock (model-inflight-lock.js) -- held for the exact span of the real
   // network call, so agent-manager-common.sh's should_yield_for_model_swap can see "a
@@ -307,6 +385,9 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   // here.
   const instancesDir = resolveInstancesDir();
   const lockModel = model || MODEL;
+  // Residency gate (2026-11-06, owner: never time out a model load, never swap): make sure the model is resident at this call's num_ctx BEFORE the
+  // request clock starts; see src/model-resident.js. Skipped with no pipeline env (bare test requires), never throws.
+  await ensureResident({ url: OLLAMA_URL, model: lockModel, numCtx: resolvedNumCtx, instancesDir });
   const lockPath = instancesDir ? inflightLock.acquire(instancesDir, lockModel, process.env.AGENT_MANAGER_INSTANCE_ID) : null;
   const resolvedTimeoutMs = timeoutMs || resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model: lockModel });
   // Stable per-worker-lane session id (not per-call) so TokenFold sees these as a
@@ -324,8 +405,9 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   // default/global scope when omitted, same as it always did before this existed.
   if (source) tokenFoldHeaders['X-TokenFold-Scope'] = source;
   try {
-    const result = await postJson(`${OLLAMA_URL}/api/generate`, body, resolvedTimeoutMs, tokenFoldHeaders);
+    const result = await postGenerate({ url: OLLAMA_URL, body, timeoutMs: resolvedTimeoutMs, headers: tokenFoldHeaders, post });
     localThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration, endpoint: OLLAMA_URL, model: lockModel });
+    emitter.emit('local-model-ready');
     // 2026-08-23, Grimmethy: "we need a way to differentiate 'working' from 'loading'...
     // this isn't the first time a lack of verbosity has caused us confusion" -- Ollama's
     // own response already carries this exact breakdown (load_duration -- time spent
@@ -346,6 +428,17 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   } finally {
     inflightLock.release(lockPath);
   }
+}
+
+// 2026-11-10 (HUB0408): register a listener for the 'local-model-ready' event, emitted
+// once per successful top-level call or callOnce (never on a thrown error). Returns an
+// unsubscribe function that removes the listener, so callers can clean up without keeping
+// a reference to the emitter.
+function onLocalModelReady(fn) {
+  emitter.on('local-model-ready', fn);
+  return () => {
+    emitter.off('local-model-ready', fn);
+  };
 }
 
 // 2026-09-18 (pipeline throughput investigation, following the qwen2.5:3b GPU-thrashing
@@ -397,6 +490,11 @@ const PER_CALL_TIMEOUT_CEILING_MS = 300_000;
 const P40_PER_CALL_TIMEOUT_CEILING_MS = 900_000;
 const ENV_TIMEOUT_MS_OVERRIDE = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || null;
 
+// The per-call ceiling this endpoint's calls run under: one place, so the timeout above and the truncation escalation below cannot drift apart.
+function perCallCeilingMs() {
+  return IS_SLOW_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : PER_CALL_TIMEOUT_CEILING_MS;
+}
+
 function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model }) {
   if (ENV_TIMEOUT_MS_OVERRIDE) return ENV_TIMEOUT_MS_OVERRIDE;
   const tokensPerSecond = localThroughput.getTokensPerSecond(instancesDir, OLLAMA_URL, model);
@@ -404,8 +502,8 @@ function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model
     promptTokens,
     numPredict,
     tokensPerSecond,
-    ceilingMs: IS_P40_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : PER_CALL_TIMEOUT_CEILING_MS,
-    hardCeilingMs: IS_P40_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : undefined,
+    ceilingMs: perCallCeilingMs(),
+    hardCeilingMs: IS_SLOW_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : undefined,
   });
 }
 
@@ -456,25 +554,87 @@ function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model
 const TRUNCATION_RETRY_MULTIPLIER = 2;
 const TRUNCATION_RETRY_NUM_PREDICT_CEILING = 8000;
 
+// 2026-10-24 (rx580 lane, 66 truncated plan calls in one day, every one stopped at its numPredict with a ~1k-token prompt): the escalation above
+// doubled 1400 -> 2800 -> 5600, but at the lane's ~16 tok/s a 5600-token generation takes ~350 s and the per-call ceiling is 300 s, so attempts 3-5
+// were all OLLAMA_TIMEOUT and a doomed task held the lane ~20 min before ending 'Plan pass degenerate: truncated' (same class as the P40 incident in
+// gpu-capacity.js resolveTimeoutMs). The largest numPredict that can finish inside the ceiling at a MEASURED rate: 90% of the ceiling, less prefill
+// at the 150 tok/s floor gpu-capacity.js uses, times tokens/s. Pure; 0 when the budget is spent before generation could start.
+function maxNumPredictThatFits({ promptTokens = 0, tokensPerSecond, ceilingMs }) {
+  const generationSeconds = (ceilingMs * 0.9) / 1000 - promptTokens / 150;
+  return Math.max(0, Math.floor(generationSeconds * tokensPerSecond));
+}
+
+// How many HARD failures (timeout, connection refused, HTTP 5xx -- anything that makes callOnce() throw) one call() may absorb. Kept
+// separate from `maxRetries`, which now bounds only attempts that returned a response: 2026-10-16, a plan call on the P40 hit an HTTP 500,
+// then a 427 s timeout, and its first real response (truncated at numPredict 1400) arrived on attempt 3 -- the loop was over, so the
+// truncation escalation below (numPredict x2, think off) never got to run and the task was recorded as 'Plan pass degenerate: truncated'.
+// Equal to maxRetries + 1, i.e. exactly the attempts a call that never gets any response has always made.
+function hardFailureAllowance(maxRetries) {
+  return maxRetries + 1;
+}
+
+// A numPredict the call can actually finish inside the per-call ceiling at a recorded rate: unchanged when it already fits, and unchanged when
+// the fit would drop below this floor (a prompt whose prefill alone spends most of the budget -- a uselessly short output is worse than a long wait).
+const MIN_CAPPED_NUM_PREDICT = 1024;
+function capNumPredictToFit({ numPredict, promptTokens = 0, tokensPerSecond, ceilingMs }) {
+  const fit = maxNumPredictThatFits({ promptTokens, tokensPerSecond, ceilingMs });
+  if (numPredict <= fit || fit < MIN_CAPPED_NUM_PREDICT) return numPredict;
+  return fit;
+}
+
+// HUB0280-02: stages whose callers already write their own model_calls row (src/local-draft.js, src/lib/implement-critique.js,
+// src/local-agentic-write-draft.js, src/research-agentic-draft.js); call() skips these so a model call is recorded exactly once.
+const CALLER_RECORDED_STAGES = ['plan', 'implement', 'implement-retry', 'critique', 'revise', 'agentic-write'];
+
+// Best-effort row in model_calls for a call whose caller does not record it (reviewer votes, needs-clarification triage votes). The model
+// label is the call's model or this module's default; latency covers the whole call including retries while the token counts are the final
+// attempt's, as on the plan/implement rows. Never throws.
+function recordUnrecordedCall(opts, startedAt, latencyMs, result) {
+  try {
+    if (!opts || typeof opts.taskId !== 'string' || !opts.taskId) return;
+    if (typeof opts.stage !== 'string' || !opts.stage || CALLER_RECORDED_STAGES.includes(opts.stage)) return;
+    if (!result || result.degenerate) return;
+    require('./model-stats-client.js').recordCall({
+      taskId: opts.taskId, stage: opts.stage, model: opts.model || MODEL, startedAt, latencyMs, result, source: opts.source || null,
+    });
+  } catch (e) {
+    console.warn(`[local-client] model_calls record failed for ${opts && opts.taskId} (non-fatal): ${e && e.message}`);
+  }
+}
+
 async function call(opts, maxRetries = 2) {
+  const startedAt = new Date().toISOString();
+  const startMs = Date.now();
+  const result = await callUnrecorded(opts, maxRetries);
+  recordUnrecordedCall(opts, startedAt, Date.now() - startMs, result);
+  return result;
+}
+
+async function callUnrecorded(opts, maxRetries = 2) {
   let lastDegenerate = null;
   let lastError = null;
   let gotAnyResponse = false;
   let callOpts = opts;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  let responses = 0;
+  let hardFailures = 0;
+  const maxHardFailures = hardFailureAllowance(maxRetries);
+  for (let attempt = 0; responses <= maxRetries && hardFailures < maxHardFailures; attempt++) {
     let result;
     try {
       result = await callOnce(callOpts);
     } catch (e) {
+      if (gpuGuard.isForgePause(e)) throw e;   // not a failure: no retry, no hard-failure audit (the lease is still held on every attempt)
       lastError = e;
+      hardFailures += 1;
       logHardFailureAudit({
         source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
         model: opts.model || MODEL, code: e.code || null, message: String(e.message || e).slice(0, 300),
-        timeoutMs: e.timeoutMs, statusCode: e.statusCode, nodeCode: e.nodeCode,
+        timeoutMs: e.timeoutMs, statusCode: e.statusCode, nodeCode: e.nodeCode, think: callOpts.think,
       });
       continue;
     }
     gotAnyResponse = true;
+    responses += 1;
     // Extract any SIDE-FINDING: block(s) BEFORE degenerate-detection judges the response,
     // so a response that's otherwise degenerate/empty except for a stray finding isn't
     // misjudged either way, and so the caller's own downstream RESOLUTION:/JSON parsing
@@ -520,13 +680,28 @@ async function call(opts, maxRetries = 2) {
       source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
       model: opts.model || MODEL, numPredict: callOpts.numPredict, doneReason: result.done_reason,
       degenerate, promptEvalCount: result.prompt_eval_count, evalCount: result.eval_count,
+      // Whether THIS attempt asked for reasoning: the think-off retry below could not be verified from the log before (2026-10-16: 3090 attempts 2
+      // and 3 still hit their ceiling with evalCount == numPredict and nothing recorded about think).
+      think: callOpts.think,
     });
     if (degenerate === 'truncated' && callOpts.numPredict) {
       const escalated = Math.min(
         Math.round(callOpts.numPredict * TRUNCATION_RETRY_MULTIPLIER),
         TRUNCATION_RETRY_NUM_PREDICT_CEILING,
       );
-      if (escalated > callOpts.numPredict) callOpts = { ...callOpts, numPredict: escalated };
+      let retryable = true;
+      if (escalated > callOpts.numPredict) {
+        let nextNumPredict = escalated;
+        // Only against a rate this endpoint+model has actually recorded: DEFAULT_TPS is a guess for a cold machine and must not shrink the ladder.
+        const measuredTps = localThroughput.getTokensPerSecond(resolveInstancesDir(), OLLAMA_URL, opts.model || MODEL);
+        if (measuredTps !== localThroughput.DEFAULT_TPS) {
+          const fits = maxNumPredictThatFits({ promptTokens: result.prompt_eval_count || 0, tokensPerSecond: measuredTps, ceilingMs: perCallCeilingMs() });
+          nextNumPredict = Math.min(escalated, fits);
+          // Nothing bigger can finish in time: another call would only time out, so hand back the truncated result now.
+          if (nextNumPredict <= callOpts.numPredict) retryable = false;
+        }
+        if (retryable) callOpts = { ...callOpts, numPredict: nextNumPredict };
+      }
       // 2026-09-14, root-caused against a real blocked backlog (21 tasks, every one
       // truncated with ZERO visible characters -- confirmed via model_calls: eval_count
       // present, response empty): doneReason:'length' with no real content at all means
@@ -545,13 +720,14 @@ async function call(opts, maxRetries = 2) {
       if (callOpts.think && !(result.response || '').trim()) {
         callOpts = { ...callOpts, think: false };
       }
+      if (!retryable) break;
     }
   }
   // Only propagate the hard error if NO attempt ever got a real response, degenerate or
   // not -- a degenerate response on an earlier attempt followed by a hard failure on a
   // later retry is still a real, legitimate degenerate outcome, not an infra failure.
   if (!gotAnyResponse && lastError) throw lastError;
-  return { response: '', thinking: '', degenerate: lastDegenerate, attempts: maxRetries + 1 };
+  return { response: '', thinking: '', degenerate: lastDegenerate, attempts: responses + hardFailures };
 }
 
 // Majority-vote helper for qualitative judgment calls. Runs the SAME prompt `n` times
@@ -579,12 +755,17 @@ async function call(opts, maxRetries = 2) {
 // (logHardFailureAudit keys off opts.taskId).
 async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
   const votes = [];
+  // Every vote records who cast it (feature cloud-agent-pool, FF-2b): provider 'cloud' when this process's OLLAMA_URL is a cloud-providers gateway (src/lanes.js isCloudEndpoint),
+  // else 'ollama', and the model the pass used (call()'s own `model || LOCAL_MODEL` rule). Two keys added; nothing existing is renamed or reordered, and readers that ignore them are unaffected.
+  const voteProvider = isCloudEndpoint(OLLAMA_URL) ? 'cloud' : 'ollama';
+  const voteModel = model || MODEL || null;
   const voteErrors = [];
   for (let i = 0; i < n; i++) {
     let result;
     try {
       result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
     } catch (e) {
+      if (gpuGuard.isForgePause(e)) throw e;   // the Forge family took the GPU mid-vote: abandon the whole vote (never tally the partial one)
       // This ONE vote hard-failed (e.g. a network timeout that survived call()'s own
       // retry above) -- must not abort the other n-1 votes, which may well succeed under
       // exactly the same slow-but-not-dead conditions. See this function's own 2026-08-23
@@ -597,7 +778,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
     }
     if (result.degenerate) continue;
     const verdict = classify(result.response);
-    if (verdict) votes.push({ verdict, response: result.response });
+    if (verdict) votes.push({ verdict, response: result.response, provider: voteProvider, model: voteModel });
 
     // Early-exit once any verdict has mathematically already secured minAgreeing votes
     // -- no remaining vote can change the outcome (adding to a losing verdict's tally, or
@@ -646,7 +827,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
+module.exports = { call, callOnce, CALLER_RECORDED_STAGES, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, NEVER_EXPIRE, maxNumPredictThatFits, capNumPredictToFit, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD, onLocalModelReady };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,

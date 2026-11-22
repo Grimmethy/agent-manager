@@ -3,7 +3,6 @@
 // apply-core.js -- extracted from src/apply-task.js ([[hub-task-integration]] node-module decompose).
 
 const { getRegisteredSource, resolveSourceName } = require('../task-source-registry.js');
-const { getCandidateSplitHubFiler } = require('../candidate-split-hub-route.js');
 const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve, closeBrainDumpEntryResolved, applyResearchTask, isEffectivelyEmptyResponse, applyArchDiscoveryCandidates } = require('../apply-group-a.js');
 const { applyGroupB, batchContainsDeleteMode } = require('../apply-group-b.js');
 require('../task-sources.js');
@@ -79,16 +78,16 @@ function applyCandidateSplit(task, source) {
   return result;
 }
 
-function writeArtifact(task, repoRoot, pipelineDir) {
+function writeArtifact(task, repoRoot, pipelineDir, opts = {}) {
   if (Array.isArray(task.candidateSplitProposals) && task.candidateSplitProposals.length > 0) {
     // A split the draft routed to the hub system becomes real, ordered sub-tasks under a
     // coordinator instead of more candidate-doc entries. applyCandidateSplitAsHub itself
     // lives in the agent-manager-hub-tasks plugin (S4b of the hub-tasks extraction,
-    // 2026-09-25) -- see candidate-split-hub-route.js for the swap point.
+    // 2026-09-25) -- the filer is injected by the caller via opts.hubFiler.
     if (task.candidateSplitRoute === 'hub') {
-      const filer = getCandidateSplitHubFiler();
+      const filer = opts.hubFiler;
       if (!filer) {
-        throw new Error(`task ${task.id}: candidate split routed to a coordinator hub, but no hub-task filer is registered -- load/register the agent-manager-hub-tasks plugin (AGENT_MANAGER_REGISTER_PATH)`);
+        throw new Error('hub filer not provided: candidate split routed to hub but no hubFiler was injected');
       }
       return filer.applyCandidateSplitAsHub(task, pipelineDir);
     }

@@ -9,7 +9,7 @@ const path = require('path');
 const {
   extractFilesLine, splitFilesLineEntries, checkCitedPaths, formatFabricatedReason,
   checkCitedSymbols, checkCitedSymbolsPerEntry, splitCandidateEntries, formatFabricatedSymbolsReason,
-  symbolCheckBlocks, formatSymbolWarnings, resolveCitedFile, normalizeFilesLine,
+  symbolCheckBlocks, formatSymbolWarnings, resolveCitedFile, normalizeFilesLine, citedContextFiles,
 } = require('./candidate-path-grounding.js');
 
 // --- extractFilesLine -----------------------------------------------------------------
@@ -401,4 +401,57 @@ test('parseFabricatedPaths: inverts formatFabricatedReason and ignores other wor
   const reason = formatFabricatedReason([{ claimedPath: 'a/b.ts' }, { claimedPath: 'c.ts' }]);
   assert.deepEqual(require('./candidate-path-grounding.js').parseFabricatedPaths(`Ungrounded draft: ${reason}`), ['a/b.ts', 'c.ts']);
   assert.deepEqual(require('./candidate-path-grounding.js').parseFabricatedPaths('fabricated symbol citation(s): `x` -- not found'), []);
+});
+
+// --- citedContextFiles: the modules a candidate's prose names (brain dump bd-1791177888894) ----------------------------------------------------------
+function contextRepo(files) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-files-'));
+  for (const [rel, body] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), body);
+  }
+  return root;
+}
+const SPEC_SECTION = "### AC-47 · Replace positional destructuring\nStrength: Strong\nFiles: app/backend/agent-pipeline/db-v2.js\n\nProblem:\nBad.\n\nSolution:\nReplace the import with `const { STATUS } = require('./statuses');` in the file.\n";
+
+test('citedContextFiles: a relative require specifier resolves against the declared file directory, with the extension probed', () => {
+  const root = contextRepo({ 'app/backend/agent-pipeline/db-v2.js': 'x', 'app/backend/agent-pipeline/statuses.js': 'y' });
+  assert.deepEqual(citedContextFiles({ section: SPEC_SECTION, declaredFiles: ['app/backend/agent-pipeline/db-v2.js'], repoRoot: root }), ['app/backend/agent-pipeline/statuses.js']);
+});
+
+test('citedContextFiles: ../ and /index specifiers, and import / from / dynamic import forms, resolve too', () => {
+  const root = contextRepo({ 'a/b/main.js': 'm', 'a/shared/util.ts': 'u', 'a/b/lib/index.js': 'i', 'a/api/ownerList.ts': 'o' });
+  const section = "Uses `require('../shared/util')` and `from './lib'` and `import('../api/ownerList')`.";
+  assert.deepEqual(citedContextFiles({ section, declaredFiles: ['a/b/main.js'], repoRoot: root }), ['a/shared/util.ts', 'a/b/lib/index.js', 'a/api/ownerList.ts']);
+});
+
+test('citedContextFiles: the old src/-prefix paths are still found, and a path under any top-level directory is found too', () => {
+  const root = contextRepo({ 'src/prompts.js': 'p', 'TaxHarvest/backend/x/y.js': 'y', 'src/local-draft.js': 'd' });
+  const section = 'Call buildPlanPrompt in `src/prompts.js`; the helper lives in TaxHarvest/backend/x/y.js.';
+  assert.deepEqual(citedContextFiles({ section, declaredFiles: ['src/local-draft.js'], repoRoot: root }), ['src/prompts.js', 'TaxHarvest/backend/x/y.js']);
+});
+
+test('citedContextFiles: a declared file, a missing file, a test, node_modules and build output are never returned', () => {
+  const root = contextRepo({ 'src/a.js': 'a', 'src/a.test.js': 't', 'node_modules/pkg/index.js': 'n', 'dist/out.js': 'o', 'tests/helper.js': 'h' });
+  const section = 'See src/a.js, src/missing.js, src/a.test.js, node_modules/pkg/index.js, dist/out.js and tests/helper.js.';
+  assert.deepEqual(citedContextFiles({ section, declaredFiles: ['src/a.js'], repoRoot: root }), []);
+});
+
+test('citedContextFiles: an ambiguous basename is never guessed (a specifier resolves only where it points, a deep path only when exact)', () => {
+  const root = contextRepo({ 'a/main.js': 'm', 'b/index.js': 'i', 'c/index.js': 'i2', 'deep/other/util.js': 'u' });
+  assert.deepEqual(citedContextFiles({ section: "require('./index') and nowhere/else/util.js", declaredFiles: ['a/main.js'], repoRoot: root }), []);
+});
+
+test('citedContextFiles: the cap holds and the order is prefix paths, then specifiers, then other paths', () => {
+  const root = contextRepo({ 'src/p.js': 'p', 'a/main.js': 'm', 'a/s1.js': '1', 'a/s2.js': '2', 'q/r/t.js': 't' });
+  const section = "Mentions q/r/t.js, then require('./s1') and require('./s2'), then src/p.js.";
+  assert.deepEqual(citedContextFiles({ section, declaredFiles: ['a/main.js'], repoRoot: root, max: 3 }), ['src/p.js', 'a/s1.js', 'a/s2.js']);
+  assert.deepEqual(citedContextFiles({ section, declaredFiles: ['a/main.js'], repoRoot: root, max: 1 }), ['src/p.js']);
+  assert.deepEqual(citedContextFiles({ section, declaredFiles: ['a/main.js'], repoRoot: root, max: 0 }), []);
+});
+
+test('citedContextFiles: a specifier that climbs out of the repo is ignored, and junk input never throws', () => {
+  const root = contextRepo({ 'a/main.js': 'm' });
+  assert.deepEqual(citedContextFiles({ section: "require('../../../../etc/passwd')", declaredFiles: ['a/main.js'], repoRoot: root }), []);
+  for (const args of [undefined, {}, { section: 5 }, { section: 'x', repoRoot: '/nonexistent-root-xyz' }, { section: "require('./x')", declaredFiles: [null, 3], repoRoot: root }]) assert.deepEqual(citedContextFiles(args), []);
 });

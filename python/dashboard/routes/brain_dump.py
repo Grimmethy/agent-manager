@@ -1,4 +1,5 @@
 import json
+import subprocess
 from datetime import datetime, timezone
 
 from flask import Blueprint, abort, jsonify, request
@@ -97,6 +98,17 @@ def api_brain_dump():
     return jsonify(_filtered_brain_dump_view(machine=False))
 
 
+def _parse_paging_int(name):
+    """Optional non-negative integer query param for /api/filed-findings paging. Absent -> None.
+    Anything that is not a plain run of ASCII digits (empty string, sign, decimal, space, ...) is a 400."""
+    raw = request.args.get(name)
+    if raw is None:
+        return None
+    if not (raw.isascii() and raw.isdigit()):
+        abort(400, description=f"{name} must be a non-negative integer")
+    return int(raw)
+
+
 @brain_dump_bp.route("/api/filed-findings")
 def api_filed_findings():
     """Filed Findings tab's left pane -- every entry a pipeline sweep raised on its own
@@ -105,7 +117,15 @@ def api_filed_findings():
     a human's own notes never get crowded out by machine-filed volume (764 of 999 live
     entries were machine-raised at time of writing). Same filter semantics as
     /api/brain-dump -- see _filtered_brain_dump_view's own header."""
-    return jsonify(_filtered_brain_dump_view(machine=True))
+    limit = _parse_paging_int("limit")
+    offset = _parse_paging_int("offset")
+    findings = _filtered_brain_dump_view(machine=True)
+    if limit is None:
+        # No paging requested: the bare array, exactly as before.
+        return jsonify(findings)
+    offset = offset or 0
+    total = len(findings)
+    return jsonify({"findings": findings[offset:offset + limit], "total": total})
 
 
 @brain_dump_bp.route("/api/brain-dump/capture", methods=["POST"])
@@ -113,7 +133,7 @@ def api_brain_dump_capture():
     """Dumb, synchronous append -- no LLM in the write path, same philosophy as
     queue-adhoc-task.js's manual task injection. The brain_dump_sort Ornith worker source
     picks unsorted ("captured") entries up from here asynchronously."""
-    from app import brain_dump_path, read_brain_dump_entries, slugify_for_id, write_brain_dump_entries
+    from app import _coerce_serial, brain_dump_path, read_brain_dump_entries, slugify_for_id, write_brain_dump_entries
     body = request.get_json(silent=True) or {}
     text = (body.get("text") or "").strip()
     if not text:
@@ -129,7 +149,7 @@ def api_brain_dump_capture():
     # a hand-edited brain-dump.json survives in the list), so this filters the same way
     # _assign_brain_dump_serials's own max() does, rather than crashing on e.get(...).
     entries = read_brain_dump_entries()
-    next_serial = max((e.get("serial") or 0) for e in entries if isinstance(e, dict)) + 1 if entries else 1
+    next_serial = max((_coerce_serial(e.get("serial")) for e in entries if isinstance(e, dict)), default=0) + 1
 
     entry_id = f"bd-{int(datetime.now(timezone.utc).timestamp() * 1000)}-{slugify_for_id(text)}"
     entry = {
@@ -211,6 +231,24 @@ def api_brain_dump_delete(entry_id):
     return jsonify({"deleted": entry_id})
 
 
+def _suspect_reasons(entry):
+    """Reasons the pre-queue target check calls this entry suspect, or [] (HUB0274-08). Runs scripts/check-brain-dump-targets.js with a 5 second timeout;
+    ANY problem (no node, timeout, bad output) returns [] so the check can never stop the owner from queueing an entry."""
+    try:
+        from app import PACKAGE_ROOT
+        cp = subprocess.run(
+            ["node", str(PACKAGE_ROOT / "scripts" / "check-brain-dump-targets.js")],
+            input=json.dumps({"id": entry.get("id"), "rawText": entry.get("rawText"), "raisedBy": entry.get("raisedBy")}),
+            capture_output=True, text=True, timeout=5, cwd=str(PACKAGE_ROOT),
+        )
+        result = json.loads((cp.stdout or "").strip().splitlines()[-1])
+        if result.get("verdict") == "suspect":
+            return [str(r) for r in (result.get("reasons") or [])] or ["the target check flagged this entry"]
+    except Exception:  # noqa: BLE001 -- fail open
+        pass
+    return []
+
+
 @brain_dump_bp.route("/api/brain-dump/<entry_id>/prioritize", methods=["POST"])
 def api_brain_dump_prioritize(entry_id):
     """'Process this now' button: injects the entry straight into queue/adhoc/, the SAME
@@ -235,6 +273,13 @@ def api_brain_dump_prioritize(entry_id):
     # existing queuedTaskId instead of minting a second one.
     if entry.get("status") == "actioned" and entry.get("queuedTaskId"):
         return jsonify(entry)
+
+    # HUB0274-08: warn before queueing an entry the target check calls suspect (every cited path missing, retired archive/ code, a hub sequencing
+    # note). The owner can still queue it: send {"force": true} (or set entry.targetCheckOverride). Fails open on any error in the check.
+    if (request.get_json(silent=True) or {}).get("force") is not True and entry.get("targetCheckOverride") is not True:
+        reasons = _suspect_reasons(entry)
+        if reasons:
+            abort(409, description="Process now was not run: " + "; ".join(reasons) + ' -- send {"force": true} to queue it anyway')
 
     pipeline_dir = get_pipeline_dir()
     if not pipeline_dir:

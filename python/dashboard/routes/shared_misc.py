@@ -17,6 +17,17 @@ import time
 
 shared_misc_bp = Blueprint("shared-misc-bp", __name__)
 
+# Keys the adhoc/drafting row builder (api_adhoc_tasks.task_row) reads directly from a
+# task record: the displayed title and the createdAt sort key. id, domain and dependsOn
+# are read with defaults (filename stem / None), so they are deliberately NOT required.
+_TASK_RECORD_KEYS = ("title", "createdAt")
+
+
+def is_task_record(data) -> bool:
+    """True only for a dict containing every key in _TASK_RECORD_KEYS. Guards the
+    drafting rglob scan against non-task JSON (lists, strings, partial dicts)."""
+    return isinstance(data, dict) and all(k in data for k in _TASK_RECORD_KEYS)
+
 @shared_misc_bp.route("/api/ping")
 def api_ping():
     # Identity endpoint for the companion app's server-list health check. Shape mirrors
@@ -139,6 +150,60 @@ def api_queue_state(state):
     ever gets read_json_safe'd, so a 200+-item done/ folder no longer means reading and
     JSON-parsing every single file on every 5s poll, just the page actually being shown."""
     from app import QUEUE_STATES, queue_dir, read_json_safe, task_summary
+    project_raw = request.args.get("project")
+    if project_raw is not None:
+        # Project-aware shape (HUB0485 2/2). Only taken when ?project= is supplied, so
+        # existing callers of /api/queue/<state> keep the {items, total} task-summary shape.
+        from routes.queue_project_filter import _registry, parse_project_param
+        from routes.queue_page_index import dependency_index, list_state_ids, resolve_page_depends_on
+        if state not in QUEUE_STATES and state != "drafting":
+            abort(404)
+        try:
+            project_param = parse_project_param(project_raw)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        # Map the label to concrete registry slugs before touching the index:
+        # "active" -> the active project's slug, "all" -> every registered slug,
+        # otherwise the (already validated) named slug.
+        if project_param == "active":
+            from app import _active_project_label
+            active_slug = _active_project_label()
+            registered = {e.get("label") for e in _registry() if e.get("label")}
+            # An active project missing from the registry cannot be looked up by label;
+            # queue_page_index treats the "active" sentinel as the live queue_dir().
+            project_slugs = [active_slug if active_slug in registered else "active"]
+        elif project_param == "all":
+            project_slugs = [e.get("label") for e in _registry() if e.get("label")]
+        else:
+            project_slugs = [project_param]
+        proj_limit = request.args.get("limit", type=int)
+        proj_offset = request.args.get("offset", default=0, type=int)
+        proj_offset = max(proj_offset or 0, 0)
+        entries = sorted(list_state_ids(project_slugs, state))
+        total = len(entries)
+        page = entries[proj_offset:proj_offset + max(proj_limit, 0)] if proj_limit is not None else entries[proj_offset:]
+        index = dependency_index()
+        proj_items = []
+        for tid, proj, path in page:
+            data = read_json_safe(path)
+            if not isinstance(data, dict):
+                continue
+            deps = data.get("dependsOn") or []
+            piece = {
+                "id": data.get("id", tid),
+                "title": data.get("title"),
+                "state": state,
+                "project": proj,
+                "dependsOn": list(deps) if isinstance(deps, (list, tuple)) else [],
+            }
+            proj_items.append({
+                "id": piece["id"],
+                "title": piece["title"],
+                "state": state,
+                "project": proj,
+                "dependsOn": resolve_page_depends_on(piece, index),
+            })
+        return jsonify({"items": proj_items, "total": total})
     qdir = queue_dir()
     if not qdir:
         return jsonify({"items": [], "total": 0})
@@ -317,7 +382,7 @@ def api_adhoc_tasks():
     how fast any one request actually was in isolation. done/ tasks aren't what this
     view exists to track anyway -- the whole point is active (in-progress) and stuck
     (blocked) work, both already excluded from that giant folder."""
-    from app import QUEUE_STATES, _adhoc_task_excerpt, queue_dir, read_json_safe
+    from app import QUEUE_STATES, _adhoc_task_excerpt, logger, queue_dir, read_json_safe
     qdir = queue_dir()
     if not qdir:
         return jsonify({"tasks": []})
@@ -369,7 +434,8 @@ def api_adhoc_tasks():
     if drafting_root.is_dir():
         for f in drafting_root.rglob("*.json"):
             data = read_json_safe(f)
-            if not data:
+            if not is_task_record(data):
+                logger.warning("skipping non-task JSON in drafting scan: %s", f)
                 continue
             task_id = data.get("id", f.stem)
             if not is_adhoc(data, task_id):
@@ -421,7 +487,7 @@ def _cached_verdict(kind, path, compute, seen):
     key = (kind, str(path), st.st_mtime_ns, st.st_size)
     seen.add(key)
     if key not in _verdict_cache:
-        _verdict_cache[key] = bool(compute(read_json_safe(path)))
+        _verdict_cache[key] = bool(compute(rec if isinstance(rec := read_json_safe(path), dict) else None))  # a stray list/string/null file is not a record
     return _verdict_cache[key]
 
 
@@ -519,26 +585,49 @@ def _compute_summary_counts(qdir):
     return counts
 
 
+def _with_memory(counts, qdir=None):
+    """The cached queue counts plus the host-memory state for the header chip, and the queue-events journal counter. Computed per call, NOT cached with the counts:
+    each is one tiny file read (see memory_status.py and queue_events_status.py) and the chip must show a pressure change on the very next refresh."""
+    import memory_status
+    import event_stream
+    import queue_events_status
+    return {**dict(counts), "memory": memory_status.memory_status(), "queueEvents": queue_events_status.queue_events_status(qdir), "eventStream": event_stream.hub_status()}
+
+
+@shared_misc_bp.route("/api/memory/unload-ollama", methods=["POST"])
+def api_memory_unload_ollama():
+    """The header chip's owner-only button: ask the gpu-broker to unload its Ollama models. The broker refuses (403) unless it was started with
+    AGENT_MANAGER_MEM_RELIEF_OLLAMA=owner, and a broker without the route answers 404; both are passed through so the page can hide the button."""
+    import memory_status
+    status, body = memory_status.unload_ollama(who="dashboard")
+    return jsonify(body), status
+
+
 @shared_misc_bp.route("/api/summary")
 def api_summary():
     from app import queue_dir
     qdir = queue_dir()
     key = str(qdir) if qdir else None
 
+    import event_stream
+
     def fresh_value():
+        # The 3 s cache is also dropped when the event stream announced a queue change since the payload was computed: a page told "counts changed" must get the new counts.
         entry = _summary_state["entry"]
-        if entry and entry[0] == key and time.monotonic() - entry[1] < _SUMMARY_TTL_S:
+        if entry and entry[0] == key and time.monotonic() - entry[1] < _SUMMARY_TTL_S and _summary_state.get("gen") == event_stream.generation("counts-changed"):
             return entry[2]
         return None
 
     def recompute():
+        gen = event_stream.generation("counts-changed")      # read BEFORE computing: a change announced while computing must still invalidate this payload
         value = _compute_summary_counts(qdir)
         _summary_state["entry"] = (key, time.monotonic(), value)
+        _summary_state["gen"] = gen
         return value
 
     value = fresh_value()
     if value is not None:
-        return jsonify(dict(value))
+        return jsonify(_with_memory(value, qdir))
     if _summary_lock.acquire(blocking=False):
         try:
             value = fresh_value()
@@ -546,16 +635,16 @@ def api_summary():
                 value = recompute()
         finally:
             _summary_lock.release()
-        return jsonify(dict(value))
+        return jsonify(_with_memory(value, qdir))
     # Another poll is already recomputing: serve the last good payload for this project
     # (flagged stale) rather than stacking behind it; only a caller with nothing to serve waits.
     entry = _summary_state["entry"]
     if entry and entry[0] == key:
-        return jsonify({**entry[2], "stale": True})
+        return jsonify(_with_memory({**entry[2], "stale": True}, qdir))
     with _summary_lock:
         entry = _summary_state["entry"]
         value = entry[2] if entry and entry[0] == key else recompute()
-    return jsonify(dict(value))
+    return jsonify(_with_memory(value, qdir))
 
 
 @shared_misc_bp.route("/api/browse")

@@ -38,10 +38,31 @@ const MIN_NUM_CTX = 2048;
 // 65536 (~20.55 GB) is inside the budget by the same formula but only ~1.6% under it and
 // past the last measured anchor -- re-measure with the card idle and raise it only then.
 // The P40 lane's card is the same 24 GB, so it gets the same value.
-const PINNED_NUM_CTX = 49152;
+const DEFAULT_PINNED_NUM_CTX = 49152;
 
-// Kept so existing callers keep working: there is no longer a separate, larger tier.
-const EXTENDED_NUM_CTX = PINNED_NUM_CTX;
+// 2026-10-17 (grimm's RX 580, 8 GB): a lane whose card cannot hold the 24 GB cards' pinned context declares its own in the lanes registry
+// (src/lanes.js `numCtx` -> AGENT_MANAGER_LANE_NUM_CTX in THAT lane's env only). Still ONE stable value per lane process, so the "never vary
+// num_ctx between calls" rule above holds. Measured on qwen3-vl:8b / RX 580 / Vulkan with a q8 KV cache: 49152 -> 10.6 tok/s, 80% on the GPU;
+// 16384 -> 26.2 tok/s, 100% on the GPU (f16 KV: 8.0 tok/s at 49152). Ignored unless a whole number >= MIN_NUM_CTX.
+function laneNumCtx(env = process.env) {
+  const n = Number(env.AGENT_MANAGER_LANE_NUM_CTX);
+  return Number.isInteger(n) && n >= MIN_NUM_CTX ? n : null;
+}
+const PINNED_NUM_CTX = laneNumCtx() || DEFAULT_PINNED_NUM_CTX;
+
+// 2026-10-17 (grimm's RX 580): a lane can also declare num_batch (lanes registry `numBatch` -> AGENT_MANAGER_LANE_NUM_BATCH, that lane's env only). Measured on
+// qwen3-vl:8b / RX 580 / Vulkan / q8 KV / 4392-token prompt: the default batch processed the prompt at 26 tok/s (169 s before the first token); num_batch 1024
+// -> 178 tok/s (26 s), generation unchanged at 25 tok/s; 2048 kept the 178 tok/s but halved generation to 13 tok/s; 256 -> 34 tok/s. null = Ollama's default.
+function laneNumBatch(env = process.env) {
+  const n = Number(env.AGENT_MANAGER_LANE_NUM_BATCH);
+  return Number.isInteger(n) && n >= 32 && n <= 8192 ? n : null;
+}
+
+// OLLAMA_KV_CACHE_TYPE (e.g. a lower-precision KV cache dtype) is an additional VRAM
+// lever that is not yet enabled in this deployment. Do not raise NUM_CTX (PINNED_NUM_CTX
+// above) until a quality regression check has been run against the
+// resulting output on this model -- a larger context or a quantized KV cache that
+// degrades quality would only show up in the actual answers, not in the VRAM math here.
 
 // ollama-http.js documents a hard-won 5-minute ceiling (docs/pipeline-incident-2026-07-19.md):
 // a call legitimately needing longer than this is a signal to change the workload, not to
@@ -63,10 +84,10 @@ const HARD_TIMEOUT_CEILING_MS = 300_000;
 // connection closed before llama-server finished loading" in Ollama's own log means.
 // Once a lane hangs up early, Ollama frees the partial load and the model never
 // actually becomes resident, so the NEXT call needs another full cold load too -- a
-// livelock that never recovers on its own. Raised well past the worst contended
-// measurement above, with real margin, while staying under this file's existing
-// 240s/300s ceilings so nothing else here needs to change.
-const MIN_TIMEOUT_MS = 150_000; // floor, not a target -- was 45_000 ("even a 20-token ping can sit queued behind real contention on this single-GPU box well past 30s before generation even starts," confirmed live 2026-08-20), too short for a genuine cold model load as this same comment's 2026-08-26 update above found live.
+// livelock that never recovers on its own. Set to 2x the 90 s worst contended
+// measurement above (180 s), so the margin is explicit. It stays under this file's
+// existing 240s/300s ceilings, so nothing else here needs to change.
+const MIN_TIMEOUT_MS = 180_000; // floor, not a target -- was 45_000 ("even a 20-token ping can sit queued behind real contention on this single-GPU box well past 30s before generation even starts," confirmed live 2026-08-20), too short for a genuine cold model load as this same comment's 2026-08-26 update above found live.
 const DEFAULT_TIMEOUT_MS = 240_000; // fallback when throughput hasn't been measured yet -- this system's previous fixed value.
 
 // overheadMiB = VRAM Ollama is using beyond the model weights themselves (KV cache + prompt
@@ -161,7 +182,9 @@ module.exports = {
   SAFETY_MARGIN_FRACTION,
   MIN_NUM_CTX,
   PINNED_NUM_CTX,
-  EXTENDED_NUM_CTX,
+  DEFAULT_PINNED_NUM_CTX,
+  laneNumCtx,
+  laneNumBatch,
   HARD_TIMEOUT_CEILING_MS,
   MIN_TIMEOUT_MS,
   DEFAULT_TIMEOUT_MS,

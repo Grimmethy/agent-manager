@@ -18,6 +18,69 @@ const os = require('os');
 const path = require('path');
 const { estimateBudgetCeiling, estimateTimeToCap, currentWindowStartMs, parseResetTime } = require('./budget-monitor.js');
 
+// AC-102: the two-pointer estimateBudgetCeiling must match the original nested-scan version.
+// The original is kept below only as a reference oracle.
+const { usageTokenCount: ac102Usage } = require('./budget-monitor.js');
+const { test: ac102Test } = require('node:test');
+const ac102Assert = require('node:assert');
+function ac102Original(allEntries) {
+  const windowMs = 5 * 60 * 60 * 1000;
+  const samples = [];
+  for (const entry of allEntries) {
+    if (entry.error !== 'rate_limit' && entry.apiErrorStatus !== 429) continue;
+    const windowStart = entry._ts - windowMs;
+    const tokens = allEntries
+      .filter((e) => e._ts > windowStart && e._ts <= entry._ts)
+      .reduce((sum, e) => sum + ac102Usage(e.message?.usage), 0);
+    if (tokens > 0) samples.push({ at: new Date(entry._ts).toISOString(), tokens });
+  }
+  if (samples.length === 0) return { ceilingTokens: null, sampleCount: 0, samples: [] };
+  const ceilingTokens = Math.max(...samples.map((s) => s.tokens));
+  return { ceilingTokens, sampleCount: samples.length, samples };
+}
+const ac102H = 3600000;
+const ac102Base = Date.UTC(2026, 0, 1);
+function ac102Gen(n, seed) {
+  let s = seed;
+  const r = () => ((s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const e = { _ts: ac102Base + Math.floor(r() * 20 * ac102H), type: 'assistant',
+      message: { usage: { input_tokens: Math.floor(r() * 1000), output_tokens: Math.floor(r() * 500) } } };
+    if (r() < 0.05) e.error = 'rate_limit';
+    out.push(e);
+  }
+  return out;
+}
+ac102Test('AC-102 estimateBudgetCeiling matches the original on empty, boundary, shuffled and random inputs', () => {
+  ac102Assert.deepStrictEqual(estimateBudgetCeiling([]), ac102Original([]));
+  const boundary = [
+    { _ts: ac102Base, type: 'assistant', message: { usage: { input_tokens: 10 } } },
+    { _ts: ac102Base + 5 * ac102H, error: 'rate_limit', message: { usage: { input_tokens: 1 } } },
+    { _ts: ac102Base + 5 * ac102H + 1, type: 'assistant', message: { usage: { input_tokens: 7 } } },
+    { _ts: ac102Base + 10 * ac102H, error: 'rate_limit', apiErrorStatus: 429 },
+  ];
+  ac102Assert.deepStrictEqual(estimateBudgetCeiling(boundary), ac102Original(boundary));
+  for (let seed = 1; seed <= 300; seed++) {
+    const c = ac102Gen(60, seed);
+    ac102Assert.deepStrictEqual(estimateBudgetCeiling(c), ac102Original(c), 'seed ' + seed);
+  }
+  for (let seed = 1; seed <= 100; seed++) {
+    const c = ac102Gen(60, seed + 1000);
+    for (let i = c.length - 1; i > 0; i--) { const j = (seed * 31 + i * 17) % (i + 1); [c[i], c[j]] = [c[j], c[i]]; }
+    ac102Assert.deepStrictEqual(estimateBudgetCeiling(c), ac102Original(c), 'shuffled seed ' + seed);
+  }
+});
+ac102Test('AC-102 estimateBudgetCeiling handles 100 hits over 100,000 entries within a loose bound', () => {
+  const big = ac102Gen(100000, 99);
+  for (let i = 0; i < 100; i++) big[i * 997].error = 'rate_limit';
+  const t = Date.now();
+  const result = estimateBudgetCeiling(big);
+  const ms = Date.now() - t;
+  ac102Assert.ok(result.sampleCount > 0);
+  ac102Assert.ok(ms < 5000, 'took ' + ms + ' ms');
+});
+
 function usageEntry(ts, tokens) {
   return { _ts: ts, type: 'assistant', message: { usage: { input_tokens: tokens, output_tokens: 0 } } };
 }

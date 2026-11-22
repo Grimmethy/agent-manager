@@ -59,14 +59,16 @@ mkdir -p "$PIPELINE_DIR/queue/product-spec-requests"
 # model (product_spec_outline -> product_spec_section), instead of the blind single local
 # pass, which empty-blocks on a real codebase. (product_spec also auto-detects this, but
 # the explicit field is the intended signal.)
-cat > "$PIPELINE_DIR/task-domains.json" <<JSONEOF
-{
-  "default": {
-    "workDirKind": "$WORKDIR_KIND",
-    "successCheck": "git-branch-diff"
-  }
-}
-JSONEOF
+# Write the full set of standard domains, preserving the user's chosen workDirKind for
+# 'default' (adopted repos may be monorepos, hence 'workDirKind' is user-supplied).
+node -e '
+const { getStandardDomains } = require("'"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"'/src/task-domains-registry.js");
+const fs = require("fs");
+const domains = getStandardDomains();
+// Override the default domain workDirKind if the user supplied one.
+if (process.argv[1]) domains.default.workDirKind = process.argv[1];
+fs.writeFileSync(process.argv[2], JSON.stringify(domains, null, 2) + "\n");
+' "$WORKDIR_KIND" "$PIPELINE_DIR/task-domains.json"
 cat > "$PIPELINE_DIR/.env" <<EOF
 export AGENT_MANAGER_REPO_ROOT=$REPO_DIR
 export AGENT_MANAGER_PIPELINE_DIR=$PIPELINE_DIR

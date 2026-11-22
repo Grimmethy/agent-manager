@@ -13,6 +13,9 @@
 // happened to land on the same id" -- keeps ours at that slot and re-files theirs' version
 // as a new slot above the doc's current max, the same renumber-on-write rule
 // applyArchDiscoveryCandidates (apply-group-a.js) already uses for fresh appends.
+//
+// It also propagates DELETIONS (a block the ancestor had, theirs removed and ours left alone is dropped) -- see the DELETIONS note in
+// mergeCandidatesDoc. src/lib/prune-retracted-candidates.js repairs branches that already carry a block main retracted earlier.
 
 const HEADING_RE = /^#{1,6}\s*AC-(\d+)\b/;
 
@@ -22,22 +25,26 @@ function parseBlocks(text) {
   const preamble = HEADING_RE.test(parts[0].trimStart()) ? '' : parts[0];
   const blocks = new Map(); // id (number) -> block text (trimmed, heading included)
   const order = [];
+  const duplicates = []; // ids that appear more than once in this text (a Map would silently keep only the last)
   for (const part of parts) {
     const trimmed = part.trim();
     if (!trimmed) continue;
     const m = trimmed.match(HEADING_RE);
     if (!m) continue;
     const id = parseInt(m[1], 10);
+    if (blocks.has(id)) duplicates.push(id);
     blocks.set(id, trimmed);
     order.push(id);
   }
-  return { preamble, blocks, order };
+  return { preamble, blocks, order, duplicates };
 }
 
 /**
  * @returns {string|null} merged text, or null if the input doesn't look like a candidates
  *   doc at all (no AC-N headings anywhere) -- callers should treat null as "could not
- *   resolve structurally," and fall back to a real conflict rather than guessing.
+ *   resolve structurally," and fall back to a real conflict rather than guessing. Also
+ *   null when ours or theirs contains the same AC-N id more than once (a same-id duplicate
+ *   cannot be merged without silently dropping one candidate).
  */
 function mergeCandidatesDoc({ ancestorText, oursText, theirsText }) {
   const ancestor = parseBlocks(ancestorText);
@@ -45,6 +52,7 @@ function mergeCandidatesDoc({ ancestorText, oursText, theirsText }) {
   const theirs = parseBlocks(theirsText);
 
   if (ours.blocks.size === 0 && theirs.blocks.size === 0) return null;
+  if (ours.duplicates.length || theirs.duplicates.length) return null;
 
   let nextId = 1;
   for (const id of [...ours.blocks.keys(), ...theirs.blocks.keys(), ...ancestor.blocks.keys()]) {
@@ -86,8 +94,20 @@ function mergeCandidatesDoc({ ancestorText, oursText, theirsText }) {
     finalOrder.push(id);
   }
 
+  // DELETIONS (2026-10-07, TaxHarvest): everything above starts from `ours` and only walks `theirs`, so a block the ancestor had, theirs DELETED
+  // and ours never touched survived every merge. That is how a retraction landed on main (AC-262..265, AC-203) kept coming back on the rolling
+  // triage branch: the pipeline merges main into the branch with this driver, and the branch kept its copy of each retracted block. A block ours
+  // EDITED is kept (never silently drop content someone changed); one both sides deleted is already gone. An empty `theirs` is treated as "no
+  // deletion information" (a truncated or non-candidate file must not read as "everything was retracted").
+  if (theirs.blocks.size > 0) {
+    for (const id of ancestor.order) {
+      if (theirs.blocks.has(id) || !finalBlocks.has(id)) continue;
+      if (ours.blocks.get(id) === ancestor.blocks.get(id)) finalBlocks.delete(id);
+    }
+  }
+
   const seen = new Set();
-  const dedupedOrder = finalOrder.filter((id) => (seen.has(id) ? false : (seen.add(id), true)));
+  const dedupedOrder = finalOrder.filter((id) => finalBlocks.has(id) && (seen.has(id) ? false : (seen.add(id), true)));
   dedupedOrder.sort((a, b) => a - b);
 
   const preamble = ours.preamble || theirs.preamble || ancestor.preamble || '# Candidates\n';

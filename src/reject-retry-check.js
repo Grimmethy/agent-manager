@@ -30,11 +30,14 @@ const crypto = require('crypto');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
-const { classifyBlockedTask, findClassifier, hasInvalidPremise } = require('./blocked-task-classifiers.js');
+const { classifyBlockedTask, findClassifier, hasInvalidPremise, isInfraError } = require('./blocked-task-classifiers.js');
+const { writeJsonAtomicSync } = require('./atomic-write.js');
 const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { acquire, release, taskMoveLockKey } = require('./single-flight-lock.js');
 const { sharedInstancesDir } = require('./instances-dir.js');
+const { recordAvoidedLane, describeTopTierFailure } = require('./premium-rotation.js');
+const { writeSideFindingInbox } = require('./side-finding.js');
 
 // Task-move lock (2026-09-27): every requeue/escalation below used to be a plain,
 // unguarded write-then-unlink -- no atomic rename, no check for whether a file for this
@@ -56,7 +59,7 @@ function writeTaskAndUnlinkOld(instancesDir, task, destPath, srcPath) {
 }
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { isCandidateFulfillmentSource, isAdvisoryProseSource } = require('./lib/harness-search.js');
-const { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock } = require('./lib/reject-retry-check.js');
+const { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, stalePremiseGateNoLongerFires, externalDepGateNoLongerBlocks, splitTooFewStillRetryable, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock } = require('./lib/reject-retry-check.js');
 // 2026-09-16: registers this package's built-in sources (side effect of the require) --
 // deterministicReviewRecoveryCheck below looks a task's source up in this SAME registry
 // (getRegisteredSource), but this file itself never required task-sources.js, so a
@@ -73,6 +76,7 @@ require('./task-sources.js');
 try { ensureRegistered(); } catch { /* no live config (e.g. a unit test) -- fine, nothing to register */ }
 
 const MAX_LOCAL_REJECT_RETRIES = 2;
+const MAX_INFRA_SORT_ATTEMPTS = 10;
 
 // Fields wiped when a task is re-admitted with a CLEAN SLATE (not a blind redraft, which
 // keeps priorRejectionFeedback + increments localRejectCount). Kept deliberately in sync
@@ -155,6 +159,11 @@ function isAdhocTask(task) {
 // entry's sortAttempt -- so nextBrainDumpSortTask regenerates the sort under a fresh id
 // (…-aN) instead of the entry being stuck 'captured' forever behind this blocked record.
 // Mirrors stampDeepDiveExhausted's "advance the source's own cursor" role.
+// HUB0196 2/3: infra-attributed failures (isInfraError) do NOT consume the content
+// sort-attempt budget (entry.sortAttempt) -- they get their own tracked counter
+// (entry.infraSortAttemptCount) bounded by MAX_INFRA_SORT_ATTEMPTS. Once that counter
+// exceeds the cap the entry is marked infraSortExhausted and becomes ineligible for
+// further sort attempts regardless of its content sortAttempt value.
 function stampBrainDumpSortExhausted(task, brainDumpPath) {
   if (task.source !== 'brain_dump_sort') return;
   const entryId = task.promptContext && task.promptContext.brainDumpEntryId;
@@ -162,10 +171,82 @@ function stampBrainDumpSortExhausted(task, brainDumpPath) {
   try {
     const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
     const entry = Array.isArray(data.entries) && data.entries.find((e) => e && e.id === entryId);
-    if (entry) {
-      entry.sortAttempt = (entry.sortAttempt || 0) + 1;
-      fs.writeFileSync(brainDumpPath, JSON.stringify(data, null, 2));
+    if (!entry) return;
+
+    const ts = new Date().toISOString();
+    const blockedReason = task.blockedReason || '';
+    const endpoint = task.endpoint || null;
+    const sortAttemptBefore = entry.sortAttempt || 0;
+    if (!Array.isArray(data.sortBudgetEvents)) data.sortBudgetEvents = [];
+
+    if (isInfraError(task)) {
+      // Infra path: do NOT touch entry.sortAttempt.
+      if (!Array.isArray(entry.infraSortAttempts)) entry.infraSortAttempts = [];
+      entry.infraSortAttempts.push({ ts, endpoint, blockedReason, category: 'infra-error' });
+      entry.infraSortAttemptCount = (entry.infraSortAttemptCount || 0) + 1;
+      const capHit = entry.infraSortAttemptCount > MAX_INFRA_SORT_ATTEMPTS;
+      // Explicit boolean so the field is well-defined even on the non-cap-hit path
+      // (an infra-skip leaves it false, not undefined -- consumers can rely on
+      // entry.infraSortExhausted === true as the sole eligibility gate either way).
+      entry.infraSortExhausted = capHit;
+      const sortAttemptAfter = entry.sortAttempt || 0; // unchanged: before === after
+      data.sortBudgetEvents.push({
+        ts,
+        action: capHit ? 'infra-cap-hit' : 'infra-skip',
+        endpoint,
+        blockedReason,
+        entryId,
+        sortAttemptBefore,
+        sortAttemptAfter,
+        category: 'infra-error',
+      });
+    } else {
+      // Content path: increment sortAttempt exactly as before.
+      // Eligibility: only bump if the entry is still eligible (not already exhausted
+      // via content attempts or infra exhaustion).
+      if (sortAttemptBefore >= 3) {
+        // Already ineligible on content budget -- record the event but do not bump further.
+        data.sortBudgetEvents.push({
+          ts,
+          action: 'content-cap-hit',
+          endpoint,
+          blockedReason,
+          entryId,
+          sortAttemptBefore,
+          sortAttemptAfter: sortAttemptBefore,
+          category: 'content-error',
+        });
+        writeJsonAtomicSync(brainDumpPath, data);
+        return;
+      }
+      if (entry.infraSortExhausted === true) {
+        // Ineligible due to infra exhaustion -- no further content bumps.
+        data.sortBudgetEvents.push({
+          ts,
+          action: 'content-skip-infra-exhausted',
+          endpoint,
+          blockedReason,
+          entryId,
+          sortAttemptBefore,
+          sortAttemptAfter: sortAttemptBefore,
+          category: 'content-error',
+        });
+        writeJsonAtomicSync(brainDumpPath, data);
+        return;
+      }
+      entry.sortAttempt = sortAttemptBefore + 1;
+      data.sortBudgetEvents.push({
+        ts,
+        action: 'content-skip',
+        endpoint,
+        blockedReason,
+        entryId,
+        sortAttemptBefore,
+        sortAttemptAfter: entry.sortAttempt,
+        category: 'content-error',
+      });
     }
+    writeJsonAtomicSync(brainDumpPath, data);
   } catch (e) {
     console.warn('[reject-retry-check] brain-dump sortAttempt bump failed:', e.message);
   }
@@ -238,7 +319,7 @@ function buildExhaustedFulfillmentQuestion(task) {
 // usually already moot by the time they exhaust (a later window supersedes it), not
 // something a human needs to individually triage -- see this session's own manual
 // retirement of 24 exhausted pipeline_debrief tasks for exactly that reasoning.
-const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief']);
+const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief', 'capability_debrief']);
 
 function isReviewVerdictAdvisoryProseSource(source) {
   return isAdvisoryProseSource(source) && !REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED.has(source);
@@ -474,7 +555,7 @@ function buildFeedbackString(ctx) {
   }
 }
 
-function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, recordModelOutcome = defaultRecordModelOutcome }) {
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, repoRoot: repoRootOverride, lanes: lanesOverride = null, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
   // blockedDir is always <pipelineDir>/queue/blocked in every real caller -- this fallback
   // only matters for tests that don't bother passing pipelineDir explicitly (it was never
@@ -493,6 +574,8 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
     || (ghostRoot ? path.join(ghostRoot, 'queue', 'approved') : null);
   let recoveryConfig = {};
   try { recoveryConfig = getConfig(); } catch { /* no live config (e.g. a unit test) -- recovery check just no-ops */ }
+  // repoRoot: an explicit caller/test override wins over the live config (the stale-premise re-admission below checks files against it).
+  const sweepRepoRoot = repoRootOverride || recoveryConfig.repoRoot;
   const entries = discoverBlockedEntries({ blockedDir, adhocDir, derivedDir });
 
   if (entries.length === 0) return summary;
@@ -543,7 +626,12 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       // one) -- see invalidPremiseBeforeCheckExisted / hasInvalidPremise: it is either
       // re-admitted once or escalated by the classifier below, never left invisible.
       const invalidPremiseBlock = hasInvalidPremise(task);
-      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !implementDegenerateBlock && !critiqueDegenerateBlock && !invalidPremiseBlock) continue;
+      // A "sub-task premise may be stale" block whose gate no longer fires (it used to call a monorepo
+      // sub-root file missing) is recognized whatever its stage -- re-admitted once below.
+      const stalePremiseFalsePositive = stalePremiseGateNoLongerFires(task, { repoRoot: sweepRepoRoot });
+      const externalDepFalsePositive = externalDepGateNoLongerBlocks(task);
+      const splitTooFewReadmit = splitTooFewStillRetryable(task);
+      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !implementDegenerateBlock && !critiqueDegenerateBlock && !invalidPremiseBlock && !stalePremiseFalsePositive && !externalDepFalsePositive && !splitTooFewReadmit) continue;
 
       // A continuation (agentic-draft-common.js: the model ran out of turns mid-
       // implementation, no real design question) is forward progress, not a failed
@@ -610,6 +698,62 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         continue;
       }
 
+      // Re-admit a task the (now-fixed) stale-premise gate wrongly blocked: it cited a file that
+      // exists under a monorepo sub-root and the gate called it missing. The re-check above already
+      // proved the gate no longer fires, so no blind retry is involved -- clean slate, exactly once
+      // (the stalePremiseReadmitted stamp is deliberately NOT in READMIT_CLEAN_SLATE_FIELDS, so a
+      // later clean-slate pass keeps the bound).
+      if (stalePremiseFalsePositive) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.stalePremiseReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior block was a stale-premise verdict from decompose-premise-check that called a cited file missing (it exists under a monorepo sub-root; resolved by path suffix since) -- re-admitted with a clean slate, exactly once");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'stale-premise-false-positive-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // Re-admit a task the (now-fixed) external-dependency gate wrongly blocked: it matched a
+      // credential/network word in prose, a code span, or the plan echo of an ordinary code edit.
+      // The re-check above proved the gate no longer blocks, so no blind retry is involved -- clean
+      // slate, exactly once (externalDepReadmitted is deliberately NOT in READMIT_CLEAN_SLATE_FIELDS).
+      if (externalDepFalsePositive) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.externalDepReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior block was the external-dependency gate matching credential/network vocabulary in prose, a code span, or the plan echo (code spans and the plan are no longer scanned, and soft markers only advise by default) -- re-admitted with a clean slate, exactly once");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'external-dep-false-positive-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // Re-admit a candidate whose split was rejected for having fewer than 2 usable sub-candidates before the in-draft retry existed
+      // (class C): clean slate, exactly once, so the draft's one corrective retry gets to run on it.
+      if (splitTooFewReadmit) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.splitTooFewReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          'reject-retry-check: prior block was a candidate split with fewer than 2 usable sub-candidates; the draft now retries that once with the one-file-per-piece rule spelled out -- re-admitted with a clean slate, exactly once');
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'split-too-few-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
       // 2026-09-06: candidate-premise-check.js's premise gate can reject a task whose
       // premise the check itself later invalidated -- the block text carries the gate's
       // verdict ("Invalid premise:"), not a real review signal, so a blind retry would
@@ -654,6 +798,63 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
           summary.exhausted++;
           continue;
         }
+      }
+
+      // 2026-11-09 (task R12, confirmed live: a decompose parent with blockedStage
+      // 'review' sat in queue/blocked/ for 5 minutes after review rejected the plan,
+      // then was replaced by hand). The entry gate (line ~670) lets it in because
+      // isReviewRejection() returns true for blockedStage:'review', but classifyBlockedTask
+      // then classifies it as non-retryable (e.g. 'unreliable-grounding' because the
+      // sub-task proposals cite files that don't exist yet — they're PROPOSED, not real)
+      // and escalates it to needs-clarification instead of requeueing. A decompose plan
+      // rejection is genuinely a review rejection: the reviewer said "no" to the split,
+      // the next pass needs to know why (priorRejectionFeedback), and the parent should
+      // redraft. Treat it like any other genuine review rejection: same localRejectCount
+      // cap, same feedback path, same pending/ destination.
+      if (task.adhocResolution === 'decompose' && task.blockedStage === 'review' && Array.isArray(task.subTaskProposals) && task.subTaskProposals.length) {
+        // Bypass classifyBlockedTask for this shape -- it's a review rejection, not a
+        // fault-side classification. Carry the rejection reasons into priorRejectionFeedback
+        // so the next plan pass knows what to avoid.
+        const retryCount = Number(task.localRejectCount) || 0;
+        if (retryCount >= MAX_LOCAL_REJECT_RETRIES) {
+          // Exhaustion policy: same as any other genuine review rejection that burns
+          // its blind-redraft budget.
+          if (needsClarificationDir) {
+            const alreadyEscalated = alreadyEscalatedSinceLastReadmission(task);
+            if (!alreadyEscalated) {
+              task.needsClarification = {
+                reason: 'design-decision',
+                openQuestions: `The decompose plan was rejected by review ${MAX_LOCAL_REJECT_RETRIES + 1} times: ${[...new Set([...(Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : []), task.blockedReason].filter(Boolean))].join('; ')}. Decide whether to redraft, narrow the scope, or split differently.`,
+              };
+              appendHistoryEvent(task, 'needs-clarification', 'decompose parent exhausted retries -- escalated to human');
+              if (ghostRoot) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'reject-retry-check:decompose-exhausted', pipelineDir: ghostRoot });
+              fs.mkdirSync(needsClarificationDir, { recursive: true });
+              writeTaskAndUnlinkOld(instancesDir, task, path.join(needsClarificationDir, name), filePath);
+              summary.exhausted++;
+              continue;
+            }
+          }
+        }
+        const rejectionReasons = [];
+        if (task.blockedReason) rejectionReasons.push(String(task.blockedReason));
+        if (Array.isArray(task.priorRejectionFeedback)) {
+          for (const r of task.priorRejectionFeedback) {
+            if (r && !rejectionReasons.includes(r)) rejectionReasons.push(r);
+          }
+        }
+        if (rejectionReasons.length) {
+          task.priorRejectionFeedback = rejectionReasons;
+        }
+        task.localRejectCount = retryCount + 1;
+        task.blockedStage = 'queue';
+        task.blockedReason = '';
+        appendHistoryEvent(task, 'requeued', `decompose plan rejected (attempt ${task.localRejectCount}/${MAX_LOCAL_REJECT_RETRIES}) -- requeued for redraft`);
+        const destDir = pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
       }
 
       // Unified fault-side escalation (src/blocked-task-classifiers.js), replacing what
@@ -869,6 +1070,22 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         delete task.planResponse;
         delete task.implementResponse;
         appendHistoryEvent(task, 'requeued', 'plan-pass degenerate -- cleared stale plan state for a fresh plan pass');
+        // Steer the task away from the lane it degenerated on while another lane exists (premium-rotation.js): the P40 lane
+        // kept re-claiming the same task and blocking it on a truncated plan, starving every task behind it.
+        // Tier rule (premium-rotation.js recordAvoidedLane): only a lane with a bigger lane above it is recorded. A degenerate plan on the BIGGEST lane records
+        // nothing (a block there would leave the task nowhere to go -- the stranded extend-the-doc premium task, 2026-10-17) and files a systemic side finding.
+        let lanes = [];
+        try { lanes = lanesOverride || require('./lanes.js').getLanes(); } catch (_) { lanes = []; }
+        const avoided = recordAvoidedLane(task, lanes.length, process.env, lanes);
+        if (avoided) {
+          appendHistoryEvent(task, 'lane-avoided', `plan degenerated on ${avoided}; other lanes get first claim`);
+        } else {
+          const finding = describeTopTierFailure(task, lanes);
+          if (finding) {
+            writeSideFindingInbox(finding, { source: 'lane_avoidance', taskId: task.id, stage: 'plan', pipelineDir });
+            appendHistoryEvent(task, 'advisory', `plan degenerated on the biggest lane; no lane avoidance recorded (nowhere bigger to go) -- filed a systemic side finding instead: ${finding.title}`);
+          }
+        }
       } else if (implementDegenerateBlock) {
         // The plan completed and is kept; only the unusable (empty / truncated) implement output is dropped.
         delete task.implementResponse;
@@ -901,6 +1118,19 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
   return summary;
 }
 
+// True when any prior draft attempt on this task was blocked by a degenerate critique call.
+// Primary signal: task.draftAttempts[i].critique.outcome === 'critique-degenerate' (written by recordCritique in
+// src/draft-attempt-record.js). Fallback: the attempt's blockedReason, which finalize copies from the draft result and
+// which implement-critique.js sets to 'Critique call degenerate (...)' when the critique call came back degenerate.
+function hasPriorCritiqueDegenerate(task) {
+  if (!task || typeof task !== 'object' || !Array.isArray(task.draftAttempts)) return false;
+  return task.draftAttempts.some((attempt) => {
+    if (!attempt || typeof attempt !== 'object') return false;
+    if (attempt.critique && attempt.critique.outcome === 'critique-degenerate') return true;
+    return typeof attempt.blockedReason === 'string' && attempt.blockedReason.startsWith('Critique call degenerate');
+  });
+}
+
 function main() {
   const { pipelineDir, deepDiveCoveragePath, brainDumpPath } = getConfig();
   const queueDir = path.join(pipelineDir, 'queue');
@@ -914,7 +1144,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { selectFeedbackBranch, buildFeedbackString, isCritiqueDegenerateBlock, rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
+module.exports = { hasPriorCritiqueDegenerate, selectFeedbackBranch, buildFeedbackString, isCritiqueDegenerateBlock, rejectRetryCheck, stampBrainDumpSortExhausted, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
 
 if (require.main === module) {
   main();

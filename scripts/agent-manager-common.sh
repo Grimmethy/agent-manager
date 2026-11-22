@@ -64,6 +64,27 @@ get_model_override() {
   ' "$settings_path" "$instance_id"
 }
 
+# The model this process was LAUNCHED with, remembered across ticks and inherited by the --once children a daemon spawns (they see the daemon's
+# exported LOCAL_MODEL, which may by then be a dashboard override, so LOCAL_MODEL itself cannot be the base). Set once, from whatever LOCAL_MODEL is at
+# the first call; `-` (not `:-`) keeps a value that is set but empty. 2026-10-27: clearing a worker-model override left the lane on the overridden
+# model because nothing remembered the launch value to go back to (a failed ornith:35b trial kept requesting a model that took ~8 min to load).
+capture_base_local_model() {
+  export AGENT_MANAGER_BASE_LOCAL_MODEL="${AGENT_MANAGER_BASE_LOCAL_MODEL-${LOCAL_MODEL:-}}"
+}
+
+# The model this instance should use THIS tick: its dashboard override when one is set (a legacy "ollama:" prefix is tolerated), else the launch-time
+# model. A "claude:" override is a Claude lane choice, not a local model, so the local model stays the launch one. Prints the name (nothing when both
+# are empty); callers assign it to LOCAL_MODEL so that REMOVING an override puts the lane back instead of leaving the last override in place.
+effective_local_model() {
+  local override
+  override="$(get_model_override "$1")"
+  case "$override" in
+    ollama:*) printf '%s' "${override#ollama:}" ;;
+    claude:*|'') printf '%s' "${AGENT_MANAGER_BASE_LOCAL_MODEL-}" ;;
+    *) printf '%s' "$override" ;;
+  esac
+}
+
 # Manual "pause Claude" kill switch (2026-08-25 -- see src/claude-pause.js's own header
 # for the full rationale: a checkbox in the Workers tab, distinct from budget-monitor.js's
 # real rate-limit detection, so a human can proactively stop Claude spend before actually
@@ -81,6 +102,33 @@ get_claude_paused() {
   ' "$settings_path"
 }
 
+# gpu_broker_url -> prints the base URL of the service that answers POST /api/gpu/yield (no trailing slash). First non-empty wins:
+# AGENT_MANAGER_GPU_BROKER_URL, AGENT_MANAGER_PROMPTFORGE_URL, PROMPTFORGE_URL, then http://localhost:7430 (PromptForge's own default).
+# Shell twin of gpuBrokerUrl() in src/gpu-guard.js; scripts/gpu-broker-url.test.js pins that the two agree. Used by scripts/launch.sh.
+gpu_broker_url() {
+  local url="${AGENT_MANAGER_GPU_BROKER_URL:-${AGENT_MANAGER_PROMPTFORGE_URL:-${PROMPTFORGE_URL:-http://localhost:7430}}}"
+  printf '%s\n' "${url%/}"
+}
+
+# ollama_endpoint_reachable [endpoint_url] -> exit 0 if the Ollama endpoint answers HTTP at all within a few seconds (any status code), 1 if the
+# connection is refused, times out or the host is unreachable. A lane worker asks this once per tick (local-worker.sh) BEFORE it claims or resumes
+# anything: with the endpoint down every draft fails the same way, burns the task's retry rounds and parks it in blocked/ (2026-10-23: grimm hard-reset,
+# its Ollama stayed down for 12 h, 540 failed ticks, six tasks parked). Seconds: AGENT_MANAGER_ENDPOINT_PROBE_TIMEOUT_S (default 3).
+# An endpoint that answers is also asked about its token budget (src/gateway-budget.js, the cloud-providers gateway's /meter): exit 1 when that budget is
+# spent, so a cloud lane waits for the reset instead of failing a draft per tick (455 of them in the lane's log). It fails open: no /meter, no node, any
+# other answer is "reachable". AGENT_MANAGER_BUDGET_PROBE=off turns that part off.
+ollama_endpoint_reachable() {
+  local url="${1:-http://localhost:11434}" code
+  code="$(curl -s -m "${AGENT_MANAGER_ENDPOINT_PROBE_TIMEOUT_S:-3}" -o /dev/null -w '%{http_code}' "${url%/}/api/version" 2>/dev/null)" || true
+  [[ -n "$code" && "$code" != "000" ]] || return 1
+  [[ "${AGENT_MANAGER_BUDGET_PROBE:-on}" != "off" ]] || return 0
+  local budget_js budget_rc=0
+  budget_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/gateway-budget.js"
+  [[ -f "$budget_js" ]] || return 0
+  node "$budget_js" check "$url" >/dev/null 2>&1 || budget_rc=$?
+  [[ "$budget_rc" -ne 3 ]]
+}
+
 # ComfyUI GPU lease (2026-08-30, Grimmethy: "If I run a generation, prompt forge should
 # set up the comfui if it's down" + "make sure the eviction only happens if there isn't
 # enough space to run both" + "It needs to go both ways"). PromptForge writes this file
@@ -94,10 +142,93 @@ get_claude_paused() {
 # stuck/runaway generation can never starve this pipeline indefinitely. Fails open --
 # any parse error / missing file -> not held.
 #
-# comfyui_lease_held -> exit 0 if held, 1 otherwise.
+# comfyui_lease_held [endpoint_url] -> exit 0 if held, 1 otherwise.
+#
+# Endpoint-scoped leases (2026-10-18): a lease may carry an `endpoints` array of Ollama URLs (a plugin reserving ONE card, e.g. a KaggleForge eval on the
+# P40). Given an endpoint_url, a scoped lease counts as held only when it lists that endpoint; an unscoped lease (no `endpoints`, PromptForge's) is held
+# for every endpoint. Called with no argument it keeps the old meaning (any fresh lease = held). The rule lives once, in src/gpu-guard.js leaseHeldFor.
+# worker_switched_off <instance_id> -> exit 0 when the operator switched this worker off (Workers tab toggle; src/worker-switch.js, marker files in a global state
+# directory), 1 otherwise. The rule lives once, in worker-switch.js, which the dashboard also uses. Any failure of node counts as NOT switched off: a broken
+# switch must never stall the pipeline.
+worker_switched_off() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || return 1
+  local switch_js
+  switch_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/worker-switch.js"
+  [[ -f "$switch_js" ]] || return 1
+  node "$switch_js" is-disabled "$id" 2>/dev/null
+}
+
+# worker_switch_message <instance_id> -> prints WHY the worker is off: the node/global pause marker's own reason and start time, or the Workers tab text for a per-worker
+# marker (src/worker-switch-message.js). Any failure prints the Workers tab text, so the log line is never empty.
+worker_switch_message() {
+  local id="${1:-}" msg_js msg=""
+  msg_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/worker-switch-message.js"
+  [[ -f "$msg_js" ]] && msg="$(node "$msg_js" "$id" 2>/dev/null)"
+  [[ -n "$msg" ]] || msg='switched off by the operator (Workers tab) -- claiming nothing until it is switched back on.'
+  printf '%s' "$msg"
+}
+
+# cloud_take_review <instance_id> -> exit 0 when this cloud worker just reviewed one waiting item (the caller then ends the tick), 1 when it did not and should go on to
+# draft. Owner rule (cloud-agent-pool): cloud agents review before they draft, and when every waiting review is already claimed the agent takes a draft. Only a worker-cloud /
+# worker-cloudN instance reviews, and not when its lane says reviews:false (LANE_RULES_CLOUD_REVIEWS, kept fresh by reload_lane_rules; unset counts as true). No spawn at all
+# when queue/review/ holds no .json file; otherwise `node src/review-unclaimed.js` asks whether some item has no live claim. If one does, run ONE review as
+# `review-runner.sh reviewer-<gpu> --once` under this worker's own env (OLLAMA_URL = the lane's gateway, LOCAL_MODEL = its model): --once reviews one item and exits 10 when it
+# did, 0 when it found nothing; the runner's per-item claim already keeps two workers off one item. AGENT_MANAGER_CLOUD_REVIEW_RUNNER overrides the runner path (tests).
+# No timer or loop here: the caller's tick is the trigger.
+cloud_take_review() {
+  local id="${1:-}"
+  [[ "$id" =~ ^worker-cloud[0-9]*$ ]] || return 1
+  [[ "${LANE_RULES_CLOUD_REVIEWS:-true}" != "false" ]] || return 1
+  compgen -G "${QUEUE_DIR:-${PIPELINE_DIR:-}/queue}/review/*.json" >/dev/null || return 1
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  node "${here}/../src/review-unclaimed.js" "${PIPELINE_DIR:-}" "${INSTANCES_DIR:-}" >/dev/null 2>&1 || return 1
+  local runner="${AGENT_MANAGER_CLOUD_REVIEW_RUNNER:-${here}/review-runner.sh}"
+  write_heartbeat_file "$id" "working" "${HEARTBEAT_MODEL:-}" "" "review" "${STARTED_AT:-}"
+  local rc=0
+  bash "$runner" "reviewer-${id#worker-}" --once || rc=$?
+  [[ $rc -eq 10 ]]
+}
+
+# cloud_dial_off <instance_id> -> exit 0 when the cloud-agent dial (src/cloud-dial.js, cloud-dial.json) turns this cloud lane off, 1 otherwise. Only a worker-cloud /
+# worker-cloudN instance is ever asked; every other worker returns 1 at once. With no dial file (today's state) it returns 1 without spawning node. With a file it asks
+# `node src/cloud-dial.js is-off <id>` only when the dial file or lanes.json is newer than a per-instance stamp, and otherwise reuses the last answer (CLOUD_DIAL_LAST), so
+# a steady dial costs no spawn per tick. Any node failure counts as NOT off (a broken dial must never stall the swarm). No timer or loop: the caller's tick is the trigger.
+cloud_dial_off() {
+  local id="${1:-}"
+  [[ "$id" =~ ^worker-cloud[0-9]*$ ]] || return 1
+  local here dial lanes stamp
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  dial="${AGENT_MANAGER_CLOUD_DIAL_PATH:-${HOME}/.local/state/agent-manager/cloud-dial.json}"
+  lanes="${AGENT_MANAGER_LANES_PATH:-${here}/../lanes.json}"
+  stamp="${CLOUD_DIAL_STAMP:-${TEMP_DIR:-/tmp}/cloud-dial-${id}.stamp}"
+  if [[ ! -f "$dial" ]]; then CLOUD_DIAL_LAST=""; return 1; fi
+  if [[ -n "${CLOUD_DIAL_LAST:-}" && ! "$dial" -nt "$stamp" && ! "$lanes" -nt "$stamp" ]]; then
+    [[ "$CLOUD_DIAL_LAST" == "off" ]]; return
+  fi
+  touch "$stamp" 2>/dev/null || true
+  if node "${here}/../src/cloud-dial.js" is-off "$id" >/dev/null 2>&1; then CLOUD_DIAL_LAST="off"; return 0; fi
+  CLOUD_DIAL_LAST="on"; return 1
+}
+
 comfyui_lease_held() {
+  local endpoint="${1:-}"
   local lease_path="${AGENT_MANAGER_COMFY_LEASE_PATH:-${HOME}/.local/state/agent-manager/comfyui-lease.json}"
   [[ -f "$lease_path" ]] || return 1
+  if [[ -n "$endpoint" ]]; then
+    local guard_js
+    guard_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/gpu-guard.js"
+    if [[ -f "$guard_js" ]]; then
+      node -e '
+        try {
+          const g = require(process.argv[1]);
+          process.exit(g.leaseHeldFor(process.argv[2], process.argv[3]) ? 0 : 1);
+        } catch (e) { process.exit(1); }
+      ' "$guard_js" "$endpoint" "$lease_path"
+      return $?
+    fi
+  fi
   local ttl="${AGENT_MANAGER_COMFY_LEASE_TTL_S:-90}"
   local max_s="${AGENT_MANAGER_COMFY_LEASE_MAX_S:-900}"
   local verdict
@@ -117,6 +248,131 @@ comfyui_lease_held() {
   [[ "$verdict" == "held" ]]
 }
 
+# A lane yielding to a GPU session (a Forge job, a tuning session) says so in its heartbeat instead of looking idle or stuck, and warms the model
+# up again when the session ends. The lease being held is the pause (comfyui_lease_held above, one tick at a time); these two helpers add the
+# visible state and the resume. The session evicted the pipeline's model from the card, so the first call after it would pay a full cold load
+# (ornith:35b measured 350-490 s from the HDD) against a 240-300 s call timeout and be counted as a failure. Warming first, with a long timeout
+# and a heartbeat every few seconds, takes that cost where it cannot fail a task. `warming` and `paused` are not `idle`, so lane-health.js (which
+# probes only idle lanes) leaves the lane alone during both.
+#   lane_note_gpu_pause <instance_id> <model> <started_at>   call in the yield branch
+#   lane_warm_after_pause <instance_id> <model> <started_at> call once the lease is clear; a no-op unless this process was paused
+lane_note_gpu_pause() {
+  LANE_WAS_PAUSED=true
+  write_heartbeat_file "$1" "paused" "${2:-}" "" "gpu-session" "${3:-}"
+}
+
+lane_warm_after_pause() {
+  [[ "${LANE_WAS_PAUSED:-false}" == "true" ]] || return 0
+  LANE_WAS_PAUSED=false
+  local id="$1" model="${2:-}" started_at="${3:-}"
+  [[ -n "$model" ]] || return 0
+  local timeout_s="${AGENT_MANAGER_WARMUP_TIMEOUT_S:-900}" beat_s="${AGENT_MANAGER_WARMUP_BEAT_S:-20}"
+  local url="${OLLAMA_URL:-http://localhost:11434}"
+  local capacity_js
+  capacity_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/gpu-capacity.js"
+  local payload
+  payload="$(node -e '
+    const { PINNED_NUM_CTX } = require(process.argv[2]);
+    const ctx = Number(process.env.AGENT_MANAGER_LANE_NUM_CTX) || PINNED_NUM_CTX;
+    console.log(JSON.stringify({ model: process.argv[1], prompt: "hi", stream: false, keep_alive: -1, options: { num_ctx: ctx } }));
+  ' "$model" "$capacity_js" 2>/dev/null)" || payload=""
+  [[ -n "$payload" ]] || return 0
+  printf '[%s] GPU session over -- warming %s before claiming anything (up to %ss)\n' "$id" "$model" "$timeout_s" >&2
+  write_heartbeat_file "$id" "warming" "$model" "" "model-warmup" "$started_at"
+  curl -s -m "$timeout_s" "${url}/api/generate" -d "$payload" -o /dev/null &
+  local curl_pid=$! waited=0
+  while kill -0 "$curl_pid" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+    if (( waited % beat_s == 0 )); then write_heartbeat_file "$id" "warming" "$model" "" "model-warmup" "$started_at"; fi
+  done
+  wait "$curl_pid" 2>/dev/null || true
+  printf '[%s] warm-up finished after %ss\n' "$id" "$waited" >&2
+  return 0
+}
+
+
+# Host-RAM headroom (2026-10-12 freeze: RAM + all swap exhausted by ComfyUI + the P40 VM +
+# Ollama's runner, kernel thrashed until power-cycled; 2026-11-01: the same shape, found by disk stall rather than
+# by MemAvailable). Primary signal since 2026-11-02: the gpu-broker's classifier writes ok|tight|critical to
+# /dev/shm/agent-manager-mem-pressure.json on every kernel pressure event (and on its slow reconcile), so a lane reads one tiny file here
+# instead of launching `node mem-guard.js` on every tick. Fallback, exactly as before: when the marker is missing, unreadable, malformed or
+# older than AGENT_MANAGER_MEM_MARKER_MAX_AGE_S (default 330 s = the broker's 300 s reconcile + slack; the broker rewrites it at least that
+# often, so 120 s would make a healthy idle marker look stale), run mem-guard.js (MemAvailable / SwapFree, asks ComfyUI to unload, exit 3
+# only when pressure remains). AGENT_MANAGER_MEM_MARKER=off ignores the marker. Any other outcome fails open.
+# mem_marker_state -> prints ok|tight|critical and returns 0 when the marker is fresh and valid, returns 1 otherwise.
+mem_marker_state() {
+  [[ "${AGENT_MANAGER_MEM_MARKER:-on}" == "off" ]] && return 1
+  local f="${AGENT_MANAGER_MEM_PRESSURE_MARKER:-/dev/shm/agent-manager-mem-pressure.json}"
+  local max="${AGENT_MANAGER_MEM_MARKER_MAX_AGE_S:-330}"
+  [[ "$max" =~ ^[0-9]+$ ]] || max=330
+  local mtime now age state
+  mtime="$(stat -c %Y "$f" 2>/dev/null)" || return 1
+  now="${AGENT_MANAGER_MEM_MARKER_NOW:-$(date +%s)}"      # the override is a test seam: it fixes "now" so the age boundary can be tested exactly
+  age=$(( now - mtime ))
+  (( age >= 0 && age <= max )) || return 1
+  state="$(sed -n 's/.*"state": *"\(ok\|tight\|critical\)".*/\1/p' "$f" 2>/dev/null | head -n 1)"
+  [[ -n "$state" ]] || return 1
+  printf '%s\n' "$state"
+}
+
+# sweep_gate_skips <project <pipelineDir> | global-redo> -> exit 0 only when src/sweep-gate.js answers exactly `skip` (nothing the sweep reads has changed). Any other answer, a crash or a
+# missing script means run: the gate fails open, exactly as before it existed (ADR-0024).
+sweep_gate_skips() {
+  local answer
+  answer="$(node "${PACKAGE_SRC_DIR}/sweep-gate.js" "$@" 2>/dev/null)" || return 1
+  [[ "$answer" == "skip" ]]
+}
+
+# mem_marker_num <key> -> prints a number from the marker's "numbers" block, or nothing when absent or not numeric (same file, freshness and spacing rules as mem_marker_state).
+mem_marker_num() {
+  local f="${AGENT_MANAGER_MEM_PRESSURE_MARKER:-/dev/shm/agent-manager-mem-pressure.json}"
+  sed -n "s/.*\"$1\": *\(-\?[0-9][0-9.]*\).*/\1/p" "$f" 2>/dev/null | head -n 1
+}
+
+# mem_tight_stalls -> exit 0 when a TIGHT marker shows real trouble and the lane should still yield; exit 1 when it is tight only on paper (swap nearly
+# full with plenty of RAM and no stall, observed 2026-11-10: every lane idle for hours with 5.4 GB available). Yield when memory stall some >=
+# AGENT_MANAGER_TIGHT_YIELD_MEM_SOME (5), io stall some >= AGENT_MANAGER_TIGHT_YIELD_IO_SOME (20), io stall full >= AGENT_MANAGER_TIGHT_YIELD_IO_FULL (5)
+# or available RAM < AGENT_MANAGER_TIGHT_YIELD_AVAILABLE_MB (2048). A number that is missing from the marker counts as stall (fail closed to the old behaviour).
+mem_tight_stalls() {
+  local key lim val
+  for key in mem_some io_some io_full available_mb; do
+    val="$(mem_marker_num "$key")"
+    [[ -n "$val" ]] || return 0
+    case "$key" in
+      mem_some) lim="${AGENT_MANAGER_TIGHT_YIELD_MEM_SOME:-5}" ;;
+      io_some) lim="${AGENT_MANAGER_TIGHT_YIELD_IO_SOME:-20}" ;;
+      io_full) lim="${AGENT_MANAGER_TIGHT_YIELD_IO_FULL:-5}" ;;
+      available_mb) lim="${AGENT_MANAGER_TIGHT_YIELD_AVAILABLE_MB:-2048}" ;;
+    esac
+    [[ "$lim" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+    if [[ "$key" == available_mb ]]; then
+      awk -v a="$val" -v b="$lim" 'BEGIN{exit !(a+0 < b+0)}' && return 0
+    else
+      awk -v a="$val" -v b="$lim" 'BEGIN{exit !(a+0 >= b+0)}' && return 0
+    fi
+  done
+  return 1
+}
+
+# mem_pressure_high -> exit 0 if the lane should yield this tick, 1 otherwise. Critical always yields; tight yields only while mem_tight_stalls says so.
+# The yield line carries the marker's reason and numbers, so a swap-only block is obvious from the worker log.
+mem_pressure_high() {
+  local state reason
+  if state="$(mem_marker_state)"; then
+    case "$state" in
+      critical|tight)
+        if [[ "$state" == tight ]] && ! mem_tight_stalls; then return 1; fi
+        reason="$(sed -n 's/.*"reason": *"\([^"]*\)".*/\1/p' "${AGENT_MANAGER_MEM_PRESSURE_MARKER:-/dev/shm/agent-manager-mem-pressure.json}" 2>/dev/null | head -n 1)"
+        printf '[common] host memory pressure %s (broker marker): %s; avail %s MB, mem some %s%%, io some %s%%, io full %s%%\n' "$state" "${reason:-no reason}" \
+          "$(mem_marker_num available_mb)" "$(mem_marker_num mem_some)" "$(mem_marker_num io_some)" "$(mem_marker_num io_full)" >>"${LOG_FILE:-/dev/null}" 2>&1
+        return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  node "${PACKAGE_SRC_DIR}/mem-guard.js" >>"${LOG_FILE:-/dev/null}" 2>&1
+  [[ $? -eq 3 ]]
+}
 
 # Pipeline-wide single-flight mutex (2026-08-19, Grimmethy: "it's still running two jobs
 # at once. We really need it to do one at a time" -- reported AFTER should_yield_for_
@@ -176,6 +432,7 @@ acquire_single_flight_lock() {
   # that identity is the entire mechanism; a bash `sed` step that drifted from the JS
   # regex even slightly would silently recreate this exact bug.
   local key="${1:-}"
+  local skip="${2:-}"
   local lockfile queue_dir
   if [[ -n "$key" ]]; then
     local safe_key
@@ -194,8 +451,8 @@ acquire_single_flight_lock() {
   # yield the GPU until the newest marker's mtime goes stale (>15s) or it is removed. Was a
   # flat 8s wall -- far too short for a multi-turn chat turn (2026-09-02). AGENT_MANAGER_
   # PRIORITY_HOLDER (set on the chat turn's own node child) skips this entirely.
-  if [[ -z "${AGENT_MANAGER_PRIORITY_HOLDER:-}" ]]; then
-    local waited=0 fresh_secs=15 max_wait="${DISCUSS_PRIORITY_MAX_WAIT_SEC:-120}"
+  if [[ -z "${AGENT_MANAGER_PRIORITY_HOLDER:-}" && -z "$skip" ]]; then
+    local waited=0 fresh_secs=15 max_wait="${DISCUSS_PRIORITY_MAX_WAIT_SEC:-900}"
     while (( waited < max_wait )); do
       local newest_age=99999 now_s f mt
       now_s="$(date +%s)"
@@ -414,7 +671,7 @@ write_heartbeat_file() {
       lastHeartbeat: now, stateSince,
     };
     if (startedAt) hb.startedAt = startedAt;
-    // Borrowed-project label (docs/idle-pool-borrowing.md): set only while this lane runs a task of another suite project.
+    // Borrowed-project label (docs/design-notes/idle-pool-borrowing.md): set only while this lane runs a task of another suite project.
     if (process.env.AGENT_MANAGER_BORROWING_FROM) hb.project = process.env.AGENT_MANAGER_BORROWING_FROM;
     fs.writeFileSync(hbPath, JSON.stringify(hb, null, 2));
   ' "$hb_path" "$instance_id" "$status" "$model" "$task_id" "$pass" "$started_at" "${AGENT_MANAGER_DAEMON_PID:-$$}"
@@ -535,5 +792,47 @@ check_instance_liveness() {
       "$instance_id" "$instance_id" "$other_pid" "$hb_path" >&2
     return 1
   fi
+  return 0
+}
+
+# reload_lane_rules [instance_id] -> re-reads this lane's taskClasses and reviewer daemon from src/lanes.js --env (one node spawn), so a lanes.json
+# edit reaches a running worker without a restart. Gated on a bash -nt test: node runs only when lanes.json is newer than LANE_RULES_STAMP, so an
+# unchanged registry costs no spawn. Sets LANE_RULES_TASK_CLASSES, LANE_RULES_REVIEWS, LANE_RULES_PROJECTS, LANE_RULES_RAISED_FROM_PREFIX
+# and (cloud lanes only) LANE_RULES_CLOUD_REVIEWS. A failed call or missing keys keeps the last good values.
+# The stamp is touched on every path inside the gate, so a failing call is not retried until lanes.json changes again. Logs one line only when a value
+# changes. No timer or loop here: the caller's tick is the trigger.
+reload_lane_rules() {
+  local id="${1:-${AGENT_MANAGER_INSTANCE_ID:-}}"
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local lanes_json="${AGENT_MANAGER_LANES_PATH:-${here}/../lanes.json}"
+  local lanes_js="${here}/../src/lanes.js"
+  local stamp="${LANE_RULES_STAMP:-${TEMP_DIR:-/tmp}/lane-rules.stamp}"
+  [[ -n "$id" && -f "$lanes_js" ]] || return 0
+  [[ "$lanes_json" -nt "$stamp" ]] || return 0
+
+  local out rc=0
+  out="$(node "$lanes_js" --env "$id" 2>/dev/null)" || rc=$?
+  # Touched before the verdict: a failed call must not be retried every tick until lanes.json changes.
+  touch "$stamp" 2>/dev/null || true
+  [[ $rc -eq 0 ]] || return 0
+
+  printf '%s\n' "$out" | grep -q '^LANE_TASK_CLASSES=' || return 0
+  printf '%s\n' "$out" | grep -q '^LANE_REVIEWS=' || return 0
+  local classes reviews cloud_reviews projects raised_from_prefix
+  classes="$(printf '%s\n' "$out" | sed -n 's/^LANE_TASK_CLASSES=//p' | head -n 1)"
+  reviews="$(printf '%s\n' "$out" | sed -n 's/^LANE_REVIEWS=//p' | head -n 1)"
+  cloud_reviews="$(printf '%s\n' "$out" | sed -n 's/^LANE_CLOUD_REVIEWS=//p' | head -n 1)"   # cloud lanes only (true|false); empty for every other lane
+  projects="$(printf '%s\n' "$out" | sed -n 's/^LANE_PROJECTS=//p' | head -n 1)"
+  raised_from_prefix="$(printf '%s\n' "$out" | sed -n 's/^LANE_RAISED_FROM_PREFIX=//p' | head -n 1)"
+
+  if [[ "${LANE_RULES_TASK_CLASSES-__unset__}" != "$classes" || "${LANE_RULES_REVIEWS-__unset__}" != "$reviews" || "${LANE_RULES_CLOUD_REVIEWS-__unset__}" != "$cloud_reviews" || "${LANE_RULES_PROJECTS-__unset__}" != "$projects" || "${LANE_RULES_RAISED_FROM_PREFIX-__unset__}" != "$raised_from_prefix" ]]; then
+    printf '[%s] lane rules: taskClasses=%s reviews=%s%s projects=%s raisedFromPrefix=%s\n' "$id" "${classes:-any}" "${reviews:-none}" "${cloud_reviews:+ cloudReviews=$cloud_reviews}" "${projects:-any}" "${raised_from_prefix:-any}" >&2
+  fi
+  LANE_RULES_TASK_CLASSES="$classes"
+  LANE_RULES_REVIEWS="$reviews"
+  LANE_RULES_CLOUD_REVIEWS="$cloud_reviews"
+  LANE_RULES_PROJECTS="$projects"
+  LANE_RULES_RAISED_FROM_PREFIX="$raised_from_prefix"
   return 0
 }

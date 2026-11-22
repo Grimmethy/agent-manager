@@ -1,3 +1,9 @@
+// Link to the agent-run trajectory page (routes/trajectories.py, brain-dump 1892): one helper for the task detail
+// modal and the Workers card so both point at the same page.
+function trajectoryLinkHtml(taskId) {
+  return `<a href="/trajectory/${encodeURIComponent(taskId)}" target="_blank" rel="noopener" title="Agent-run trajectories: every recorded tool-loop run of this task as a timeline">trajectories</a>`;
+}
+
 function renderDraftAttempts(task) {
   const attempts = Array.isArray(task.draftAttempts) ? task.draftAttempts : [];
   if (!attempts.length) return '';
@@ -226,7 +232,20 @@ function renderTaskDetailModal(task) {
   html += `<div style="margin:8px 0 4px">`
     + `<button type="button" class="secondary" id="task-send-to-chat">Send to Chat</button> `
     + `<button type="button" class="${premiumOn ? 'action' : 'secondary'}" id="task-premium-priority" title="${premiumOn ? 'Currently claimed ahead of everything else in the queue, every pass, until turned off or the task completes. Click to turn off.' : 'Always claim this task first, every pass, regardless of source or age -- stays on until you turn it off or the task completes.'}">${premiumOn ? '★ Premium Priority (on)' : '☆ Set Premium Priority'}</button>`
+    + (premiumProvenanceText(task, Date.now()) ? ` <span class="muted" id="task-premium-provenance">${escapeHtml(premiumProvenanceText(task, Date.now()))}</span>` : '')
     + `</div>`;
+  // Retire hub (HUB0441 3/3): only a coordinating hub gets the button. The panel stays hidden until clicked; the client sends the whole
+  // sub-task list unfiltered and the server (routes/task.py api_hub_retire) decides which children are safe to archive.
+  if (task._foundState === 'coordinating') {
+    html += `<div style="margin:6px 0"><button type="button" class="secondary" id="task-hub-retire-btn">Retire hub...</button></div>`
+      + `<div id="task-hub-retire-panel" style="display:none;margin:6px 0">`
+      + `<input type="text" id="task-hub-retire-reason" placeholder="Why retire this hub? (required)" style="width:100%">`
+      + `<div id="task-hub-retire-preview" style="margin:6px 0"></div>`
+      + `<div class="meta" style="margin:4px 0">Retiring archives every unfinished sub-task. If any is in flight (review, approved or drafting) the server refuses and nothing changes.</div>`
+      + `<button type="button" class="action" id="task-hub-retire-confirm">Confirm retire</button> `
+      + `<div id="task-hub-retire-error" class="meta da-outcome-error" style="margin:4px 0"></div>`
+      + `</div>`;
+  }
   if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
   html += `<div><strong>${escapeHtmlBright(task.title || '')}</strong></div>`;
   // Hub back-link (2026-09-06, Grimmethy: "when a task is a sub-task of a hub I should be
@@ -353,6 +372,7 @@ function renderTaskDetailModal(task) {
   // the per-attempt history -- every earlier plan, every tier's decline reason + response,
   // every tier-3 worktree diff -- so following up on a task that failed N times no longer
   // means re-investigating from scratch.
+  if (task.id) html += `<div class="field-label">Agent-run trajectories</div><div>${trajectoryLinkHtml(task.id)}</div>`;
   html += renderDraftAttempts(task);
   html += renderWorkLog(task);
   html += renderHarnessHits(task);
@@ -390,6 +410,44 @@ function renderTaskDetailModal(task) {
   // implement -- and hard-caps the payload at <=200 chars before sendTextToChat
   // (core-ui.js:783), which POSTs the { text } verbatim to /api/chat/inject with no
   // further expansion. That is the full, complete scope of what gets injected.
+  // Retire hub wiring (HUB0441 3/3): the request is validated by hubRetireRequest before any fetch; the response is judged by hubRetireOutcome.
+  const hubRetireBtn = document.getElementById('task-hub-retire-btn');
+  if (hubRetireBtn) {
+    const hubRetirePanel = document.getElementById('task-hub-retire-panel');
+    const hubRetireReason = document.getElementById('task-hub-retire-reason');
+    const hubRetirePreviewEl = document.getElementById('task-hub-retire-preview');
+    const hubRetireConfirm = document.getElementById('task-hub-retire-confirm');
+    const hubRetireError = document.getElementById('task-hub-retire-error');
+    hubRetireBtn.onclick = () => {
+      const rows = hubRetirePreview(task.subTasks);
+      hubRetirePreviewEl.innerHTML = rows.length
+        ? rows.map((c) => `<div class="task-history-row"><code>${escapeHtml(c.id)}</code> <span class="meta">${escapeHtml(c.state || '?')}</span> ${escapeHtmlBright(c.title || '')}</div>`).join('')
+        : '<span class="meta">This hub has no sub-tasks.</span>';
+      hubRetireError.textContent = '';
+      hubRetirePanel.style.display = '';
+    };
+    hubRetireConfirm.onclick = async () => {
+      hubRetireError.textContent = '';
+      const req = hubRetireRequest(task.id, hubRetireReason.value);
+      if (req.error) { hubRetireError.textContent = req.error; return; }
+      hubRetireConfirm.disabled = true;
+      try {
+        const res = await fetch(req.url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req.body) });
+        const payload = await res.json().catch(() => ({}));
+        const outcome = hubRetireOutcome(res.status, payload);
+        if (outcome.close) {
+          closeDetail();
+          renderQueueTab('coordinating');
+        } else {
+          hubRetireError.textContent = outcome.message;
+        }
+      } catch (e) {
+        hubRetireError.textContent = 'Retire failed: ' + e.message;
+      } finally {
+        hubRetireConfirm.disabled = false;
+      }
+    };
+  }
   const taskSendToChatBtn = document.getElementById('task-send-to-chat');
   if (taskSendToChatBtn) {
     taskSendToChatBtn.onclick = async () => {
@@ -422,6 +480,10 @@ function renderTaskDetailModal(task) {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         showToast(nextEnabled ? 'Premium priority set -- claimed first every pass until you turn it off' : 'Premium priority cleared', 'info');
         task.premiumPriority = nextEnabled;
+        // mirror what the route just stamped so the in-place re-render shows who/when instead of "origin unknown"
+        const nowIso = new Date().toISOString();
+        if (nextEnabled) { task.premiumSetBy = 'operator-ui'; task.premiumSetAt = nowIso; delete task.premiumClearedAt; delete task.premiumClearedBy; }
+        else { task.premiumClearedBy = 'operator-ui'; task.premiumClearedAt = nowIso; }
         renderTaskDetailModal(task); // re-render in place so the button flips state immediately, no full reopen
       } catch (e) {
         showToast('Could not update premium priority: ' + e.message);
@@ -433,30 +495,35 @@ function renderTaskDetailModal(task) {
 }
 
 function stopTaskDetailAutoRefresh() {
-  if (taskDetailPoll) { clearInterval(taskDetailPoll); taskDetailPoll = null; }
+  taskDetailWatch = null;
 }
 
 function armTaskDetailAutoRefresh(task) {
   stopTaskDetailAutoRefresh();
   const state = task._foundState || '';
   if (!TASK_DETAIL_LIVE_STATES.has(state)) return;
-  const id = task.id;
-  let lastSig = `${state}:${(task.history || []).length}`;
-  taskDetailPoll = setInterval(async () => {
-    const backdrop = document.getElementById('modal-backdrop');
-    if (!backdrop || !backdrop.classList.contains('open')) { stopTaskDetailAutoRefresh(); return; }
-    let fresh;
-    try {
-      fresh = await fetchJson(`/api/task-anywhere/${encodeURIComponent(id)}`);
-    } catch (e) {
-      return; // transient -- try again next tick
-    }
-    const sig = `${fresh._foundState || ''}:${(fresh.history || []).length}`;
-    if (sig !== lastSig) {
-      lastSig = sig;
-      renderTaskDetailModal(fresh); // re-arms (or stops, if it landed in a terminal state)
-    }
-  }, 4000);
+  taskDetailWatch = { id: task.id, sig: `${state}:${(task.history || []).length}` };
+}
+
+// Called by the page when the pipeline says a task record or a queue state changed (live-updates.js: task-records-changed, counts-changed, snapshot). Does nothing, and
+// fetches nothing, unless the open modal is watching a task in a live state; then it re-reads that task and re-renders only when its state or history length moved.
+async function refreshTaskDetailModal() {
+  const watch = taskDetailWatch;
+  if (!watch) return;
+  const backdrop = document.getElementById('modal-backdrop');
+  if (!backdrop || !backdrop.classList.contains('open')) { stopTaskDetailAutoRefresh(); return; }
+  let fresh;
+  try {
+    fresh = await fetchJson(`/api/task-anywhere/${encodeURIComponent(watch.id)}`);
+  } catch (e) {
+    return; // transient -- the next announcement tries again
+  }
+  if (taskDetailWatch !== watch) return;     // the modal was closed or moved to another task while the fetch was in flight
+  const sig = `${fresh._foundState || ''}:${(fresh.history || []).length}`;
+  if (sig !== watch.sig) {
+    watch.sig = sig;
+    renderTaskDetailModal(fresh); // re-arms (or stops, if it landed in a terminal state)
+  }
 }
 
 function renderDesignDecisionPicker(task) {
@@ -476,7 +543,7 @@ function renderDesignDecisionPicker(task) {
     html += `<div style="margin-top:10px"><strong>Pick one:</strong></div>`;
     html += `<div style="margin-top:6px;display:flex;flex-direction:column;gap:6px">`;
     html += nc.options.map((o, i) => `
-      <button type="button" class="secondary clarify-answer-option-btn" data-answer="${escapeAttr(`${o.label}: ${o.description}`)}" style="text-align:left;padding:8px 10px">
+      <button type="button" class="secondary clarify-answer-option-btn" data-answer="${escapeAttr(`${o.label}: ${o.description}`)}" style="text-align:left;padding:8px 12px">
         <strong>${escapeHtml(o.label)}</strong><br><span class="meta">${escapeHtmlBright(o.description)}</span>
       </button>`).join('');
     html += `</div>`;

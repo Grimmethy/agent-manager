@@ -43,6 +43,13 @@ function intervalMs() {
 
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
 
+// Premium priority must survive a stage move: the fields are snapshotted from the claimed record and restored onto the record written to the destination.
+const PREMIUM_FIELDS = ['premiumPriority', 'premiumSetBy', 'premiumSetAt'];
+function carryPremiumFields(source, dest) {
+  for (const k of PREMIUM_FIELDS) if (k in source) dest[k] = source[k];
+  return dest;
+}
+
 function sweepExpiry({ pipelineDir, sources, now = new Date(), dryRun = false, force = false } = {}) {
   const summary = { sources: 0, checked: 0, archived: 0, released: 0, skipped: 0, errors: 0, throttled: false };
   if (!enabled() || !pipelineDir) return summary;
@@ -95,6 +102,7 @@ function sweepExpiry({ pipelineDir, sources, now = new Date(), dryRun = false, f
         try {
           const task = readJson(staged);
           if (!task) { fs.renameSync(staged, src); summary.skipped += 1; continue; }
+          const premiumSource = { ...task };
           if (item.action === 'archive') {
             const dest = path.join(archiveDir, name);
             if (fs.existsSync(dest)) { fs.renameSync(staged, src); summary.skipped += 1; continue; }
@@ -102,6 +110,7 @@ function sweepExpiry({ pipelineDir, sources, now = new Date(), dryRun = false, f
             appendHistoryEvent(task, 'aged-out', why);
             task.terminalDisposition = 'aged-out';
             task.manualArchive = { at: nowIso, from: 'pending', reason: why };
+            carryPremiumFields(premiumSource, task);
             writeJsonAtomicSync(staged, task);
             fs.mkdirSync(archiveDir, { recursive: true });
             fs.renameSync(staged, dest);
@@ -111,6 +120,7 @@ function sweepExpiry({ pipelineDir, sources, now = new Date(), dryRun = false, f
             delete task.blockedReason; delete task.blockedStage;
             task.status = 'approved';
             appendHistoryEvent(task, 'approved', `expiry-sweep: ${item.reason || 'subject aged out, but this task already holds an approved result'} -- applying it, no redraft`);
+            carryPremiumFields(premiumSource, task);
             writeJsonAtomicSync(staged, task);
             fs.mkdirSync(approvedDir, { recursive: true });
             fs.renameSync(staged, path.join(approvedDir, name));
