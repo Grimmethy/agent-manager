@@ -10,7 +10,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { validateRow, TRIGGER_KINDS, HEALTH_LEDGER_ROW_SCHEMA } = require('../src/health-ledger-schema.js');
+const { validateRow, TRIGGER_KINDS, HEALTH_LEDGER_ROW_SCHEMA } = require('./health-ledger-schema.js');
 
 // ---------- Real-shape fixture ----------
 
