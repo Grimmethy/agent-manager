@@ -963,6 +963,26 @@ while :; do                                                                     
           continue
         fi
 
+        # Premium-only re-check (2026-10-20, HUB0813 1/3): the top-of-tick gate at line 674
+        # only runs once per tick, before the claim loop. A --once borrowed child can be
+        # borrowed across ticks, and the operator may flip the switch between the home tick's
+        # gate check and this child's claim step (the child is a separate bash process, not
+        # held by the home daemon). Without a second check, a switched-off worker could still
+        # claim a premium task via a borrowed tick -- bypassing the operator's kill switch.
+        # Re-check immediately before the claim: if the switch is now on, behave exactly like
+        # the top-of-tick gate did (increment SWITCHED_OFF_TICKS, print transition message on
+        # first tick, write disabled heartbeat, exit 0 for --once) so the borrowed child
+        # claims nothing and the operator sees consistent state.
+        if "$PREMIUM_ONLY" && worker_switched_off "$INSTANCE_ID"; then
+          if (( SWITCHED_OFF_TICKS == 0 )); then
+            printf '[worker-%s] %s\\n' "$INSTANCE_ID" "$(worker_switch_message "$INSTANCE_ID")" >&2
+          fi
+          SWITCHED_OFF_TICKS=$((SWITCHED_OFF_TICKS + 1))
+          write_heartbeat_file "$INSTANCE_ID" "disabled" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
+          if "$ONCE"; then exit 0; fi
+          continue
+        fi
+
         printf '[worker-%s] claiming %s\n' "$INSTANCE_ID" "$name"               # log that we're about to attempt claim — same kind of status emit as PowerShell's `$null = Write-Host "Processing $draftName"` block which prints progress to operator console so they know daemon IS doing something (otherwise they'd wonder if it hung silently).
         write_heartbeat_file "$INSTANCE_ID" "working" "$HEARTBEAT_MODEL" "$task_id" "claim" "$STARTED_AT"
         # Stamp claimedAt (ISO) so the dashboard's chat-preempt age gate knows when THIS
