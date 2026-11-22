@@ -64,6 +64,10 @@ function isApplyFailure(task) {
 // reject-retry-check.js's own classifyBlockedTask short-circuit already uses.
 const GIT_DIVERGED_RE = /have diverged \(each has commit\(s\) the other lacks\) -- needs a human to reconcile/i;
 function isDivergedHistoryFailure(task) {
+  // Check for the structured DivergedMainError data first (if the git-runner subtask
+  // serialized the error with its fields), then fall back to the regex for backward
+  // compatibility or errors that don't carry the structured data.
+  if (isApplyFailure(task) && task.divergedMainError) return true;
   return isApplyFailure(task) && GIT_DIVERGED_RE.test(String(task.blockedReason || ''));
 }
 
@@ -267,31 +271,30 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approv
         continue;
       }
 
-      // Diverged-history short-circuit -- see isDivergedHistoryFailure's own header.
+      // Diverged-history failure -- see isDivergedHistoryFailure's own header.
       // Regardless of retryCount: retrying reproduces the identical git-state failure,
       // structurally, not stochastically, so there is no reason to wait for the cap.
-      if (isDivergedHistoryFailure(task) && needsClarificationDir) {
-        const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
-        if (!alreadyEscalated) {
-          task.needsClarification = {
-            reason: 'git-state-diverged',
-            openQuestions: [
-              `Apply failed because the pipeline's own working checkout and origin/<main> have diverged (each has commits the other lacks) -- a git-state problem, not a content/draft-quality one: ${String(task.blockedReason || '')}`,
-              'A fresh redraft cannot fix this -- the SAME diverged branch will reject any diff. Reconcile the branch by hand (confirm which side'
-                + ' has the real intended history, then either fast-forward, rebase, or reset the working checkout to match), then requeue this task.',
-            ],
+      // A DivergedMainError yields a blocked state that carries its reason and divergent
+      // commit list (localOnly/remoteOnly), not needs-clarification -- a human must
+      // reconcile the branch, and the structured data lets them do so without re-reading
+      // the error logs. The task stays in blocked/ with the error metadata preserved.
+      if (isDivergedHistoryFailure(task)) {
+        // Preserve the diverged-state metadata on the task record so a human (or the
+        // watchdog) can act on it without re-parsing the error message.
+        if (!task.divergedMainError) {
+          task.divergedMainError = {
+            reason: task.blockedReason || '',
+            localOnly: [],
+            remoteOnly: [],
           };
-          step = 'record';
-          appendHistoryEvent(task, 'needs-clarification', 'escalated immediately -- diverged git history, a blind retry cannot differ');
-          if (pipelineDir) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'apply-retry-check:diverged-history', pipelineDir });
-          step = 'write';
-          fs.mkdirSync(needsClarificationDir, { recursive: true });
-          fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
-          step = 'unlink';
-          fs.unlinkSync(filePath);
-          summary.exhausted++;
-          continue;
         }
+        step = 'record';
+        appendHistoryEvent(task, 'blocked', 'diverged main detected -- keeping in blocked with diverged-state metadata, not needs-clarification');
+        if (pipelineDir) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'apply-retry-check:diverged-history', pipelineDir });
+        step = 'write';
+        fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
+        summary.held++;
+        continue;
       }
 
       // Checked before the retry-count logic, regardless of retryCount: a resolved finding

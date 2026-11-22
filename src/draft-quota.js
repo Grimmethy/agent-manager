@@ -52,11 +52,11 @@ function classify(text, nowMs) {
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
   const inSec = parseResetsInSec(t);
   if (inSec !== null) {
-    return { kind: 'quota', source: 'resetsInSec', resumeAt: now + Math.min(inSec * 1000 + RESET_PAD_MS, MAX_WAIT_MS) };
+    return { kind: 'quota', source: 'resetsInSec', resumeAt: now + inSec * 1000 + RESET_PAD_MS };
   }
   const at = parseResetsAt(t);
   if (at !== null && at > now) {
-    return { kind: 'quota', source: 'resetsAt', resumeAt: Math.min(at + RESET_PAD_MS, now + MAX_WAIT_MS) };
+    return { kind: 'quota', source: 'resetsAt', resumeAt: at + RESET_PAD_MS };
   }
   return { kind: 'quota', source: 'backoff', resumeAt: now + QUOTA_BACKOFF_MS };
 }
