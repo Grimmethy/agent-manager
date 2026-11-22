@@ -159,6 +159,45 @@
       ]
     },
     {
+      "id": "loop:grill",
+      "name": "Grill worker (shadow)",
+      "kind": "worker",
+      "trigger": "service:watchdog-script:agent-manager-pipeline-ops:grill-trigger",
+      "gate": "the grill-disabled marker in ~/.local/state/pipeline-ops (present = off) and GRILL_RULES/GRILL_URL/GRILL_MODEL/GRILL_SHADOW set",
+      "steps": [
+        {
+          "id": "ledger",
+          "label": "Read the ledger",
+          "does": "Reads the Needs-Work ledger the trigger saw change and finds the holds that have no shadow row yet.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        },
+        {
+          "id": "answer",
+          "label": "Answer new holds",
+          "does": "Asks the model named by GRILL_MODEL (the 3090 lane's model by default) how the owner would answer each new hold.",
+          "model": {
+            "provider": "local",
+            "name": null,
+            "fromLane": "worker-3090"
+          }
+        },
+        {
+          "id": "shadow",
+          "label": "Write shadow rows",
+          "does": "Appends the answers to the shadow file the review screen reads; the bot never acts: it never merges, discards or files anything.",
+          "model": {
+            "provider": "script",
+            "name": null,
+            "fromLane": null
+          }
+        }
+      ]
+    },
+    {
       "id": "loop:hub",
       "name": "Hub worker",
       "kind": "worker",
