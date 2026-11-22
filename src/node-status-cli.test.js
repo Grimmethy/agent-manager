@@ -70,3 +70,29 @@ test('the same now goes to listNodes and summarizeNodes, and run returns instead
   assert.equal(res.text, formatSummary(summarizeNodes(nodes, leases, NOW)));
   assert.equal(res.code, 0);
 });
+
+test('listLeases receives the env object passed to run', () => {
+  const env = { FOO: 'x' };
+  let calls = 0;
+  let receivedEnv;
+  run([], env, deps({ listLeases: (e) => { calls += 1; receivedEnv = e; return leases; } }));
+  assert.equal(calls, 1);
+  assert.equal(receivedEnv, env);
+});
+
+test('now is read once per run and the same value goes to listNodes and summarizeNodes', () => {
+  let calls = 0;
+  const times = [NOW, NOW + 2 * MIN];
+  const countingNow = () => times[Math.min(calls++, times.length - 1)];
+  const lent = [{ taskId: 'tx', nodeId: 'a', state: 'lent', expiresAt: at(MIN) }];
+  let seenNow;
+  const res = run([], {}, deps({
+    listNodes: (env, n) => { seenNow = n; return nodes; },
+    listLeases: () => lent,
+    now: countingNow,
+  }));
+  assert.equal(calls, 1);
+  assert.equal(seenNow, NOW);
+  assert.equal(res.text, formatSummary(summarizeNodes(nodes, lent, NOW)));
+  assert.equal(res.text.split('\n')[1], 'a up 0.5 8 1 0 0 0 1');
+});
