@@ -30,6 +30,12 @@ function readMarker(env) {
   try { return JSON.parse(fs.readFileSync(markerPath(env), 'utf8')); } catch { return null; }
 }
 
+// A marker still flagged settling: true whose on() process is gone was left by a run that was killed mid-settle.
+// (Pid reuse can make a dead owner look alive; accepted, and the expire() path catches it once the pid is free again.)
+function ownerAlive(st) {
+  try { process.kill(Number(st.ownerPid), 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
 // ---- readings (from /proc, or FORGE_MODE_PROC for tests) ----
 function readings(env = process.env) {
   const proc = env.FORGE_MODE_PROC || '/proc';
@@ -115,7 +121,11 @@ async function modelsReading(io) {
 // ---- on ----
 async function on({ vm = 'keep' } = {}, io = realIo()) {
   const env = io.env;
-  if (readMarker(env)) { io.log('already in forge mode (see status)'); return 0; }
+  const prior = readMarker(env);
+  if (prior && prior.settling && !ownerAlive(prior)) {
+    io.log('a forge-mode run was killed mid-settle; clearing its leftovers');
+    await off(io, 'the on() run that wrote the marker died');
+  } else if (prior) { io.log('already in forge mode (see status)'); return 0; }
   const vmRunning = vm === 'off' && vmState(io) === 'running';
   const rd = readings(env);
   const vmMB = vmRunning ? Number(env.FORGE_MODE_VM_MB || 4300) : 0;
@@ -131,11 +141,12 @@ async function on({ vm = 'keep' } = {}, io = realIo()) {
   io.log(`preflight ok (MemAvailable ${Math.round(rd.availMB)} MB, I/O ${rd.io}%)`);
   const undo = [];
   const fail = async (why) => { io.log(`failed: ${why}; rolling back`); for (const u of undo.reverse()) await u(); return 1; };
-  const state = { since: new Date(io.now()).toISOString(), vm, vmShutDown: false, gpu: false };
+  const state = { since: new Date(io.now()).toISOString(), vm, vmShutDown: false, gpu: false, settling: true, ownerPid: process.pid };
   fs.mkdirSync(stateDir(env), { recursive: true });
   fs.writeFileSync(markerPath(env), JSON.stringify(state));
   undo.push(async () => { try { fs.unlinkSync(markerPath(env)); io.log('rolled back: marker removed'); } catch { /* gone */ } });
   io.log('step 1: pipeline-paused marker created (drains finish their tick and exit; no trigger starts one)');
+  try {
   const acq = await io.pf('POST', '/api/gpu/acquire', { owner: 'forge-mode' });
   if (acq.status !== 200) return fail(`GPU session refused (${acq.status || acq.error})`);
   state.gpu = true;
@@ -149,9 +160,14 @@ async function on({ vm = 'keep' } = {}, io = realIo()) {
     undo.push(async () => { virsh(io, 'start', domain(env)); io.log('rolled back: VM started'); });
     io.log('step 3: P40 VM shut off');
   } else io.log(`step 3: P40 VM left as it is (${vm === 'off' ? 'not running' : 'keep'})`);
+  state.settling = false;
   fs.writeFileSync(markerPath(env), JSON.stringify(state));
   io.log('forge mode is on (it ends by itself after 6 hours or when the GPU session is gone)');
   return 0;
+  } catch (e) {
+    // Any exception after the marker exists rolls back the same way a failed step does, so no marker is left behind.
+    return fail(`unexpected error (${e && e.message ? e.message : e})`);
+  }
 }
 
 // ---- off ----
@@ -185,6 +201,7 @@ async function status(io = realIo()) {
 async function expire(io = realIo()) {
   const st = readMarker(io.env);
   if (!st) return { expired: false, reason: 'not in forge mode' };
+  if (st.settling && !ownerAlive(st)) { const why = 'the on() run that wrote the marker died'; await off(io, why); return { expired: true, reason: why }; }
   const age = (io.now() - Date.parse(st.since)) / 60000;
   const g = await io.pf('GET', '/api/gpu/status');
   const gone = g.status === 200 && g.json && g.json.active === false;
