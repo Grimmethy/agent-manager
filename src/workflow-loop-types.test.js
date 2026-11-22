@@ -132,7 +132,7 @@ test('a reviewer lane with no reviews edge pointing at it is still a reviewer (b
 const REGISTRY = require('./workflow-loop-types.json');
 // The watchdog trigger nodes of the live graph (2026-11-07).
 const LIVE_TRIGGERS = ['agent-manager-context-ops:impact-trigger', 'agent-manager-context-ops:map-trigger', 'agent-manager-context-ops:memory-trigger', 'agent-manager-pipeline-ops:checker-trigger',
-  'agent-manager-pipeline-ops:atomizer-trigger', 'agent-manager-pipeline-ops:hub-trigger', 'agent-manager-pipeline-ops:merger-trigger', 'agent-manager-pipeline-ops:nw-trigger', 'agent-manager-pipeline-ops:scout-trigger',
+  'agent-manager-pipeline-ops:atomizer-trigger', 'agent-manager-pipeline-ops:grill-trigger', 'agent-manager-pipeline-ops:hub-trigger', 'agent-manager-pipeline-ops:merger-trigger', 'agent-manager-pipeline-ops:nw-trigger', 'agent-manager-pipeline-ops:scout-trigger',
   'agent-manager-pipeline-ops:stalled-trigger', 'agent-manager-pipeline-ops:steward-trigger', 'agent-manager-pipeline-ops:verify-trigger', 'pf-loops:pfscraper-trigger', 'uiforge:watchdog-trigger'].map((t) => 'service:watchdog-script:' + t);
 
 test('registry: schema version, slug-shaped unique loop ids, names, and at least one step per loop', () => {
@@ -159,9 +159,18 @@ test('registry: every watchdog trigger of the live graph belongs to exactly one 
   for (const l of REGISTRY.loops) assert.ok(LIVE_TRIGGERS.includes(l.trigger), l.id + ' trigger ' + l.trigger);
 });
 
-test('registry: only the stalled worker, the PF scraper builder and the task atomizer call a model; every other step is a script', () => {
+test('registry: the grill worker (shadow) entry exists, its trigger ends with :grill-trigger and its answer step follows the 3090 lane', () => {
+  const grill = REGISTRY.loops.find((l) => l.id === 'loop:grill');
+  assert.ok(grill, 'a loop:grill entry exists');
+  assert.ok(grill.trigger.endsWith(':grill-trigger'));
+  assert.equal(grill.name, 'Grill worker (shadow)');
+  assert.deepEqual(grill.steps.map((s) => s.id), ['ledger', 'answer', 'shadow']);
+  assert.equal(grill.steps[1].model.fromLane, 'worker-3090');
+});
+
+test('registry: only the stalled worker, the grill answer step, the PF scraper builder and the task atomizer call a model; every other step is a script', () => {
   const cloudSteps = REGISTRY.loops.flatMap((l) => l.steps.filter((s) => s.model.provider !== 'script').map((s) => `${l.id}:${s.id}:${s.model.provider}:${s.model.name}`));
-  assert.deepEqual(cloudSteps, ['loop:stalled:classify:cloud:claude-sonnet-5-5', 'loop:stalled:draft:cloud:claude-sonnet-5-5', 'loop:pfscraper:decide:cloud:claude-sonnet-5-5', 'loop:atomizer:capture:cloud:claude-sonnet-5-5', 'loop:atomizer:replay:local:qwen3-vl:4b-instruct', 'loop:atomizer:split:cloud:claude-sonnet-5-5']);
+  assert.deepEqual(cloudSteps, ['loop:stalled:classify:cloud:claude-sonnet-5-5', 'loop:stalled:draft:cloud:claude-sonnet-5-5', 'loop:grill:answer:local:null', 'loop:pfscraper:decide:cloud:claude-sonnet-5-5', 'loop:atomizer:capture:cloud:claude-sonnet-5-5', 'loop:atomizer:replay:local:qwen3-vl:4b-instruct', 'loop:atomizer:split:cloud:claude-sonnet-5-5']);
 });
 
 test('registry on the live-shaped graph: every loop becomes a step chain with a trigger service, uiconf keeps its script lane', () => {
