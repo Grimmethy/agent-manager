@@ -199,4 +199,27 @@ function detectContradictoryLiteralAcceptance(task) {
   };
 }
 
-module.exports = { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock, normalizeList, MAX_CRITERIA, detectContradictoryLiteralAcceptance, declaredEditFiles, dropSingleFileScopeContradictions };
+// assertFilesChecklist (HUB0747 1/2) -- every NOW WHAT item must name at least one Files:
+// entry, and every entry must be drawn from closedSet, which the CALLER supplies (no
+// module-level closed-set constant exists in src/). Failure tags all start with 'files-checklist'.
+function assertFilesChecklist(nowWhatItems, closedSet) {
+  const allowed = new Set(Array.isArray(closedSet) ? closedSet : []);
+  const items = Array.isArray(nowWhatItems) ? nowWhatItems : [];
+  const failures = [];
+  items.forEach((item, idx) => {
+    const n = idx + 1;
+    const text = `${(item && item.body) || ''}\n${(item && item.title) || ''}`;
+    const m = text.match(/^\s*Files:\s*(.*)$/im);
+    if (!m) { failures.push(`files-checklist: item ${n} has no Files: line`); return; }
+    const value = m[1].split(/\s+Why:/i)[0].trim().replace(/\.$/, '').trim();
+    if (!value) { failures.push(`files-checklist: item ${n} has empty Files:`); return; }
+    for (const raw of value.split(',')) {
+      const entry = raw.trim();
+      if (!entry) { failures.push(`files-checklist: item ${n} has an empty Files: entry`); continue; }
+      if (!allowed.has(entry)) failures.push(`files-checklist: item ${n} file "${entry}" is not in closed set`);
+    }
+  });
+  return { pass: failures.length === 0, failures };
+}
+
+module.exports = { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock, normalizeList, MAX_CRITERIA, detectContradictoryLiteralAcceptance, declaredEditFiles, dropSingleFileScopeContradictions, assertFilesChecklist };
