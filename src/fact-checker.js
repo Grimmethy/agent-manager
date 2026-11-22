@@ -785,7 +785,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
     if (sourceText.includes(url)) continue;
     if (isNamedServiceUrl(url, sourceText)) continue;
     if (existsLiterallyInRepo(url, repoRoot, ref)) continue;
-    flags.push({ type: 'ungrounded-url', detail: url });
+    flags.push({ type: 'ungrounded-url', detail: url, citedValue: url, groundingSource: sourceText, groundingExcerpt: sourceText.slice(0, 200) });
   }
 
   const fields = [...new Set(scannableText.match(GIS_FIELD_RE) || [])];
@@ -799,7 +799,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
     if (isPlatformConstant(field)) continue;
     if (sourceText.toLowerCase().includes(field.toLowerCase())) continue;
     if (existsLiterallyInRepo(field, repoRoot, ref)) continue;
-    flags.push({ type: 'ungrounded-field', detail: field });
+    flags.push({ type: 'ungrounded-field', detail: field, citedValue: field, groundingSource: sourceText, groundingExcerpt: sourceText.slice(0, 200) });
   }
 
   return flags;
