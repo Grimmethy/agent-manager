@@ -18,6 +18,8 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
+// Matching assertions compare only the matching key (type, detail); record-shape fields are checked separately.
+const brief = (list) => list.map(({ type, detail }) => ({ type, detail }));
 const { extractDiffCreateTargets, checkFilePaths, extractFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix, checkCompletionClaimsInNote, getCompletionClaimDismissals, stripVendoredDiffSections } = require('./fact-checker.js');
 
 // Real git repo fixture with exactly one real commit -- needed to test checkCommitClaims
@@ -518,7 +520,7 @@ test('checkGroundedValues does not flag a newly-declared constant from a real +c
   const sourceText = 'unrelated grounding material that never mentions that constant at all';
 
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 test('checkGroundedValues still flags a genuinely fabricated field that is NOT declared anywhere in the diff', () => {
@@ -526,7 +528,7 @@ test('checkGroundedValues still flags a genuinely fabricated field that is NOT d
   const sourceText = 'grounding material that never mentions that field at all';
 
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, [{ type: 'ungrounded-field', detail: 'FCV_CUR' }]);
+  assert.deepEqual(brief(flags), [{ type: 'ungrounded-field', detail: 'FCV_CUR' }]);
 });
 
 test('checkGroundedValues does not exempt a field that merely APPEARS on a diff line without being declared', () => {
@@ -541,7 +543,7 @@ test('checkGroundedValues does not exempt a field that merely APPEARS on a diff 
   const sourceText = 'grounding material that never mentions that field at all';
 
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, [{ type: 'ungrounded-field', detail: 'FCV_CUR' }]);
+  assert.deepEqual(brief(flags), [{ type: 'ungrounded-field', detail: 'FCV_CUR' }]);
 });
 
 // Regression, 2026-08-25, same day: the const/let/var-only version above was itself a
@@ -558,7 +560,7 @@ test('checkGroundedValues does not flag a newly-declared Python constant with no
   const sourceText = 'unrelated grounding material that never mentions that pattern at all';
 
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 test('checkGroundedValues still flags a real comparison (NAME == value) rather than treating it as a declaration', () => {
@@ -571,7 +573,7 @@ test('checkGroundedValues still flags a real comparison (NAME == value) rather t
   const sourceText = 'grounding material that never mentions that field at all';
 
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, [{ type: 'ungrounded-field', detail: 'FCV_CUR' }]);
+  assert.deepEqual(brief(flags), [{ type: 'ungrounded-field', detail: 'FCV_CUR' }]);
 });
 
 // checkGroundedValues: self-invented shell echo-marker exemption ------------------------
@@ -593,7 +595,7 @@ test('checkGroundedValues does not flag a self-invented echo success-marker the 
   const sourceText = 'unrelated grounding material that never mentions that marker at all';
 
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 test('checkGroundedValues still flags a field that merely LOOKS like an echo marker but was never actually echoed', () => {
@@ -603,7 +605,7 @@ test('checkGroundedValues still flags a field that merely LOOKS like an echo mar
   const sourceText = 'grounding material that never mentions that field at all';
 
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, [{ type: 'ungrounded-field', detail: 'NEWFILE_SYNTAX_OK' }]);
+  assert.deepEqual(brief(flags), [{ type: 'ungrounded-field', detail: 'NEWFILE_SYNTAX_OK' }]);
 });
 
 test('checkGroundedValues exempts an echo marker whether or not it is quoted', () => {
@@ -611,7 +613,7 @@ test('checkGroundedValues exempts an echo marker whether or not it is quoted', (
   const sourceText = 'grounding material that never mentions that marker at all';
 
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 // checkGroundedValues: named-external-service URL exemption -----------------------------
@@ -628,7 +630,7 @@ test('checkGroundedValues does not flag a URL whose domain was named by the huma
   const sourceText = 'HUMAN DESIGN DECISION: Default to ntfy (self-hostable, no account/API-key required).';
 
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 test('checkGroundedValues still flags a fabricated URL whose domain was never named anywhere in the source material', () => {
@@ -636,7 +638,7 @@ test('checkGroundedValues still flags a fabricated URL whose domain was never na
   const sourceText = 'HUMAN DESIGN DECISION: Default to ntfy (self-hostable, no account/API-key required).';
 
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, [{ type: 'ungrounded-url', detail: 'https://totally-invented-service.example-real-tld.com/api' }]);
+  assert.deepEqual(brief(flags), [{ type: 'ungrounded-url', detail: 'https://totally-invented-service.example-real-tld.com/api' }]);
 });
 
 // checkGroundedValues: dotted letter-octet placeholder host ------------------------------
@@ -646,13 +648,13 @@ test('checkGroundedValues still flags a fabricated URL whose domain was never na
 test('checkGroundedValues does not flag a dotted x.y.z placeholder host', () => {
   const sourceText = 'AGENT_URL=http://100.96.112.78:7450';
   const draftText = 'e.g. http://100.96.112.78:7450 and http://100.x.y.z:7450 or http://x.x.x.x:7450';
-  assert.deepEqual(checkGroundedValues(draftText, sourceText), []);
+  assert.deepEqual(brief(checkGroundedValues(draftText, sourceText)), []);
 });
 
 test('checkGroundedValues still flags an invented numeric address next to a placeholder one', () => {
   const sourceText = 'AGENT_URL=http://100.96.112.78:7450';
   const draftText = 'use http://100.x.y.z:7450 or http://10.231.4.9:7450';
-  assert.deepEqual(checkGroundedValues(draftText, sourceText), [{ type: 'ungrounded-url', detail: 'http://10.231.4.9:7450' }]);
+  assert.deepEqual(brief(checkGroundedValues(draftText, sourceText)), [{ type: 'ungrounded-url', detail: 'http://10.231.4.9:7450' }]);
 });
 
 // checkGroundedValues: real-but-elsewhere-in-the-repo exemption --------------------------
@@ -676,7 +678,7 @@ test('checkGroundedValues does not flag a field that exists literally elsewhere 
   const sourceText = 'unrelated frontend grounding material that never mentions VRAM at all';
 
   const flags = checkGroundedValues(draftText, sourceText, dir);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 // checkGroundedValues: unchanged diff context/removed lines are not new claims -----------
@@ -706,7 +708,7 @@ test('checkGroundedValues does not flag a field that only appears in an unchange
   const sourceText = 'unrelated grounding material that never mentions that field at all';
 
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 test('checkGroundedValues still flags a field that does not exist anywhere in the real repo', () => {
@@ -716,7 +718,7 @@ test('checkGroundedValues still flags a field that does not exist anywhere in th
   const sourceText = 'grounding material that never mentions that field at all';
 
   const flags = checkGroundedValues(draftText, sourceText, dir);
-  assert.deepEqual(flags, [{ type: 'ungrounded-field', detail: 'TOTALLY_FABRICATED_FIELD_XYZ' }]);
+  assert.deepEqual(brief(flags), [{ type: 'ungrounded-field', detail: 'TOTALLY_FABRICATED_FIELD_XYZ' }]);
 });
 
 test('checkGroundedValues does not flag a URL that exists literally elsewhere in the real repo', () => {
@@ -729,7 +731,7 @@ test('checkGroundedValues does not flag a URL that exists literally elsewhere in
   const sourceText = 'unrelated grounding material';
 
   const flags = checkGroundedValues(draftText, sourceText, dir);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 // checkGroundedValues: IP literal URLs are never exempt as "named service" -----------
@@ -743,28 +745,28 @@ test('checkGroundedValues flags an invented IP that shares an octet with a groun
   const sourceText = 'AGENT_URL=http://100.96.112.78:7450';
   const draftText = 'use http://100.96.112.99:7450 (invented, same third-octet)';
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, [{ type: 'ungrounded-url', detail: 'http://100.96.112.99:7450' }]);
+  assert.deepEqual(brief(flags), [{ type: 'ungrounded-url', detail: 'http://100.96.112.99:7450' }]);
 });
 
 test('checkGroundedValues does not flag an exact-grounded IP literal (substring match confirms it)', () => {
   const sourceText = 'AGENT_URL=http://100.96.112.78:7450';
   const draftText = 'use http://100.96.112.78:7450 (exact match)';
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 test('checkGroundedValues flags an invented IPv6 literal', () => {
   const sourceText = 'See https://real-internal-docs.example.test/page';
   const draftText = 'also http://[2001:db8::1]:8080 (made up)';
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, [{ type: 'ungrounded-url', detail: 'http://[2001:db8::1' }]);
+  assert.deepEqual(brief(flags), [{ type: 'ungrounded-url', detail: 'http://[2001:db8::1' }]);
 });
 
 test('checkGroundedValues still exempts a named domain (ntfy.sh) grounded by name in source', () => {
   const sourceText = 'Default to ntfy for notifications: https://ntfy.sh/docs/publish/';
   const draftText = 'Use https://ntfy.sh/abc123 for the webhook endpoint.';
   const flags = checkGroundedValues(draftText, sourceText);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 // --- resolvedVia / imprecise-file-path (2026-08-30): a real file cited with a missing or
@@ -857,7 +859,7 @@ test('checkGroundedValues does NOT flag a field that exists only on the given st
   assert.deepEqual(flagsWithRef, [], 'a value real on the stacked branch must not be flagged ungrounded');
 
   const flagsWithoutRef = checkGroundedValues(draftText, sourceText, dir);
-  assert.deepEqual(flagsWithoutRef, [{ type: 'ungrounded-field', detail: 'SIBLING_ONLY_FIELD' }],
+  assert.deepEqual(brief(flagsWithoutRef), [{ type: 'ungrounded-field', detail: 'SIBLING_ONLY_FIELD' }],
     'without a ref (a non-stacked task), the same value is still correctly flagged -- proves this is not a blanket loosening of the gate');
 });
 
@@ -920,7 +922,7 @@ test('checkRevertsAPriorFix does not flag an edit to the same line that is NOT a
     replace: "logHardFailureAudit({ code: err.code }); throw err; }",
   }]);
   const flags = checkRevertsAPriorFix(implementResponse, dir);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 test('checkRevertsAPriorFix does not flag a revert of a commit with no AC-\\d+ marker (ordinary iteration, not undoing a confirmed fix)', () => {
@@ -938,7 +940,7 @@ test('checkRevertsAPriorFix does not flag a revert of a commit with no AC-\\d+ m
 
   const implementResponse = JSON.stringify([{ file: 'sweep.js', mode: 'edit', find: 'const x = 2;', replace: 'const x = 1;' }]);
   const flags = checkRevertsAPriorFix(implementResponse, dir);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 test('checkRevertsAPriorFix is a no-op (never throws) with no git repo at all', () => {
@@ -1136,7 +1138,7 @@ const SRC = 'unrelated grounding text with nothing in it';
 
 test('checkGroundedValues: a URL that exists only in added TEST files is exempt; the same URL in a production file, in both, or only in prose is still flagged', () => {
   const testOnly = diffOf(['pkg/tests/test_cache.py', ['url = "http://ex.com/report/a.pdf"']]);
-  assert.deepEqual(checkGroundedValues(testOnly, SRC, null, null), []);
+  assert.deepEqual(brief(checkGroundedValues(testOnly, SRC, null, null)), []);
   assert.deepEqual([...urlsOnlyInAddedTestFiles(testOnly)], ['http://ex.com/report/a.pdf']);
 
   const prod = diffOf(['pkg/cache.py', ['URL = "http://ex.com/report/a.pdf"']]);
@@ -1148,7 +1150,7 @@ test('checkGroundedValues: a URL that exists only in added TEST files is exempt;
   assert.deepEqual(checkGroundedValues('The fix fetches http://ex.com/report/a.pdf from the portal.', SRC, null, null).map((f) => f.detail), ['http://ex.com/report/a.pdf'], 'prose only');
 
   const proseAndTest = `Tests use http://ex.com/page.html.\n${diffOf(['src/foo.test.js', ['const u = "http://ex.com/page.html";']])}`;
-  assert.deepEqual(checkGroundedValues(proseAndTest, SRC, null, null), [], 'prose describing the fixture does not veto it');
+  assert.deepEqual(brief(checkGroundedValues(proseAndTest, SRC, null, null)), [], 'prose describing the fixture does not veto it');
 });
 
 test('test-file recognition covers tests/ dirs, *.test.js/ts, *.spec.*, test_*.py and *_test.py, and nothing else', () => {
@@ -1183,7 +1185,7 @@ test('checkGroundedValues does not flag an env var read on an added line (JS, Py
   ];
   for (const line of cases) {
     const draft = envDraft([line], { prose: 'Set AGENT_MANAGER_EDIT_FILE_TIERS=on to enable it.' });
-    assert.deepEqual(checkGroundedValues(draft, 'grounding that predates the switch'), [], line);
+    assert.deepEqual(brief(checkGroundedValues(draft, 'grounding that predates the switch')), [], line);
     assert.ok(extractEnvReadIdentifiers(draft).has('AGENT_MANAGER_EDIT_FILE_TIERS'), line);
   }
 });
@@ -1210,7 +1212,7 @@ test('checkGroundedValues does not flag an env var read through an injected env 
     "+    v = env.get('AGENT_MANAGER_NEW_SWITCH', '')",
   ]) {
     const draft = envDraft([line], { prose: 'Set AGENT_MANAGER_NEW_SWITCH=off to disable it.' });
-    assert.deepEqual(checkGroundedValues(draft, 'grounding that predates the switch'), [], line);
+    assert.deepEqual(brief(checkGroundedValues(draft, 'grounding that predates the switch')), [], line);
     assert.ok(extractEnvReadIdentifiers(draft).has('AGENT_MANAGER_NEW_SWITCH'), line);
   }
 });
@@ -1243,7 +1245,7 @@ test('checkGroundedValues does not flag an ALL_CAPS token inside a string litera
     ['tests/unit/thing.spec.ts', 'TS_FIXTURE_NAME', '+  expect(f(`TS_FIXTURE_NAME`)).toBe(1);'],
   ]) {
     const draft = twoFileDraft({ testPath, testLine, prose: `The test uses ${name} as a stand-in.` });
-    assert.deepEqual(checkGroundedValues(draft, 'grounding that predates the test'), [], testPath);
+    assert.deepEqual(brief(checkGroundedValues(draft, 'grounding that predates the test')), [], testPath);
     assert.ok(fieldsOnlyInAddedTestFiles(draft).has(name), testPath);
   }
 });
@@ -1313,7 +1315,7 @@ const SOURCE_WITHOUT_URLS = 'Plain grounding text with no URLs in it.';
 
 test('a fabricated URL in prose AFTER a diff block is flagged', () => {
   const draft = ['Summary.', '', 'diff --git a/src/a.js b/src/a.js', '@@ -1,2 +1,3 @@', ' const a = 1;', '+const b = 2;', '', `Afterwards call ${FABRICATED_URL} to confirm.`].join('\n');
-  assert.deepEqual(checkGroundedValues(draft, SOURCE_WITHOUT_URLS), [{ type: 'ungrounded-url', detail: FABRICATED_URL }]);
+  assert.deepEqual(brief(checkGroundedValues(draft, SOURCE_WITHOUT_URLS)), [{ type: 'ungrounded-url', detail: FABRICATED_URL }]);
 });
 
 test('a bullet, a tab-indented line or plain prose after the diff also ends the block, so a URL in it is flagged', () => {
@@ -1326,7 +1328,7 @@ test('a bullet, a tab-indented line or plain prose after the diff also ends the 
 
 test('a stripped-space blank context line inside a hunk does not end the block: later unchanged context URLs are not flagged', () => {
   const draft = ['diff --git a/src/a.js b/src/a.js', '@@ -1,4 +1,5 @@', ' const first = "https://old.zzctx1.io/a";', '', ' const second = "https://old.zzctx2.io/b";', '+const added = 1;'].join('\n');
-  assert.deepEqual(checkGroundedValues(draft, SOURCE_WITHOUT_URLS), []);
+  assert.deepEqual(brief(checkGroundedValues(draft, SOURCE_WITHOUT_URLS)), []);
 });
 
 test('removed and context URLs inside the diff are still never flagged, and an added URL still is', () => {
@@ -1345,12 +1347,12 @@ const UFG_UNRELATED = 'grounding that mentions none of these names';
 
 test('ungrounded-field: a Python annotated module constant the draft declares is not flagged', () => {
   const flags = checkGroundedValues(ufgDiff('RULE_TABLE: dict[str, bool] = {', 'NAME_LIST: Tuple[str, ...] = ("a", "b")'), UFG_UNRELATED);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 test('ungrounded-field: shell export/readonly/local declarations the draft adds are not flagged', () => {
   const flags = checkGroundedValues(ufgDiff('export BACKUP_TARGET=/srv/b', 'readonly RETRY_LIMIT=3', 'local WORK_DIR_NAME=x'), UFG_UNRELATED);
-  assert.deepEqual(flags, []);
+  assert.deepEqual(brief(flags), []);
 });
 
 test('ungrounded-field: an annotated-looking dict entry, a kwarg and a comparison are still not declarations', () => {
@@ -1368,4 +1370,18 @@ test('ungrounded-field: @NAME@ template placeholders on added lines are exempt, 
 test('ungrounded-field: language and OS constants are exempt, a made-up config key is still flagged', () => {
   const flags = checkGroundedValues(ufgDiff('DIR="$(dirname "${BASH_SOURCE[0]}")"', 'RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX', 'Environment=NODE_ENV=production', 'if (MADE_UP_LIMIT) {}'), UFG_UNRELATED);
   assert.deepEqual(flags.map((f) => f.detail), ['MADE_UP_LIMIT']);
+});
+
+// checkGroundedValues: ungrounded-field flags carry the cited value and the grounding source ---
+test('checkGroundedValues attaches citedValue and grounding source to an ungrounded-field flag', () => {
+  const draftText = 'The response includes the FABRICATED_CITED_FIELD_QQ for support.';
+  const sourceText = 'grounding material that never mentions that field at all';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].type, 'ungrounded-field');
+  assert.equal(flags[0].detail, 'FABRICATED_CITED_FIELD_QQ');
+  assert.equal(flags[0].citedValue, 'FABRICATED_CITED_FIELD_QQ');
+  assert.equal(flags[0].groundingSource, sourceText);
+  assert.equal(flags[0].groundingExcerpt, sourceText.slice(0, 200));
 });
