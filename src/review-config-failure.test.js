@@ -43,12 +43,12 @@ function configBranch() {
 
 test('getDomainConfig returns a listed domain', () => {
   const p = tmpFile('task-domains.json', JSON.stringify({ adhoc: { workDirKind: 'repoRoot', successCheck: 'git-branch-diff' } }));
-  assert.deepEqual(getDomainConfig(p, 'adhoc'), { workDirKind: 'repoRoot', successCheck: 'git-branch-diff' });
+  assert.deepEqual(getDomainConfig(p, 'adhoc', { pipelineDir: require('path').dirname(p) }), { workDirKind: 'repoRoot', successCheck: 'git-branch-diff' });
 });
 
 test('an unlisted domain names the file and the fix, and keeps the prefix the runner matches on', () => {
   const p = tmpFile('task-domains.json', JSON.stringify({ default: { workDirKind: 'repoRoot', successCheck: 'git-branch-diff' } }));
-  assert.throws(() => getDomainConfig(p, 'xyzzy-nonexistent-domain'), (e) => {
+  assert.throws(() => getDomainConfig(p, 'xyzzy-nonexistent-domain', { pipelineDir: require('path').dirname(p) }), (e) => {
     assert.ok(e.message.startsWith('Unknown task domain: xyzzy-nonexistent-domain (valid: default)'), e.message);
     assert.ok(e.message.includes(p), 'the message should name the domains file it read');
     assert.ok(e.message.includes('ensure-task-domains.sh'), 'the message should name the fix');
@@ -58,7 +58,7 @@ test('an unlisted domain names the file and the fix, and keeps the prefix the ru
 
 test('adhoc is a standard domain and self-heals the file instead of throwing', () => {
   const p = tmpFile('task-domains.json', JSON.stringify({ default: { workDirKind: 'repoRoot', successCheck: 'git-branch-diff' } }));
-  const cfg = getDomainConfig(p, 'adhoc');
+  const cfg = getDomainConfig(p, 'adhoc', { pipelineDir: require('path').dirname(p) });
   assert.deepEqual(cfg, { workDirKind: 'repoRoot', successCheck: 'git-branch-diff' });
   const reloaded = JSON.parse(fs.readFileSync(p, 'utf8'));
   assert.ok(reloaded.adhoc, 'the self-heal should write adhoc back into the file');

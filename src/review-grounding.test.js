@@ -53,8 +53,9 @@ test('getWorkDir picks the repo root or the second brain by workDirKind and thro
 
 test('getDomainConfig returns a known domain and names the file for an unknown one', () => {
   const { domainsPath } = Fx.fixture();
-  assert.equal(grounding.getDomainConfig(domainsPath, 'sb').workDirKind, 'secondBrainDir');
-  assert.throws(() => grounding.getDomainConfig(domainsPath, 'zzz_not_a_domain'), /Unknown task domain: zzz_not_a_domain/);
+  const pipelineDir = path.dirname(domainsPath);
+  assert.equal(grounding.getDomainConfig(domainsPath, 'sb', { pipelineDir }).workDirKind, 'secondBrainDir');
+  assert.throws(() => grounding.getDomainConfig(domainsPath, 'zzz_not_a_domain', { pipelineDir }), /Unknown task domain: zzz_not_a_domain/);
 });
 
 test('resolveRepoRootForCheck keeps the work dir, and swaps in a deep_dive clone path from the coverage file', () => {
