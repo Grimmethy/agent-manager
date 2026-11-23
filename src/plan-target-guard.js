@@ -49,7 +49,14 @@ const WRITE_FILE_PHRASE_RE = /\bwrite\s+(?:(?:the|a|an|one|single|new)\s+)+file[
 // it only matters for a path that does not exist, so "Add a summary of the problem, then edit src/x.js" still leaves src/x.js an ordinary target.
 const DIRECT_CREATE_RE = /\b(?:create|creates|creating|add|adds|adding)\s+(?:(?:the|a|an|one|single|new)\s+)*(?:file\s+)?[\s`'"*_(]*$/i;
 const ONCE_IT_EXISTS_AFTER_RE = /^[\s`'"*_)(,.;:-]{0,6}once[\s*_]+it[\s*_]+(?:exists|is[\s*_]+(?:created|written))\b/i;
-const isCreateVerbBefore = (before) => CREATE_FILE_VERBS_RE.test(before) || WRITE_FILE_PHRASE_RE.test(before);
+// 2026-11-18 (this task: plan cites main.ts/main.tsx and instances/code-bad-sha.json as missing, both clearly create intents): broader create-signal patterns that
+// catch "make X", "generate X", "produce X", "output X", "introduce X", "build X" phrasings the tighter regexes above miss. Checked at every mention, same strict form as
+// DIRECT_CREATE_RE: the verb must sit DIRECTLY against the path (only articles, "file" and punctuation or quotes between), so "Make a summary, then edit src/x.js" still
+// leaves src/x.js an ordinary target.
+const BROAD_CREATE_DIRECT_RE = /\b(?:make|makes|making|generate|generates|generating|produce|produces|producing|output|outputs|outputting|introduce|introduces|introducing|build|builds|building)\s+(?:(?:the|a|an|one|single|new)\s+)*(?:file\s+)?[\s`'\"*_)(]*$/i;
+// 2026-11-18: "the new file <path>" / "a new <path>" / "this new <path>" -- noun-phrase framing where the path IS the thing being introduced.
+const NEW_FILE_NOUN_PHRASE_RE = /\b(?:the|a|an|this|that|our|my|its)\s+new\s+file[\s,:;(`'\"*_-]*$/i;
+const isCreateVerbBefore = (before) => CREATE_FILE_VERBS_RE.test(before) || WRITE_FILE_PHRASE_RE.test(before) || BROAD_CREATE_DIRECT_RE.test(before) || NEW_FILE_NOUN_PHRASE_RE.test(before);
 
 // every occurrence of needle in text, as start indexes (the guard used to look at the first only: 2026-10-15, a plan that quoted the task's "write ONE file" first and said
 // "one file to create" later was blocked because only the first mention was examined)
