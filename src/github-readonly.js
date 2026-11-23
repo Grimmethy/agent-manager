@@ -27,12 +27,18 @@ function validateOwner(name) {
   if (typeof name !== 'string' || !IDENT_RE.test(name)) {
     return `invalid owner: ${JSON.stringify(name)} (must match ^[A-Za-z0-9._-]+$)`;
   }
+  if (name === '.' || name === '..' || name.includes('..') || name.startsWith('-') || name.startsWith('.')) {
+    return `invalid owner: ${JSON.stringify(name)} (must not be "." or "..", contain "..", or start with "-" or ".")`;
+  }
   return null;
 }
 
 function validateRepo(name) {
   if (typeof name !== 'string' || !IDENT_RE.test(name)) {
     return `invalid repo: ${JSON.stringify(name)} (must match ^[A-Za-z0-9._-]+$)`;
+  }
+  if (name === '.' || name === '..' || name.includes('..') || name.startsWith('-')) {
+    return `invalid repo: ${JSON.stringify(name)} (must not be "." or "..", contain "..", or start with "-")`;
   }
   return null;
 }
