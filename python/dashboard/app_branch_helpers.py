@@ -414,7 +414,7 @@ def _summarize_hub(data, state):
     built_n = sum(1 for p in phases if p in ("merged", "built"))
     gate = data.get("integrationGate") or {}
     all_children_built = len(subs) > 0 and built_n == len(subs)
-    gate_clear = gate.get("status") in (None, "passed", "skipped")
+    gate_clear = not gate or gate.get("status") in ("passed", "skipped")
     # An ABANDONED piece counts as finished for hub auto-completion (coordinator-sweep.js, on purpose), but it is not code that shipped: a hub whose wiring
     # piece was abandoned is not ready to merge (pf-admin-ui HUB0001 read ready with piece 3/3 abandoned, so its sheet was never rendered). The hub record's
     # `abandonedPiecesWaived: true` is the owner's explicit "merge it anyway".
