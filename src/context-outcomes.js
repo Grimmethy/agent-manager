@@ -31,6 +31,7 @@ const CAVEATS = [
   'a task still in flight is in no state directory and is not counted',
 ];
 const EXCLUDED_DISPOSITIONS = new Set(['noop', 'dismissed', 'abandoned', 'filed']);
+// An independent definition for outcome classification, not a mirror of STALL_STAGES in src/queue-events.js (the two sets overlap but answer different questions).
 const RETRY_STAGES = new Set(['requeued', 'blocked', 'needs-clarification']);
 
 // Reads queue/<state>/*.json whose file mtime is at or after minMtimeMs (a stat before the parse: the done directory holds thousands of records).

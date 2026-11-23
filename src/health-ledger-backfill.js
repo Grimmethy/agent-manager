@@ -12,10 +12,10 @@
 // watchdog tick"; adding it to the tick is a separate owner decision). Per-day log lines go to stderr, which scripts/queue-watcher.sh already
 // redirects into the standard logs directory when a tick runs a sweep.
 //
-// Schema fit: the real validator (health-ledger-schema.js validateRow) requires NUMBERS for metric.before/after and cost.gpu_minutes/peak_ram_mb,
-// so the null the original ask used for "not measured" is rejected. A backfilled row therefore carries 0 in those four fields and says so
-// explicitly: verdict.inputs.unknown_fields lists them and the note repeats it, so a reader never mistakes 0 for a measurement. NULL token/cost
-// columns in model_calls are counted per column, never summed as zero.
+// Schema fit: the real validator (health-ledger-schema.js validateRow) accepts a finite NUMBER or null for metric.before/after and cost.gpu_minutes/peak_ram_mb (cost.model_calls must stay a finite number),
+// so a backfilled row writes null in those four fields for "not measured" and says so
+// explicitly: the note says those fields are null because they were not measured, so a reader never mistakes them for a measured zero. NULL token/cost
+// columns in model_calls are counted per column, never summed as zero. The validator's null acceptance for these four fields is provided by sibling task HUB0286.
 
 const fs = require('fs');
 const path = require('path');
@@ -127,9 +127,9 @@ function buildRow(day, calls, historyEvents, nowIso) {
       },
     },
     items: { released: [], held: [], filed: [] },
-    metric: { name: 'backfill', before: 0, after: 0 },
-    cost: { gpu_minutes: 0, peak_ram_mb: 0, model_calls: c.calls },
-    note: `Backfilled for ${day} from model-stats.db and pipeline-history. ${nullNote}. ${UNKNOWN_FIELDS.join(', ')} were not measured and are written as 0.`,
+    metric: { name: 'backfill', before: null, after: null },
+    cost: { gpu_minutes: null, peak_ram_mb: null, model_calls: c.calls },
+    note: `Backfilled for ${day} from model-stats.db and pipeline-history. ${nullNote}. metric.before, metric.after, cost.gpu_minutes and cost.peak_ram_mb are null: not measured. null is the intended representation for them, not 0.`,
   };
 }
 

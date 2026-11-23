@@ -42,8 +42,8 @@ class TestSummarizeHub(unittest.TestCase):
 
     def test_integration_gate_still_has_to_be_clear(self):
         subs = [{"id": "a", "status": "pending-merge", "phase": "built"}, {"id": "b", "status": "pending-merge", "phase": "built"}]
-        for status, ready in ((None, True), ("passed", True), ("skipped", True), ("pending", False), ("failed", False)):
-            h = app._summarize_hub(hub(subs, integrationGate={"status": status} if status else {}), "coordinating")
+        for status, ready in ((None, False), ("passed", True), ("skipped", True), ("pending", False), ("running", False), ("failed", False)):
+            h = app._summarize_hub(hub(subs, integrationGate={"status": status}), "coordinating")
             self.assertEqual(h["readyToMerge"], ready, status)
 
     def test_a_hub_already_in_done_is_ready_and_an_empty_hub_is_not(self):

@@ -30,6 +30,7 @@ const { findStalenessCandidates } = require('./staleness-audit.js');
 const { classifyVote } = require('./auto-confirm-review.js');
 const { normalizeTaskTokens, dupSimilarityThreshold } = require('./staleness-audit-dedup.js');
 const { jaccardSimilarity } = require('./text-similarity.js');
+const { siblingsShareFeatureOrChain } = require('./staleness-feature-preamble.js');
 
 const SCAN_DIRS = ['blocked', 'needs-clarification', 'coordinating'];
 const CORPUS_DIRS = ['pending', 'drafting', 'blocked', 'needs-clarification', 'coordinating', 'adhoc', 'approved', 'review'];
@@ -59,7 +60,7 @@ function classifyStaleTask(candidate) {
   const ev = Array.isArray(candidate.evidence) ? candidate.evidence.slice() : [];
 
   const mk = (reason, disposition, confidence, extra = [], confidenceSource = 'heuristic-default') => ({
-    reason, disposition, confidence, evidence: [...ev, ...extra], confidenceSource,
+    reason, disposition: (candidate.featureGuarded && disposition === 'retire') ? 'review' : disposition, confidence, evidence: [...ev, ...extra], confidenceSource,
   });
 
   // High-confidence deterministic -- nothing left to build.
@@ -225,6 +226,14 @@ function safeMtime(p) { try { return fs.statSync(p).mtimeMs; } catch { return 0;
 
 function nonEmptyStr(v) { return typeof v === 'string' && v.trim() !== ''; }
 
+// States whose records count as 'live pieces' of a feature (HUB0498 cap).
+const LIVE_PIECE_STATES = new Set(['pending', 'adhoc', 'drafting', 'coordinating', 'needs-clarification']);
+
+// True when another live record (from the already-loaded corpus) shares a feature signal with task.
+function hasOtherLivePieces(task, corpus) {
+  return corpus.some((o) => o && o.id && o.id !== task.id && LIVE_PIECE_STATES.has(String(o.state)) && siblingsShareFeatureOrChain(task, o));
+}
+
 function hubIdPrefix(id) {
   const m = /^(HUB\d+)-\d+$/.exec(String(id || ''));
   return m ? m[1] : null;
@@ -288,6 +297,7 @@ function applySameHubGuard({ scanned, corpus, candidates, dryRun, summary }) {
       const raw = jaccardSimilarity(mine, normalizeTaskTokens(other));
       if (raw < threshold) continue;
       const key = sameHubKey(task, other);
+      if (siblingsShareFeatureOrChain(task, other)) summary.siblingFeatureGuard = (summary.siblingFeatureGuard || 0) + 1; // 'sibling-feature-guard' skip, counted
       const pairKey = [task.id, other.id].sort().join('|');
       if (!counted.has(pairKey)) { counted.add(pairKey); summary.sameHubSuppressed += 1; }
       const sa = normalizeTaskTokens(withoutRepeatedParagraphs(task, group));
@@ -335,7 +345,7 @@ function applySameHubGuard({ scanned, corpus, candidates, dryRun, summary }) {
 }
 
 async function sweep({ pipelineDir, repoRoot, majorityVote, dryRun = false, now = Date.now() }) {
-  const summary = { scanned: 0, flagged: 0, highConfidence: 0, voted: 0, confirmed: 0, dropped: 0, skipped: 0, errors: 0, sameHubSuppressed: 0, wouldFlag: [] };
+  const summary = { scanned: 0, flagged: 0, highConfidence: 0, voted: 0, confirmed: 0, dropped: 0, skipped: 0, errors: 0, sameHubSuppressed: 0, siblingFeatureGuard: 0, wouldFlag: [] };
   if (process.env.AGENT_MANAGER_ADHOC_STALENESS_FLAG === 'false') return summary;
 
   // Scoped to adhoc / brain-dump / manual tasks -- the "dead adhoc task" question. Other
@@ -355,6 +365,7 @@ async function sweep({ pipelineDir, repoRoot, majorityVote, dryRun = false, now 
     scanned.map((s) => s.task), {}, now, { repoRoot, corpusTasks: corpus },
   );
   const candidates = applySameHubGuard({ scanned, corpus, candidates: rawCandidates, dryRun, summary });
+  for (const c of candidates) { if (hasOtherLivePieces(c.task, corpus)) c.featureGuarded = true; }
   const byId = new Map(scanned.map((s) => [s.task.id, s]));
 
   for (const candidate of candidates) {

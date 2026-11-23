@@ -3633,6 +3633,43 @@ test('arch_review (candidate-fulfillment): the plan call is NOT allowed to be em
   });
 });
 
+// 2026-11 (HUB0822 3/3): a degenerate plan pass on an adhoc task must route back to
+// plan stage, NOT get requeued for implement retry. The prior bug (HUB0822 1/3) was that
+// the blocked result carried no blockedStage, so reject-retry-check.js's entry gate
+// missed it and the task sat in queue/blocked/ forever. The fix (HUB0822 2/3) added
+// blockedStage: 'plan' to the degenerate-plan return value. This test pins that routing:
+// a degenerate plan response must yield blockedStage 'plan' and must NOT have triggered
+// the implement tier (proving the task was not requeued for implement retry).
+test('degenerate plan pass on an adhoc task routes to blockedStage "plan" (not implement retry)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    let implementTierRan = false;
+    let planCalls = 0;
+    const localCall = async () => {
+      planCalls += 1;
+      return { response: '', degenerate: 'truncated', attempts: 3 };
+    };
+    const result = await draftTask(
+      { id: 'degenerate-plan-route-1', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } },
+      {
+        localCall,
+        withLockFn: async (d, fn) => fn(),
+        draftAdhocViaLocalAgenticWriteFn: async (t) => {
+          implementTierRan = true;
+          t.adhocResolution = 'no-changes-needed';
+          t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
+          return { succeeded: true, blocked: false };
+        },
+      },
+    );
+    assert.equal(result.blocked, true, 'a degenerate plan must block the draft');
+    assert.match(result.blockedReason, /Plan pass degenerate: truncated/);
+    // The fix: blockedStage is set so reject-retry-check.js can recognize and act on it.
+    assert.equal(result.blockedStage, 'plan', 'degenerate plan must route to plan stage, not implement retry');
+    assert.equal(implementTierRan, false, 'the implement tier must NOT run after a degenerate plan');
+    assert.ok(planCalls >= 1, `plan pass was invoked at least once (got ${planCalls})`);
+  });
+});
+
 test('an implement pass that comes back degenerate blocks with blockedStage "implement" (it used to carry none: invisible to reject-retry-check, stuck forever)', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = {

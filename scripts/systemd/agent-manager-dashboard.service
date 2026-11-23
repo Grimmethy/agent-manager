@@ -1,0 +1,16 @@
+# Agent Manager dashboard as a systemd USER service. Installed by scripts/install-crash-recovery.sh.
+# The interpreter name (python3) is an assumption: check it matches how the owner launches the dashboard.
+[Unit]
+Description=Agent Manager dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+ExecStart=/usr/bin/env python3 python/dashboard/app.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

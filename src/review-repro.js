@@ -26,8 +26,10 @@ function wantsRepro(task, { hubChild = false, env = process.env } = {}) {
 function summariseRepro(r) {
   if (!r || typeof r !== 'object') return null;
   const strs = (a, n, len) => (Array.isArray(a) ? a : []).slice(0, n).map((x) => String(x).slice(0, len));
+  const testsTotal = Array.isArray(r.tests) ? r.tests.length : 0;
+  const failuresTotal = Array.isArray(r.failures) ? r.failures.length : 0;
   return r.ran
-    ? { ran: true, failedOnBase: !!r.failedOnBase, tests: strs(r.tests, 8, 160), failures: strs(r.failures, 5, 160) }
+    ? { ran: true, failedOnBase: !!r.failedOnBase, tests: strs(r.tests, 8, 160), failures: strs(r.failures, 5, 160), testsTotal, failuresTotal }
     : { ran: false, reason: String(r.reason || 'not run').slice(0, 200) };
 }
 
@@ -53,12 +55,14 @@ function blockReason(repro, env = process.env) {
 
 function formatReproSection(repro) {
   if (!repro || typeof repro !== 'object' || !repro.ran) return '';
+  const testsNote = (repro.testsTotal && repro.tests.length < repro.testsTotal) ? ` (and ${repro.testsTotal - repro.tests.length} more not shown)` : '';
+  const failuresNote = (repro.failuresTotal && repro.failures.length < repro.failuresTotal) ? ` (and ${repro.failuresTotal - repro.failures.length} more not shown)` : '';
   if (repro.failedOnBase) {
     return ['--- Defect reproduction (deterministic check; advisory) ---',
-      `The harness reverted every production change of the diff and re-ran the tests the diff adds (${repro.tests.join(', ')}): they FAIL on the base${repro.failures.length ? ` (${repro.failures.join('; ')})` : ''}. The change is pinned by a test that fails without it.`].join('\n');
+      `The harness reverted every production change of the diff and re-ran the tests the diff adds (${repro.tests.join(', ')}${testsNote}): they FAIL on the base${repro.failures.length ? ` (${repro.failures.join('; ')}${failuresNote})` : ''}. The change is pinned by a test that fails without it.`].join('\n');
   }
   return ['--- Defect reproduction (deterministic check; advisory) ---',
-    `The harness reverted every production change of the diff and re-ran the tests the diff adds (${repro.tests.join(', ')}): they still PASS on the base.`,
+    `The harness reverted every production change of the diff and re-ran the tests the diff adds (${repro.tests.join(', ')}${testsNote}): they still PASS on the base.`,
     'So these tests do not demonstrate the defect the task describes. This task came from a brain-dump entry, and such entries are sometimes speculation about a problem the code already prevents. Before approving, check the code the task cites: if the defect cannot occur on the base, REJECT; approve only if the diff is justified for another reason you can name. This is evidence to weigh, not a verdict.'].join('\n');
 }
 

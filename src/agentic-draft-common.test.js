@@ -73,6 +73,48 @@ test('parseSubTaskProposals correctly handles a literal bracket character INSIDE
   ]);
 });
 
+// Malformed-input regression tests (HUB0835). A malformed candidate must never yield an entry
+// and must never throw. parseSubTaskProposals returns null when no valid entry survives.
+test('parseSubTaskProposals builds no entry from an unescaped inner double quote, and does not throw', () => {
+  let result;
+  assert.doesNotThrow(() => { result = parseSubTaskProposals('[{"title":"say "hi""}]'); });
+  assert.equal(result, null);
+});
+
+test('parseSubTaskProposals builds no entry from an invalid JSON escape, and does not throw', () => {
+  let result;
+  assert.doesNotThrow(() => { result = parseSubTaskProposals('[{"title":"C:\\x"}]'); });
+  assert.equal(result, null);
+});
+
+test('parseSubTaskProposals keeps a ] inside a string value intact instead of truncating the array', () => {
+  assert.deepEqual(
+    parseSubTaskProposals('[{"title":"a]b","rawText":"x"}]'),
+    [{ title: 'a]b', rawText: 'x' }],
+  );
+});
+
+test('parseSubTaskProposals ignores a stray ] in prose around the array', () => {
+  assert.deepEqual(
+    parseSubTaskProposals('note] here [{"title":"t","rawText":"r"}] tail ]'),
+    [{ title: 't', rawText: 'r' }],
+  );
+});
+
+test('parseSubTaskProposals keeps only the valid entry when a sibling entry is missing required fields', () => {
+  assert.deepEqual(
+    parseSubTaskProposals('[{"title":"ok","rawText":"r"},{"title":""}]'),
+    [{ title: 'ok', rawText: 'r' }],
+  );
+});
+
+test("parseSubTaskProposals parses an apostrophe inside a double-quoted string", () => {
+  assert.deepEqual(
+    parseSubTaskProposals('[{"title":"don\'t stop","rawText":"r"}]'),
+    [{ title: "don't stop", rawText: 'r' }],
+  );
+});
+
 // Root-caused live 2026-09-14: every decompose call site used to stamp
 // task.implementResponse to a content-free templated sentence with no trace of the actual
 // proposals, so review-task.js's buildVerdictPrompt (which never reads subTaskProposals
