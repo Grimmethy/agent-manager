@@ -30,6 +30,14 @@ As a service: `scripts/systemd/agent-manager-tailnet-gateway.service` (instructi
 (7420), `AGENT_MANAGER_PLUGINS_PATH`, `AGENT_MANAGER_TAILNET_EXTRA_PORTS`, `AGENT_MANAGER_TAILNET_BIND` (must still be a Tailscale address).
 Tests: `node --test scripts/tailnet-gateway.test.js` (whois and the network are stubbed; no tailscale needed).
 
+## What a plugin sees from a gateway caller
+
+The gateway forwards plain TCP, so a plugin behind it sees every admitted caller as `127.0.0.1` with NO proxy header (`X-Forwarded-For`, `Forwarded` and `X-Real-IP` are never added). A plugin's own "loopback only" write check (for example PromptForge's `loopback_only` in `server/core/jobs_routes.py`) therefore passes for the owner's other machine: the owner's logins are the trust boundary, and no per-plugin allowlist, token or IP check is needed for a second machine (grimm) to file jobs or start runs on wok. Verified 2026-11-20: from grimm, `POST http://<wok tailnet ip>:7430/api/jobs` with an empty body returned 400 (accepted, nothing filed), and the same request with an `X-Forwarded-For` header returned 403.
+
+Debugging a refused write from another machine: read `~/.local/state/agent-manager/logs/plugin-<name>.log` for the source address the plugin saw (127.0.0.1 means the gateway admitted it and the refusal is the plugin's own logic), and run `ss -ltnp` to see which process owns the tailnet listener.
+
+Known weakness: a plugin that parses JSON with `get_json(force=True)` and does not check the `Origin` header accepts a cross-site POST from a web page open in a browser on an admitted machine. Plugins with write routes should reject a request whose `Origin` host differs from its `Host`.
+
 ## Known gaps
 
 - A plugin that already binds `0.0.0.0` on its port (seen 2026-10-14: the goatmon plugin on 7441) cannot be fronted: the gateway logs
