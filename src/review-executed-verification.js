@@ -7,6 +7,7 @@
 const { resolveSourceName } = require('./task-source-registry.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { describeFailure } = require('./describe-failure.js');
 
 // --- executed verification (2026-09-30) ---------------------------------------------------------
 // The reviewer votes on the draft's own NARRATED "Acceptance:" results and never reproduces any of them. review-verify.js applies the diff in a
@@ -90,21 +91,21 @@ function executedVerificationBlockReason(ev, options = {}) {
   if (mode === 'advisory') return null;
   const bits = [];
   if (ev.tests && ev.tests.passed === false) {
-    const names = (ev.tests.failures || []).slice(0, 5).join('; ');
-    bits.push(`the tests covering it (${(ev.tests.ran || []).join(', ')}) FAIL${names ? `: ${names}` : ''}`);
+    const names = (ev.tests.failures || []).slice(0, 5).map((f) => describeFailure(f)).join('; ');
+    bits.push(`the tests covering it (${(ev.tests.ran || []).map((t) => describeFailure(t)).join(', ')}) FAIL${names ? `: ${names}` : ''}`);
   }
   for (const c of (ev.commands || []).filter((x) => x.outcome === 'contradicted')) {
-    bits.push(`the draft claimed PASS for \`${c.command}\` but it exits ${c.exitCode}`);
+    bits.push(`the draft claimed PASS for \`${describeFailure(c.command)}\` but it exits ${describeFailure(c.exitCode)}`);
   }
   // Test pinning failures: the covering tests pass with the diff but also pass on the base,
   // meaning the diff is unnecessary (or a refactor that does not change behavior).
   if (ev.blockedTests && Array.isArray(ev.blockedTests) && ev.blockedTests.length) {
     bits.push(`test pinning failed: the covering tests pass on the base without the diff (${ev.blockedTests.length} test(s) unverified)`);
   }
-  const tail = (ev.tests && ev.tests.passed === false && ev.tests.raw)
+  const tail = describeFailure((ev.tests && ev.tests.passed === false && ev.tests.raw)
     || ((ev.commands || []).find((c) => c.outcome === 'contradicted') || {}).detail
-    || (ev.blockedTests && ev.blockedTests[0] ? String(ev.blockedTests[0]).slice(-700) : '');
-  return `Deterministic gate: executed verification failed -- the diff was applied in a scratch worktree and ${bits.join('; ') || (ev.reasons || []).join('; ')}.${tail ? ` Output tail: ${tail}` : ''} No local-model review call spent on a draft whose own tests or claimed checks demonstrably fail.`;
+    || (ev.blockedTests && ev.blockedTests[0] ? String(ev.blockedTests[0]).slice(-700) : ''));
+  return `Deterministic gate: executed verification failed -- the diff was applied in a scratch worktree and ${bits.join('; ') || (ev.reasons || []).map((r) => describeFailure(r)).join('; ')}.${tail ? ` Output tail: ${tail}` : ''} No local-model review call spent on a draft whose own tests or claimed checks demonstrably fail.`;
 }
 
 // A slice of a hub (stacked branch, dependency, parent hub) can legitimately add something a later sibling wires up.
