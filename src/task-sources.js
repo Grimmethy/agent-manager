@@ -51,6 +51,7 @@ const { listHeldTasksFifo, deriveResolveIdentity, selfHealResolveDeadlock, build
 const { taskPriority } = require('./lib/task-priority.js');
 const { markPipelineHealthAuditChecked, markUiVisibilityAuditChecked, coverageEntryActiveLocal, markPipelineDebriefReported } = require('./lib/task-audit.js');
 const { nextProductSpecSectionTask, getNextTask, setPreemptLoaders } = require('./lib/task-selection.js'); setPreemptLoaders({ nextAdhocTask, nextDerivedTask }); // registered here (hoisted declarations) so lib/task-selection.js need not require this file
+const { shouldLeaseOrSkip, canClaim } = require('./node-generated-lease.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -3351,6 +3352,7 @@ if (require.main === module) {
     } else if (!task) {
       console.log('no eligible task found (all registered sources exhausted or malformed)');
     } else {
+      const _lease = shouldLeaseOrSkip({ nodeId: process.env.AGENT_MANAGER_NODE_ID, task, sourceScope: task.scope, canClaim }); if (_lease === 'skip') return; if (_lease === 'lease') task.leasedTo = process.env.AGENT_MANAGER_NODE_ID;
       const file = writeTask(task);
       console.log(`queued: ${file}`);
       if (task.source === 'pipeline_self_audit') markPipelineSelfAuditReported(task);
