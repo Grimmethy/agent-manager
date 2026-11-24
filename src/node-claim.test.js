@@ -342,3 +342,39 @@ test('claimNext still offers a task the claimant node reported blocked only once
   fs.writeFileSync(path.join(pipelineDir, 'queue', 'adhoc', 'tb2.json'), JSON.stringify({ id: 'tb2', title: 'tb2', domain: 'adhoc', source: 'manual', history: [{ stage: 'node-blocked grimm' }] }));
   assert.equal(claimNext({ claimant: 'grimm', pipelineDirs: [pipelineDir], env }).task.id, 'tb2');
 });
+
+test('requireRemote: a task whose project has no origin URL is skipped before any lease is taken, and the next one with a remote is claimed', () => {
+  const { pipe, pending, env } = setup();
+  const other = path.join(path.dirname(pipe), 'pipe-with-remote');
+  fs.mkdirSync(path.join(other, 'queue', 'pending'), { recursive: true });
+  writeTask(pending, 'no-remote-task', {}, 200);
+  writeTask(path.join(other, 'queue', 'pending'), 'remote-task', {}, 100);
+  const skipped = [];
+  const r = claimNext({
+    claimant: 'node-a', pipelineDirs: [pipe, other], env, now: Date.now(), skipped, requireRemote: true,
+    readRemote: (dir) => (dir === other ? 'git@github.com:org/repo.git' : ''),
+  });
+  assert.ok(r, 'the task with a remote is claimed');
+  assert.strictEqual(r.task.id, 'remote-task');
+  assert.deepStrictEqual(skipped.filter((x) => x.reason === 'no-remote'), [{ taskId: 'no-remote-task', reason: 'no-remote' }]);
+  assert.deepStrictEqual(listLeases(env).map((l) => l.taskId), ['remote-task'], 'no lease row for the skipped task');
+  assert.strictEqual(readJson(path.join(pending, 'no-remote-task.json')).leasedTo, undefined, 'the skipped record is not stamped');
+});
+
+test('requireRemote off (the default) still lends a task whose project has no origin URL', () => {
+  const { pipe, pending, env } = setup();
+  writeTask(pending, 'plain-task', {}, 100);
+  const r = claimNext({ claimant: 'node-a', pipelineDirs: [pipe], env, now: Date.now(), readRemote: () => '' });
+  assert.ok(r);
+  assert.strictEqual(r.repo.remoteUrl, '');
+});
+
+test('requireRemote reads each project dir once per claim', () => {
+  const { pipe, pending, env } = setup();
+  writeTask(pending, 'a', {}, 300);
+  writeTask(pending, 'b', {}, 200);
+  writeTask(pending, 'c', {}, 100);
+  let calls = 0;
+  claimNext({ claimant: 'node-a', pipelineDirs: [pipe], env, now: Date.now(), requireRemote: true, readRemote: () => { calls += 1; return ''; } });
+  assert.strictEqual(calls, 1);
+});

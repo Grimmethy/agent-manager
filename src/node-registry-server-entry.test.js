@@ -10,7 +10,7 @@ const os = require('node:os');
 const net = require('node:net');
 const path = require('node:path');
 const http = require('node:http');
-const { spawn } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
 const { parsePipelineDirs } = require('./node-registry-server.js');
 const { registerNode } = require('./node-registry.js');
 
@@ -88,6 +88,8 @@ test('the standalone service claims from the pipelines named in AGENT_MANAGER_NO
   const s = await startStandalone(t);
   const pipe = path.join(s.dir, 'pipe');
   fs.mkdirSync(path.join(pipe, 'queue', 'adhoc'), { recursive: true });
+  execFileSync('git', ['init', '-q', pipe]); // /claim skips a task whose project has no origin URL
+  execFileSync('git', ['-C', pipe, 'remote', 'add', 'origin', 'https://example.invalid/repo.git']);
   fs.writeFileSync(path.join(pipe, 'queue', 'adhoc', 't-9.json'), JSON.stringify({ id: 't-9', title: 'x' }));
   const r = await postJson(s.port, s.token, '/claim', { id: 'grimm' });
   assert.equal(r.status, 200);
