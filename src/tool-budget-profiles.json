@@ -1,0 +1,6 @@
+{
+  "measurement": "Sample size: 0 runs. These budgets and multiples are provisional placeholders for local models, not measured values. Re-derive them from real local-model runs before relying on them.",
+  "reviewer": { "budget": 8, "multiple": 2 },
+  "drafter": { "budget": 24, "multiple": 2 },
+  "apply": { "budget": 16, "multiple": 2 }
+}
