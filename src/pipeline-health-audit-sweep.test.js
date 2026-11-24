@@ -19,7 +19,7 @@ const path = require('path');
 const { pipelineHealthAuditSweep } = require('./pipeline-health-audit-sweep.js');
 
 test('pipelineHealthAuditSweep does nothing (filed: false) when next() returns null (not due, or no anomalies)', () => {
-  const result = pipelineHealthAuditSweep({ next: () => null, write: () => { throw new Error('write must not be called'); } });
+  const result = pipelineHealthAuditSweep({ eligible: () => true, next: () => null, write: () => { throw new Error('write must not be called'); } });
   assert.deepEqual(result, { filed: false });
 });
 
@@ -27,6 +27,7 @@ test('pipelineHealthAuditSweep writes the task and reports filed: true when next
   const task = { id: 'pipeline-health-audit-123', source: 'pipeline_health_audit', title: 'Pipeline health audit: something is wrong' };
   const writeCalls = [];
   const result = pipelineHealthAuditSweep({
+    eligible: () => true,
     next: () => task,
     write: (t) => { writeCalls.push(t); return '/fake/queue/pending/pipeline-health-audit-123.json'; },
   });
@@ -37,9 +38,21 @@ test('pipelineHealthAuditSweep writes the task and reports filed: true when next
 });
 
 test('pipelineHealthAuditSweep reports { filed: false, error } instead of throwing when next() itself throws', () => {
-  const result = pipelineHealthAuditSweep({ next: () => { throw new Error('boom'); }, write: () => {} });
+  const result = pipelineHealthAuditSweep({ eligible: () => true, next: () => { throw new Error('boom'); }, write: () => {} });
   assert.equal(result.filed, false);
   assert.match(result.error, /boom/);
+});
+
+test('pipelineHealthAuditSweep skips (no next, no write) when the core-scope check says the active project is not agent-manager', () => {
+  const calls = { next: 0, write: 0 };
+  const result = pipelineHealthAuditSweep({
+    eligible: () => false,
+    next: () => { calls.next++; return { id: 'x', title: 'x' }; },
+    write: () => { calls.write++; return '/fake'; },
+  });
+  assert.deepEqual(result, { filed: false, skipped: 'core-scope: active project is not agent-manager' });
+  assert.equal(calls.next, 0);
+  assert.equal(calls.write, 0);
 });
 
 // End-to-end wiring check, same shape as task-sources.test.js's own
@@ -65,5 +78,10 @@ test('pipelineHealthAuditSweep(), with no injected deps, defers to the real next
   markChecked(path.join(dir, 'instances'), new Date());
 
   const { pipelineHealthAuditSweep: realSweep } = require('./pipeline-health-audit-sweep.js');
-  assert.deepEqual(realSweep(), { filed: false });
+  // Active-project independent: with the core-scope gate open this is { filed: false }; when the active
+  // project is not agent-manager it is the core-scope skip. Either way nothing is filed and nothing errors.
+  const result = realSweep();
+  assert.equal(result.filed, false);
+  assert.equal(result.error, undefined);
+  assert.ok(result.skipped === undefined || result.skipped === 'core-scope: active project is not agent-manager');
 });
