@@ -8,6 +8,9 @@ const os = require('os');
 const path = require('path');
 const { switchMessage, OPERATOR_TEXT } = require('./worker-switch-message.js');
 const { setPause, setDisabled } = require('./worker-switch.js');
+const { pinTimezone } = require('../test/helpers/pin-timezone.js');
+
+pinTimezone('UTC');
 
 function env() {
   return { AGENT_MANAGER_DISABLED_WORKERS_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'wsm-')) };
