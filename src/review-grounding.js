@@ -15,36 +15,37 @@ const { getRegisteredSource, resolveSourceName } = require('./task-source-regist
 const { appendHistoryEvent } = require('./task-history.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 
-function getDomainConfig(domainsPath, domain) {
+function getDomainConfig(domainsPath, domain, { pipelineDir } = {}) {
   const domains = JSON.parse(fs.readFileSync(domainsPath, 'utf8'));
-  const cfg = domains[domain];
-  if (!cfg) {
-    // Self-heal: if the domain is a standard one (derived from task-source-registry.js),
-    // add it to the pipeline's task-domains.json and continue. This prevents tasks from
-    // being permanently blocked due to a missing key.
-    const { isStandardDomain, getDomainShape } = require('./task-domains-registry.js');
-    if (isStandardDomain(domain)) {
-      const shape = getDomainShape(domain);
-      domains[domain] = shape;
-      // Atomic write: write to tmp, then rename.
-      const tmp = `${domainsPath}.tmp-${process.pid}`;
-      fs.writeFileSync(tmp, JSON.stringify(domains, null, 2) + '\n');
-      fs.renameSync(tmp, domainsPath);
-      // Log the self-heal action.
-      try {
-        const { logPipelineEvent } = require('./pipeline-history.js');
-        logPipelineEvent(path.dirname(domainsPath), 'task-domain-self-heal', {
-          domain,
-          shape,
-          at: new Date().toISOString(),
-        });
-      } catch { /* pipeline-history may not be available in all contexts */ }
-      return shape;
+  // 1. Exact-key registry lookup (no case folding, no prefix matching).
+  if (Object.prototype.hasOwnProperty.call(domains, domain)) {
+    const entry = domains[domain];
+    // 2. Deprecated marker: throw without healing.
+    if (entry && entry.deprecated) {
+      throw new Error(`Deprecated task domain: ${domain} in ${domainsPath} -- this domain is marked deprecated; use its replacement instead`);
     }
-    // Genuinely unknown domain: block with a clear message naming the file to edit.
-    throw new Error(`Unknown task domain: ${domain} (valid: ${Object.keys(domains).join(', ')}) in ${domainsPath} -- add "${domain}" to ${domainsPath} or run scripts/ensure-task-domains.sh <that pipeline dir>`);
+    return entry;
   }
-  return cfg;
+  // 3. Self-heal: only for an exact standard-domain name absent from the registry.
+  const { isStandardDomain, getDomainShape } = require('./task-domains-registry.js');
+  if (isStandardDomain(domain)) {
+    const shape = getDomainShape(domain);
+    // Audit before the write: one event per heal.
+    logPipelineEvent(pipelineDir || path.dirname(domainsPath), 'domain-self-heal', {
+      domain,
+      domainsPath,
+      previousRegistry: null,
+      addedEntry: shape,
+    });
+    domains[domain] = shape;
+    // Atomic write: write to a .tmp file, then rename over the registry.
+    const tmp = `${domainsPath}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(domains, null, 2) + '\n');
+    fs.renameSync(tmp, domainsPath);
+    return shape;
+  }
+  // 4. Genuinely unknown domain: block with a clear message naming the file to edit.
+  throw new Error(`Unknown task domain: ${domain} (valid: ${Object.keys(domains).join(', ')}) in ${domainsPath} -- add "${domain}" to ${domainsPath} or run scripts/ensure-task-domains.sh <that pipeline dir>`);
 }
 
 function getWorkDir(cfg, { repoRoot, secondBrainDir }) {
@@ -148,7 +149,7 @@ function preValidationGate({ task, repoRootForCheck, factCheckExtraRoots, pipeli
 // ctx: { task, repoRoot, secondBrainDir, domainsPath, deepDiveCoveragePath, pipelineDir, recordModelOutcome }
 // -> { early } or { factCheck, factCheckVerdict, repoRootForCheck, groundingText, factCheckExtraRoots, groundingRef }.
 function prepareFactCheck({ task, repoRoot, secondBrainDir, domainsPath, deepDiveCoveragePath, pipelineDir, recordModelOutcome }) {
-  const domainCfg = getDomainConfig(domainsPath, task.domain);
+  const domainCfg = getDomainConfig(domainsPath, task.domain, { pipelineDir });
   const workDir = getWorkDir(domainCfg, { repoRoot, secondBrainDir });
   const repoRootForCheck = resolveRepoRootForCheck({ task, workDir, deepDiveCoveragePath });
   const groundingText = buildGroundingText(task);
