@@ -10,6 +10,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { targetRepoForTask } = require('./task-target-repo.js');
 
 const DEBOUNCE_MS = 2000;
 const BACKOFF_FIRST_MS = 30000;
@@ -126,6 +127,14 @@ async function pullOnce({ env = process.env, deps = {}, state = makeState() } = 
         return failure(d, state, `claim response has no repo.remoteUrl (task ${body.task.id})`);
       }
       await d.ensureRepo({ remoteUrl });
+      try {
+        const target = targetRepoForTask(body.task);
+        if (target !== null && target.remoteUrl !== remoteUrl) {
+          await d.ensureRepo({ remoteUrl: target.remoteUrl });
+        }
+      } catch (e) {
+        d.log(`node-pull: target repo for task ${body.task.id} failed: ${errorMessage(e)}`);
+      }
       const record = { ...body.task, leasedTo: id };
       if (!d.writeAdhoc(pipelineDir, record)) {
         return failure(d, state, `task ${body.task.id} is already queued`);
