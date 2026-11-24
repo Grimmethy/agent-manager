@@ -44,6 +44,4 @@ function switchSleepMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { projectSwitchState, renderProjectSwitchNoticeHtml, switchNoticeBaseName, switchSleepMs };
-}
+if (typeof module !== 'undefined' && module.exports) module.exports = { projectSwitchState, renderProjectSwitchNoticeHtml, switchNoticeBaseName, switchSleepMs };

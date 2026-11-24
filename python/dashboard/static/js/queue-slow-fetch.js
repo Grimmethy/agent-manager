@@ -29,7 +29,5 @@
   var g = (typeof window !== 'undefined') ? window : globalThis;
   g.QueueSlowFetch = QueueSlowFetch;
 
-  if (typeof module !== 'undefined' && module.exports) {
-    module.exports = QueueSlowFetch;
-  }
+  if (typeof module !== 'undefined' && module.exports) module.exports = QueueSlowFetch;
 })();
