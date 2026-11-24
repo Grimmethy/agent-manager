@@ -18,13 +18,32 @@ function workerSwitchState(inst) {
   return 'going-off-idle';
 }
 
-function buildWorkerSwitchHtml(inst) {
+// Host name shown in switch tooltips and the Workers header: the page's own hostname, '' when unknown.
+function workerSwitchHostName() {
+  return (typeof location !== 'undefined' && location.hostname) ? location.hostname : '';
+}
+
+// Returns RAW (unescaped) text; the caller escapes it once. Falls back to 'this machine' when the host is unknown.
+function workerSwitchHostLabel(host) {
+  return host ? String(host) : 'this machine';
+}
+
+function workerSwitchTitle(turningOn, host) {
+  const where = 'this lane on ' + workerSwitchHostLabel(host) + ' only';
+  return turningOn
+    ? 'Turns on ' + where + ': it starts claiming tasks again within about one tick (30 seconds).'
+    : 'Turns off ' + where + ': it finishes the task it is on, then claims nothing until you turn it back on. The process keeps running.';
+}
+
+function workersHeaderLine(host) {
+  return 'Switches here control ' + workerSwitchHostLabel(host) + ' only; node lanes are listed read-only.';
+}
+
+function buildWorkerSwitchHtml(inst, host) {
   const state = workerSwitchState(inst);
   if (!state) return '';
   const turningOn = state !== 'on';
-  const title = turningOn
-    ? 'Switch this worker back on: it starts claiming tasks again within about one tick (30 seconds).'
-    : 'Switch this worker off: it finishes the task it is on, then claims nothing until you turn it back on. The process keeps running.';
+  const title = workerSwitchTitle(turningOn, host);
   const notes = {
     'going-off-working': '<span class="badge warn" title="Switched off: it finishes its current task, then claims nothing">turning off after this task</span>',
     'going-off-idle': '<span class="badge warn" title="Switched off: it stops claiming at its next tick">turning off…</span>',

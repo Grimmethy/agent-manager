@@ -322,7 +322,7 @@ async function renderWorkers(isPoll) {
   // can push #main well past one screen, and a poll landing mid-scroll would otherwise
   // silently reset the operator back to the top every 5s.
   const scrollY = window.scrollY;
-  main.innerHTML = filterBar + (shown.length === 0
+  main.innerHTML = (typeof workersHeaderLine === 'function' ? '<div class="meta">' + workerSwitchEsc(workersHeaderLine(workerSwitchHostName())) + '</div>' : '') + filterBar + (shown.length === 0
     ? '<div class="empty">No workers match this filter.</div>'
     : shown.map(inst => `
     <div class="worker-card clickable${typeof workerCardOffClass === 'function' ? workerCardOffClass(inst) : ''}" data-instance-id="${escapeAttr(inst.instanceId)}">
@@ -334,7 +334,7 @@ async function renderWorkers(isPoll) {
           <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : statusLabel(inst.status)}</span>
           ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
           <span class="state-timer" id="state-timer-${inst.instanceId}">${inst.stateAgeSeconds != null ? 'in this state ' + fmtDuration(inst.stateAgeSeconds) : ''}</span>
-          ${typeof buildWorkerSwitchHtml === 'function' ? buildWorkerSwitchHtml(inst) : ''}
+          ${typeof buildWorkerSwitchHtml === 'function' ? buildWorkerSwitchHtml(inst, typeof workerSwitchHostName === 'function' ? workerSwitchHostName() : '') : ''}
         </div>
       </div>
       <div class="meta">
