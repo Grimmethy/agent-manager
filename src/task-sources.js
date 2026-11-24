@@ -3351,6 +3351,7 @@ if (require.main === module) {
     } else if (!task) {
       console.log('no eligible task found (all registered sources exhausted or malformed)');
     } else {
+      require('./node-generated-lease.js').applyGeneratedLease(task);
       const file = writeTask(task);
       console.log(`queued: ${file}`);
       if (task.source === 'pipeline_self_audit') markPipelineSelfAuditReported(task);
