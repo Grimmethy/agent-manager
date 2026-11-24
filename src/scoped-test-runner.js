@@ -233,6 +233,15 @@ function withSandbox(fn) {
 // regression" on every commit touching a lock-contending file. `passed: null` marks this
 // inconclusive -- same "stay silent, let the LLM decide" treatment as no-coverage-exists,
 // never folded into a hard pass or fail.
+// A non-zero exit with no `not ok` line (e.g. a test file that throws while it loads) would otherwise leave the failure list empty. Records it as one string entry in
+// the same "<file path>: <error text>" shape the other failure entries use, so the message is never built through object-to-string conversion.
+function loadErrorEntry(file, out, err) {
+  const text = String(out || '');
+  const line = text.split('\n').map((l) => l.trim().replace(/^#\s*/, '')).find((l) => /^[A-Za-z]*Error: /.test(l));
+  const msg = line || (err && typeof err.message === 'string' ? err.message : String(err));
+  return `${file}: ${msg}`;
+}
+
 function runNodeTests(repoRoot, files) {
   if (!files.length) return null;
   try {
@@ -243,7 +252,14 @@ function runNodeTests(repoRoot, files) {
   } catch (e) {
     const timedOut = e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT';
     const out = `${e.stdout || ''}${e.stderr || ''}`;
-    return { ran: files, passed: timedOut || e.code === 'ENOENT' ? null : false, failures: parseNodeTestFailures(out), raw: out.slice(0, 4000), timedOut };
+    // node --test reports a file that throws while loading as `not ok N - <absolute file path>`; that name is replaced with the load-error entry.
+    const failures = parseNodeTestFailures(out).map((name) => {
+      const file = files.find((f) => name === f || name.endsWith('/' + f));
+      return file ? loadErrorEntry(file, out, e) : name;
+    });
+    // A non-zero exit with no `not ok` line (e.g. a test file that throws while loading) is recorded as a load-error entry, not an empty list.
+    if (!failures.length && !timedOut && e.code !== 'ENOENT') failures.push(loadErrorEntry(files.join(', '), out, e));
+    return { ran: files, passed: timedOut || e.code === 'ENOENT' ? null : false, failures, raw: out.slice(0, 4000), timedOut };
   }
 }
 
