@@ -70,6 +70,22 @@ function readToken(file) {
   return token;
 }
 
+// Best-effort POST /release on the registry that served the claim (the claim URL with /claim swapped for /release). Never throws.
+async function releaseLease(d, claimUrl, token, nodeId, taskId) {
+  try {
+    const url = claimUrl.replace(/\/claim$/, '/release');
+    if (url === claimUrl) return false;
+    const res = await d.fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ id: nodeId, taskId }),
+    });
+    return Boolean(res && res.ok);
+  } catch (e) {
+    return false;
+  }
+}
+
 async function pullOnce({ env = process.env, deps = {}, state = makeState() } = {}) {
   const d = resolveDeps(deps);
   try {
@@ -104,7 +120,11 @@ async function pullOnce({ env = process.env, deps = {}, state = makeState() } = 
 
     if (body.task) {
       const remoteUrl = String((body.repo && body.repo.remoteUrl) || '').trim();
-      if (!remoteUrl) return failure(d, state, 'claim response has no repo.remoteUrl');
+      if (!remoteUrl) {
+        // Hand the lease back (best effort) so the task is not held for its full TTL, and name it so the log shows which one.
+        await releaseLease(d, claimUrl, token, id, body.task.id);
+        return failure(d, state, `claim response has no repo.remoteUrl (task ${body.task.id})`);
+      }
       await d.ensureRepo({ remoteUrl });
       const record = { ...body.task, leasedTo: id };
       if (!d.writeAdhoc(pipelineDir, record)) {
