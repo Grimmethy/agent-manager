@@ -3216,9 +3216,7 @@ if (require.main === module) {
       }
     }
   }
-  if (fs.existsSync(pendingDir)) {
-    for (const f of fs.readdirSync(pendingDir)) if (f.endsWith('.json')) inFlightFiles.push(path.join(pendingDir, f));
-  }
+  if (fs.existsSync(pendingDir)) inFlightFiles.push(...require('./pending-in-flight.js').claimablePendingFiles(fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json')).map((f) => path.join(pendingDir, f))));
   const instancesDir = sharedInstancesDir(pipelineDir);
   const alreadyPending = generationThrottled(inFlightFiles.length, instancesDir);
 
