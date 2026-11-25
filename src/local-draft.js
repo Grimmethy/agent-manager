@@ -877,6 +877,22 @@ async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRo
     // blocked/ forever with zero automated retry -- confirmed live: 2 of 4 stuck-child
     // hubs in Hub Tasks were gated on exactly this shape. 'plan' is deliberately not
     // 'review'/'apply'/'pre-critique'/'draft' so none of those checks accidentally match it.
+    task.blockedStage = 'plan';
+    // 2026-11 (HUB0822 1/3): clear any BLOCKER-TYPE tag the task may have picked up
+    // from a prior implement pass. Without this, a task re-routed to plan carries its
+    // old infra-error/design-question/budget-exhausted classification and the plan pass
+    // output gets misclassified as infra-error on re-entry. The BLOCKER-TYPE line is
+    // embedded in blockedReason as a line matching /BLOCKER-TYPE:\s*(design-question|budget-exhausted|infra-error)\b/i;
+    // strip that line (and the trailing newline) so the new degenerate-plan reason is
+    // the only content.
+    if (typeof task.blockedReason === 'string') {
+      const BLOCKER_TYPE_RE = /BLOCKER-TYPE:\s*(design-question|budget-exhausted|infra-error)\b/i;
+      task.blockedReason = task.blockedReason
+        .split('\n')
+        .filter(line => !BLOCKER_TYPE_RE.test(line))
+        .join('\n')
+        .replace(/\n+$/, '');
+    }
     return { blocked: true, blockedReason, blockedStage: 'plan' };
   }
 
@@ -2251,6 +2267,26 @@ async function runDraftPasses(task, attempt, {
       }
     }
     // TODO: strip mode -- remove bad citations and continue instead of rejecting.
+
+    // HUB0131 (1/2): brain_dump_sort drafts skip the critique model call entirely --
+    // plan + implement are enough for this source and the critique pass only burns a
+    // local-model turn. The audit log is best-effort: a log failure must NOT abort the
+    // pipeline. concludeDraft() runs first so the draft still lands a well-formed
+    // 'draft-done'/'needs-review' record (and task.status flips) exactly like the
+    // normal success path, then the sentinel below -- which still carries the
+    // succeeded/blocked contract keys main() keys on -- is returned.
+    if (resolveSourceName(task) === 'brain_dump_sort') {
+      try {
+        const { pipelineDir } = getConfig();
+        logPipelineEvent(pipelineDir, 'critique-skipped', {
+          taskId: task.id,
+          source: resolveSourceName(task),
+        });
+      } catch { /* best-effort -- an audit failure must not abort the pipeline */ }
+      appendHistoryEvent(task, 'critique-skipped', 'brain_dump_sort -- critique pass skipped by design (HUB0131)');
+      concludeDraft(task);
+      return { succeeded: true, blocked: false, skipped: true, reason: 'brain_dump_sort', issues: [] };
+    }
 
     await runCritiqueAndRevision(task, {
       maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall,

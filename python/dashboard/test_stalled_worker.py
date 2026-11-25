@@ -21,6 +21,29 @@ _ISO_ENV = mock.patch.dict(os.environ, {"HOME": _ISO_DIR, "STALLED_DISABLED_PATH
                                         "STALLED_INDEX_PATH": os.path.join(_ISO_DIR, "index.json")})
 
 
+class LatestDecisionHolds(unittest.TestCase):
+    def test_a_hold_followed_by_a_requeue_or_archive_is_not_a_hold(self):
+        for later in ("REQUEUE", "ARCHIVE-DUPLICATE"):
+            with self.subTest(later=later):
+                self.assertEqual(build(rows=[row("intent", "t", "HOLD-FOR-OWNER", 300), row("intent", "t", later, 100)])["holds"], [])
+
+    def test_a_task_held_twice_appears_once_with_the_age_of_its_latest_hold(self):
+        holds = build(rows=[row("intent", "t", "HOLD-FOR-OWNER", 500), row("intent", "t", "HOLD-FOR-OWNER", 200)])["holds"]
+        self.assertEqual([(h["taskId"], h["ageS"]) for h in holds], [("t", 200)])
+
+    def test_a_task_held_resolved_then_held_again_appears_once(self):
+        holds = build(rows=[row("intent", "t", "HOLD-FOR-OWNER", 500), row("intent", "t", "ARCHIVE-DUPLICATE", 300), row("intent", "t", "HOLD-FOR-OWNER", 100)])["holds"]
+        self.assertEqual([(h["taskId"], h["ageS"]) for h in holds], [("t", 100)])
+
+    def test_two_tasks_still_held_are_listed_oldest_first(self):
+        holds = build(rows=[row("intent", "young", "HOLD-FOR-OWNER", 100), row("intent", "old", "HOLD-FOR-OWNER", 900)])["holds"]
+        self.assertEqual([h["taskId"] for h in holds], ["old", "young"])
+
+    def test_a_row_without_a_taskId_does_not_clear_or_replace_a_hold(self):
+        holds = build(rows=[row("intent", "t", "HOLD-FOR-OWNER", 500), {"at": ISO(300), "mode": "on", "outcome": "ARCHIVE-DUPLICATE", "phase": "intent"}])["holds"]
+        self.assertEqual([(h["taskId"], h["ageS"]) for h in holds], [("t", 500)])
+
+
 def setUpModule():
     # Every test runs with HOME and every state path in a temp dir: even a broken rule can only ever write here, never the real ~/.local/state/pipeline-ops (a mutation run once did).
     _ISO_ENV.start()

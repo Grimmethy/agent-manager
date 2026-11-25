@@ -6,6 +6,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { buildSummary, runDaily, localDate, summaryHour } = require('./notify-summary.js');
+const { pinTimezone } = require('../test/helpers/pin-timezone.js');
+
+pinTimezone('UTC');
 
 const HOUR = 60 * 60 * 1000;
 

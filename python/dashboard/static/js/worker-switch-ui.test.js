@@ -136,7 +136,7 @@ test('wiring: workers-tab.js has the three guarded hooks and index.html loads wo
   const tab = fs.readFileSync(path.join(__dirname, 'workers-tab.js'), 'utf8');
   const html = fs.readFileSync(path.join(__dirname, '..', '..', 'templates', 'index.html'), 'utf8');
   assert.match(tab, /worker-card clickable\$\{typeof workerCardOffClass === 'function' \? workerCardOffClass\(inst\) : ''\}/);
-  assert.match(tab, /\$\{typeof buildWorkerSwitchHtml === 'function' \? buildWorkerSwitchHtml\(inst\) : ''\}/);
+  assert.match(tab, /\$\{typeof buildWorkerSwitchHtml === 'function' \? buildWorkerSwitchHtml\(inst, typeof workerSwitchHostName === 'function' \? workerSwitchHostName\(\) : ''\) : ''\}/);
   assert.match(tab, /if \(typeof wireWorkerSwitchButtons === 'function'\) wireWorkerSwitchButtons\(main\);/);
   const a = html.indexOf('static/js/workers-tab.js');
   const b = html.indexOf('static/js/worker-switch-ui.js');

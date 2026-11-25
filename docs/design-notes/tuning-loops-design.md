@@ -81,6 +81,7 @@ or `Docs/` artifact found). This design pins it down:
   Loops never read each other's slices.
 - **Append-only.** Rows are never rewritten; corrections are new rows. This makes every
   dismissal auditable (see §7's `dismissed_total` / `held_total` counters).
+- **Nullable measurement fields (target contract).** `metric.before`, `metric.after`, `cost.gpu_minutes`, and `cost.peak_ram_mb` accept a finite number or `null`. `null` means "not measured". The backfill writes `null` for a measurement it could not take and lists that field in `verdict.inputs.unknown_fields`. `cost.model_calls` remains a required number and is never `null`. Status: this is the target contract. The current validator in `src/health-ledger-schema.js` still declares these fields as `number` and rejects `null`; accepting `null` depends on sibling work HUB0286.
 
 ## 3. The first three loops, in build order (each with its smallest first PR)
 

@@ -375,6 +375,20 @@ const CLASSIFIERS = [
       return null;
     },
   },
+  {
+    // 2026-11-22 (HUB0822 · 2/3): the plan pass produced a degenerate/empty/non-actionable
+    // output (no actionable steps, empty plan, etc.). This is a plan-quality issue, not an
+    // infra-error -- the model failed to produce a useful plan, not a harness/environment
+    // failure. Classified as faultSide:'model', retryable:false: a blind retry cannot fix a
+    // degenerate plan (the same model will produce the same degenerate output).
+    name: 'plan-pass-degenerate',
+    classify(task) {
+      if (/plan pass degenerate/i.test(String(task.blockedReason || ''))) {
+        return { category: 'plan-quality', faultSide: 'model', retryable: false };
+      }
+      return null;
+    },
+  },
   ...REASON_CATEGORIES.map(({ key, keywords }) => ({
     name: key,
     classify(task) {
@@ -420,6 +434,13 @@ function findClassifier(name) {
   return CLASSIFIERS.find((c) => c.name === name) || null;
 }
 
+// 2026-11-22 (HUB0822 · 2/3): exported for direct use by plan-pass routing logic
+// (HUB0822 · 1/3) and tests (HUB0822 · 3/3). Detects 'Plan pass degenerate' in
+// blockedReason -- a plan-quality issue, not an infra-error.
+function isDegeneratePlanPass(task) {
+  return /plan pass degenerate/i.test(String(task.blockedReason || ''));
+}
+
 module.exports = {
   CLASSIFIERS,
   REASON_CATEGORIES,
@@ -433,6 +454,7 @@ module.exports = {
   hasFabricatedSymbolCitation,
   hasNoContextFiles,
   isInfraError,
+  isDegeneratePlanPass,
   signatureForTask,
   findClassifier,
 };

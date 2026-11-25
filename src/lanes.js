@@ -72,6 +72,7 @@ const PROVIDERS = ['ollama', 'cloud', 'script'];
 let registryError = false; // set when the registry file exists but cannot be read or parsed (the --env CLI refuses to print a lane then)
 let detectedGpu; // cached per process
 const warned = new Set();
+const warnedCloudTaskClasses = new Set(); // lane ids that carried a taskClasses list now ignored because the lane is cloud
 
 function warnOnce(msg) {
   if (warned.has(msg)) return;
@@ -177,6 +178,10 @@ function laneFromEntry(raw, index) {
     const list = Array.isArray(raw.taskClasses) ? raw.taskClasses.map((c) => String(c).trim()).filter(Boolean) : [];
     if (!list.length) { warnOnce(`${where} (${id}) taskClasses must be a non-empty array of task source names; skipped`); return null; }
     taskClasses = [...new Set(list)];
+  }
+  if (cloud && taskClasses && !warnedCloudTaskClasses.has(id)) {
+    warnedCloudTaskClasses.add(id);
+    warnOnce(`${where} (${id}) is a cloud lane and its taskClasses list is ignored; removing`);
   }
   let projects = null;
   if (raw.projects !== undefined && raw.projects !== null) {
@@ -310,20 +315,24 @@ function laneById(id, env = process.env) {
   return getLanes(env).find((l) => l.id === id) || null;
 }
 
-// May this lane claim a task of this source? A lane with no allowlist (host, P40, most registry lanes) claims anything. An unknown /
+// May this lane claim a task of this source? Cloud lanes (provider 'cloud') always claim anything -- their taskClasses allowlist is ignored.
+// A lane with no allowlist (host, P40, most registry lanes) claims anything. An unknown /
 // unresolvable source name never matches a restricted lane (fail closed).
 function laneAllowsSource(lane, sourceName) {
+  if (lane && lane.provider === 'cloud') return true;
   if (!lane || !Array.isArray(lane.taskClasses)) return true;
   return typeof sourceName === 'string' && lane.taskClasses.includes(sourceName);
 }
 
-// May this lane claim a task with these attributes? Scope is ignored for reviewer lanes.
+// May this lane claim a task with these attributes? Cloud lanes (provider 'cloud') always claim anything -- their taskClasses, projects and
+// raisedFromPrefix are ignored. Scope is ignored for reviewer lanes.
 // A reviewer (reviewer:true or role==='reviewer') always returns true. Otherwise the lane's
 // projects (if set) must contain `project` exactly, and raisedFromPrefix (if set) must have an
 // entry that `raisedFrom` starts with; both project and raisedFrom must be present. taskClasses
 // still applies (fail closed).
 function laneAllowsTask(lane, { source, project, raisedFrom }) {
   if (lane && (lane.reviewer === true || lane.role === 'reviewer')) return true;
+  if (lane && lane.provider === 'cloud') return true;
   if (!laneAllowsSource(lane, source)) return false;
   if (!project || !raisedFrom) return false;
   if (lane.projects && !lane.projects.includes(project)) return false;

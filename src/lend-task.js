@@ -21,6 +21,17 @@ const { writeJsonAtomicSync } = require('./atomic-write.js');
 const POST_TIMEOUT_MS = 15000;
 const QUEUES = ['pending', 'adhoc'];
 
+// Strip the plan-limit deferUntil field from a task copy. The node is a different
+// account, so a lent copy must never carry a plan-limit deferral set by this
+// machine's worker. The canonical home of this helper is src/draft-quota.js
+// (stripPlanLimitDeferral); it is defined locally here because that dependency
+// (HUB0803-0/1) has not landed yet. Once it does, replace this with an import.
+function stripPlanLimitDeferral(task) {
+  if (!task || typeof task !== 'object') return task;
+  const { deferUntil: _skip, ...rest } = task;
+  return rest;
+}
+
 // The queue file of a task on this machine, or null.
 function findRecordFile(pipelineDir, taskId) {
   for (const q of QUEUES) {
@@ -51,7 +62,8 @@ async function lendTask({ taskId, nodeId, pipelineDir, url, tokenFile, post = ht
   if (!lease) return { ok: false, reason: `task ${taskId} already has a live lease` };
   let status = 0;
   try {
-    const res = await post(url, { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, JSON.stringify({ task: record, lease: { taskId, nodeId, expiresAt: lease.expiresAt } }), POST_TIMEOUT_MS);
+    const lentTask = stripPlanLimitDeferral(record);
+    const res = await post(url, { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, JSON.stringify({ task: lentTask, lease: { taskId, nodeId, expiresAt: lease.expiresAt } }), POST_TIMEOUT_MS);
     status = Number(res && res.status) || 0;
   } catch (e) {
     status = 0;

@@ -365,6 +365,46 @@ function renameSources(rawDiff) {
   return out;
 }
 
+// Restores the files a failed apply touched. A file with a HEAD entry is checked out from HEAD and never unlinked.
+// A file with no HEAD entry (one the patch created) is unlinked, ENOENT tolerated. A file whose HEAD probe fails for
+// a non-exit reason (spawn error) is recorded as unrestored and left alone.
+function restoreFilesAfterFailedApply(files, repoRoot) {
+  const restored = [];
+  const removed = [];
+  const unrestored = [];
+  for (const file of files) {
+    let inHead;
+    try {
+      // `git cat-file -e` exits non-zero when the entry is missing; that is a normal answer, not a failure.
+      execFileSync('git', ['cat-file', '-e', `HEAD:${file}`], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'] });
+      inHead = true;
+    } catch (probeErr) {
+      if (typeof probeErr.status !== 'number') {
+        unrestored.push({ file, error: String(probeErr.message || probeErr) });
+        continue;
+      }
+      inHead = false;
+    }
+    if (inHead) {
+      try {
+        // `HEAD --` (not bare `--`): a failed --3way leaves the index unmerged, and only a real commit-ish resets it.
+        execFileSync('git', ['checkout', 'HEAD', '--', file], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+        restored.push(file);
+      } catch (checkoutErr) {
+        unrestored.push({ file, error: String(checkoutErr.stderr || checkoutErr.message || checkoutErr).trim() });
+      }
+      continue;
+    }
+    try {
+      fs.unlinkSync(path.join(repoRoot, file));
+      removed.push(file);
+    } catch (unlinkErr) {
+      if (unlinkErr.code !== 'ENOENT') unrestored.push({ file, error: unlinkErr.message || String(unlinkErr) });
+    }
+  }
+  return { restored, removed, unrestored };
+}
+
 function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
   if (task && task.adhocResolution === 'decompose') {
     return buildDecomposedPlan(task, pipelineDir);
@@ -405,6 +445,12 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
     }
     // A rename also touches its old path (the apply deletes it): stage it too, and restore it if the apply fails.
     files.push(...renameSources(rawDiff));
+    // Rename destinations too (`rename to <path>`): a failed apply can leave the new name behind, so it must be restored or removed as well.
+    for (const line of String(rawDiff).split('\n')) {
+      if (!line.startsWith('rename to ')) continue;
+      const dest = unquoteGitPath(line.slice('rename to '.length));
+      if (dest && !files.includes(dest)) files.push(dest);
+    }
 
     // --recount: confirmed live 2026-08-18 -- a real, otherwise-valid diff from
     // adhoc-agentic-draft.js's agentic capture (`git diff` against an isolated worktree)
@@ -445,28 +491,9 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
         // failed" report that reads as "nothing changed." Restore every file this
         // patch touches to its real HEAD content before rethrowing, so a failed
         // attempt -- 3-way or plain -- has the exact same "untouched" guarantee.
-        for (const file of files) {
-          try {
-            // `HEAD --` (not bare `--`, which means "from the index") -- confirmed live
-            // writing this fix: a failed --3way conflict leaves the INDEX itself marked
-            // unmerged (stage U), and plain `git checkout -- <file>` refuses to touch an
-            // unmerged path ("error: path is unmerged") entirely. Checking out an actual
-            // commit-ish resets both the index and working tree regardless of merge state.
-            execFileSync('git', ['checkout', 'HEAD', '--', file], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
-          } catch (restoreErr) {
-            // Fails for a file this patch CREATES (mode:"create" has no HEAD entry to
-            // restore from) -- the failed --3way attempt may have still written a stray
-            // file there. Best-effort remove it rather than leave a leftover conflict-
-            // marker file sitting in the repo untracked; per-file (not a blanket git
-            // clean) so an unrelated pre-existing untracked file elsewhere is never
-            // touched.
-            try { fs.unlinkSync(path.join(repoRoot, file)); } catch (unlinkErr) {
-              if (unlinkErr.code !== 'ENOENT') {
-                console.warn(`[apply-adhoc-diff] failed to remove stray file after failed apply: ${file} -- ${unlinkErr.message || String(unlinkErr)}`);
-              }
-            }
-          }
-        }
+        // Files with a HEAD entry are checked out from HEAD; files the patch created are unlinked (see restoreFilesAfterFailedApply).
+        const restoreResult = restoreFilesAfterFailedApply(files, repoRoot);
+        if (restoreResult.unrestored.length) plainApplyErr.unrestored = restoreResult.unrestored;
         // Surface the PLAIN apply's error (what a human/redraft decision should
         // actually see), not the 3-way attempt's, since 3-way's own failure mode
         // ("Failed to merge in the changes") is less informative about the real
@@ -493,7 +520,8 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
     return { files };
   } catch (e) {
     if (/^acceptance command failed/.test(e.message || '')) throw e;
-    const detail = (e.stdout || e.stderr || e.message || '').toString().slice(0, 2000);
+    const restoreNote = Array.isArray(e.unrestored) && e.unrestored.length ? `\n[restore incomplete -- left in place: ${e.unrestored.map((u) => `${u.file} (${u.error})`).join('; ')}]` : '';
+    const detail = (e.stdout || e.stderr || e.message || '').toString().slice(0, 2000) + restoreNote;
     // Only on this failure path: if the diff was written for another registered project, name it and where the record belongs (apply-target-hint.js).
     const hint = targetHintForFailure(rawDiff, repoRoot);
     throw new Error(`git apply failed: ${detail}${hint ? `\n${hint}` : ''}`);
@@ -502,4 +530,4 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
   }
 }
 
-module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask, slugify, BRAIN_DUMP_DISPOSITION_RE, renameSources, unquoteGitPath };
+module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask, slugify, BRAIN_DUMP_DISPOSITION_RE, renameSources, unquoteGitPath, restoreFilesAfterFailedApply };
