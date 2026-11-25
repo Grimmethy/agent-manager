@@ -1,7 +1,7 @@
 """The rules of the Python main-push gate (HUB0364): a write to the main branch is allowed only when the exact commit has a READY record.
 
 Mirrors `assertMainPushReady` in src/lib/main-push-policy.js rule for rule and message for message (test_main_push_gate.py runs both on the same fixtures). The merge-route hook that applies these rules lives in main_push_gate.py.
-READY record = a `merge` verdict from a human source (chat or manual) for exactly this (branch, head sha) in <queue dir>/branch-verdicts.json
+READY record = a `merge` verdict from a human source (chat or manual), or from a worker (owner order 2026-11-25: ready work is merged, not held for the owner), for exactly this (branch, head sha) in <queue dir>/branch-verdicts.json
 (branch_verdicts.py). Every refusal appends one JSON line to <queue dir>/main-push-ledger.jsonl and raises MainPushNotReady, a PermissionError, so the
 merge routes answer 409. The only bypass is AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH=true (a warning, no ledger row). Optional:
 AGENT_MANAGER_MAIN_PUSH_READY_MAX_AGE_HOURS (a positive number) also refuses a record older than that; unset means no age limit.
@@ -50,11 +50,16 @@ def not_ready_reason(store, branch, head_sha, now, diff_facts_loader=None):
         return f"the verdict for {branch} at {head_sha} is '{record.get('verdict')}', not 'merge'"
     if record.get("source") not in branch_verdicts.HUMAN_SOURCES:
         not_human = f"the merge verdict for {branch} at {head_sha} comes from '{record.get('source')}', not a human source (chat or manual)"
-        if not main_push_safe_class.worker_class_applies(record, diff_facts_loader):
+        if main_push_safe_class.worker_class_applies(record, diff_facts_loader):
+            unsafe, _facts = main_push_safe_class.unsafe_reason(diff_facts_loader)
+            if unsafe:
+                return f"{not_human}; {unsafe}"
+        elif record.get("source") != "worker":
             return not_human
-        unsafe, _facts = main_push_safe_class.unsafe_reason(diff_facts_loader)
-        if unsafe:
-            return f"{not_human}; {unsafe}"
+        elif diff_facts_loader is not None:  # owner order 2026-11-25: any other worker merge is READY, but forbidden paths are still refused
+            bad = main_push_safe_class.forbidden_reason(diff_facts_loader)
+            if bad:
+                return f"the worker merge verdict for {branch} at {head_sha} is refused: {bad}"
     at = _parse_time(record.get("verifiedAt"))
     if at is None:
         return f"the merge verdict for {branch} at {head_sha} has no valid verifiedAt timestamp"
@@ -89,12 +94,16 @@ def assert_main_push_ready(queue_dir, branch, head_sha, caller=None, task_id=Non
         seen.append(diff_facts_loader())
         return seen[-1]
 
-    reason = "branch and headSha are both required" if not branch or not head_sha else not_ready_reason(branch_verdicts.load_verdicts(queue_dir), branch, head_sha, now, loader if diff_facts_loader else None)
+    store = branch_verdicts.load_verdicts(queue_dir)
+    record = ((store or {}).get(branch) or {}).get(head_sha) or {}
+    reason = "branch and headSha are both required" if not branch or not head_sha else not_ready_reason(store, branch, head_sha, now, loader if diff_facts_loader else None)
     stamp = now.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    if reason is None and seen:
+    if reason is None and seen and main_push_safe_class.worker_class_applies(record, diff_facts_loader):
         _append_ledger(queue_dir, {"at": stamp, "outcome": "allowed-worker-class", "branch": branch, "headSha": head_sha, "caller": caller, "taskId": task_id, "class": seen[-1]["class"], "files": seen[-1]["files"]})
         return {"allowed": True, "bypass": False, "viaClass": seen[-1]["class"]}
     if reason is None:
+        if record.get("source") == "worker":
+            _append_ledger(queue_dir, {"at": stamp, "outcome": "allowed-worker", "branch": branch, "headSha": head_sha, "caller": caller, "taskId": task_id})
         return {"allowed": True, "bypass": False}
     _append_ledger(queue_dir, {"at": stamp, "outcome": "refused", "branch": branch or None, "headSha": head_sha or None, "caller": caller, "taskId": task_id, "reason": reason})
     raise MainPushNotReady(
