@@ -57,11 +57,16 @@ test('needs-work, hold and discard verdicts are refused', () => {
   }
 });
 
-test('a merge verdict from the deterministic check or the worker is not a READY record', () => {
-  for (const source of ['deterministic', 'worker']) {
-    const dir = pipeline({ 'agent/x': { [SHA]: rec({ source }) } });
-    withEnv({ AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH: undefined }, () => assert.throws(() => call(dir), /not a human source/));
-  }
+test('a merge verdict from the deterministic check is not a READY record', () => {
+  const dir = pipeline({ 'agent/x': { [SHA]: rec({ source: 'deterministic' }) } });
+  withEnv({ AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH: undefined }, () => assert.throws(() => call(dir), /not a human source/));
+});
+
+test('a worker merge verdict for the exact head is a READY record (owner order 2026-11-25), an older head is not', () => {
+  const dir = pipeline({ 'agent/x': { [SHA]: rec({ source: 'worker' }) } });
+  withEnv({ AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH: undefined }, () => assert.deepStrictEqual(call(dir), { allowed: true, bypass: false }));
+  const old = pipeline({ 'agent/x': { ['b'.repeat(40)]: rec({ source: 'worker' }) } });
+  withEnv({ AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH: undefined }, () => assert.throws(() => call(old), /no verdict recorded/));
 });
 
 test('a missing or unparseable verifiedAt is refused', () => {
