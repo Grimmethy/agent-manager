@@ -20,6 +20,11 @@ _state = {"cache": {}, "thread": None}  # cache: real repo root -> {"at": epoch,
 _queue = []  # project dicts waiting for a scan, front = next (guarded by _lock)
 _current = {"root": None}  # real repo root the scan thread is working on right now (guarded by _lock)
 
+# Per-project scan timeout: a single project's git fetch + per-branch work must finish within this window
+# or the project is marked errored and the queue keeps moving. Default 30 s (enough for a healthy repo on
+# a slow disk, short enough to not stall the whole tab). Env override for CI / test environments.
+BRANCH_SCAN_TIMEOUT_S = int(os.environ.get("BRANCH_SCAN_TIMEOUT_S", "30"))
+
 
 def _ttl_seconds():
     """How long another project's branch list is served before the background thread refetches it. Default 1800 s (was 300): with ~20 registered repos the old value meant
@@ -112,11 +117,39 @@ def _pop_next():
         return p
 
 
+def _scan_bounded(repo_root, pipeline_dir):
+    """Run one project's scan with a timeout. Returns (branches, error) tuple.
+
+    On timeout or exception, returns ([], error_string) so the queue keeps moving. The
+    background thread for a timed-out scan is daemon and will be reaped by the interpreter;
+    we do not wait for it. This is intentional: a stuck git fetch must not block the whole
+    tab. The project will be retried at the next TTL."""
+    import app
+    result = {"branches": None, "error": None}
+
+    def _target():
+        try:
+            branches = app._list_unmerged_branches_uncached(
+                force_fetch=True, repo_root=repo_root, pipeline_dir=pipeline_dir
+            )
+            result["branches"] = branches
+            result["error"] = None
+        except Exception as e:  # noqa: BLE001
+            result["branches"] = []
+            result["error"] = f"{type(e).__name__}: {e}"
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=BRANCH_SCAN_TIMEOUT_S)
+    if t.is_alive():
+        return [], f"Scan timed out after {BRANCH_SCAN_TIMEOUT_S}s"
+    return result["branches"], result["error"]
+
+
 def _refresh_stale(projects=None):
     """Background thread body: drain the queue, recomputing one project at a time until it is empty. Optional `projects` are enqueued first. The thread slot is cleared in the
     same lock hold that finds the queue empty, so a request that enqueues meanwhile either lands in this drain or starts a new thread. A failure stamps the entry anyway
     (keeping any previous list) so a broken repo is retried at the next TTL, not on every request."""
-    import app
     import event_stream
     me = threading.current_thread()
     if projects:
@@ -124,17 +157,19 @@ def _refresh_stale(projects=None):
             _enqueue_locked(projects)
     try:
         for p in iter(_pop_next, None):
-            err = None
-            try:
-                branches = app._list_unmerged_branches_uncached(force_fetch=True, repo_root=p["repoRoot"], pipeline_dir=p["pipelineDir"])
-            except Exception as e:  # noqa: BLE001 -- one broken repo must not stop the others
-                err = f"{type(e).__name__}: {e}"
+            started_at = time.time()
+            branches, err = _scan_bounded(p["repoRoot"], p["pipelineDir"])
+            if err:
                 print(f"[branches] project {p['label']} failed (non-fatal): {err}", file=sys.stderr)
-                with _lock:
-                    branches = list((_state["cache"].get(p["repoRoot"]) or {}).get("branches") or [])
             with _lock:
                 previous = _state["cache"].get(p["repoRoot"]) or {}
-                _state["cache"][p["repoRoot"]] = {"at": time.time(), "branches": branches, "error": err}
+                _state["cache"][p["repoRoot"]] = {
+                    "at": time.time(),
+                    "branches": branches,
+                    "error": err,
+                    "startedAt": started_at,
+                    "finishedAt": time.time(),
+                }
                 _current["root"] = None
             if event_stream.digest(branches) != event_stream.digest(previous.get("branches")):
                 event_stream.announce("branch-list-changed", project=p["repoRoot"])
@@ -212,6 +247,70 @@ def failed_project_labels() -> list[str]:
         return []
     labels = {p["repoRoot"]: p["label"] for p in registered_projects(None)}
     return sorted(labels.get(root, root) for root in failed)
+
+
+def scan_status():
+    """Current scan progress: pending list (queued but not yet started) and errors list (timed out or failed).
+
+    Used by the `scan` field in the route response so the UI can show what is still loading and what went wrong.
+    Projects currently being scanned (the one the background thread is working on) are omitted from both lists
+    -- they are in flight, not pending or errored.
+    """
+    with _lock:
+        current = _current["root"]
+        queued = [q for q in _queue if q["repoRoot"] != current]
+        cache = dict(_state["cache"])
+    pending = [
+        {"label": q["label"], "state": "pending", "startedAt": None}
+        for q in queued
+    ]
+    errors = []
+    for root, entry in cache.items():
+        if not entry or not entry.get("error"):
+            continue
+        labels = {p["repoRoot"]: p["label"] for p in registered_projects(None)}
+        label = labels.get(root, root)
+        errors.append({
+            "label": label,
+            "error": entry["error"],
+        })
+    return {"pending": pending, "errors": errors}
+
+
+def scan_one_now(project_root_or_label):
+    """Scan one project immediately, ahead of the queue. Used by the /scan-project route.
+
+    Takes either a label or a repo root. Returns the cached entry (branches + error) for that project
+    after the scan completes (blocking up to BRANCH_SCAN_TIMEOUT_S). If the project is not registered,
+    returns (None, "unknown project").
+    """
+    real = None
+    for p in registered_projects(None):
+        if p["label"] == project_root_or_label or p["repoRoot"] == project_root_or_label:
+            real = p["repoRoot"]
+            break
+    if real is None:
+        return None, "unknown project"
+
+    # Enqueue at front and wait for it
+    project = next(p for p in registered_projects(None) if p["repoRoot"] == real)
+    with _lock:
+        _enqueue_locked([project], front_root=real)
+        _ensure_thread_locked()
+
+    # Wait for this specific project to finish (or timeout)
+    deadline = time.time() + BRANCH_SCAN_TIMEOUT_S
+    while time.time() < deadline:
+        with _lock:
+            entry = _state["cache"].get(real)
+            if entry and (entry.get("branches") or entry.get("error")):
+                return entry, None
+        time.sleep(0.05)
+
+    # Timed out waiting for the queue to reach this project
+    with _lock:
+        entry = _state["cache"].get(real) or {}
+    return entry, entry.get("error") or f"Scan timed out waiting in queue"
 
 
 def combined_branches(active_branches, active_root):
