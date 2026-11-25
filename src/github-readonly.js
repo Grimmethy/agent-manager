@@ -25,20 +25,20 @@ const PATH_RE = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
 
 function validateOwner(name) {
   if (typeof name !== 'string' || !IDENT_RE.test(name)) {
-    return `invalid owner: ${JSON.stringify(name)} (must match ^[A-Za-z0-9._-]+$)`;
+    throw new Error(`invalid owner: ${JSON.stringify(name)} (must match ^[A-Za-z0-9._-]+$)`);
   }
-  if (name === '.' || name === '..' || name.includes('..') || name.startsWith('-') || name.startsWith('.')) {
-    return `invalid owner: ${JSON.stringify(name)} (must not be "." or "..", contain "..", or start with "-" or ".")`;
+  if (name === '.' || name === '..' || name.startsWith('-')) {
+    throw new Error(`invalid owner: ${JSON.stringify(name)} (dot-only names are not allowed; must not start with -)`);
   }
   return null;
 }
 
 function validateRepo(name) {
   if (typeof name !== 'string' || !IDENT_RE.test(name)) {
-    return `invalid repo: ${JSON.stringify(name)} (must match ^[A-Za-z0-9._-]+$)`;
+    throw new Error(`invalid repo: ${JSON.stringify(name)} (must match ^[A-Za-z0-9._-]+$)`);
   }
-  if (name === '.' || name === '..' || name.includes('..') || name.startsWith('-')) {
-    return `invalid repo: ${JSON.stringify(name)} (must not be "." or "..", contain "..", or start with "-")`;
+  if (name === '.' || name === '..' || name.startsWith('-')) {
+    throw new Error(`invalid repo: ${JSON.stringify(name)} (dot-only names are not allowed; must not start with -)`);
   }
   return null;
 }
@@ -422,6 +422,8 @@ function createGithubClient({ fetch, baseUrl }) {
   }
 
   async function githubRecentCommits(owner, repo, options = {}) {
+    validateOwner(owner);
+    validateRepo(repo);
     const { perPage = 10, path } = options;
     const validatedPerPage = Math.min(Math.max(1, Math.floor(perPage)), 20);
     

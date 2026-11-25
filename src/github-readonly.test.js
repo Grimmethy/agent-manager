@@ -54,19 +54,26 @@ function jsonResponse(body, status = 200, headers = {}) {
 }
 
 // ---- Tests: Validation ----
-// The validators return null when the value is valid and an error message when it is not (the callers do `if (err) return error`).
-test('validateOwner returns null for a valid owner and a message otherwise', () => {
+// The validators return null when the value is valid and throw an Error when it is not (guard() turns the throw into { error }).
+test('validateOwner returns null for a valid owner and throws otherwise', () => {
   assert.equal(validateOwner('valid-owner'), null);
-  assert.match(validateOwner(''), /invalid owner/);
-  assert.match(validateOwner('bad owner'), /invalid owner/);
-  assert.match(validateOwner('owner/repo'), /invalid owner/);
-  assert.match(validateOwner(42), /invalid owner/);
+  assert.throws(() => validateOwner(''), /invalid owner/);
+  assert.throws(() => validateOwner('bad owner'), /invalid owner/);
+  assert.throws(() => validateOwner('owner/repo'), /invalid owner/);
+  assert.throws(() => validateOwner(42), /invalid owner/);
+  assert.throws(() => validateOwner('.'), /invalid owner/);
+  assert.throws(() => validateOwner('..'), /invalid owner/);
+  assert.equal(validateOwner('..foo'), null);
+  assert.equal(validateOwner('a..b'), null);
 });
 
-test('validateRepo returns null for a valid repo and a message otherwise', () => {
+test('validateRepo returns null for a valid repo and throws otherwise', () => {
   assert.equal(validateRepo('valid-repo'), null);
-  assert.match(validateRepo(''), /invalid repo/);
-  assert.match(validateRepo('bad repo'), /invalid repo/);
+  assert.throws(() => validateRepo(''), /invalid repo/);
+  assert.throws(() => validateRepo('bad repo'), /invalid repo/);
+  assert.throws(() => validateRepo('.'), /invalid repo/);
+  assert.throws(() => validateRepo('..'), /invalid repo/);
+  assert.equal(validateRepo('..foo'), null);
 });
 
 test('validatePath accepts nested paths and rejects .. and unsafe characters', () => {
