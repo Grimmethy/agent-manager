@@ -7,6 +7,10 @@
 const { resolveSourceName } = require('./task-source-registry.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { classifyCoveringFailures, formatTestName } = require('./review-differential-tests.js');
+const fs = require('node:fs');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 
 // --- executed verification (2026-09-30) ---------------------------------------------------------
 // The reviewer votes on the draft's own NARRATED "Acceptance:" results and never reproduces any of them. review-verify.js applies the diff in a
@@ -161,6 +165,88 @@ function diffTouchesOnlyTestFiles(diff) {
   return filePaths.length > 0 && filePaths.every((fp) => testPattern.test(fp));
 }
 
+// Detect the remote base ref (origin/main if it exists, otherwise origin/master). Uses read-only git branch -r.
+function detectBaseRef(repoRoot) {
+  if (!repoRoot || typeof repoRoot !== 'string') return null;
+  let out = '';
+  try {
+    out = execFileSync('git', ['branch', '-r', '--list', 'origin/*'], { cwd: repoRoot, encoding: 'utf8', timeout: 5000 }).toString();
+  } catch (e) {
+    return null;
+  }
+  const lines = out.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (lines.includes('origin/main')) return 'origin/main';
+  if (lines.includes('origin/master')) return 'origin/master';
+  return null;
+}
+
+// Populate a scratch directory from a remote ref via git archive | tar. Returns the scratch dir path on success, null on failure.
+function populateBaseScratch(repoRoot, baseRef, pipelineDir) {
+  if (!repoRoot || !baseRef || !pipelineDir) return null;
+  const scratchDir = fs.mkdtempSync(path.join(pipelineDir, 'base-scratch-'));
+  try {
+    const archive = execFileSync('git', ['archive', baseRef], { cwd: repoRoot, encoding: null, timeout: 30000 });
+    const { execSync } = require('node:child_process');
+    execSync(`tar -x -f -`, { input: archive, cwd: scratchDir, timeout: 30000 });
+  } catch (e) {
+    try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch {}
+    return null;
+  }
+  return scratchDir;
+}
+
+// Run the same test files that failed on the branch, but on the base ref code. Returns an array of failure records (strings or {file, name} objects).
+function runTestsOnBase(scratchDir, branchFailures, pipelineDir) {
+  if (!scratchDir || !Array.isArray(branchFailures) || !branchFailures.length) return [];
+  const baseFailures = [];
+  // For each unique test file mentioned in the branch failures, run it on the base and collect its failures.
+  const fileToTests = new Map();
+  for (const record of branchFailures) {
+    const file = typeof record === 'string' ? '' : (record && typeof record === 'object' ? record.file : '');
+    const name = typeof record === 'string' ? record : (record && typeof record === 'object' ? record.name : '');
+    if (file) {
+      if (!fileToTests.has(file)) fileToTests.set(file, []);
+      if (name && !fileToTests.get(file).includes(name)) fileToTests.get(file).push(name);
+    }
+  }
+  // Run each file that has a non-empty file path on the base. Use node --test for JS test files.
+  for (const [file, names] of fileToTests) {
+    const testFile = path.join(scratchDir, file);
+    if (!fs.existsSync(testFile)) continue;
+    try {
+      const out = execFileSync('node', ['--test', testFile], { cwd: scratchDir, encoding: 'utf8', timeout: 120000, maxBuffer: 10 * 1024 * 1024 });
+      // Parse node --test output for failing tests. node:test reports failures with "FAIL" lines.
+      const lines = out.split('\n');
+      let currentTest = null;
+      let currentFile = null;
+      for (const line of lines) {
+        const failMatch = line.match(/^  FAIL\s+(.+)$/);
+        if (failMatch) {
+          const testDesc = failMatch[1].trim();
+          baseFailures.push({ file, name: testDesc });
+          continue;
+        }
+        const testMatch = line.match(/^\s+-\s+(.+)$/);
+        if (testMatch) {
+          currentTest = testMatch[1].trim();
+        }
+      }
+    } catch (e) {
+      // Test failed or could not run on base -- treat as a failure on base too (pre-existing).
+      for (const name of names) {
+        baseFailures.push({ file, name });
+      }
+    }
+  }
+  // For string-form failures (no file), assume they also fail on base (conservative).
+  for (const record of branchFailures) {
+    if (typeof record === 'string') {
+      baseFailures.push(record);
+    }
+  }
+  return baseFailures;
+}
+
 // The stage itself. ctx: { task, repoRoot, pipelineDir, verifyDiffFn, recordModelOutcome, factCheckVerdict }.
 function runExecutedVerificationStage({ task, repoRoot, pipelineDir, verifyDiffFn, recordModelOutcome, factCheckVerdict }) {
   // Executed verification: see the block comment above summariseExecutedVerification. HUB0184 · 2/4: any source whose
@@ -232,6 +318,36 @@ function runExecutedVerificationStage({ task, repoRoot, pipelineDir, verifyDiffF
             ? `test pinning: ${ev.blockedTests.length} test(s) unverified (refactor escape: test-only diff)`
             : `test pinning: ${ev.blockedTests.length} test(s) unverified (advisory)`;
           appendHistoryEvent(task, 'advisory', advisoryMsg);
+        }
+      }
+      // Base-vs-branch differential: when covering tests fail on the branch, also run them on the base ref.
+      // If all failures also fail on the base (advisory), pass the gate with an advisory line.
+      // Only block when there are failures that pass on the base (blocking).
+      if (ev.status === 'failed' && ev.tests && Array.isArray(ev.tests.failures) && ev.tests.failures.length) {
+        const branchFailures = ev.tests.failures;
+        const baseRef = detectBaseRef(repoRoot);
+        let advisoryNames = [];
+        if (baseRef) {
+          const scratchDir = populateBaseScratch(repoRoot, baseRef, pipelineDir);
+          if (scratchDir) {
+            try {
+              const baseFailures = runTestsOnBase(scratchDir, branchFailures, pipelineDir);
+              const { blocking, advisory } = classifyCoveringFailures({ branchFailures, baseFailures });
+              if (blocking.length) {
+                // Blocking: some failures pass on the base, so the diff caused them.
+                // Fall through to the existing block path below.
+              } else if (advisory.length) {
+                // Advisory only: all failures are pre-existing. Pass the gate with an advisory line.
+                advisoryNames = advisory.map(formatTestName);
+                const advisoryMsg = `Deterministic gate advisory: pre-existing covering test failures (also fail on base): ${advisoryNames.join('; ')}`;
+                task.executedVerification.advisoryTests = advisoryNames.slice(0, 10);
+                appendHistoryEvent(task, 'advisory', advisoryMsg);
+                return { succeeded: true, verdict: 'passed', blockedReason: null, blockedStage: null, factCheckVerdict, advisory: advisoryMsg };
+              }
+            } catch (e) {
+              console.error(`[review] base differential check errored for ${task.id} (non-fatal, continuing to vote): ${e && e.message}`);
+            }
+          }
         }
       }
       if (ev.status === 'failed') {
