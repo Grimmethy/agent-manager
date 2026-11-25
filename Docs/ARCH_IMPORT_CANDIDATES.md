@@ -238,3 +238,32 @@ Adapt the `latestDecisiveReviews` pattern from the source finding into agent-man
 
 Benefits:
 The majority-vote gate becomes order-independent: re-reviewing a task no longer risks a stale verdict skewing the tally, and the deterministic pre-filter satisfies the "no-LLM" aggregation promise in ADR 0022 without introducing a new runtime dependency. Reviewers get a clear contract—only their latest decisive call counts—reducing confusion when a task bounces through multiple review passes. The conservative tie-break (block on tie) aligns with the unattended-pipeline safety posture already encoded in the "VERDICT ONLY" prompt in both `review-task.js` and `review-runner.ps1`, and the per-source decisive-action list in `task-sources.js` keeps the rule extensible as new GUARDRAIL span actions are introduced.
+
+### AC-18 · Prepare-then-apply version handshake for branch preparation
+Strength: Strong
+Source: builderio-agent-native — "Prepare-then-apply handshake with a returned version token"
+Files: src/agentic-draft-common.js, src/apply-branch-prep-route.js
+
+Problem:
+In agent-manager, `src/apply-branch-prep-route.js`'s `prepareApplyBranch()` performs git branch preparation (resetToMain, deleteBranch, createBranch, or prepareStackedBranch) but does not capture a version token of the target state before the apply step runs. Between the prepare step and when `applyPartialDiff` in `src/agentic-draft-common.js` actually writes the diff, the underlying branch or worktree could change — especially in stacked-branch scenarios where seq 2+ rides on top of seq 1's commits. The existing code already handles dirty-tree cases (quarantineDirtyTree, assertCleanTree) and checks for unmerged remote work (remoteHasUnmergedWork), but there is no explicit version handshake: the prepare step snapshots the state, returns a hash or mtime, and the apply step rejects if the target has moved on. Without this, a late local-model draft or a concurrent apply could clobber a newer accepted change.
+
+Solution:
+Adapt the prepare-then-apply pattern by having `prepareApplyBranch()` capture a version token (the HEAD SHA of the target branch) and return it alongside the branch metadata. The apply step (in `applyPartialDiff` or the caller) then verifies the token matches before applying. If the token has changed, the apply is rejected with a clear message indicating the target moved. This mirrors builderio-agent-native's pattern where `prepareRestore` flushes and returns an `updatedAt` stamp, and `applyRestore` uses that stamp as the expected version. In agent-manager, the token would be the HEAD SHA of the target branch (or main, for non-stacked applies), captured at prepare time and verified at apply time.
+
+Benefits:
+Prevents silent clobbering of newer changes by stale drafts, especially in stacked-branch workflows where seq 2+ depends on seq 1's commits. Makes the prepare-apply boundary explicit and self-healing: if the target moves, the apply fails fast with a clear reason rather than producing a corrupted or inconsistent state. Aligns with the existing quarantine and clean-tree guards by adding a version-level check.
+
+
+### AC-19 · Stage name allowlist predicate
+Strength: Worth exploring
+Source: builderio-agent-native — "Single exported allowlist predicate, tested in isolation"
+Files: src/workflow-graph.js
+
+Problem:
+The `STAGE_NAMES` array in `src/workflow-graph.js` enumerates the five valid stage names (`orient`, `plan`, `implement`, `review`, `apply`) and is used internally to build a deterministic pipeline graph. However, if agent-manager ever needs to accept a stage name from an external source — a CLI argument, a config file, a workflow overlay, or LLM output — there is no exported predicate to validate that the name is known. Without such a predicate, unknown or hallucinated stage names would either crash the graph builder or be silently ignored, making failures hard to diagnose.
+
+Solution:
+Derive a `Set` from `STAGE_NAMES` and export a single `isKnownStage(name)` predicate from `src/workflow-graph.js`. Every consumer that receives a free-form stage name (from CLI args, config, workflow overlays, or LLM output) calls this predicate before using the name. Unknown values fail closed with a clear warning rather than being silently dropped or causing a runtime error. Tests would be written with `node:test` to verify the predicate in isolation.
+
+Benefits:
+One source of truth for valid stage names, consistent validation across all consumers, and clear failure modes when unknown stage names are encountered. This makes the system more robust against configuration errors, CLI typos, and LLM hallucinations.

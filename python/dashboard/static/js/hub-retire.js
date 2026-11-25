@@ -20,6 +20,4 @@ function hubRetireOutcome(status, payload) {
   return { close: false, message: message };
 }
 
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { hubRetireRequest, hubRetirePreview, hubRetireOutcome };
-}
+if (typeof module !== 'undefined' && module.exports) module.exports = { hubRetireRequest, hubRetirePreview, hubRetireOutcome };

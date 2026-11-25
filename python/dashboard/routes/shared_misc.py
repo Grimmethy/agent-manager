@@ -154,26 +154,56 @@ def api_queue_state(state):
     if project_raw is not None:
         # Project-aware shape (HUB0485 2/2). Only taken when ?project= is supplied, so
         # existing callers of /api/queue/<state> keep the {items, total} task-summary shape.
-        from routes.queue_project_filter import collect_pieces, parse_project_param, resolve_depends_on
+        from routes.queue_project_filter import _registry, parse_project_param
+        from routes.queue_page_index import dependency_index, list_state_ids, resolve_page_depends_on
         if state not in QUEUE_STATES and state != "drafting":
             abort(404)
         try:
             project_param = parse_project_param(project_raw)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        full_store = collect_pieces("all")
+        # Map the label to concrete registry slugs before touching the index:
+        # "active" -> the active project's slug, "all" -> every registered slug,
+        # otherwise the (already validated) named slug.
+        if project_param == "active":
+            from app import _active_project_label
+            active_slug = _active_project_label()
+            registered = {e.get("label") for e in _registry() if e.get("label")}
+            # An active project missing from the registry cannot be looked up by label;
+            # queue_page_index treats the "active" sentinel as the live queue_dir().
+            project_slugs = [active_slug if active_slug in registered else "active"]
+        elif project_param == "all":
+            project_slugs = [e.get("label") for e in _registry() if e.get("label")]
+        else:
+            project_slugs = [project_param]
+        proj_limit = request.args.get("limit", type=int)
+        proj_offset = request.args.get("offset", default=0, type=int)
+        proj_offset = max(proj_offset or 0, 0)
+        entries = sorted(list_state_ids(project_slugs, state))
+        total = len(entries)
+        page = entries[proj_offset:proj_offset + max(proj_limit, 0)] if proj_limit is not None else entries[proj_offset:]
+        index = dependency_index()
         proj_items = []
-        for piece in collect_pieces(project_param):
-            if piece.get("state") != state:
+        for tid, proj, path in page:
+            data = read_json_safe(path)
+            if not isinstance(data, dict):
                 continue
+            deps = data.get("dependsOn") or []
+            piece = {
+                "id": data.get("id", tid),
+                "title": data.get("title"),
+                "state": state,
+                "project": proj,
+                "dependsOn": list(deps) if isinstance(deps, (list, tuple)) else [],
+            }
             proj_items.append({
-                "id": piece.get("id"),
-                "title": piece.get("title"),
-                "state": piece.get("state"),
-                "project": piece.get("project"),
-                "dependsOn": resolve_depends_on(piece, full_store),
+                "id": piece["id"],
+                "title": piece["title"],
+                "state": state,
+                "project": proj,
+                "dependsOn": resolve_page_depends_on(piece, index),
             })
-        return jsonify({"items": proj_items, "total": len(proj_items)})
+        return jsonify({"items": proj_items, "total": total})
     qdir = queue_dir()
     if not qdir:
         return jsonify({"items": [], "total": 0})

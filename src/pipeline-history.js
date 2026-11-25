@@ -29,15 +29,17 @@ const LOG_FILENAME = 'pipeline-history.log';
 
 function logPipelineEvent(pipelineDir, type, entry) {
   try {
-    if (!pipelineDir) return;
+    if (!pipelineDir) return false;
     const dir = path.join(pipelineDir, 'instances');
     fs.mkdirSync(dir, { recursive: true });
     fs.appendFileSync(
       path.join(dir, LOG_FILENAME),
       `${JSON.stringify({ at: new Date().toISOString(), type, ...entry })}\n`,
     );
+    return true;
   } catch {
     // best-effort audit trail -- must never break the real call
+    return false;
   }
 }
 

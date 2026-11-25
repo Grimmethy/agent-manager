@@ -102,3 +102,14 @@ def unsafe_reason(loader):
     if facts["class"] not in SAFE_WORKER_CLASSES:
         return f"the diff class is '{facts['class']}', not one of {', '.join(SAFE_WORKER_CLASSES)}: a person must read it", facts
     return None, facts
+
+
+def forbidden_reason(loader):
+    """Why a worker merge is refused on the paths it touches (None when it is fine): a forbidden path, or a diff that cannot be read (fail closed)."""
+    try:
+        facts = loader()
+    except Exception as exc:  # noqa: BLE001 -- fail closed on any error reading the diff
+        return f"the diff could not be read ({exc})"
+    if facts["forbidden"]:
+        return f"the branch adds or changes forbidden paths: {', '.join(facts['forbidden'][:5])}"
+    return None

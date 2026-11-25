@@ -3061,3 +3061,106 @@ Extract a small `moveToArchive(srcPath, destDir, destDirEnsuredRef, result)` hel
 
 Benefits:
 A change to the archiving mechanics (destination layout, cross-filesystem handling, error-message format) is made in one helper rather than in two parallel code paths. The public functions become shorter and more readable, each focusing on its distinct responsibility (enumerating which files to archive) while delegating the shared mechanics.
+
+### AC-253 · Test file has fragile cross-community dependency
+Strength: Strong
+Files: src/test_project_search_zero_findings_prompt.js, src/brain-dump-sort-classify.js, src/lib/prompt-assembly.js
+
+Problem:
+The test file `src/test_project_search_zero_findings_prompt.js` depends on a module outside this community, creating a fragile cross-community dependency. This means changes to the external module could break this test without any local indication, and the test's validity depends on the external module's API remaining stable.
+
+Solution:
+Either include the external module in this community if it's closely related, or add explicit documentation about the dependency and its stability guarantees. Consider extracting the tested functionality into a shared module that can be properly versioned and tested.
+
+Benefits:
+Reduces cross-community coupling, makes dependencies explicit, and ensures that changes to shared functionality are properly tracked and tested.
+
+### AC-255 · Mixed concerns in `git-ownership.js` blur rules, detection, and filtering
+Strength: Worth exploring
+Files: src/lib/git-ownership.js
+
+Problem:
+`git-ownership.js` contains a mix of concerns: prompt text (`GIT_OWNERSHIP_RULE`), regex patterns for detecting git-write criteria (`GIT_WRITE_CRITERION_RE`), regex patterns for detecting git-write requests (`GIT_WRITE_TITLE_RE`, `GIT_WRITE_INSTRUCTION_RE`), and utility functions (`dropGitWriteCriteria`, `isGitWriteRequest`). While these are related, they serve different purposes (prompt generation, validation, filtering) and could be organized more clearly. The file currently mixes "what to tell the model" with "how to detect violations," which could lead to confusion about the module's primary responsibility.
+
+Solution:
+Split the file into focused sub-modules or organize the content more clearly by concern. For example: `git-ownership-rules.js` for `GIT_OWNERSHIP_RULE`, `git-write-detector.js` for the regex patterns and `isGitWriteRequest`, and `git-write-filter.js` for `dropGitWriteCriteria` and `GIT_WRITE_REQUEST_REFUSAL`. Alternatively, if keeping a single file, add clearer section headers and comments to delineate the different concerns.
+
+Benefits:
+- Improves readability by separating concerns
+- Makes it easier to find and modify specific functionality
+- Reduces cognitive load when reading the file
+- Clarifies the module's API surface
+
+### AC-812 · `fetchJson` is tightly coupled to `Date.now()` with no time override
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+
+Problem:
+The `fetchJson` function calls `Date.now()` directly for cache expiration logic, with no injectable clock or time override. This makes the cache behavior deterministic only relative to the wall clock, which cannot be controlled in tests. Test code must monkey-patch `ctx.Date = { now: () => clock.t }` after loading the script, a fragile workaround that couples test infrastructure to an implementation detail and makes cache expiration hard to test deterministically.
+
+Solution:
+Extract a `now` parameter into `fetchJson` (defaulting to `Date.now` for backward compatibility) so that cache expiration is driven by an injectable clock. This makes the time dependency explicit in the function signature and allows tests to use a fake clock without mutating globals.
+
+Benefits:
+The cache expiration logic becomes testable without global mutation. The function's dependency on time becomes part of its public contract. Future changes to cache behavior (e.g., adding a `maxAge` parameter) are easier to reason about when the time source is explicit.
+
+---
+
+### AC-815 · Global state coupling in branch-verdicts.js
+Strength: Strong
+Files: python/dashboard/static/js/branch-verdicts.js
+
+Problem:
+The module `branch-verdicts.js` depends on at least eight external globals (`currentBranches`, `currentHeldHubs`, `branchProjectsPending`, `branchProjectsPendingHtml`, `branchListRefreshing`, `branchListRefreshingHtml`, `branchListWithProjectHeadersHtml`, `branchCardHtml`, `wireBranchCard`) that are not declared or imported within the file. Functions like `renderBranchListInto` and `refreshBranchVerdictFilterBar` accept some parameters but silently read `currentHeldHubs` from the global scope, creating a hidden contract. This makes the module's true dependencies invisible to callers, prevents reliable unit testing from Node, and allows silent failures when globals are missing or renamed.
+
+Solution:
+Introduce an explicit `BranchVerdictContext` object that encapsulates all shared state and dependencies. Pass this context as the first parameter to every function that requires it, replacing global reads with explicit access. Remove the `typeof X === 'function'` guards for optional dependencies and instead require them to be provided via the context, failing loudly at initialization if any are missing.
+
+Benefits:
+Callers now see the full dependency graph in function signatures. The module becomes testable from Node without browser globals. Missing dependencies cause clear initialization errors instead of silent runtime failures. Refactoring or renaming a dependency requires updating only the context definition and its consumers.
+
+### AC-840 · `resolveSourceName`'s short-circuit evaluation can miss valid source aliases
+Strength: Strong
+
+**Strength:** Worth exploring  
+**Files:** `src/task-source-registry.js`
+
+**Problem:**  
+The precedence logic uses short-circuit evaluation:
+```js
+const resolved = (task.domain !== undefined && domainAliases[task.domain]) || sourceAliases[task.source] || task.source;
+```
+If `domainAliases[task.domain]` returns a value that's not in the registry, the expression short-circuits and `sourceAliases[task.source]` is never evaluated. This means a task with an invalid domain alias will not be tried against the source alias, even if the source alias would resolve correctly. This can lead to unresolved drops for tasks that could have been resolved via source alias, which is confusing for debugging and makes the alias system fragile.
+
+**Solution:**  
+Change the precedence to try all aliases before falling back to `task.source`:
+```js
+const domainResolved = task.domain !== undefined && domainAliases[task.domain];
+const sourceResolved = sourceAliases[task.source];
+const resolved = domainResolved || sourceResolved || task.source;
+```
+The unresolved drop tracking should be updated to reflect this new behavior.
+
+**Benefits:**  
+Makes the alias system more robust (source alias is always tried), reduces unresolved drops for tasks with invalid domain aliases, makes the behavior more predictable and easier to debug, and aligns with the documented intent of "try all aliases before falling back."
+
+NOTE: The independent review's critique section reported "NO ISSUES FOUND" after verifying all three ACs against the codebase, so no changes to the draft were necessary.
+
+### AC-841 · Verify extraction wiring for fact-checker-text-utils.js
+Strength: Worth exploring
+Files: src/lib/fact-checker-text-utils.js, pre-validate-cited-paths.test.js
+
+Problem:
+`src/lib/fact-checker-text-utils.js` declares itself as "extracted from src/fact-checker.js" but `src/fact-checker.js` is not in this community, so I cannot verify whether the extraction was completed. The test file `pre-validate-cited-paths.test.js` imports from `./src/fact-checker.js` directly, not from the extracted text-utils module. If `fact-checker.js` was not updated to import from the extracted module, then the text-utils file is dead code or an incomplete extraction that leaves the original implementations duplicated or orphaned.
+
+Solution:
+Locate `src/fact-checker.js` and verify whether it imports from `src/lib/fact-checker-text-utils.js`. If it does not, either (a) update `fact-checker.js` to use the extracted module, or (b) remove the extraction comment and restore the utilities inline if the extraction was premature.
+
+Benefits:
+Eliminates uncertainty about whether the extraction was completed, preventing dead code or inconsistent implementations between the extracted module and its source.
+
+---
+
+The plan identified a side-finding about incomplete extraction verification. This candidate addresses that finding with "Worth exploring" strength since it cannot be fully verified from the files in this community alone.
+
+NOTE: No changes applied — the critique found no issues with the original draft.

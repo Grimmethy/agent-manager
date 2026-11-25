@@ -67,6 +67,17 @@ test('two in-flight hub-tier tasks fill every lane slot: a priority-30 source is
   assert.match(out, /pending\/ already has work queued, not adding another task/);
 });
 
+// A source registered under a machine-handle name (hex id, URI) must not have that handle inherited as its task title:
+// the registry adds no default title, so a task that omits one stays untitled rather than getting the raw source name.
+test('the registry does not default a task title from a machine-handle source name', () => {
+  const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  const handle = 'a1f09c3e77b2';
+  registerTaskSource(handle, { priority: 99, next: () => ({ id: `${handle}-task`, source: handle, domain: 'default' }) });
+  const task = getRegisteredSource(handle).next();
+  assert.equal(task.title, undefined, 'the registry must not inject a title');
+  assert.notEqual(task.title, handle, 'the raw source handle must never become the task title');
+});
+
 // 2026-10-30: production task-selection.js:128 calls source.next() with NO argument for every registered source.
 // brain_dump_resolution_check.next() must tolerate this (no options parameter) -- a throw here would crash
 // the entire generation walk (no try/catch around source.next() in the normal path).

@@ -10,8 +10,8 @@
 
 const assert = require('assert/strict');
 const { test } = require('node:test');
-const { windowFetchedFileContent, collectAnchorHits } = require('./candidate-fulfillment.js');
-const { selectAnchorHits } = require('./lib/file-grounding.js');
+const { windowFetchedFileContent } = require('./candidate-fulfillment.js');
+const { selectAnchorHits, collectAnchorHits } = require('./lib/file-grounding.js');
 
 test('windowFetchedFileContent: content under the cap is returned unchanged with strong confidence', () => {
   const content = 'small content, well under the cap';

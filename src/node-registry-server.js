@@ -147,7 +147,7 @@ function createServer({
     try {
       releaseStaleLeasedTo({ pipelineDirs, env });
     } catch (e) { /* healing is best effort too: it never fails a claim */ }
-    const result = claim({ nodeId: payload.id, claimant: payload.id, classes: payload.classes, pipelineDirs, env, now: now() });
+    const result = claim({ nodeId: payload.id, claimant: payload.id, classes: payload.classes, pipelineDirs, env, now: now(), requireRemote: true });
     if (!result || !result.task) return idle();
     return send(res, 200, { ok: true, task: result.task, lease: result.lease, repo: result.repo });
   };

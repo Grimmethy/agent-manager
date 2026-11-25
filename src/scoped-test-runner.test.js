@@ -411,3 +411,17 @@ test('reverseDependentsPy: only for a non-test .py file, bounded to its director
   for (let i = 0; i < MAX_REVERSE_DEP_FILES + 4; i++) write(repo, `pkg/sub/test_many_${i}.py`, 'import mod\n');
   assert.equal(reverseDependentsPy(repo, 'pkg/sub/mod.py', new Set()).length, MAX_REVERSE_DEP_FILES);
 });
+
+test('runJsTests: a test runner that cannot start (ENOENT) is inconclusive (passed:null), not a test failure', () => {
+  const repo = tmpRepo();
+  write(repo, 'pkg/x.test.js', "const { test } = require('node:test');\ntest('ok', () => {});\n");
+  const savedPath = process.env.PATH;
+  process.env.PATH = '/nonexistent-scoped-test-path';
+  try {
+    const r = require('./scoped-test-runner.js').runJsTests(repo, ['pkg/x.test.js']);
+    assert.equal(r.passed, null);
+    assert.deepEqual(r.failures, []);
+  } finally {
+    process.env.PATH = savedPath;
+  }
+});

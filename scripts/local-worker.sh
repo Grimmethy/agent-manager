@@ -265,6 +265,13 @@ process_drafting_file() {
     # The pattern is the FORGE_PAUSE_MESSAGE text (pinned by src/local-client-forge-pause.test.js so the copies cannot drift).
     printf '[worker-%s] draft paused for a Forge GPU session -- not counted as a failure; %s stays in drafting/ and resumes when the lease clears\n' "$INSTANCE_ID" "$task_id" >&2
     TICK_HAD_INFRA_FAILURE=true
+  elif quota_resume="$(printf '%s' "$draft_result" | node "${PACKAGE_SRC_DIR}/draft-quota.js" classify-and-defer "$wpath" 2>>"$LOG_FILE")"; [[ -n "$quota_resume" ]]; then
+    # Rate-limit / quota (HTTP 429: hourly token budget, five-hour plan limit) -- a TEMPORARY capacity condition, not a draft failure
+    # (src/draft-quota.js). classify-and-defer already wrote task.deferUntil; the item stays in drafting/ and the existing per-tick
+    # leftover-drafting pass skips it until then (no new timer or poll, ADR-0024). Deliberately NO draftFailureCount increment, NO
+    # infra-requeue round and NO block, so a quota window can never send the task to needs-clarification. This tick stops claiming.
+    printf '[worker-%s] draft deferred on a rate limit until %s -- not counted as a failure; %s stays in drafting/\n' "$INSTANCE_ID" "$quota_resume" "$task_id" >&2
+    TICK_HAD_INFRA_FAILURE=true
   else
     # Draft call itself failed (e.g. Ollama unreachable, or a real generation call timing
     # out under GPU contention) -- retry via the leftover-drafting resume pass at the top
@@ -450,7 +457,16 @@ process_drafting_file() {
         const isInfra = INFRA_FAILURE_PATTERN.test(draftResult || "") || !(draftResult || "").trim();
         const infraRequeueCount = o.infraRequeueCount || 0;
         o.history = o.history || [];
-        if (isManualPause) {
+        // 2026-11-24: a content-safety (acceptable-use) rejection is not an infra outage. Retrying the same prompt cannot succeed, so give up at once: no requeue, no infraRequeueCount increment.
+        let isContentPolicy = false;
+        try { isContentPolicy = require(process.argv[5].replace(/infra-attribution\.js$/, "content-policy.js")).isContentPolicyFailure(draftResult || ""); } catch (e) { isContentPolicy = false; }
+        if (isContentPolicy) {
+          o.blockedStage = "draft";
+          o.blockedReason = `content-policy (needs-rewording): the model safeguards flagged this prompt under its acceptable-use policy (most recent: ${draftResult}) -- reword the prompt and resubmit; this is not an infrastructure outage and was not retried`;
+          o.history.push({ stage: "blocked", at: new Date().toISOString(), detail: o.blockedReason });
+          fs.writeFileSync(p, JSON.stringify(o, null, 2));
+          console.log("block");
+        } else if (isManualPause) {
           o.draftFailureCount = 0;
           o.history.push({
             stage: "requeued",
@@ -543,6 +559,7 @@ fi
 CONSECUTIVE_INFRA_FAILURES=0
 SWITCHED_OFF_TICKS=0                                                     # consecutive ticks this worker has been switched off by the operator (worker_switched_off); only used to print one line on each transition
 DIAL_OFF_TICKS=0                                                         # consecutive ticks this cloud lane has been turned off by the cloud-agent dial (cloud_dial_off); only used to print one line on each transition
+PLAN_LIMIT_OFF_TICKS=0                                                   # consecutive ticks this cloud lane has held because its gateway is at the plan limit (cloud_plan_limited); only used to print the hold and resume lines once
 LANE_RULES_STAMP="${TEMP_DIR:-${TMPDIR:-/tmp}}/lane-rules-${INSTANCE_ID}.stamp"   # reload_lane_rules (agent-manager-common.sh) re-reads this lane's taskClasses and reviews only when lanes.json is newer than this per-instance stamp; the tick is the trigger, no timer
 ENDPOINT_DOWN_TICKS=0                                                    # consecutive ticks the lane's Ollama endpoint did not answer (see the circuit breaker in the main loop)
 LAST_WAKE=""                                                            # how the last idle wait ended: event | timeout | sleep (see wait_for_queue_change)
@@ -666,7 +683,7 @@ while :; do                                                                     
   # when the switch flips finishes first (the check is once per tick).
   if worker_switched_off "$INSTANCE_ID"; then
     if (( SWITCHED_OFF_TICKS == 0 )); then
-      printf '[worker-%s] switched off by the operator (Workers tab) -- claiming nothing until it is switched back on.\n' "$INSTANCE_ID" >&2
+      printf '[worker-%s] %s\n' "$INSTANCE_ID" "$(worker_switch_message "$INSTANCE_ID")" >&2
     fi
     SWITCHED_OFF_TICKS=$((SWITCHED_OFF_TICKS + 1))
     write_heartbeat_file "$INSTANCE_ID" "disabled" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
@@ -693,6 +710,23 @@ while :; do                                                                     
   if (( DIAL_OFF_TICKS > 0 )); then
     printf '[worker-%s] the cloud-agent dial now includes this lane after %s tick(s) off; resuming.\n' "$INSTANCE_ID" "$DIAL_OFF_TICKS" >&2
     DIAL_OFF_TICKS=0
+  fi
+  # Plan-limit hold (src/cloud-plan-limit.js): a cloud lane whose cloud-providers gateway is at its plan limit claims nothing this tick -- no claim, no resume, no review (cloud_take_review below
+  # runs after this) -- instead of claiming a task, getting HTTP 429 and parking it as deferred until the window resets. Heartbeat status disabled with pass "planlimit" (the Workers tab can
+  # tell it from the operator switch and the dial). Only a worker-cloud / worker-cloudN instance is ever asked, and an unreachable or unclear gateway counts as NOT limited (fails open).
+  if [[ "$INSTANCE_ID" =~ ^worker-cloud[0-9]*$ ]] && cloud_plan_limited "${OLLAMA_URL:-}"; then
+    if (( PLAN_LIMIT_OFF_TICKS == 0 )); then
+      printf '[worker-%s] gateway is at its plan limit (%s) -- claiming nothing until it lifts.\n' "$INSTANCE_ID" "${CLOUD_PLAN_LIMIT_NOTE:-until unknown}" >&2
+    fi
+    PLAN_LIMIT_OFF_TICKS=$((PLAN_LIMIT_OFF_TICKS + 1))
+    write_heartbeat_file "$INSTANCE_ID" "disabled" "$HEARTBEAT_MODEL" "" "planlimit" "$STARTED_AT"
+    if "$ONCE"; then exit 0; fi
+    sleep "${AGENT_MANAGER_SWITCHED_OFF_PAUSE_S:-${ORC_TICK_SECS:-30}}"
+    continue
+  fi
+  if (( PLAN_LIMIT_OFF_TICKS > 0 )); then
+    printf '[worker-%s] gateway plan limit lifted after %s tick(s) held; resuming.\n' "$INSTANCE_ID" "$PLAN_LIMIT_OFF_TICKS" >&2
+    PLAN_LIMIT_OFF_TICKS=0
   fi
   reload_lane_rules "$INSTANCE_ID" || true                                      # a lanes.json edit (taskClasses, reviews) reaches this running worker without a restart; no node spawn while lanes.json is unchanged, and a failure never stops the tick. Sets LANE_RULES_TASK_CLASSES / LANE_RULES_REVIEWS for later pieces; nothing reads them yet.
   refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work -- see the function's own comment above the loop.
@@ -830,6 +864,8 @@ while :; do                                                                     
       wpath="${drafting_instance_dir}/${name}"
       [[ -f "$wpath" && -s "$wpath" ]]                                        || continue
       if "$PREMIUM_ONLY" && ! is_premium_file "$wpath"; then continue; fi       # a premium-only borrowed tick leaves regular leftovers for later
+      # Rate-limit deferral (src/draft-quota.js): leave the item alone until its stated reset has passed. No failure was counted.
+      if node "${PACKAGE_SRC_DIR}/draft-quota.js" deferred "$wpath" 2>/dev/null; then continue; fi
       printf '[worker-%s] resuming leftover drafting item: %s\n' "$INSTANCE_ID" "$name"
       # A resumed item that predates the claimedAt stamp (or a chat-preempt requeue that
       # skipped drafting/) gets one now, set-once -- see the claim site's comment.

@@ -159,6 +159,16 @@ worker_switched_off() {
   node "$switch_js" is-disabled "$id" 2>/dev/null
 }
 
+# worker_switch_message <instance_id> -> prints WHY the worker is off: the node/global pause marker's own reason and start time, or the Workers tab text for a per-worker
+# marker (src/worker-switch-message.js). Any failure prints the Workers tab text, so the log line is never empty.
+worker_switch_message() {
+  local id="${1:-}" msg_js msg=""
+  msg_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/worker-switch-message.js"
+  [[ -f "$msg_js" ]] && msg="$(node "$msg_js" "$id" 2>/dev/null)"
+  [[ -n "$msg" ]] || msg='switched off by the operator (Workers tab) -- claiming nothing until it is switched back on.'
+  printf '%s' "$msg"
+}
+
 # cloud_take_review <instance_id> -> exit 0 when this cloud worker just reviewed one waiting item (the caller then ends the tick), 1 when it did not and should go on to
 # draft. Owner rule (cloud-agent-pool): cloud agents review before they draft, and when every waiting review is already claimed the agent takes a draft. Only a worker-cloud /
 # worker-cloudN instance reviews, and not when its lane says reviews:false (LANE_RULES_CLOUD_REVIEWS, kept fresh by reload_lane_rules; unset counts as true). No spawn at all
@@ -200,6 +210,19 @@ cloud_dial_off() {
   touch "$stamp" 2>/dev/null || true
   if node "${here}/../src/cloud-dial.js" is-off "$id" >/dev/null 2>&1; then CLOUD_DIAL_LAST="off"; return 0; fi
   CLOUD_DIAL_LAST="on"; return 1
+}
+
+# cloud_plan_limited <gateway_url> -> exit 0 when that cloud-providers gateway is at its plan limit, 1 otherwise. `node src/cloud-plan-limit.js is-limited <url>` asks (it probes
+# <url>/health, and answers not-limited without any HTTP call for a url that is not an enabled cloud lane's endpoint). On exit 0 the CLI's one line (the resetsAt, or 'until unknown')
+# is left in CLOUD_PLAN_LIMIT_NOTE for the caller's log. An empty url, a missing node, a node failure or anything unclear counts as NOT limited (a broken probe must never stall the
+# swarm). No timer or loop: the caller's tick is the trigger.
+cloud_plan_limited() {
+  local url="${1:-}" here out
+  CLOUD_PLAN_LIMIT_NOTE=""
+  [[ -n "$url" ]] || return 1
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if out="$(node "${here}/../src/cloud-plan-limit.js" is-limited "$url" 2>/dev/null)"; then CLOUD_PLAN_LIMIT_NOTE="$out"; return 0; fi
+  return 1
 }
 
 comfyui_lease_held() {
@@ -787,7 +810,8 @@ check_instance_liveness() {
 
 # reload_lane_rules [instance_id] -> re-reads this lane's taskClasses and reviewer daemon from src/lanes.js --env (one node spawn), so a lanes.json
 # edit reaches a running worker without a restart. Gated on a bash -nt test: node runs only when lanes.json is newer than LANE_RULES_STAMP, so an
-# unchanged registry costs no spawn. Sets LANE_RULES_TASK_CLASSES, LANE_RULES_REVIEWS and (cloud lanes only) LANE_RULES_CLOUD_REVIEWS. A failed call or missing keys keeps the last good values.
+# unchanged registry costs no spawn. Sets LANE_RULES_TASK_CLASSES, LANE_RULES_REVIEWS, LANE_RULES_PROJECTS, LANE_RULES_RAISED_FROM_PREFIX
+# and (cloud lanes only) LANE_RULES_CLOUD_REVIEWS. A failed call or missing keys keeps the last good values.
 # The stamp is touched on every path inside the gate, so a failing call is not retried until lanes.json changes again. Logs one line only when a value
 # changes. No timer or loop here: the caller's tick is the trigger.
 reload_lane_rules() {
@@ -808,16 +832,20 @@ reload_lane_rules() {
 
   printf '%s\n' "$out" | grep -q '^LANE_TASK_CLASSES=' || return 0
   printf '%s\n' "$out" | grep -q '^LANE_REVIEWS=' || return 0
-  local classes reviews cloud_reviews
+  local classes reviews cloud_reviews projects raised_from_prefix
   classes="$(printf '%s\n' "$out" | sed -n 's/^LANE_TASK_CLASSES=//p' | head -n 1)"
   reviews="$(printf '%s\n' "$out" | sed -n 's/^LANE_REVIEWS=//p' | head -n 1)"
   cloud_reviews="$(printf '%s\n' "$out" | sed -n 's/^LANE_CLOUD_REVIEWS=//p' | head -n 1)"   # cloud lanes only (true|false); empty for every other lane
+  projects="$(printf '%s\n' "$out" | sed -n 's/^LANE_PROJECTS=//p' | head -n 1)"
+  raised_from_prefix="$(printf '%s\n' "$out" | sed -n 's/^LANE_RAISED_FROM_PREFIX=//p' | head -n 1)"
 
-  if [[ "${LANE_RULES_TASK_CLASSES-__unset__}" != "$classes" || "${LANE_RULES_REVIEWS-__unset__}" != "$reviews" || "${LANE_RULES_CLOUD_REVIEWS-__unset__}" != "$cloud_reviews" ]]; then
-    printf '[%s] lane rules: taskClasses=%s reviews=%s%s\n' "$id" "${classes:-any}" "${reviews:-none}" "${cloud_reviews:+ cloudReviews=$cloud_reviews}" >&2
+  if [[ "${LANE_RULES_TASK_CLASSES-__unset__}" != "$classes" || "${LANE_RULES_REVIEWS-__unset__}" != "$reviews" || "${LANE_RULES_CLOUD_REVIEWS-__unset__}" != "$cloud_reviews" || "${LANE_RULES_PROJECTS-__unset__}" != "$projects" || "${LANE_RULES_RAISED_FROM_PREFIX-__unset__}" != "$raised_from_prefix" ]]; then
+    printf '[%s] lane rules: taskClasses=%s reviews=%s%s projects=%s raisedFromPrefix=%s\n' "$id" "${classes:-any}" "${reviews:-none}" "${cloud_reviews:+ cloudReviews=$cloud_reviews}" "${projects:-any}" "${raised_from_prefix:-any}" >&2
   fi
   LANE_RULES_TASK_CLASSES="$classes"
   LANE_RULES_REVIEWS="$reviews"
   LANE_RULES_CLOUD_REVIEWS="$cloud_reviews"
+  LANE_RULES_PROJECTS="$projects"
+  LANE_RULES_RAISED_FROM_PREFIX="$raised_from_prefix"
   return 0
 }

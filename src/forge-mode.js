@@ -30,6 +30,12 @@ function readMarker(env) {
   try { return JSON.parse(fs.readFileSync(markerPath(env), 'utf8')); } catch { return null; }
 }
 
+// A marker still flagged settling: true whose on() process is gone was left by a run that was killed mid-settle.
+// (Pid reuse can make a dead owner look alive; accepted, and the expire() path catches it once the pid is free again.)
+function ownerAlive(st) {
+  try { process.kill(Number(st.ownerPid), 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
 // ---- readings (from /proc, or FORGE_MODE_PROC for tests) ----
 function readings(env = process.env) {
   const proc = env.FORGE_MODE_PROC || '/proc';
@@ -45,10 +51,13 @@ function topRss(exec, n = 5) {
 }
 
 // -> { ok, reasons[], top[] }. plannedFreeMB: what the planned steps will give back (the VM when it goes, the models PromptForge evicts).
-function preflight({ availMB, io, plannedFreeMB = 0, minAvailMB = MIN_AVAIL_MB, maxIo = MAX_IO_SOME10, top = [] }) {
+function preflight({ availMB, io, plannedFreeMB = 0, minAvailMB = MIN_AVAIL_MB, maxIo = MAX_IO_SOME10, top = [], counted = null }) {
   const reasons = [];
   if (availMB === null || availMB === undefined) reasons.push('MemAvailable is unreadable');
-  else if (availMB + plannedFreeMB < minAvailMB) reasons.push(`MemAvailable ${Math.round(availMB)} MB + ${Math.round(plannedFreeMB)} MB freed by the plan = ${Math.round(availMB + plannedFreeMB)} MB, under the ${minAvailMB} MB needed`);
+  else if (availMB + plannedFreeMB < minAvailMB) {
+    const c = counted ? ` (VM ${Math.round(counted.vmMB)} MB + resident models ${Math.round(counted.modelsMB)} MB${counted.modelsError ? `; models not counted, ${counted.modelsError}` : ''})` : '';
+    reasons.push(`MemAvailable ${Math.round(availMB)} MB + ${Math.round(plannedFreeMB)} MB freed by the plan = ${Math.round(availMB + plannedFreeMB)} MB, under the ${minAvailMB} MB needed${c}`);
+  }
   if (io !== null && io !== undefined && io >= maxIo) reasons.push(`I/O pressure (some, 10 s) is ${io}%, the limit is under ${maxIo}%`);
   return { ok: reasons.length === 0, reasons, top };
 }
@@ -72,7 +81,22 @@ function realIo(env = process.env) {
     log: (line) => process.stdout.write(`[forge-mode] ${line}\n`),
     exec: (cmd, args) => { const r = spawnSync(cmd, args, { encoding: 'utf8', timeout: 60000 }); return { status: r.status === null ? 1 : r.status, stdout: r.stdout || '', stderr: r.stderr || '' }; },
     pf: request,
-    modelsMB: async () => { try { const o = (env.OLLAMA_URL || 'http://localhost:11434').replace(/\/$/, ''); const r = await new Promise((res) => { const u = new URL(o + '/api/ps'); http.get({ hostname: u.hostname, port: u.port, path: u.pathname, timeout: 5000 }, (rs) => { const c = []; rs.on('data', (d) => c.push(d)); rs.on('end', () => { try { res(JSON.parse(Buffer.concat(c).toString())); } catch { res(null); } }); }).on('error', () => res(null)); }); return r && r.models ? r.models.reduce((a, m) => a + (m.size || 0), 0) / 1048576 : 0; } catch { return 0; } },
+    // Resident Ollama models (/api/ps size, MiB). REJECTS with a readable message when Ollama cannot be asked, so a failed reading is never mistaken for 'no model resident'.
+    modelsMB: () => new Promise((resolve, reject) => {
+      const o = (env.OLLAMA_URL || 'http://localhost:11434').replace(/\/$/, '');
+      const u = new URL(o + '/api/ps');
+      const rq = http.get({ hostname: u.hostname, port: u.port, path: u.pathname, timeout: 5000 }, (rs) => {
+        const c = []; rs.on('data', (d) => c.push(d));
+        rs.on('end', () => {
+          let r = null;
+          try { r = JSON.parse(Buffer.concat(c).toString()); } catch (e) { reject(new Error(`Ollama /api/ps answered with unreadable JSON (${e.message})`)); return; }
+          if (!r || !Array.isArray(r.models)) { reject(new Error('Ollama /api/ps answered without a models list')); return; }
+          resolve(r.models.reduce((a, m) => a + (m.size || 0), 0) / 1048576);
+        });
+      });
+      rq.on('error', (e) => reject(new Error(`Ollama /api/ps unreachable (${e.message})`)));
+      rq.on('timeout', () => rq.destroy(new Error('timed out after 5 s')));
+    }),
   };
 }
 
@@ -89,14 +113,25 @@ async function waitVm(io, want, seconds) {
   }
 }
 
+// -> { modelsMB, modelsError }: the resident Ollama models' memory, or 0 with the reason the reading failed (never a silent 0).
+async function modelsReading(io) {
+  try { return { modelsMB: Number(await io.modelsMB()) || 0, modelsError: null }; } catch (e) { return { modelsMB: 0, modelsError: e && e.message ? e.message : String(e) }; }
+}
+
 // ---- on ----
 async function on({ vm = 'keep' } = {}, io = realIo()) {
   const env = io.env;
-  if (readMarker(env)) { io.log('already in forge mode (see status)'); return 0; }
+  const prior = readMarker(env);
+  if (prior && prior.settling && !ownerAlive(prior)) {
+    io.log('a forge-mode run was killed mid-settle; clearing its leftovers');
+    await off(io, 'the on() run that wrote the marker died');
+  } else if (prior) { io.log('already in forge mode (see status)'); return 0; }
   const vmRunning = vm === 'off' && vmState(io) === 'running';
   const rd = readings(env);
-  const planned = (vmRunning ? Number(env.FORGE_MODE_VM_MB || 4300) : 0) + (await io.modelsMB());
-  const pre = preflight({ ...rd, plannedFreeMB: planned, top: topRss(io.exec) });
+  const vmMB = vmRunning ? Number(env.FORGE_MODE_VM_MB || 4300) : 0;
+  const mm = await modelsReading(io);
+  const planned = vmMB + mm.modelsMB;
+  const pre = preflight({ ...rd, plannedFreeMB: planned, top: topRss(io.exec), counted: { vmMB, modelsMB: mm.modelsMB, modelsError: mm.modelsError } });
   if (!pre.ok) {
     io.log(`refused: ${pre.reasons.join('; ')}`);
     if (pre.top.length) io.log(`holding memory: ${pre.top.join(', ')}`);
@@ -106,11 +141,12 @@ async function on({ vm = 'keep' } = {}, io = realIo()) {
   io.log(`preflight ok (MemAvailable ${Math.round(rd.availMB)} MB, I/O ${rd.io}%)`);
   const undo = [];
   const fail = async (why) => { io.log(`failed: ${why}; rolling back`); for (const u of undo.reverse()) await u(); return 1; };
-  const state = { since: new Date(io.now()).toISOString(), vm, vmShutDown: false, gpu: false };
+  const state = { since: new Date(io.now()).toISOString(), vm, vmShutDown: false, gpu: false, settling: true, ownerPid: process.pid };
   fs.mkdirSync(stateDir(env), { recursive: true });
   fs.writeFileSync(markerPath(env), JSON.stringify(state));
   undo.push(async () => { try { fs.unlinkSync(markerPath(env)); io.log('rolled back: marker removed'); } catch { /* gone */ } });
   io.log('step 1: pipeline-paused marker created (drains finish their tick and exit; no trigger starts one)');
+  try {
   const acq = await io.pf('POST', '/api/gpu/acquire', { owner: 'forge-mode' });
   if (acq.status !== 200) return fail(`GPU session refused (${acq.status || acq.error})`);
   state.gpu = true;
@@ -124,9 +160,14 @@ async function on({ vm = 'keep' } = {}, io = realIo()) {
     undo.push(async () => { virsh(io, 'start', domain(env)); io.log('rolled back: VM started'); });
     io.log('step 3: P40 VM shut off');
   } else io.log(`step 3: P40 VM left as it is (${vm === 'off' ? 'not running' : 'keep'})`);
+  state.settling = false;
   fs.writeFileSync(markerPath(env), JSON.stringify(state));
   io.log('forge mode is on (it ends by itself after 6 hours or when the GPU session is gone)');
   return 0;
+  } catch (e) {
+    // Any exception after the marker exists rolls back the same way a failed step does, so no marker is left behind.
+    return fail(`unexpected error (${e && e.message ? e.message : e})`);
+  }
 }
 
 // ---- off ----
@@ -151,14 +192,16 @@ async function status(io = realIo()) {
   const st = readMarker(env);
   const rd = readings(env);
   const g = await io.pf('GET', '/api/gpu/status');
+  const mm = await modelsReading(io);
   const age = st ? Math.max(0, Math.round((io.now() - Date.parse(st.since)) / 60000)) : null;
   return { paused: !!st, since: st ? st.since : null, ageMin: age, expiresInMin: st ? Math.max(0, MAX_AGE_MIN - age) : null, vm: { domain: domain(env), state: vmState(io), shutDownByForgeMode: !!(st && st.vmShutDown) },
-    gpuSession: { active: !!(g.json && g.json.active), reachable: g.status === 200 }, memAvailMB: rd.availMB === null ? null : Math.round(rd.availMB), ioSome10: rd.io, top: topRss(io.exec, 3) };
+    gpuSession: { active: !!(g.json && g.json.active), reachable: g.status === 200 }, memAvailMB: rd.availMB === null ? null : Math.round(rd.availMB), ioSome10: rd.io, modelsMB: Math.round(mm.modelsMB), modelsError: mm.modelsError, top: topRss(io.exec, 3) };
 }
 
 async function expire(io = realIo()) {
   const st = readMarker(io.env);
   if (!st) return { expired: false, reason: 'not in forge mode' };
+  if (st.settling && !ownerAlive(st)) { const why = 'the on() run that wrote the marker died'; await off(io, why); return { expired: true, reason: why }; }
   const age = (io.now() - Date.parse(st.since)) / 60000;
   const g = await io.pf('GET', '/api/gpu/status');
   const gone = g.status === 200 && g.json && g.json.active === false;

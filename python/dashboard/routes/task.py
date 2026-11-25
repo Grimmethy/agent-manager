@@ -17,6 +17,16 @@ import tempfile
 
 task_bp = Blueprint("task-bp", __name__)
 
+# Optional operator feedback on a manual requeue (api_task_requeue's "feedback" body key): one more entry of the array-of-strings priorRejectionFeedback.
+REQUEUE_FEEDBACK_MAX_CHARS = 2000
+_REQUEUE_FEEDBACK_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _clean_requeue_feedback(raw):
+    # Strip C0 control characters and DEL, trim, cap the length. None when nothing usable remains.
+    cleaned = _REQUEUE_FEEDBACK_CONTROL_RE.sub("", raw).strip()
+    return cleaned[:REQUEUE_FEEDBACK_MAX_CHARS] or None
+
 
 def _qdir_for_request(body=None, queue_only=False):
     """(queue dir, scope) for the project a request names (2026-10-30). `?project=<repoRoot>` (or "project" in a JSON body) selects another registered
@@ -84,6 +94,21 @@ def _clean_slate_for_fresh_adhoc_attempt(data):
         data.pop(field, None)
     if data.get("status") == "blocked":
         data["status"] = "pending"
+
+
+_PREMIUM_FIELDS = ("premiumPriority", "premiumSetBy", "premiumSetAt")
+
+
+def _carry_premium_fields(src_path, data):
+    """Re-reads the source file (no lock helper exists in this module, so this is a fresh read
+    immediately before the write) and copies the premium fields into `data` in place, after any
+    clean-slate stripping, so a needs-clarification -> adhoc move never loses them."""
+    from app import read_json_safe
+    current_src = read_json_safe(src_path) or {}
+    for field in _PREMIUM_FIELDS:
+        if field in current_src:
+            data[field] = current_src[field]
+
 
 @task_bp.route("/api/task/<state>/<task_id>")
 def api_task_detail(state, task_id):
@@ -575,6 +600,12 @@ def api_task_requeue(state, task_id):
     human moved to _archived_no_action/ by hand; see done-archive.js's own header on the
     same "always reversible" promise this endpoint already exists to uphold."""
     from app import _record_manual_requeue, _repeated_blocker_match, get_active_repo_root, logger, read_json_safe
+    requeue_feedback = None
+    _requeue_body = request.get_json(silent=True) or {}
+    if "feedback" in _requeue_body:
+        if not isinstance(_requeue_body["feedback"], str):
+            abort(400, description="feedback must be a string")
+        requeue_feedback = _clean_requeue_feedback(_requeue_body["feedback"])
     if state not in ("blocked", "needs-clarification", "done", "archived"):
         abort(400, description="only a blocked, needs-clarification, done, or archived task can be requeued")
     qdir, scope = _qdir_for_request(request.get_json(silent=True) or {})   # ?project=<repoRoot>: that registered project's queue, repo and pipeline
@@ -620,6 +651,12 @@ def api_task_requeue(state, task_id):
                 "actual root cause first (or confirm you already have), then requeue "
                 "again to proceed anyway."
             ))
+
+    # circuitBreaker (set by src/review-task.js when the fact-check rejection counter trips): a manual requeue would redo
+    # the same failing work, so refuse here. This runs before any branch handling or write to queue/pending/, so the task
+    # file stays in queue/blocked/. A missing or non-True field is a no-op.
+    if data.get("circuitBreaker") is True:
+        return jsonify({"error": "circuit_breaker"}), 409
 
     # If this task was already applied to a branch that never merged (task-disposition.js's
     # 'pending-merge' -- an agent/<id> branch exists, ahead of main, unmerged), a requeue is
@@ -749,6 +786,31 @@ def api_task_requeue(state, task_id):
         fresh["premiumSetBy"] = data["premiumSetBy"]
     if "premiumSetAt" in data:
         fresh["premiumSetAt"] = data["premiumSetAt"]
+    # Fresh read of the source file to ensure premium fields are preserved even if
+    # something between the initial read and this write modified the in-memory copy.
+    # This is the defensive pattern: re-read the file to get the canonical current
+    # values, then copy the premium fields from that fresh read.
+    current_src = read_json_safe(src) or {}
+    if "premiumPriority" in current_src:
+        fresh["premiumPriority"] = current_src["premiumPriority"]
+    if "premiumSetBy" in current_src:
+        fresh["premiumSetBy"] = current_src["premiumSetBy"]
+    if "premiumSetAt" in current_src:
+        fresh["premiumSetAt"] = current_src["premiumSetAt"]
+    if requeue_feedback is not None:
+        # Array of strings: absent -> [feedback]; list -> appended; legacy non-empty string -> wrapped first. Readers are unchanged.
+        prior = data.get("priorRejectionFeedback")
+        if isinstance(prior, list):
+            prior_list = list(prior)
+        elif isinstance(prior, str) and prior:
+            prior_list = [prior]
+        else:
+            prior_list = []
+        fresh["priorRejectionFeedback"] = prior_list + [requeue_feedback]
+        for ev in reversed(fresh.get("history") or []):
+            if isinstance(ev, dict) and ev.get("stage") == "requeued":
+                ev["requeueFeedback"] = requeue_feedback
+                break
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual",
@@ -786,6 +848,7 @@ def api_task_resolve_clarification(task_id):
     dest = adhoc_dir / f"{task_id}.json"
     if dest.exists():
         abort(409, description=f"'{task_id}' already has a task in adhoc/")
+    _carry_premium_fields(src, data)
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint="needs-clarification resolved via the file-path picker", requeue_writer="operator-manual", pipeline_dir=scope["pipelineDir"] if scope else None)
@@ -865,6 +928,7 @@ def api_task_answer_clarification(task_id):
     dest = adhoc_dir / f"{task_id}.json"
     if dest.exists():
         abort(409, description=f"'{task_id}' already has a task in adhoc/")
+    _carry_premium_fields(src, data)
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint=f"needs-clarification answered from the picker: {answer[:200]}", requeue_writer="operator-manual", pipeline_dir=scope["pipelineDir"] if scope else None)

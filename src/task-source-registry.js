@@ -26,16 +26,37 @@ function pipelineDirForHistory() {
 /**
  * Record one owner-mismatch suppression for a single source: a history event and a per-source counter.
  * taskId is not known at the gate (the source has not produced a task yet), so it is logged as null.
+ *
+ * Three outcomes:
+ * - recorded: the history event is written to the pipeline directory.
+ * - skipped: pipelineDirForHistory() returned null (no pipelineDir, no AGENT_MANAGER_PIPELINE_DIR, no repoRoot),
+ *   so there is nowhere to write; a warning is written to stderr.
+ * - failed: the directory resolved but the write failed (logPipelineEvent returned false or threw); a warning is
+ *   written to stderr.
+ * In the last two cases the per-source counter still increments, and the error is never rethrown, so the gate
+ * still returns null for the caller.
  */
 function recordOwnerMismatch(sourceName, runningRoot, owners) {
   ownerMismatchCounts[sourceName] = (ownerMismatchCounts[sourceName] || 0) + 1;
-  logPipelineEvent(pipelineDirForHistory(), 'owner-mismatch', {
+  const entry = {
     source: sourceName,
     taskId: null,
     runningRoot,
     owners,
     reason: 'owner-mismatch',
-  });
+  };
+  try {
+    const dir = pipelineDirForHistory();
+    if (!dir) {
+      process.stderr.write(`[owner-mismatch] source "${sourceName}": no pipeline directory resolved (pipelineDir, AGENT_MANAGER_PIPELINE_DIR and repoRoot all unset); owner-mismatch event NOT recorded\n`);
+      return;
+    }
+    if (!logPipelineEvent(dir, 'owner-mismatch', entry)) {
+      process.stderr.write(`[owner-mismatch] source "${sourceName}": failed to write owner-mismatch event to "${dir}"; event NOT recorded\n`);
+    }
+  } catch (err) {
+    process.stderr.write(`[owner-mismatch] source "${sourceName}": error recording owner-mismatch event (${err && err.message}); event NOT recorded\n`);
+  }
 }
 
 /**
@@ -47,29 +68,40 @@ const registry = {};
  * task.source string -> registry name, for sources whose generated tasks carry a `source`
  * field that differs from the name they registered under (e.g. unused_export stamps
  * source: 'deadcode_triage'). A plugin declares its own quirk via registerSourceAlias()
- * instead of this file needing to know every consumer's naming; resolveSourceName() below
- * still has hardcoded fallbacks for this package's own built-in quirks + a legacy one.
+ * instead of this file needing to know every consumer's naming. This package's own built-ins
+ * ('manual' -> adhoc) are seeded through the same call by seedBuiltinAliases() at module load.
  */
 const sourceAliases = {};
+
+/** task.domain string -> registry name (e.g. 'adhoc' -> 'adhoc'). Filled via registerDomainAlias(). */
+const domainAliases = Object.create(null);
+
+/** Unresolved-task drops, keyed by task id + raw source + raw domain. */
+const unresolvedDrops = new Map();
 
 /** Markers for gated next() wrappers, so a function is never double-wrapped. */
 const gatedNextFns = new WeakSet();
 
 /**
- * The single scope:'core' eligibility gate. Wraps a source's next() so EVERY caller -- retrieval
- * (getRegisteredSource / getRegisteredSources) or direct invocation -- gets null on any other
- * project. The predicate is read on each call, never cached at registration time.
+ * Generic eligibility gate. Wraps a source's next() so EVERY caller -- retrieval
+ * (getRegisteredSource / getRegisteredSources) or direct invocation -- gets null whenever the
+ * source's `gate` returns falsy. The gate is evaluated on each call, never cached at registration time.
+ * @param {Function} gate - predicate; falsy means next() returns null without calling the source
  * @param {Function} next - the source's next() implementation
  * @returns {Function} the gated next()
  */
-function gateCoreNext(next) {
+function gateNext(gate, next) {
   if (gatedNextFns.has(next)) return next;
-  const gated = (...args) => {
-    const { sourceEligibleHere } = require('./lib/source-scope.js');
-    return sourceEligibleHere({ scope: 'core' }) ? next(...args) : null;
-  };
+  const gated = (...args) => (gate() ? next(...args) : null);
   gatedNextFns.add(gated);
   return gated;
+}
+
+/** Throws unless `config.gate` is absent or a function. */
+function validateGate(name, config) {
+  if (config && config.gate !== undefined && config.gate !== null && typeof config.gate !== 'function') {
+    throw new Error(`Task source "${name}": gate must be a function`);
+  }
 }
 
 /**
@@ -82,11 +114,12 @@ function registerTaskSource(name, config) {
   if (registry[name] !== undefined) {
     throw new Error(`Task source "${name}" is already registered`);
   }
-  // scope:'core' sources audit agent-manager ITSELF (src/lib/source-scope.js). Wrap next() so that EVERY
-  // caller -- getNextTask, the always-run watchdog sweeps that call a source directly -- gets null on any
-  // other project, not just the priority ladder.
-  if (config && config.scope === 'core' && typeof config.next === 'function') {
-    config = { ...config, next: gateCoreNext(config.next) };
+  // `gate` (optional function): evaluated on every next() call; a falsy result makes next() return null without
+  // calling the source. Wrapped here so EVERY caller -- getNextTask, the always-run watchdog sweeps that call a
+  // source directly -- sees the gate, not just the priority ladder.
+  validateGate(name, config);
+  if (config && typeof config.gate === 'function' && typeof config.next === 'function') {
+    config = { ...config, next: gateNext(config.gate, config.next) };
   }
   // Owner guard (per source, no shared state): when this source declares owners, each generation call checks whether the
   // running root is one of them via ownerAllows() from source-owner-guard.js. A mismatch returns null for this source only,
@@ -149,11 +182,45 @@ function registerSourceAlias(fromField, toName) {
 }
 
 /**
- * Clear all registered sources (and source aliases). Useful for testing.
+ * Declare that tasks carrying `task.domain === domain` belong to the registry entry `toName`.
+ * Looked up at call time (never cached), so registration order between plugins does not matter.
+ * @param {string} domain - the value a task stamps on its `domain` field
+ * @param {string} toName - the registry key that source registered under
+ */
+function registerDomainAlias(domain, toName) {
+  domainAliases[domain] = toName;
+}
+
+/** Register this package's own built-in domain/source quirks through the public alias calls. */
+function seedBuiltinAliases() {
+  registerDomainAlias('adhoc', 'adhoc');
+  registerDomainAlias('secondbrain', 'secondbrain');
+  // See resolveSourceName(): source:'manual' is adhoc-shaped whatever domain landed on the task.
+  registerSourceAlias('manual', 'adhoc');
+}
+
+/**
+ * Clear all registered sources, source aliases, domain aliases and unresolved-drop records, then
+ * re-seed this package's own built-in aliases (they are not plugin-owned). Useful for testing.
  */
 function clearRegistry() {
   Object.keys(registry).forEach(key => delete registry[key]);
   Object.keys(sourceAliases).forEach(key => delete sourceAliases[key]);
+  Object.keys(domainAliases).forEach(key => delete domainAliases[key]);
+  unresolvedDrops.clear();
+  seedBuiltinAliases();
+}
+
+/** Total number of recorded unresolved-task drops (sum over all id/source/domain keys). */
+function getUnresolvedSourceCount() {
+  let n = 0;
+  for (const d of unresolvedDrops.values()) n += d.count;
+  return n;
+}
+
+/** Recorded unresolved drops: [{ taskId, source, domain, count }]. */
+function getUnresolvedSources() {
+  return [...unresolvedDrops.values()].map(d => ({ ...d }));
 }
 
 /**
@@ -173,14 +240,28 @@ function clearRegistry() {
  * source:'manual' is otherwise only ever set by queue-adhoc-task.js's CLI and
  * api_brain_dump_prioritize -- both adhoc-shaped regardless of which domain string
  * landed on the task -- so this is a safe, unambiguous second identifier, not a guess.
+ *
+ * Precedence: domain alias (registerDomainAlias), then source alias (registerSourceAlias),
+ * then task.source unchanged.
+ *
+ * REQUIRES AN INITIALIZED REGISTRY: it only resolves against what has been registered so far.
+ * Built-in aliases are seeded at module load; sources and plugin aliases register in their own
+ * registration files. Called earlier, it returns the unresolved result (task.source unchanged) --
+ * not an error, and the miss is never cached. When the registry has entries but the result is
+ * not one of them, one drop is recorded (see getUnresolvedSources()), keyed by task id, raw
+ * source and raw domain. With an empty registry nothing is recorded.
  * @param {object} task - The task record.
  * @returns {string} The registry name to look up.
  */
 function resolveSourceName(task) {
-  if (task.domain === 'adhoc' || task.source === 'manual') return 'adhoc';
-  if (task.domain === 'secondbrain') return 'secondbrain';
-  if (sourceAliases[task.source]) return sourceAliases[task.source];
-  return task.source;
+  const resolved = (task.domain !== undefined && domainAliases[task.domain]) || sourceAliases[task.source] || task.source;
+  if (registry[resolved] === undefined && Object.keys(registry).length > 0) {
+    const key = JSON.stringify([task.id ?? null, task.source ?? null, task.domain ?? null]);
+    const rec = unresolvedDrops.get(key);
+    if (rec) rec.count += 1;
+    else unresolvedDrops.set(key, { taskId: task.id ?? null, source: task.source ?? null, domain: task.domain ?? null, count: 1 });
+  }
+  return resolved;
 }
 
 /**
@@ -195,11 +276,12 @@ function updateTaskSource(name, partialConfig) {
   if (registry[name] === undefined) {
     throw new Error(`Cannot update unregistered task source: "${name}"`);
   }
-  // Same gate as registration: a core source's next() must stay gated even when it is attached
-  // or replaced after registration, or when the entry is switched to scope:'core' later.
+  // Same gate as registration: a gated source's next() must stay gated even when it is attached
+  // or replaced after registration, or when a gate is attached later.
+  validateGate(name, partialConfig);
   const merged = { ...registry[name], ...partialConfig };
-  if (merged.scope === 'core' && typeof merged.next === 'function' && !gatedNextFns.has(merged.next)) {
-    partialConfig = { ...partialConfig, next: gateCoreNext(merged.next) };
+  if (typeof merged.gate === 'function' && typeof merged.next === 'function' && !gatedNextFns.has(merged.next)) {
+    partialConfig = { ...partialConfig, next: gateNext(merged.gate, merged.next) };
   }
   Object.assign(registry[name], partialConfig);
 }
@@ -220,4 +302,6 @@ function getVariantsOf(parent) {
   return Object.keys(registry).filter((n) => variantParentOf(n) === parent);
 }
 
-module.exports = { variantParentOf, getVariantsOf, registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource, resolveSourceName, registerSourceAlias };
+seedBuiltinAliases();
+
+module.exports = { variantParentOf, getVariantsOf, registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource, resolveSourceName, registerSourceAlias, registerDomainAlias, getUnresolvedSourceCount, getUnresolvedSources };

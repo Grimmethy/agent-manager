@@ -190,10 +190,10 @@ function runSandboxed({ worktreeDir, bin, args, timeoutMs, pythonBin, mainRepoRo
     if (!wrapped.available) return { ran: false, reason: 'bwrap sandbox unavailable' };
     const r = spawnSync(wrapped.command, wrapped.args, { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     const timedOut = (r.error && r.error.code === 'ETIMEDOUT') || r.signal === 'SIGTERM';
-    const output = `${r.stdout || ''}${r.stderr || ''}`;
+    const fullOutput = `${r.stdout || ''}${r.stderr || ''}`;
     // Read from the FULL output: the 4000-char tail can cut the one line that names the missing module.
-    const missingModules = [...new Set([...output.matchAll(/Cannot find (?:module|package) '([^']+)'/g)].map((m) => m[1]))];
-    return { ran: true, exitCode: timedOut ? null : (typeof r.status === 'number' ? r.status : 1), timedOut: !!timedOut, output: output.slice(-MAX_OUTPUT_CHARS), missingModules };
+    const missingModules = [...new Set([...fullOutput.matchAll(/Cannot find (?:module|package) '([^']+)'/g)].map((m) => m[1]))];
+    return { ran: true, exitCode: timedOut ? null : (typeof r.status === 'number' ? r.status : 1), timedOut: !!timedOut, output: fullOutput.slice(-MAX_OUTPUT_CHARS), fullOutput, missingModules };
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
   }
@@ -235,6 +235,35 @@ function sandboxUnresolvedDependency(missingModules, repoRoot) {
   return null;
 }
 
+// Per-failure cap for deterministic gate outputs: keep every failing test name, cap each failure's
+// message individually (first failure's message stays intact), and append a marker to each capped
+// message stating how many characters were dropped. The caller parses the FULL output before any
+// MAX_OUTPUT_CHARS cap and then runs this on the parsed failures so no test name is lost to truncation.
+function capFailureMessages(failures, maxChars) {
+  if (!Array.isArray(failures) || failures.length === 0) return failures;
+  const result = [];
+  for (let i = 0; i < failures.length; i += 1) {
+    const f = failures[i];
+    if (i === 0) {
+      // First failure: keep message intact (may be needed for context).
+      result.push({ ...f, message: f.message });
+    } else {
+      const msg = f.message || '';
+      if (msg.length > maxChars) {
+        const kept = msg.slice(0, maxChars);
+        const dropped = msg.length - maxChars;
+        result.push({
+          ...f,
+          message: kept + `\n[Gate output truncated: ${dropped} characters dropped]`,
+        });
+      } else {
+        result.push({ ...f, message: msg });
+      }
+    }
+  }
+  return result;
+}
+
 function worktreePaths(taskId) {
   const safe = String(taskId).replace(/[^\w.-]/g, '_');
   // Deliberately NOT agenticWorktreePaths(): a draft may be using that name for the same task id.
@@ -256,10 +285,12 @@ function extractChangedSymbols(diff) {
     if (name && name.length >= 5 && !SYMBOL_STOPLIST.has(name) && !found.includes(name)) found.push(name);
   };
   const declRe = /^(?:async\s+)?(?:function\*?\s+|def\s+|class\s+)([A-Za-z_$][\w$]*)|^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/;
+  const constRes = [/^([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)/, /^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=(?!.*=>)/]; // module-level constants: matched on the UNTRIMMED line, so indented assignments never match
   for (const line of String(diff || '').split('\n')) {
     let body = null;
     if (line.startsWith('@@')) body = (line.match(/^@@[^@]*@@\s*(.*)$/) || [])[1];      // hunk header: the function the hunk sits in
     else if ((line[0] === '+' || line[0] === '-' || line[0] === ' ') && !/^(?:\+\+\+|---)/.test(line)) body = line.slice(1).trimStart();   // changed OR context: an edit inside a function shows its def as context
+    if ((line[0] === '+' || line[0] === '-') && !/^(?:\+\+\+|---)/.test(line)) for (const re of constRes) { const c = line.slice(1).match(re); if (c) add(c[1]); }
     if (!body) continue;
     const m = body.match(declRe);
     if (m) add(m[1] || m[2]);
@@ -777,14 +808,14 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
             const n = runOne(s.bin, narrowed.buildArgs([file]), TEST_TIMEOUT_MS, { tolerateTimeout: true, cwd: s.cwd });
             if (n.ran && !n.timedOut) {
               (result.tests.partial = result.tests.partial || []).push({ file, tests: added.slice(0, 12), count: added.length, passed: n.exitCode === 0 });
-              if (n.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s: narrowed, names: s.parse(n.output), raw: n.output, missing: n.missingModules || [] }); }
+              if (n.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s: narrowed, names: capFailureMessages(s.parse(n.fullOutput), MAX_OUTPUT_CHARS), raw: n.fullOutput, missing: n.missingModules || [] }); }
             }
           }
           const r = runOne(s.bin, one.buildArgs(one.files), TEST_TIMEOUT_MS, { cwd: s.cwd });
           if (!r.ran) { result.tests = null; break; }
           result.tests.ran.push(file);
           if (r.timedOut) { result.tests.timedOut = true; if (result.tests.passed !== false) result.tests.passed = null; (result.tests.timedOutFiles = result.tests.timedOutFiles || []).push(file); continue; }
-          if (r.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s: one, names: s.parse(r.output), raw: r.output, missing: r.missingModules || [] }); }
+          if (r.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s: one, names: capFailureMessages(s.parse(r.fullOutput), MAX_OUTPUT_CHARS), raw: r.fullOutput, missing: r.missingModules || [] }); }
         }
         if (!result.tests) break;
       }
@@ -833,7 +864,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
           if (!r.ran) continue;
           result.tests.dependents = [...(result.tests.dependents || []), file];
           if (r.timedOut) { result.tests.dependentsUnverified = [...(result.tests.dependentsUnverified || []), file]; continue; }
-          if (r.exitCode !== 0) failedSuites.push({ s: one, dependent: true, names: s.parse(r.output), raw: r.output, missing: r.missingModules || [] });   // result.tests.passed is only touched once the failure is attributed to the diff
+          if (r.exitCode !== 0) failedSuites.push({ s: one, dependent: true, names: capFailureMessages(s.parse(r.fullOutput), MAX_OUTPUT_CHARS), raw: r.fullOutput, missing: r.missingModules || [] });   // result.tests.passed is only touched once the failure is attributed to the diff
         }
       }
     }
@@ -918,7 +949,15 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
         if (result.tests && result.tests.passed === false && !result.tests.failures.length) result.tests.passed = null;   // every failing suite was already failing on the base
       }
     }
-    if (failures.length) { result.status = 'failed'; result.reasons.push(...failures); return result; }
+    if (failures.length) {
+      result.status = 'failed';
+      result.reasons.push(...failures);
+      // Explicit classification: this is a verification failure (deterministic gate failed after apply),
+      // NOT a plan-degenerate or other upstream issue. Downstream consumers (context-outcomes.js) use
+      // this to avoid misclassifying a real regression as a degenerate plan.
+      result.classification = 'verification-failure';
+      return result;
+    }
     if (unattributable.length) return inconclusive(unattributable.join('; '));
     if (sandboxMissing && !anyExecuted) {
       const reasons = [...notRunReasons];
@@ -971,7 +1010,7 @@ module.exports = {
   unpinnedBlockDecision,
   extraCoveringMax,
   pythonTestArgs, checkChangedFilesSyntax, splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
-  verifyDiff, addedTestNames, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
+  verifyDiff, addedTestNames, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths, capFailureMessages,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS,
   checkFailsOnBase, splitDiffFiles, checkTestPinning,
 };

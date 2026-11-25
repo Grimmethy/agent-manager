@@ -877,6 +877,22 @@ async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRo
     // blocked/ forever with zero automated retry -- confirmed live: 2 of 4 stuck-child
     // hubs in Hub Tasks were gated on exactly this shape. 'plan' is deliberately not
     // 'review'/'apply'/'pre-critique'/'draft' so none of those checks accidentally match it.
+    task.blockedStage = 'plan';
+    // 2026-11 (HUB0822 1/3): clear any BLOCKER-TYPE tag the task may have picked up
+    // from a prior implement pass. Without this, a task re-routed to plan carries its
+    // old infra-error/design-question/budget-exhausted classification and the plan pass
+    // output gets misclassified as infra-error on re-entry. The BLOCKER-TYPE line is
+    // embedded in blockedReason as a line matching /BLOCKER-TYPE:\s*(design-question|budget-exhausted|infra-error)\b/i;
+    // strip that line (and the trailing newline) so the new degenerate-plan reason is
+    // the only content.
+    if (typeof task.blockedReason === 'string') {
+      const BLOCKER_TYPE_RE = /BLOCKER-TYPE:\s*(design-question|budget-exhausted|infra-error)\b/i;
+      task.blockedReason = task.blockedReason
+        .split('\n')
+        .filter(line => !BLOCKER_TYPE_RE.test(line))
+        .join('\n')
+        .replace(/\n+$/, '');
+    }
     return { blocked: true, blockedReason, blockedStage: 'plan' };
   }
 
@@ -954,12 +970,63 @@ function skipPlanForDeterministicChecklist(task, attempt) {
   return true;
 }
 
+// Named-change plan skip: a lookup/substring check over the criteria text. A criterion has a
+// verified named target when it contains a repo path token that exists (fileExists lookup, which
+// also covers named test files) or a process.env.NAME expression. The plan is skipped only when
+// EVERY criterion has at least one verified target; any criterion without one (e.g. "update the
+// README usage section") keeps the plan pass running. Pure: fileExists is injected.
+// Kill switch: AGENT_MANAGER_ADHOC_NAMED_SKIP=false.
+const NAMED_PATH_RE = /(?:[\w.-]+\/)+[\w.-]+\.[A-Za-z]{1,5}\b/g;
+const NAMED_TEST_RE = /[\w./-]+\.test\.js/g;
+const NAMED_ENV_RE = /process\.env\.[A-Z][A-Z0-9_]+/g;
+
+function skipPlanForNamedChange(criteria, { fileExists } = {}) {
+  const list = Array.isArray(criteria) ? criteria.filter((c) => typeof c === 'string' && c.trim()) : [];
+  if (list.length === 0) return { skip: false, reason: 'no-criteria', targets: [], unmatched: [] };
+  const exists = typeof fileExists === 'function' ? fileExists : () => false;
+  const targets = [];
+  const unmatched = [];
+  for (const c of list) {
+    const found = [];
+    const pathTokens = new Set([...(c.match(NAMED_PATH_RE) || []), ...(c.match(NAMED_TEST_RE) || [])]);
+    for (const tok of pathTokens) { if (exists(tok)) found.push(tok); }
+    for (const env of (c.match(NAMED_ENV_RE) || [])) found.push(env);
+    if (found.length === 0) unmatched.push(c); else targets.push(...found);
+  }
+  if (unmatched.length) return { skip: false, reason: 'unnamed-criterion', targets, unmatched };
+  return { skip: true, reason: 'all-criteria-named', targets, unmatched };
+}
+
+// Returns true when the plan pass was skipped (no model call); the criteria become the plan.
+// Every decision is recorded as a plan-skip-named-change history event (reason, targets, unmatched).
+function applyNamedChangePlanSkip(task, attempt, fileExistsFn) {
+  if (process.env.AGENT_MANAGER_ADHOC_NAMED_SKIP === 'false') return false;
+  if (resolveSourceName(task) !== 'adhoc' || task._planCritiqueRevised) return false;
+  const { criteria } = resolveAcceptanceCriteria(task);
+  const repoRoot = getConfig().repoRoot;
+  const fileExists = fileExistsFn || ((p) => {
+    try { return fs.existsSync(require('path').join(repoRoot, p)); } catch (_) { return false; }
+  });
+  const d = skipPlanForNamedChange(criteria, { fileExists });
+  const evt = d.skip ? 'plan-skipped-named-change' : 'plan-not-skipped-named-change';
+  appendHistoryEvent(task, 'plan-skip-named-change', `${evt}: reason=${d.reason} targets=${JSON.stringify(d.targets)} unmatched=${JSON.stringify(d.unmatched.map((c) => c.slice(0, 120)))} criteria=${JSON.stringify(criteria.map((c) => c.slice(0, 120)))}`);
+  if (!d.skip) return false;
+  const text = `CRITERIA:\n${criteria.map((c) => `- ${c}`).join('\n')}`;
+  task.planResponse = capPlanForTask(task, text, appendHistoryEvent);
+  task.lastGoodPlan = text;
+  applyPlanAcceptanceCriteria(task);
+  recordPlan(attempt, { text, seededFromPrior: false });
+  appendHistoryEvent(task, 'plan-done', `skipped plan pass: named change (${criteria.length} items) -- ${d.targets.join(', ')}`);
+  return true;
+}
+
 async function runPlanPass(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
-  runOrientPassFn = runOrientPass, recordModelCall,
+  runOrientPassFn = runOrientPass, recordModelCall, fileExistsFn,
 }) {
   if (reusePriorPlanForContinuation(task, attempt)) return { blocked: false };
   if (skipPlanForDeterministicChecklist(task, attempt)) return { blocked: false };
+  if (applyNamedChangePlanSkip(task, attempt, fileExistsFn)) return { blocked: false };
   // Plan-cap context derived once per pass and threaded to every plan write site below.
   const { ruleId, expectedDisposition } = derivePlanCapContext(task);
   // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
@@ -1576,6 +1643,25 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
     task.priorRejectionFeedback.push(blockedReason);
     return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
   }
+  // Deterministic decompose structure gate (src/decompose-structure-check.js, no LLM call): a RESOLUTION: decompose draft without a valid
+  // JSON array of {title, rawText} sub-tasks is bounced here, before any review vote is spent on it. Deterministic defect, so like the size
+  // gate it goes through the normal reject-retry loop (no reviewInconclusive). A throwing gate is advisory and never blocks a draft.
+  let decomposeGate = null;
+  try {
+    decomposeGate = require('./decompose-structure-check.js').runDecomposeStructureCheck(task, task.implementResponse);
+  } catch (e) {
+    decomposeGate = null;
+  }
+  if (decomposeGate && decomposeGate.verdict === 'blocked') {
+    const blockedReason = String(decomposeGate.reason || '(no detail)').slice(0, 500);
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: blockedReason });
+    appendHistoryEvent(task, 'blocked', blockedReason);
+    task.blockedStage = 'review';
+    task.blockedReason = blockedReason;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(blockedReason);
+    return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
+  }
   if (postImplementEntry && typeof postImplementEntry.postImplementCheck === 'function') {
     let grounding;
     try {
@@ -2182,6 +2268,26 @@ async function runDraftPasses(task, attempt, {
     }
     // TODO: strip mode -- remove bad citations and continue instead of rejecting.
 
+    // HUB0131 (1/2): brain_dump_sort drafts skip the critique model call entirely --
+    // plan + implement are enough for this source and the critique pass only burns a
+    // local-model turn. The audit log is best-effort: a log failure must NOT abort the
+    // pipeline. concludeDraft() runs first so the draft still lands a well-formed
+    // 'draft-done'/'needs-review' record (and task.status flips) exactly like the
+    // normal success path, then the sentinel below -- which still carries the
+    // succeeded/blocked contract keys main() keys on -- is returned.
+    if (resolveSourceName(task) === 'brain_dump_sort') {
+      try {
+        const { pipelineDir } = getConfig();
+        logPipelineEvent(pipelineDir, 'critique-skipped', {
+          taskId: task.id,
+          source: resolveSourceName(task),
+        });
+      } catch { /* best-effort -- an audit failure must not abort the pipeline */ }
+      appendHistoryEvent(task, 'critique-skipped', 'brain_dump_sort -- critique pass skipped by design (HUB0131)');
+      concludeDraft(task);
+      return { succeeded: true, blocked: false, skipped: true, reason: 'brain_dump_sort', issues: [] };
+    }
+
     await runCritiqueAndRevision(task, {
       maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall,
     });
@@ -2449,7 +2555,7 @@ function tryGroundingRefreshFallback(task) {
   }
 }
 
-module.exports = { reusePriorPlanForContinuation, isDeterministicChecklist, runPlanPass, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, SPLIT_TRUNCATION_MAX_RETRIES, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback, attemptSeedReroll };
+module.exports = { skipPlanForNamedChange, applyNamedChangePlanSkip, reusePriorPlanForContinuation, isDeterministicChecklist, runPlanPass, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, SPLIT_TRUNCATION_MAX_RETRIES, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback, attemptSeedReroll };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on

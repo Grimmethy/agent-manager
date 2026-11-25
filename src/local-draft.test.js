@@ -16,6 +16,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { EventEmitter } = require('events');
+const { isValidDuplicateMatch } = require('./apply-group-a-brain-dump.js');
 
 // The real decompose-pass primitive (prompt building + parsing) moved to the
 // agent-manager-hub-tasks plugin (S4b of the hub-tasks extraction, 2026-09-25); core now
@@ -940,6 +941,18 @@ test('a research task runs its Claude implement pass when research_task IS in AG
       delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
     }
   });
+});
+
+// 2026-09-16: truncation regression for the possible-duplicate gate. existingQueuedTaskTitles()
+// cuts titles to 140 chars, so a "Research: ..." title can lose the literal words a free-text
+// match needs. The research-domain branch must still match it via the structured domain/prefix.
+test('isValidDuplicateMatch: truncated Research: title matches a research-domain candidate with no "web research" substring', () => {
+  const title = 'Research: Open WebUI opt-in context compa';
+  assert.ok(title.length <= 140);
+  assert.equal(
+    isValidDuplicateMatch('web research on Open WebUI context compression', [title], { title, domain: 'research' }),
+    true,
+  );
 });
 
 // 2026-09: routing regression tests for isResearchDomainTask (local-draft.js) -- the
@@ -3617,6 +3630,43 @@ test('arch_review (candidate-fulfillment): the plan call is NOT allowed to be em
     // retry-check.js's entry gate, so a task landing here sat in queue/blocked/ forever
     // with zero automated retry. See reject-retry-check.js's isPlanDegenerateBlock.
     assert.equal(result.blockedStage, 'plan');
+  });
+});
+
+// 2026-11 (HUB0822 3/3): a degenerate plan pass on an adhoc task must route back to
+// plan stage, NOT get requeued for implement retry. The prior bug (HUB0822 1/3) was that
+// the blocked result carried no blockedStage, so reject-retry-check.js's entry gate
+// missed it and the task sat in queue/blocked/ forever. The fix (HUB0822 2/3) added
+// blockedStage: 'plan' to the degenerate-plan return value. This test pins that routing:
+// a degenerate plan response must yield blockedStage 'plan' and must NOT have triggered
+// the implement tier (proving the task was not requeued for implement retry).
+test('degenerate plan pass on an adhoc task routes to blockedStage "plan" (not implement retry)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    let implementTierRan = false;
+    let planCalls = 0;
+    const localCall = async () => {
+      planCalls += 1;
+      return { response: '', degenerate: 'truncated', attempts: 3 };
+    };
+    const result = await draftTask(
+      { id: 'degenerate-plan-route-1', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'do the thing' } },
+      {
+        localCall,
+        withLockFn: async (d, fn) => fn(),
+        draftAdhocViaLocalAgenticWriteFn: async (t) => {
+          implementTierRan = true;
+          t.adhocResolution = 'no-changes-needed';
+          t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do';
+          return { succeeded: true, blocked: false };
+        },
+      },
+    );
+    assert.equal(result.blocked, true, 'a degenerate plan must block the draft');
+    assert.match(result.blockedReason, /Plan pass degenerate: truncated/);
+    // The fix: blockedStage is set so reject-retry-check.js can recognize and act on it.
+    assert.equal(result.blockedStage, 'plan', 'degenerate plan must route to plan stage, not implement retry');
+    assert.equal(implementTierRan, false, 'the implement tier must NOT run after a degenerate plan');
+    assert.ok(planCalls >= 1, `plan pass was invoked at least once (got ${planCalls})`);
   });
 });
 

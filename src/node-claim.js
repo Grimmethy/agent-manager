@@ -121,7 +121,7 @@ function mergeCandidateLists(lists) {
   return out;
 }
 
-function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = nodeId, classes, pipelineDirs = [], env = process.env, now = Date.now(), settle, readRemote = readRemoteUrl, skipped = [] } = {}) {
+function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = nodeId, classes, pipelineDirs = [], env = process.env, now = Date.now(), settle, readRemote = readRemoteUrl, requireRemote = false, skipped = [] } = {}) {
   if (!claimant) return null;
   // Same owner id claimableOnNode uses: AGENT_MANAGER_NODE_ID, or 'wok' when unset.
   const ownerId = workerNode(env.AGENT_MANAGER_NODE_ID);
@@ -202,9 +202,21 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
   const merged = mergeCandidateLists(lists);
   const candidates = [...merged.filter((c) => c.sticky), ...merged.filter((c) => !c.sticky)];
 
+  const remoteCache = new Map(); // one git call per pipeline dir per claim
+  const remoteFor = (dir) => {
+    if (!remoteCache.has(dir)) remoteCache.set(dir, readRemote(dir));
+    return remoteCache.get(dir);
+  };
+
   for (const c of candidates) {
     if (isHubBlocked(c.task, claimant, now, { leases: listLeases(env), readRecord, env })) {
       skipped.push({ taskId: c.taskId, reason: 'hub-blocked' });
+      continue;
+    }
+    // requireRemote (the registry's /claim sets it): a node cannot clone a repo that has no origin URL, so such a task is skipped
+    // BEFORE any lease is taken. Otherwise the claim would lease it, node-pull would refuse it, and the 1 h lease would be wasted.
+    if (requireRemote && !remoteFor(c.pipelineDir)) {
+      skipped.push({ taskId: c.taskId, reason: 'no-remote' });
       continue;
     }
     const lease = lendLease(c.taskId, claimant, { ttlMs: 3600000, now, env });
@@ -227,7 +239,7 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
       skipped.push({ taskId: c.taskId, reason: 'stamp-failed' });
       continue;
     }
-    const remoteUrl = readRemote(c.pipelineDir);
+    const remoteUrl = remoteFor(c.pipelineDir);
     // Handed-out copy only (the wok file above keeps dependsOn). The deps were verified satisfied on wok by the filter
     // above, so their ids are passed as dependsOnResolved, stamped with the same 'now' claimNext already uses.
     const { dependsOn, ...rest } = record;

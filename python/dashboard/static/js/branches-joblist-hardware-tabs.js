@@ -64,7 +64,7 @@ function branchCardHtml(b) {
       ${b.description ? `<div style="margin-top:8px;font-size:14px;color:var(--text)">${escapeHtml(b.description)}</div>` : ''}
       <div class="meta" style="font-family:monospace;font-size:12px;margin-top:4px">${escapeHtml(b.branch)}</div>
       <div class="row" style="margin-top:8px">
-        <button class="action" data-project="${escapeAttr(branchProjectRequestRoot(b))}" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}" data-hub-midflight="${hubMidFlight === true}" data-hub-status="${escapeAttr(b.hub ? b.hub.progress.done + '/' + b.hub.progress.total + ' done' + (b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : '') : '')}">Merge to ${escapeHtml(b.mainBranch)}</button>
+        <button class="action" data-project="${escapeAttr(branchProjectRequestRoot(b))}" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}" data-hub-midflight="${hubMidFlight === true}" data-hub-status="${escapeAttr(b.hub ? b.hub.progress.done + '/' + b.hub.progress.total + ' done' + (b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : '') : '')}" data-main-branch="${escapeAttr(b.mainBranch)}">Merge to ${escapeHtml(b.mainBranch)}</button>
         <button class="secondary" data-project="${escapeAttr(branchProjectRequestRoot(b))}" data-discard-branch="${escapeAttr(b.branch)}" title="Permanently delete this remote branch and archive its task -- for a branch you've decided NOT to merge.">Discard</button>
       </div>
     </div>
@@ -113,11 +113,13 @@ function wireBranchCard(card) {
       const branch = mergeBtn.dataset.mergeBranch;
       const project = mergeBtn.dataset.project || '';
       const midFlight = mergeBtn.dataset.hubMidflight === 'true';
+      // mainBranch can be empty: fall back to a neutral phrase rather than hardcoding a branch name.
+      const target = mergeBtn.dataset.mainBranch || 'the main branch';
       const confirmMsg = mergeBtn.dataset.willConflict === 'true'
-        ? `"${branch}" is flagged as WILL CONFLICT with master on: ${mergeBtn.dataset.conflictFiles}.\n\nThe merge will very likely fail and need manual resolution. Attempt it anyway?`
+        ? `"${branch}" is flagged as WILL CONFLICT with ${target} on: ${mergeBtn.dataset.conflictFiles}.\n\nThe merge will very likely fail and need manual resolution. Attempt it anyway?`
         : midFlight
           ? `"${branch}" belongs to a coordinator hub that is NOT finished (${mergeBtn.dataset.hubStatus}).\n\nMerging now ships an incomplete decomposition -- the moved routes will 404 until the wiring task lands. Force the merge anyway?`
-          : `Merge "${branch}" into master and sync the live dashboard?`;
+          : `Merge "${branch}" into ${target} and sync the live dashboard?`;
       if (!confirm(branchConfirmWithProject(confirmMsg, mergeBtn))) return;
       mergeBtn.disabled = true;
       mergeBtn.textContent = 'Merging...';
@@ -919,7 +921,7 @@ async function renderHardwareTab() {
   if (data.available === false) {
     main.innerHTML = `
       <div class="empty">Hardware monitoring is off -- pick a plugin on the
-        <a href="#" onclick="activeTab='plugins'; renderNav(); renderMain(); return false;">Plugins tab</a>.</div>`;
+        <a href="#" onclick="switchToTab('plugins'); return false;">Plugins tab</a>.</div>`;
     return;
   }
   const watchChecklistHtml = renderWatchConfigChecklist(watchConfig || {});

@@ -117,6 +117,14 @@ function packageInitEstablished(symbol, files, combined) {
   return new RegExp(`\\b(?:from|import)\\s+${dotted}\\b`).test(combined);
 }
 
+// Case-insensitive, whole-token containment: `token` must not be a substring of a longer
+// identifier (`skip` does not match inside `skipUnless`). Pure string test, no I/O.
+function containsToken(haystack, token) {
+  if (!token) return false;
+  const re = new RegExp(`(?<![A-Za-z0-9_])${escapeRe(token)}(?![A-Za-z0-9_])`, 'i');
+  return re.test(haystack);
+}
+
 function checkFabricatedSymbols(task, implementResponse) {
   const files = realFilesOf(task);
   if (!files.length) return [];
@@ -151,7 +159,7 @@ function checkFabricatedSymbols(task, implementResponse) {
       continue;
     }
     const finalSegment = citedIdentifier(symbol);
-    if (!combined.includes(symbol) && !combined.includes(finalSegment)) {
+    if (!containsToken(combined, symbol) && !containsToken(combined, finalSegment)) {
       flag('import', symbol, `the draft cites \`${symbol}\`, but neither that path nor its final segment (\`${finalSegment}\`) appears anywhere in the real fetched content of any file in this community`);
     }
   }
@@ -233,8 +241,9 @@ function detectClaimedKind(symbol, draftText) {
     const clause = clauseAround(draftText, m.index, m.index + m[0].length);
     if (/\bTypedDict\b/.test(clause)) return 'TypedDict';
     if (/\bEnum\b/.test(clause)) return 'Enum';
-    if (/\bclass\b/.test(clause)) return 'class';
+    if (/\bclass\b(?!-like\b)/.test(clause)) return 'class';
     if (/\b(function|method)s?\b/.test(clause)) return 'function';
+    if (/\bclass\b/.test(clause)) return 'class';
   }
   return null;
 }

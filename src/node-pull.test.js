@@ -453,3 +453,37 @@ test('the safety re-check timer is armed after a successful claim and fires exac
   await settle();
   assert.equal(server.requests.length, 2, 'the safety timer fires exactly one more pull');
 });
+
+test('a claim with no repo.remoteUrl names the task in the log and returns its lease through /release', async (t) => {
+  const { env } = setup(t);
+  const logs = [];
+  const calls = [];
+  const fetchStub = async (url, opts) => {
+    calls.push({ url, body: JSON.parse(opts.body), auth: opts.headers.Authorization });
+    if (url.endsWith('/claim')) return { ok: true, json: async () => ({ ok: true, task: { id: 'no-remote-1' } }) };
+    return { ok: true, json: async () => ({ ok: true }) };
+  };
+  const out = await pullOnce({
+    env: { ...env, AGENT_MANAGER_CLAIM_URL: 'http://127.0.0.1:1/claim' },
+    deps: { fetch: fetchStub, log: (m) => logs.push(m), ensureRepo: async () => {} },
+  });
+  assert.ok(out.error);
+  assert.match(logs.join('\n'), /no repo\.remoteUrl \(task no-remote-1\)/);
+  const release = calls.find((c) => c.url === 'http://127.0.0.1:1/release');
+  assert.ok(release, 'a /release request was sent');
+  assert.deepStrictEqual(release.body, { id: NODE_ID, taskId: 'no-remote-1' });
+  assert.strictEqual(release.auth, `Bearer ${TOKEN}`);
+});
+
+test('a failing /release never throws and the pull still reports the missing remote', async (t) => {
+  const { env } = setup(t);
+  const fetchStub = async (url) => {
+    if (url.endsWith('/claim')) return { ok: true, json: async () => ({ ok: true, task: { id: 'no-remote-2' } }) };
+    throw new Error('network down');
+  };
+  const out = await pullOnce({
+    env: { ...env, AGENT_MANAGER_CLAIM_URL: 'http://127.0.0.1:1/claim' },
+    deps: { fetch: fetchStub, log: () => {}, ensureRepo: async () => {} },
+  });
+  assert.match(out.error, /no repo\.remoteUrl \(task no-remote-2\)/);
+});

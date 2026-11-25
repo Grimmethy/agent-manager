@@ -124,6 +124,9 @@ function wireDecomposedBlueprints({ repoRoot, branch, sourceFile, moves, exec = 
     if (next === null) {
       return { ok: true, registered: 0, skipped: true, detail: `wiring block already present on ${branch}` };
     }
+    if (!appBoundAboveSplice(before)) {
+      return { ok: false, registered: 0, detail: `${sourceFile}: no top-level "app = Flask(" above the blueprint splice point (before the __main__ guard), so register_blueprint would raise NameError` };
+    }
     fs.writeFileSync(abs, next);
 
     // Ensure each new module's package dir is importable.
@@ -158,4 +161,14 @@ function wireDecomposedBlueprints({ repoRoot, branch, sourceFile, moves, exec = 
   }
 }
 
-module.exports = { wireDecomposedBlueprints, importPathFor, buildBlock, spliceBlock, MARKER };
+// `app` must be bound (`app = Flask(`) above the splice point, or the `app.register_blueprint(...)`
+// lines in the block raise NameError at import time. Only the text before the `if __name__` guard
+// (or the whole file, when there is no guard) counts -- a binding below the guard is too late.
+const APP_BINDING_RE = /^app\s*=\s*Flask\(/m;
+function appBoundAboveSplice(text) {
+  const m = text.match(MAIN_GUARD_RE);
+  const upto = m ? text.slice(0, m.index) : text;
+  return APP_BINDING_RE.test(upto);
+}
+
+module.exports = { wireDecomposedBlueprints, importPathFor, buildBlock, spliceBlock, appBoundAboveSplice, MARKER };

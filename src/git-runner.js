@@ -31,6 +31,21 @@ function isLockError(err) { return Boolean(err) && LOCK_ERROR_RE.test(String(err
 
 // Stable prefix of the error assertCleanTree() throws. apply-retry-check.js matches on it to treat the
 // failure as INFRASTRUCTURE (a git-state problem, not a draft-quality one): no retry burned, no redraft.
+// Thrown by resetToMain when local main and origin/main have diverged and the rescue branch could not be created.
+class DivergedMainError extends Error {
+  constructor({ mainBranch, remote, cause, reason = 'automatic recovery failed', localOnly = [], remoteOnly = [] }) {
+    super(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- automatic recovery failed, needs a human to reconcile, not an automatic reset. Nothing was preserved; local ${mainBranch} is not reconciled with ${remote}: ${cause}`);
+    this.name = 'DivergedMainError';
+    this.reason = reason;
+    this.localOnly = localOnly;
+    this.remoteOnly = remoteOnly;
+  }
+}
+// Short SHA list for a git rev-list range; empty array when unknown.
+function revListShas(run, range) {
+  try { return String(run(['rev-list', range])).split('\n').map((s) => s.trim()).filter(Boolean); } catch { return []; }
+}
+
 const DIRTY_CLONE_ERROR_PREFIX = 'apply clone is dirty';
 
 /**
@@ -109,6 +124,22 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
   }
   function isAncestor(a, b) {
     try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
+  }
+  // Pre-flight (2026-09-23/24 incident): .gitattributes names a merge driver but its COMMAND lives only in each clone's local .git/config.
+  // A clone without it silently falls back to a plain text merge and the candidate-doc rebase conflicts. Log a clear warning; never throws.
+  function warnIfMergeDriverMissing(probePath = 'Docs/CHANGE_REVIEW_CANDIDATES.md') {
+    try {
+      const out = String(run(['check-attr', 'merge', '--', probePath])).trim();
+      const m = /:\s*merge:\s*(\S+)\s*$/.exec(out);
+      const driver = m && m[1];
+      if (!driver || ['unspecified', 'unset', 'set'].includes(driver)) return null;
+      let cmd = '';
+      try { cmd = String(run(['config', '--get', `merge.${driver}.driver`])).trim(); } catch { cmd = ''; }
+      if (cmd) return null;
+      const msg = `[git-runner] WARNING: .gitattributes names merge driver '${driver}' for ${probePath} but merge.${driver}.driver is unset in ${repoRoot}; rebases will fall back to a plain text merge. Run scripts/setup-merge-drivers.sh ${repoRoot}`;
+      console.error(msg);
+      return msg;
+    } catch { return null; }
   }
   // A push that hits the time cap may still have landed (2026-11-04: apply's `git push` of agent/<id> timed out after 60 s while the branch was arriving on GitHub; apply recorded
   // a failure for work that was already on origin, and the sanctioned retry then collided with its own first push as a non-fast-forward: 33 minutes of a 38 minute build).
@@ -250,6 +281,7 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
     run(['checkout', mainBranch]);
     run(['fetch', 'origin', mainBranch]);
     const remote = `origin/${mainBranch}`;
+    let divergedRescue = null; // set only when the diverged branch preserved local-only commits
     const originInLocal = isAncestor(remote, mainBranch);
     const localInOrigin = isAncestor(mainBranch, remote);
     if (originInLocal && !localInOrigin) {
@@ -274,9 +306,35 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
         console.error(`[git-runner] local ${mainBranch} had commit(s) origin lacks; NOT pushed to ${mainBranch} (no ungated main pushes) -- kept on ${rescue} for a human to review/merge`);
       }
     } else if (!originInLocal && !localInOrigin) {
-      throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic reset`);
+      // Diverged: preserve local-only commits on a rescue branch, then align main to origin
+      // (the reset below). Main is never pushed. Throw only if the rescue itself fails.
+      const stamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+      let rescue = `agent/rescued-${mainBranch}-${stamp}`;
+      let preserved = null;
+      try {
+        let exists = true;
+        try { run(['rev-parse', '--verify', '--quiet', `refs/heads/${rescue}`]); } catch { exists = false; }
+        if (exists) rescue = `${rescue}-${Math.random().toString(36).slice(2, 8)}`;
+        run(['branch', rescue, mainBranch]);
+        const a = String(run(['rev-parse', rescue])).trim();
+        const b = String(run(['rev-parse', mainBranch])).trim();
+        if (!a || a !== b) throw new Error(`rescue ref ${rescue} does not match local ${mainBranch}`);
+        preserved = rescue;
+      } catch (e) {
+        throw new DivergedMainError({ mainBranch, remote, cause: e.message, reason: 'rescue branch could not be created', localOnly: revListShas(run, `${remote}..${mainBranch}`), remoteOnly: revListShas(run, `${mainBranch}..${remote}`) });
+      }
+      divergedRescue = preserved;
+      try { run(['push', '-u', 'origin', preserved]); } catch { /* best-effort: the local rescue branch still exists */ }
+      console.error(`[git-runner] local ${mainBranch} and ${remote} were out of sync (local-only commit(s) on both sides); preserved local-only commit(s) on ${preserved} and aligning ${mainBranch} to ${remote}`);
     }
-    run(['reset', '--hard', remote]);
+    try {
+      run(['reset', '--hard', remote]);
+    } catch (e) {
+      if (divergedRescue) {
+        throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged -- automatic recovery failed: local-only commit(s) were preserved on ${divergedRescue}, but the reset to ${remote} failed, so local ${mainBranch} is not reconciled: ${e.message}`);
+      }
+      throw e;
+    }
     // 2026-11-05 (stalled-task fix): if we fell back from a timed-out stash, log where the
     // work was saved so the task owner (or the next retry) knows how to recover it.
     if (stashFallback) {
@@ -406,7 +464,9 @@ function createRealGitRunner(repoRoot, { exec = execFileSync, sleepMs = syncSlee
     //     "the whole prior chain already merged" fallback the seq===1 path already uses
     //     (2026-09-07 reasoning) -- now reached by an actual staleness check instead of
     //     by trusting whatever name happens to exist locally.
+    warnIfMergeDriverMissing,
     prepareStackedBranch: (name) => {
+      warnIfMergeDriverMissing();
       try {
         run(['fetch', 'origin', name]);
       } catch {
@@ -674,4 +734,4 @@ function createFakeGitRunner(opts = {}) {
   };
 }
 
-module.exports = { createRealGitRunner, createFakeGitRunner, detectDefaultBranch, annotateGitTimeout, DIRTY_CLONE_ERROR_PREFIX };
+module.exports = { createRealGitRunner, createFakeGitRunner, detectDefaultBranch, annotateGitTimeout, DIRTY_CLONE_ERROR_PREFIX, DivergedMainError };
