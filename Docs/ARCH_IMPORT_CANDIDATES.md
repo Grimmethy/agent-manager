@@ -254,3 +254,17 @@ Benefits:
 Prevents silent clobbering of newer changes by stale drafts, especially in stacked-branch workflows where seq 2+ depends on seq 1's commits. Makes the prepare-apply boundary explicit and self-healing: if the target moves, the apply fails fast with a clear reason rather than producing a corrupted or inconsistent state. Aligns with the existing quarantine and clean-tree guards by adding a version-level check.
 
 NOTE: The CRITIQUE section concluded "NO ISSUES FOUND" — no flagged problems were present, so the draft was reproduced unchanged.
+
+### AC-19 · Stage name allowlist predicate
+Strength: Worth exploring
+Source: builderio-agent-native — "Single exported allowlist predicate, tested in isolation"
+Files: src/workflow-graph.js
+
+Problem:
+The `STAGE_NAMES` array in `src/workflow-graph.js` enumerates the five valid stage names (`orient`, `plan`, `implement`, `review`, `apply`) and is used internally to build a deterministic pipeline graph. However, if agent-manager ever needs to accept a stage name from an external source — a CLI argument, a config file, a workflow overlay, or LLM output — there is no exported predicate to validate that the name is known. Without such a predicate, unknown or hallucinated stage names would either crash the graph builder or be silently ignored, making failures hard to diagnose.
+
+Solution:
+Derive a `Set` from `STAGE_NAMES` and export a single `isKnownStage(name)` predicate from `src/workflow-graph.js`. Every consumer that receives a free-form stage name (from CLI args, config, workflow overlays, or LLM output) calls this predicate before using the name. Unknown values fail closed with a clear warning rather than being silently dropped or causing a runtime error. Tests would be written with `node:test` to verify the predicate in isolation.
+
+Benefits:
+One source of truth for valid stage names, consistent validation across all consumers, and clear failure modes when unknown stage names are encountered. This makes the system more robust against configuration errors, CLI typos, and LLM hallucinations.
