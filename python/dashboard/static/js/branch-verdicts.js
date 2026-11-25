@@ -181,7 +181,7 @@ async function runDiscardAll(main) {
   try {
     const resp = await fetch('/api/git/branches/discard-batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(discardAllPayload(candidates, includeTriage)) });
     const result = await resp.json();
-    text = resp.ok ? discardAllResultText(result) : `Nothing was discarded: ${result.reason || 'HTTP ' + resp.status}`;
+    text = resp.status === 409 ? `Nothing was discarded: the apply lock was busy (HTTP 409), so all ${candidates.length} branches were skipped and none were touched: ${candidates.map((b) => b.branch).join(', ')}. Retry when the pipeline finishes its apply.` : resp.ok ? discardAllResultText(result) : `Nothing was discarded: ${result.reason || 'HTTP ' + resp.status}`;
   } catch (e) {
     text = 'Discard all failed: ' + e.message;
   }
