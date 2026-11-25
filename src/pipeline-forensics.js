@@ -19,7 +19,7 @@
 
 const {
   hasZeroHitHarnessSearch, categorizeBlockedReason, signatureForTask,
-} = require('./pipeline-self-audit.js');
+} = require('./blocked-task-classifiers.js');
 
 // A needs-clarification cluster is small (a handful of tasks that each already burned the
 // full retry budget), so the "confident it's systemic" bar is lower than

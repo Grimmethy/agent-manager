@@ -5,7 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 const { readSamplesInWindow } = require('./uptime-log.js');
-const { signatureForTask } = require('./pipeline-self-audit.js');
+const { signatureForTask } = require('./blocked-task-classifiers.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 
