@@ -118,7 +118,10 @@ const INFRA_APPLY_RE = /apply clone is dirty|local changes to the following file
 // can recur every time, so it is bounded: after APPLY_TIMEOUT_MAX_RELEASES releases it is left in a retryable state (NOT needs-clarification)
 // with the fetch timeout recorded as its reason, so the watchdog picks it up again automatically once git connectivity returns. The redraft
 // counter is never touched for this failure class -- redrafting cannot fix a network timeout, and burning retries on it masks the real cause.
-const GIT_TIMEOUT_RE = /spawnSync git ETIMEDOUT|\bgit [\w-]+[^\n]{0,80} timed out after \d+ms/i;
+// 2026-11-17: a short GitHub DNS outage ('fatal: unable to access ...: Could not resolve host: github.com', about 3 minutes) blocked an approved apply and
+// answered the merge route with an unexplained 500; nothing retried it until apply-retry-check was run by hand. The same four git network messages
+// below are the same class as a timeout (the connection, not the draft, failed), so they take this same bounded no-redraft release path.
+const GIT_TIMEOUT_RE = /spawnSync git ETIMEDOUT|\bgit [\w-]+[^\n]{0,80} timed out after \d+ms|Could not resolve host|Temporary failure in name resolution|Connection timed out|Connection refused/i;
 const APPLY_TIMEOUT_MAX_RELEASES = 4;
 function isGitTimeoutApplyFailure(task) {
   return isApplyFailure(task) && GIT_TIMEOUT_RE.test(String(task.blockedReason || ''))

@@ -63,9 +63,13 @@ def api_task_amend(state, task_id):
     if files is not None and not isinstance(files, list):
         return jsonify({"ok": False, "error": "files must be a list"}), 400
 
-    qdir = _pipeline_queue_dir()
+    from routes.task import api_task_requeue, _qdir_for_request
+    qdir, scope = _qdir_for_request(body)
+    if qdir is None:
+        qdir = _pipeline_queue_dir()
     if qdir is None:
         return jsonify({"ok": False, "error": "AGENT_MANAGER_PIPELINE_DIR is not set"}), 500
+    qdir = Path(qdir)
     record_file = qdir / state / f"{task_id}.json"
     if not record_file.exists():
         return jsonify({"ok": False, "error": f"no task '{task_id}' in {state}"}), 404
@@ -75,8 +79,7 @@ def api_task_amend(state, task_id):
     tmp.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, record_file)
 
-    # Delegate the requeue to the existing view (same request context).
-    from routes.task import api_task_requeue
+    # Delegate the requeue to the existing view (same request context; it honors ?project= like this route).
     return api_task_requeue(state, task_id)
 
 

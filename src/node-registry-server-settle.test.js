@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const { execFileSync } = require('node:child_process');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
@@ -92,6 +93,8 @@ test('an overdue lent lease answered unknown returns the task to the pool and th
   try {
     lendLease('T1', 'grimm', { now: T0 - 2 * HOUR, env: s.env });
     writeTask(s.pipelineDir, 'T1');
+    execFileSync('git', ['init', '-q', s.pipelineDir]); // /claim skips a task whose project has no origin URL
+    execFileSync('git', ['-C', s.pipelineDir, 'remote', 'add', 'origin', 'https://example.invalid/repo.git']);
     const r = await s.post({ id: 'grimm' }, s.auth, '/claim');
     assert.equal(r.status, 200);
     assert.equal(r.body.ok, true);

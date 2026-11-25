@@ -3216,9 +3216,7 @@ if (require.main === module) {
       }
     }
   }
-  if (fs.existsSync(pendingDir)) {
-    for (const f of fs.readdirSync(pendingDir)) if (f.endsWith('.json')) inFlightFiles.push(path.join(pendingDir, f));
-  }
+  if (fs.existsSync(pendingDir)) inFlightFiles.push(...require('./pending-in-flight.js').claimablePendingFiles(fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json')).map((f) => path.join(pendingDir, f))));
   const instancesDir = sharedInstancesDir(pipelineDir);
   const alreadyPending = generationThrottled(inFlightFiles.length, instancesDir);
 
@@ -3353,6 +3351,7 @@ if (require.main === module) {
     } else if (!task) {
       console.log('no eligible task found (all registered sources exhausted or malformed)');
     } else {
+      require('./node-generated-lease.js').applyGeneratedLease(task);
       const file = writeTask(task);
       console.log(`queued: ${file}`);
       if (task.source === 'pipeline_self_audit') markPipelineSelfAuditReported(task);

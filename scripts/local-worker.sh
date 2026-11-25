@@ -457,7 +457,16 @@ process_drafting_file() {
         const isInfra = INFRA_FAILURE_PATTERN.test(draftResult || "") || !(draftResult || "").trim();
         const infraRequeueCount = o.infraRequeueCount || 0;
         o.history = o.history || [];
-        if (isManualPause) {
+        // 2026-11-24: a content-safety (acceptable-use) rejection is not an infra outage. Retrying the same prompt cannot succeed, so give up at once: no requeue, no infraRequeueCount increment.
+        let isContentPolicy = false;
+        try { isContentPolicy = require(process.argv[5].replace(/infra-attribution\.js$/, "content-policy.js")).isContentPolicyFailure(draftResult || ""); } catch (e) { isContentPolicy = false; }
+        if (isContentPolicy) {
+          o.blockedStage = "draft";
+          o.blockedReason = `content-policy (needs-rewording): the model safeguards flagged this prompt under its acceptable-use policy (most recent: ${draftResult}) -- reword the prompt and resubmit; this is not an infrastructure outage and was not retried`;
+          o.history.push({ stage: "blocked", at: new Date().toISOString(), detail: o.blockedReason });
+          fs.writeFileSync(p, JSON.stringify(o, null, 2));
+          console.log("block");
+        } else if (isManualPause) {
           o.draftFailureCount = 0;
           o.history.push({
             stage: "requeued",
