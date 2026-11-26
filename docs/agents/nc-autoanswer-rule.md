@@ -144,7 +144,7 @@ If the grill bot returns `{answer: "I can export your data as CSV", level: 4}` a
 
 ## Consumer behaviour (`src/nc-autoanswer.js`)
 
-The autoanswer consumer (defined in `src/nc-autoanswer.js`) does the following when a task enters `queue/needs-clarification/`:
+The autoanswer consumer is implemented as `handleNeedsClarificationEntered(task, deps)` in `src/nc-autoanswer.js`. It is invoked when a task enters `queue/needs-clarification/` and does the following:
 
 1. Read `ncAutoAnswer` from `dashboard-settings.json`. If `'off'`, return immediately.
 2. Call `grillBot(task)` from the grill bot module.
