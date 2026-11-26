@@ -866,6 +866,39 @@ while :; do                                                                     
       if "$PREMIUM_ONLY" && ! is_premium_file "$wpath"; then continue; fi       # a premium-only borrowed tick leaves regular leftovers for later
       # Rate-limit deferral (src/draft-quota.js): leave the item alone until its stated reset has passed. No failure was counted.
       if node "${PACKAGE_SRC_DIR}/draft-quota.js" deferred "$wpath" 2>/dev/null; then continue; fi
+      # FF-1: skip a draft that this node already finished and shipped to wok (its file
+      # name also lives in node-outbox/ or node-sent/). The resume loop used to pick it up
+      # every tick and re-draft, which is what the arch-import-aider-ai-aider-1.json
+      # incident root-caused: same id in drafting/, node-outbox, AND node-sent simultaneously.
+      base="${name%.json}"
+      if [[ -f "${QUEUE_DIR}/node-outbox/${base}.json" ]] || [[ -f "${QUEUE_DIR}/node-sent/${base}.json" ]]; then
+        printf '[worker-%s] FF-1 skip: %s already in node-outbox or node-sent, not resuming\n' "$INSTANCE_ID" "$name" >&2
+        continue
+      fi
+      # FF-1: cap resumes at 3 drafts without a state change. After three failed attempts
+      # the task is parked with a clear history entry instead of being re-drafted forever.
+      draft_failures="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(Number(o.draftFailureCount)||0)}catch(e){console.log(0)}' "$wpath" 2>/dev/null)"
+      if [[ "${draft_failures:-0}" -ge 3 ]]; then
+        printf '[worker-%s] FF-1 cap: %s has %s drafts without state change on node %s -- stopping\n' "$INSTANCE_ID" "$name" "$draft_failures" "$INSTANCE_ID" >&2
+        node -e '
+          try {
+            const fs = require("fs");
+            const p = process.argv[1];
+            const o = JSON.parse(fs.readFileSync(p, "utf8"));
+            o.draftFailureCount = (Number(o.draftFailureCount) || 0) + 1;
+            o.history = o.history || [];
+            o.history.push({
+              stage: "draft-cap-reached",
+              at: new Date().toISOString(),
+              detail: `FF-1: task ${o.id} capped after ${o.draftFailureCount} drafts without state change on node ${process.argv[2]}; not re-drafting further.`,
+              nodeId: process.argv[2],
+              draftFailureCount: o.draftFailureCount,
+            });
+            fs.writeFileSync(p, JSON.stringify(o, null, 2));
+          } catch (e) { /* best-effort */ }
+        ' "$wpath" "$INSTANCE_ID" 2>/dev/null || true
+        continue
+      fi
       printf '[worker-%s] resuming leftover drafting item: %s\n' "$INSTANCE_ID" "$name"
       # A resumed item that predates the claimedAt stamp (or a chat-preempt requeue that
       # skipped drafting/) gets one now, set-once -- see the claim site's comment.
