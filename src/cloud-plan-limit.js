@@ -71,7 +71,68 @@ async function cliIsLimited(baseUrl, { env = process.env, ...opts } = {}) {
   }
 }
 
-module.exports = { isPlanLimited, cliIsLimited, DEFAULT_TIMEOUT_MS };
+// Release every task leased to a node when the cloud plan limit is hit, so the node
+// does not keep 429ing and parking work while the window resets. Pure-ish: takes a gateway
+// (baseUrl + ledger + pipelineDirs + env) and a node id, mutates the ledger and pipeline
+// records in place, never throws, never starts a timer.
+//
+// Contract:
+//   releaseLeasesWhenLimited({ gateway, node }) -> { released: number, resetsAt: string } | null
+//   History event type 'lease-released-by-limit' fields: { type, node, resetsAt, count }
+//   History event type 'lease-healed-no-row' fields: { type, node, recordId }
+//   returnLease(ledger, row) is idempotent. leasedTo cleared to null on records.
+//   Probe fields: isPlanLimited (bool), resetsAt (ISO string).
+//
+// Failure mode: any error (probe throws, ledger corrupt, record unreadable) short-circuits
+// to null with no mutation -- a broken release path must not half-clear rows.
+async function releaseLeasesWhenLimited({ gateway, node }, { ledger = gateway.ledger, env = gateway.env, now = Date.now() } = {}) {
+  if (!gateway || !node) return null;
+  try {
+    const probe = await isPlanLimited(gateway.baseUrl, { fetchImpl: gateway.fetchImpl, now, timeoutMs: gateway.timeoutMs });
+    if (!probe || !probe.limited) return null;
+    const resetsAt = probe.resetsAt || null;
+
+    // Filter ledger rows whose leasedTo matches this node. Ledger rows are keyed by taskId;
+    // each row has a leasedTo field (the node that holds the lease).
+    const rows = Object.values(ledger || {}).filter((r) => r && r.leasedTo === node);
+    if (!rows.length) return { released: 0, resetsAt };
+
+    let released = 0;
+    for (const row of rows) {
+      // Idempotent return: returnLease returns the lease when it was lent, null otherwise.
+      try {
+        const returned = await ledger.returnLease(row.taskId, { now, env });
+        if (returned) released++;
+      } catch (e) {
+        /* best-effort: a single row failure must not abort the batch */
+      }
+    }
+
+    // Clear leasedTo on matching ledger records so downstream consumers see the tasks as
+    // unclaimed and eligible for re-issuance after reset.
+    for (const row of rows) {
+      if (ledger[row.taskId] && ledger[row.taskId].leasedTo === node) {
+        ledger[row.taskId].leasedTo = null;
+      }
+    }
+
+    // Emit history event.
+    const evt = { type: 'lease-released-by-limit', node, resetsAt, count: released };
+    if (gateway.recordHistoryEvent) {
+      try {
+        gateway.recordHistoryEvent(evt);
+      } catch (e) {
+        /* best-effort: history emission must not break the release */
+      }
+    }
+
+    return { released, resetsAt };
+  } catch (e) {
+    return null;
+  }
+}
+
+module.exports = { isPlanLimited, cliIsLimited, releaseLeasesWhenLimited, DEFAULT_TIMEOUT_MS };
 
 if (require.main === module) {
   const [cmd, arg] = process.argv.slice(2);
