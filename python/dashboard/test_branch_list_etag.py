@@ -34,7 +34,8 @@ class BranchListEtag(unittest.TestCase):
     def test_reply_carries_a_strong_etag_and_no_cache(self):
         resp = self.get(ALL)
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.get_json(), ROWS)
+        self.assertEqual(resp.get_json()["branches"], ROWS)
+        self.assertIn("scan", resp.get_json())
         self.assertRegex(resp.headers["ETag"], r'^"[0-9a-f]{64}"$')
         self.assertEqual(resp.headers["Cache-Control"], "no-cache")
 
@@ -51,7 +52,8 @@ class BranchListEtag(unittest.TestCase):
         first = self.get(ALL)
         changed = self.get(ALL, rows=MORE, headers={"If-None-Match": first.headers["ETag"]})
         self.assertEqual(changed.status_code, 200)
-        self.assertEqual(changed.get_json(), MORE)
+        self.assertEqual(changed.get_json()["branches"], MORE)
+        self.assertIn("scan", changed.get_json())
         self.assertNotEqual(changed.headers["ETag"], first.headers["ETag"])
 
     def test_same_body_but_a_different_pending_header_gets_a_new_tag(self):
