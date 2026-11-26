@@ -1,3 +1,3 @@
 [
-  {"id":"a","cadence":{"time":"24:00","days":["mon"]},"replaceWith":"x"}
+  {"id":"a","cadence":{"at":{"time":"24:00"}},"job":{"queue-task":{"pipeline":"audit"}}}
 ]

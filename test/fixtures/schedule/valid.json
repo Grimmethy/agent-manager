@@ -1,4 +1,4 @@
 [
-  {"id":"a","cadence":{"time":"00:00","days":["mon","fri"]},"replaceWith":"x"},
-  {"id":"b","cadence":{"time":"23:59","days":["sun"]},"replaceWith":"y"}
+  {"id":"a","cadence":{"at":{"time":"00:00"}},"job":{"queue-task":{"pipeline":"audit"}}},
+  {"id":"b","cadence":{"every":{"interval":"P1D"}},"job":{"run-command":{"command":"/bin/backup"}}}
 ]

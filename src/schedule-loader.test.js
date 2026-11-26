@@ -7,7 +7,6 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { loadSchedule } = require('./schedule-loader.js');
-const { validateCadence } = require('./schedule-schema.js');
 
 // Ensure the loader's SCHEDULE_PATH override does not leak into tests that
 // pass their own filePath. The override test restores the value it saved.
@@ -25,8 +24,8 @@ function withTempDir(fn) {
 function validEntry(overrides = {}) {
   return {
     id: 'job-1',
-    cadence: { time: '09:30', days: ['mon', 'wed'] },
-    replaceWith: 'job-2',
+    cadence: { at: { time: '09:30' } },
+    job: { 'queue-task': { pipeline: 'audit' } },
     ...overrides,
   };
 }
@@ -75,51 +74,127 @@ test('malformed JSON returns ok:false and does not throw', () => {
   });
 });
 
-test('out-of-range HH:MM time fails validation', () => {
-  for (const time of ['25:00', '12:60', '9:30']) {
-    const result = validateCadence({ time, days: ['mon'] }, 0);
-    assert.equal(result.ok, false, `expected ${time} to be rejected`);
-    assert.ok(result.errors.length > 0);
-    assert.ok(result.errors.some((e) => e.includes('HH:MM')));
-  }
-});
-
-test('bad HH:MM time makes loadSchedule return ok:false', () => {
+test('defaults node to "wok" when missing', () => {
   withTempDir((dir) => {
-    const file = path.join(dir, 'bad-time.json');
-    const entry = validEntry({ cadence: { time: '25:00', days: ['mon'] } });
+    const file = path.join(dir, 'schedule.json');
+    const entry = {
+      id: 'job-1',
+      cadence: { at: { time: '09:30' } },
+      job: { 'queue-task': { pipeline: 'audit' } },
+    };
     fs.writeFileSync(file, JSON.stringify({ entries: [entry] }));
 
     const result = loadSchedule(file);
-    assert.equal(result.ok, false);
-    assert.equal(result.path, file);
-    assert.match(result.error, /HH:MM/);
+    assert.equal(result.ok, true);
+    assert.equal(result.entries[0].node, 'wok');
   });
 });
 
-test('out-of-set weekday fails validation', () => {
-  const result = validateCadence({ time: '09:30', days: ['funday'] }, 0);
-  assert.equal(result.ok, false);
-  assert.ok(result.errors.some((e) => e.includes('funday')));
-});
-
-test('out-of-set weekday makes loadSchedule return ok:false', () => {
+test('preserves explicit node value', () => {
   withTempDir((dir) => {
-    const file = path.join(dir, 'bad-day.json');
-    const entry = validEntry({ cadence: { time: '09:30', days: ['funday'] } });
+    const file = path.join(dir, 'schedule.json');
+    const entry = {
+      id: 'job-1',
+      cadence: { at: { time: '09:30' } },
+      job: { 'queue-task': { pipeline: 'audit' } },
+      node: 'wok',
+    };
     fs.writeFileSync(file, JSON.stringify({ entries: [entry] }));
 
     const result = loadSchedule(file);
+    assert.equal(result.ok, true);
+    assert.equal(result.entries[0].node, 'wok');
+  });
+});
+
+test('passes through replaceWith field', () => {
+  withTempDir((dir) => {
+    const file = path.join(dir, 'schedule.json');
+    const entry = {
+      id: 'job-1',
+      cadence: { at: { time: '09:30' } },
+      job: { 'queue-task': { pipeline: 'audit' } },
+      replaceWith: 'file-watcher',
+    };
+    fs.writeFileSync(file, JSON.stringify({ entries: [entry] }));
+
+    const result = loadSchedule(file);
+    assert.equal(result.ok, true);
+    assert.equal(result.entries[0].replaceWith, 'file-watcher');
+  });
+});
+
+test('passes through migratedFrom field', () => {
+  withTempDir((dir) => {
+    const file = path.join(dir, 'schedule.json');
+    const entry = {
+      id: 'job-1',
+      cadence: { at: { time: '09:30' } },
+      job: { 'queue-task': { pipeline: 'audit' } },
+      migratedFrom: 'old-timer.service',
+    };
+    fs.writeFileSync(file, JSON.stringify({ entries: [entry] }));
+
+    const result = loadSchedule(file);
+    assert.equal(result.ok, true);
+    assert.equal(result.entries[0].migratedFrom, 'old-timer.service');
+  });
+});
+
+test('detects duplicate ids', () => {
+  withTempDir((dir) => {
+    const file = path.join(dir, 'schedule.json');
+    const data = {
+      entries: [
+        { id: 'job-1', cadence: { at: { time: '09:30' } }, job: { 'queue-task': { pipeline: 'audit' } } },
+        { id: 'job-1', cadence: { at: { time: '10:30' } }, job: { 'queue-task': { pipeline: 'audit' } } },
+      ],
+    };
+    fs.writeFileSync(file, JSON.stringify(data));
+
+    const result = loadSchedule(file);
     assert.equal(result.ok, false);
-    assert.equal(result.path, file);
-    assert.match(result.error, /funday/);
+    assert.match(result.error, /duplicate id/);
+  });
+});
+
+test('rejects non-object top level', () => {
+  withTempDir((dir) => {
+    const file = path.join(dir, 'schedule.json');
+    fs.writeFileSync(file, '[]');
+
+    const result = loadSchedule(file);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /"entries" array/);
+  });
+});
+
+test('rejects missing entries array', () => {
+  withTempDir((dir) => {
+    const file = path.join(dir, 'schedule.json');
+    fs.writeFileSync(file, '{"foo": "bar"}');
+
+    const result = loadSchedule(file);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /"entries" array/);
   });
 });
 
 test('SCHEDULE_PATH overrides the filePath argument', () => {
   withTempDir((dir) => {
     const overrideFile = path.join(dir, 'override.json');
-    fs.writeFileSync(overrideFile, JSON.stringify({ entries: [validEntry({ id: 'from-env' })] }));
+    fs.writeFileSync(
+      overrideFile,
+      JSON.stringify({
+        entries: [
+          {
+            id: 'from-env',
+            cadence: { at: { time: '09:30' } },
+            job: { 'queue-task': { pipeline: 'audit' } },
+          },
+        ],
+      })
+    );
     const missingArg = path.join(dir, 'never-created.json');
 
     const prev = process.env.SCHEDULE_PATH;
@@ -135,5 +210,83 @@ test('SCHEDULE_PATH overrides the filePath argument', () => {
         process.env.SCHEDULE_PATH = prev;
       }
     }
+  });
+});
+
+test('loads all cadence kinds', () => {
+  withTempDir((dir) => {
+    const file = path.join(dir, 'schedule.json');
+    const data = {
+      entries: [
+        { id: 'at-job', cadence: { at: { time: '09:00' } }, job: { 'queue-task': { pipeline: 'audit' } } },
+        { id: 'every-job', cadence: { every: { interval: 'P1D' } }, job: { 'run-command': { command: '/bin/x' } } },
+        { id: 'rule-job', cadence: { rule: { name: 'loop-audits' } }, job: { 'queue-task': { pipeline: 'audit' } } },
+      ],
+    };
+    fs.writeFileSync(file, JSON.stringify(data));
+
+    const result = loadSchedule(file);
+    assert.equal(result.ok, true);
+    assert.equal(result.entries.length, 3);
+  });
+});
+
+test('loads all job kinds', () => {
+  withTempDir((dir) => {
+    const file = path.join(dir, 'schedule.json');
+    const data = {
+      entries: [
+        { id: 'qt-job', cadence: { at: { time: '09:00' } }, job: { 'queue-task': { pipeline: 'audit' } } },
+        { id: 'rc-job', cadence: { at: { time: '10:00' } }, job: { 'run-command': { command: '/bin/x' } } },
+      ],
+    };
+    fs.writeFileSync(file, JSON.stringify(data));
+
+    const result = loadSchedule(file);
+    assert.equal(result.ok, true);
+    assert.equal(result.entries.length, 2);
+  });
+});
+
+test('rejects invalid cadence kind', () => {
+  withTempDir((dir) => {
+    const file = path.join(dir, 'schedule.json');
+    const data = {
+      entries: [
+        { id: 'job-1', cadence: { at: { time: '09:00' }, every: { interval: 'P1D' } }, job: { 'queue-task': { pipeline: 'audit' } } },
+      ],
+    };
+    fs.writeFileSync(file, JSON.stringify(data));
+
+    const result = loadSchedule(file);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /exactly one kind/);
+  });
+});
+
+test('rejects invalid job kind', () => {
+  withTempDir((dir) => {
+    const file = path.join(dir, 'schedule.json');
+    const data = {
+      entries: [
+        { id: 'job-1', cadence: { at: { time: '09:00' } }, job: { 'queue-task': { pipeline: 'audit' }, 'run-command': { command: '/bin/x' } } },
+      ],
+    };
+    fs.writeFileSync(file, JSON.stringify(data));
+
+    const result = loadSchedule(file);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /exactly one kind/);
+  });
+});
+
+test('rejects empty entries array', () => {
+  withTempDir((dir) => {
+    const file = path.join(dir, 'schedule.json');
+    fs.writeFileSync(file, '{"entries": []}');
+
+    const result = loadSchedule(file);
+    assert.equal(result.ok, true);
+    assert.equal(result.entries.length, 0);
   });
 });

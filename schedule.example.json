@@ -1,21 +1,55 @@
 {
-  "_doc": "Schedule file format. Top-level object with an 'entries' array. Each entry is an object with exactly three keys: 'id' (string, unique per schedule), 'cadence' (object), and 'replaceWith' (string). 'cadence.time' is 24-hour HH:MM (00:00-23:59). 'cadence.days' is a non-empty array of one or more lowercase weekday abbreviations: sun, mon, tue, wed, thu, fri, sat. The SCHEDULE_PATH environment variable, when set, overrides the filePath argument passed to loadSchedule.",
+  "_doc": "Schedule file format. Top-level object with an 'entries' array. Each entry has: id (string, unique), cadence (object with exactly one of: at/every/rule), job (object with exactly one of: queue-task/run-command), node (string, defaults to 'wok'), replaceWith (optional string), migratedFrom (optional non-empty string).",
   "entries": [
     {
       "id": "example-weekday",
       "cadence": {
-        "time": "07:30",
-        "days": ["mon", "tue", "wed", "thu", "fri"]
+        "at": {
+          "time": "07:30",
+          "weekday": "mon"
+        }
       },
-      "replaceWith": "example-replacement-a"
+      "job": {
+        "queue-task": {
+          "pipeline": "audit",
+          "priority": "normal"
+        }
+      },
+      "node": "wok",
+      "replaceWith": "file-change-watcher"
     },
     {
-      "id": "example-weekend",
+      "id": "example-daily",
       "cadence": {
-        "time": "09:00",
-        "days": ["sat", "sun"]
+        "every": {
+          "interval": "P1D"
+        }
       },
-      "replaceWith": "example-replacement-b"
+      "job": {
+        "run-command": {
+          "command": "/usr/local/bin/backup.sh",
+          "args": ["--full"],
+          "env": { "BACKUP_DIR": "/mnt/backups" }
+        }
+      },
+      "node": "wok",
+      "replaceWith": "none yet"
+    },
+    {
+      "id": "example-audit",
+      "cadence": {
+        "rule": {
+          "name": "loop-audits"
+        }
+      },
+      "job": {
+        "queue-task": {
+          "pipeline": "audit",
+          "priority": "premium"
+        }
+      },
+      "node": "wok",
+      "migratedFrom": "loop-audit.timer"
     }
   ]
 }

@@ -2,23 +2,27 @@
   "entries": [
     {
       "id": "morning-standup",
-      "cadence": { "time": "09:00", "days": ["mon", "tue", "wed", "thu", "fri"] },
+      "cadence": { "at": { "time": "09:00", "weekday": "mon" } },
+      "job": { "queue-task": { "pipeline": "standup", "priority": "normal" } },
       "replaceWith": "standup-slack"
     },
     {
       "id": "weekend-check",
-      "cadence": { "time": "10:00", "days": ["sat", "sun"] },
+      "cadence": { "at": { "time": "10:00", "weekday": "sat" } },
+      "job": { "queue-task": { "pipeline": "report", "priority": "normal" } },
       "replaceWith": "weekend-report"
     },
     {
       "id": "daily-backup",
-      "cadence": { "time": "23:59", "days": ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] },
+      "cadence": { "every": { "interval": "P1D" } },
+      "job": { "run-command": { "command": "/usr/local/bin/backup.sh", "args": ["--full"] } },
       "replaceWith": "backup-service"
     },
     {
       "id": "midday-break",
-      "cadence": { "time": "12:30", "days": ["mon", "wed", "fri"] },
-      "replaceWith": "break-room"
+      "cadence": { "at": { "time": "12:30", "weekday": "wed" } },
+      "job": { "queue-task": { "pipeline": "break-room", "priority": "normal" } },
+      "replaceWith": "break-notification"
     }
   ]
 }
