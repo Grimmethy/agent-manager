@@ -920,6 +920,12 @@ def api_task_answer_clarification(task_id):
     if not answer:
         abort(400, description="answer is required")
 
+    # Persist the answer on the task record (needsClarification.answer field)
+    if "needsClarification" not in data:
+        data["needsClarification"] = {}
+    data["needsClarification"]["answer"] = answer
+    data["needsClarification"]["answeredAt"] = datetime.now(timezone.utc).isoformat()
+
     data.setdefault("promptContext", {})
     # A `Files:` line in the answer REPLACES the task's stale first one (same rule as the chat answer), so the guards read the corrected paths.
     prior, files_replaced = replace_files_line(data["promptContext"].get("rawText", ""), answer)
