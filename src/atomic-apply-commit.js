@@ -36,27 +36,30 @@ function execFilePromise(command, args, options = {}) {
 /**
  * Stage a single file with `git add`.
  * @param {string} filePath - Absolute or relative path to the file to stage.
+ * @param {string} [cwd] - Working directory for the git command.
  */
-async function gitAdd(filePath) {
-  await execFilePromise('git', ['add', filePath]);
+async function gitAdd(filePath, cwd) {
+  await execFilePromise('git', ['add', filePath], cwd ? { cwd } : {});
 }
 
 /**
  * Commit all staged changes with the deterministic apply message.
  * @param {string} candidateId - The candidate id, used in the commit message.
+ * @param {string} [cwd] - Working directory for the git command.
  */
-async function gitCommit(candidateId) {
+async function gitCommit(candidateId, cwd) {
   const message = `apply: candidate ${candidateId}`;
-  await execFilePromise('git', ['commit', '-m', message]);
+  await execFilePromise('git', ['commit', '-m', message], cwd ? { cwd } : {});
 }
 
 /**
  * Unstage a file (and remove it from the working tree if it was added but not yet committed).
  * @param {string} filePath - The file to unstage.
+ * @param {string} [cwd] - Working directory for the git command.
  */
-async function gitUnstage(filePath) {
+async function gitUnstage(filePath, cwd) {
   try {
-    await execFilePromise('git', ['rm', '--cached', filePath]);
+    await execFilePromise('git', ['rm', '--cached', filePath], cwd ? { cwd } : {});
   } catch {
     // Ignore errors during cleanup -- we're already in a failure path.
   }
@@ -107,16 +110,16 @@ async function writeCandidateDoc(candidate, outputDir) {
     await fs.rename(tempPath, finalPath);
 
     // 3. Stage.
-    await gitAdd(finalPath);
+    await gitAdd(finalPath, outputDir);
 
     // 4. Commit.
-    await gitCommit(candidate.id);
+    await gitCommit(candidate.id, outputDir);
 
     return { success: true };
   } catch (error) {
     // Clean up on failure: remove temp file and unstage any partial git state.
     await removeIfExists(tempPath);
-    await gitUnstage(finalPath);
+    await gitUnstage(finalPath, outputDir);
     throw error;
   }
 }

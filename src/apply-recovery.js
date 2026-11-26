@@ -126,10 +126,10 @@ function checkDirtyState(outputDir) {
 
   let recovered = false;
 
-  // 1. Delete .candidate-*.tmp files
+  // 1. Delete .candidate-*-temp files (leftover from failed writeCandidateDoc calls)
   try {
     const files = fs.readdirSync(outputDir);
-    const tmpFiles = files.filter((f) => f.startsWith('.candidate-') && f.endsWith('.tmp'));
+    const tmpFiles = files.filter((f) => f.startsWith('.candidate-') && f.endsWith('-temp'));
 
     if (tmpFiles.length > 0) {
       log('info', `Found ${tmpFiles.length} .candidate-*.tmp file(s) to clean up`);
@@ -149,7 +149,7 @@ function checkDirtyState(outputDir) {
     const stagedFiles = stagedOutput
       .split('\n')
       .filter((line) => line.trim())
-      .filter((line) => /^candidate-.*\.json$/.test(line));
+      .filter((line) => /candidate-.*\.json$/.test(line));
 
     if (stagedFiles.length > 0) {
       log('info', `Found ${stagedFiles.length} staged candidate file(s) to recover`);
@@ -170,6 +170,7 @@ function checkDirtyState(outputDir) {
       try {
         gitCommand('commit', ['-m', commitMessage], outputDir);
         log('info', `Successfully committed: ${stagedFile}`);
+        recovered = true;
       } catch (err) {
         log('warn', `Commit failed for ${stagedFile}: ${err.message}`);
         const filePath = path.join(outputDir, stagedFile);
