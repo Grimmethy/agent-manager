@@ -889,8 +889,25 @@ def api_task_answer_clarification(task_id):
     session's transcript already gets folded in as (see api_discuss_end's needs-
     clarification branch), just without ever opening a session.
     Body: {"answer": "<free text, or the clicked option's label+description>"}."""
-    from app import _record_manual_requeue, read_json_safe
+    from app import _record_manual_requeue, read_json_safe, read_project_registry
     body = request.get_json(silent=True) or {}
+
+    # Extract project name using clear multi-line logic to avoid malformed ternary
+    if isinstance(body, dict) and "project" in body:
+        project_name = body["project"]
+    else:
+        project_name = request.args.get("project")
+    
+    # Validate project name against registered projects
+    if project_name:
+        registered_projects = read_project_registry()
+        valid_labels = [p.get("label", "") for p in registered_projects if isinstance(p, dict)]
+        # Also check against repoRoot for backward compatibility
+        valid_roots = [p.get("repoRoot", "") for p in registered_projects if isinstance(p, dict)]
+        
+        if project_name not in valid_labels and project_name not in valid_roots:
+            abort(400, description=f"unknown project '{project_name}' -- valid projects: {', '.join(valid_labels) or '(none registered)'}")
+    
     qdir, scope = _qdir_for_request(body)
     if not qdir:
         abort(404)
