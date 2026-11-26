@@ -274,6 +274,23 @@ function capFailureMessages(failures, maxChars) {
   return result;
 }
 
+// Format an array of failure objects for display. Each failure has shape
+// {name: string, message: string, stack?: string}. The output is a single
+// readable string: '${name}: ${message}' for each failure, joined with ', '.
+// If a failure lacks name or message, fall back to JSON.stringify(failure)
+// truncated to 200 chars so callers never see '[object Object]'.
+function formatFailureMessages(failures) {
+  if (!Array.isArray(failures) || failures.length === 0) return '';
+  const parts = failures.map((f) => {
+    if (f && typeof f === 'object' && f.name && typeof f.name === 'string' && f.message != null) {
+      return `${f.name}: ${f.message}`;
+    }
+    // Fallback: never emit '[object Object]'
+    return JSON.stringify(f).slice(0, 200);
+  });
+  return parts.join(', ');
+}
+
 function worktreePaths(taskId) {
   const safe = String(taskId).replace(/[^\w.-]/g, '_');
   // Deliberately NOT agenticWorktreePaths(): a draft may be using that name for the same task id.
@@ -1020,7 +1037,7 @@ module.exports = {
   unpinnedBlockDecision,
   extraCoveringMax,
   pythonTestArgs, checkChangedFilesSyntax, splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
-  verifyDiff, addedTestNames, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths, capFailureMessages,
+  verifyDiff, addedTestNames, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths, capFailureMessages, formatFailureMessages,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS,
   checkFailsOnBase, splitDiffFiles, checkTestPinning,
 };
