@@ -133,6 +133,11 @@ function maxTasks(env) {
 
 function buildDaemonDeps(env = process.env, overrides = {}) {
   const ensure = overrides.ensure || ((spec, opts) => require('./node-repo-ensure.js').ensureRepo(spec, opts));
+  const countBehind = overrides.countBehind || ((codeSha, masterSha) => {
+    // Default: query the registry to count commits behind. Returns null when unknown.
+    // Production wiring would call the registry's /drift/count endpoint.
+    return null;
+  });
   return {
     ensureRepo: async (info) => {
       const remoteUrl = info && info.remoteUrl;
@@ -154,6 +159,9 @@ function buildDaemonDeps(env = process.env, overrides = {}) {
     },
     isPaused: () => fs.existsSync(path.join(stateDir(env), PAUSE_MARKER)),
     classes: parseClasses(env.AGENT_MANAGER_NODE_CLASSES),
+    codeSha: env.AGENT_MANAGER_NODE_CODE_SHA || null,
+    masterSha: env.AGENT_MANAGER_REGISTRY_MASTER_SHA || null,
+    countBehind,
   };
 }
 

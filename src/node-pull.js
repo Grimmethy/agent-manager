@@ -10,6 +10,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { checkDrift, readMaxBehind } = require('./node-code-drift.js');
 
 const DEBOUNCE_MS = 2000;
 const BACKOFF_FIRST_MS = 30000;
@@ -49,6 +50,9 @@ function resolveDeps(deps = {}) {
     classes: deps.classes,
     isPaused: deps.isPaused || (() => false),
     isWorkerFree: deps.isWorkerFree || (() => true),
+    codeSha: deps.codeSha || null,
+    masterSha: deps.masterSha || null,
+    countBehind: deps.countBehind || (() => null),
   };
 }
 
@@ -101,6 +105,19 @@ async function pullOnce({ env = process.env, deps = {}, state = makeState() } = 
       token = readToken(String(env.AGENT_MANAGER_NODE_TOKEN_FILE || '').trim());
     } catch (e) {
       return failure(d, state, 'cannot read node token file');
+    }
+
+    // Check code drift before claiming: refuse if the node is behind the registry master by more than AGENT_MANAGER_NODE_MAX_BEHIND.
+    const maxBehind = readMaxBehind();
+    const driftResult = checkDrift({
+      codeSha: d.codeSha,
+      masterSha: d.masterSha,
+      maxBehind,
+      countBehind: d.countBehind,
+    });
+    if (driftResult.allow === false) {
+      d.log(driftResult.message);
+      return failure(d, state, driftResult.message);
     }
 
     // An absent classes key means "no class filter" on the claim side; an empty array would filter out every task, so it is never sent.
