@@ -22,6 +22,16 @@ function wantsRepro(task, { hubChild = false, env = process.env } = {}) {
   return !!(pc && typeof pc === 'object' && pc.brainDumpEntryId);
 }
 
+// Convert a failure object to a readable string for display.
+// Failure objects have shape {name: string, message: string, stack?: string}.
+// Falls back to JSON.stringify if name or message is missing.
+function formatFailure(failure) {
+  if (failure && typeof failure === 'object' && failure.name && failure.message) {
+    return `${failure.name}: ${failure.message}`;
+  }
+  return JSON.stringify(failure).slice(0, 200);
+}
+
 // A compact, record-safe view of review-verify's result.repro.
 function summariseRepro(r) {
   if (!r || typeof r !== 'object') return null;
@@ -29,7 +39,7 @@ function summariseRepro(r) {
   const testsTotal = Array.isArray(r.tests) ? r.tests.length : 0;
   const failuresTotal = Array.isArray(r.failures) ? r.failures.length : 0;
   return r.ran
-    ? { ran: true, failedOnBase: !!r.failedOnBase, tests: strs(r.tests, 8, 160), failures: strs(r.failures, 5, 160), testsTotal, failuresTotal }
+    ? { ran: true, failedOnBase: !!r.failedOnBase, tests: strs(r.tests, 8, 160), failures: r.failures ? r.failures.slice(0, 5).map(formatFailure) : [], testsTotal, failuresTotal }
     : { ran: false, reason: String(r.reason || 'not run').slice(0, 200) };
 }
 
