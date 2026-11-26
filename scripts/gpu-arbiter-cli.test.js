@@ -258,3 +258,86 @@ test('hold: a draft-class acquire on the held key times out while the hold is li
     h.cp.kill('SIGKILL');
   }
 });
+
+// --- direct class (FF-1/1a) ---------------------------------------------------------------
+// `direct` is rank 4, the lowest priority. Used by the proxy to safely call the arbiter
+// without freezing streams or killing the proxy via cancelBelow().
+
+test('cancel-below(audit) marks a direct ticket cancelRequested', () => {
+  const pd = tmpPipeline();
+  const fp = writeTicket(pd, 'test-model', '0000000000000001.' + process.pid + '.d.json',
+    { pid: process.pid, cls: 'direct', taskId: 't-direct', holding: false });
+
+  const r = runCli(['cancel-below', '--cls', 'audit'], pd);
+  assert.equal(r.status, 0, r.stderr);
+  const rows = JSON.parse(r.stdout);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].cls, 'direct');
+  assert.equal(rows[0].action, 'cancel-marked');
+  assert.equal(JSON.parse(fs.readFileSync(fp, 'utf8')).cancelRequested, true);
+});
+
+test('cancel-below(audit) leaves an audit ticket alone (direct is below audit)', () => {
+  const pd = tmpPipeline();
+  writeTicket(pd, 'test-model', '0000000000000001.' + process.pid + '.e.json',
+    { pid: process.pid, cls: 'audit', taskId: 't-audit', holding: false });
+  const r = runCli(['cancel-below', '--cls', 'audit'], pd);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout), []);
+});
+
+test('status lists a direct ticket in waiting when it is not holding', () => {
+  const pd = tmpPipeline();
+  writeTicket(pd, 'test-model', '0000000000000001.' + process.pid + '.f.json',
+    { pid: process.pid, cls: 'audit', taskId: 't-audit', holding: true });
+  writeTicket(pd, 'test-model', '0000000000000002.' + process.pid + '.g.json',
+    { pid: process.pid, cls: 'direct', taskId: 't-direct', holding: false });
+  const r = runCli(['status'], pd);
+  assert.equal(r.status, 0, r.stderr);
+  const st = JSON.parse(r.stdout);
+  assert.equal(st.holder.cls, 'audit');
+  assert.ok(st.waiting.some((w) => w.cls === 'direct' && w.taskId === 't-direct'));
+});
+
+test('hold --cls direct is accepted', async () => {
+  const pd = tmpPipeline();
+  const owner = sleeper();
+  const h = startHold(['--key', HOLD_KEY, '--pid', String(owner.pid), '--cls', 'direct'], pd);
+  try {
+    const held = await h.waitFor('held');
+    assert.equal(held.cls, 'direct');
+    assert.equal(held.ownerPid, owner.pid);
+    const files = fs.readdirSync(holdTicketsDir(pd)).filter((n) => n.endsWith('.json'));
+    assert.equal(files.length, 1);
+    const ticket = JSON.parse(fs.readFileSync(path.join(holdTicketsDir(pd), files[0]), 'utf8'));
+    assert.equal(ticket.cls, 'direct');
+    owner.kill('SIGKILL');
+    await h.waitFor('released');
+    h.cp.kill('SIGKILL');
+  } finally {
+    owner.kill('SIGKILL');
+    h.cp.kill('SIGKILL');
+  }
+});
+
+test('direct ticket yields to every other class', async () => {
+  const pd = tmpPipeline();
+  const arbPath = path.join(__dirname, '..', 'src', 'gpu-arbiter.js');
+  const inst = path.join(pd, 'instances');
+  // Hold an audit-class lock so a direct ticket must wait
+  const owner = sleeper();
+  const h = startHold(['--key', HOLD_KEY, '--pid', String(owner.pid), '--cls', 'audit'], pd);
+  try {
+    await h.waitFor('held');
+    // Now try to acquire a direct ticket - it should block and time out
+    const blocked = spawnSync(process.execPath, ['-e', `
+      const arb = require(${JSON.stringify(arbPath)});
+      try { const g = arb.acquire(${JSON.stringify(inst)}, { cls: 'direct', model: 'm', lockKey: ${JSON.stringify(HOLD_KEY)}, taskId: 'direct-waiter' }); g.release(); process.stdout.write('acquired'); }
+      catch (e) { process.stdout.write('error:' + e.message); }
+    `], { encoding: 'utf8', env: { ...process.env, SINGLE_FLIGHT_LOCK_TIMEOUT_SECS: '1' }, timeout: 15000 });
+    assert.match(blocked.stdout, /^error:.*timed out waiting to reach the head of the queue/, blocked.stdout + blocked.stderr);
+  } finally {
+    owner.kill('SIGKILL');
+    h.cp.kill('SIGKILL');
+  }
+});

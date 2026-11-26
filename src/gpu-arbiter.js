@@ -79,7 +79,7 @@ function interactiveCompatMarker(instancesDir, cls) {
   };
 }
 
-const CLASS_RANK = Object.freeze({ interactive: 0, review: 1, draft: 2, audit: 3 });
+const CLASS_RANK = Object.freeze({ interactive: 0, review: 1, draft: 2, audit: 3, direct: 4 });
 const DEFAULT_CLASS = 'draft';
 
 const TICKETS_DIRNAME = '.gpu-tickets';
