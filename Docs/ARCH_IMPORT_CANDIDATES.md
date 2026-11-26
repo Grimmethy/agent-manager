@@ -299,3 +299,17 @@ Benefits:
 - Makes the harness the authority on what counts as a safe re-apply vs. redraft, matching the classification already encoded in `apply-retry-lock.test.js` but removing the worker's ability to subvert it.
 - Validates the splice before it lands, so a worker exit that the current code would silently splice back is now caught and fails the step.
 - Keeps context short for the model, which reduces the chance of the kind of hunk-header/body mismatch that triggered the 2026-08-18 incident in the first place.
+
+### AC-22 · Word-boundary truncation for brain-dump task titles
+Strength: Strong
+Source: builderio-agent-native — "buildPlanMetaDescription word-boundary truncation helper"
+Files: python/dashboard/routes/brain_dump.py
+
+Problem:
+In `python/dashboard/routes/brain_dump.py`, the `api_brain_dump_prioritize` endpoint mints a task title with `"title": entry["rawText"][:120]` — a hard 120-character slice with no word-boundary protection, no ellipsis, and no whitespace normalization. LLM-written or copy-pasted brain-dump entries routinely contain trailing spaces, internal newlines, or mid-word breaks at the 120th character, so the resulting title lands as a garbled fragment (e.g. `"edit src/main.py and the thing abou"` or `"fix the\nbug in x"`). The same file also concatenates human-readable descriptions in abort calls like `abort(409, description="Process now was not run: " + "; ".join(reasons) + ' -- send {"force": true} to queue it anyway')` where a long `reasons` list can exceed display widths, but the title truncation is the canonical case the original finding was built to solve.
+
+Solution:
+Extract a small `truncateForLabel(text, limit, opts)` helper (modeled on `buildPlanMetaDescription` but adapted for Python): it first collapses internal whitespace (newlines, tabs, multiple spaces) into single spaces via a regex, then if the result exceeds `limit`, walks backward from `limit` to the last space and slices there, appending `…`. The 120-character constant in `brain_dump.py` becomes a named limit (e.g. `TITLE_CHAR_LIMIT = 120`) pulled from a config or env var so the dashboard display width drives it, not an SEO heuristic. Replace `entry["rawText"][:120]` with `truncateForLabel(entry["rawText"], TITLE_CHAR_LIMIT)`. The abort-description concatenation in the same file can also route through the helper with a wider limit, so multi-reason abort messages don't silently overflow the dashboard error toast.
+
+Benefits:
+Titles in the queue no longer break mid-word, so the Brain Dump tab and downstream task lists render cleanly without truncation artifacts. The whitespace collapse handles LLM-written entries that include stray newlines or indentation. The named limit makes it trivial to retune per-display without hunting for magic numbers, and the shared helper eliminates any future ad-hoc `[:N]` slices that would reintroduce the same problem in other routes.
