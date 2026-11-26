@@ -313,3 +313,31 @@ Extract a small `truncateForLabel(text, limit, opts)` helper (modeled on `buildP
 
 Benefits:
 Titles in the queue no longer break mid-word, so the Brain Dump tab and downstream task lists render cleanly without truncation artifacts. The whitespace collapse handles LLM-written entries that include stray newlines or indentation. The named limit makes it trivial to retune per-display without hunting for magic numbers, and the shared helper eliminates any future ad-hoc `[:N]` slices that would reintroduce the same problem in other routes.
+
+### AC-23 · Pre-queue source eligibility gate
+Strength: Strong
+Source: builderio-agent-native — "Pre-process gate that fails closed before work is queued"
+Files: src/lib/task-state.js, src/node-claim.js
+
+Problem:
+In `src/node-claim.js`, the `claimNext` function filters tasks by `allowedSources` (via `filterSources(env)`) only when iterating through already-queued tasks to find claimable ones. Tasks are written to `queue/pending` or `queue/adhoc` subdirectories without first validating whether their source is in the allowed list. This means ineligible tasks can be queued, consume disk space, and only get filtered out later during claiming with a `not-eligible-for-node` skip reason. The gate runs too late: after queuing, not before.
+
+Solution:
+Add a pre-queue validation step (adapted from the original finding's `beforeMailIntegrationProcess` pattern) that checks `allowedSources` before a task is written to the queue. This gate should return a handled/not-handled result with a specific reason (e.g., `source-not-allowed`) and enrich the request with the verified identity. Tasks that fail this gate are rejected immediately, before any local-model worker or queue processing is involved. The gate should be placed at the front of the queuing path, not inside `claimNext`.
+
+Benefits:
+Ineligible tasks are rejected immediately with a clear reason, saving disk I/O, queue space, and downstream filtering work. The gate also enriches the request with verified identity, making it easier to debug source-related rejections. This matches the original finding's pattern of failing closed before work proceeds.
+
+### AC-24 · Queue-state restore with position-preserving rollback
+Strength: Strong
+Source: builderio-agent-native — "Optimistic remove with index-preserving rollback"
+Files: src/abandoned-recheck.js, src/abandoned-recheck.test.js, src/task-sources.js
+
+Problem:
+When a task record is moved out of an open queue state (e.g., `queue/review/` to `queue/done/`) during a slow local-model call or a dashboard action, the system currently has no guarantee that a failed action can restore the task to its original position. The abandoned-recheck loop in `src/abandoned-recheck.js` handles the "branch gone, work lost" case with `restoreRecord` and `shared-branch-restore.js`, but that is a git-branch recovery path, not a queue-state rollback path. When `queue/review/` holds a task and the reviewer's apply action fails mid-flight, the task record may already be written to `queue/done/` or `queue/blocked/`, leaving the queue in an inconsistent state where the task is "lost" between states. The `taskIdExistsInQueue` primitive in `.vendor-core/agent-manager/src/task-sources.js` can detect the absence, but there is no mechanism to reinsert the task at its original index or to snapshot the pre-action state for rollback. This causes flicker in the dashboard's Job List and requires manual intervention to recover tasks that should be restored to their previous queue position.
+
+Solution:
+Adapt the optimistic-remove pattern by having the queue-move operation (e.g., `queueAdhocTask` or the dashboard's apply route) snapshot the task's current state and position before the move, then on error reinsert the task at its original index clamped to the current queue length. The snapshot should record `{queueState, index, taskId}` for each affected queue, similar to the `{queryKey, form, index}` shape from the original finding. On error, the rollback logic checks if the task is already present in the target state (a background refetch may have landed between mutate and error), and if not, reinserts it at the original index. The `restoreRecord` function in `src/abandoned-recheck.js` already handles the "restore to approved/" pattern for shared-branch cases; this can be generalized to queue-state restoration by treating the queue state as the "branch" to restore. The test in `src/abandoned-recheck.test.js` for `HUB0018-01` (restoring a stacked task to `queue/approved/`) demonstrates the rollback shape with a deferred promise; this test pattern should be extended to cover queue-state rollback with a similar assertion that the task is back in its original queue state after a failed action.
+
+Benefits:
+The queue no longer flickers during slow local-model calls or dashboard actions, and failed actions automatically restore tasks to their original position without manual intervention. This eliminates the "lost task" state where a task is neither in an open queue nor properly completed, reducing the need for operator recovery. The index-preserving rollback ensures that task ordering is maintained across failures, which is critical for priority-based scheduling in the queue. The pattern is testable with the same deferred-promise shape used in `src/abandoned-recheck.test.js`, making it easy to verify rollback behavior without spinning up a full pipeline.
