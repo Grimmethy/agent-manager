@@ -950,13 +950,10 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
       }
     }
     if (failures.length) {
-      result.status = 'failed';
-      result.reasons.push(...failures);
       // Explicit classification: this is a verification failure (deterministic gate failed after apply),
       // NOT a plan-degenerate or other upstream issue. Downstream consumers (context-outcomes.js) use
       // this to avoid misclassifying a real regression as a degenerate plan.
-      result.classification = 'verification-failure';
-      return result;
+      return { outcome: 'tests-failed', failingOutput: failures.join('\n'), evidence: null };
     }
     if (unattributable.length) return inconclusive(unattributable.join('; '));
     if (sandboxMissing && !anyExecuted) {
@@ -972,7 +969,6 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     }
     const confirmed = (result.tests && result.tests.passed === true) || result.commands.some((c) => c.outcome === 'confirmed');
     if (!confirmed) return inconclusive('no covering tests and no runnable acceptance commands were found');
-    result.status = 'passed';
     // Advisory, after the verdict is settled: never changes the status.
     // Test pinning check runs before unpinned hunk check -- it reverts production changes
     // and verifies tests fail on base, providing evidence the diff is needed.
@@ -998,9 +994,9 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
         if (repro) result.repro = repro;
       } catch { /* advisory */ }
     }
-    return result;
+    return { outcome: 'pass', failingOutput: null, evidence: null };
   } catch (e) {
-    return inconclusive(`verification errored (${String((e && e.message) || e).slice(0, 200)})`);
+    return { outcome: 'tool-error', failingOutput: null, evidence: String((e && e.message) || e).slice(0, 200) };
   } finally {
     if (prepared) { try { d.cleanup(repoRoot, worktreeDir, branchName); } catch { /* best-effort */ } }
   }
