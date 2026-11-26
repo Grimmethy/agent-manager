@@ -252,6 +252,13 @@ const REASON_CATEGORIES = [
   { key: 'truncated-draft', keywords: ['truncat'] },
   { key: 'inconclusive-review', keywords: ['inconclusive'] },
   { key: 'json-parse-failure', keywords: ['invalid json', 'unexpected end of json', 'unexpected token', 'false positive'] },
+  { key: 'empty-draft', keywords: ['empty draft', 'empty response', 'no content'], retryable: true },
+  { key: 'infra-error', keywords: ['infra error', 'infrastructure error', 'infrastructure failure'], retryable: true },
+  { key: 'invented-claim', keywords: ['invented claim', 'fabricated claim', 'hallucinated'], retryable: true },
+  { key: 'invented-path', keywords: ['invented path', 'fabricated path', 'non-existent path'], retryable: false },
+  { key: 'ambiguous', keywords: ['ambiguous', 'ambiguous request', 'unclear requirement'], retryable: true },
+  { key: 'zero-search-results', keywords: ['zero search results', 'no search results', 'no results found'], retryable: true },
+  { key: 'refusal', keywords: ['refusal', 'refused to', 'refused the'], retryable: true },
 ];
 
 function categorizeBlockedReason(reason) {
@@ -389,12 +396,12 @@ const CLASSIFIERS = [
       return null;
     },
   },
-  ...REASON_CATEGORIES.map(({ key, keywords }) => ({
+  ...REASON_CATEGORIES.map(({ key, keywords, retryable = true }) => ({
     name: key,
     classify(task) {
       const lower = (task.blockedReason || '').toLowerCase();
       if (keywords.some((kw) => lower.includes(kw))) {
-        return { category: key, faultSide: 'model', retryable: true };
+        return { category: key, faultSide: 'model', retryable };
       }
       return null;
     },
