@@ -438,10 +438,64 @@ function main() {
     if (objGrounding) parts.push(objGrounding);
   }
 
+  // 2026-11-03: recorded tool/command output from the task's own execution. The fact-check
+  // gate previously rejected drafts citing values (like shell exit codes) that appeared in
+  // the task's own toolCallLog but not in static source files -- the gate treated only
+  // static files as "grounding" and missed values produced by commands run during the task.
+  // This block extracts stdout, stderr, and exit codes from every tier's toolCallLog so
+  // they are available for the fact-check to confirm against.
+  if (task.draftAttempts) {
+    const recordedOutputs = extractRecordedToolOutput(task.draftAttempts);
+    if (recordedOutputs.length > 0) {
+      parts.push([
+        '=== RECORDED TOOL/COMMAND OUTPUT (from the task\'s own execution -- values the drafter ' +
+        'actually saw and produced. A claim matching this output is CONFIRMED by the task itself, ' +
+        'not fabricated. ===',
+        ...recordedOutputs,
+      ].join('\n'));
+    }
+  }
+
   process.stdout.write(parts.join('\n\n'));
 }
 
-module.exports = { tiersOfCurrentAttempt, extractLiveRepoGrounding, refreshFetchedFileContent, extractRequestObjectTokens, buildRequestObjectGrounding, main };
+// Extract recorded tool/command output from draft attempts. The actual shape is:
+//   task.draftAttempts[].tiers[].toolCallLog: [{ tool, args, result: { exitCode, stdout, stderr } }]
+// We extract stdout, stderr, and exit codes from each tool call, tagged with the tool name
+// and stage for traceability.
+function extractRecordedToolOutput(draftAttempts) {
+  if (!Array.isArray(draftAttempts)) return [];
+  const outputs = [];
+  for (const attempt of draftAttempts) {
+    if (!attempt || !Array.isArray(attempt.tiers)) continue;
+    for (const tier of attempt.tiers) {
+      if (!tier || !Array.isArray(tier.toolCallLog)) continue;
+      const stage = tier.stage || 'unknown';
+      for (const call of tier.toolCallLog) {
+        if (!call || typeof call !== 'object') continue;
+        const tool = call.tool || 'unknown';
+        const result = call.result;
+        if (!result || typeof result !== 'object') continue;
+        const lines = [];
+        if (result.exitCode !== undefined && result.exitCode !== null) {
+          lines.push(`  tool=${tool} exit_code=${result.exitCode}`);
+        }
+        if (result.stdout && typeof result.stdout === 'string' && result.stdout.trim()) {
+          lines.push(`  tool=${tool} stdout:\n${result.stdout}`);
+        }
+        if (result.stderr && typeof result.stderr === 'string' && result.stderr.trim()) {
+          lines.push(`  tool=${tool} stderr:\n${result.stderr}`);
+        }
+        if (lines.length > 0) {
+          outputs.push(`[stage=${stage}] ${lines.join('\n')}`);
+        }
+      }
+    }
+  }
+  return outputs;
+}
+
+module.exports = { tiersOfCurrentAttempt, extractLiveRepoGrounding, refreshFetchedFileContent, extractRequestObjectTokens, buildRequestObjectGrounding, extractRecordedToolOutput, main };
 
 if (require.main === module) {
   main();
