@@ -70,3 +70,59 @@ test('recorded without succeeded does not reach done/', () => {
   const { where } = run({ succeeded: false, recorded: true });
   assert.deepEqual(where.done, []);
 });
+
+// FF-1: deferUntil handling in the leftover-drafting resume pass.
+function runWithDeferUntil(deferUntilValue) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-defer-'));
+  const mk = (...p) => { const d = path.join(root, ...p); fs.mkdirSync(d, { recursive: true }); return d; };
+  const pkg = mk('pkg');
+  fs.symlinkSync(path.join(REAL, 'scripts'), path.join(pkg, 'scripts'));
+  fs.rmSync(path.join(pkg, 'scripts'));
+  mk('pkg', 'scripts'); mk('pkg', 'src');
+  for (const f of fs.readdirSync(path.join(REAL, 'scripts'))) fs.symlinkSync(path.join(REAL, 'scripts', f), path.join(pkg, 'scripts', f));
+  for (const f of fs.readdirSync(path.join(REAL, 'src'))) if (f !== 'local-draft.js') fs.symlinkSync(path.join(REAL, 'src', f), path.join(pkg, 'src', f));
+  fs.writeFileSync(path.join(pkg, 'src', 'local-draft.js'), "process.stdout.write(process.env.STUB_DRAFT_RESULT + '\\n');\n");
+  fs.symlinkSync(path.join(REAL, 'node_modules'), path.join(pkg, 'node_modules'));
+  const P = mk('P'); mk('repo'); mk('home');
+  for (const d of ['pending', 'adhoc', 'drafting', 'review', 'blocked', 'done']) mk('P', 'queue', d);
+  mk('P', 'queue', 'drafting', 'worker-x');
+  fs.writeFileSync(path.join(P, 'task-domains.json'), '{}');
+  const task = { id: 't-defer', domain: 'default', source: 'trouble_log', title: 't', status: 'drafting', history: [] };
+  if (deferUntilValue !== undefined) task.deferUntil = deferUntilValue;
+  fs.writeFileSync(path.join(P, 'queue', 'drafting', 'worker-x', 't-defer.json'), JSON.stringify(task));
+  const marker = path.join(root, 'mem-marker.json');
+  fs.writeFileSync(marker, JSON.stringify({ state: 'ok', seq: 1, at: new Date().toISOString() }));
+  const projectsPath = path.join(root, 'projects.json');
+  fs.writeFileSync(projectsPath, JSON.stringify([{ repoRoot: path.join(root, 'repo'), pipelineDir: P, domainsPath: path.join(P, 'task-domains.json'), label: 'P' }]));
+  const r = spawnSync('bash', [path.join(pkg, 'scripts', 'local-worker.sh'), 'worker-x', '--once'], {
+    encoding: 'utf8', timeout: 120000,
+    env: { ...process.env, HOME: path.join(root, 'home'), OLLAMA_URL: 'http://127.0.0.1:9', MODEL_URL: 'http://127.0.0.1:9', LOCAL_MODEL: 'x', AGENT_MANAGER_TASK_SOURCES: 'none-such',
+      AGENT_MANAGER_PROJECTS_PATH: projectsPath, AGENT_MANAGER_POOL_STATE_PATH: path.join(root, 'pool-state.json'), ORC_TICK_SECS: '2', AGENT_MANAGER_ENDPOINT_PROBE: 'off', AGENT_MANAGER_MEM_PRESSURE_MARKER: marker,
+      AGENT_MANAGER_REPO_ROOT: path.join(root, 'repo'), AGENT_MANAGER_PIPELINE_DIR: P, AGENT_MANAGER_DOMAINS_PATH: path.join(P, 'task-domains.json'),
+      AGENT_MANAGER_INSTANCES_DIR: path.join(P, 'instances'), STUB_DRAFT_RESULT: JSON.stringify({ succeeded: true }) },
+  });
+  const where = {};
+  for (const d of ['review', 'blocked', 'done']) where[d] = fs.readdirSync(path.join(P, 'queue', d)).filter((f) => f.endsWith('.json'));
+  where.drafting = fs.readdirSync(path.join(P, 'queue', 'drafting', 'worker-x'));
+  return { r, where };
+}
+
+test('FF-1: a drafting record with deferUntil in the past is resumed (picked up by the resume selection)', () => {
+  const past = new Date(Date.now() - 60000).toISOString();
+  const { where } = runWithDeferUntil(past);
+  assert.deepEqual(where.drafting, [], 'past-deferred record was picked up');
+  assert.deepEqual(where.review, ['t-defer.json'], 'resumed record went to review/');
+});
+
+test('FF-1: a drafting record with deferUntil in the future is NOT resumed (stays in drafting/)', () => {
+  const future = new Date(Date.now() + 3600000).toISOString();
+  const { where } = runWithDeferUntil(future);
+  assert.deepEqual(where.drafting, ['t-defer.json'], 'future-deferred record stays in drafting/');
+  assert.deepEqual(where.review, []);
+});
+
+test('FF-1: without deferUntil behaviour is unchanged (record is resumed)', () => {
+  const { where } = runWithDeferUntil(undefined);
+  assert.deepEqual(where.drafting, [], 'record without deferUntil was picked up');
+  assert.deepEqual(where.review, ['t-defer.json'], 'resumed record went to review/');
+});

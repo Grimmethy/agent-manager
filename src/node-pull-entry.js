@@ -107,6 +107,23 @@ function countLeasedIn(dir, nodeId, pipelineDir) {
   let count = 0;
   for (const name of names) {
     if (!name.endsWith('.json')) continue;
+    // FF-1: a drafting record whose deferUntil is still in the future cannot keep the
+    // node at its cap -- it is waiting for a deadline, not doing work. Skip it from the
+    // held count (and from isDeadDuplicate checks) so a deferred draft does not block
+    // the node from picking up new work.
+    if (queueName.startsWith('drafting/')) {
+      const filePath = path.join(pipelineDir, 'queue', queueName, name);
+      let record;
+      try {
+        record = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      } catch (e) {
+        continue;
+      }
+      if (record && record.deferUntil) {
+        const until = Date.parse(record.deferUntil);
+        if (Number.isFinite(until) && until > Date.now()) continue;
+      }
+    }
     if (holdsLeasedTask(pipelineDir, queueName, name, nodeId)) count += 1;
   }
   return count;

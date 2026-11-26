@@ -85,6 +85,30 @@ test('records leased to another node or not leased do not count, and neither do 
   assert.equal(buildDaemonDeps(env).isWorkerFree(), true);
 });
 
+test('FF-1: a drafting record with deferUntil in the future is not counted as held; past-deferred and no-deferUntil records still are', (t) => {
+  const { env, pipelineDir } = setup(t);
+  const draftingDir = path.join(pipelineDir, 'queue', 'drafting', 'worker-x');
+  fs.mkdirSync(draftingDir, { recursive: true });
+  // Past deferUntil: should be counted (resumable)
+  put(pipelineDir, path.join('drafting', 'worker-x'), 'past', { leasedTo: NODE, deferUntil: new Date(Date.now() - 60000).toISOString() });
+  // Future deferUntil: should NOT be counted
+  put(pipelineDir, path.join('drafting', 'worker-x'), 'future', { leasedTo: NODE, deferUntil: new Date(Date.now() + 3600000).toISOString() });
+  // No deferUntil: should be counted (unchanged behavior)
+  put(pipelineDir, path.join('drafting', 'worker-x'), 'none', { leasedTo: NODE });
+  assert.equal(buildDaemonDeps(env).isWorkerFree(), false, 'past + none still hold the node');
+  const held = countHeldTasks(pipelineDir, NODE);
+  assert.equal(held, 2, 'past and none count, future does not');
+});
+
+test('FF-1: adhoc/pending records are never filtered by deferUntil', (t) => {
+  const { env, pipelineDir } = setup(t);
+  // adhoc with future deferUntil still counts (deferUntil only matters for drafting)
+  put(pipelineDir, 'adhoc', 'adhoc-deferred', { leasedTo: NODE, deferUntil: new Date(Date.now() + 3600000).toISOString() });
+  assert.equal(buildDaemonDeps(env).isWorkerFree(), false);
+  const held = countHeldTasks(pipelineDir, NODE);
+  assert.equal(held, 1);
+});
+
 test('an unset node id or pipeline dir, and an unreadable directory, count as not free', (t) => {
   const { env, pipelineDir } = setup(t);
   const noId = { ...env }; delete noId.AGENT_MANAGER_NODE_ID;
