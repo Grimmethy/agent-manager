@@ -18,6 +18,11 @@ const path = require('path');
 
 const { pipelineHealthAuditSweep } = require('./pipeline-health-audit-sweep.js');
 
+// pipeline_health_audit is a core-scope source (src/lib/source-scope.js). Declare the
+// active project as agent-manager so the core-scope gate stays open regardless of
+// AGENT_MANAGER_REPO_ROOT.
+process.env.AGENT_MANAGER_CORE_SOURCES_ANYWHERE = 'true';
+
 test('pipelineHealthAuditSweep does nothing (filed: false) when next() returns null (not due, or no anomalies)', () => {
   const result = pipelineHealthAuditSweep({ eligible: () => true, next: () => null, write: () => { throw new Error('write must not be called'); } });
   assert.deepEqual(result, { filed: false });
