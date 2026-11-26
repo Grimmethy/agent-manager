@@ -94,8 +94,13 @@ function executedVerificationBlockReason(ev, options = {}) {
   if (mode === 'advisory') return null;
   const bits = [];
   if (ev.tests && ev.tests.passed === false) {
-    const names = (ev.tests.failures || []).slice(0, 5).join('; ');
-    bits.push(`the tests covering it (${(ev.tests.ran || []).join(', ')}) FAIL${names ? `: ${names}` : ''}`);
+    const failures = (ev.tests.failures || []).slice(0, 5);
+    const names = failures.join('; ');
+    // List only the tests that FAILED, not all tests that were run. The full ran list is
+    // preserved in ev.tests.ran for logging/auditing but is not part of the failure message
+    // because unrelated tests that happen to be in the suite (pre-existing failures or
+    // failures on the base revision) would otherwise be blamed on the diff.
+    bits.push(`the tests covering it FAIL${names ? `: ${names}` : ''}`);
   }
   for (const c of (ev.commands || []).filter((x) => x.outcome === 'contradicted')) {
     bits.push(`the draft claimed PASS for \`${c.command}\` but it exits ${c.exitCode}`);
