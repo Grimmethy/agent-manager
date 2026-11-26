@@ -55,6 +55,16 @@ const SYNTAX_TIMEOUT_MS = 20000;
 const REPLAY_MIN_REMAINING_MS = 8000;
 const REPLAY_TIMEOUT_MS = 90000;
 
+// Convert a failure object to a readable string for display.
+// Failure objects have shape {name: string, message: string, stack?: string}.
+// Falls back to JSON.stringify if name or message is missing.
+function formatFailure(failure) {
+  if (failure && typeof failure === 'object' && failure.name && failure.message) {
+    return `${failure.name}: ${failure.message}`;
+  }
+  return JSON.stringify(failure).slice(0, 200);
+}
+
 // Names of the node:test cases the diff ADDS to `file` (test( / it( / describe( opened on a `+` line). Used to run just those first in a covering file that is
 // too slow to run whole (src/local-draft.test.js is ~9 minutes, past the review's per-run cap). Empty when the diff adds none there.
 function addedTestNames(rawDiff, file) {
@@ -574,7 +584,7 @@ function checkFailsOnBase({ worktreeDir, rawDiff, suites, run, d, deadline, py, 
           if (r.exitCode !== 0) { failedOnBase = true; failures.push(...s.parse(r.output)); }
         }
       }
-      if (!result) result = { ran: true, failedOnBase, tests: ranFiles.slice(0, 8), failures: failures.slice(0, 5).map((f) => String(f).slice(0, 160)) };
+      if (!result) result = { ran: true, failedOnBase, tests: ranFiles.slice(0, 8), failures: failures.slice(0, 5).map(formatFailure) };
     }
   } finally {
     const back = d.applyDiff(worktreeDir, prodPatch);
