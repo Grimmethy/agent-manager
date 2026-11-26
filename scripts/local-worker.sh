@@ -265,6 +265,27 @@ process_drafting_file() {
     # The pattern is the FORGE_PAUSE_MESSAGE text (pinned by src/local-client-forge-pause.test.js so the copies cannot drift).
     printf '[worker-%s] draft paused for a Forge GPU session -- not counted as a failure; %s stays in drafting/ and resumes when the lease clears\n' "$INSTANCE_ID" "$task_id" >&2
     TICK_HAD_INFRA_FAILURE=true
+  elif provider_defer="$(printf '%s' "$draft_result" | node "${PACKAGE_SRC_DIR}/provider-limit.js" parseProviderLimit 2>>"$LOG_FILE")"; [[ -n "$provider_defer" ]]; then
+    # Provider plan limit (HTTP 429 with resetsAt) -- a TEMPORARY capacity condition, not a draft failure
+    # (src/provider-limit.js). parseProviderLimit returns {resetsAt, resetsAtIso} on HTTP 429 with a usable reset;
+    # deferOnProviderLimit sets task.deferUntil and task.reason without touching failure counters.
+    # The item stays in drafting/ and the existing per-tick leftover-drafting pass skips it until then.
+    # Deliberately NO draftFailureCount increment, NO infra-requeue round and NO block.
+    # Log the deferral in pipeline history for audit trail. This tick stops claiming.
+    # Inline Node wrapper: reads task, parses provider_defer, calls deferOnProviderLimit, writes task back.
+    node -e '
+      const fs = require("fs");
+      const { deferOnProviderLimit } = require(process.argv[1]);
+      const task = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+      const providerDefer = JSON.parse(process.argv[3]);
+      deferOnProviderLimit(task, providerDefer);
+      fs.writeFileSync(process.argv[2], JSON.stringify(task, null, 2));
+    ' "${PACKAGE_SRC_DIR}/provider-limit-defer.js" "$wpath" "$provider_defer" 2>>"$LOG_FILE"
+    resetsAtIso="$(echo "$provider_defer" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.resetsAtIso)}catch(e){}' 2>/dev/null)"
+    resetsAt="$(echo "$provider_defer" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.resetsAt)}catch(e){}' 2>/dev/null)"
+    printf '[worker-%s] draft deferred on a provider plan limit until %s -- not counted as a failure; %s stays in drafting/\n' "$INSTANCE_ID" "$resetsAtIso" "$task_id" >&2
+    node "${PACKAGE_SRC_DIR}/pipeline-history.js" logPipelineEvent "$PIPELINE_DIR" "provider_limit_deferred" "{\"taskId\":\"${task_id}\",\"reason\":\"waiting on provider plan limit, resets ${resetsAtIso}\",\"resetsAt\":${resetsAt}}" 2>>"$LOG_FILE"
+    TICK_HAD_INFRA_FAILURE=true
   elif quota_resume="$(printf '%s' "$draft_result" | node "${PACKAGE_SRC_DIR}/draft-quota.js" classify-and-defer "$wpath" 2>>"$LOG_FILE")"; [[ -n "$quota_resume" ]]; then
     # Rate-limit / quota (HTTP 429: hourly token budget, five-hour plan limit) -- a TEMPORARY capacity condition, not a draft failure
     # (src/draft-quota.js). classify-and-defer already wrote task.deferUntil; the item stays in drafting/ and the existing per-tick
