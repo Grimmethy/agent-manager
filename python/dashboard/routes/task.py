@@ -8,6 +8,14 @@ import re
 import subprocess
 import tempfile
 
+from routes.stall_counter import (
+    increment_hub_retire,
+    increment_hub_restore,
+    increment_piece_escalate,
+    increment_nc_resolve,
+    increment_nc_owner,
+)
+
 # The app.py helpers these views call (ENV_FILE_PATH, PACKAGE_ROOT, QUEUE_STATES, SRC_DIR, _archive_task_file, _call_discuss, _discuss_provider_args, _files_touched_for, _incoming_task_links, _outgoing_task_links, _record_manual_requeue, _repeated_blocker_match, _task_cost_summary, _task_input_summary, _work_log_for, get_active_grep_dirs, get_active_repo_root, get_pipeline_dir, instances_dir, logger, queue_dir, read_env_file, read_json_safe) are
 # imported lazily inside each view: app.py imports THIS module to register the
 # blueprint, so a top-level `from app import ...` is a circular import that only
@@ -254,6 +262,8 @@ def api_hub_retire(hub_id):
     if blockers:
         abort(409, description="not retired, nothing changed: " + "; ".join(blockers))
 
+    increment_hub_retire()
+
     now_iso = datetime.now(timezone.utc).isoformat()
 
     def _stamp_and_archive(path, from_state, why_detail):
@@ -305,6 +315,8 @@ def api_hub_waive_abandoned(hub_id):
         abort(409, description="the hub has no abandoned piece; nothing to waive")
     if hub.get("abandonedPiecesWaived") is True:
         return jsonify({"hub": hub_id, "waived": True, "abandoned": abandoned, "alreadyWaived": True})
+
+    increment_hub_restore()
     now_iso = datetime.now(timezone.utc).isoformat()
     hub["abandonedPiecesWaived"] = True
     hub.setdefault("history", []).append({"stage": "abandoned-pieces-waived", "at": now_iso, "detail": f"abandoned piece(s) {', '.join(abandoned)} waived: {reason}"})
@@ -378,6 +390,8 @@ def api_hub_add_piece(hub_id):
     if not result.get("ok"):
         status = 404 if str(result.get("error", "")).startswith("no coordinating hub") else 409
         return jsonify(result), status
+
+    increment_piece_escalate()
     return jsonify(result)
 
 
@@ -852,6 +866,8 @@ def api_task_resolve_clarification(task_id):
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint="needs-clarification resolved via the file-path picker", requeue_writer="operator-manual", pipeline_dir=scope["pipelineDir"] if scope else None)
+
+    increment_nc_resolve()
     return jsonify({"id": task_id, "resolved": True, "prefetchedPaths": data.get("promptContext", {}).get("prefetchedPaths")})
 
 
@@ -932,6 +948,8 @@ def api_task_answer_clarification(task_id):
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint=f"needs-clarification answered from the picker: {answer[:200]}", requeue_writer="operator-manual", pipeline_dir=scope["pipelineDir"] if scope else None)
+
+    increment_nc_owner()
     return jsonify({"id": task_id, "answered": True})
 
 
@@ -989,6 +1007,8 @@ def api_task_mark_done_clarification(task_id):
         abort(409, description=f"'{task_id}' already has a task in done/")
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
+
+    increment_nc_owner()
     return jsonify({"id": task_id, "done": True})
 
 
