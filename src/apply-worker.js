@@ -35,46 +35,38 @@ function log(level, message, taskId) {
  * 2. Writes the candidate document atomically and commits it.
  * 3. Returns success/failure result.
  *
- * @param {object} task - The task record with at least { id, source, implementResponse }.
+ * @param {object} candidate - The candidate object with at least { id, source, title, content }.
  * @param {string} outputDir - Directory to write the candidate file into.
  * @returns {{ succeeded: boolean, reason?: string, branch?: string }}
  */
-async function runApplyWorker(task, outputDir) {
-  const taskId = task.id || 'unknown';
+async function applyWorker(candidate, outputDir) {
+  const candidateId = candidate?.id || 'unknown';
 
   try {
     // Step 1: Check for and recover from dirty state
-    log('info', 'Checking for dirty state...', taskId);
+    log('info', 'Checking for dirty state...');
     const recoveryResult = checkDirtyState(outputDir);
 
     if (recoveryResult.recovered) {
-      log('info', 'Recovered from dirty state', taskId);
+      log('info', 'Recovered from dirty state');
     } else {
-      log('info', 'No dirty state detected', taskId);
+      log('info', 'No dirty state detected');
     }
 
     // Step 2: Write candidate document atomically
-    log('info', `Writing candidate document for ${task.source}...`, taskId);
-
-    const candidate = {
-      id: task.id,
-      source: task.source,
-      title: task.title,
-      content: task.implementResponse,
-      timestamp: new Date().toISOString(),
-    };
+    log('info', `Writing candidate document for ${candidate.source}...`);
 
     const result = await writeCandidateDoc(candidate, outputDir);
 
-    log('info', 'Candidate document written and committed successfully', taskId);
+    log('info', 'Candidate document written and committed successfully');
 
     return {
       succeeded: true,
-      branch: `agent/${task.id}`,
-      reason: `candidate ${task.id} applied`,
+      branch: `agent/${candidateId}`,
+      reason: `candidate ${candidateId} applied`,
     };
   } catch (error) {
-    log('error', `Apply worker failed: ${error.message}`, taskId);
+    log('error', `Apply worker failed: ${error.message}`);
 
     return {
       succeeded: false,
@@ -84,7 +76,7 @@ async function runApplyWorker(task, outputDir) {
 }
 
 /**
- * Main entry point: parse task from stdin, run apply worker, output result.
+ * Main entry point: parse task from stdin, build candidate, run apply worker, output result.
  * CLI: node apply-worker.js <task.json>
  */
 async function main() {
@@ -105,7 +97,16 @@ async function main() {
   }
 
   const outputDir = task.outputDir || path.join(process.cwd(), 'output');
-  const result = await runApplyWorker(task, outputDir);
+
+  const candidate = {
+    id: task.id,
+    source: task.source,
+    title: task.title,
+    content: task.implementResponse,
+    timestamp: new Date().toISOString(),
+  };
+
+  const result = await applyWorker(candidate, outputDir);
 
   console.log(JSON.stringify(result, null, 2));
 }
@@ -118,4 +119,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runApplyWorker };
+module.exports = { applyWorker };

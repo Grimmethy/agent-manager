@@ -12,6 +12,7 @@ const { execFileSync } = require('child_process');
 
 const { writeCandidateDoc } = require('../src/atomic-apply-commit.js');
 const { checkDirtyState } = require('../src/apply-recovery.js');
+const { applyWorker } = require('../src/apply-worker.js');
 
 /**
  * Create a temporary git repository for testing.
@@ -208,21 +209,19 @@ test('checkDirtyState - handles missing directory gracefully', () => {
   assert.equal(result.recovered, false);
 });
 
-test('apply-worker integration - runApplyWorker succeeds', async () => {
+test('apply-worker integration - applyWorker succeeds', async () => {
   const repoDir = createTestRepo();
   const outputDir = path.join(repoDir, 'candidates');
   fs.mkdirSync(outputDir);
   
-  const { runApplyWorker } = require('../src/apply-worker.js');
-  
-  const task = {
+  const candidate = {
     id: 'worker-test-1',
     source: 'arch_discovery',
     title: 'Worker Test',
-    implementResponse: 'Test response content',
+    content: 'Test response content',
   };
   
-  const result = await runApplyWorker(task, outputDir);
+  const result = await applyWorker(candidate, outputDir);
   
   assert.equal(result.succeeded, true);
   assert.ok(result.branch);
@@ -234,25 +233,23 @@ test('apply-worker integration - runApplyWorker succeeds', async () => {
   cleanupDir(repoDir);
 });
 
-test('apply-worker integration - runApplyWorker handles errors', async () => {
+test('apply-worker integration - applyWorker handles errors', async () => {
   const repoDir = createTestRepo();
   const outputDir = path.join(repoDir, 'candidates');
   fs.mkdirSync(outputDir);
   
-  const { runApplyWorker } = require('../src/apply-worker.js');
-  
   // Make directory read-only to force failure
   fs.chmodSync(outputDir, 0o555);
   
-  const task = {
+  const candidate = {
     id: 'worker-fail-1',
     source: 'test',
     title: 'Fail Test',
-    implementResponse: 'Content',
+    content: 'Content',
   };
   
   try {
-    const result = await runApplyWorker(task, outputDir);
+    const result = await applyWorker(candidate, outputDir);
     assert.equal(result.succeeded, false);
     assert.ok(result.reason);
   } finally {
