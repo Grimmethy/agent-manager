@@ -24,8 +24,14 @@ const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js'
 const ORIENT_TURNS = Number(process.env.AGENT_MANAGER_ADHOC_ORIENT_TURNS) || 8;
 const ORIENT_NOTES_CAP = 4000;
 
-function buildOrientPrompt(task, groundingText) {
+// Non-string / empty / whitespace-only focus all mean "no focus".
+function normaliseFocus(focus) {
+  return typeof focus === 'string' ? focus.trim() : '';
+}
+
+function buildOrientPrompt(task, groundingText, focus) {
   const ctx = task.promptContext || {};
+  const f = normaliseFocus(focus);
   return [
     'You are ORIENTING for a one-off task before a plan is written. You have real, read-only tools (grep_codebase, read_file, list_directory) against a real checkout of this repository. You will NOT change anything -- your only output is an ORIENTATION REPORT that a planner and an implementer will build on.',
     '',
@@ -34,6 +40,7 @@ function buildOrientPrompt(task, groundingText) {
     ctx.rawText || JSON.stringify(ctx).slice(0, 4000),
     '',
     groundingText ? `A deterministic grep already found the following -- CONFIRM it and FILL THE GAPS; do NOT re-run searches for what is already shown here:\n\n${groundingText}\n` : '',
+    f ? `FOCUS (re-orient): the plan needs these specific repository facts. Prioritise finding them over a general survey:\n${f}\n` : '',
     'Spend your turns reading the code the task actually touches. Then, as your FINAL message (no more tool calls), write the ORIENTATION REPORT in this shape:',
     '',
     'CURRENT STATE: what exists now that is relevant to this task (2-4 sentences).',
@@ -46,17 +53,19 @@ function buildOrientPrompt(task, groundingText) {
   ].filter(Boolean).join('\n');
 }
 
-// task, { grounding?, runPlan?, maybeLocked } -> { notes: string, turnsUsed: number, skipped: bool }
-async function runOrientPass(task, { grounding, runPlan = runPlanWithTools, maybeLocked, recordModelCall = defaultRecordModelCall } = {}) {
+// task, { grounding?, runPlan?, maybeLocked?, recordModelCall?, focus? } -> { notes: string, turnsUsed: number, skipped: bool }
+// A non-empty focus (a re-orient for specific repo facts the plan lacked) bypasses the
+// grounding-covers skip -- the grounding evidently did not supply those facts.
+async function runOrientPass(task, { grounding, runPlan = runPlanWithTools, maybeLocked, recordModelCall = defaultRecordModelCall, focus } = {}) {
   const g = grounding || buildPlanGrounding(task);
   const groundingText = g ? g.text : '';
 
   // Nothing named, nothing found, or everything named is already covered -> skip the GPU.
-  if (g && groundingCovers(task, g) && process.env.AGENT_MANAGER_ADHOC_ORIENT_ALWAYS !== 'true') {
+  if (g && groundingCovers(task, g) && process.env.AGENT_MANAGER_ADHOC_ORIENT_ALWAYS !== 'true' && !normaliseFocus(focus)) {
     return { notes: groundingText, turnsUsed: 0, skipped: true };
   }
 
-  const call = () => runPlan({ prompt: buildOrientPrompt(task, groundingText), maxTurns: ORIENT_TURNS, source: task.source, taskId: task.id, stage: 'orient' });
+  const call = () => runPlan({ prompt: buildOrientPrompt(task, groundingText, focus), maxTurns: ORIENT_TURNS, source: task.source, taskId: task.id, stage: 'orient' });
   let result;
   const startedAt = new Date().toISOString();
   const startMs = Date.now();

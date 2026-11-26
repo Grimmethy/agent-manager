@@ -70,3 +70,55 @@ test('notes are capped', async () => {
   });
   assert.ok(r.notes.length <= 4100, `notes were ${r.notes.length}`);
 });
+
+test('buildOrientPrompt: absent/empty/whitespace/non-string focus -> identical to no-focus prompt', () => {
+  const t = task('add updateFooCache');
+  const g = 'GREP HITS:\nsrc/foo.js:1: x';
+  const base = buildOrientPrompt(t, g);
+  assert.equal(buildOrientPrompt(t, g, undefined), base);
+  assert.equal(buildOrientPrompt(t, g, ''), base);
+  assert.equal(buildOrientPrompt(t, g, '   '), base);
+  assert.equal(buildOrientPrompt(t, g, 42), base);
+  assert.equal(buildOrientPrompt(t, g, null), base);
+  assert.doesNotMatch(base, /FOCUS \(re-orient\)/);
+});
+
+test('buildOrientPrompt: non-empty focus adds a trimmed FOCUS preamble before the report contract', () => {
+  const p = buildOrientPrompt(task('add updateFooCache'), 'GREP HITS:\nsrc/foo.js:1: x', '  where is X defined  ');
+  assert.match(p, /FOCUS \(re-orient\)/);
+  assert.ok(p.includes('where is X defined'));
+  assert.ok(!p.includes('  where is X defined  '), 'focus text must be trimmed');
+  assert.ok(p.indexOf('FOCUS (re-orient)') < p.indexOf('Spend your turns reading the code'));
+});
+
+test('runOrientPass: focus reaches the runPlan prompt', async () => {
+  let seen;
+  await runOrientPass(task('improve dashboard performance broadly'), {
+    grounding: weak, focus: 'foo-needle', recordModelCall: null,
+    runPlan: async (opts) => { seen = opts; return { response: 'CURRENT STATE: ok', turnsUsed: 1 }; },
+  });
+  assert.ok(seen, 'runPlan must be called');
+  assert.match(seen.prompt, /foo-needle/);
+  assert.match(seen.prompt, /FOCUS \(re-orient\)/);
+});
+
+test('runOrientPass: a non-empty focus bypasses the grounding-covers skip; no focus still skips', async () => {
+  const saved = process.env.AGENT_MANAGER_ADHOC_ORIENT_ALWAYS;
+  delete process.env.AGENT_MANAGER_ADHOC_ORIENT_ALWAYS;
+  try {
+    let calls = 0;
+    const runPlan = async () => { calls += 1; return { response: 'CURRENT STATE: ok', turnsUsed: 1 }; };
+    const r1 = await runOrientPass(task('fix updateFooCache in src/foo.js'), { grounding: covering, runPlan, recordModelCall: null });
+    assert.equal(r1.skipped, true);
+    assert.equal(calls, 0);
+    const r2 = await runOrientPass(task('fix updateFooCache in src/foo.js'), { grounding: covering, runPlan, recordModelCall: null, focus: 'foo' });
+    assert.equal(calls, 1);
+    assert.equal(r2.skipped, false);
+    const r3 = await runOrientPass(task('fix updateFooCache in src/foo.js'), { grounding: covering, runPlan, recordModelCall: null, focus: '   ' });
+    assert.equal(r3.skipped, true);
+    assert.equal(calls, 1, 'whitespace-only focus must not bypass the skip');
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_ADHOC_ORIENT_ALWAYS;
+    else process.env.AGENT_MANAGER_ADHOC_ORIENT_ALWAYS = saved;
+  }
+});
