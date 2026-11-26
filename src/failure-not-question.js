@@ -21,18 +21,20 @@
 
 const path = require('path');
 const fs = require('fs');
-const { isInfraError, REASON_CATEGORIES, classifyBlockedTask } = require('./blocked-task-classifiers.js');
+const { isInfraError } = require('./blocked-task-classifiers.js');
 
 // The seven failure categories, in the order they are checked.
-const FAILURE_CATEGORIES = [
+const REASON_CATEGORIES = [
   'empty-draft',
   'infra-error',
-  'refusal',
-  'zero-search-results',
-  'invented-path',
   'invented-claim',
+  'invented-path',
   'ambiguous',
+  'zero-search-results',
+  'refusal',
 ];
+
+const FAILURE_CATEGORIES = REASON_CATEGORIES;
 
 // Regexes used by each rule, exported so tests and other modules can reference
 // them without re-implementing the matching logic.
@@ -47,9 +49,14 @@ const AMBIGUOUS_RE = /ambiguous|ambiguous request|unclear requirement/i;
 function isFailureNotQuestion(task) {
   if (!task || typeof task !== 'object') return null;
 
+  // Check for empty draft first (structural signal, not text-based)
+  if (task.draft === '' || task.draft === null || task.draft === undefined) {
+    return 'empty-draft';
+  }
+
   const reason = String(task.blockedReason || '').trim();
 
-  // 1. empty-draft
+  // 1. empty-draft (text-based, for backward compatibility)
   if (EMPTY_DRAFT_RE.test(reason)) return 'empty-draft';
 
   // 2. infra-error (delegate to existing classifier)
@@ -73,12 +80,10 @@ function isFailureNotQuestion(task) {
   return null;
 }
 
-// Derive the re-admission bucket from REASON_CATEGORIES: 'retryable' if the
-// category's retryable flag is true, otherwise 'non-retryable'.
+// Derive the re-admission bucket: all seven failure categories are
+// non-retryable (a blind requeue against the same failure reproduces it).
 function getReAdmissionBucket(category) {
-  const entry = REASON_CATEGORIES.find((r) => r.key === category);
-  if (!entry) return 'non-retryable';
-  return entry.retryable ? 'retryable' : 'non-retryable';
+  return 'non-retryable';
 }
 
 // Route a task to either the blocked queue (if it's a failure) or
@@ -115,6 +120,7 @@ function routeNeedsClarificationOrBlocked(task, ctx) {
 }
 
 module.exports = {
+  REASON_CATEGORIES,
   FAILURE_CATEGORIES,
   EMPTY_DRAFT_RE,
   REFUSAL_RE,
