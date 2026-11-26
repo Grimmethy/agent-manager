@@ -234,8 +234,15 @@ def api_task_set_hub_priority(task_id):
     actually changes what gets worked next, not just how the list looks.
 
     Only meaningful on a coordinating task; a non-hub target is rejected so a stray call
-    can't stamp the field somewhere it will never be read."""
-    from app import queue_dir, read_json_safe
+    can't stamp the field somewhere it will never be read. Pass ?project=<repoRoot> to
+    reach another registered project's queue; the default is the active project.
+
+    The coordinating/ directory is project-scoped (each registered project has its own
+    queue root), so the project parameter is what actually lets an operator rank a hub
+    in a sibling project's queue from the active one -- without it the call only ever
+    sees the active project's coordinating/."""
+    from app import get_active_repo_root, queue_dir, read_json_safe
+    from routes.task import _qdir_for_request
     body = request.get_json(silent=True) or {}
     raw = body.get("priority", None)
     if raw is None or raw == "":
@@ -246,7 +253,7 @@ def api_task_set_hub_priority(task_id):
         except (TypeError, ValueError):
             abort(400, description="priority must be an integer or null")
 
-    qdir = queue_dir()
+    qdir, _scope = _qdir_for_request(body)
     if not qdir:
         abort(404)
     target = qdir / "coordinating" / f"{task_id}.json"

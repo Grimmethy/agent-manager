@@ -430,8 +430,12 @@ def api_instance_assign_task(instance_id):
     task already claimed by some OTHER lane (killing it if it's actively in-flight there,
     or just relocating it if it's merely sitting in that lane's own drafting/ backlog)
     and moves it into pending/ first, so everything below operates on it the same way
-    either way."""
+    either way. Pass ?project=<repoRoot> to reach another registered project's queue;
+    the default is the active project. Cross-project pinning is what lets an operator
+    pull a task out of a sibling project's queue and onto a lane that belongs to the
+    active project -- the lane doesn't have to live in that project's git repo."""
     from app import _kill_and_requeue_instance, _relocate_task_to_pending, _worker_lane_refusal, instances_dir, queue_dir, read_json_safe
+    from routes.task import _qdir_for_request
     # Checked before any relocate/kill: an opted-out heartbeat (assignable: false) is refused here, so its process is never killed.
     refusal = _worker_lane_refusal(instance_id)
     if refusal:
@@ -442,7 +446,7 @@ def api_instance_assign_task(instance_id):
     if not task_id:
         abort(400, description="taskId is required")
 
-    qdir = queue_dir()
+    qdir, _scope = _qdir_for_request(body)
     if not qdir:
         abort(404)
 
