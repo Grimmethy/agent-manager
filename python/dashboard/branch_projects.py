@@ -350,18 +350,41 @@ def resolve_scope(project_root, active_root):
     raise LookupError(f"'{project_root}' is not a registered project")
 
 
+def find_cached_other_project_branch(scope, branch):
+    """Cache-only lookup for a branch of a non-active project. Returns the cache entry (a dict with `repoRoot`, `at`, `branches`, `error`) if the project has a cached list
+    and that list names the branch, else None.
+
+    Never calls refresh_branches, request_refresh, subprocess, or git: it is strictly a read of the in-process cache. Used by find_or_refresh_other_project_branch as the
+    first (and post-refresh) probe so the refresh path is a single point of change."""
+    with _lock:
+        cache = dict(_state["cache"])
+    real = os.path.realpath(scope["repoRoot"])
+    entry = cache.get(real)
+    if not entry:
+        return None
+    row = next((b for b in entry["branches"] if b["branch"] == branch), None)
+    if not row:
+        return None
+    return {"repoRoot": real, "at": entry["at"], "branches": list(entry["branches"]), "error": entry.get("error")}
+
+
 def find_or_refresh_other_project_branch(scope, branch):
     """find_other_project_branch, but when that project has no cached list that names the branch (the cache is only filled once the tab has asked for `?projects=all`,
     and a list can be up to TTL old), compute the project's list now, exactly like merge and discard do, and look again. Without this a verdict for a pushed branch of a
     registered project was parked in pending_verdicts, which nothing drains for a non-active project. A failed refresh counts as 'not listed'."""
-    real, row = find_other_project_branch(scope["repoRoot"], branch)
-    if row:
-        return real, row
+    cached = find_cached_other_project_branch(scope, branch)
+    if cached:
+        row = next((b for b in cached["branches"] if b["branch"] == branch), None)
+        return cached["repoRoot"], row
     try:
         refresh_branches(scope)
     except Exception as e:  # noqa: BLE001 -- the caller falls back to its pending/404 path
         print(f"[branches] refresh for verdict on {scope.get('label')} failed (non-fatal): {type(e).__name__}: {e}", file=sys.stderr)
-    return find_other_project_branch(scope["repoRoot"], branch)
+    cached = find_cached_other_project_branch(scope, branch)
+    if cached:
+        row = next((b for b in cached["branches"] if b["branch"] == branch), None)
+        return cached["repoRoot"], row
+    return None, None
 
 
 def refresh_branches(scope):
@@ -427,3 +450,16 @@ def find_other_project_branch(project_root, branch):
         return None, None
     row = next((b for b in entry["branches"] if b["branch"] == branch), None)
     return (real, row) if row else (None, None)
+
+
+def kick_project_refresh(scope):
+    """Expire that project's cached list and enqueue a background refresh, returning immediately.
+
+    Mirrors the pattern in routes/pipeline_1_more.py: mark the entry stale (at=0.0) so the TTL probe treats it as expired, then request_refresh to push it to the front of the
+    scan queue. The background thread does the git work; this function never blocks on it. A failure to expire is logged and ignored -- the project will be retried at the next
+    TTL anyway. Does NOT call refresh_branches synchronously."""
+    try:
+        expire(scope["repoRoot"])
+        request_refresh(scope["repoRoot"])
+    except Exception as e:  # noqa: BLE001
+        print(f"[branches] kick_project_refresh failed for {scope.get('label')} (non-fatal): {type(e).__name__}: {e}", file=sys.stderr)
