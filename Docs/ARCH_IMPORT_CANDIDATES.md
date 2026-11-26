@@ -282,3 +282,20 @@ Adapt the prepare-then-apply pattern by having `prepareApplyBranch()` capture a 
 
 Benefits:
 Prevents silent clobbering of newer changes by stale drafts, especially in stacked-branch workflows where seq 2+ depends on seq 1's commits. Makes the prepare-apply boundary explicit and self-healing: if the target moves, the apply fails fast with a clear reason rather than producing a corrupted or inconsistent state. Aligns with the existing quarantine and clean-tree guards by adding a version-level check.
+
+### AC-21 · Slice-scoped apply with harness-side splice
+Strength: Strong
+Source: aider-ai-aider — "Scoped editable slice with deterministic splice-back"
+Files: src/apply-adhoc-diff.test.js, src/apply-retry-lock.test.js
+
+Problem:
+The agent-manager's apply surface currently treats the diff as a whole and lets the worker write into the working tree directly. Two real code paths show the risk: `apply-adhoc-diff.test.js` exercises a "real diff whose hunk header line-count is wrong" case that had to be hard-coded as a regression test for a 2026-08-18 "corrupt patch" incident, meaning the production apply path has already been burned by a malformed diff reaching `git apply`; and `apply-retry-lock.test.js` distinguishes lock failures (re-apply the approved draft, keep `rawDiff`/`implementResponse`/`planResponse`, do not burn `applyRetryCount`) from content failures like "patch does not apply: hunk #1 failed at 12" (redraft, burn `applyRetryCount`). That split is exactly the kind of boundary the aider finding protects: the harness decides what counts as a safe re-apply vs. a redraft, and the worker itself is never trusted to make that call. Today the worker is the one producing the diff the harness later judges, so a weak or adversarial model can smuggle in edits outside the intended region, and the harness only notices after damage is done.
+
+Solution:
+Adapt the aider pattern at the harness level in the apply flow that already owns `rawDiff`/`implementResponse`/`planResponse` (the same fields `apply-retry-lock.test.js` preserves across re-apply). Before handing the diff to `git apply`, the harness extracts only the relevant slice of the target file into a temp file, gives the task log plus the diff to the model as read-only inputs, and splices the edited slice back between the untouched head and tail. Concretely: (1) parse the diff to identify the editable region; (2) write the head, slice, and tail to a temp file where only the slice is exposed to the worker; (3) after the worker returns, validate the splice by re-reading the head and tail and confirming the old lines are byte-identical; (4) if validation fails or the worker exits abnormally, fail the apply step immediately rather than silently splicing back whatever the worker produced. This adapts the aider finding's key insight — limit what a weak local model can damage by giving it a small window — to agent-manager's existing approved-draft pipeline, where `rawDiff` is already the source of truth and the retry classification in `apply-retry-lock.test.js` already treats the approved draft as immutable for infra failures.
+
+Benefits:
+- Cuts the blast radius of a malformed or adversarial diff: the worker can only touch the slice, so a "corrupt patch" incident like the one already in `apply-adhoc-diff.test.js` cannot rewrite unrelated content.
+- Makes the harness the authority on what counts as a safe re-apply vs. redraft, matching the classification already encoded in `apply-retry-lock.test.js` but removing the worker's ability to subvert it.
+- Validates the splice before it lands, so a worker exit that the current code would silently splice back is now caught and fails the step.
+- Keeps context short for the model, which reduces the chance of the kind of hunk-header/body mismatch that triggered the 2026-08-18 incident in the first place.
