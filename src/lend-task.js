@@ -112,14 +112,43 @@ function applyNodeBlock({ pipelineDirs, taskId, nodeId, reason = '' } = {}) {
 }
 
 // Heals a record that still names a node while the ledger row for it is no longer 'lent' (expired or returned): clears leasedTo. Runs from
-// the claim path, no timer. Only lease rows are walked (a few hundred), never the queue directories. Returns the task ids healed.
+// the claim path, no timer. Walks both ledger rows and queue records so orphaned record references (where leasedTo has no corresponding ledger row)
+// are also cleared with a 'lease-healed-no-row' history event. Returns the task ids healed.
 function releaseStaleLeasedTo({ pipelineDirs = [], env = process.env } = {}) {
-  const healed = [];
+  const healed = new Map();
+  const dirs = pipelineDirs.filter(Boolean);
+
+  // Walk ledger rows: clear leasedTo where the row is no longer 'lent'.
   for (const row of listLeases(env)) {
     if (!row || row.state === 'lent' || !row.taskId || !row.nodeId) continue;
-    if (clearLeasedToInDirs(pipelineDirs.filter(Boolean), row.taskId, row.nodeId).length) healed.push(row.taskId);
+    const changed = clearLeasedToInDirs(dirs, row.taskId, row.nodeId);
+    if (changed.length) {
+      if (!healed.has(row.taskId)) healed.set(row.taskId, { nodeId: row.nodeId, source: 'ledger' });
+    }
   }
-  return healed;
+
+  // Walk queue records: clear leasedTo where there is no 'lent' ledger row for it.
+  for (const dir of dirs) {
+    for (const q of QUEUES) {
+      const queueDir = path.join(dir, 'queue', q);
+      let files;
+      try { files = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')); } catch (e) { continue; }
+      for (const file of files) {
+        const taskId = file.replace(/\.json$/, '');
+        const record = readJson(path.join(queueDir, file));
+        if (!record || typeof record !== 'object' || !record.leasedTo) continue;
+        const lease = leaseFor(taskId, env);
+        if (lease && lease.state === 'lent') continue;
+        const nodeId = record.leasedTo;
+        delete record.leasedTo;
+        appendHistoryEvent(record, 'lease-healed-no-row', JSON.stringify({ type: 'lease-healed-no-row', node: nodeId, recordId: taskId }));
+        writeJsonAtomicSync(path.join(queueDir, file), record);
+        if (!healed.has(taskId)) healed.set(taskId, { nodeId, source: 'record' });
+      }
+    }
+  }
+
+  return Array.from(healed.keys());
 }
 
 function flag(argv, name) {
