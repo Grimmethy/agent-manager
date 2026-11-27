@@ -513,3 +513,38 @@ Remove the `enterStall` function body (lines 95–125) and drop `enterStall` fro
 
 Benefits:
 Eliminates a misleading unused export that future readers might assume is wired in, reducing the public surface of `src/queue-events.js` to only the functions actually exercised by the codebase. It also removes a branch of dead environment-variable logic that could confuse anyone investigating stall-event behavior later.
+
+### AC-36 · Remove unused createChangeDraft factory function
+Strength: Strong
+Symbol: createChangeDraft
+
+**Strength:** Strong
+
+**Files:** `src/review/change-draft.js`, `test/change-draft.test.js`
+
+**Problem:**
+The `createChangeDraft` factory function in `src/review/change-draft.js` has no production call sites in the codebase. The file uses an explicit CommonJS export pattern (`module.exports = { createChangeDraft }`), confirming it's a self-contained module rather than a barrel re-export. The only reference is in `test/change-draft.test.js`, which likely imports the module without calling it (otherwise the grep would have found it), suggesting the test itself may be broken or the function was never integrated into the active codebase.
+
+**Solution:**
+Remove the entire `src/review/change-draft.js` file, which contains the `createChangeDraft` factory function and its helper functions (`deepCopy`, `DEFAULT_ARTIFACT_KEYS`). No production callers need to be updated since none exist. Remove `test/change-draft.test.js` as well, since it tests a function that no longer exists in the codebase.
+
+**Benefits:**
+Eliminates dead code that adds maintenance burden and confuses future readers about the active API surface. Reduces the codebase surface area and removes a module that appears to have been created but never integrated into the application logic. Removes a test file that is now orphaned and likely broken.
+
+---
+
+NOTE: The critique found no issues with the original draft, so no changes were necessary.
+
+### AC-37 · Remove unused `hasPriorCritiqueDegenerate` export from reject-retry-check.js
+Strength: Strong
+Files: src/reject-retry-check.js
+Symbol: hasPriorCritiqueDegenerate
+
+Problem:
+The function `hasPriorCritiqueDegenerate` is defined at line 1125 and exported at line 1147 in `src/reject-retry-check.js`, but no code in the 43+ files that reference this module actually calls it. A grep for the symbol found zero call sites, meaning no caller destructures it from the module's exports. The function is a utility predicate exported alongside many other related predicates (`isCritiqueDegenerateBlock`, `isImplementDegenerateBlock`, etc.), suggesting it was part of a shared utility library. However, the function appears to be a leftover from refactoring where callers were migrated to use other predicates instead. The function checks `task.draftAttempts` for prior degenerate critique outcomes, but no current code path invokes this check.
+
+Solution:
+Remove the function definition (lines 1121-1132, including the comment block) and remove `hasPriorCritiqueDegenerate` from the `module.exports` object at line 1147. No caller files need to be modified since none of them reference this symbol.
+
+Benefits:
+Removing this dead code reduces the public API surface of the module, eliminates confusion for future readers who might wonder why this function exists, and removes maintenance burden for a function that no code path uses. The export list becomes a more accurate representation of the module's actual functionality.
