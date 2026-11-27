@@ -13,6 +13,7 @@ const path = require('path');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { resolveGroundingRef, readFileAtRef } = require('./stacked-grounding.js');
+const { recordedToolOutputText } = require('./recorded-tool-output.js');
 
 // Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
 // consumer's own registration file (ensureRegistered, below) calls updateTaskSource on
@@ -391,6 +392,23 @@ function main() {
       } catch (e) {
         console.warn(`[get-grounding-source] worklog read failed for ${task.id}, continuing without it: ${e?.message ?? e}`);
       }
+    }
+
+    // Render the full tool-call transcript (commands, exit codes, stdout, stderr) from
+    // the task's toolCallLog entries into a labeled text block for grounding. Source label
+    // 'recorded tool output' is appended alongside existing labels so a fact-check pass
+    // can distinguish this from other grounding sources. Best-effort: malformed entries
+    // are skipped silently, same discipline as every other block in this function.
+    try {
+      if (task.toolCallLog && Array.isArray(task.toolCallLog) && task.toolCallLog.length > 0) {
+        const workLogEntries = [{ stage: 'task', toolCallLog: task.toolCallLog }];
+        const rendered = recordedToolOutputText(workLogEntries);
+        if (rendered) {
+          parts.push(rendered);
+        }
+      }
+    } catch (e) {
+      console.warn(`[get-grounding-source] recorded tool output failed for ${task.id}, continuing without it: ${e?.message ?? e}`);
     }
 
     const sourceName = resolveSourceName(task);
