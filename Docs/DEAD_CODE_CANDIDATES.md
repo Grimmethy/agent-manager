@@ -143,3 +143,17 @@ Remove the function body (lines 102–131, including the JSDoc comment) and remo
 
 Benefits:
 Eliminates ~30 lines of unused, documented-but-unreachable code, reducing the public surface area of the module and removing a genuine source of confusion for any future reader who might assume the function is still in active use because of its detailed JSDoc.
+
+### AC-11 · Remove unused sanitizeFilename and MAX_FILENAME_LENGTH from src/apply/filename-sanitizer.js
+Strength: Strong
+Files: src/apply/filename-sanitizer.js
+Symbol: sanitizeFilename
+
+Problem:
+The `sanitizeFilename` function and `MAX_FILENAME_LENGTH` constant in `src/apply/filename-sanitizer.js` are genuinely dead code: a full codebase grep found zero production call sites, and the only file that imports this module is `test/filename-sanitizer.test.js`, which is a test file rather than application code. The module exports a specific named function (`sanitizeFilename`) with no barrel re-export pattern, and the function name is distinct enough that it would not be confused with similarly-named utilities or used indirectly. The implementation was likely written as a utility for sanitizing filenames before the apply queue touches disk, but no code path ever wired it in.
+
+Solution:
+Remove the entire `sanitizeFilename` function body (lines 13–42) and the `MAX_FILENAME_LENGTH` constant (line 11) from `src/apply/filename-sanitizer.js`, leaving only the `'use strict'` directive and the JSDoc comment block (or removing the file entirely if the comment block is no longer meaningful). Also remove `test/filename-sanitizer.test.js` since it only tests the orphaned function. No production call sites need to be updated because none exist.
+
+Benefits:
+Eliminates dead code that no longer serves any purpose, reducing surface area and removing a misleading artifact that could confuse future readers into thinking the apply queue performs filename sanitization when it does not. The test file is also removed, preventing a failing or orphaned test from cluttering the test suite.
