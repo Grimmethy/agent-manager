@@ -83,12 +83,14 @@ def _task_file(queue_dir, task_id):
     return None
 
 
-def write_task_log(queue_dir, task_ids, hub_id, branch, verdict, reasons, source, sha=None):
+def write_task_log(queue_dir, task_ids, hub_id, branch, verdict, reasons, source, sha=None, failed=None):
     """Append a history event to each owning task and to its hub, shaped like src/task-history.js's
     appendHistoryEvent ({stage, at, detail}). `task_ids` is one id or a list (see resolve_owner). Silent
     no-op for an id with no task file. Returns the count of records written.
 
-    Also stamps promptContext.priorVerdict on each owning TASK (never the hub) -- see apply_prior_verdict."""
+    Also stamps promptContext.priorVerdict on each owning TASK (never the hub) -- see apply_prior_verdict.
+
+    On OSError or ValueError during write, appends the task_id to `failed` (if provided) and logs a warning."""
     if not queue_dir:
         return 0
     if isinstance(task_ids, str):
@@ -115,5 +117,7 @@ def write_task_log(queue_dir, task_ids, hub_id, branch, verdict, reasons, source
             _atomic_write_json(path, rec)
             written += 1
         except (OSError, ValueError) as exc:
+            if failed is not None:
+                failed.append(tid)
             logger.warning("Could not log verdict for %s onto task %s: %s", branch, tid, exc)
     return written
