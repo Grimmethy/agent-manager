@@ -2128,6 +2128,17 @@ def _find_task_log_anywhere(repo_root, task_id):
     return read_json_safe(Path(repo_root) / "task-logs" / f"{task_id}.json")
 
 
+# Hub record schema / loader / writer (HUB0931 subtask 1/3). Extracted to hub_record.py
+# so the schema and its I/O have no external dependencies -- the dashboard's other
+# imports (Flask, networkx, etc.) are unavailable in test sandboxes.
+from hub_record import (  # noqa: E402
+    _HUB_RECORD_SCHEMA_FIELDS,
+    _HubRecordSchema,
+    load_hub_record,
+    write_hub_record,
+)
+
+
 def _hub_label_index(qdir):
     """{hub id or any of its formerIds: hub record} for every live coordinating hub that has a HUB#### label."""
     index = {}
