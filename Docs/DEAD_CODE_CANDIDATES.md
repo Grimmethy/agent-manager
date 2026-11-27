@@ -425,3 +425,17 @@ Remove `isNodeExcluded` from the `module.exports` object in `src/node-return-on-
 
 Benefits:
 Eliminates a misleading public API surface that no consumer adopted, reducing the cognitive load on future readers who might wonder why this function exists. Tightens the module's contract so its exports accurately reflect actual usage, and removes a potential source of confusion if someone later assumes the export is part of the supported API.
+
+### AC-30 · Remove orphaned `plan-citation-guard.js` module
+Strength: Strong
+Files: src/plan-citation-guard.js
+Symbol: classifyCitations
+
+Problem:
+The file `src/plan-citation-guard.js` is an orphaned module: no file in the codebase imports or requires it, and the grep found zero call sites for its exported `classifyCitations` symbol. Because the containing module is unused, every export — `classifyCitations`, `toCreateEntries`, and the private helpers it depends on — is dead code. No barrel re-export, dynamic `require`, factory registry, or test fixture references the module either, so there is no hidden lifecycle keeping it alive.
+
+Solution:
+Delete the entire file `src/plan-citation-guard.js` (including its `module.exports` line and all helper functions). No call-site edits are needed because no file references the module — the call-site search returned zero hits, and the "Files that name this module: none found" check confirms the same. No documentation, comment, or build-config references to `plan-citation-guard` were identified, so no ancillary cleanup is required.
+
+Benefits:
+Eliminates ~54 lines of unused code that no reader can invoke, removing a source of confusion for anyone scanning the `src/` tree for citation-handling logic. Reduces the module surface area, shrinks the import graph, and removes a file whose very name suggests a purpose the codebase no longer exercises.
