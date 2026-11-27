@@ -358,7 +358,13 @@ def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, hub_l
                         if written:
                             task_ids, hub_id = resolve_owner(repo_root, b.get("mainBranch") or "master", branch, run_git,
                                                              queue_dir, hub_lookup, b.get("taskId"))
-                            write_task_log(queue_dir, task_ids, hub_id or (b.get("hub") or {}).get("id"), branch, verdict, reasons, "deterministic", sha)
+                            failed: list[str] = []
+                            logged = write_task_log(queue_dir, task_ids, hub_id or (b.get("hub") or {}).get("id"), branch, verdict, reasons, "deterministic", sha, failed=failed)
+                            if failed:
+                                logger.warning(
+                                    "branch %s: wrote %d of %d task logs for verdict %s; failed ids: %s",
+                                    branch, logged, logged + len(failed), verdict, ", ".join(failed),
+                                )
                         verdicts = load_verdicts(queue_dir)
                 elif existing is not None:
                     clear_verdict(queue_dir, branch, sha)
