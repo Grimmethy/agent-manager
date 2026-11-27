@@ -94,6 +94,23 @@ function ensureArchiveDir(destDir) {
 }
 
 /**
+ * Single source of truth for the queue/done/_archived/<YYYY-MM>/ destination that both
+ * archive passes write into. The month bucket comes from `now`, not from file mtime.
+ */
+function archiveRootDir(doneDir) {
+  return path.join(doneDir, ARCHIVE_DIRNAME);
+}
+
+function archiveDestDir(doneDir, now) {
+  return path.join(archiveRootDir(doneDir), monthBucket(new Date(now)));
+}
+
+/** Creates the destination directory (idempotent). */
+function ensureArchiveDir(destDir) {
+  fs.mkdirSync(destDir, { recursive: true });
+}
+
+/**
  * Scans queue/done/ TOP LEVEL ONLY (fs.readdirSync is non-recursive by nature -- never
  * descends into _archived_no_action/ or the dated _archived/<YYYY-MM>/ folders this itself
  * creates) and moves any *.json file whose mtime is older than the retention window into
@@ -213,7 +230,7 @@ function checkDue({ pipelineDir, now = Date.now() }) {
 // (not hand-duplicated as a glob elsewhere) so both consumers stay correct automatically as
 // new month buckets appear -- no consumer needs to know the naming scheme itself.
 function listArchivedMonthDirs(pipelineDir) {
-  const archiveRoot = path.join(pipelineDir, 'queue', 'done', ARCHIVE_DIRNAME);
+  const archiveRoot = archiveRootDir(path.join(pipelineDir, 'queue', 'done'));
   try {
     return fs.readdirSync(archiveRoot, { withFileTypes: true })
       .filter((e) => e.isDirectory())
