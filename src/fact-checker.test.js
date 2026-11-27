@@ -1424,12 +1424,13 @@ test('adhoc draft citing a value present in rawText passes the deterministic gat
 
 test('adhoc draft citing a value ABSENT from rawText still fails the gate', () => {
   // Simulate what get-grounding-source.js produces for an adhoc task
+  // The rawText does NOT contain XYZZY, and neither does any other part of sourceText
   const rawText = 'Fix the bug in the adhoc pipeline.';
-  const sourceText = `=== ADHOC REQUEST ===\n${rawText}\n\n=== DRAFT ===\nThe XYZZY_NONSENSE_FIELD_999 is now handled correctly.`;
+  const sourceText = `=== ADHOC REQUEST ===\n${rawText}\n\nSome other grounding text that does not mention the field.`;
   const draftText = 'The XYZZY_NONSENSE_FIELD_999 is now handled correctly.';
 
   const flags = checkGroundedValues(draftText, sourceText);
-  // MADE_UP_FIELD does NOT appear in sourceText, so it SHOULD be flagged
+  // XYZZY_NONSENSE_FIELD_999 does NOT appear in sourceText, so it SHOULD be flagged
   assert.equal(flags.length, 1);
   assert.equal(flags[0].type, 'ungrounded-field');
   assert.equal(flags[0].detail, 'XYZZY_NONSENSE_FIELD_999');
