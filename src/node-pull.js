@@ -86,6 +86,33 @@ async function releaseLease(d, claimUrl, token, nodeId, taskId) {
   }
 }
 
+// The repo a handed-out task targets (src/task-target-repo.js getTaskTargetRepo), resolved from its promptContext.
+// Lazily required so a missing or throwing helper means "no target" rather than a failed pull.
+function resolveTaskTargetRepo(task) {
+  try {
+    const { getTaskTargetRepo } = require('./task-target-repo.js');
+    return typeof getTaskTargetRepo === 'function' ? getTaskTargetRepo(task && task.promptContext) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Makes sure the task's target repo is cloned on this node. Non-fatal: a failure is logged with the task id and the url, never thrown.
+async function ensureTaskTargetRepo(d, task, claimRemoteUrl) {
+  const target = resolveTaskTargetRepo(task);
+  const targetUrl = target && typeof target.remoteUrl === 'string' ? target.remoteUrl.trim() : '';
+  if (!targetUrl || targetUrl === claimRemoteUrl) return;
+  const taskId = task && task.id;
+  try {
+    const result = await d.ensureRepo({ remoteUrl: targetUrl });
+    if (result && result.ok === false) {
+      d.log(`node-pull: warning: could not ensure target repo for task ${taskId} (${targetUrl}): ${result.reason || 'ensureRepo failed'}`);
+    }
+  } catch (e) {
+    d.log(`node-pull: warning: could not ensure target repo for task ${taskId} (${targetUrl}): ${errorMessage(e)}`);
+  }
+}
+
 async function pullOnce({ env = process.env, deps = {}, state = makeState() } = {}) {
   const d = resolveDeps(deps);
   try {
@@ -126,6 +153,7 @@ async function pullOnce({ env = process.env, deps = {}, state = makeState() } = 
         return failure(d, state, `claim response has no repo.remoteUrl (task ${body.task.id})`);
       }
       await d.ensureRepo({ remoteUrl });
+      await ensureTaskTargetRepo(d, body.task, remoteUrl);
       const record = { ...body.task, leasedTo: id };
       if (!d.writeAdhoc(pipelineDir, record)) {
         return failure(d, state, `task ${body.task.id} is already queued`);
