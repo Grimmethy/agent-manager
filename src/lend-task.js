@@ -127,7 +127,9 @@ function releaseStaleLeasedTo({ pipelineDirs = [], env = process.env } = {}) {
     }
   }
 
-  // Walk queue records: clear leasedTo where there is no 'lent' ledger row for it.
+  // Walk queue records: clear leasedTo where there is no ledger row at all for it.
+  const rows = listLeases(env);
+  const taskIdsWithRows = new Set(rows.map((r) => r.taskId));
   for (const dir of dirs) {
     for (const q of QUEUES) {
       const queueDir = path.join(dir, 'queue', q);
@@ -137,8 +139,7 @@ function releaseStaleLeasedTo({ pipelineDirs = [], env = process.env } = {}) {
         const taskId = file.replace(/\.json$/, '');
         const record = readJson(path.join(queueDir, file));
         if (!record || typeof record !== 'object' || !record.leasedTo) continue;
-        const lease = leaseFor(taskId, env);
-        if (lease && lease.state === 'lent') continue;
+        if (taskIdsWithRows.has(taskId)) continue;
         const nodeId = record.leasedTo;
         delete record.leasedTo;
         appendHistoryEvent(record, 'lease-healed-no-row', JSON.stringify({ type: 'lease-healed-no-row', node: nodeId, recordId: taskId }));
