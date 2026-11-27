@@ -182,6 +182,10 @@ Any worker lane (`worker-<gpu>`, including `worker-cloud`) can be switched off b
 
 Spec for the Workers tab list view when several cloud workers are offline or disabled: the view shows at most one offline or disabled cloud (Haiku) worker or cloud reviewer row, the first one in natural lane order. The other offline or disabled cloud rows are hidden behind a `+N more offline hidden` note, and hovering that note lists the hidden ids. The kept row's **Turn on** button is the add-one-more control: pressing it enables one more hidden lane. This collapse is display-only and does not change any switch state, the marker files or the pipeline. `/api/instances` is unchanged and still returns every worker lane with its `switchable` and `disabled` fields.
 
+**Follow-ups:**
+- **Workers graph view.** The python-side `workflow-graph-view.js` should apply the same one-offline-cloud-row rule.
+- **Merge workers and reviewers.** Merge the worker and reviewer lists; touches `scripts/review-runner.sh`, `src/review-task.js`, `src/lanes.js`, and the Workers tab.
+
 ## Pausing a machine (2026-11-11)
 
 Besides the per-worker switch, two machine-wide pauses exist so a whole machine can stop claiming work, for example while someone is using the site that runs on it. They are marker files in the same directory as the per-worker switch: `_pause-node` (this machine) and `_pause-global` (the whole system; other machines receive it through their heartbeat reply, a later piece of the multi-node plan). The leading underscore means they can never be a worker id, so nothing that lists switched-off workers sees them.
