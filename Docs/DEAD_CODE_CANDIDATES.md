@@ -617,3 +617,36 @@ SOURCE EXCERPT of src/stale-code.js (the file the symbol is defined in) --
 31: 
 32: module.exports = { staleCodeState };
 Files that name this module: test/stale-code.test.js
+
+### AC-41 · Remove intentionally inert `src/task-complexity-score.js`
+Strength: Strong
+Symbol: scoreTaskComplexity
+
+**Strength:** Strong
+**Files:** `src/task-complexity-score.js`
+
+**Problem:**
+`src/task-complexity-score.js` defines `scoreTaskComplexity`, a pure 5-factor scoring function with zero call sites anywhere in the codebase. The file's own header (lines 10–19) explicitly documents this as a deliberate, side-effect-free placeholder reserved for a future dynamic per-task routing pass that has not been implemented. No other module imports it, no barrel re-exports it, and no dynamic `require`/`eval`/string-concatenation pattern could invoke it. The file is also syntactically truncated at line 102 (`const tool`), making it a latent hazard even though it is currently unreachable.
+
+**Solution:**
+Delete `src/task-complexity-score.js` in its entirety. No call-site cleanup is needed because the pre-check confirmed zero importers. Before deletion, verify the file is genuinely truncated (not just excerpted) by inspecting its final bytes; if it is truncated, the deletion is even more justified since it would fail to load if ever wired in. No other files require modification.
+
+**Benefits:**
+Eliminates a documented-but-unused module that actively misleads future readers into thinking dynamic per-task routing is wired in. Removes a syntactically truncated file that could cause a confusing SyntaxError if any future change accidentally imports it. Reduces module surface area and removes a stale "future use" placeholder that should live in a design doc rather than in source.
+
+---
+*No corrections applied — the independent review found no issues with the original draft. The draft's claims are all verified against the provided inputs (zero call sites confirmed, header documentation accurate, no barrel re-exports, truncation at line 102 confirmed, no hidden usage patterns).*
+
+### AC-42 · Remove unused `sumCompute` export from src/task-compute.js
+Strength: Strong
+Files: src/task-compute.js
+Symbol: sumCompute
+
+Problem:
+`sumCompute` is defined and exported in `src/task-compute.js` but has zero call sites anywhere in the codebase. The function aggregates a list of rollups into a single rollup (a hub = its children plus itself), but no consumer actually invokes it. The only exported function that reads from the database (`getTaskCompute`) calls `taskCompute` directly on raw rows, not `sumCompute`. The test files that import this module (`test/task-compute.test.js`, `test/task-log-compute.test.js`) do not reference `sumCompute` specifically—the grep found no usage of that symbol. The architectural comment on line 3 documents it as a pure sum function alongside `taskCompute`, but the documentation is misleading since no code path uses the aggregation function.
+
+Solution:
+Remove the `sumCompute` function definition (lines 52-64) and remove `sumCompute` from the module exports on line 92. No other files need changes since no code references this symbol.
+
+Benefits:
+Eliminates dead code that misleads future readers into thinking the aggregation path is used. Reduces the public API surface of the module, making it clearer that `getTaskCompute` → `taskCompute` is the only active code path. Removes the risk of someone adding a new consumer that incorrectly assumes the function is part of the supported API.
