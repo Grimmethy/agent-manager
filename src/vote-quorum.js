@@ -46,10 +46,12 @@ function quorumVote({ reviewers, predicate, fallback, defaultVerdict, timeoutMs 
     function settle() {
       if (resolved) return;
       try {
-        const early = predicate(tally, pending);
-        if (early !== undefined && early !== null) {
-          finish(early);
-          return;
+        if (typeof predicate === 'function') {
+          const early = predicate(tally, pending);
+          if (early !== undefined && early !== null) {
+            finish(early);
+            return;
+          }
         }
         if (pending === 0) {
           if (tally.size === 0 || isTie()) {
