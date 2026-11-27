@@ -328,6 +328,7 @@ async function renderWorkers(isPoll) {
     <div class="worker-card clickable${typeof workerCardOffClass === 'function' ? workerCardOffClass(inst) : ''}" data-instance-id="${escapeAttr(inst.instanceId)}">
       <div class="row">
         <span class="id">${inst.instanceId}</span>
+        ${typeof workerMachineBadgeHtml === 'function' ? workerMachineBadgeHtml(inst, typeof workerSwitchHostName === 'function' ? workerSwitchHostName() : '') : ''}
         ${buildWorkerModelSelectHtml(inst, workerModels, overrides)}
         ${canAssignTask(inst) ? buildTaskPickerHtml(inst, assignableByInstance[inst.instanceId] || [], selectedWorkerTaskType[inst.instanceId] || '') : ''}
         <div class="badge-col">

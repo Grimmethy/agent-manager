@@ -832,6 +832,25 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/api/scan-project")
+def scan_project():
+    """Scan one project immediately and return its status.
+
+    Query parameter `project` is required: either a registered project label or its repo root.
+    Returns the scan response {pending:[{label,state,startedAt}], errors:[{label,error}]}
+    from branch_projects.scan_status(), with the requested project forced to the front of the queue.
+    """
+    import branch_projects
+    project = request.args.get("project")
+    if not project:
+        return jsonify({"error": "Missing required query parameter: project"}), 400
+    # Force this project to the front of the scan queue
+    branch_projects.request_refresh(project)
+    # Return the current scan status (the requested project should be in 'scanning' or 'pending')
+    status = branch_projects.scan_status()
+    return jsonify(status)
+
+
 def _lane_inputs_key():
     """What src/lanes.js reads, as a cheap comparable value: the lanes registry file and the env file (stat keys) and the AGENT_MANAGER_* environment. While it is unchanged the cached lane
     definitions are still right; when it changes the cache is stale (swr_cache.py) and is refreshed in the background."""

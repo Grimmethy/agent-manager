@@ -123,13 +123,14 @@ class TestRules(unittest.TestCase):
                 self.check(q, lambda f=fx: f)
             self.assertEqual([r["outcome"] for r in ledger(q)], ["refused"])
 
-    def test_a_worker_merge_without_the_checker_text_or_without_a_loader_is_refused_as_before(self):
+    def test_any_worker_merge_is_ready_but_a_forbidden_path_is_still_refused(self):
         q = make_queue({BRANCH: {SHA: rec(source="worker")}})
-        with env_without_bypass(), self.assertRaisesRegex(gate.MainPushNotReady, "not a human source"):
-            self.check(q, lambda: Fx.facts())
-        q = make_queue({BRANCH: {SHA: Fx.worker()}})
-        with env_without_bypass(), self.assertRaisesRegex(gate.MainPushNotReady, "not a human source"):
-            self.check(q, None)
+        with env_without_bypass():
+            self.assertEqual(self.check(q, lambda: Fx.facts("other")), {"allowed": True, "bypass": False})
+            self.assertEqual(self.check(q, None), {"allowed": True, "bypass": False})
+        self.assertEqual([r["outcome"] for r in ledger(q)], ["allowed-worker", "allowed-worker"])
+        with env_without_bypass(), self.assertRaisesRegex(gate.MainPushNotReady, "forbidden paths: node_modules"):
+            self.check(q, lambda: Fx.facts("other", ["node_modules"]))
 
     def test_an_unreadable_diff_fails_closed(self):
         def boom():

@@ -203,7 +203,7 @@ function hubHasUnmergedEarlierSibling(pipelineDir, task, hubRecord = null) {
   const myDeps = Array.isArray(task.dependsOn) ? task.dependsOn : [];
   for (let i = 0; i < myIndex; i += 1) {
     const sib = subTasks[i];
-    if (!sib || !sib.status) continue;
+    if (!sib) continue;
     if (!SIBLING_RESOLVED_STATUSES.has(sib.status)) {
       // Pending-merge on the same stacked branch is visible to this child -- skip.
       if (myBranch && sib.status === 'pending-merge' && siblingIsOnStackedBranch(pipelineDir, sib.id, myBranch)) continue;
