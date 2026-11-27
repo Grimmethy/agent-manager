@@ -3913,3 +3913,16 @@ Extract a small `moveToArchive(srcPath, destDir, destDirEnsuredRef, result)` hel
 
 **Benefits:**  
 A change to the archiving mechanics is made in one helper rather than in two parallel code paths, eliminating the risk of divergence. The public functions become shorter and more readable, each expressing a single concern (enumeration vs. move semantics), which makes future refactors — such as adding logging, metrics, or cross-filesystem fallback — straightforward and localized.
+
+### AC-847 · Duplicate function definitions in `src/done-archive.js`
+Strength: Strong
+Files: src/done-archive.js
+
+Problem:
+Three functions — `archiveRootDir`, `archiveDestDir`, and `ensureArchiveDir` — are each defined twice in `src/done-archive.js`. The second definition of each function shadows the first, rendering the first definition dead code. This creates a maintenance hazard: a developer editing the file is likely to modify the wrong (first) definition, never realizing it has no effect at runtime. It also confuses readers who must trace which definition actually executes, and it makes static analysis tools (linters, type checkers, coverage reports) report misleading results about dead code and unused exports.
+
+Solution:
+Remove the first definition of each of the three functions, keeping only the second (the one that actually runs). Before deleting, verify that neither first definition is referenced from any other file via dynamic imports, string-based lookups, or test mocks — if any are, migrate those references to the surviving definition and then delete. Add a comment or a `@deprecated` JSDoc on the removed block if the intent was to preserve it for historical reference, but the cleanest fix is full deletion since the first definitions never execute. Run the existing test suite to confirm behavior is unchanged.
+
+Benefits:
+Eliminates dead code and the shadowing hazard, so developers editing the file will modify the function that actually runs. Static analysis tools will report accurately, and the file becomes easier to read and maintain. Test coverage and runtime behavior remain unchanged (since the first definitions were never reached), but the risk of future regressions from accidentally editing the wrong definition is removed.
