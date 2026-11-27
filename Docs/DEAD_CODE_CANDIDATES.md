@@ -554,3 +554,17 @@ Strength: Strong
 Symbol: canTransitionToPlannerFailure
 
 The function `canTransitionToPlannerFailure` has non-trivial logic (type checking, allowed-source validation, reason-based gating for the `needs-clarification` case) that is architecturally central to the module's purpose. The only file naming this module is `tests/unit/task-state.test.js`, which exists specifically to test this module's exports. Given the module exports exactly four items all related to planner-failure state management, and the test file targets this module, it is virtually certain the test exercises `canTransitionToPlannerFailure` — likely via destructured import or through a test helper. Removing it would leave an incomplete public API and break the test suite.
+
+### AC-39 · Remove `unpinnedBlockDecision` from src/review-verify.js
+Strength: Strong
+Files: src/review-verify.js
+Symbol: unpinnedBlockDecision
+
+Problem:
+The function `unpinnedBlockDecision` has zero call sites across the entire codebase. The grep search confirmed no direct calls, destructured imports, re-exports, property accesses, or string literals referencing the symbol. The function is defined in `src/review-verify.js` alongside `checkUnpinnedHunks`, but `checkUnpinnedHunks` returns a different data shape and does not invoke this decision layer. The module is imported by other files for different exports (`checkUnpinnedHunks`, `checkFailsOnBase`, `splitDiffFiles`), but none of them wire up `unpinnedBlockDecision`. The function appears to be an incomplete feature — a gate for unpinned changes that was never integrated into the review pipeline.
+
+Solution:
+Remove the function `unpinnedBlockDecision` (lines 510-520) and its associated constants `UNPINNED_BLOCK_RATIO` and `UNPINNED_BLOCK_HUNK_LINES` (lines 508-509) from `src/review-verify.js`. No call sites need to be updated since none exist. If the unpinned-block feature is still intended, the wiring must be completed by calling this function from the appropriate place in the review pipeline.
+
+Benefits:
+Removing this dead code eliminates misleading unused code that future readers would have to puzzle over. It reduces the surface area of the module and clarifies that the unpinned-block decision layer is not yet implemented. The codebase no longer contains a half-finished feature that could confuse maintainers about the current state of the unpinned-check logic.
