@@ -425,13 +425,15 @@ def api_git_unmerged_branches():
     with _branch_cache_lock:
         filled = _branch_cache["at"]
     pending = []
+    scan = None
     if request.args.get("projects") == "all":
         # Every registered project, active first, each row tagged with its `project`. The default (no param) stays the active project's bare list: the verdict/merge
         # tooling and the verify-unmerged-branches skill read it and act on the active repo only.
         import branch_projects
         from app import get_active_repo_root
         branches, pending = branch_projects.combined_branches(branches, get_active_repo_root())
-    resp = jsonify(branches)
+        scan = branch_projects.scan_status()
+    resp = jsonify({"branches": branches, "scan": scan} if scan is not None else branches)
     resp.headers["X-Branch-Cache-Age"] = str(max(0, int(time.time() - filled))) if filled else "0"
     resp.headers["X-Branch-Projects-Pending"] = ",".join(pending)
     resp.headers["X-Branch-Refreshing"] = "1" if branch_list_refreshing() else "0"
@@ -440,6 +442,29 @@ def api_git_unmerged_branches():
     resp.headers["Cache-Control"] = "no-cache"
     resp.set_etag(hashlib.sha256(resp.get_data() + b"\0" + resp.headers["X-Branch-Projects-Pending"].encode() + b"\0" + resp.headers["X-Branch-Refreshing"].encode()).hexdigest())
     return resp.make_conditional(request)
+
+
+@pipeline_1_more_bp.route("/api/git/unmerged-branches/scan-project", methods=["POST"])
+def api_git_scan_project():
+    """Scan one project immediately, ahead of the queue. Takes ?project=<label or repoRoot>.
+
+    Returns the cached entry for that project (branches + error) after the scan completes (blocking
+    up to BRANCH_SCAN_TIMEOUT_S). If the project is not registered, returns 404 with an error entry.
+    """
+    import branch_projects
+    project_param = request.args.get("project") or (request.get_json(silent=True) or {}).get("project")
+    if not project_param:
+        return jsonify({"label": "", "error": "missing ?project=<label or repoRoot>"}), 400
+    entry, err = branch_projects.scan_one_now(project_param)
+    if entry is None:
+        return jsonify({"label": project_param, "error": err}), 404
+    if err:
+        return jsonify({"label": entry.get("label") or project_param, "error": err}), 200
+    return jsonify({
+        "label": entry.get("label") or project_param,
+        "branches": entry.get("branches") or [],
+        "at": entry.get("at"),
+    }), 200
 
 
 @pipeline_1_more_bp.route("/api/git/stale-branch-candidates")

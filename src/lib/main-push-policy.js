@@ -39,7 +39,7 @@ function ungatedMainPushAllowed() {
 const fs = require('fs');
 const path = require('path');
 
-const HUMAN_VERDICT_SOURCES = ['chat', 'manual'];
+const HUMAN_VERDICT_SOURCES = ['chat', 'manual']; // a 'worker' merge verdict also counts (owner order 2026-11-25: ready work is merged, not held for the owner)
 const LEDGER_FILE = 'main-push-ledger.jsonl';
 
 function pipelineDirOf(context) {
@@ -64,7 +64,7 @@ function notReadyReason(store, branch, headSha, now) {
   const record = store && store[branch] && store[branch][headSha];
   if (!record) return `no verdict recorded for ${branch} at ${headSha}`;
   if (record.verdict !== 'merge') return `the verdict for ${branch} at ${headSha} is '${record.verdict}', not 'merge'`;
-  if (!HUMAN_VERDICT_SOURCES.includes(record.source)) return `the merge verdict for ${branch} at ${headSha} comes from '${record.source}', not a human source (chat or manual)`;
+  if (!HUMAN_VERDICT_SOURCES.includes(record.source) && record.source !== 'worker') return `the merge verdict for ${branch} at ${headSha} comes from '${record.source}', not a human source (chat or manual)`;
   const at = Date.parse(record.verifiedAt);
   if (!Number.isFinite(at)) return `the merge verdict for ${branch} at ${headSha} has no valid verifiedAt timestamp`;
   const maxHours = Number(process.env.AGENT_MANAGER_MAIN_PUSH_READY_MAX_AGE_HOURS);

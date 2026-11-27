@@ -307,3 +307,27 @@ test('module exports exactly the six named symbols', () => {
     'tokenizeJs',
   ]);
 });
+
+test('findPyFunctionSpans: a top-level def ends at the next top-level def, not at end of file', () => {
+  const lines = ['def a():', '    return 1', '', 'def b():', '    return 2', '', 'x = 3'];
+  const spans = findPyFunctionSpans(lines);
+  assert.deepStrictEqual(spans.map((s) => [s.name, s.startLine, s.endLine]), [['a', 1, 2], ['b', 4, 5]]);
+});
+
+test('findPyFunctionSpans: a method ends before its sibling method', () => {
+  const lines = ['class C:', '    def one(self):', '        return 1', '', '    def two(self):', '        return 2'];
+  const spans = findPyFunctionSpans(lines);
+  assert.deepStrictEqual(spans.map((s) => [s.name, s.startLine, s.endLine]), [['one', 2, 3], ['two', 5, 6]]);
+});
+
+test('findPyFunctionSpans: a multi-line signature belongs to the def and a decorator ends the previous def', () => {
+  const lines = ['def a(', '    x,', '    y,', '):', '    return x', '@dec', 'def b():', '    return 2'];
+  const spans = findPyFunctionSpans(lines);
+  assert.deepStrictEqual(spans.map((s) => [s.name, s.startLine, s.endLine]), [['a', 1, 5], ['b', 7, 8]]);
+});
+
+test('findLongFunctions: a short python function in a file with a long tail is not a violation', () => {
+  const body = ['def a():', '    return 1', ''];
+  for (let i = 0; i < 150; i++) body.push(`x${i} = ${i}`);
+  assert.deepStrictEqual(findLongFunctions(body.join('\n'), 'mod.py'), []);
+});

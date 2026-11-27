@@ -15,15 +15,8 @@
 // null and every caller's existing behavior is completely unchanged.
 
 const path = require('path');
-const { execFileSync } = require('child_process');
 const { createRealGitRunner } = require('./git-runner.js');
-
-const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
-const GIT_TIMEOUT_MS = 60_000;
-
-function runGit(args, cwd) {
-  return execFileSync('git', args, { cwd, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
-}
+const { runGit } = require('./git-env.js');
 
 // Returns the stacked branch's plain name (e.g. "agent/decompose-autodecomp-...") if
 // `task` is a stacked child AND that branch genuinely exists on origin right now, else
@@ -113,7 +106,7 @@ function resolveAtRef(repoRoot, ref, candidatePath, extraRoots = []) {
   }
   let files;
   try {
-    files = execFileSync('git', ['ls-tree', '-r', '--name-only', `origin/${ref}`], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 })
+    files = runGit(['ls-tree', '-r', '--name-only', `origin/${ref}`], repoRoot, { maxBuffer: 64 * 1024 * 1024 })
       .split('\n').filter(Boolean);
   } catch (e) {
     throw new Error(`resolveAtRef: git ls-tree failed for origin/${ref} (looking up ${normalized}): ${e && e.message ? e.message : e}`, { cause: e });

@@ -378,3 +378,27 @@ test('isHubTierTask: an atomic decompose child is in the tier even when its hub 
   const dir = makePipeline();
   assert.equal(isHubTierTask(dir, { id: 'atom', atomic: true }), true);
 });
+
+test('hubHasUnmergedEarlierSibling blocks on a dependsOn sibling with no status property', () => {
+  const dir = makePipeline();
+  const hub = { subTasks: [{ id: 'a' }, { id: 'c' }] };
+  const r = hubHasUnmergedEarlierSibling(dir, { id: 'c', parentHub: 'h', dependsOn: ['a'] }, hub);
+  assert.equal(r.blocked, true);
+  assert.equal(r.blockingSiblingId, 'a');
+});
+
+test('hubHasUnmergedEarlierSibling blocks on a dependsOn sibling with status null or empty string', () => {
+  const dir = makePipeline();
+  for (const status of [null, '']) {
+    const hub = { subTasks: [{ id: 'a', status }, { id: 'c' }] };
+    const r = hubHasUnmergedEarlierSibling(dir, { id: 'c', parentHub: 'h', dependsOn: ['a'] }, hub);
+    assert.equal(r.blocked, true, 'status ' + JSON.stringify(status) + ' must block');
+  }
+});
+
+test('hubHasUnmergedEarlierSibling does not block on an unstatused sibling that is not depended on and not stacked', () => {
+  const dir = makePipeline();
+  const hub = { subTasks: [{ id: 'a' }, { id: 'c' }] };
+  const r = hubHasUnmergedEarlierSibling(dir, { id: 'c', parentHub: 'h', dependsOn: [] }, hub);
+  assert.equal(r.blocked, false);
+});

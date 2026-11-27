@@ -405,18 +405,13 @@ function findPyFunctionSpans(lines) {
     const startLine = i + 1; // 1-based
     const defIndent = lines[i].search(/\S/); // leading whitespace count
 
-    // Find end: first line after start that has indent < defIndent (or is blank at same indent)
+    // End: first following non-blank line indented no deeper than the def (sibling def, decorator, next statement); a multi-line signature runs to its ':'.
     let endLine = startLine;
+    let sig = !/:\s*(#.*)?$/.test(lines[i]);
     for (let j = i + 1; j < lines.length; j++) {
       const line = lines[j];
-      if (line.trim() === '') {
-        endLine = j + 1;
-        continue;
-      }
-      const indent = line.search(/\S/);
-      if (indent < defIndent) {
-        break;
-      }
+      if (line.trim() !== '' && !sig && line.search(/\S/) <= defIndent) break;
+      if (line.trim() !== '' && sig && /:\s*(#.*)?$/.test(line)) sig = false;
       endLine = j + 1;
     }
 

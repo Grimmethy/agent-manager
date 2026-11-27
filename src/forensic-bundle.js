@@ -24,7 +24,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { signatureForTask } = require('./pipeline-self-audit.js');
+const { signatureForTask } = require('./blocked-task-classifiers.js');
 const { readWorkLog } = require('./work-log.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 
