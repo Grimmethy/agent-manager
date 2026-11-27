@@ -568,3 +568,52 @@ Remove the function `unpinnedBlockDecision` (lines 510-520) and its associated c
 
 Benefits:
 Removing this dead code eliminates misleading unused code that future readers would have to puzzle over. It reduces the surface area of the module and clarifies that the unpinned-block decision layer is not yet implemented. The codebase no longer contains a half-finished feature that could confuse maintainers about the current state of the unpinned-check logic.
+
+### AC-40 · Remove dead `staleCodeState` module and its test
+Strength: Strong
+Files: src/stale-code.js, test/stale-code.test.js
+Symbol: staleCodeState
+
+Problem:
+`staleCodeState` is a pure utility that performs no I/O, registers no hooks, and has no side effects on import — its only purpose is to be called by other code. The pre-check confirmed that the sole file importing `src/stale-code.js` is `test/stale-code.test.js`; no production code references this module, there is no barrel re-export, and there is no dynamic `require()` pattern that could bypass static analysis. This is the classic leftover pattern: the production consumer was removed (likely because the staleness check was simplified, inlined, or moved elsewhere), but the test file remained as an unexercised artifact.
+
+Solution:
+Delete `src/stale-code.js` (removing the `staleCodeState` export, the `STALE_AFTER_MS` constant, and the helper `isNonEmptyString`). Delete `test/stale-code.test.js` (the only consumer, which verifies behavior no longer exercised in production). No call sites in production code need updating — the pre-check found zero.
+
+Benefits:
+Eliminates an unused 24-hour threshold constant and a pure utility that no code relies on, reducing surface area and removing a misleading artifact that would otherwise invite future readers to wonder why it exists. The test suite becomes tighter because it no longer contains a test for behavior that is not part of the live system.
+
+SOURCE EXCERPT of src/stale-code.js (the file the symbol is defined in) --
+1: 'use strict';
+2: 
+3: // Pure staleness comparison between a node's repo HEAD and the primary's HEAD.
+4: // Rule: missing or empty fields -> 'unknown'; equal shas -> 'current';
+5: // unparseable dates -> 'unknown'; node date more than 24h older than the
+6: // primary date -> 'stale'; otherwise 'current'. The 24-hour threshold is
+7: // defined only in this file.
+8: //
+9: // Pure by design: no I/O, no timers, no wall-clock reads. The result depends only on
+10: // the arguments, so the browser and the server can share the same decision.
+11: 
+12: const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
+13: 
+14: function isNonEmptyString(value) {
+15:   return typeof value === 'string' && value.length > 0;
+16: }
+17: 
+18: function staleCodeState({ nodeSha, nodeDate, primarySha, primaryDate } = {}) {
+19:   if (![nodeSha, nodeDate, primarySha, primaryDate].every(isNonEmptyString)) {
+20:     return 'unknown';
+21:   }
+22:   if (nodeSha === primarySha) return 'current';
+23: 
+24:   const nodeMs = Date.parse(nodeDate);
+25:   const primaryMs = Date.parse(primaryDate);
+26:   if (Number.isNaN(nodeMs) || Number.isNaN(primaryMs)) return 'unknown';
+27: 
+28:   if (primaryMs - nodeMs > STALE_AFTER_MS) return 'stale';
+29:   return 'current';
+30: }
+31: 
+32: module.exports = { staleCodeState };
+Files that name this module: test/stale-code.test.js
