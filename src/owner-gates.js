@@ -47,18 +47,15 @@
 //     - piece.id is missing → returned object's id will be undefined; callers
 //       should treat this as a malformed piece, not a gate hit.
 //
-// PROTECTED CASE (checked first by the CALLER, documented here for clarity)
-// -----------------------------------------------------------------------
-// The HUB0924 task contract specifies that tasks with status 'blocked' that
-// were previously escalated from 'needs-clarification' MUST NOT be dismissed
-// even when there are no recent history events. This protection is NOT
-// implemented inside ownerGateFor itself (the gate function has no access to
-// task history or status); it is the responsibility of the caller that
-// consumes the gate result (typically the coordinator sweep or dashboard
-// route that decides whether to dismiss/archive a piece).
+// PROTECTED CASE
+// --------------
+// Tasks with status 'blocked' that were previously escalated from
+// 'needs-clarification' MUST NOT be dismissed even when there are no recent
+// history events. This protection is implemented inside ownerGateFor itself:
+// when a piece has status 'blocked' and was escalated from 'needs-clarification',
+// the function returns null without recording a dismissal, preserving the
+// operator's explicit pause signal.
 //
-// WHY THE PROTECTED CASE IS CHECKED FIRST
-// ---------------------------------------
 // A piece that was escalated from needs-clarification to blocked was actively
 // being worked on — the operator needed clarification, the piece was paused,
 // and the status was set to blocked to prevent it from being auto-dismissed
@@ -69,42 +66,54 @@
 //
 // ORDERING LOGIC
 // --------------
-// When a caller evaluates multiple return paths (e.g. gate hit, protected
-// case, dismissal), the protected case MUST be checked before the gate logic
-// because:
+// The protected case is checked BEFORE the gate logic because:
 //   1. The protected case is a SAFETY NET — it prevents data loss of
 //      intentionally-held work.
 //   2. The gate logic is a ROUTING decision — it directs work to the owner.
 //   3. Safety nets always take precedence over routing: you never route
 //      around a safety net.
 //
-// In practice this means: if a piece is blocked-and-escalated-from-needs-
-// clarification, the caller MUST skip dismissal regardless of what
-// ownerGateFor returns. The gate function itself remains pure and side-effect
-// free; it only detects trigger phrases.
-//
 // DISMISSAL RECORDING
 // -------------------
-// The gate function itself does NOT record dismissals (it has no access to
-// the task history store). Dismissal recording is the caller's responsibility:
-// when a caller decides to dismiss a piece (after checking the protected case),
-// it should call appendHistoryEvent(task, 'advisory', ...) to log the
-// dismissal reason. This keeps ownerGateFor pure and testable.
+// Every dismissal path in the gate function records the dismissal via a
+// history event (using appendHistoryEvent from task-history.js). This allows
+// wrongly dismissed cases to be found and audited. The recording is consistent
+// with the hub's existing history tracking patterns.
 //
 // SEE ALSO
 // --------
 //   - src/apply-adhoc-diff.js:295 — first caller (hub decompose)
 //   - src/hub-add-piece.js:181 — second caller (manual piece addition)
 //   - src/hub-apply-routing.js:30 — consumer that logs ownerGates to history
-//   - src/owner-gates.test.js — unit tests for the regex match
+//   - src/owner-gates.test.js — unit tests for the regex match, protected case, and dismissal recording
 
 const GATE_RE = /owner[ -]approval|needs the owner|design decision/i;
+const { appendHistoryEvent } = require('./task-history.js');
 
-// piece: { id, title, rawText } -> { id, title, why } or null. `why` is the matched phrase, lower-cased.
+// piece: { id, title, rawText, status?, promptContext? } -> { id, title, why } or null. `why` is the matched phrase, lower-cased.
 // See module-level JSDoc for full contract, return paths, and protected-case ordering.
 function ownerGateFor(piece) {
+  // Protected case: tasks with status 'blocked' escalated from 'needs-clarification'
+  // MUST NOT be dismissed even without recent history events.
+  if (piece.status === 'blocked' && piece.promptContext && piece.promptContext.raisedFrom === 'needs-clarification') {
+    return null;
+  }
+
   const m = GATE_RE.exec(`${piece.title || ''}\n${piece.rawText || ''}`);
-  return m ? { id: piece.id, title: piece.title, why: m[0].toLowerCase() } : null;
+  if (m) {
+    return { id: piece.id, title: piece.title, why: m[0].toLowerCase() };
+  }
+
+  // Dismissal path: record the dismissal via history event
+  if (piece.id) {
+    try {
+      appendHistoryEvent(piece, 'advisory', 'piece dismissed: no owner-gate trigger found');
+    } catch (err) {
+      // Best-effort: never abort a pass on a history write failure
+    }
+  }
+
+  return null;
 }
 
 module.exports = { GATE_RE, ownerGateFor };

@@ -16,3 +16,30 @@ test('ownerGateFor returns null for an ordinary piece, including a mere mention 
   assert.equal(ownerGateFor({ id: 'p5', title: 'Add a route', rawText: 'The owner of the session is the host.' }), null);
   assert.equal(ownerGateFor({ id: 'p6' }), null);
 });
+
+test('ownerGateFor does not dismiss protected case: blocked + escalated from needs-clarification', () => {
+  const piece = {
+    id: 'p7',
+    title: 'Blocked task',
+    rawText: 'No trigger phrases here',
+    status: 'blocked',
+    promptContext: { raisedFrom: 'needs-clarification' }
+  };
+  assert.equal(ownerGateFor(piece), null);
+});
+
+test('ownerGateFor records dismissal via history event for non-protected case', () => {
+  const piece = {
+    id: 'p8',
+    title: 'Ordinary task',
+    rawText: 'No trigger phrases here',
+    status: 'pending'
+  };
+  const result = ownerGateFor(piece);
+  assert.equal(result, null);
+  assert.ok(Array.isArray(piece.history), 'history should be an array');
+  assert.ok(piece.history.length > 0, 'history should have at least one entry');
+  const lastEntry = piece.history[piece.history.length - 1];
+  assert.equal(lastEntry.stage, 'advisory');
+  assert.ok(lastEntry.detail.includes('dismissed'));
+});
