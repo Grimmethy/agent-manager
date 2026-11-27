@@ -249,3 +249,17 @@ Delete the file `src/lib/near-match.js` in its entirety. No call sites or refere
 
 Benefits:
 Eliminates ~60 lines of unused, unmaintained code that performs a filesystem walk on every call, reducing surface area and removing a misleading artifact that could confuse a future reader into thinking the feature is wired up somewhere.
+
+### AC-18 · Remove unused `MAX_RETRIES` export from plan-retry-strategy
+Strength: Strong
+Files: src/lib/plan-retry-strategy.js
+Symbol: MAX_RETRIES
+
+Problem:
+`MAX_RETRIES` is defined as `const MAX_RETRIES = 3` at the top of the module and re-exported via `module.exports`, but no code in the file references it — the actual retry-capacity check on the exhaustion path uses `RETRY_STRATEGIES.length` instead, which is both the source of truth and the only consumer. A cross-module search also found zero call sites, and the sole importing file (`tests/unit/plan-retry.test.js`) does not destructure `MAX_RETRIES` either. The constant is therefore a leftover from before the refactor to the strategy array and adds no behavioral or documentation value (the comment block already describes the three strategies by name).
+
+Solution:
+In `src/lib/plan-retry-strategy.js`, delete the `const MAX_RETRIES = 3;` declaration and remove `MAX_RETRIES,` from the `module.exports` object. No other files need to change because no call site references the symbol.
+
+Benefits:
+The module's public surface shrinks by one misleading entry, eliminating a stale constant that could tempt a future reader to rely on a hardcoded retry count instead of the authoritative `RETRY_STRATEGIES.length`. This also removes an export that tests and consumers never used, reducing the risk of drift if the strategy list is ever extended.
