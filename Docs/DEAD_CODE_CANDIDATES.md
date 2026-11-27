@@ -129,3 +129,17 @@ Eliminates one piece of unused documentation metadata from an otherwise-unused c
 **GENUINE — `OUTPUT_PATH` is genuinely dead code.**
 
 The constant is a static documentation string in a file that is not imported anywhere. It describes a path expression for human/machine reference but is never consumed by any function, tooling, or code generator. Removing it requires only deleting the constant definition and its export entry — no call sites exist to update.
+
+### AC-10 · Remove dead export `findPluginRootForPaths` from `src/accessible-roots.js`
+Strength: Strong
+Files: src/accessible-roots.js
+Symbol: findPluginRootForPaths
+
+Problem:
+The function `findPluginRootForPaths` (lines 102–131 of `src/accessible-roots.js`) is exported alongside four other utilities, but a full-codebase grep for the symbol returned zero references. The module is imported by 18+ files, yet none of them destructure or otherwise use this specific export — the other four exports (`resolveAccessibleRoots`, `resolveReadOnlySiblingRoots`, `isSecretLookingPath`, `isCoreRepo`) are the ones actually consumed. The function is not passed as a callback, stored in a variable, or invoked via bracket notation, so the absence of references is genuine. The detailed JSDoc (lines 102–105) indicates it was intentionally written and documented, making it almost certainly leftover from a prior refactoring that removed its call sites but forgot to remove the definition.
+
+Solution:
+Remove the function body (lines 102–131, including the JSDoc comment) and remove `findPluginRootForPaths` from the `module.exports` object on line 155 of `src/accessible-roots.js`. No other files need changes: the pre-check confirmed zero call sites across the entire codebase, including the test file `src/accessible-roots.test.js` and all 18+ importers.
+
+Benefits:
+Eliminates ~30 lines of unused, documented-but-unreachable code, reducing the public surface area of the module and removing a genuine source of confusion for any future reader who might assume the function is still in active use because of its detailed JSDoc.
