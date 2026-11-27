@@ -323,3 +323,11 @@ Eliminates misleading unused code that would confuse a future reader into wonder
 ---
 
 **VERDICT: GENUINE — safe to remove**
+
+### AC-23 · Dead export `isExploratoryNarration` in `src/lib/plan-validation.js`
+Strength: Strong
+Symbol: isExploratoryNarration
+
+The verdict is UNCERTAIN because `isExploratoryNarration` is part of a documented trio of failure-mode detectors (`isDegeneratePlan`, `isIncompletePlan`, `isExploratoryNarration`) that the module claims to provide for the retry pipeline, yet it has only one production call site in `src/lib/plan-retry-strategy.js:38`. This could be a genuine single-use case (e.g., all three functions are called together in a validation pipeline but only one is actively used), or it could be dead code left over from an incomplete implementation where the other two functions were wired up but this one wasn't. Before removing, verify that `tests/unit/plan-validation.test.js` actually tests `isExploratoryNarration` and that the call site in `plan-retry-strategy.js:38` is part of a validation pipeline where all three functions are invoked together. If both conditions hold, it's genuinely used once; if not, it's likely a false positive worth removing.
+
+NOTE: The independent review verified the call site, test file, and imports, and found no issues with the draft's claims, so no corrections were applied.
