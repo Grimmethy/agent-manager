@@ -411,3 +411,17 @@ Remove the `readMaxBehind` function definition (lines 113–122, including the p
 
 Benefits:
 Eliminates dead surface area and removes a misleading unused export that could confuse a future reader into thinking `AGENT_MANAGER_NODE_MAX_BEHIND` is honored by `checkDrift`. Reduces the module's public API to the three functions that are actually wired into the system, making the contract between `checkDrift` and its callers clearer.
+
+### AC-29 · Remove dead export `isNodeExcluded` from `node-return-on-pause`
+Strength: Strong
+Files: src/node-return-on-pause.js
+Symbol: isNodeExcluded
+
+Problem:
+The `isNodeExcluded` export is a simple predicate (`excludedNodes.has(nodeId)`) that is defined and added to `module.exports` but never consumed by any production code. The only file that names this module is `src/node-return-on-pause.test.js`, meaning the function is exercised solely by its own unit tests — the classic signature of an exported-but-unused symbol. The companion export `excludedNodes` (the `Set` itself) shows the same pattern and was likely added as an API surface that no consumer ever adopted.
+
+Solution:
+Remove `isNodeExcluded` from the `module.exports` object in `src/node-return-on-pause.js`. Update `src/node-return-on-pause.test.js` to either call `excludedNodes.has(nodeId)` directly if the test needs to assert exclusion, or remove the assertions that depend on it. Consider whether `excludedNodes` (the `Set`) should also be removed from exports — it carries the same dead-code diagnosis.
+
+Benefits:
+Eliminates a misleading public API surface that no consumer adopted, reducing the cognitive load on future readers who might wonder why this function exists. Tightens the module's contract so its exports accurately reflect actual usage, and removes a potential source of confusion if someone later assumes the export is part of the supported API.
