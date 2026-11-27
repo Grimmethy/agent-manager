@@ -485,3 +485,31 @@ Delete lines 27–33 of `src/prompts.js`: the two-line docstring ("Retry hygiene
 
 Benefits:
 Eliminates a misleading constant that signals a feature (retry-hygiene prompt prefixing) which does not exist, reducing surface area and preventing a future reader from spending time tracing a dead reference. The two-line docstring it carried also disappears, removing an orphaned explanation of intent that no longer applies.
+
+### AC-34 · Remove dead `clearStall` export from src/queue-events.js
+Strength: Strong
+Files: src/queue-events.js
+Symbol: clearStall
+
+Problem:
+The `clearStall` function (lines 127-131) is never invoked anywhere in the codebase. It is the intended inverse of `enterStall` — both operate on the same `activeStalls` set using the identical `${project}|${taskId}|${stage}` key format — yet no caller wires it up. The function is exported on line 217 alongside `enterStall`, suggesting it was meant to be part of the public API, but all 11 importing files (including `src/branch-conflict-readmit-sweep.js`, `src/context-outcomes.js`, `src/lib/poll-detector.js`, `src/live-checkout-sync.js`, and the remaining three) destructure or reference only `enterStall` and never `clearStall`. The grep confirmed zero call sites across the entire codebase.
+
+Solution:
+Remove the `clearStall` function definition (lines 127-131) from `src/queue-events.js` and remove `clearStall` from the `module.exports` object on line 217. No call sites need adjustment — the grep confirmed none exist.
+
+Benefits:
+Eliminates a misleading unused export that suggests a cleanup path exists when it does not. Reduces surface area and prevents future readers from assuming `clearStall` is wired up. The underlying `activeStalls` memory leak (monotonic growth without cleanup) remains a separate issue requiring its own fix, but the dead function itself should not mask that problem.
+
+### AC-35 · Remove unused `enterStall` export from `src/queue-events.js`
+Strength: Strong
+Files: src/queue-events.js
+Symbol: enterStall
+
+Problem:
+The `enterStall` function in `src/queue-events.js` is defined, exported, and guarded by the `AGENT_MANAGER_QUEUE_EVENTS` environment variable, yet a full-codebase grep confirms zero call sites across all consumers and test files. It is a standalone utility that wraps `append` with deduplication logic for stall events, but no importer destructures it from the module and no test exercises it. The function is therefore dead code: it compiles, ships, and is available for use, but is never invoked in practice.
+
+Solution:
+Remove the `enterStall` function body (lines 95–125) and drop `enterStall` from the `module.exports` object on the final line of `src/queue-events.js`. No other files need changes: the grep confirmed no consumer references the symbol, and the `activeStalls` Set it populates is similarly only written by `enterStall` and read nowhere useful — leave it in place since it is a harmless no-op when never mutated, or remove it in a follow-up if you prefer to clean up the associated state.
+
+Benefits:
+Eliminates a misleading unused export that future readers might assume is wired in, reducing the public surface of `src/queue-events.js` to only the functions actually exercised by the codebase. It also removes a branch of dead environment-variable logic that could confuse anyone investigating stall-event behavior later.
