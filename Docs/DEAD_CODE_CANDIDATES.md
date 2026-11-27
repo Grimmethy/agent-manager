@@ -453,3 +453,35 @@ Remove the `toCreateEntries` function definition (lines 49–52) and drop it fro
 
 Benefits:
 Eliminates an unused function and its associated dead export, reducing surface area and preventing a future reader from wondering why `toCreateEntries` exists or whether it's wired in somewhere. The codebase becomes one step closer to a clean removal of the entire `src/plan-citation-guard.js` module if its companion export is also confirmed dead.
+
+### AC-32 · Remove unused `promptTemplateText` export from `src/prompt-tuning-audit.js`
+Strength: Strong
+Files: src/prompt-tuning-audit.js
+Symbol: promptTemplateText
+
+Problem:
+The function `promptTemplateText` is exported from `src/prompt-tuning-audit.js` but has zero call sites anywhere in the codebase. The only file that imports this module is `test/prompt-tuning-audit.test.js`, which likely tests the other exported functions (`ALLOWLIST`, `minOutcomes`, `gatherCorpus`). The function appears to be dead code — it was added to the module but never wired into the actual workflow.
+
+Solution:
+Remove the function definition (lines 102-113) and the `promptTemplateText` entry from the `module.exports` object on line 115 of `src/prompt-tuning-audit.js`. No call sites need to be updated since none exist.
+
+Benefits:
+Removing this export reduces the public API surface area and eliminates misleading unused code that could confuse future readers about the module's actual functionality. The helper functions `skipQuoted`, `skipTemplate`, and `closeOf` may also be dead if they were only used by `promptTemplateText` — those should be evaluated separately.
+
+---
+
+**Verification:** The grep found zero call sites for `promptTemplateText`. The test file `test/prompt-tuning-audit.test.js` is the only consumer of this module, and it likely only tests the other exports. This is genuinely dead code that can be safely removed.
+
+### AC-33 · Remove unused RETRY_HYGIENE_PREFIX constant from src/prompts.js
+Strength: Strong
+Files: src/prompts.js
+Symbol: RETRY_HYGIENE_PREFIX
+
+Problem:
+`RETRY_HYGIENE_PREFIX` is a module-private `const` string built by joining a literal array with `'\n'`. It is never imported by any other module (none of the 59+ files that require `src/prompts.js` reference it), never used inside `src/prompts.js` itself, and never exposed via `module.exports`. The docstring explicitly states its intended role — prepending to a retry prompt so the model returns only the deliverable — but no prompt-building function in this file (or in any of the prompt-assembly modules it imports) ever references it, indicating the feature was scaffolded but never wired up.
+
+Solution:
+Delete lines 27–33 of `src/prompts.js`: the two-line docstring ("Retry hygiene rules: prepended to a retry prompt so the model returns only the deliverable," / "with no meta-commentary and no reference to earlier attempts.") and the `const RETRY_HYGIENE_PREFIX = [...]` declaration. No call-site cleanup is needed — the pre-check confirmed zero references across the entire codebase, including comments and string literals.
+
+Benefits:
+Eliminates a misleading constant that signals a feature (retry-hygiene prompt prefixing) which does not exist, reducing surface area and preventing a future reader from spending time tracing a dead reference. The two-line docstring it carried also disappears, removing an orphaned explanation of intent that no longer applies.
