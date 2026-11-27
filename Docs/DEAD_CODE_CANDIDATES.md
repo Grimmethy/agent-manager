@@ -389,3 +389,11 @@ Eliminates a misleading swap-point pattern that no longer serves its intended pu
 4. **The `setCandidateSplitHubFiler()` function is likely also dead.** If no plugin calls it, it serves no purpose. This should be verified and removed if confirmed.
 
 **Recommendation:** Remove `getCandidateSplitHubFiler()`, `setCandidateSplitHubFiler()`, and the `current` variable. Update the test file to remove the call to `getCandidateSplitHubFiler()`.
+
+### AC-27 · searchTasksAllProjects is genuinely used
+Strength: Strong
+Symbol: searchTasksAllProjects
+
+`searchTasksAllProjects` is genuinely used, not dead code. The grep found 2 real call sites in `src/local-tool-client.js` (lines 89 and 670), which is a clear signal of active consumption. The function performs non-trivial cross-project aggregation—iterating over all registered projects, calling `searchTasksTool` per pipeline dir, deduplicating by real path, and tagging results with the project label—which no other export in this file provides. Removing it would break the "search all projects" feature path in the client.
+
+**VERDICT: FALSE POSITIVE** — The symbol is genuinely used. Do not remove.
