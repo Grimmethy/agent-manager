@@ -548,3 +548,9 @@ Remove the function definition (lines 1121-1132, including the comment block) an
 
 Benefits:
 Removing this dead code reduces the public API surface of the module, eliminates confusion for future readers who might wonder why this function exists, and removes maintenance burden for a function that no code path uses. The export list becomes a more accurate representation of the module's actual functionality.
+
+### AC-38 · `canTransitionToPlannerFailure` in `src/lib/task-state.js`
+Strength: Strong
+Symbol: canTransitionToPlannerFailure
+
+The function `canTransitionToPlannerFailure` has non-trivial logic (type checking, allowed-source validation, reason-based gating for the `needs-clarification` case) that is architecturally central to the module's purpose. The only file naming this module is `tests/unit/task-state.test.js`, which exists specifically to test this module's exports. Given the module exports exactly four items all related to planner-failure state management, and the test file targets this module, it is virtually certain the test exercises `canTransitionToPlannerFailure` — likely via destructured import or through a test helper. Removing it would leave an incomplete public API and break the test suite.
