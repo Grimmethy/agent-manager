@@ -189,3 +189,17 @@ Remove the `snippetMismatch` function definition (lines 300-310) and its entry f
 Eliminates unused code that adds surface area and could mislead future readers into thinking the grounding check is still active. Reduces maintenance burden and clarifies that the candidate-docs module no longer performs snippet validation.
 
 Files that name this module: src/apply-group-a-report-appenders.js, src/apply-group-a.js, src/apply-task.test.js, src/arch-discovery-structcheck.js, src/candidate-docs.test.js, src/candidate-size-gate.js, src/candidate-size-gate.test.js, src/empty-approval-decision.js (+7 more)
+
+### AC-14 · Remove unused `MAX_WAIT_MS` export from `src/draft-quota.js`
+Strength: Strong
+Files: src/draft-quota.js
+Symbol: MAX_WAIT_MS
+
+Problem:
+`MAX_WAIT_MS` is defined at line 22 and re-exported on line 197, but a full-codebase grep found zero call sites — no import, no property access, no internal reference in `src/draft-quota.js` itself. The constant was likely exported in anticipation of clamping logic that was simplified away, or left behind during a refactoring where the `classify()` function no longer uses it. The three consumer files (`scripts/local-worker.sh`, `src/draft-quota.test.js`, `src/lend-task.js`) do not reference it either.
+
+Solution:
+Remove line 22 (`const MAX_WAIT_MS = 6 * 60 * 60 * 1000;`) and remove `MAX_WAIT_MS` from the `module.exports` object on line 197. No consumer needs updating — the grep confirmed zero references across the entire codebase.
+
+Benefits:
+Eliminates a misleading unused constant that could confuse a future reader into thinking the clamping behavior is still wired up. Reduces the public surface of the module and removes a test/maintenance burden — the constant can no longer be accidentally imported and relied upon as a configuration knob.
