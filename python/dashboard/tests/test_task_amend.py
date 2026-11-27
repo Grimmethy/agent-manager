@@ -24,6 +24,7 @@ def _fake_requeue(state, task_id):
 
 
 _stub.api_task_requeue = _fake_requeue
+_stub._qdir_for_request = lambda body=None, queue_only=False: ((Path(os.environ["AGENT_MANAGER_PIPELINE_DIR"]) / "queue") if os.environ.get("AGENT_MANAGER_PIPELINE_DIR") else None, None)
 sys.modules["routes.task"] = _stub
 
 spec = importlib.util.spec_from_file_location("task_amend_under_test", ROUTE_FILE)
