@@ -397,3 +397,17 @@ Symbol: searchTasksAllProjects
 `searchTasksAllProjects` is genuinely used, not dead code. The grep found 2 real call sites in `src/local-tool-client.js` (lines 89 and 670), which is a clear signal of active consumption. The function performs non-trivial cross-project aggregation—iterating over all registered projects, calling `searchTasksTool` per pipeline dir, deduplicating by real path, and tagging results with the project label—which no other export in this file provides. Removing it would break the "search all projects" feature path in the client.
 
 **VERDICT: FALSE POSITIVE** — The symbol is genuinely used. Do not remove.
+
+### AC-28 · Remove unused `readMaxBehind` export from node-code-drift
+Strength: Strong
+Files: src/node-code-drift.js
+Symbol: readMaxBehind
+
+Problem:
+`readMaxBehind` (lines 115–122) is exported at line 124 but has zero call sites anywhere in the codebase. It reads `AGENT_MANAGER_NODE_MAX_BEHIND` from `process.env` and falls back to `DEFAULT_MAX_BEHIND` (20), yet `checkDrift` at line 93 accepts `maxBehind` as an injected parameter rather than calling `readMaxBehind`. The two test files that import this module (`src/node-code-drift.test.js`, `src/node-pull-stale.test.js`) never import or reference `readMaxBehind`. The function is a leftover from a refactoring where env-reading was extracted but never wired into the call chain.
+
+Solution:
+Remove the `readMaxBehind` function definition (lines 113–122, including the preceding comment block) and remove `readMaxBehind` from the `module.exports` object at line 124, leaving `module.exports = { codeDrift, describeDrift, checkDrift };`. No other files need changes since no consumer imports this symbol.
+
+Benefits:
+Eliminates dead surface area and removes a misleading unused export that could confuse a future reader into thinking `AGENT_MANAGER_NODE_MAX_BEHIND` is honored by `checkDrift`. Reduces the module's public API to the three functions that are actually wired into the system, making the contract between `checkDrift` and its callers clearer.
