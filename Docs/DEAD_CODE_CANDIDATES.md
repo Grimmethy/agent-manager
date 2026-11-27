@@ -263,3 +263,63 @@ In `src/lib/plan-retry-strategy.js`, delete the `const MAX_RETRIES = 3;` declara
 
 Benefits:
 The module's public surface shrinks by one misleading entry, eliminating a stale constant that could tempt a future reader to rely on a hardcoded retry count instead of the authoritative `RETRY_STRATEGIES.length`. This also removes an export that tests and consumers never used, reducing the risk of drift if the strategy list is ever extended.
+
+### AC-19 · Remove unused `auditFiles` export from batch-write-bypass-audit
+Strength: Strong
+Files: src/batch-write-bypass-audit.js
+Symbol: auditFiles
+
+Problem:
+The `auditFiles` function is a convenience wrapper that iterates over entries and calls `auditFile` for each, but production code never imports or uses it. The pre-check confirms only `src/batch-write-bypass-audit.test.js` references this module, and within that test file, `auditFiles` appears at lines 4 and 46 solely to exercise the batch path. Since `auditFile` handles the actual auditing logic and production code calls it directly per file, `auditFiles` is dead code that adds surface area without value.
+
+Solution:
+Remove the `auditFiles` function definition (lines 104-109) and its export from the `module.exports` statement on line 111 in `src/batch-write-bypass-audit.js`. In `src/batch-write-bypass-audit.test.js`, remove the two test call sites at lines 4 and 46 that invoke `auditFiles`, along with any test cases specifically validating the batch wrapper behavior.
+
+Benefits:
+Eliminates unused code that could mislead future readers into thinking the batch path is production-relevant. Reduces the module's public API surface, making it clearer that consumers should call `auditFile` directly. Simplifies the test suite by removing redundant batch-wrapper coverage.
+
+### AC-20 · Remove unused `findMissingCitedPaths` export and definition
+Strength: Strong
+Files: src/candidate-path-grounding.js
+Symbol: findMissingCitedPaths
+
+Problem:
+The function `findMissingCitedPaths` (lines 382-395) and its export (line 413) are genuinely dead code. Grep confirms zero call sites across the entire codebase: no imports, no re-exports from barrel files, no dynamic access patterns, and no test usage. The function is a standalone utility that filters claimed paths against the repo but was never integrated into any calling code, likely left over from an incomplete refactoring or an unused utility added for future use.
+
+Solution:
+Remove the function definition at lines 382-395 and the corresponding export entry at line 413 from `src/candidate-path-grounding.js`. No other files need changes since no codebase consumer references this symbol.
+
+Benefits:
+Eliminates misleading unused code that could confuse future readers about the module's API surface. Reduces maintenance burden by removing a function that serves no purpose. Prevents potential confusion if someone later assumes this is part of the public API and tries to use it.
+
+### AC-21 · Remove unused `groundedOnlyBlock` helper
+Strength: Strong
+Files: src/agentic-draft-common.js
+Symbol: groundedOnlyBlock
+
+Problem:
+The function `groundedOnlyBlock` (lines 48–60) renders a "GROUNDED-ONLY" prompt block and is exported from `src/agentic-draft-common.js`, but a full-codebase grep confirms it has zero call sites -- not in production code, not in `src/agentic-draft-common.test.js`, and not in any of the 29+ files that import this module. As a leaf rendering helper with a domain-specific name, it cannot be reached through polymorphic dispatch, dynamic invocation, or framework wiring; its absence from the test suite for the very module that defines it confirms it is orphaned code left over from a refactoring or abandoned feature.
+
+Solution:
+Remove the function definition and its leading comment (lines 48–60) from `src/agentic-draft-common.js`, and remove the `groundedOnlyBlock` entry from the `module.exports` object (line 1181). No call-site cleanup is needed, as no references exist anywhere in the codebase.
+
+Benefits:
+Eliminates a misleading, unused rendering helper that future readers could waste time tracing. Shrinks the public surface of a core utility module (imported by 29+ files) so that the remaining exports are a more trustworthy signal of what is actually in use. Removes a stale "GROUNDED-ONLY" prompt block whose intended integration point was never wired in, preventing confusion about whether the feature is intentionally disabled or simply broken.
+
+### AC-22 · Remove dead `retentionVerdict` module
+Strength: Strong
+Files: src/branch-retention-gate.js
+Symbol: retentionVerdict
+
+Problem:
+The `retentionVerdict` export in `src/branch-retention-gate.js` has zero call sites anywhere in the codebase. The only file that references the module is `test/branch-retention-gate.test.js`, which is the test file for the module itself — expected and not a production consumer. The source comment on lines 13–15 explicitly states the module is "standalone" and that wiring into the `done` transition is an open item that has not yet been completed. There is no barrel file, re-export chain, or strategy registry that could be calling this indirectly. This is genuinely dead code written as a forward-looking utility that was never integrated.
+
+Solution:
+Remove the entire file `src/branch-retention-gate.js` and its corresponding test file `test/branch-retention-gate.test.js`. No other files need modification since no production code references this module.
+
+Benefits:
+Eliminates misleading unused code that would confuse a future reader into wondering why it exists. Reduces maintenance surface by removing a module with a documented open integration item that has not been acted on. Removes a git subprocess call path that is never exercised, eliminating potential confusion about pipeline behavior.
+
+---
+
+**VERDICT: GENUINE — safe to remove**
