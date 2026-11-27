@@ -650,3 +650,32 @@ Remove the `sumCompute` function definition (lines 52-64) and remove `sumCompute
 
 Benefits:
 Eliminates dead code that misleads future readers into thinking the aggregation path is used. Reduces the public API surface of the module, making it clearer that `getTaskCompute` → `taskCompute` is the only active code path. Removes the risk of someone adding a new consumer that incorrectly assumes the function is part of the supported API.
+
+### AC-43 · Remove dead export `getUnresolvedSources` from task-source-registry
+Strength: Strong
+Files: src/task-source-registry.js
+Symbol: getUnresolvedSources
+
+Problem:
+`getUnresolvedSources()` is defined at line 222 and exported at line 307, but a grep for the symbol `getUnresolvedSources` across the entire repository returns only two call sites, both inside `src/task-source-registry.test.js` (lines 63 and 105). No production code imports or invokes it. The JSDoc on `resolveSourceName()` references it only as a documentation pointer explaining the unresolved-drops mechanism, not as an active dependency. The production counterpart `getUnresolvedSourceCount()` (line 215) already covers the aggregate use case, so the detailed breakdown was never wired into any consumer.
+
+Solution:
+- In `src/task-source-registry.js`: delete the function body at lines 222–224, and remove `getUnresolvedSources` from the `module.exports` list at line 307.
+- In `src/task-source-registry.test.js`: remove the two test call sites at lines 63 and 105 that reference the now-deleted symbol (and any assertions or test branches that depended on its output).
+
+Benefits:
+Eliminates a misleading public API that suggests the detailed unresolved-drops list is part of the contract when it is not. Reduces surface area for future readers who might otherwise assume the function is live, and removes two test lines that would otherwise fail on the next lint/run pass.
+
+### AC-44 · Remove dead `orderTasks` export in src/task-order.js
+Strength: Strong
+Files: src/task-order.js, test/task-order.test.js
+Symbol: orderTasks
+
+Problem:
+The `orderTasks` function exported from `src/task-order.js` is pure dead code: a grep of the repository finds zero call sites in production code, and the only file that names the module is `test/task-order.test.js`, which itself reports zero references to `orderTasks`. There is no barrel re-export, no dynamic `require`/`import`, and no factory or strategy pattern that would explain the missing consumers. The test file appears to be an orphaned artifact from a prior refactor, leaving the module completely unused today.
+
+Solution:
+Delete `src/task-order.js` entirely, along with its companion test file `test/task-order.test.js`. No call sites need to be updated because none exist in the active codebase. If a future reader needs this tiered-sort logic, it can be reintroduced from git history rather than preserved as unused code.
+
+Benefits:
+Removing these two files eliminates a misleading, unrun module that could confuse a future reader into believing the ordering pipeline is wired up. It shrinks the surface area, removes a test file that cannot execute, and keeps the repository honest about which utilities are actually in use.
