@@ -27,6 +27,7 @@ const { ownerGateFor } = require('./owner-gates.js');
 const { validProposalFiles } = require('./proposal-files.js');
 const { targetHintForFailure } = require('./apply-target-hint.js');
 const { inferTestDependsOn, validateTestDependencies } = require('./lib/test-dependencies.js');
+const { assertCleanWorkerExit } = require('./apply-adhoc-diff-exit-guard.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const { gitTimeoutMs } = require('./lib/git-timeout.js');
@@ -405,7 +406,17 @@ function restoreFilesAfterFailedApply(files, repoRoot) {
   return { restored, removed, unrestored };
 }
 
-function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
+// HUB0932 2/2: the real worker (the agentic edit that produced task.rawDiff) runs
+// upstream in adhoc-agentic-draft.js before this function is called, so by default
+// there is no process to inspect here and the default reports a clean exit -- the
+// success path is unchanged. Tests (or a caller holding a real worker result) inject
+// `worker` so an abnormal exit (non-zero status, signal, or spawn error) is refused
+// BEFORE the temp patch is written or spliced into the working tree.
+function defaultAdhocWorker() {
+  return { status: 0, signal: null, error: undefined };
+}
+
+function applyAdhocDiff({ task, repoRoot, pipelineDir, exec, worker = defaultAdhocWorker }) {
   if (task && task.adhocResolution === 'decompose') {
     return buildDecomposedPlan(task, pipelineDir);
   }
@@ -425,6 +436,12 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
     }
     return artifact;
   }
+
+  // Gate the splice-back on the worker's exit status. Outside the try below on purpose:
+  // the guard's own error must propagate unchanged (not be rewrapped by the apply
+  // failure path), and nothing has touched the working tree or tmpdir yet.
+  const workerResult = worker({ task, repoRoot });
+  assertCleanWorkerExit(workerResult);
 
   const patchPath = path.join(os.tmpdir(), `adhoc-apply-${task.id}-${process.pid}.patch`);
   fs.writeFileSync(patchPath, rawDiff.endsWith('\n') ? rawDiff : `${rawDiff}\n`);
