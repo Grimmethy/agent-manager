@@ -16,7 +16,7 @@
 //   process.env. Passed through for testability.
 // @returns {boolean} true if the feature is disabled (kill switch off), false if enabled.
 function isKillSwitchOff(env = process.env) {
-  return env.AGENT_MANAGER_REORIENT === 'false';
+  return env.AGENT_MANAGER_REORIENT === 'false' || env.AGENT_MANAGER_REORIENT === undefined;
 }
 
 module.exports = { isKillSwitchOff };
