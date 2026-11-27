@@ -235,3 +235,17 @@ Remove the entire file `src/lib/create-intent.js`. No call sites need to be upda
 
 Benefits:
 Eliminates a misleading, uninvoked function that future readers could mistake for part of the active classifier pipeline. Removes a stale "keep in sync" comment that no longer applies, and shrinks the module surface so the real intent-classification entry point is unambiguous.
+
+### AC-17 · Remove dead `src/lib/near-match.js`
+Strength: Strong
+Files: src/lib/near-match.js
+Symbol: findNearMatches
+
+Problem:
+The module `src/lib/near-match.js` exports a single function, `findNearMatches`, which walks a directory tree to find files whose basename matches a given missing path. A full-codebase grep confirms zero call sites and zero references to this file from any other source — no `require()`, no `import`, no dynamic path construction, no test file, no bin entry. The function is therefore unreachable from any code path in the project and constitutes dead code.
+
+Solution:
+Delete the file `src/lib/near-match.js` in its entirety. No call sites or references need to be updated, as none were found. No other files in the repository require adjustment.
+
+Benefits:
+Eliminates ~60 lines of unused, unmaintained code that performs a filesystem walk on every call, reducing surface area and removing a misleading artifact that could confuse a future reader into thinking the feature is wired up somewhere.
