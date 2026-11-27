@@ -1385,3 +1385,52 @@ test('checkGroundedValues attaches citedValue and grounding source to an ungroun
   assert.equal(flags[0].groundingSource, sourceText);
   assert.equal(flags[0].groundingExcerpt, sourceText.slice(0, 200));
 });
+
+// 2026-11-04: acceptance criteria -- ungrounded-field failure message must include field name,
+// context, and grounding source identifier for diagnosis without rerunning the pipeline.
+test('ungrounded-field flag includes diagnostic information for all acceptance criteria', () => {
+  const draftText = 'The response includes the TEST_EXIT field for exit handling.';
+  const sourceText = 'grounding material that never mentions that field at all';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.equal(flags.length, 1);
+  const flag = flags[0];
+  // Field name is included
+  assert.equal(flag.type, 'ungrounded-field');
+  assert.equal(flag.detail, 'TEST_EXIT');
+  assert.equal(flag.citedValue, 'TEST_EXIT');
+  // Grounding source is included (the actual text that was searched)
+  assert.ok(flag.groundingSource, 'groundingSource must be present');
+  assert.equal(flag.groundingSource, sourceText);
+  // Grounding excerpt is included for quick diagnosis
+  assert.ok(flag.groundingExcerpt, 'groundingExcerpt must be present');
+  assert.ok(flag.groundingExcerpt.length <= 200, 'groundingExcerpt is at most 200 chars');
+  assert.ok(flag.groundingExcerpt.length > 0, 'groundingExcerpt is not empty');
+});
+
+// 2026-11-04: regression for HUB0733/HUB0840/arch-import-anomalyco-opencode-168 -- a value
+// the human named in the adhoc request must NOT be flagged as ungrounded when it appears in
+// the draft's claims. This is the core bug being fixed.
+test('adhoc draft citing a value present in rawText passes the deterministic gate', () => {
+  // Simulate what get-grounding-source.js now produces for an adhoc task with rawText
+  const rawText = 'Fix the TEST_EXIT handling in the adhoc pipeline.';
+  const sourceText = `=== ADHOC REQUEST ===\n${rawText}\n\n=== DRAFT ===\nThe TEST_EXIT field is now handled correctly in the adhoc pipeline.`;
+  const draftText = 'The TEST_EXIT field is now handled correctly in the adhoc pipeline.';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  // TEST_EXIT appears in sourceText, so it should NOT be flagged
+  assert.equal(flags.length, 0);
+});
+
+test('adhoc draft citing a value ABSENT from rawText still fails the gate', () => {
+  // Simulate what get-grounding-source.js produces for an adhoc task
+  const rawText = 'Fix the bug in the adhoc pipeline.';
+  const sourceText = `=== ADHOC REQUEST ===\n${rawText}\n\n=== DRAFT ===\nThe XYZZY_NONSENSE_FIELD_999 is now handled correctly.`;
+  const draftText = 'The XYZZY_NONSENSE_FIELD_999 is now handled correctly.';
+
+  const flags = checkGroundedValues(draftText, sourceText);
+  // MADE_UP_FIELD does NOT appear in sourceText, so it SHOULD be flagged
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].type, 'ungrounded-field');
+  assert.equal(flags[0].detail, 'XYZZY_NONSENSE_FIELD_999');
+});

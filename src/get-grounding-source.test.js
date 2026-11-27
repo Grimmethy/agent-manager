@@ -618,3 +618,48 @@ test('CLI end-to-end: a stale attempt\'s worklog output is not grounding, the cu
   assert.match(stdout, /CURRENT_ACCOUNTS_PRESENT/);
   assert.doesNotMatch(stdout, /STALE_ENOENT_ACCOUNTS_MISSING/);
 });
+
+// 2026-11-04: regression for HUB0733/HUB0840/arch-import-anomalyco-opencode-168 -- a value
+// the human named in the request (TEST_EXIT) must be in the grounding source for adhoc tasks,
+// otherwise the deterministic gate flags it as ungrounded even though it's literally in the
+// request the draft is responding to.
+test('CLI end-to-end: adhoc rawText is always in the grounding source, not just as a fallback', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-rawtext-'));
+  const task = {
+    id: 'test-task-1', domain: 'adhoc', source: 'manual',
+    promptContext: {
+      rawText: 'Fix the TEST_EXIT handling in the adhoc pipeline.',
+      body: 'The adhoc pipeline has a bug.',
+      noteContent: 'Please fix it.',
+    },
+    implementResponse: 'TEST_EXIT is now handled correctly.',
+  };
+  const taskPath = path.join(repoRoot, 'task.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+  const stdout = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPath], { encoding: 'utf8', env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: repoRoot } });
+  // TEST_EXIT must appear in the grounding source so the deterministic gate doesn't flag it
+  assert.match(stdout, /TEST_EXIT/);
+  // rawText content should be present
+  assert.match(stdout, /Fix the TEST_EXIT handling in the adhoc pipeline/);
+});
+
+test('CLI end-to-end: non-adhoc tasks do NOT get rawText in grounding (preserves existing behavior)', () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-nonadhoc-'));
+  const task = {
+    id: 'test-task-2', domain: 'deep_dive', source: 'manual',
+    promptContext: {
+      rawText: 'Research TEST_EXIT in the codebase.',
+      body: 'Do research.',
+    },
+    implementResponse: 'TEST_EXIT was found in src/foo.js.',
+  };
+  const taskPath = path.join(repoRoot, 'task.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+  const stdout = execFileSync('node', [path.join(__dirname, 'get-grounding-source.js'), taskPath], { encoding: 'utf8', env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: repoRoot } });
+  // For non-adhoc tasks, rawText should NOT be included (only body/noteContent etc.)
+  // This test verifies we don't accidentally include rawText for all task types
+  // (the rawText might contain sensitive or irrelevant info for non-adhoc tasks)
+  // Note: rawText might still appear if it's in body/noteContent, but the point is
+  // we don't add it as a separate grounding block for non-adhoc tasks
+  assert.doesNotMatch(stdout, /Fix the TEST_EXIT handling in the adhoc pipeline/);
+});

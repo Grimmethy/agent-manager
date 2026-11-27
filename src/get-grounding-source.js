@@ -308,12 +308,18 @@ function main() {
   }
 
   if (pc) {
-    if (pc.existingStub) parts.push(String(pc.existingStub));
-    if (pc.siblingExample && pc.siblingExample.content) parts.push(String(pc.siblingExample.content));
-    if (pc.goalMdFull) parts.push(String(pc.goalMdFull));
-    if (pc.csvRow) parts.push(JSON.stringify(pc.csvRow));
-    if (pc.body) parts.push(String(pc.body));
-    if (pc.noteContent) parts.push(String(pc.noteContent));
+  if (pc.existingStub) parts.push(String(pc.existingStub));
+  if (pc.siblingExample && pc.siblingExample.content) parts.push(String(pc.siblingExample.content));
+  if (pc.goalMdFull) parts.push(String(pc.goalMdFull));
+  if (pc.csvRow) parts.push(JSON.stringify(pc.csvRow));
+  if (pc.body) parts.push(String(pc.body));
+  if (pc.noteContent) parts.push(String(pc.noteContent));
+  // 2026-11-04: adhoc rawText is the human's original request -- the ONLY place TEST_EXIT
+  // (and similar identifiers) can appear for tasks like HUB0733/HUB0840/arch-import-anomalyco-opencode-168.
+  // Without this, any value the human named but no other pc field contains gets flagged as
+  // "ungrounded" even though it's literally in the request the draft is responding to.
+  // Always include rawText for adhoc so the human's own words are verifiable against the draft's claims.
+  if (task.domain === 'adhoc' && pc.rawText) parts.push(String(pc.rawText));
     if (pc.files) {
       for (const f of [].concat(pc.files)) {
         if (f.content) parts.push(String(f.content));
