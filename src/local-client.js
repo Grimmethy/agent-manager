@@ -14,6 +14,7 @@ const { sharedInstancesDir } = require('./instances-dir.js');
 const os = require('os');
 const path = require('path');
 const { postJson } = require('./ollama-http.js');
+const { outcomeError } = require('./errors/outcome-error.js');
 const inflightLock = require('./model-inflight-lock.js');
 const gpuCapacity = require('./gpu-capacity.js');
 const gpuGuard = require('./gpu-guard.js');
@@ -631,7 +632,11 @@ async function callUnrecorded(opts, maxRetries = 2) {
         model: opts.model || MODEL, code: e.code || null, message: String(e.message || e).slice(0, 300),
         timeoutMs: e.timeoutMs, statusCode: e.statusCode, nodeCode: e.nodeCode, think: callOpts.think,
       });
-      continue;
+      // 2026-11-12 (HUB0870): wrap a hard failure (connection refused, timeout, non-200) as an
+      // outcome error so callers can distinguish "the local backend is unreachable" from other
+      // failure classes without re-parsing the error message. The original error is preserved
+      // on `.cause` so the full diagnostic trail is still available.
+      throw outcomeError('BackendUnreachable', { backend: OLLAMA_URL, message: String(e.message || e).slice(0, 300) });
     }
     gotAnyResponse = true;
     responses += 1;
@@ -727,6 +732,14 @@ async function callUnrecorded(opts, maxRetries = 2) {
   // not -- a degenerate response on an earlier attempt followed by a hard failure on a
   // later retry is still a real, legitimate degenerate outcome, not an infra failure.
   if (!gotAnyResponse && lastError) throw lastError;
+  // 2026-11-12 (HUB0870): if every attempt hit the token ceiling, surface it as an
+  // outcome error (OutputTruncated) so callers can distinguish a genuine truncation
+  // from other degenerate classes (empty, gibberish, repetition) without re-parsing
+  // the degenerate string. The original degenerate value is preserved on `.data` for
+  // diagnostics.
+  if (lastDegenerate === 'truncated') {
+    throw outcomeError('OutputTruncated');
+  }
   return { response: '', thinking: '', degenerate: lastDegenerate, attempts: responses + hardFailures };
 }
 
