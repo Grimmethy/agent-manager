@@ -177,7 +177,7 @@ test('advisory: the check is requested for a brain-dump task, recorded, noted in
     const result = await reviewTask(t, { repoRoot, domainsPath, localMajorityVote: approve(captured), recordModelOutcome: () => {}, verifyDiffFn: passedWith(PASSED_ON_BASE) });
     assert.equal(result.verdict, 'approved');
     assert.equal(passedWith.seen.checkRepro, true);
-    assert.deepEqual(t.executedVerification.repro, { ran: true, failedOnBase: false, tests: ['src/foo.test.js'], failures: [] });
+    assert.deepEqual(t.executedVerification.repro, { ran: true, failedOnBase: false, tests: ['src/foo.test.js'], failures: [], testsTotal: 1, failuresTotal: 0 });
     assert.match(t.history.find((h) => h.stage === 'advisory' && /repro check/.test(h.detail)).detail, /PASS without its production change.*not reproduced/);
     assert.equal(captured.length, 1);
     assert.match(captured[0], /Defect reproduction \(deterministic check; advisory\)/);
