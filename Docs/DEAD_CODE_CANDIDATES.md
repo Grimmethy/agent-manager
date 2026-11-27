@@ -171,3 +171,21 @@ Remove the `isDegeneratePlanPass` function definition (lines 437-442 in the sour
 
 Benefits:
 Eliminates misleading unused code that could confuse future maintainers about the active classification surface area. Reduces the exported API surface, making the module's public contract clearer and less prone to accidental coupling. Removes a potential source of confusion when readers encounter the HUB0822 comment and wonder why the referenced routing logic is missing.
+
+### AC-13 · Remove unused `snippetMismatch` export from src/candidate-docs.js
+Strength: Strong
+Symbol: snippetMismatch
+
+**Strength:** Strong
+**Files:** src/candidate-docs.js
+
+**Problem:**
+The `snippetMismatch` function (lines 300-310) and its export (line 313) are genuinely dead code. A grep across the entire codebase found zero call sites for `snippetMismatch`. The function implements a "Model-free grounding check" that validates draft text contains a candidate's snippet, but no code is performing this validation. The export alongside other utility functions (`isEffectivelyEmptyResponse`, `parseArchDiscoveryCandidates`, etc.) indicates it was designed for use, but all callers have been removed or refactored away. The comment documenting the return contract describes what callers *would* do, not what they currently do.
+
+**Solution:**
+Remove the `snippetMismatch` function definition (lines 300-310) and its entry from the `module.exports` object (line 313) in `src/candidate-docs.js`. No call sites need to be updated since none exist.
+
+**Benefits:**
+Eliminates unused code that adds surface area and could mislead future readers into thinking the grounding check is still active. Reduces maintenance burden and clarifies that the candidate-docs module no longer performs snippet validation.
+
+Files that name this module: src/apply-group-a-report-appenders.js, src/apply-group-a.js, src/apply-task.test.js, src/arch-discovery-structcheck.js, src/candidate-docs.test.js, src/candidate-size-gate.js, src/candidate-size-gate.test.js, src/empty-approval-decision.js (+7 more)
