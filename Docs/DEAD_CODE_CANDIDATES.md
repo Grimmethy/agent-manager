@@ -439,3 +439,17 @@ Delete the entire file `src/plan-citation-guard.js` (including its `module.expor
 
 Benefits:
 Eliminates ~54 lines of unused code that no reader can invoke, removing a source of confusion for anyone scanning the `src/` tree for citation-handling logic. Reduces the module surface area, shrinks the import graph, and removes a file whose very name suggests a purpose the codebase no longer exercises.
+
+### AC-31 · Remove dead `toCreateEntries` export from `src/plan-citation-guard.js`
+Strength: Strong
+Files: src/plan-citation-guard.js
+Symbol: toCreateEntries
+
+Problem:
+The function `toCreateEntries` has zero call sites anywhere in the codebase, and the entire module `src/plan-citation-guard.js` is unimported — no file in the repository contains a `require()` or `import` referencing it. This means `toCreateEntries` is never executed, never reachable, and effectively invisible to any runtime path. The absence of any reference to the module itself (not just the symbol) rules out hidden re-export patterns, dynamic loading, or test-only wiring that might revive it.
+
+Solution:
+Remove the `toCreateEntries` function definition (lines 49–52) and drop it from the `module.exports` statement on line 54 in `src/plan-citation-guard.js`. Since the pre-check confirmed no files name this module, no call-site cleanup is needed. If a future reader later confirms that `classifyCitations` is also unused (as the module-level analysis suggests), the entire file can be removed in a follow-up pass.
+
+Benefits:
+Eliminates an unused function and its associated dead export, reducing surface area and preventing a future reader from wondering why `toCreateEntries` exists or whether it's wired in somewhere. The codebase becomes one step closer to a clean removal of the entire `src/plan-citation-guard.js` module if its companion export is also confirmed dead.
