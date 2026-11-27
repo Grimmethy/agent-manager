@@ -203,3 +203,21 @@ Remove line 22 (`const MAX_WAIT_MS = 6 * 60 * 60 * 1000;`) and remove `MAX_WAIT_
 
 Benefits:
 Eliminates a misleading unused constant that could confuse a future reader into thinking the clamping behavior is still wired up. Reduces the public surface of the module and removes a test/maintenance burden — the constant can no longer be accidentally imported and relied upon as a configuration knob.
+
+### AC-15 · Remove dead code export `renderFailures`
+Strength: Strong
+Files: src/failure-render.js
+Symbol: renderFailures
+
+Problem:
+The function `renderFailures` is defined and exported in `src/failure-render.js` but has zero call sites anywhere in the codebase. While the function is exported via `module.exports` (line 64), the export alone doesn't constitute usage. The only file that references the module is `tests/failure-render.test.js`, but this test file likely only exercises the other three exports (`normalizeFailure`, `summarizeFailingTests`, `extractResourceWarnings`) which are all actively used. The function stands out as the only exported symbol with no callers, confirming it's genuinely dead code.
+
+Solution:
+Remove the `renderFailures` function definition (lines 33-43) from `src/failure-render.js` and remove its entry from the `module.exports` object (line 64). No call sites need to be modified since there are none.
+
+Benefits:
+Removing this dead code reduces surface area and eliminates a misleading unused export that could confuse future readers about the module's intended API. The codebase becomes cleaner and the test file's purpose becomes clearer -- it only tests the three functions that are actually used.
+
+---
+
+**VERDICT: GENUINE -- `renderFailures` is dead code and safe to remove**
