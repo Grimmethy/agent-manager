@@ -331,3 +331,11 @@ Symbol: isExploratoryNarration
 The verdict is UNCERTAIN because `isExploratoryNarration` is part of a documented trio of failure-mode detectors (`isDegeneratePlan`, `isIncompletePlan`, `isExploratoryNarration`) that the module claims to provide for the retry pipeline, yet it has only one production call site in `src/lib/plan-retry-strategy.js:38`. This could be a genuine single-use case (e.g., all three functions are called together in a validation pipeline but only one is actively used), or it could be dead code left over from an incomplete implementation where the other two functions were wired up but this one wasn't. Before removing, verify that `tests/unit/plan-validation.test.js` actually tests `isExploratoryNarration` and that the call site in `plan-retry-strategy.js:38` is part of a validation pipeline where all three functions are invoked together. If both conditions hold, it's genuinely used once; if not, it's likely a false positive worth removing.
 
 NOTE: The independent review verified the call site, test file, and imports, and found no issues with the draft's claims, so no corrections were applied.
+
+### AC-24 · POLL_OK_TOKEN in src/lib/poll-avoidance-lines.js
+Strength: Strong
+Symbol: POLL_OK_TOKEN
+
+**VERDICT: FALSE POSITIVE**
+
+The symbol is not dead code. `src/poll-avoidance-prompts.test.js` imports and uses `POLL_OK_TOKEN` to validate the token value and verify it appears correctly in assembled prompt strings, which is the right pattern for a shared constant. The export maintains the module's public API contract and serves as a canonical reference for the "triggers not polls" advisory system, ensuring all consumers reference the same literal rather than a magic string. Removing it would break the test and change the module's surface without functional benefit.
