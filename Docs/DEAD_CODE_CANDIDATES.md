@@ -157,3 +157,17 @@ Remove the entire `sanitizeFilename` function body (lines 13–42) and the `MAX_
 
 Benefits:
 Eliminates dead code that no longer serves any purpose, reducing surface area and removing a misleading artifact that could confuse future readers into thinking the apply queue performs filename sanitization when it does not. The test file is also removed, preventing a failing or orphaned test from cluttering the test suite.
+
+### AC-12 · Remove dead export `isDegeneratePlanPass` from blocked-task-classifiers.js
+Strength: Strong
+Files: src/blocked-task-classifiers.js
+Symbol: isDegeneratePlanPass
+
+Problem:
+The function `isDegeneratePlanPass` is defined and exported in `src/blocked-task-classifiers.js` but has zero call sites anywhere in the codebase. The surrounding comment references HUB0822 ticket work (plan-pass routing logic and associated tests), suggesting this was part of a tracked feature that was partially removed or refactored, leaving the export behind. While the module itself has 25+ consumers, none of them actually invoke `isDegeneratePlanPass` — the export is unused dead code that misleads future readers into thinking the function is still part of the active classification pipeline.
+
+Solution:
+Remove the `isDegeneratePlanPass` function definition (lines 437-442 in the source excerpt) and its associated comment block from `src/blocked-task-classifiers.js`. Also remove the `isDegeneratePlanPass` entry from the `module.exports` object. Before removing, verify that no external consumers (plugins, integrations, or dynamic requires outside this repository) depend on this symbol being exported — the 25+ module consumers listed in the pre-check should be confirmed to not reference this specific export.
+
+Benefits:
+Eliminates misleading unused code that could confuse future maintainers about the active classification surface area. Reduces the exported API surface, making the module's public contract clearer and less prone to accidental coupling. Removes a potential source of confusion when readers encounter the HUB0822 comment and wonder why the referenced routing logic is missing.
