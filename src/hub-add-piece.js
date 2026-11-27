@@ -143,7 +143,8 @@ function addPieceToHub({ pipelineDir, hubId, title, rawText, files, dependsOn, p
     if (chain.error) return { ok: false, error: chain.error };
     if (chain.branch && rec.task.stacked && rec.task.stacked.branch && rec.task.stacked.branch !== chain.branch) return { ok: false, error: `'${adopt}' is stacked on ${rec.task.stacked.branch}, the hub's chain is ${chain.branch}` };
     const entry = { id: adopt, title: rec.task.title || adopt, status: 'pending' };
-    return finish({ hub, hubFile, entry, by, reason, now, sleep, adopted: true, at });
+    const pieceBranch = (rec.task.stacked && rec.task.stacked.branch) || null;
+    return finish({ hub, hubFile, entry, by, reason, now, sleep, adopted: true, at, pieceBranch });
   }
 
   // ---------------------------------------------------------------- build a new child
@@ -179,15 +180,23 @@ function addPieceToHub({ pipelineDir, hubId, title, rawText, files, dependsOn, p
   writeJsonAtomic(childFile, record);
   const entry = { id, title: record.title, status: 'pending' };
   const gate = ownerGateFor({ id, title: record.title, rawText: record.promptContext.rawText });
-  return finish({ hub, hubFile, entry, by, reason, now, sleep, gate, seq: record.stacked && record.stacked.seq, at });
+  const pieceBranch = record.stacked && record.stacked.branch;
+  return finish({ hub, hubFile, entry, by, reason, now, sleep, gate, seq: record.stacked && record.stacked.seq, at, pieceBranch });
 }
 
-function finish({ hub, hubFile, entry, by, reason, now, sleep, gate, adopted, seq, at }) {
+function finish({ hub, hubFile, entry, by, reason, now, sleep, gate, adopted, seq, at, pieceBranch }) {
   // Re-read just before writing so we extend the freshest copy; the coordinator may have rewritten the hub since `hub` was read.
   const fresh = readJson(hubFile) || hub;
   if (!fresh.subTasks.some((s) => s && s.id === entry.id)) {
     if (at == null) fresh.subTasks.push({ ...entry });
     else fresh.subTasks.splice(Math.min(at, fresh.subTasks.length), 0, { ...entry });
+  }
+  // Record the piece's branch on the hub (HUB0931-02). pieceBranches is a map[pieceId, branch]
+  // populated as each piece is applied, so the hub always knows every piece's branch without
+  // re-reading each child record. Defaults to {} for backward compatibility with old hubs.
+  if (typeof pieceBranch === 'string' && pieceBranch) {
+    if (!fresh.pieceBranches || typeof fresh.pieceBranches !== 'object') fresh.pieceBranches = {};
+    fresh.pieceBranches[entry.id] = pieceBranch;
   }
   if (gate) fresh.ownerGates = [...(Array.isArray(fresh.ownerGates) ? fresh.ownerGates : []), gate];
   appendHistoryEvent(fresh, 'advisory', `piece ${entry.id} ${adopted ? 'adopted into' : 'added to'} the hub by ${by}${reason ? `: ${reason}` : ''} -- the hub is not ready to merge until it is built`);
