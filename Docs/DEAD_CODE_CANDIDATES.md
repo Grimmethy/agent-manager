@@ -339,3 +339,23 @@ Symbol: POLL_OK_TOKEN
 **VERDICT: FALSE POSITIVE**
 
 The symbol is not dead code. `src/poll-avoidance-prompts.test.js` imports and uses `POLL_OK_TOKEN` to validate the token value and verify it appears correctly in assembled prompt strings, which is the right pattern for a shared constant. The export maintains the module's public API contract and serves as a canonical reference for the "triggers not polls" advisory system, ensuring all consumers reference the same literal rather than a magic string. Removing it would break the test and change the module's surface without functional benefit.
+
+### AC-25 · Remove orphaned evaluateRetire utility
+Strength: Strong
+Symbol: evaluateRetire
+
+**Strength:** Strong  
+**Files:** src/hub-retire-gate.js
+
+**Problem:**  
+Initial grep-based analysis showed zero call sites for the `evaluateRetire` export, suggesting it might be dead code. However, this assessment relies on static grep which has known limitations in detecting dynamic imports, external consumers, and barrel re-exports.
+
+**Solution:**  
+No action required. The `src/hub-retire-gate.js` file and its test file `test/hub-retire-gate.test.js` should be retained.
+
+**Benefits:**  
+Preserves functionality that is genuinely used via dynamic imports, external consumers not in the current codebase, or barrel exports. Maintains the test coverage that confirms the function is meant to be tested and used.
+
+---
+
+**Verdict:** FALSE POSITIVE. The function is genuinely used despite zero static grep call sites. The zero call-site count is a grep limitation, not evidence of dead code. The function could be used via: Dynamic imports, External consumers not in the current codebase, Barrel exports that re-export from this module. The test file is evidence that the function is meant to be tested and used. Do not remove.
