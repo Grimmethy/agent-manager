@@ -1,0 +1,37 @@
+// Polkit rule to allow the 'wok' user to restart tailscaled.service
+// without authentication. This rule is scoped to only the tailscaled.service
+// unit and only the 'restart' verb to minimize privilege escalation risk.
+//
+// Verification of detail keys:
+// The detail keys 'unit' and 'verb' are verified against the installed systemd
+// (systemd 255) by checking the polkit action definition in
+// /usr/share/polkit-1/actions/org.freedesktop.systemd1.policy. The action
+// org.freedesktop.systemd1.manage-units accepts 'unit' and 'verb' as detail
+// keys per systemd's polkit integration specification. Any verification
+// patterns used must include hyphens to properly match systemd unit names
+// and verbs (e.g., using .+ or [^ ]+ instead of [^-]+).
+
+polkit.addRule(function(action, subject) {
+    // Verify that the action is manage-units
+    if (action.id !== "org.freedesktop.systemd1.manage-units") {
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    // Verify that the unit is tailscaled.service
+    if (action.lookup("unit") !== "tailscaled.service") {
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    // Verify that the verb is restart
+    if (action.lookup("verb") !== "restart") {
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    // Verify that the subject user is 'wok'
+    if (subject.user !== "wok") {
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    // All conditions met: allow without authentication
+    return polkit.Result.YES;
+});
