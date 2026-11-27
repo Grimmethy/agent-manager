@@ -31,6 +31,17 @@ class TestRules(unittest.TestCase):
                 self.assertEqual(self.check(q), {"allowed": True, "bypass": False})
             self.assertEqual(ledger(q), [])
 
+    def test_a_worker_merge_for_the_exact_sha_passes_and_writes_one_allowed_worker_row(self):
+        q = make_queue({BRANCH: {SHA: rec(source="worker")}})
+        with env_without_bypass():
+            self.assertEqual(self.check(q), {"allowed": True, "bypass": False})
+        self.assertEqual([(r["outcome"], r["branch"], r["headSha"]) for r in ledger(q)], [("allowed-worker", BRANCH, SHA)])
+
+    def test_a_worker_merge_for_an_older_sha_is_still_refused(self):
+        q = make_queue({BRANCH: {"b" * 40: rec(source="worker")}})
+        with env_without_bypass(), self.assertRaisesRegex(gate.MainPushNotReady, "no verdict recorded"):
+            self.check(q)
+
     def test_another_sha_is_refused_and_ledgered(self):
         q = make_queue({BRANCH: {"b" * 40: rec()}})
         with env_without_bypass(), self.assertRaises(gate.MainPushNotReady) as cm:
@@ -40,7 +51,7 @@ class TestRules(unittest.TestCase):
         self.assertEqual((row["outcome"], row["branch"], row["headSha"], row["caller"], row["taskId"], row["at"]), ("refused", BRANCH, SHA, "t", "T1", "2026-11-10T12:00:00.000Z"))
 
     def test_other_verdicts_and_sources_are_refused(self):
-        for over, text in (({"verdict": "needs-work"}, "not 'merge'"), ({"verdict": "hold"}, "not 'merge'"), ({"source": "worker"}, "not a human source"), ({"source": "deterministic"}, "not a human source")):
+        for over, text in (({"verdict": "needs-work"}, "not 'merge'"), ({"verdict": "hold"}, "not 'merge'"), ({"source": "deterministic"}, "not a human source")):
             q = make_queue({BRANCH: {SHA: rec(**over)}})
             with env_without_bypass(), self.assertRaisesRegex(gate.MainPushNotReady, text):
                 self.check(q)
@@ -96,8 +107,8 @@ class TestEdgeRefusals(EdgeBase):
         resp, _ = self.post(f"/api/git/branches/{BRANCH}/merge")
         self.assertEqual(resp.status_code, 409)
 
-    def test_a_worker_record_is_refused(self):
-        self.record({BRANCH: {SHA: rec(source="worker")}})
+    def test_a_deterministic_record_is_refused(self):
+        self.record({BRANCH: {SHA: rec(source="deterministic")}})
         resp, _ = self.post(f"/api/git/branches/{BRANCH}/merge")
         self.assertEqual(resp.status_code, 409)
         self.assertIn("not a human source", resp.get_json()["reason"])
