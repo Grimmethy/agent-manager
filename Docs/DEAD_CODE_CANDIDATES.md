@@ -221,3 +221,17 @@ Removing this dead code reduces surface area and eliminates a misleading unused 
 ---
 
 **VERDICT: GENUINE -- `renderFailures` is dead code and safe to remove**
+
+### AC-16 · Remove dead `src/lib/create-intent.js` module (unused `hasCreateIntent` export)
+Strength: Strong
+Files: src/lib/create-intent.js
+Symbol: hasCreateIntent
+
+Problem:
+The `hasCreateIntent` function exported from `src/lib/create-intent.js` has zero call sites anywhere in the codebase, and no other file imports or requires this module. The file is a self-contained classifier with no factory, interface, or barrel-export indirection that could mask real usage, and it is not referenced in any config, build script, or dynamic `require()`. The only hint of prior intent is a documentation comment noting the regex constants were copied from `src/plan-target-guard.js` to be unified later — but that unification never happened, and the function itself was never wired into the call chain. This is a textbook case of a well-implemented utility that was authored and possibly tested in isolation but never integrated.
+
+Solution:
+Remove the entire file `src/lib/create-intent.js`. No call sites need to be updated because none exist. Optionally, if `src/plan-target-guard.js` is live code and still maintains its own copy of the regex constants, leave it alone — the duplication comment in the dead file is no longer actionable.
+
+Benefits:
+Eliminates a misleading, uninvoked function that future readers could mistake for part of the active classifier pipeline. Removes a stale "keep in sync" comment that no longer applies, and shrinks the module surface so the real intent-classification entry point is unambiguous.
