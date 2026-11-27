@@ -15,11 +15,11 @@ async function pollWithTimeout(read, { timeoutMs, intervalMs = 20, message = 'po
   // poll-ok: test-only bounded wait with deadline and attempt limit; runs only inside node:test processes, never in the idle system
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const value = await read();
-    if (value !== undefined) return value;
+    if (value) return value;
     if (Date.now() >= deadline) break;
     await new Promise((r) => setTimeout(r, intervalMs));
   }
-  const err = new Error(`${message} (timed out after ${timeoutMs}ms)`);
+  const err = new Error(`${message} timed out after ${timeoutMs}ms`);
   err.name = 'PollTimeoutError';
   throw err;
 }
