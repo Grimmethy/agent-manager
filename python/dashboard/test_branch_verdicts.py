@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -253,6 +254,53 @@ class TaskLog(unittest.TestCase):
     def test_no_owning_task_is_a_silent_noop(self):
         self.assertEqual(bv.write_task_log(self.q, "ghost", None, "agent/ghost", "merge", [], "manual"), 0)
 
+    def test_failed_list_collects_task_ids_on_OSError(self):
+        """When writing a task file raises OSError, the task id is appended to the failed list."""
+        (self.q / "done" / "t1.json").write_text(json.dumps({"id": "t1", "history": []}))
+        failed = []
+        with mock.patch("branch_verdict_log._atomic_write_json", side_effect=OSError("disk full")):
+            n = bv.write_task_log(self.q, "t1", None, "agent/t1", "needs-work", ["conflicts"], "chat", "s", failed=failed)
+        # The write should have failed, so n=0 and failed should contain "t1"
+        self.assertEqual(n, 0)
+        self.assertEqual(failed, ["t1"])
+
+    def test_failed_list_collects_task_ids_on_ValueError(self):
+        """When parsing a corrupt task file raises ValueError, the task id is appended to the failed list."""
+        # Write corrupt JSON
+        (self.q / "done" / "t1.json").write_text("{not json")
+        failed = []
+        n = bv.write_task_log(self.q, "t1", None, "agent/t1", "needs-work", ["conflicts"], "chat", "s", failed=failed)
+        # The parse should have failed, so n=0 and failed should contain "t1"
+        self.assertEqual(n, 0)
+        self.assertEqual(failed, ["t1"])
+
+    def test_failed_list_is_not_populated_when_no_error(self):
+        """When write succeeds, failed list remains empty."""
+        (self.q / "done" / "t1.json").write_text(json.dumps({"id": "t1", "history": []}))
+        failed = []
+        n = bv.write_task_log(self.q, "t1", None, "agent/t1", "merge", ["ok"], "manual", "s", failed=failed)
+        self.assertEqual(n, 1)
+        self.assertEqual(failed, [])
+
+    def test_failed_list_none_means_no_collection(self):
+        """When failed is None (default), failures are logged but not collected."""
+        (self.q / "done" / "t1.json").write_text("{not json")
+        # Should not raise, just log a warning
+        n = bv.write_task_log(self.q, "t1", None, "agent/t1", "needs-work", ["conflicts"], "chat", "s")
+        self.assertEqual(n, 0)
+
+    def test_duplicate_history_events_are_not_deduplicated(self):
+        """Current behavior: write_task_log does NOT deduplicate history events.
+        Each call appends a new history entry, even if the last event matches.
+        (The 'seen' set in the implementation deduplicates TASK IDS, not history events.)"""
+        (self.q / "done" / "t1.json").write_text(json.dumps({"id": "t1", "history": []}))
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "discard", ["dup reason"], "deterministic", "s")
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "discard", ["dup reason"], "deterministic", "s2")
+        history = json.loads((self.q / "done" / "t1.json").read_text())["history"]
+        # Both calls should have appended, even though the event is the same
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["detail"], history[1]["detail"])
+
 
 class PriorVerdictOnTask(unittest.TestCase):
     """write_task_log stamps promptContext.priorVerdict on the owning TASK so a redraft is shown a human
@@ -494,6 +542,65 @@ class Enrich(unittest.TestCase):
         self.assertIsNone(b[0]["verdict"])
         self.assertTrue(b[0]["stale"])
         self.assertEqual(b[0]["reasons"], ["verdict is for an older commit"])
+
+
+class EnrichWithFailures(unittest.TestCase):
+    """Tests for enrich_branches_with_verdicts failure handling: failed list collection and warning logging."""
+
+    def setUp(self):
+        self.fx = Fixture()
+        self.addCleanup(self.fx.cleanup)
+
+    def test_enrich_logs_warning_when_task_log_write_fails(self):
+        """When write_task_log fails (e.g., corrupt task file), enrich_branches_with_verdicts logs a warning with failed ids."""
+        fx = self.fx
+        # Create a redundant branch (will be marked discard)
+        fx.branch_from_master("agent/dup")
+        fx.write("f.txt", "f\n")
+        fx.commit("f")
+        fx.push("agent/dup")
+        git(["cherry-pick", "origin/agent/dup"], fx.work)
+        git(["commit", "--amend", "-m", "by hand"], fx.work)
+        git(["push", "origin", "master"], fx.work)
+        git(["fetch", "origin", "--prune"], fx.work)
+        (fx.queue / "done").mkdir()
+        # Write a corrupt task file to trigger ValueError
+        (fx.queue / "done" / "dup.json").write_text("{not json")
+        branches = [{"branch": "agent/dup", "taskId": "dup", "mainBranch": "master", "behind": 1}]
+        # Capture warnings
+        with mock.patch("branch_verdicts.logger") as mock_logger:
+            bv.enrich_branches_with_verdicts(fx.queue, fx.work, branches, run_git)
+            # Check that a warning was logged with "failed ids"
+            warnings = [call for call in mock_logger.warning.call_args_list if "failed ids" in str(call)]
+            self.assertTrue(len(warnings) > 0, "Expected a warning with 'failed ids'")
+            self.assertIn("dup", str(warnings[0]))  # The failed task id should be in the warning
+
+    def test_enrich_continues_after_task_log_failure(self):
+        """When one task log write fails, enrich_branches_with_verdicts continues processing other branches."""
+        fx = self.fx
+        fx.branch_from_master("agent/fail")
+        fx.write("f.txt", "f\n")
+        fx.commit("f")
+        fx.push("agent/fail")
+        fx.branch_from_master("agent/ok")
+        fx.write("o.txt", "o\n")
+        fx.commit("o")
+        fx.push("agent/ok")
+        git(["fetch", "origin", "--prune"], fx.work)
+        (fx.queue / "done").mkdir()
+        # Write a corrupt task file for the first branch
+        (fx.queue / "done" / "fail.json").write_text("{not json")
+        # Write a valid task file for the second branch
+        (fx.queue / "done" / "ok.json").write_text(json.dumps({"id": "ok"}))
+        branches = [
+            {"branch": "agent/fail", "taskId": "fail", "mainBranch": "master", "behind": 1},
+            {"branch": "agent/ok", "taskId": "ok", "mainBranch": "master", "behind": 1},
+        ]
+        # Should not raise an exception
+        bv.enrich_branches_with_verdicts(fx.queue, fx.work, branches, run_git)
+        # The second branch should be processed (may or may not have a verdict depending on redundancy)
+        # The key assertion is that the function completes without crashing
+        self.assertIn("branch", branches[1])
 
 
 if __name__ == "__main__":
