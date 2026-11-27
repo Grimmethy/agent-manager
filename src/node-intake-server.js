@@ -197,6 +197,95 @@ function writeAdhoc(pipelineDir, record) {
   }
 }
 
+// Promotes leased, dependency-resolved adhoc tasks to pending on this node.
+// A task is promoted when:
+// - It is in queue/adhoc/
+// - It has leasedTo set to this node (nodeId)
+// - It has no dependsOn (or dependsOn is empty)
+// - Its dependsOnResolved.ids is empty (all dependencies satisfied)
+// - It is not shadowed by a record in queue/blocked/ with the same id
+// Returns the number of tasks promoted.
+function promoteLeasedAdhoc(pipelineDir, nodeId) {
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  const pendingDir = path.join(pipelineDir, 'queue', 'pending');
+  const blockedDir = path.join(pipelineDir, 'queue', 'blocked');
+  
+  let promoted = 0;
+  
+  try {
+    fs.mkdirSync(pendingDir, { recursive: true });
+    fs.mkdirSync(blockedDir, { recursive: true });
+  } catch (e) {
+    return 0;
+  }
+  
+  let adhocFiles;
+  try {
+    adhocFiles = fs.readdirSync(adhocDir).filter(f => f.endsWith('.json'));
+  } catch (e) {
+    return 0;
+  }
+  
+  // Build set of ids in blocked/ for shadow check
+  const blockedIds = new Set();
+  try {
+    const blockedFiles = fs.readdirSync(blockedDir).filter(f => f.endsWith('.json'));
+    for (const f of blockedFiles) {
+      blockedIds.add(f.replace('.json', ''));
+    }
+  } catch (e) {
+    // If we can't read blocked/, proceed without shadow check
+  }
+  
+  for (const file of adhocFiles) {
+    const id = file.replace('.json', '');
+    
+    // Skip if shadowed by a blocked record
+    if (blockedIds.has(id)) continue;
+    
+    let record;
+    try {
+      record = JSON.parse(fs.readFileSync(path.join(adhocDir, file), 'utf8'));
+    } catch (e) {
+      continue;
+    }
+    
+    // Check if leased to this node
+    if (record.leasedTo !== nodeId) continue;
+    
+    // Check if no dependsOn (or empty)
+    if (record.dependsOn && record.dependsOn.length > 0) continue;
+    
+    // Check if dependsOnResolved is satisfied (empty ids)
+    if (!record.dependsOnResolved || !Array.isArray(record.dependsOnResolved.ids) || record.dependsOnResolved.ids.length > 0) continue;
+    
+    // Promote: move from adhoc to pending
+    const src = path.join(adhocDir, file);
+    const dst = path.join(pendingDir, file);
+    
+    // Skip if already in pending
+    if (fs.existsSync(dst)) continue;
+    
+    try {
+      // Use rename for atomic move within same filesystem
+      fs.renameSync(src, dst);
+      promoted++;
+    } catch (e) {
+      // If rename fails (cross-filesystem), try copy+delete
+      try {
+        const data = fs.readFileSync(src, 'utf8');
+        fs.writeFileSync(dst, data);
+        fs.unlinkSync(src);
+        promoted++;
+      } catch (e2) {
+        // Skip on failure
+      }
+    }
+  }
+  
+  return promoted;
+}
+
 function createServer({ env = process.env, gitFn, repoDir = process.cwd() } = {}) {
   const token = readToken(env);
   const pipelineDir = String(env.AGENT_MANAGER_PIPELINE_DIR || '').trim();
@@ -211,6 +300,10 @@ function createServer({ env = process.env, gitFn, repoDir = process.cwd() } = {}
     if (lease.taskId !== task.id || typeof lease.nodeId !== 'string' || !lease.nodeId.trim()) return send(res, 400, { ok: false, error: 'lease does not match the task' });
 
     if (!writeAdhoc(pipelineDir, { ...task, leasedTo: lease.nodeId.trim() })) return send(res, 409, { ok: false, error: 'a task with that id is already queued' });
+    
+    // Promote any leased, dependency-resolved adhoc tasks to pending
+    promoteLeasedAdhoc(pipelineDir, lease.nodeId.trim());
+    
     return send(res, 200, { ok: true, taskId: task.id });
   };
 
@@ -269,4 +362,4 @@ if (require.main === module) {
   server.listen(port, host, () => process.stdout.write(`node intake listening on ${host}:${port}\n`));
 }
 
-module.exports = { createServer, blockedReasonOf, normalizeIp, bearer, sameToken, writeAdhoc, TASK_ID_RE, MAX_BODY_BYTES, validateStatusBody, detectTaskState, defaultGitFn, resolveBase, defaultBaseGitFn };
+module.exports = { createServer, blockedReasonOf, normalizeIp, bearer, sameToken, writeAdhoc, promoteLeasedAdhoc, TASK_ID_RE, MAX_BODY_BYTES, validateStatusBody, detectTaskState, defaultGitFn, resolveBase, defaultBaseGitFn };

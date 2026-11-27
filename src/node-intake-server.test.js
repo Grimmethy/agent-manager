@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const { spawnSync } = require('node:child_process');
-const { createServer, normalizeIp, bearer, sameToken, writeAdhoc } = require('./node-intake-server.js');
+const { createServer, normalizeIp, bearer, sameToken, writeAdhoc, promoteLeasedAdhoc } = require('./node-intake-server.js');
 
 const TOKEN = 'lender-secret-' + 'x'.repeat(24);
 
@@ -166,4 +166,104 @@ test('helpers: ::ffff: prefix stripped, bearer parsing, constant-time comparison
   const s = setup();
   assert.equal(writeAdhoc(s.pipeline, { id: 'q1' }), true);
   assert.equal(writeAdhoc(s.pipeline, { id: 'q1' }), false);
+});
+
+test('promoteLeasedAdhoc: leased and resolved is promoted to pending', () => {
+  const s = setup();
+  const pipeline = s.pipeline;
+  const adhocDir = path.join(pipeline, 'queue', 'adhoc');
+  const pendingDir = path.join(pipeline, 'queue', 'pending');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  fs.mkdirSync(pendingDir, { recursive: true });
+  
+  // Write a leased, resolved task to adhoc
+  const task = { id: 'task-1', title: 'Test', leasedTo: 'grimm', dependsOn: [], dependsOnResolved: { ids: [], checkedAt: Date.now() } };
+  fs.writeFileSync(path.join(adhocDir, 'task-1.json'), JSON.stringify(task));
+  
+  const promoted = promoteLeasedAdhoc(pipeline, 'grimm');
+  assert.equal(promoted, 1);
+  assert.equal(fs.existsSync(path.join(pendingDir, 'task-1.json')), true);
+  assert.equal(fs.existsSync(path.join(adhocDir, 'task-1.json')), false);
+});
+
+test('promoteLeasedAdhoc: unresolved stays in adhoc', () => {
+  const s = setup();
+  const pipeline = s.pipeline;
+  const adhocDir = path.join(pipeline, 'queue', 'adhoc');
+  const pendingDir = path.join(pipeline, 'queue', 'pending');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  fs.mkdirSync(pendingDir, { recursive: true });
+  
+  // Write a leased task with unsatisfied dependencies
+  const task = { id: 'task-2', title: 'Test', leasedTo: 'grimm', dependsOn: ['dep-1'], dependsOnResolved: { ids: ['dep-1'], checkedAt: Date.now() } };
+  fs.writeFileSync(path.join(adhocDir, 'task-2.json'), JSON.stringify(task));
+  
+  const promoted = promoteLeasedAdhoc(pipeline, 'grimm');
+  assert.equal(promoted, 0);
+  assert.equal(fs.existsSync(path.join(pendingDir, 'task-2.json')), false);
+  assert.equal(fs.existsSync(path.join(adhocDir, 'task-2.json')), true);
+});
+
+test('promoteLeasedAdhoc: shadowed by a blocked copy is handled', () => {
+  const s = setup();
+  const pipeline = s.pipeline;
+  const adhocDir = path.join(pipeline, 'queue', 'adhoc');
+  const pendingDir = path.join(pipeline, 'queue', 'pending');
+  const blockedDir = path.join(pipeline, 'queue', 'blocked');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  fs.mkdirSync(pendingDir, { recursive: true });
+  fs.mkdirSync(blockedDir, { recursive: true });
+  
+  // Write a leased, resolved task to adhoc
+  const task = { id: 'task-3', title: 'Test', leasedTo: 'grimm', dependsOn: [], dependsOnResolved: { ids: [], checkedAt: Date.now() } };
+  fs.writeFileSync(path.join(adhocDir, 'task-3.json'), JSON.stringify(task));
+  
+  // Write a shadow in blocked
+  fs.writeFileSync(path.join(blockedDir, 'task-3.json'), JSON.stringify({ id: 'task-3', blockedReason: 'test' }));
+  
+  const promoted = promoteLeasedAdhoc(pipeline, 'grimm');
+  assert.equal(promoted, 0);
+  assert.equal(fs.existsSync(path.join(pendingDir, 'task-3.json')), false);
+  assert.equal(fs.existsSync(path.join(adhocDir, 'task-3.json')), true);
+});
+
+test('promoteLeasedAdhoc: already in pending is not duplicated', () => {
+  const s = setup();
+  const pipeline = s.pipeline;
+  const adhocDir = path.join(pipeline, 'queue', 'adhoc');
+  const pendingDir = path.join(pipeline, 'queue', 'pending');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  fs.mkdirSync(pendingDir, { recursive: true });
+  
+  // Write a leased, resolved task to pending
+  const task = { id: 'task-4', title: 'Test', leasedTo: 'grimm', dependsOn: [], dependsOnResolved: { ids: [], checkedAt: Date.now() } };
+  fs.writeFileSync(path.join(pendingDir, 'task-4.json'), JSON.stringify(task));
+  
+  // Write a duplicate in adhoc (should not happen, but test the case)
+  fs.writeFileSync(path.join(adhocDir, 'task-4.json'), JSON.stringify({ ...task, title: 'Duplicate' }));
+  
+  const promoted = promoteLeasedAdhoc(pipeline, 'grimm');
+  assert.equal(promoted, 0);
+  // The adhoc file should still exist (or be removed if promote tries to move it)
+  // The pending file should be unchanged
+  const pendingContent = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-4.json'), 'utf8'));
+  assert.equal(pendingContent.title, 'Test');
+});
+
+test('promoteLeasedAdhoc: unleased record cannot be claimed', () => {
+  const s = setup();
+  const pipeline = s.pipeline;
+  const adhocDir = path.join(pipeline, 'queue', 'adhoc');
+  const pendingDir = path.join(pipeline, 'queue', 'pending');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  fs.mkdirSync(pendingDir, { recursive: true });
+  
+  // Write an unleased task to adhoc
+  const task = { id: 'task-5', title: 'Test', leasedTo: 'other-node', dependsOn: [], dependsOnResolved: { ids: [], checkedAt: Date.now() } };
+  fs.writeFileSync(path.join(adhocDir, 'task-5.json'), JSON.stringify(task));
+  
+  const promoted = promoteLeasedAdhoc(pipeline, 'grimm');
+  assert.equal(promoted, 0);
+  assert.equal(fs.existsSync(path.join(pendingDir, 'task-5.json')), false);
+  assert.equal(fs.existsSync(path.join(adhocDir, 'task-5.json')), true);
 });
