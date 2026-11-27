@@ -679,3 +679,17 @@ Delete `src/task-order.js` entirely, along with its companion test file `test/ta
 
 Benefits:
 Removing these two files eliminates a misleading, unrun module that could confuse a future reader into believing the ordering pipeline is wired up. It shrinks the surface area, removes a test file that cannot execute, and keeps the repository honest about which utilities are actually in use.
+
+### AC-45 · Remove unused SKELETON_SWEEP_MS export
+Strength: Strong
+Files: python/dashboard/static/js/skeleton.js
+Symbol: SKELETON_SWEEP_MS
+
+Problem:
+The constant `SKELETON_SWEEP_MS` (1400) is the only symbol in `skeleton.js` that is never consumed by production code. The only call site is `skeleton.test.js`, which asserts the constant's value for test purposes. The comment on line 8 claims the value is "mirrored by the CSS animation duration in templates/index.html", but CSS cannot import JS modules, and no runtime code injects this constant into the stylesheet — meaning the two values are independently maintained and can silently drift. The other exports (`SKELETON_MAX_ROWS`, `SKELETON_LINE_WIDTHS`, `skeletonRowHtml`, `skeletonHtml`, `showTabSkeleton`) are all used by `index.html` and other JS files.
+
+Solution:
+Remove the `SKELETON_SWEEP_MS` definition from line 8 of `python/dashboard/static/js/skeleton.js` and remove it from the `module.exports` object on line 41. The test file reference at `skeleton.test.js:52` is a false match — it tests the constant's value but does not constitute a production dependency. Optionally update the comment on line 8 to reflect that the CSS duration is now independently maintained, or remove the misleading "mirrored by" claim entirely.
+
+Benefits:
+Eliminates dead code from the module surface, removes the false implication that the CSS animation duration is synchronized with a JS constant, and prevents future developers from being misled into thinking changes to `SKELETON_SWEEP_MS` would affect the UI animation. The module becomes easier to reason about since every remaining export has a documented consumer.
