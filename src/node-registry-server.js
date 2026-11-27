@@ -11,7 +11,7 @@
 //                      A node whose behindSince (its codeSha differs from wok's published sha) is older than AGENT_MANAGER_NODE_BEHIND_MIN minutes (default 30) gets ONE
 //                      summary notice per episode (key node-behind:<id>:<stamp>), and one recovered notice (node-behind-recovered:<id>:<stamp>) when it matches again after
 //                      such a notice. Notices are best effort: a failing notifier never changes the reply.
-//   POST /claim        JSON {id, classes?} -> 200 {ok: true, task, lease, repo} | 200 {ok: true, task: null, retryAfterSec: 60}
+//   POST /claim        JSON {id, held?, classes?} -> 200 {ok: true, task, lease, repo} | 200 {ok: true, task: null, retryAfterSec: 60}
 //                      (a paused node always gets the retryAfterSec answer)
 //   POST /event        JSON {id, taskId, event} -> 200 {ok: true}; 400 on an event outside drafted/reviewed/applied/merged/blocked/failed;
 //                      503 {ok: false, error: 'events unavailable'} when no recordEvent is injected
@@ -147,7 +147,8 @@ function createServer({
     try {
       releaseStaleLeasedTo({ pipelineDirs, env });
     } catch (e) { /* healing is best effort too: it never fails a claim */ }
-    const result = claim({ nodeId: payload.id, claimant: payload.id, classes: payload.classes, pipelineDirs, env, now: now(), requireRemote: true });
+    const held = Array.isArray(payload.held) ? payload.held.filter((id) => typeof id === 'string') : [];
+    const result = claim({ nodeId: payload.id, claimant: payload.id, classes: payload.classes, pipelineDirs, env, now: now(), requireRemote: true, held });
     if (!result || !result.task) return idle();
     return send(res, 200, { ok: true, task: result.task, lease: result.lease, repo: result.repo });
   };

@@ -17,6 +17,9 @@
 // and filed for this repo or unscoped). Other tasks there are recorded in skipped as 'not-eligible-for-node'.
 // Pipeline dirs not listed in AGENT_MANAGER_NODE_FILTERED_DIRS are unfiltered, exactly as before.
 // AGENT_MANAGER_NODE_SKIP_PREMIUM (true, 1 or on, trimmed and case-insensitive; default off) refuses tasks with premiumPriority true in every pipeline dir, filtered or not.
+// `held` (array of task ids, default []) is a client-provided set of task ids this node already holds elsewhere. Tasks whose id is in `held` are skipped before
+// lendLease and recorded in skipped as {taskId, reason: 'node-holds-it'}; the counter is `heldSkips` in the return object. The 500-id cap on the request body
+// (src/node-pull.js) is enforced upstream; claimNext trusts the payload. Held ids are NOT filtered by node eligibility or by the protected queue/node dirs.
 
 const fs = require('fs');
 const path = require('path');
@@ -121,7 +124,7 @@ function mergeCandidateLists(lists) {
   return out;
 }
 
-function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = nodeId, classes, pipelineDirs = [], env = process.env, now = Date.now(), settle, readRemote = readRemoteUrl, requireRemote = false, skipped = [] } = {}) {
+function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = nodeId, classes, pipelineDirs = [], env = process.env, now = Date.now(), settle, readRemote = readRemoteUrl, requireRemote = false, skipped = [], held = [] } = {}) {
   if (!claimant) return null;
   // Same owner id claimableOnNode uses: AGENT_MANAGER_NODE_ID, or 'wok' when unset.
   const ownerId = workerNode(env.AGENT_MANAGER_NODE_ID);
@@ -208,6 +211,7 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
     return remoteCache.get(dir);
   };
 
+  let heldSkips = 0;
   for (const c of candidates) {
     if (isHubBlocked(c.task, claimant, now, { leases: listLeases(env), readRecord, env })) {
       skipped.push({ taskId: c.taskId, reason: 'hub-blocked' });
@@ -217,6 +221,11 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
     // BEFORE any lease is taken. Otherwise the claim would lease it, node-pull would refuse it, and the 1 h lease would be wasted.
     if (requireRemote && !remoteFor(c.pipelineDir)) {
       skipped.push({ taskId: c.taskId, reason: 'no-remote' });
+      continue;
+    }
+    if (held.includes(c.taskId)) {
+      skipped.push({ taskId: c.taskId, reason: 'node-holds-it' });
+      heldSkips++;
       continue;
     }
     const lease = lendLease(c.taskId, claimant, { ttlMs: 3600000, now, env });
@@ -245,7 +254,7 @@ function claimNext({ nodeId = process.env.AGENT_MANAGER_NODE_ID, claimant = node
     const { dependsOn, ...rest } = record;
     const verifiedIds = Array.isArray(dependsOn) ? dependsOn.slice() : [];
     const lent = { ...rest, leasedTo: claimant, dependsOnResolved: { ids: verifiedIds, checkedAt: now } };
-    return { task: lent, lease, repo: { root: c.pipelineDir, remoteUrl }, skipped };
+    return { task: lent, lease, repo: { root: c.pipelineDir, remoteUrl }, skipped, heldSkips };
   }
   return null;
 }

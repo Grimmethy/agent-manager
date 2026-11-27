@@ -45,9 +45,13 @@ const MAX_DEBRIEF_ACTIONS = 3; // 2026-09-07: Easy Agile / Coveros retrospective
 // decision, so a category discovered once (in either mechanism) benefits both instead
 // of needing the same keyword/structural check written twice with no shared vocabulary.
 // Re-exported here UNCHANGED (same names, same value shapes, same signature format
-// `${source}::${category}`) so pipeline-forensics.js and staleness-audit.js's existing
-// `require('./pipeline-self-audit.js')` imports need zero changes -- this file's public
-// API is identical, only its internal implementation is now a pure delegation.
+// `${source}::${category}`). Production consumers (pipeline-forensics.js,
+// staleness-audit.js, forensic-bundle.js, system-report.js, system-report-compute.js,
+// staleness-audit-signals.js) import these from blocked-task-classifiers.js directly.
+// Still routed through this file: src/blocked-drain.js (signatureForTask),
+// src/pipeline-self-audit.test.js, and test/blocked-drain.zero-hit.test.js, which stubs
+// selfAudit.signatureForTask on this module, so blocked-drain.js must keep requiring it
+// from here until that test stops stubbing the facade.
 const {
   REASON_CATEGORIES, categorizeBlockedReason, hasZeroHitHarnessSearch, signatureForTask, classifyBlockedTask,
 } = require('./blocked-task-classifiers.js');

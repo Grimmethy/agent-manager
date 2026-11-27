@@ -4,7 +4,7 @@
 
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { REASON_CATEGORIES } = require('./pipeline-self-audit.js');
+const { REASON_CATEGORIES } = require('./blocked-task-classifiers.js');
 const { extractFilePaths, resolveAgainstRepo } = require('./fact-checker.js');
 const { normalizeTokens, jaccardSimilarity: jaccard, STOPWORDS: DUP_STOPWORDS, distinctivePhrases: sharedDistinctivePhrases } = require('./text-similarity.js');
 
