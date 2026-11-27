@@ -359,3 +359,33 @@ Preserves functionality that is genuinely used via dynamic imports, external con
 ---
 
 **Verdict:** FALSE POSITIVE. The function is genuinely used despite zero static grep call sites. The zero call-site count is a grep limitation, not evidence of dead code. The function could be used via: Dynamic imports, External consumers not in the current codebase, Barrel exports that re-export from this module. The test file is evidence that the function is meant to be tested and used. Do not remove.
+
+### AC-26 · `getCandidateSplitHubFiler()` is dead code
+Strength: Strong
+Files: src/candidate-split-hub-route.js
+Symbol: getCandidateSplitHubFiler
+
+Problem:
+The call-site search shows that `getCandidateSplitHubFiler()` is only invoked in `src/plugin-api.test.js` (line 39), with no runtime consumers in `src/apply-adhoc-diff.js`, `src/apply-task.js`, or `lib/apply-core.js`. The source comment describes a pattern where `writeArtifact` would retrieve the filer via this getter, but the actual runtime code does not implement this retrieval — the comment is outdated. The function is a getter for a module-level singleton that no production code reads.
+
+Solution:
+Remove `getCandidateSplitHubFiler()` and the `current` variable it reads from `src/candidate-split-hub-route.js`. Also remove `setCandidateSplitHubFiler()` if no plugin calls it (likely dead for the same reason). The test file `src/plugin-api.test.js` line 39 should be updated to remove the call to `getCandidateSplitHubFiler()`.
+
+Benefits:
+Eliminates a misleading swap-point pattern that no longer serves its intended purpose. Reduces surface area and removes a source of confusion for future readers who might assume the getter is still wired into the runtime.
+
+---
+
+**VERDICT: GENUINE DEAD CODE**
+
+**Reasoning:**
+
+1. **The call-site search is definitive.** `getCandidateSplitHubFiler()` is only invoked in `src/plugin-api.test.js` line 39. No runtime file (`src/apply-adhoc-diff.js`, `src/apply-task.js`, `lib/apply-core.js`) calls it.
+
+2. **The comment is outdated.** Lines 4-9 describe a pattern where `writeArtifact` would call `getCandidateSplitHubFiler()`, but the actual runtime code does not implement this. The comment describes intent, not current behavior.
+
+3. **The test call site confirms the pattern is test-only.** `src/plugin-api.test.js` line 39 is the sole consumer, likely used to verify registration state in tests.
+
+4. **The `setCandidateSplitHubFiler()` function is likely also dead.** If no plugin calls it, it serves no purpose. This should be verified and removed if confirmed.
+
+**Recommendation:** Remove `getCandidateSplitHubFiler()`, `setCandidateSplitHubFiler()`, and the `current` variable. Update the test file to remove the call to `getCandidateSplitHubFiler()`.
