@@ -1,0 +1,47 @@
+{
+  "script": "adhoc-replay/replay-extract.js",
+  "repoPath": "/tmp/agent-manager-adhoc-worktree-HUB0681-01-replay-extractdeclaredtargets-on-the-repro-task",
+  "taskTitle": "Re-point module docstring to graph_build.py",
+  "specText": "In `python/test_build_graph.py`, change the module docstring on line 2 from X to Y",
+  "shapes": {
+    "shapeA_topLevelRawText": {
+      "description": "Top-level rawText (spec shape, not produced by pipeline)",
+      "taskObject": {
+        "title": "Re-point module docstring to graph_build.py",
+        "rawText": "In `python/test_build_graph.py`, change the module docstring on line 2 from X to Y",
+        "plan": []
+      },
+      "extractDeclaredTargets": {
+        "includeCreated": false
+      },
+      "result": {
+        "array": ["graph_build.py"],
+        "containsTarget": false
+      },
+      "note": "The leading 'In `python/test_build_graph.py`,' clause is not seen because extractDeclaredTargets only reads task.promptContext.rawText (or falls back to task.title)"
+    },
+    "shapeB_promptContextRawText": {
+      "description": "promptContext.rawText (real pipeline shape written by src/queue-adhoc-task.js)",
+      "taskObject": {
+        "title": "Re-point module docstring to graph_build.py",
+        "promptContext": {
+          "rawText": "In `python/test_build_graph.py`, change the module docstring on line 2 from X to Y"
+        },
+        "plan": []
+      },
+      "extractDeclaredTargets": {
+        "includeCreated": false
+      },
+      "result": {
+        "array": ["graph_build.py", "python/test_build_graph.py"],
+        "containsTarget": true
+      },
+      "note": "The target IS returned because extractDeclaredTargets reads task.promptContext.rawText, which contains the full 'In `<path>`,' leading clause that Rule 4 (leadingInClauseTargets) extracts"
+    }
+  },
+  "answer": {
+    "containsTarget": true,
+    "shape": "promptContext.rawText (real pipeline shape)",
+    "note": "The top-level rawText shape is a spec artifact - the pipeline never produces it. Under the real pipeline shape, the target is correctly identified."
+  }
+}
