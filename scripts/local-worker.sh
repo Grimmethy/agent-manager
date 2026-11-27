@@ -775,6 +775,18 @@ while :; do                                                                     
     continue
   fi
 
+  # >>> claude-pause gate (scripts/tests/test-claude-pause.sh extracts and runs the lines between these markers)
+  # Claude manual pause on a CLOUD lane: when dashboard-settings.json has claudePaused=true, skip every gateway call this tick and emit a heartbeat with status
+  # 'paused' and reason 'claude-pause'. Ordering: this runs BEFORE check_budget_healthy (which also honours the flag but only reports an unhealthy budget) and
+  # before cloud_take_review or any draft, so a paused cloud lane spends nothing and the Workers tab sees the real cause. Local GPU lanes are not gated here.
+  if [[ "$INSTANCE_ID" =~ ^worker-cloud[0-9]*$ ]] && check_claude_paused 2>>"$LOG_FILE"; then
+    emit_heartbeat "paused" "claude-pause" "claude-pause"
+    if "$ONCE"; then exit 0; fi
+    sleep "${ORC_TICK_SECS:-30}"
+    continue
+  fi
+  # <<< claude-pause gate
+
   # Cloud agents review before they draft (cloud_take_review, scripts/agent-manager-common.sh): when queue/review/ holds an item no live reviewer has claimed, this cloud lane
   # reviews ONE item and ends the tick; when every waiting review is already claimed (or there is none) it goes on to draft. A premium-only borrowed tick never reviews.
   if ! "$PREMIUM_ONLY" && cloud_take_review "$INSTANCE_ID"; then

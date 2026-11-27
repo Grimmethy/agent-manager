@@ -655,12 +655,12 @@ test_review_rejection() {
 # a restart) resets stateSince to now. Powers the dashboard's "how long in current state"
 # tracker (Workers tab).
 write_heartbeat_file() {
-  local instance_id="$1" status="$2" model="${3:-}" task_id="${4:-}" pass="${5:-}" started_at="${6:-}"
+  local instance_id="$1" status="$2" model="${3:-}" task_id="${4:-}" pass="${5:-}" started_at="${6:-}" reason="${7:-}"
   local hb_path="${INSTANCES_DIR}/${instance_id}.json"
   mkdir -p "$INSTANCES_DIR"
   node -e '
     const fs = require("fs");
-    const [hbPath, instanceId, status, model, taskId, pass, startedAt, pid] = process.argv.slice(1);
+    const [hbPath, instanceId, status, model, taskId, pass, startedAt, pid, reason] = process.argv.slice(1);
     const now = new Date().toISOString();
     let stateSince = now;
     try {
@@ -684,10 +684,12 @@ write_heartbeat_file() {
       lastHeartbeat: now, stateSince,
     };
     if (startedAt) hb.startedAt = startedAt;
+    // Optional reason field for status transitions (2026-11-24: claude-pause gate)
+    if (reason) hb.reason = reason;
     // Borrowed-project label (docs/design-notes/idle-pool-borrowing.md): set only while this lane runs a task of another suite project.
     if (process.env.AGENT_MANAGER_BORROWING_FROM) hb.project = process.env.AGENT_MANAGER_BORROWING_FROM;
     fs.writeFileSync(hbPath, JSON.stringify(hb, null, 2));
-  ' "$hb_path" "$instance_id" "$status" "$model" "$task_id" "$pass" "$started_at" "${AGENT_MANAGER_DAEMON_PID:-$$}"
+  ' "$hb_path" "$instance_id" "$status" "$model" "$task_id" "$pass" "$started_at" "${AGENT_MANAGER_DAEMON_PID:-$$}" "$reason"
 }
 
 # Startup liveness check -- adapted from taskmesh's dead-worker detection
@@ -710,6 +712,26 @@ write_heartbeat_file() {
 # than one missed tick, matching taskforge's "lease must exceed heartbeat" ratio) or a
 # dead pid means the previous holder is gone, not still alive -- takeover proceeds
 # normally (logged, not silent) rather than refusing forever on an abandoned file.
+# check_claude_paused -> exit 0 when dashboard-settings.json has claudePaused=true (the manual kill switch, see get_claude_paused and src/claude-pause.js), 1
+# otherwise (including a missing/corrupt file: fail open). Prints one stderr line when paused so the caller can log the pause without parsing stdout. The cloud
+# lane tick (scripts/local-worker.sh) calls this BEFORE check_budget_healthy and before any gateway call, so a paused cloud lane spends nothing and its
+# heartbeat names the real cause (claude-pause) instead of a generic budget hold.
+check_claude_paused() {
+  if [[ "$(get_claude_paused)" == "true" ]]; then
+    echo "Claude is paused (manual kill switch from the dashboard)" >&2
+    return 0
+  fi
+  return 1
+}
+
+# emit_heartbeat <status> [reason] [pass] -> write this daemon's own heartbeat (INSTANCE_ID, HEARTBEAT_MODEL and STARTED_AT from the caller's scope) through
+# write_heartbeat_file. A non-empty reason is stored as the heartbeat's "reason" field (e.g. status "paused", reason "claude-pause"), so the Workers tab can tell a
+# manual pause from a GPU lease or an infra hold; with no reason the field is omitted.
+emit_heartbeat() {
+  local status="$1" reason="${2:-}" pass="${3:-}"
+  write_heartbeat_file "${INSTANCE_ID:-}" "$status" "${HEARTBEAT_MODEL:-}" "" "$pass" "${STARTED_AT:-}" "$reason"
+}
+
 # Claude rate-limit gate. budget-monitor.js's isBudgetHealthy() (see that module's own
 # header) reads Claude Code's own local transcript for a real rate-limit-hit event -- it
 # existed and was already wired into review-runner.ps1/apply-runner.ps1 (both check it
