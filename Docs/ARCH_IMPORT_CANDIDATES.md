@@ -397,3 +397,19 @@ Add a test case to `src/reject-retry-check.test.js` that simulates a task with a
 
 Benefits:
 Validates the documented safety contract for `requeue_blocked_task`, ensuring that recurring blockers are properly detected and that silent forced retries cannot occur without explicit human confirmation. This catches a gate that silently accepts a repeated rejection, preventing tasks from being retried indefinitely against the same blocker and ensuring the human is informed of the pattern before any force action.
+
+### AC-29 · Adversarial input handling in repo registration and command allowlist validation
+Strength: Strong
+Source: builderio-agent-native — "Adversarial lookalike and bypass tables for allowlist checks"
+Files: python/dashboard/routes/internal_chat.py
+
+Problem:
+The repo registration route constructs `pipeline_dir = repo_root + "-pipeline"` using simple string concatenation after `os.path.normpath(os.path.abspath(raw_path))`, and the command runner delegates to `chat_command_runner.run_approved` which "re-validates the allowlist, the kill switch and the confirmation's age itself". Neither location exercises adversarial near-miss inputs: sibling-prefix paths (`/repo-evil` vs `/repo`), `..` segments that slip through normpath edge cases, symlinks that escape the repo boundary, or non-string/empty inputs that could bypass fail-closed logic. The allowlist validation in `chat_command_runner` is a critical security boundary but has no visible test coverage for lookalike command names or scheme-based bypasses.
+
+Solution:
+Write node:test tables (or Python equivalent) that exercise the allowlist and path containment with adversarial inputs: for repo registration, test `/repo-evil` vs `/repo`, absolute vs relative paths, `..` segments, symlinks pointing outside the repo, and empty/non-string `path` values. For the command allowlist, test near-miss command names (`git-evil` vs `git`), embedded credentials in URLs, `javascript:`/`file:` schemes in arguments, and non-string argv inputs. Ensure both checks fail closed on unexpected input types or edge cases from local model output.
+
+Benefits:
+Closes a security gap in the operator-facing chat plugin by ensuring adversarial inputs cannot bypass repo containment or command allowlists. The fail-closed behavior protects against malformed or malicious local model output that could otherwise exploit string concatenation or allowlist matching edge cases.
+
+NOTE: The independent review found no issues with the original draft, so no corrections were applied.
