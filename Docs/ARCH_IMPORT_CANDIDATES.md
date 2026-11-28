@@ -369,3 +369,17 @@ Create a single shared file (e.g. src/lib/adversarial-inputs.test.js) that expor
 
 Benefits:
 New validators inherit the adversarial test table automatically, reducing the chance that a validator is added without bad-input coverage. The table surfaces edge cases that individual tests might miss (e.g. a path validator that handles `..` but not embedded newlines). Maintenance is centralized: adding a new adversarial input requires updating one file, and all validators immediately benefit.
+
+### AC-27 · Content hash verification before adhoc diff commit
+Strength: Strong
+Source: builderio-agent-native — "Verify content hashes before committing"
+Files: src/apply-adhoc-diff.js, src/apply-adhoc-diff.test.js
+
+Problem:
+The `applyAdhocDiff` function applies a unified diff to the repository and stages the resulting files, but there is no verification that the bytes actually written to the working tree match the bytes that were reviewed and approved during the majority-vote step. Between approval and apply time, a worker, a concurrent user, or a race condition could modify the file on disk, meaning the commit could contain content that was never voted on. The test file shows the function handles renames and content changes correctly in happy paths, but the absence of a hash check means there is no fail-closed guarantee that the applied bytes equal the approved bytes.
+
+Solution:
+After `applyAdhocDiff` computes the staged files and before the final commit, compute the sha256 of each staged file's current content and compare it against the hashes recorded at approval time. If any file's hash mismatches or is missing from the approval record, abort the commit and return an error indicating which files failed verification. This mirrors the `createCheckpoint` pattern from the source finding but adapted for the adhoc diff workflow: record hashes when the review approves, then verify at apply time. The verification should be integrated into the commit flow within `apply-adhoc-diff.js`, likely near where `git add` and `git commit` are invoked.
+
+Benefits:
+Ensures the applied bytes are exactly the bytes reviewers voted on, preventing silent content substitution between approval and commit. Provides a fail-closed safety guarantee without requiring changes to the review system or the diff application logic. Independent of other project components, so it can be added incrementally with tests in the existing test file.
