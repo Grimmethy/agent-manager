@@ -350,6 +350,19 @@ self-contained, tested unit of work as a race against the next `resetToMain()` -
   function name) to check before spending time on recovery that isn't needed. If it comes
   back empty, *then* treat it as a real wipe and check `git stash list`.
 
+## Local model and GPU: never call Ollama directly; go through the arbiter
+
+- A session or agent never calls Ollama (`localhost:11434`, `/api/chat`, `/api/generate`) directly, not even to "just test". A direct call bypasses the arbiter and overlaps pipeline calls on the one shared model. On 2026-11-25 a session's hand-run grill rounds held `ornith:35b` for up to ~7.7 minutes beside live pipeline calls.
+- Sanctioned paths:
+  - Queue a pipeline task. It runs in the `draft` class through `src/local-client.js` and the arbiter.
+  - For interactive work, use the chat plugin's local provider (the `interactive` class through the arbiter).
+  - For Forge, ComfyUI or ollama-vision jobs, use the GPU broker (`agent-manager-gpu-broker`, `127.0.0.1:7449`): `POST /api/gpu/acquire`, `/api/gpu/heartbeat`, `/api/gpu/release`.
+- If none of these fits, ask the owner before touching the model.
+- Hand-run only with the owner's explicit approval. Then set `"think": false` and set `num_ctx` equal to the loaded context (`PINNED_NUM_CTX` in `src/gpu-capacity.js`, 49152). Report what was run and for how long.
+- See [`src/gpu-arbiter.js`](src/gpu-arbiter.js) (the single owner of local-model access: priority classes interactive > review > draft > audit, ticket files, `cancelBelow`, `status`). See also the [GPU broker README](../agent-manager-gpu-broker/README.md) in the `agent-manager-gpu-broker` repo.
+
+Trim or update this section when direct Ollama access is blocked by the proxy, if that is built.
+
 ## queue/ is live pipeline state, not a source tree -- never hand-edit it
 
 `queue/*/*.json` (gitignored) is mutated continuously by the worker lanes (`worker-3090`, `worker-p40`), `reviewer`, and
