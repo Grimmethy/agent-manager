@@ -450,3 +450,19 @@ The helper signature is `(stage, detail_or_none, malformed)` — the `source` pa
 Operators see exactly which review votes were received, which are malformed, and how many total votes were cast — instead of a blank line that could mean either outcome. Downstream code that acts on `reviewVotes` can no longer misread "no vote recorded" for "vote recorded but malformed," closing the silent-drop path the original finding identifies. Malformed votes are explicitly counted as abstentions/failures, preventing "majorities computed over fewer votes unnoticed" as the source finding requires. The helper is pure and independently testable.
 
 NOTE: The reviewer's final "NO ISSUES FOUND" conclusion contradicts their own detailed critique and appears to be an error; all seven flagged problems were addressed in this corrected draft.
+
+### AC-31 · Add reversible history record to task file moves
+Strength: Strong
+Source: bytedance-deer-flow — "Locked validate-scan-write-audit sequence with reversible history record"
+Files: scripts/apply-task.sh
+
+Problem:
+When `scripts/apply-task.sh` moves a task record between directories (queue → done, queue → blocked, queue → awaiting-confirm, queue → coordinating) via `move_task_file_locked()`, it does so without recording the previous state or the reason for the move in a way that enables reversal. The `report_id_mismatch()` function only logs a warning when the file name and task id disagree -- it doesn't create a reversible record. This means the system has no audit trail for task lifecycle transitions, making debugging failed applies or recovering from incorrect routing difficult without external logs.
+
+Solution:
+Extend `move_task_file_locked()` in `scripts/apply-task.sh` to append a history entry to the task record AFTER the move, capturing the previous directory, the new directory, timestamp, and the task's state at the time of the move. This mirrors the original finding's "validate-scan-write-audit" sequence: validate the move is legal, scan the current state, perform the write/move, then append a history record with the prev/new content -- all under the existing per-task lock. The history entry should include enough context (prev directory, new directory, reason from the calling code, task id) to enable reversal: a future `undo_task_move()` function could read the last history entry and move the file back to its previous directory. This adds reversibility without git, similar to the original finding's approach.
+
+Benefits:
+Every task lifecycle transition becomes auditable and reversible. Operators can trace why a task was moved to `BLOCKED_DIR` vs `DONE_DIR`, recover from incorrect routing by reading the history entry, and debug race conditions more easily. The per-task lock already exists, so the addition is minimal -- just appending a JSON history entry after the `mv`. This aligns with the original finding's pattern of making local-model worker outputs traceable and recoverable.
+
+NOTE: The critique identified a real structural mismatch (history should be appended after the move, not before, to capture prev/new content) but concluded "NO ISSUES FOUND" -- I applied the fix rather than leaving the draft unchanged.
