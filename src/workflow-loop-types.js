@@ -8,13 +8,41 @@
 
 const { modelSize, smallestModelSize } = require('./model-size.js');
 
-const PIPELINE_STEPS = [
-  { name: 'orient', pool: 'draft' },
-  { name: 'plan', pool: 'draft' },
-  { name: 'implement', pool: 'draft' },
-  { name: 'review', pool: 'review' },
-  { name: 'apply', pool: 'apply' },
-];
+// The ordered pipeline manifest: every stage, in run order, with the model pool it draws from. This is the single hand-maintained list; the order,
+// membership and stage-id views below are DERIVED from it and checked at load time by pipelineManifestValid (the JS stand-in for a TypeScript
+// `satisfies` check), so the views can never drift from the manifest.
+const PIPELINE_POOLS = Object.freeze(['draft', 'review', 'apply']);
+
+const PIPELINE_STEPS = Object.freeze([
+  Object.freeze({ name: 'orient', pool: 'draft' }),
+  Object.freeze({ name: 'plan', pool: 'draft' }),
+  Object.freeze({ name: 'implement', pool: 'draft' }),
+  Object.freeze({ name: 'review', pool: 'review' }),
+  Object.freeze({ name: 'apply', pool: 'apply' }),
+]);
+
+// pipelineManifestValid(steps) -> true when `steps` is a non-empty array of { name, pool } entries with unique non-empty string names and a known pool.
+// Never throws.
+function pipelineManifestValid(steps) {
+  if (!Array.isArray(steps) || steps.length === 0) return false;
+  const seen = new Set();
+  for (const s of steps) {
+    if (s === null || typeof s !== 'object' || Array.isArray(s)) return false;
+    if (typeof s.name !== 'string' || s.name === '' || seen.has(s.name)) return false;
+    if (!PIPELINE_POOLS.includes(s.pool)) return false;
+    seen.add(s.name);
+  }
+  return true;
+}
+
+const PIPELINE_VALID = pipelineManifestValid(PIPELINE_STEPS);
+const PIPELINE_ORDER = Object.freeze(PIPELINE_STEPS.map((s) => s.name));
+const PIPELINE_MEMBERSHIP = Object.freeze(Object.fromEntries(PIPELINE_STEPS.map((s) => [s.name, s.pool])));
+
+// The graph node id of every pipeline stage, in run order.
+function pipelineStageIds() {
+  return PIPELINE_ORDER.map((name) => 'stage:' + name);
+}
 
 const SCRIPT_LOOP_NAMES = { tuner: 'Tuning loop', uiconf: 'UI conformance loop' };
 
@@ -67,14 +95,14 @@ function buildLoops(graph, registry) {
     const loops = [];
 
     // The task pipeline, derived from the lanes.
-    const hasStages = PIPELINE_STEPS.every((s) => byId.has('stage:' + s.name));
+    const hasStages = PIPELINE_VALID && pipelineStageIds().every((id) => byId.has(id));
     if (hasStages) {
       const draftModels = laneNodes.filter((n) => !isReviewer(n) && !isScript(n)).map(laneModel);
       const reviewModels = laneNodes.filter((n) => isReviewer(n)).map(laneModel);
       const applyModels = [modelEntry('apply-loop', 'script', null)];
       const pools = { draft: draftModels, review: reviewModels, apply: applyModels };
-      const steps = PIPELINE_STEPS.map((s) => 'stage:' + s.name);
-      PIPELINE_STEPS.forEach((s) => updated.set('stage:' + s.name, withModels(byId.get('stage:' + s.name), 'loop:pipeline', pools[s.pool])));
+      const steps = pipelineStageIds();
+      PIPELINE_ORDER.forEach((name) => updated.set('stage:' + name, withModels(byId.get('stage:' + name), 'loop:pipeline', pools[PIPELINE_MEMBERSHIP[name]])));
       loops.push({ id: 'loop:pipeline', name: 'Task pipeline', kind: 'pipeline', steps, services: byId.has('service:apply-loop') ? ['service:apply-loop'] : [] });
     }
 
@@ -129,4 +157,4 @@ function addLoopTypes(graph, registry) {
   return { ...graph, nodes: built.nodes, edges: built.edges, loops: built.loops, warnings: (graph && Array.isArray(graph.warnings) ? graph.warnings : []).concat(built.warnings) };
 }
 
-if (typeof module !== 'undefined') module.exports = { buildLoops, addLoopTypes };
+if (typeof module !== 'undefined') module.exports = { buildLoops, addLoopTypes, PIPELINE_ORDER, PIPELINE_MEMBERSHIP, pipelineManifestValid };
