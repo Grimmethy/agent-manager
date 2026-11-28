@@ -355,3 +355,17 @@ Adapt the pattern from the original finding—where `fetchSessionExport` throws 
 
 Benefits:
 Once deployed, any failure in the lots-fetching path returns the exception class and message. An operator or the owner looking at a `{"available": false}` response can immediately see whether it was `sqlite3.OperationalError: no such table: ebay_lot` (expected during a partial migration) or `TypeError: '>=' not supported between instances of str and datetime.date` (a real data bug). Every distinct failure mode is no longer indistinguishable, eliminating the need for ad-hoc debugging sessions.
+
+### AC-26 · Adversarial input tables for every validator
+Strength: Strong
+Source: builderio-agent-native — "Table of adversarial inputs run through every validator"
+Files: src/lib/task-images.test.js, src/model-size.test.js, src/node-code-gate.test.js
+
+Problem:
+Each validator in agent-manager already has its own narrow bad-input test, but the tests are isolated to the function they cover. src/lib/task-images.test.js has one test that exercises malformed imagePaths; src/model-size.test.js has one test for smallestModelSize with empty/bad input; src/node-code-gate.test.js has one test for bad bundle paths, branch-like args, and short SHAs. There is no shared fixture of adversarial inputs that every validator must reject. When a new validator is added, the convention of "write a bad-input test" is easy to skip, and the original finding shows that even established codebases miss edge cases like embedded newlines, trailing whitespace, and `..` escapes until they are explicitly enumerated.
+
+Solution:
+Create a single shared file (e.g. src/lib/adversarial-inputs.test.js) that exports a table of known-bad model outputs: paths with embedded newlines, trailing whitespace, `..` escapes, null bytes, and other injection vectors. Every validator in agent-manager imports this table and runs its predicate over each entry, asserting rejection. This mirrors the original finding's approach of a table of near-miss inputs that the resolver and boolean predicate must both reject. The table is the single source of truth for what constitutes bad input across all validators.
+
+Benefits:
+New validators inherit the adversarial test table automatically, reducing the chance that a validator is added without bad-input coverage. The table surfaces edge cases that individual tests might miss (e.g. a path validator that handles `..` but not embedded newlines). Maintenance is centralized: adding a new adversarial input requires updating one file, and all validators immediately benefit.
