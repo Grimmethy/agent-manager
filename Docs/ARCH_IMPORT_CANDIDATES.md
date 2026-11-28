@@ -383,3 +383,17 @@ After `applyAdhocDiff` computes the staged files and before the final commit, co
 
 Benefits:
 Ensures the applied bytes are exactly the bytes reviewers voted on, preventing silent content substitution between approval and commit. Provides a fail-closed safety guarantee without requiring changes to the review system or the diff application logic. Independent of other project components, so it can be added incrementally with tests in the existing test file.
+
+### AC-28 · Assert the repeatedBlocker rejection path in requeue_blocked_task tests
+Strength: Strong
+Source: builderio-agent-native — "Assert the rejection path, not only the happy path"
+Files: src/local-tool-client.js, src/reject-retry-check.test.js, scripts/local-worker-borrow.test.js
+
+Problem:
+The `requeue_blocked_task` function in `src/local-tool-client.js` documents a critical safety guard: when a `repeatedBlocker` match is detected (the same rejection reason recurring), the system must tell the human plainly and ask before retrying with `force:true`, never silently forcing it. However, `src/reject-retry-check.test.js` and `scripts/local-worker-borrow.test.js` only test the happy-path requeue scenario (clearing stale state, incrementing `localRejectCount`, moving from blocked/ to pending/). There is no test asserting that a repeated rejection reason triggers the `repeatedBlocker` detection and that the function refuses to silently force a retry without explicit `force:true`. This leaves a gap where a gate could silently accept a forced retry even when the blocker is recurring, contradicting the documented safety contract.
+
+Solution:
+Add a test case to `src/reject-retry-check.test.js` that simulates a task with a `repeatedBlocker` match (same `blockedReason` as a prior attempt) and asserts that `requeue_blocked_task` reports the repeated blocker and requires `force:true` to proceed. The test should verify that calling without `force:true` returns a rejection status or error indicating the repeated blocker, while calling with `force:true` after the human confirms proceeds with the retry. This mirrors the original finding's approach of asserting the rejection path with a specific asserted reason, catching a gate that silently accepts everything.
+
+Benefits:
+Validates the documented safety contract for `requeue_blocked_task`, ensuring that recurring blockers are properly detected and that silent forced retries cannot occur without explicit human confirmation. This catches a gate that silently accepts a repeated rejection, preventing tasks from being retried indefinitely against the same blocker and ensuring the human is informed of the pattern before any force action.
