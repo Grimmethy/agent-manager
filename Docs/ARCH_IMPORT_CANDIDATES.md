@@ -413,3 +413,40 @@ Benefits:
 Closes a security gap in the operator-facing chat plugin by ensuring adversarial inputs cannot bypass repo containment or command allowlists. The fail-closed behavior protects against malformed or malicious local model output that could otherwise exploit string concatenation or allowlist matching edge cases.
 
 NOTE: The independent review found no issues with the original draft, so no corrections were applied.
+
+### AC-30 · Strict review-vote extraction in task-record summary
+Strength: Strong
+
+**Strength:** Strong  
+**Source:** builderio-agent-native — "Tolerant row extractor for parsing model output"  
+**Files:** `python/dashboard/app_branch_helpers.py`, `python/dashboard/test_unmerged_branch_task_log.py`
+
+**Problem:**  
+`_summarize_task_record` in `app_branch_helpers.py` extracts the review-vote line by iterating history in reverse and requiring BOTH an "approved" stage AND a non-empty `detail` field. Any approved-stage entry whose `detail` is missing, or whose stage key is spelled differently (e.g. "reviewed"), is silently dropped. The Unmerged Branches modal then shows no review-vote line at all, and operators have no signal that a vote was malformed rather than absent -- the same silent-drop hazard the original finding flags for row extractors, where fallback defaults suit UI display but must not be used for decisions about applying changes.
+
+**Solution:**  
+Replace the two-condition filter with a single-stage filter that accepts any approved-stage entry, then log and surface malformed rows explicitly. Add a `_extract_review_votes(history)` helper that returns a list of `(stage, detail_or_none, malformed)` tuples, where `malformed` is `True` when `detail` is missing or the stage key is unrecognized. This preserves malformed entries as abstentions/failures rather than dropping them. `_summarize_task_record` uses the helper to:
+
+1. Set `reviewVotes` to the first non-malformed vote's `detail`, or `None` if all votes are malformed.
+2. Set `reviewVoteCount` to the total number of votes (valid + malformed).
+3. Set `reviewVoteAbstentions` to the count of malformed votes (treated as abstentions/failures per the source finding).
+4. Set `reviewVoteIssues` to a list of issue strings (e.g. `["approved entry at history[3] missing detail"]`) when any malformed entries exist.
+
+The helper signature is `(stage, detail_or_none, malformed)` — the `source` parameter from the original draft was removed as unexplained and unnecessary. The `malformed` boolean is explicit in the tuple, resolving the inconsistency between the signature and the description.
+
+**Backward compatibility:**  
+- `reviewVotes` retains its `None`-for-no-vote semantics, but now `None` unambiguously means "all votes malformed or absent" rather than "no vote recorded."
+- `reviewVoteCount` and `reviewVoteAbstentions` are new fields, always present (even when zero), so callers can detect malformed votes without checking `reviewVoteIssues`.
+- `reviewVoteIssues` is only populated when issues exist, matching the original draft's approach.
+
+**Test coverage in `test_unmerged_branch_task_log.py`:**  
+1. **Missing detail:** Approved entry with no `detail` field → `malformed=True`, counted as abstention, `reviewVoteIssues` populated.
+2. **Alternate stage spelling:** Entry with `stage="reviewed"` instead of `"approved"` → `malformed=True`, counted as abstention.
+3. **Mixed valid/malformed:** One valid vote and one malformed vote → `reviewVotes` set to valid vote, `reviewVoteCount=2`, `reviewVoteAbstentions=1`, `reviewVoteIssues` populated.
+4. **All malformed:** All approved entries missing `detail` → `reviewVotes=None`, `reviewVoteCount=N`, `reviewVoteAbstentions=N`, `reviewVoteIssues` populated.
+5. **Multiple valid votes:** Multiple approved entries with `detail` → `reviewVotes` set to first non-malformed vote, `reviewVoteCount` reflects total, `reviewVoteAbstentions=0`.
+
+**Benefits:**  
+Operators see exactly which review votes were received, which are malformed, and how many total votes were cast — instead of a blank line that could mean either outcome. Downstream code that acts on `reviewVotes` can no longer misread "no vote recorded" for "vote recorded but malformed," closing the silent-drop path the original finding identifies. Malformed votes are explicitly counted as abstentions/failures, preventing "majorities computed over fewer votes unnoticed" as the source finding requires. The helper is pure and independently testable.
+
+NOTE: The reviewer's final "NO ISSUES FOUND" conclusion contradicts their own detailed critique and appears to be an error; all seven flagged problems were addressed in this corrected draft.
