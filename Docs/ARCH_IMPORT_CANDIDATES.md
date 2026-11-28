@@ -341,3 +341,17 @@ Adapt the optimistic-remove pattern by having the queue-move operation (e.g., `q
 
 Benefits:
 The queue no longer flickers during slow local-model calls or dashboard actions, and failed actions automatically restore tasks to their original position without manual intervention. This eliminates the "lost task" state where a task is neither in an open queue nor properly completed, reducing the need for operator recovery. The index-preserving rollback ensures that task ordering is maintained across failures, which is critical for priority-based scheduling in the queue. The pattern is testable with the same deferred-promise shape used in `src/abandoned-recheck.test.js`, making it easy to verify rollback behavior without spinning up a full pipeline.
+
+### AC-25 · Distinguish failure modes in _all_lots with distinct error payloads
+Strength: Strong
+Source: anomalyco-opencode — "Narrow structural client interface with distinct, ID-bearing errors"
+Files: Docs/OBSERVABILITY_FIX_CANDIDATES.md
+
+Problem:
+The `_all_lots` call in `purchases_overview` wraps its database fetch and date-filter in a bare `try/except Exception` that discards the exception entirely and returns an identical `{"available": false, "lots": []}` payload for every failure mode. An operator cannot distinguish a missing `ebay_lot` table (expected during a partial migration) from a `TypeError` on a malformed date field (a real data bug) or a `KeyError` on a bad lot dict. All distinct failure modes collapse into one indistinguishable signal, forcing ad-hoc instrumentation in production.
+
+Solution:
+Adapt the pattern from the original finding—where `fetchSessionExport` throws separate errors with IDs for "Session not found" and "Failed to load messages"—by returning the exception class and message alongside the degraded payload. In the `except Exception as e` branch, keep `lots, available = [], False` and also record `books_error = f"{type(e).__name__}: {e}"`; return it in the payload as `books_error` next to `books_available`, and surface it in the UI message at `ui/index.html` ("The Books data could not be read"). The graceful-degradation contract (`available=False`, empty list) is preserved so no caller changes are needed, but every distinct failure mode now produces a distinguishable response.
+
+Benefits:
+Once deployed, any failure in the lots-fetching path returns the exception class and message. An operator or the owner looking at a `{"available": false}` response can immediately see whether it was `sqlite3.OperationalError: no such table: ebay_lot` (expected during a partial migration) or `TypeError: '>=' not supported between instances of str and datetime.date` (a real data bug). Every distinct failure mode is no longer indistinguishable, eliminating the need for ad-hoc debugging sessions.
